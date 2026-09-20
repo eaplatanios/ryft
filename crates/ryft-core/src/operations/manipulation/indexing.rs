@@ -39,6 +39,7 @@ pub trait IndexInteger {
 macro_rules! impl_index_integer {
     ($integer:ty) => {
         impl IndexInteger for $integer {
+            #[inline]
             fn to_index_integer(self) -> i128 {
                 self as i128
             }
@@ -211,16 +212,15 @@ pub struct IndexMask {
     values: Vec<bool>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl IndexMask {
-    /// Creates a concrete mask with row-major `values` and the specified axis extents. The product of the extents
-    /// must equal the number of values and fit in `usize`. A scalar mask has an empty shape and exactly one value.
+    /// Creates a new concrete [`IndexMask`] with row-major `values` and the specified axis extents. The product of the
+    /// extents must equal the number of values and fit in `usize`. A scalar mask has an empty shape and exactly one
+    /// value.
     ///
     /// # Parameters
     ///
     ///   - `shape`: Extents of the consecutive input axes consumed by this mask.
-    ///   - `values`: Host-known Boolean entries in row-major order; each `true` entry selects its position.
+    ///   - `values`: Host-known Boolean entries in row-major order, each `true` entry selects its position.
     pub fn new(shape: Vec<usize>, values: Vec<bool>) -> Result<Self, ProgramError> {
         let count = shape
             .iter()
@@ -228,7 +228,8 @@ impl IndexMask {
             .ok_or_else(|| TypeError::invalid("index mask shape overflows `usize`"))?;
         if count != values.len() {
             return Err(TypeError::invalid(format!(
-                "index mask shape requires {count} values but got {}",
+                "index mask shape requires {} values but got {}",
+                count,
                 values.len()
             ))
             .into());
@@ -236,80 +237,85 @@ impl IndexMask {
         Ok(Self { shape, values })
     }
 
-    /// Returns the extents of the input axes consumed by this mask. An empty shape denotes a scalar mask.
+    /// Returns the extents of the input axes consumed by this [`IndexMask`]. An empty shape denotes a scalar mask.
+    #[inline]
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
 
-    /// Returns the concrete Boolean entries in row-major order.
+    /// Returns the concrete Boolean entries of this [`IndexMask`] in row-major order.
+    #[inline]
     pub fn values(&self) -> &[bool] {
         &self.values
     }
 }
 
-/// One component of an array selection. Use [`index!`](crate::index) or the standard conversions to construct a list.
-/// The value parameter is inferred from the receiver of [`Indexing::at`], including for a list containing only basic
-/// indices. Array selectors borrow the receiver's value family; lift constants into the trace before using them.
+/// One component of an array selection. Use [`index!`] or the standard conversions to construct lists of such
+/// selectors. The value parameter is inferred from the receiver of [`Indexing::at`], including for a list containing
+/// only basic indices. Array selectors borrow the receiver's value family and so the caller must lift constants into
+/// the trace before using them.
 ///
 /// Selectors fall into NumPy's two [indexing](https://numpy.org/doc/stable/user/basics.indexing.html) categories.
 /// [`Basic`](Self::Basic) selectors are host-known and act on one axis at a time (refer to the documentation of
-/// [`BasicIndex`] for more information). [`Array`](Self::Array) and [`Mask`](Self::Mask) selectors are advanced
-/// indices: all advanced selectors in one selection broadcast jointly to a single coordinate shape, and the selection
+/// [`BasicIndex`] for more information). [`Array`](Self::Array) and [`Mask`](Self::Mask) selectors are _advanced_
+/// indices. All advanced selectors in one selection broadcast jointly to a single coordinate shape, and the selection
 /// gathers (or scatters) at those coordinates. When a selection mixes the two categories, the basic selectors are
 /// applied axis by axis around the advanced gather, and host integers count as advanced for the purpose of axis
-/// placement, as in NumPy's rules for [combining advanced and basic indexing][combining]. Advanced selectors that are
-/// adjacent in the selection insert their broadcast axes in place of the first consumed axis, while advanced selectors
-/// separated by a slice, new axis, or ellipsis move their broadcast axes to the front of the result.
+/// placement, as in NumPy's rules for [combining advanced and basic indexing](
+/// https://numpy.org/doc/stable/user/basics.indexing.html#combining-advanced-and-basic-indexing). Advanced selectors
+/// that are adjacent in the selection insert their broadcast axes in place of the first consumed axis, while advanced
+/// selectors separated by a slice, new axis, or ellipsis move their broadcast axes to the front of the result.
 ///
-/// Negative integer indices count backward from the axis end once. Remaining invalid integer indices follow the
-/// bounds options supplied to the read or update function.
-///
-/// [combining]: https://numpy.org/doc/stable/user/basics.indexing.html#combining-advanced-and-basic-indexing
+/// Negative integer indices count backward from the axis end once. Remaining invalid integer indices follow the bounds
+/// options supplied to the read or update function.
 #[derive(Clone, Debug, PartialEq)]
 pub enum IndexSelector<'i, V: Value> {
-    /// Basic index: a host integer, slice, new axis, or ellipsis.
+    /// Basic index represented as a host integer, a slice, a new axis, or an ellipsis.
     Basic(BasicIndex),
 
-    /// Advanced index: an integer array of coordinates, including rank-zero arrays. Boolean arrays are rejected; use
-    /// [`IndexMask`] for concrete masks. Keeping rank-zero arrays distinct from host integers preserves advanced-index
-    /// semantics (a rank-zero array contributes to the joint broadcast and does not remove the axis the way a host
-    /// integer does).
+    /// Advanced index represented as an integer array of coordinates, including rank-zero arrays. Boolean arrays are
+    /// rejected (callers must use [`IndexMask`] for concrete Boolean masks). Keeping rank-zero arrays distinct from
+    /// host integers preserves advanced-index semantics (i.e., a rank-zero array contributes to the joint broadcast
+    /// and does not remove the axis the way a host integer does).
     Array(&'i V),
 
-    /// Advanced index: an explicitly host-known mask, consuming one input axis per mask axis and contributing one
-    /// advanced axis whose extent is the number of true entries.
+    /// Advanced index represented as an explicitly host-known mask, consuming one input axis per mask axis and
+    /// contributing one advanced axis whose extent is the number of true entries.
     Mask(&'i IndexMask),
 }
 
 impl<V: Value> From<BasicIndex> for IndexSelector<'_, V> {
+    #[inline]
     fn from(value: BasicIndex) -> Self {
         Self::Basic(value)
     }
 }
 
 impl<V: Value> From<IndexSlice> for IndexSelector<'_, V> {
+    #[inline]
     fn from(value: IndexSlice) -> Self {
         Self::Basic(BasicIndex::Slice(value))
     }
 }
 
 impl<'i, V: Value> From<&'i V> for IndexSelector<'i, V> {
+    #[inline]
     fn from(value: &'i V) -> Self {
         Self::Array(value)
     }
 }
 
 impl<'i, V: Value> From<&'i IndexMask> for IndexSelector<'i, V> {
+    #[inline]
     fn from(value: &'i IndexMask) -> Self {
         Self::Mask(value)
     }
 }
 
-// Implement host integer conversions explicitly so they cannot overlap the borrowed-value conversion.
-macro_rules! index_integer_conversions {
-    // Implements descriptor conversion for one primitive host integer with an exact signed representation.
+macro_rules! impl_from_integer_for_index_selector {
     ($integer:ty) => {
         impl<V: Value> From<$integer> for IndexSelector<'_, V> {
+            #[inline]
             fn from(value: $integer) -> Self {
                 Self::Basic(BasicIndex::Integer(value.to_index_integer()))
             }
@@ -317,41 +323,47 @@ macro_rules! index_integer_conversions {
     };
 }
 
-index_integer_conversions!(i8);
-index_integer_conversions!(i16);
-index_integer_conversions!(i32);
-index_integer_conversions!(i64);
-index_integer_conversions!(i128);
-index_integer_conversions!(isize);
-index_integer_conversions!(u8);
-index_integer_conversions!(u16);
-index_integer_conversions!(u32);
-index_integer_conversions!(u64);
-index_integer_conversions!(usize);
+impl_from_integer_for_index_selector!(i8);
+impl_from_integer_for_index_selector!(i16);
+impl_from_integer_for_index_selector!(i32);
+impl_from_integer_for_index_selector!(i64);
+impl_from_integer_for_index_selector!(i128);
+impl_from_integer_for_index_selector!(isize);
+impl_from_integer_for_index_selector!(u8);
+impl_from_integer_for_index_selector!(u16);
+impl_from_integer_for_index_selector!(u32);
+impl_from_integer_for_index_selector!(u64);
+impl_from_integer_for_index_selector!(usize);
 
 impl<I: IndexInteger, V: Value> From<Range<I>> for IndexSelector<'_, V> {
+    #[inline]
     fn from(value: Range<I>) -> Self {
         IndexSlice::new(Some(value.start.to_index_integer()), Some(value.end.to_index_integer()), 1).into()
     }
 }
 
 impl<I: IndexInteger, V: Value> From<RangeFrom<I>> for IndexSelector<'_, V> {
+    #[inline]
     fn from(value: RangeFrom<I>) -> Self {
         IndexSlice::new(Some(value.start.to_index_integer()), None, 1).into()
     }
 }
 
 impl<I: IndexInteger, V: Value> From<RangeTo<I>> for IndexSelector<'_, V> {
+    #[inline]
     fn from(value: RangeTo<I>) -> Self {
         IndexSlice::new(None, Some(value.end.to_index_integer()), 1).into()
     }
 }
 
 impl<V: Value> From<RangeFull> for IndexSelector<'_, V> {
+    #[inline]
     fn from(_: RangeFull) -> Self {
         IndexSlice::new(None, None, 1).into()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Creates borrowed selections for reads and functional updates. The wrapper has no effects until a terminal
 /// function is called, and its functions require only the capabilities needed for their direction.
