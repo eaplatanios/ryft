@@ -1,7 +1,10 @@
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
-use crate::arrays::{Array, ArrayIrType, ArrayType, Broadcastable, DataType, Dimension, Shape};
+use crate::arrays::{
+    Array, ArrayIrType, ArraySliceAxis, ArrayType, Broadcastable, DataType, Dimension, ReferenceDynamicIndex,
+    ReferenceIndex, ReferenceSlice, Shape,
+};
 use crate::contexts::{Context, Domain};
 use crate::macros::check_count;
 use crate::operations::compare::Compare;
@@ -23,7 +26,8 @@ use crate::operations::manipulation::scattering::{
 };
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::math::add::Add;
-use crate::programs::{ProgramError, Type, TypeError, Typed, Value, ValueProjection};
+use crate::operations::references::{ReferenceAddUpdate, ReferenceRead, ReferenceSwap, ReferenceWrite};
+use crate::programs::{ProgramError, ReferenceType, Type, TypeError, Typed, Value, ValueProjection};
 
 /// A host integer that can be represented exactly as an indexing coordinate, slice endpoint, or stride. The [`index!`]
 /// macro and range conversions into [`IndexSelector`] use this trait to accept integer types such as `usize` without
@@ -363,31 +367,32 @@ impl<V: Value> From<RangeFull> for IndexSelector<'_, V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Creates borrowed selections for reads and functional updates. The wrapper has no effects until a terminal
 /// function is called, and its functions require only the capabilities needed for their direction.
 ///
-/// # Examples
+/// # Example
 ///
 /// ```rust
-/// use ryft_core::{Array, GatherMode, GatherOptions, Indexing, index};
+/// # use ryft_core::{Array, GatherMode, GatherOptions, Indexing, index};
 /// let input = Array::matrix(3, 2, vec![0_i32, 1, 2, 3, 4, 5]).unwrap();
 /// let options = GatherOptions::new().with_mode(GatherMode::Clip);
 /// let output = input.at(&index![.. by -1, 1]).get(&options).unwrap();
 /// assert_eq!(output, Array::vector(vec![5_i32, 3, 1]).unwrap());
 /// ```
 pub trait Indexing: Value {
-    /// Borrows this value and its [`IndexSelector`]s in an [`Indexed`] wrapper. Its `get` function reads the selection;
-    /// `set`, `add`, `multiply`, `min`, and `max` return a new array, leaving the input unchanged. Validation occurs in
-    /// those terminal functions, so constructing a wrapper is infallible. Refer to [`Indexed`] for supported geometry
-    /// and the shared bounds and index-promise contracts.
+    /// Borrows this value and the provided [`IndexSelector`]s in an [`Indexed`] wrapper. For array values, its `get`
+    /// function reads the selection while `set`, `add`, `multiply`, `min`, and `max` return a new array, leaving the
+    /// input unchanged. For reference values, `view` derives a reference to the selected region and `read`, `write`,
+    /// `add_update`, and `swap` access the reference's state through that view in place. Validation occurs in those
+    /// terminal functions, so constructing a wrapper is infallible. Refer to [`Indexed`] for supported geometry and
+    /// the shared bounds and index-promise contracts.
     ///
     /// # Parameters
     ///
-    ///   - `selectors`: Ordered selection components, usually constructed with [`index!`](crate::index). Omitted
-    ///     trailing axes are selected in full. The wrapper borrows this list and its array indices until its last use.
-    fn at<'a, 's, 'i>(&'a self, selectors: &'s [IndexSelector<'i, Self>]) -> Indexed<'a, 's, 'i, Self> {
+    ///   - `selectors`: Ordered [`IndexSelector`]s, usually constructed with [`index!`]. Omitted trailing axes are
+    ///     selected in full. The wrapper borrows this list and its array indices until its last use.
+    #[inline]
+    fn at<'v, 's, 'i>(&'v self, selectors: &'s [IndexSelector<'i, Self>]) -> Indexed<'v, 's, 'i, Self> {
         Indexed { input: self, selectors, marker: PhantomData }
     }
 }
@@ -395,15 +400,17 @@ pub trait Indexing: Value {
 impl<V: Value> Indexing for V {}
 
 /// Borrowed selection of a value. Separate input, selector-list, and index-value lifetimes allow both reusable lists
-/// and temporary lists used within a chained call. The type parameter selects homogeneous or mixed-IR execution.
-/// Selections have value semantics: reads produce values and updates return new values, leaving the input unchanged.
-/// No selection exposes a mutable view.
+/// and temporary lists used within a chained call. Selections of array values have value/functional semantics meaning
+/// that reads produce values and updates return new values, leaving the input unchanged, exactly like `x.at[...]` in
+/// [JAX](https://docs.jax.dev/en/latest/_autosummary/jax.Array.at.html). Selections of reference values instead derive
+/// a reference view of the selected region and access the reference's state through it in place, exactly like
+/// `ref.at[...]` in JAX.
 ///
 /// # Supported Geometry
 ///
 /// Concrete shapes support host integer indices, positive and negative strides, inserted axes, ellipses, broadcast
 /// integer-array indices, and explicit host-known [`IndexMask`]s. Eager arrays and staged arrays use the same selection
-/// rules. Reads compose slice, reverse, reshape, and gather; updates compose broadcast, reshape, and scatter.
+/// rules. Reads compose slice, reverse, reshape, and gather, and updates compose broadcast, reshape, and scatter.
 ///
 /// Symbolic shapes use the mixed [`ArrayIrType`] value family so dimension values remain available during staging.
 /// This path supports at most one indexed axis, full forward or reverse slices on the other axes, and inserted axes.
@@ -412,6 +419,17 @@ impl<V: Value> Indexing for V {}
 /// explicit output sharding, and index promises are currently rejected by the symbolic frontend. Untouched axes and
 /// query axes may have zero runtime extents; symbolic reads impose an additional indexed-axis requirement documented
 /// on their `get` function.
+///
+/// # Reference Views
+///
+/// A reference input (i.e., a value of [`ReferenceType`]) is selected without accessing its state: [`view`](Self::view)
+/// derives a reference sharing the input's allocation, and [`read`](Self::read), [`write`](Self::write),
+/// [`add_update`](Self::add_update), and [`swap`](Self::swap) go through that view. Reference views are limited to the
+/// transforms the reference machinery can reconstruct (i.e., host integers, unit-stride forward slices, an ellipsis,
+/// and scalar integer index arrays that select one position at run time). Inserted axes, masks, non-scalar index
+/// arrays, and strided or reversed slices are rejected, and axes touched by host integers or slices must have static
+/// extents. The bounds and index-promise options below do not apply to reference views, whose host integers must lie
+/// within their axis after negative-index normalization.
 ///
 /// # Bounds and Index Promises
 ///
@@ -424,71 +442,19 @@ impl<V: Value> Indexing for V {}
 /// The value parameter precedes the type parameter, unlike the usual generic parameter order, because `T` defaults to
 /// the value's type and a defaulted parameter must follow the parameter it depends on.
 #[derive(Debug)]
-pub struct Indexed<'a, 's, 'i, V: Value, T: Type = <V as Typed>::Type> {
+pub struct Indexed<'v, 's, 'i, V: Value, T: Type = <V as Typed>::Type> {
     /// The input whose elements are read or functionally updated.
-    input: &'a V,
+    input: &'v V,
 
-    /// The borrowed list of host and value-level selectors.
+    /// Borrowed list of host and value-level [`IndexSelector`]s.
     selectors: &'s [IndexSelector<'i, V>],
 
     /// [`PhantomData`] marker identifying the input's type universe.
     marker: PhantomData<fn() -> T>,
 }
 
-/// An expanded selector; ellipses remain separators even when they consume no axes.
-#[derive(Clone)]
-enum ExpandedIndex<V> {
-    /// Host selector consuming one input axis or inserting an output axis.
-    Basic(BasicIndex),
-
-    /// Owned array coordinate, cloned or lifted from the original descriptor.
-    Array(V),
-
-    /// Scalar Boolean mask contributing an advanced axis without an input axis.
-    Boolean(bool),
-}
-
-/// Shared gather/scatter geometry. The result without inserted new axes is exactly the gather result shape and the
-/// scatter update shape; reshaping at the boundary adds/removes only known singleton axes.
-struct IndexPlan<V> {
-    /// Jointly broadcast coordinate components with a final index-vector axis.
-    indices: V,
-
-    /// Gather dimension mapping.
-    dimensions: GatherDimensionNumbers,
-
-    /// Static window size on every input axis.
-    sizes: Vec<usize>,
-
-    /// Gather/scatter shape before inserting new singleton axes.
-    shape: Vec<usize>,
-
-    /// Public selection shape including inserted singleton axes.
-    output_shape: Vec<usize>,
-
-    /// Positions of singleton axes absent from the gather result.
-    new_axes: Vec<usize>,
-}
-
-/// Axis contribution in the public selection order, before the advanced broadcast dimensions are inserted.
-#[derive(Copy, Clone)]
-enum OutputAxis {
-    /// A contiguous slice becomes a gather window dimension.
-    Window(usize),
-
-    /// A strided slice contributes a coordinate-query dimension.
-    Query(usize),
-
-    /// A newly inserted extent-one axis is restored after gathering.
-    New,
-
-    /// Position at which jointly broadcast integer-array dimensions appear.
-    Advanced,
-}
-
-impl<V> Indexed<'_, '_, '_, V, ArrayType>
-where
-    V: Value<Type = ArrayType>
+impl<
+    V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
         + Broadcast
         + Reshape
         + Concatenate
@@ -499,13 +465,12 @@ where
         + Slice
         + Reverse
         + Gather,
-    V::ExecutionDomain: Context,
-    <V::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
+> Indexed<'_, '_, '_, V, ArrayType>
 {
     /// Reads this selection. Invalid scalar/array indices follow `options` after negative-index normalization.
     /// Slices clip their endpoints independently. Floating-point fill literals preserve their original encodings.
-    /// Refer to [`Indexed`] for supported geometry and the shared bounds and index-promise contracts.
-    /// A host integer that remains out of bounds under [`GatherMode::PromiseInBounds`] is rejected before staging.
+    /// Refer to [`Indexed`] for supported geometry and the shared bounds and index-promise contracts. A host integer
+    /// that remains out of bounds under [`GatherMode::PromiseInBounds`] is rejected before staging.
     ///
     /// # Parameters
     ///
@@ -525,6 +490,7 @@ where
     /// ```
     pub fn get(&self, options: &GatherOptions) -> Result<V, ProgramError> {
         let expanded = self.expanded()?;
+
         // Positive slices and valid scalar indices need only one slice and a rank adjustment. Reversal is a separate
         // linear operation, preserving symbolic extents and avoiding index tensors for ordinary reverse slicing.
         let input_type = self.input.r#type();
@@ -534,7 +500,8 @@ where
                 return Err(TypeError::invalid("index fill must be a scalar of the input data type").into());
             }
         }
-        if expanded.iter().all(|index| matches!(index, ExpandedIndex::Basic(_)))
+
+        if expanded.iter().all(|index| matches!(index, ExpandedIndexSelector::Basic(_)))
             && input_type.shape().dimensions().iter().all(|dimension| dimension.value().is_some())
         {
             let mut starts = Vec::new();
@@ -546,9 +513,9 @@ where
             let mut can_slice = true;
             for index in &expanded {
                 match index {
-                    ExpandedIndex::Basic(BasicIndex::NewAxis) => output.push(1),
-                    ExpandedIndex::Basic(BasicIndex::Ellipsis) => {}
-                    ExpandedIndex::Basic(BasicIndex::Slice(slice)) => {
+                    ExpandedIndexSelector::Basic(BasicIndex::NewAxis) => output.push(1),
+                    ExpandedIndexSelector::Basic(BasicIndex::Ellipsis) => {}
+                    ExpandedIndexSelector::Basic(BasicIndex::Slice(slice)) => {
                         let normalized = slice.normalize(input_type.dimension(axis).value().unwrap())?;
                         starts.push(normalized.start);
                         limits.push(normalized.limit);
@@ -559,7 +526,7 @@ where
                         }
                         axis += 1;
                     }
-                    ExpandedIndex::Basic(BasicIndex::Integer(integer)) => {
+                    ExpandedIndexSelector::Basic(BasicIndex::Integer(integer)) => {
                         let extent = input_type.dimension(axis).value().unwrap();
                         let integer = if *integer < 0 { integer.saturating_add(extent as i128) } else { *integer };
                         let valid = integer >= 0 && integer < extent as i128;
@@ -583,6 +550,7 @@ where
                     _ => unreachable!("only basic selectors reach the slicing fast path"),
                 }
             }
+
             if can_slice {
                 let input = if reversed.is_empty() { self.input.clone() } else { self.input.reverse(reversed)? };
                 return input
@@ -590,7 +558,9 @@ where
                     .reshape_with_output_sharding(Shape::from(output), options.output_sharding().cloned());
             }
         }
+
         let plan = self.plan(&expanded, matches!(options.mode(), GatherMode::PromiseInBounds))?;
+
         // Negative-coordinate normalization and interleaving slice coordinates can change lexicographic order.
         // Keep uniqueness as a caller promise about normalized selected positions, but do not forward sortedness.
         let mut gather_options = options.clone().with_indices_are_sorted(false);
@@ -598,6 +568,7 @@ where
             if sharding.dimensions().len() != plan.output_shape.len() {
                 return Err(TypeError::invalid("index output sharding rank does not match selection rank").into());
             }
+
             gather_options = gather_options.with_output_sharding(
                 sharding
                     .with_dimensions(
@@ -612,11 +583,13 @@ where
                     .map_err(|error| TypeError::invalid(error.to_string()))?,
             );
         }
+
         let empty_indexed_axis = plan
             .dimensions
             .collapsed_slice_dimensions()
             .iter()
             .any(|&axis| input_type.dimension(axis).value() == Some(0));
+
         let gathered = if empty_indexed_axis {
             let mut validation_shape = input_type.shape().dimensions().to_vec();
             for &axis in plan.dimensions.collapsed_slice_dimensions() {
@@ -624,30 +597,35 @@ where
                     validation_shape[axis] = Dimension::Static(1);
                 }
             }
+
             let output_type = input_type.clone().into_owned().with_shape(Shape::new(validation_shape)).gather(
                 plan.indices.r#type().as_ref(),
                 &plan.dimensions,
                 &plan.sizes,
                 &gather_options,
             )?;
+
             if plan.shape.iter().all(|&extent| extent != 0) && !matches!(options.mode(), GatherMode::Fill { .. }) {
                 return Err(TypeError::invalid(
                     "cannot index a nonempty selection from an empty axis without fill mode",
                 )
                 .into());
             }
+
             let fill = gather_options.resolved_fill_value(input_type.data_type())?;
             self.constant(fill)?.broadcast(output_type, &[])?
         } else {
             self.input.gather(&plan.indices, &plan.dimensions, &plan.sizes, &gather_options)?
         };
+
         gathered.reshape_with_output_sharding(Shape::from(plan.output_shape), options.output_sharding().cloned())
     }
 }
 
-impl<V> Indexed<'_, '_, '_, V, ArrayType>
-where
-    V: Value<Type = ArrayType>
+// TODO(eaplatanios): Review from here onwards.
+
+impl<
+    V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
         + Broadcast
         + Reshape
         + Concatenate
@@ -656,8 +634,7 @@ where
         + Add
         + Select
         + Scatter,
-    V::ExecutionDomain: Context,
-    <V::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
+> Indexed<'_, '_, '_, V, ArrayType>
 {
     /// Returns a value with selected elements overwritten by `updates`. Conflicting repeated indices do not promise
     /// a deterministic winner. The input is unchanged, and updates broadcast to the selection shape.
@@ -679,6 +656,7 @@ where
     ///     Array::vector(vec![0_i32, 9, 9, 3]),
     /// );
     /// ```
+    #[inline]
     pub fn set(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Overwrite, options)
     }
@@ -692,6 +670,7 @@ where
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
     ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
     ///     [`Indexed`] for how normalization and clipping affect these promises.
+    #[inline]
     pub fn add(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Add, options)
     }
@@ -706,6 +685,7 @@ where
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
     ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
     ///     [`Indexed`] for how normalization and clipping affect these promises.
+    #[inline]
     pub fn multiply(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Mul, options)
     }
@@ -719,6 +699,7 @@ where
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
     ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
     ///     [`Indexed`] for how normalization and clipping affect these promises.
+    #[inline]
     pub fn min(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Min, options)
     }
@@ -732,6 +713,7 @@ where
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
     ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
     ///     [`Indexed`] for how normalization and clipping affect these promises.
+    #[inline]
     pub fn max(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Max, options)
     }
@@ -760,7 +742,7 @@ where
     <V::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
 {
     /// Expands ellipses and concrete masks once, keeping separators for advanced-index axis ordering.
-    fn expanded(&self) -> Result<Vec<ExpandedIndex<V>>, ProgramError> {
+    fn expanded(&self) -> Result<Vec<ExpandedIndexSelector<V>>, ProgramError> {
         let rank = self.input.r#type().rank();
         let consumed = self
             .selectors
@@ -794,14 +776,14 @@ where
                 IndexSelector::Basic(BasicIndex::Ellipsis) => {
                     ellipsis = true;
                     // A zero-width ellipsis still separates two advanced groups.
-                    result.push(ExpandedIndex::Basic(BasicIndex::Ellipsis));
+                    result.push(ExpandedIndexSelector::Basic(BasicIndex::Ellipsis));
                     for _ in 0..rank - consumed {
-                        result.push(ExpandedIndex::Basic(BasicIndex::Slice(IndexSlice::new(None, None, 1))));
+                        result.push(ExpandedIndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(None, None, 1))));
                         axis += 1;
                     }
                 }
                 IndexSelector::Basic(value) => {
-                    result.push(ExpandedIndex::Basic(*value));
+                    result.push(ExpandedIndexSelector::Basic(*value));
                     if !matches!(value, BasicIndex::NewAxis) {
                         axis += 1;
                     }
@@ -817,12 +799,12 @@ where
                     if r#type.memory() != self.input.r#type().memory() {
                         return Err(TypeError::invalid("index arrays and input must share one memory space").into());
                     }
-                    result.push(ExpandedIndex::Array((*value).clone()));
+                    result.push(ExpandedIndexSelector::Array((*value).clone()));
                     axis += 1;
                 }
                 IndexSelector::Mask(mask) => {
                     if mask.shape.is_empty() {
-                        result.push(ExpandedIndex::Boolean(mask.values[0]));
+                        result.push(ExpandedIndexSelector::Boolean(mask.values[0]));
                         continue;
                     }
                     for (offset, &extent) in mask.shape.iter().enumerate() {
@@ -848,7 +830,7 @@ where
                             .filter(|(_, active)| **active)
                             .map(|(index, _)| ((index / stride) % mask.shape[coordinate_axis]) as i64)
                             .collect::<Vec<_>>();
-                        result.push(ExpandedIndex::Array(self.constant(Array::vector(coordinates)?)?));
+                        result.push(ExpandedIndexSelector::Array(self.constant(Array::vector(coordinates)?)?));
                     }
                     axis += mask.shape.len();
                 }
@@ -856,7 +838,7 @@ where
         }
         if !ellipsis {
             for _ in consumed..rank {
-                result.push(ExpandedIndex::Basic(BasicIndex::Slice(IndexSlice::new(None, None, 1))));
+                result.push(ExpandedIndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(None, None, 1))));
             }
         }
         Ok(result)
@@ -885,7 +867,7 @@ where
 
     /// Builds one shared window/query mapping, preserving contiguous windows rather than constructing a full grid
     /// over every output element. Only genuinely strided slices add coordinate-query axes.
-    fn plan(&self, expanded: &[ExpandedIndex<V>], promise: bool) -> Result<IndexPlan<V>, ProgramError> {
+    fn plan(&self, expanded: &[ExpandedIndexSelector<V>], promise: bool) -> Result<IndexPlan<V>, ProgramError> {
         let input_type = self.input.r#type();
         let shape = input_type
             .shape()
@@ -902,11 +884,12 @@ where
         if shape.iter().any(|&extent| i64::try_from(extent).is_err()) {
             return Err(TypeError::invalid("indexed axis extent exceeds `i64::MAX`").into());
         }
-        let advanced =
-            expanded.iter().any(|index| matches!(index, ExpandedIndex::Array(_) | ExpandedIndex::Boolean(_)));
-        let is_advanced = |index: &ExpandedIndex<V>| {
-            matches!(index, ExpandedIndex::Array(_) | ExpandedIndex::Boolean(_))
-                || (advanced && matches!(index, ExpandedIndex::Basic(BasicIndex::Integer(_))))
+        let advanced = expanded
+            .iter()
+            .any(|index| matches!(index, ExpandedIndexSelector::Array(_) | ExpandedIndexSelector::Boolean(_)));
+        let is_advanced = |index: &ExpandedIndexSelector<V>| {
+            matches!(index, ExpandedIndexSelector::Array(_) | ExpandedIndexSelector::Boolean(_))
+                || (advanced && matches!(index, ExpandedIndexSelector::Basic(BasicIndex::Integer(_))))
         };
         let positions = expanded
             .iter()
@@ -917,8 +900,8 @@ where
         let mut broadcast_shape = Shape::new(vec![]);
         for index in expanded {
             let next = match index {
-                ExpandedIndex::Array(value) => Some(value.r#type().shape().clone()),
-                ExpandedIndex::Boolean(value) => Some(Shape::new(vec![Dimension::Static(usize::from(*value))])),
+                ExpandedIndexSelector::Array(value) => Some(value.r#type().shape().clone()),
+                ExpandedIndexSelector::Boolean(value) => Some(Shape::new(vec![Dimension::Static(usize::from(*value))])),
                 _ => None,
             };
             if let Some(next) = next {
@@ -948,9 +931,9 @@ where
                 output.push(OutputAxis::Advanced);
             }
             match index {
-                ExpandedIndex::Basic(BasicIndex::NewAxis) => output.push(OutputAxis::New),
-                ExpandedIndex::Basic(BasicIndex::Ellipsis) | ExpandedIndex::Boolean(_) => {}
-                ExpandedIndex::Basic(BasicIndex::Integer(integer)) => {
+                ExpandedIndexSelector::Basic(BasicIndex::NewAxis) => output.push(OutputAxis::New),
+                ExpandedIndexSelector::Basic(BasicIndex::Ellipsis) | ExpandedIndexSelector::Boolean(_) => {}
+                ExpandedIndexSelector::Basic(BasicIndex::Integer(integer)) => {
                     let integer = if *integer < 0 { integer.saturating_add(shape[axis] as i128) } else { *integer };
                     if promise && (integer < 0 || integer >= shape[axis] as i128) {
                         return Err(TypeError::invalid(format!(
@@ -964,12 +947,12 @@ where
                     collapsed.push(axis);
                     axis += 1;
                 }
-                ExpandedIndex::Array(value) => {
+                ExpandedIndexSelector::Array(value) => {
                     components.push((axis, self.normalized_indices(value, shape[axis])?, None));
                     collapsed.push(axis);
                     axis += 1;
                 }
-                ExpandedIndex::Basic(BasicIndex::Slice(slice)) => {
+                ExpandedIndexSelector::Basic(BasicIndex::Slice(slice)) => {
                     let normalized = slice.normalize(shape[axis])?;
                     if normalized.stride == 1 && !normalized.reversed {
                         sizes[axis] = normalized.length;
@@ -1185,6 +1168,82 @@ macro_rules! index {
 // The macro is exported at the crate root by `#[macro_export]`; this re-export lets callers that import the
 // manipulation facade reach it through the module path as well.
 pub use crate::index;
+
+/// One entry of a selection after [`expanded`](Indexed::expanded) has made it explicit. The public [`IndexSelector`]
+/// list is what the caller wrote; this is what the planner reads. By this point the ellipsis has been replaced by
+/// full slices over the unspecified axes, every mask has been turned into the integer coordinate arrays of its true
+/// positions, and index arrays are owned by the working value family rather than borrowed. The `Ellipsis` entry itself
+/// is kept as a zero-width marker, because an ellipsis separates advanced-index groups even when it consumes no axes.
+#[derive(Clone)]
+enum ExpandedIndexSelector<V> {
+    /// Host integer, slice, new axis, or the ellipsis marker.
+    Basic(BasicIndex),
+
+    /// Owned integer coordinate array, cloned from the caller's index array or produced from a mask.
+    Array(V),
+
+    /// Scalar mask, contributing an advanced axis of extent one (`true`) or zero (`false`) without consuming an input
+    /// axis.
+    Boolean(bool),
+}
+
+/// The gather or scatter that realizes one expanded selection. [`plan`](Indexed::plan) builds it once from the
+/// [`ExpandedIndexSelector`]s, and reads and updates share it so that both address exactly the same input positions.
+/// Contiguous slices become gather windows, and only strided slices and advanced indices contribute coordinates, which
+/// keeps the coordinate array small. The gather result and the scatter update have [`shape`](Self::shape), while the
+/// caller sees [`output_shape`](Self::output_shape), which differs only by the inserted extent-one axes; reads reshape
+/// after gathering and updates reshape before scattering.
+struct IndexPlan<V> {
+    /// Jointly broadcast coordinates of every strided slice and advanced index, with a trailing index-vector axis.
+    indices: V,
+
+    /// Gather dimension numbers mapping windows, collapsed axes, and coordinate components onto the input axes. The
+    /// scatter reuses the same mapping.
+    dimensions: GatherDimensionNumbers,
+
+    /// Window size on every input axis: the slice length for a contiguous slice and one everywhere else.
+    sizes: Vec<usize>,
+
+    /// Shape of the gather result and of the scatter update, before the inserted extent-one axes.
+    shape: Vec<usize>,
+
+    /// Shape the caller sees, including the inserted extent-one axes.
+    output_shape: Vec<usize>,
+
+    /// Positions of the inserted extent-one axes within [`output_shape`](Self::output_shape).
+    new_axes: Vec<usize>,
+}
+
+/// Axis contribution in the public selection order, before the advanced broadcast dimensions are inserted.
+#[derive(Copy, Clone)]
+enum OutputAxis {
+    /// A contiguous slice becomes a gather window dimension.
+    Window(usize),
+
+    /// A strided slice contributes a coordinate-query dimension.
+    Query(usize),
+
+    /// A newly inserted extent-one axis is restored after gathering.
+    New,
+
+    /// Position at which jointly broadcast integer-array dimensions appear.
+    Advanced,
+}
+
+/// Per-axis outcome of resolving a selection against a reference's referent shape.
+enum ReferenceAxisSelection<'i, V> {
+    /// The axis is selected in full and needs no view transform.
+    Full,
+
+    /// A static unit-stride window that keeps the axis.
+    Window(ArraySliceAxis),
+
+    /// A normalized host index that removes the axis.
+    Index(usize),
+
+    /// A scalar integer value that removes the axis at run time.
+    Dynamic(&'i V),
+}
 
 /// Runtime geometry for a selection with at most one array or scalar index. Full slices preserve their dimension
 /// identities; inserted axes are recorded separately so gather/scatter continue to operate on the original rank.
@@ -1689,6 +1748,230 @@ where
     }
 }
 
+impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
+where
+    V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceDynamicIndex,
+{
+    /// Derives a reference view of the selected region of a reference input without accessing its state. The view
+    /// shares the input's allocation, so reads through it observe later writes to the input and writes through it are
+    /// visible to the input, which is the reference counterpart of NumPy's basic-indexing views and of `ref.at[...]`
+    /// in JAX. Reference views are restricted to the transforms the reference machinery can reconstruct: host integers
+    /// remove their axis, unit-stride forward slices keep theirs, an ellipsis expands over the unspecified axes, and a
+    /// scalar integer array selects one position on its axis at run time (clamped into bounds, as for
+    /// [`reference_dynamic_index`](ReferenceDynamicIndex::reference_dynamic_index)). Inserted axes, masks,
+    /// non-scalar index arrays, strided or reversed slices, and out-of-bounds host integers are rejected. Every axis
+    /// that a host integer or slice touches must have a static extent, and when any slice is present the whole
+    /// referent shape must be static. A selection that touches no axis returns the input itself.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, ArrayIrValue, Indexing, ProgramError, ReferenceNew, ReferenceRead, index};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// let buffer = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0])?).reference_new()?;
+    /// let row = buffer.at(&index![1, 1..]).view()?;
+    /// assert_eq!(row.read()?, ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0])?));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn view(&self) -> Result<V, ProgramError> {
+        let input_type = self.input.r#type();
+        let referent = <&ReferenceType<ArrayType>>::try_from(input_type.as_ref())?.referent();
+        let rank = referent.rank();
+
+        // Reject unsupported selector kinds and validate the selection against the referent rank before assigning
+        // selectors to axes, so that the ellipsis can be expanded over exactly the unspecified axes.
+        let mut ellipses = 0;
+        let mut consumed = 0;
+        for selector in self.selectors {
+            match selector {
+                IndexSelector::Basic(BasicIndex::Ellipsis) => ellipses += 1,
+                IndexSelector::Basic(BasicIndex::NewAxis) => {
+                    return Err(TypeError::invalid("reference views cannot insert axes").into());
+                }
+                IndexSelector::Mask(_) => {
+                    return Err(TypeError::invalid("reference views do not support index masks").into());
+                }
+                IndexSelector::Basic(_) | IndexSelector::Array(_) => consumed += 1,
+            }
+        }
+        if ellipses > 1 {
+            return Err(TypeError::invalid("index selection contains more than one ellipsis").into());
+        }
+        if consumed > rank {
+            return Err(TypeError::invalid(format!(
+                "index selection consumes {consumed} axes but input rank is {rank}"
+            ))
+            .into());
+        }
+        let mut assigned = vec![None; rank];
+        let mut axis = 0;
+        for selector in self.selectors {
+            if matches!(selector, IndexSelector::Basic(BasicIndex::Ellipsis)) {
+                axis += rank - consumed;
+            } else {
+                assigned[axis] = Some(selector);
+                axis += 1;
+            }
+        }
+
+        // Resolve every selector against its axis. Host integers and slices need the static extent of their axis to
+        // normalize negative coordinates and to prove that the selection lies within the referent.
+        let extent = |axis: usize| -> Result<usize, ProgramError> {
+            referent.dimension(axis).value().ok_or_else(|| {
+                TypeError::invalid(format!(
+                    "reference views require a static extent on axis {axis} but got `{referent}`"
+                ))
+                .into()
+            })
+        };
+        let mut selections = Vec::with_capacity(rank);
+        for (axis, selector) in assigned.iter().enumerate() {
+            let selection = match selector {
+                None
+                | Some(IndexSelector::Basic(BasicIndex::Ellipsis | BasicIndex::NewAxis))
+                | Some(IndexSelector::Mask(_)) => ReferenceAxisSelection::Full,
+                Some(IndexSelector::Basic(BasicIndex::Integer(index))) => {
+                    let extent = extent(axis)?;
+                    let normalized = if *index < 0 { *index + extent as i128 } else { *index };
+                    if normalized < 0 || normalized >= extent as i128 {
+                        return Err(TypeError::invalid(format!(
+                            "index {index} is out of bounds for axis {axis} with extent {extent}"
+                        ))
+                        .into());
+                    }
+                    ReferenceAxisSelection::Index(normalized as usize)
+                }
+                Some(IndexSelector::Basic(BasicIndex::Slice(slice))) => {
+                    if slice.step() < 0 {
+                        return Err(TypeError::invalid("reference views do not support reversed slices").into());
+                    }
+                    // A complete unit-stride slice selects its axis in full whatever the extent, so it never needs a
+                    // static extent, which keeps dynamic axes that are not touched selectable through `..`.
+                    if slice.start().is_none() && slice.stop().is_none() && slice.step() == 1 {
+                        selections.push(ReferenceAxisSelection::Full);
+                        continue;
+                    }
+                    let extent = extent(axis)?;
+                    let normalized = slice.normalize(extent)?;
+                    if normalized.stride != 1 {
+                        return Err(TypeError::invalid("reference views do not support strided slices").into());
+                    }
+                    if normalized.start == 0 && normalized.length == extent {
+                        ReferenceAxisSelection::Full
+                    } else {
+                        ReferenceAxisSelection::Window(ArraySliceAxis::new(normalized.start, normalized.length, 1))
+                    }
+                }
+                Some(IndexSelector::Array(value)) => {
+                    let index_type = value.r#type();
+                    let index_type = <&ArrayType>::try_from(index_type.as_ref())?;
+                    if index_type.rank() != 0 || !index_type.data_type().is_integer() {
+                        return Err(TypeError::invalid(format!(
+                            "reference views support only scalar integer index arrays but got `{index_type}`"
+                        ))
+                        .into());
+                    }
+                    ReferenceAxisSelection::Dynamic(*value)
+                }
+            };
+            selections.push(selection);
+        }
+
+        // Windows are applied first through one rank-preserving slice over every axis, and then the indexed axes are
+        // removed from the sliced view in ascending order, adjusting for the axes removed before them.
+        let mut view = self.input.clone();
+        if selections.iter().any(|selection| matches!(selection, ReferenceAxisSelection::Window(_))) {
+            let axes = selections
+                .iter()
+                .enumerate()
+                .map(|(axis, selection)| match selection {
+                    ReferenceAxisSelection::Window(window) => Ok(*window),
+                    _ => Ok(ArraySliceAxis::new(0, extent(axis)?, 1)),
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            view = view.reference_slice(&axes)?;
+        }
+        let mut removed = 0;
+        for (axis, selection) in selections.iter().enumerate() {
+            match selection {
+                ReferenceAxisSelection::Index(index) => {
+                    view = view.reference_index(axis - removed, *index)?;
+                    removed += 1;
+                }
+                ReferenceAxisSelection::Dynamic(index) => {
+                    view = view.reference_dynamic_index(axis - removed, index)?;
+                    removed += 1;
+                }
+                ReferenceAxisSelection::Full | ReferenceAxisSelection::Window(_) => {}
+            }
+        }
+        Ok(view)
+    }
+}
+
+impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
+where
+    V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceDynamicIndex + ReferenceRead,
+{
+    /// Reads the selected region of a reference input as an immutable snapshot. This is
+    /// [`view`](Self::view) followed by [`read`](ReferenceRead::read), so it supports exactly the selections that
+    /// [`view`](Self::view) accepts and observes the reference state at the point of the read in program order.
+    pub fn read(&self) -> Result<V, ProgramError> {
+        self.view()?.read()
+    }
+}
+
+impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
+where
+    V: Value<Type = ArrayIrType>
+        + ReferenceIndex
+        + ReferenceSlice
+        + ReferenceDynamicIndex
+        + ReferenceWrite
+        + ReferenceAddUpdate
+        + ReferenceSwap,
+{
+    /// Overwrites the selected region of a reference input in place. This is [`view`](Self::view) followed by
+    /// [`write`](ReferenceWrite::write), so it supports exactly the selections that [`view`](Self::view) accepts. It
+    /// is the in-place counterpart of the functional [`set`](Self::set) on array values: the reference's state is
+    /// updated in program order and nothing is returned.
+    ///
+    /// # Parameters
+    ///
+    ///   - `replacement`: Array value with the selected region's type.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::{Array, ArrayIrValue, Indexing, ProgramError, ReferenceNew, ReferenceRead, index};
+    /// # fn main() -> Result<(), ProgramError> {
+    /// let buffer = ArrayIrValue::Array(Array::vector(vec![0_i32, 1, 2, 3])?).reference_new()?;
+    /// buffer.at(&index![1..3]).write(&ArrayIrValue::Array(Array::vector(vec![9_i32, 9])?))?;
+    /// assert_eq!(buffer.read()?, ArrayIrValue::Array(Array::vector(vec![0_i32, 9, 9, 3])?));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn write(&self, replacement: &V) -> Result<(), ProgramError> {
+        self.view()?.write(replacement)
+    }
+
+    /// Adds `update` into the selected region of a reference input in place. This is [`view`](Self::view) followed by
+    /// [`add_update`](ReferenceAddUpdate::add_update), and the in-place counterpart of the functional
+    /// [`add`](Self::add) on array values. Refer to the documentation of [`write`](Self::write) for the shared
+    /// selection contract.
+    pub fn add_update(&self, update: &V) -> Result<(), ProgramError> {
+        self.view()?.add_update(update)
+    }
+
+    /// Overwrites the selected region of a reference input in place and returns the previously stored region. This is
+    /// [`view`](Self::view) followed by [`swap`](ReferenceSwap::swap). Refer to the documentation of
+    /// [`write`](Self::write) for the shared selection contract.
+    pub fn swap(&self, replacement: &V) -> Result<V, ProgramError> {
+        self.view()?.swap(replacement)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -1701,6 +1984,7 @@ mod tests {
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
+    use crate::operations::references::{ReferenceFreeze, ReferenceNew};
     use crate::partial::PartialValue;
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -2809,6 +3093,229 @@ mod tests {
         assert_eq!(
             input.at(&index![&indices]).max(&updates, &ScatterOptions::new()),
             Array::vector(vec![10_i32, 20, 30])
+        );
+    }
+
+    /// Allocates the 2x3 `f32` reference used by the reference-view tests.
+    fn reference_matrix() -> ArrayIrValue<Array> {
+        ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())
+            .reference_new()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_indexed_view() {
+        let buffer = reference_matrix();
+        // Host integers remove their axis, slices keep theirs, an ellipsis and omitted trailing axes select in full,
+        // and negative coordinates count from the end.
+        let view = buffer.at(&index![1]).view().unwrap();
+        assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap())));
+        let view = buffer.at(&index![.., 1..3]).view().unwrap();
+        assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0_f32, 3.0, 5.0, 6.0]).unwrap())));
+        let view = buffer.at(&index![-1, 1..]).view().unwrap();
+        assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())));
+        let view = buffer.at(&index![..., -1]).view().unwrap();
+        assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::vector(vec![3.0_f32, 6.0]).unwrap())));
+        // Full selections derive no view transform and hand back the input allocation.
+        let view = buffer.at(&index![.., 0..3]).view().unwrap();
+        assert_eq!(view.r#type(), buffer.r#type());
+        assert_eq!(view.read(), buffer.read());
+        assert_eq!(buffer.at(&[]).view().unwrap().read(), buffer.read());
+        // Scalar integer arrays select one position at run time, clamped into bounds.
+        let index = ArrayIrValue::Array(Array::scalar(1_i32).unwrap());
+        let view = buffer.at(&index![&index, 2]).view().unwrap();
+        assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::scalar(6.0_f32).unwrap())));
+        let index = ArrayIrValue::Array(Array::scalar(7_i32).unwrap());
+        let view = buffer.at(&index![.., &index]).view().unwrap();
+        assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::vector(vec![3.0_f32, 6.0]).unwrap())));
+        // Views alias the allocation, so writes through the input are visible through an earlier view.
+        let view = buffer.at(&index![0, 0]).view().unwrap();
+        buffer.write(&ArrayIrValue::Array(Array::matrix(2, 3, vec![9.0_f32; 6]).unwrap())).unwrap();
+        assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::scalar(9.0_f32).unwrap())));
+    }
+
+    #[test]
+    fn test_indexed_view_validation() {
+        let buffer = reference_matrix();
+        assert_eq!(
+            buffer.at(&index![new_axis]).view(),
+            Err(TypeError::invalid("reference views cannot insert axes").into()),
+        );
+        let mask = IndexMask::new(vec![2], vec![true, false]).unwrap();
+        assert_eq!(
+            buffer.at(&index![&mask]).view(),
+            Err(TypeError::invalid("reference views do not support index masks").into()),
+        );
+        assert_eq!(
+            buffer.at(&index![.., .., ..]).view(),
+            Err(TypeError::invalid("index selection consumes 3 axes but input rank is 2").into()),
+        );
+        assert_eq!(
+            buffer.at(&index![..., ...]).view(),
+            Err(TypeError::invalid("index selection contains more than one ellipsis").into()),
+        );
+        assert_eq!(
+            buffer.at(&index![2]).view(),
+            Err(TypeError::invalid("index 2 is out of bounds for axis 0 with extent 2").into()),
+        );
+        assert_eq!(
+            buffer.at(&index![.., -4]).view(),
+            Err(TypeError::invalid("index -4 is out of bounds for axis 1 with extent 3").into()),
+        );
+        assert_eq!(
+            buffer.at(&index![..by - 1]).view(),
+            Err(TypeError::invalid("reference views do not support reversed slices").into()),
+        );
+        assert_eq!(
+            buffer.at(&index![.., .. by 2]).view(),
+            Err(TypeError::invalid("reference views do not support strided slices").into()),
+        );
+        let vector = ArrayIrValue::Array(Array::vector(vec![0_i32]).unwrap());
+        assert_eq!(
+            buffer.at(&index![&vector]).view(),
+            Err(TypeError::invalid("reference views support only scalar integer index arrays but got `i32[1]`").into()),
+        );
+        let float = ArrayIrValue::Array(Array::scalar(0.5_f32).unwrap());
+        assert_eq!(
+            buffer.at(&index![&float]).view(),
+            Err(TypeError::invalid("reference views support only scalar integer index arrays but got `f32[]`").into()),
+        );
+        // Array inputs have no reference to view.
+        let array = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
+        assert!(matches!(array.at(&index![0]).view(), Err(ProgramError::Type(_))));
+
+        // Axes touched by host integers or slices must have static extents.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
+        let dynamic_type = ArrayIrType::Array(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(3)]),
+        ));
+        let indexed: [IndexSelector<'_, ArrayIrTracer>; 1] = index![0];
+        let sliced: [IndexSelector<'_, ArrayIrTracer>; 2] = index![.., 1..3];
+        for selectors in [indexed.as_slice(), sliced.as_slice()] {
+            let error = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |input| input.reference_new()?.at(selectors).view().map(|_| ()),
+                dynamic_type.clone(),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ProgramError::Type(TypeError::Invalid { message })
+                    if message.starts_with("reference views require a static extent on axis 0 but got `"),
+            ));
+        }
+    }
+
+    #[test]
+    fn test_indexed_view_staging() {
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, replacement, index): (ArrayIrTracer, ArrayIrTracer, ArrayIrTracer)| {
+                let buffer = input.reference_new()?;
+                buffer.at(&index![1..3]).write(&replacement)?;
+                buffer.at(&index![..2]).add_update(&replacement)?;
+                let element = buffer.at(&index![&index]).read()?;
+                let last = buffer.at(&index![-1]).swap(&element)?;
+                Ok((last, buffer.freeze()?))
+            },
+            (
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+                ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[4], %1:f32[2], %2:i32[] .
+                let %3:ref<f32[4]> = reference_new %0
+                    %4:ref<f32[2]> = reference_slice [axes=[ArraySliceAxis { start: 1, size: 2, stride: 1 }]] %3
+                    () = reference_write %4 %1
+                    %5:ref<f32[2]> = reference_slice [axes=[ArraySliceAxis { start: 0, size: 2, stride: 1 }]] %3
+                    () = reference_add_update %5 %1
+                    %6:ref<f32[]> = reference_dynamic_index [axis=0] %3 %2
+                    %7:f32[] = reference_read %6
+                    %8:ref<f32[]> = reference_index [axis=0, index=3] %3
+                    %9:f32[] = reference_swap %8 %7
+                    %10:f32[4] = reference_freeze %3
+                in (%9, %10)"},
+        );
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
+        let replacement = ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0]).unwrap());
+        let index = ArrayIrValue::Array(Array::scalar(0_i32).unwrap());
+        assert_eq!(
+            program.interpret((input, replacement, index)),
+            Ok((
+                ArrayIrValue::Array(Array::scalar(4.0_f32).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![11.0_f32, 30.0, 20.0, 11.0]).unwrap()),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_indexed_read() {
+        let buffer = reference_matrix();
+        assert_eq!(
+            buffer.at(&index![1, 1..]).read(),
+            Ok(ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())),
+        );
+        // Reads observe the reference state at the time of the read.
+        buffer.write(&ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap())).unwrap();
+        assert_eq!(
+            buffer.at(&index![1, 1..]).read(),
+            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0]).unwrap()))
+        );
+    }
+
+    #[test]
+    fn test_indexed_write() {
+        let buffer = reference_matrix();
+        buffer
+            .at(&index![1, 1..])
+            .write(&ArrayIrValue::Array(Array::vector(vec![50.0_f32, 60.0]).unwrap()))
+            .unwrap();
+        buffer
+            .at(&index![.., 0])
+            .write(&ArrayIrValue::Array(Array::vector(vec![10.0_f32, 40.0]).unwrap()))
+            .unwrap();
+        assert_eq!(
+            buffer.read(),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![10.0_f32, 2.0, 3.0, 40.0, 50.0, 60.0]).unwrap())),
+        );
+        // The replacement must match the selected region's type.
+        assert!(
+            buffer
+                .at(&index![1])
+                .write(&ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_indexed_add_update() {
+        let buffer = reference_matrix();
+        buffer
+            .at(&index![0])
+            .add_update(&ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap()))
+            .unwrap();
+        assert_eq!(
+            buffer.read(),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![2.0_f32, 3.0, 4.0, 4.0, 5.0, 6.0]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_indexed_swap() {
+        let buffer = reference_matrix();
+        assert_eq!(
+            buffer
+                .at(&index![.., 1..3])
+                .swap(&ArrayIrValue::Array(Array::matrix(2, 2, vec![0.0_f32; 4]).unwrap())),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0_f32, 3.0, 5.0, 6.0]).unwrap())),
+        );
+        assert_eq!(
+            buffer.read(),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 4.0, 0.0, 0.0]).unwrap())),
         );
     }
 
