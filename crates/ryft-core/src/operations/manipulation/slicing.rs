@@ -2784,15 +2784,13 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Value capability for extracting a sub-array whose starts and sizes are first-class dimension values, so the result
-/// extents may vary at runtime. [`dynamic_slice_with_dimensions`](Self::dynamic_slice_with_dimensions) and
-/// [`dynamic_slice_with_bounds`](Self::dynamic_slice_with_bounds) take dimension starts and sizes, while
-/// [`dynamic_slice_axis`](Self::dynamic_slice_axis) and [`dynamic_index_axis`](Self::dynamic_index_axis) select
-/// host-known windows along one axis and retain every other runtime extent. This capability requires
-/// [`Value<Type = ArrayIrType>`](Value), because the mixed [`ArrayIrValue`] representation is what carries dimensions
-/// alongside arrays, and so it is unavailable for homogeneous arrays and type descriptors:
+/// Value capability for extracting a sub-array whose starts and sizes are first-class dimension values, so the
+/// result extents may vary at runtime. [`dynamic_slice_with_dimensions`](Self::dynamic_slice_with_dimensions)
+/// and [`dynamic_slice_with_bounds`](Self::dynamic_slice_with_bounds) take dimension starts and sizes, while
+/// [`dynamic_slice_axis`](Self::dynamic_slice_axis) and [`dynamic_index_axis`](Self::dynamic_index_axis)
+/// select host-known windows along one axis and retain every other runtime extent. This capability requires
+/// [`Value<Type = ArrayIrType>`](Value), because the mixed [`ArrayIrValue`] representation is what carries
+/// dimensions alongside arrays, and so it is unavailable for homogeneous arrays and type descriptors:
 ///
 /// ```compile_fail
 /// use ryft_core::{Array, DynamicSliceWithDimensions};
@@ -2802,8 +2800,8 @@ impl<
 ///
 /// Starts are non-negative dimensions and positive static strides select `start + i * stride`
 /// for `0 <= i < size`. The [`DynamicSliceBounds`] policy decides how starts meet the input: under the default
-/// [`Checked`](DynamicSliceBounds::Checked) policy, every selected element must lie within the input and an empty axis
-/// permits a start at its end, while the [`Clamp`](DynamicSliceBounds::Clamp) policy moves the start so that the
+/// [`Checked`](DynamicSliceBounds::Checked) policy, every selected element must lie within the input and an empty
+/// axis permits a start at its end, while the [`Clamp`](DynamicSliceBounds::Clamp) policy moves the start so that the
 /// requested window fits without shrinking it. Invalid runtime bounds remain observable even when the result is unused.
 /// The output preserves the input memory space and inferred sharding; an identity slice preserves the input layout and
 /// any other slice uses a fresh dense layout. Array tangents follow the same slice, and reverse-mode differentiation
@@ -2865,14 +2863,7 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
     /// rejects a window that extends outside the input. Both policies reject a window whose span exceeds the logical
     /// input extent.
     ///
-    /// # Parameters
-    ///
-    ///   - `start_indices`: One non-negative dimension value per input axis, specifying its inclusive start.
-    ///   - `sizes`: One dimension value per input axis, specifying the number of selected elements.
-    ///   - `strides`: One strictly positive static step per input axis.
-    ///   - `bounds`: Policy resolving the starts against the input extents.
-    ///
-    /// # Example
+    /// # Examples
     ///
     /// ```rust
     /// # use ryft_core::{
@@ -2898,6 +2889,13 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Parameters
+    ///
+    ///   - `start_indices`: One non-negative dimension value per input axis, specifying its inclusive start.
+    ///   - `sizes`: One dimension value per input axis, specifying the number of selected elements.
+    ///   - `strides`: One strictly positive static step per input axis.
+    ///   - `bounds`: Policy resolving the starts against the input extents.
     fn dynamic_slice_with_bounds(
         &self,
         start_indices: &[Self],
@@ -2908,13 +2906,6 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
 
     /// Slices one axis with host-known indices while retaining every other runtime extent. This convenience constructs
     /// integer queries and uses [`DynamicGather`], sharing its gather/scatter transformation rules.
-    ///
-    /// # Parameters
-    ///
-    ///   - `axis`: Axis to slice; negative axes count backward from the input rank.
-    ///   - `start`: Non-negative inclusive start, no larger than `limit`.
-    ///   - `limit`: Exclusive limit, which must be proven within the selected axis by its declared bounds.
-    ///   - `stride`: Positive distance between selected elements. Indices do not wrap or clamp.
     ///
     /// # Example
     ///
@@ -2939,6 +2930,13 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Axis to slice; negative axes count backward from the input rank.
+    ///   - `start`: Non-negative inclusive start, no larger than `limit`.
+    ///   - `limit`: Exclusive limit, which must be proven within the selected axis by its declared bounds.
+    ///   - `stride`: Positive distance between selected elements. Indices do not wrap or clamp.
     fn dynamic_slice_axis<A: Into<Axis>>(
         &self,
         axis: A,
@@ -2969,7 +2967,7 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
 
         if limit > minimum {
             return Err(TypeError::invalid(format!(
-                "`dynamic_slice_axis` limit {limit} exceeds the guaranteed extent {minimum} of axis {axis}"
+                "`dynamic_slice_axis` limit {limit} exceeds the guaranteed extent {minimum} of axis {axis}",
             ))
             .into());
         }
@@ -3008,12 +3006,6 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
     /// dimensions are preserved. This composes [`Self::dynamic_slice_axis`] with [`DynamicReshape`] and has the same
     /// bounds requirements and gather/scatter differentiation behavior.
     ///
-    /// # Parameters
-    ///
-    ///   - `axis`: Input axis containing the index; negative axes count backward from the end.
-    ///   - `index`: Non-negative coordinate that must be proven in bounds.
-    ///   - `keep_axis`: Whether the selected axis remains in the output with extent one.
-    ///
     /// # Example
     ///
     /// ```rust
@@ -3037,6 +3029,12 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Input axis containing the index; negative axes count backward from the end.
+    ///   - `index`: Non-negative coordinate that must be proven in bounds.
+    ///   - `keep_axis`: Whether the selected axis remains in the output with extent one.
     fn dynamic_index_axis<A: Into<Axis>>(&self, axis: A, index: usize, keep_axis: bool) -> Result<Self, ProgramError>
     where
         Self: DynamicGather
@@ -3063,6 +3061,8 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
         output.dynamic_reshape(&dimensions)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> DynamicSliceWithDimensions
     for ArrayIrValue<A>
