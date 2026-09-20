@@ -1770,7 +1770,7 @@ where
 
     #[inline]
     fn residual_stack_update() -> Self {
-        Self::from(DynamicUpdateSliceOperation)
+        Self::from(DynamicUpdateSliceOperation::new())
     }
 
     #[inline]

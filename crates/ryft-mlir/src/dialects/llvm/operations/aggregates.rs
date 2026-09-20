@@ -128,7 +128,7 @@ pub trait LandingPadOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the `clauses` operands.
     fn clauses(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
-        self.operand_values().skip(0).collect()
+        self.operand_values().collect()
     }
 
     /// Returns whether the `cleanup` unit attribute is present.

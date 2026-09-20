@@ -133,7 +133,7 @@ where
 
     #[inline]
     fn residual_stack_update() -> Self {
-        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation)))
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation::new())))
     }
 
     #[inline]

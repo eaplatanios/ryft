@@ -582,7 +582,7 @@ pub trait LaunchFuncOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
-        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
+        if self.result_count() == 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -819,7 +819,7 @@ pub trait LaunchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
-        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
+        if self.result_count() == 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -1524,7 +1524,7 @@ pub trait WaitOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
-        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
+        if self.result_count() == 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -1664,7 +1664,7 @@ macro_rules! gpu_async_prefix_operation {
 
                 /// Returns the optional async token result.
                 fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
-                    if self.result_count() <= 0 {
+                    if self.result_count() == 0 {
                         Ok(None)
                     } else {
                         self.result(0).map(|result| Some(result.as_ref()))
@@ -2718,7 +2718,7 @@ pub trait SpmvOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
-        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
+        if self.result_count() == 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -2978,7 +2978,7 @@ pub trait SpmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
-        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
+        if self.result_count() == 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -3205,7 +3205,7 @@ pub trait SddmmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
-        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
+        if self.result_count() == 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -3528,7 +3528,7 @@ pub trait SpGemmCopyOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the optional async token result.
     fn async_token(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
-        if self.result_count() <= 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
+        if self.result_count() == 0 { Ok(None) } else { self.result(0).map(|result| Some(result.as_ref())) }
     }
 }
 
@@ -4285,7 +4285,13 @@ mod tests {
 
         assert_eq!(operation.name().as_str(), Ok("gpu.wait"));
         assert_eq!(operation.async_dependencies().unwrap(), vec![dependency]);
-        assert!(operation.async_token().unwrap().is_some());
+        assert_eq!(operation.async_token().unwrap(), Some(operation.result(0).unwrap().as_ref()));
+
+        // A synchronous wait consumes dependencies without producing a token.
+        let operation = wait(&[dependency], false, location).unwrap();
+        assert_eq!(operation.async_dependencies().unwrap(), vec![dependency]);
+        assert_eq!(operation.result_count(), 0);
+        assert_eq!(operation.async_token().unwrap(), None);
     }
 
     #[test]

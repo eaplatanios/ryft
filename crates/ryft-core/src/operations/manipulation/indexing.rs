@@ -1,42 +1,3 @@
-//! Array selection and functional indexed updates.
-//!
-//! [`Indexing::at`] borrows an array and a list of [`IndexSelector`]s. Its [`Indexed::get`] function reads the
-//! selection; update functions return a new array, leaving the input unchanged. [`index!`](crate::index) constructs
-//! selectors with Rust ranges, `by` strides, `...` ellipses, and borrowed integer arrays. It does not execute an
-//! operation.
-//!
-//! Negative integer indices count backward from the axis end once. Slice bounds are clipped, and omitted reverse
-//! bounds remain distinct from explicit negative bounds. Remaining invalid integer indices follow the explicit
-//! gather/scatter options. Basic selections have value semantics, not mutable-view aliasing. Array indices broadcast
-//! jointly; separated advanced indices put their broadcast axes first, while adjacent ones insert those axes in place.
-//!
-//! # Supported Geometry
-//!
-//! Concrete shapes support host integer indices, positive and negative strides, inserted axes, ellipses, broadcast
-//! integer-array indices, and explicit host-known [`IndexMask`]s. Eager arrays and staged arrays use the same selection
-//! rules. Reads compose slice, reverse, reshape, and gather; updates compose broadcast, reshape, and scatter.
-//!
-//! Symbolic shapes use the mixed [`ArrayIrType`] value family so dimension values remain available during staging.
-//! This path supports at most one indexed axis, full forward or reverse slices on the other axes, and inserted axes.
-//! It also supports a symbolic query-array shape on that indexed axis. When working with a projected array tracer,
-//! use its parent mixed-IR value for this path. General symbolic slice bounds, multiple symbolic advanced indices,
-//! explicit output sharding, and index promises are currently rejected by the symbolic frontend. Symbolic reads
-//! inherit [`DynamicGather`]'s one-element window requirement on the indexed axis: its minimum extent must be
-//! positive unless the query is statically empty. Untouched axes and query axes may have zero runtime extents.
-//!
-//! Boolean masks must be supplied as concrete [`IndexMask`] descriptors. Runtime Boolean compaction and host reads
-//! of device or traced masks are unsupported. All updates return new values; no selection exposes a mutable view.
-//!
-//! # Index Promises
-//!
-//! Bounds modes apply after negative-index normalization. A uniqueness promise applies to the final selected input
-//! positions, including aliases introduced by normalization or clipping; this frontend never establishes uniqueness
-//! for the caller. The concrete-shape frontend clears the sortedness promise before gathering or scattering because
-//! normalization and interleaved slice coordinates can change index order. Existing operation type rules validate
-//! memory, sharding, and reduction-state compatibility for the composed operations.
-
-// TODO(eaplatanios): Review from here onwards.
-
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
@@ -64,32 +25,44 @@ use crate::operations::manipulation::slicing::Slice;
 use crate::operations::math::add::Add;
 use crate::programs::{ProgramError, Type, TypeError, Typed, Value, ValueProjection};
 
-/// A host integer that can be represented exactly as an indexing endpoint. This conversion is used by the
-/// indexing macro so that bounds with types such as `usize` work without permitting floating-point truncation.
-#[doc(hidden)]
+/// A host integer that can be represented exactly as an indexing coordinate, slice endpoint, or stride. The [`index!`]
+/// macro and range conversions into [`IndexSelector`] use this trait to accept integer types such as `usize` without
+/// losing precision or permitting floating-point truncation.
+///
+/// Implementations must preserve the integer's value when converting to `i128`. All primitive integer types except
+/// `u128` (because the full range of `u128` cannot be represented by `i128`) implement this trait.
 pub trait IndexInteger {
     /// Converts this integer to the signed representation used by indexing descriptors without losing precision.
     fn to_index_integer(self) -> i128;
 }
 
-/// Implements exact host-integer conversion for the supported primitive integer types.
 macro_rules! impl_index_integer {
-    // Every listed primitive integer type fits in i128 without truncation.
-    ($($integer:ty),* $(,)?) => {
-        $(impl IndexInteger for $integer {
+    ($integer:ty) => {
+        impl IndexInteger for $integer {
             fn to_index_integer(self) -> i128 {
                 self as i128
             }
-        })*
+        }
     };
 }
 
-impl_index_integer!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, usize);
+impl_index_integer!(i8);
+impl_index_integer!(i16);
+impl_index_integer!(i32);
+impl_index_integer!(i64);
+impl_index_integer!(i128);
+impl_index_integer!(isize);
+impl_index_integer!(u8);
+impl_index_integer!(u16);
+impl_index_integer!(u32);
+impl_index_integer!(u64);
+impl_index_integer!(usize);
 
-/// A signed, half-open slice of one array axis. Omitted endpoints select the corresponding end of the axis;
-/// negative endpoints count backward from its extent. A negative step traverses the selected positions in reverse.
-/// In particular, an omitted stop differs from an explicit `-1` when the step is negative: the former includes
-/// index `0`, whereas the latter refers to the last element. A zero step is rejected when the slice is normalized.
+/// A signed, half-open slice of one array axis. Omitted endpoints select the corresponding end of the axis. Negative
+/// endpoints count backward from its extent. A negative step traverses the selected positions in reverse. In
+/// particular, an omitted stop differs from an explicit `-1` when the step is negative as the former includes
+/// index `0`, whereas the latter refers to the last element. Slice bounds are clipped to the axis independently of
+/// the bounds mode used for integer indices. A zero step is rejected when the slice is normalized.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct IndexSlice {
     /// Refer to the documentation of [`start`](Self::start) for more information.
@@ -101,6 +74,8 @@ pub struct IndexSlice {
     /// Refer to the documentation of [`step`](Self::step) for more information.
     step: i128,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl IndexSlice {
     /// Creates a signed slice with the provided optional endpoints and step. Endpoints are exclusive at the stop
@@ -199,6 +174,8 @@ struct NormalizedIndexSlice {
 /// A host-known Boolean mask with explicit shape. Constructing it validates the number of entries. Indexing converts
 /// its true positions into constant integer coordinates; it never reads a device value or tracer back to the host.
 /// A scalar mask inserts an advanced axis of size one (`true`) or zero (`false`) without consuming an input axis.
+/// Boolean indexing requires this concrete descriptor; runtime Boolean compaction and host reads of device or
+/// traced masks are unsupported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexMask {
     /// Refer to the documentation of [`shape`](Self::shape) for more information.
@@ -245,6 +222,10 @@ impl IndexMask {
 /// One component of an array selection. Use [`index!`](crate::index) or the standard conversions to construct a list.
 /// The value parameter is inferred from the receiver of [`Indexing::at`], including for a list containing only basic
 /// indices. Array selectors borrow the receiver's value family; lift constants into the trace before using them.
+///
+/// Negative integer indices count backward from the axis end once. Remaining invalid integer indices follow the
+/// bounds options supplied to the read or update function. Array indices broadcast jointly; separated advanced
+/// indices put their broadcast axes first, while adjacent ones insert those axes in place.
 #[derive(Clone, Debug, PartialEq)]
 pub enum IndexSelector<'i, V: Value> {
     /// Host integer, slice, new axis, or ellipsis.
@@ -284,16 +265,27 @@ impl<'i, V: Value> From<&'i IndexMask> for IndexSelector<'i, V> {
 
 // Implement host integer conversions explicitly so they cannot overlap the borrowed-value conversion.
 macro_rules! index_integer_conversions {
-    // Each primitive host integer has an exact conversion into the descriptor's signed representation.
-    ($($integer:ty),* $(,)?) => {
-        $(impl<V: Value> From<$integer> for IndexSelector<'_, V> {
+    // Implements descriptor conversion for one primitive host integer with an exact signed representation.
+    ($integer:ty) => {
+        impl<V: Value> From<$integer> for IndexSelector<'_, V> {
             fn from(value: $integer) -> Self {
                 Self::Basic(BasicIndex::Integer(value.to_index_integer()))
             }
-        })*
+        }
     };
 }
-index_integer_conversions!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, usize);
+
+index_integer_conversions!(i8);
+index_integer_conversions!(i16);
+index_integer_conversions!(i32);
+index_integer_conversions!(i64);
+index_integer_conversions!(i128);
+index_integer_conversions!(isize);
+index_integer_conversions!(u8);
+index_integer_conversions!(u16);
+index_integer_conversions!(u32);
+index_integer_conversions!(u64);
+index_integer_conversions!(usize);
 
 impl<I: IndexInteger, V: Value> From<Range<I>> for IndexSelector<'_, V> {
     fn from(value: Range<I>) -> Self {
@@ -332,8 +324,10 @@ impl<V: Value> From<RangeFull> for IndexSelector<'_, V> {
 /// assert_eq!(output, Array::vector(vec![5_i32, 3, 1]).unwrap());
 /// ```
 pub trait Indexing: Value {
-    /// Borrows this value and its selectors. `get` reads the selection; `set`, `add`, `multiply`, `min`, and `max`
-    /// return an updated value. Validation occurs in those terminal functions, so constructing a wrapper is infallible.
+    /// Borrows this value and its [`IndexSelector`]s in an [`Indexed`] wrapper. Its `get` function reads the selection;
+    /// `set`, `add`, `multiply`, `min`, and `max` return a new array, leaving the input unchanged. Validation occurs in
+    /// those terminal functions, so constructing a wrapper is infallible. Refer to [`Indexed`] for supported geometry
+    /// and the shared bounds and index-promise contracts.
     ///
     /// # Parameters
     ///
@@ -348,6 +342,30 @@ impl<V: Value> Indexing for V {}
 
 /// Borrowed selection of a value. Separate input, selector-list, and index-value lifetimes allow both reusable lists
 /// and temporary lists used within a chained call. The type parameter selects homogeneous or mixed-IR execution.
+/// Selections have value semantics: reads produce values and updates return new values, leaving the input unchanged.
+/// No selection exposes a mutable view.
+///
+/// # Supported Geometry
+///
+/// Concrete shapes support host integer indices, positive and negative strides, inserted axes, ellipses, broadcast
+/// integer-array indices, and explicit host-known [`IndexMask`]s. Eager arrays and staged arrays use the same selection
+/// rules. Reads compose slice, reverse, reshape, and gather; updates compose broadcast, reshape, and scatter.
+///
+/// Symbolic shapes use the mixed [`ArrayIrType`] value family so dimension values remain available during staging.
+/// This path supports at most one indexed axis, full forward or reverse slices on the other axes, and inserted axes.
+/// It also supports a symbolic query-array shape on that indexed axis. When working with a projected array tracer,
+/// use its parent mixed-IR value for this path. General symbolic slice bounds, multiple symbolic advanced indices,
+/// explicit output sharding, and index promises are currently rejected by the symbolic frontend. Untouched axes and
+/// query axes may have zero runtime extents; symbolic reads impose an additional indexed-axis requirement documented
+/// on their `get` function.
+///
+/// # Bounds and Index Promises
+///
+/// Bounds modes apply after negative-index normalization. A uniqueness promise applies to the final selected input
+/// positions, including aliases introduced by normalization or clipping; this frontend never establishes uniqueness
+/// for the caller. The concrete-shape frontend clears the sortedness promise before gathering or scattering because
+/// normalization and interleaved slice coordinates can change index order. Existing operation type rules validate
+/// memory, sharding, and reduction-state compatibility for the composed operations.
 #[derive(Debug)]
 pub struct Indexed<'a, 's, 'i, V: Value, T: Type = <V as Typed>::Type> {
     /// The input whose elements are read or functionally updated.
@@ -752,6 +770,7 @@ where
 {
     /// Reads this selection. Invalid scalar/array indices follow `options` after negative-index normalization.
     /// Slices clip their endpoints independently. Floating-point fill literals preserve their original encodings.
+    /// Refer to [`Indexed`] for supported geometry and the shared bounds and index-promise contracts.
     /// A host integer that remains out of bounds under [`GatherMode::PromiseInBounds`] is rejected before staging.
     ///
     /// # Parameters
@@ -909,7 +928,8 @@ where
     ///
     ///   - `updates`: Values broadcast to the selected shape, with the same data type as the input.
     ///   - `options`: Bounds handling, output placement, and promises about the final normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise.
+    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     [`Indexed`] for how normalization and clipping affect these promises.
     ///
     /// # Examples
     ///
@@ -932,7 +952,8 @@ where
     ///
     ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise.
+    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     [`Indexed`] for how normalization and clipping affect these promises.
     pub fn add(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Add, options)
     }
@@ -945,7 +966,8 @@ where
     ///
     ///   - `updates`: Factors with the input's data type, broadcast to the selection shape.
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise.
+    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     [`Indexed`] for how normalization and clipping affect these promises.
     pub fn multiply(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Mul, options)
     }
@@ -957,7 +979,8 @@ where
     ///
     ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise.
+    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     [`Indexed`] for how normalization and clipping affect these promises.
     pub fn min(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Min, options)
     }
@@ -969,7 +992,8 @@ where
     ///
     ///   - `updates`: Values with the input's data type, broadcast to the selection shape.
     ///   - `options`: Bounds handling, output placement, and promises about normalized selected positions.
-    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise.
+    ///     Sortedness is cleared before scatter; uniqueness remains an unchecked caller promise. Refer to
+    ///     [`Indexed`] for how normalization and clipping affect these promises.
     pub fn max(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Max, options)
     }
@@ -998,9 +1022,10 @@ where
 /// inserts an axis of size one. Borrowed integer arrays select multiple positions, and borrowed [`IndexMask`]
 /// descriptors select positions identified by a concrete Boolean mask.
 ///
-/// Each expression is evaluated once. Use parentheses around expressions containing top-level commas, such as
-/// explicit generic argument lists. The receiver of `at` determines the array-value parameter of the descriptors,
-/// so basic indexing requires no explicit type annotation when used directly with a receiver.
+/// This macro only constructs selectors; it does not execute an operation. Each expression is evaluated once. Use
+/// parentheses around expressions containing top-level commas, such as explicit generic argument lists. The receiver
+/// of `at` determines the array-value parameter of the descriptors, so basic indexing requires no explicit type
+/// annotation when used directly with a receiver.
 ///
 /// # Examples
 ///
@@ -1456,12 +1481,17 @@ where
 {
     /// Reads a mixed-IR array selection. Concrete geometry shares the homogeneous implementation. Symbolic shapes
     /// support one indexed axis, full forward/reverse slices, and inserted axes through retained dimension values.
-    /// Use the parent mixed-IR value when starting from a projected array tracer with symbolic dimensions.
+    /// Use the parent mixed-IR value when starting from a projected array tracer with symbolic dimensions. Refer to
+    /// [`Indexed`] for the complete supported-geometry contract.
+    ///
+    /// Symbolic reads inherit [`DynamicGather`]'s one-element window requirement on the indexed axis: its minimum
+    /// extent must be positive unless the query is statically empty. Untouched axes and query axes may have zero
+    /// runtime extents.
     ///
     /// # Parameters
     ///
     ///   - `options`: Bounds handling and optional fill. Symbolic geometry rejects explicit output sharding and
-    ///     index promises. Concrete geometry also supports placement and uniqueness as described in this module.
+    ///     index promises. Concrete geometry also supports placement and uniqueness as described on [`Indexed`].
     pub fn get(&self, options: &GatherOptions) -> Result<V, ProgramError> {
         if self.has_symbolic_shape()? {
             return dynamic_index_get(self.input, self.selectors, options);
@@ -1519,7 +1549,8 @@ where
     ///
     ///   - `updates`: Array value with the input's data type and shape broadcastable to the selection.
     ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
-    ///     explicit output sharding and index promises.
+    ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
+    ///     bounds and index-promise contracts.
     pub fn set(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Overwrite, options)
     }
@@ -1530,7 +1561,8 @@ where
     ///
     ///   - `updates`: Array value with the input's data type and shape broadcastable to the selection.
     ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
-    ///     explicit output sharding and index promises.
+    ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
+    ///     bounds and index-promise contracts.
     pub fn add(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Add, options)
     }
@@ -1541,7 +1573,8 @@ where
     ///
     ///   - `updates`: Array value with the input's data type and shape broadcastable to the selection.
     ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
-    ///     explicit output sharding and index promises.
+    ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
+    ///     bounds and index-promise contracts.
     pub fn multiply(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Mul, options)
     }
@@ -1552,7 +1585,8 @@ where
     ///
     ///   - `updates`: Array value with the input's data type and shape broadcastable to the selection.
     ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
-    ///     explicit output sharding and index promises.
+    ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
+    ///     bounds and index-promise contracts.
     pub fn min(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Min, options)
     }
@@ -1563,7 +1597,8 @@ where
     ///
     ///   - `updates`: Array value with the input's data type and shape broadcastable to the selection.
     ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
-    ///     explicit output sharding and index promises.
+    ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
+    ///     bounds and index-promise contracts.
     pub fn max(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Max, options)
     }
@@ -1594,6 +1629,7 @@ where
         Ok(V::from_projected(input.at(&selectors).update(&updates.clone().into_projected()?, kind, options)?))
     }
 }
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;

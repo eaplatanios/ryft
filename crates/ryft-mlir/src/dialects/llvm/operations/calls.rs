@@ -127,7 +127,8 @@ pub trait CallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the `callee_operands` operands.
     fn callee_operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
-        self.operand_values().skip(0).collect()
+        let callee_operand_count = self.dense_integer_32_array_attribute_usize_value("operand_segment_sizes", 0)?;
+        self.operand_values().take(callee_operand_count).collect()
     }
 
     /// Returns the optional `callee` attribute.
@@ -256,7 +257,7 @@ pub trait InlineAsmOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
 
     /// Returns the `operands` operands.
     fn operands(&self) -> Result<Vec<ValueRef<'o, 'c, 't>>, Error> {
-        self.operand_values().skip(0).collect()
+        self.operand_values().collect()
     }
 
     /// Returns the `asm_string` attribute.
@@ -499,6 +500,35 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_call_operand_bundles() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let r#type = context.signless_integer_type(32);
+        let block = context.block(&[(r#type.as_ref(), location), (r#type.as_ref(), location)]);
+        let argument: ValueRef<'_, '_, '_> = block.argument(0).unwrap().into();
+        let bundle_input: ValueRef<'_, '_, '_> = block.argument(1).unwrap().into();
+        let operation = call(
+            &[argument],
+            &[bundle_input],
+            r#type.as_ref(),
+            None,
+            Some(context.flat_symbol_ref_attribute("callee").as_ref()),
+            None,
+            None,
+            Some(context.dense_i32_array_attribute(&[1]).unwrap().as_ref()),
+            Some(context.array_attribute(&[context.string_attribute("deopt")]).as_ref()),
+            None,
+            None,
+            location,
+        )
+        .unwrap();
+
+        // Bundle inputs follow the callee inputs but belong to a separate operand segment.
+        assert_eq!(operation.callee_operands().unwrap(), vec![argument]);
+        assert_eq!(operation.op_bundle_operands().unwrap(), vec![bundle_input]);
     }
 
     #[test]

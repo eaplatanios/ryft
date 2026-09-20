@@ -1326,10 +1326,10 @@ mod tests {
         assert_eq!(unsafe { attribute.f32_elements() }.collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
 
         let tensor_type = context.tensor_type(f64_type, &[Size::Static(4)], None, context.unknown_location()).unwrap();
-        let attribute = context.splatted_dense_f64_elements_attribute(tensor_type, 3.14).unwrap();
+        let attribute = context.splatted_dense_f64_elements_attribute(tensor_type, std::f64::consts::PI).unwrap();
         assert_eq!(&context, attribute.context());
         assert!(attribute.is_splat());
-        assert!((unsafe { attribute.f64_splat() }.unwrap() - 3.14).abs() < 1e-6);
+        assert!((unsafe { attribute.f64_splat() }.unwrap() - std::f64::consts::PI).abs() < 1e-6);
     }
 
     #[test]

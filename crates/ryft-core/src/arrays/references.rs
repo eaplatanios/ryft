@@ -1212,7 +1212,7 @@ where
         // while the selected axis uses the same runtime index and clamping extent as the original view.
         let mut inputs = vec![target, &update];
         inputs.extend(std::iter::repeat_n(binding, rank));
-        self.bind(C::Operation::from_reference_dynamic_update_slice(DynamicUpdateSliceOperation), &inputs)
+        self.bind(C::Operation::from_reference_dynamic_update_slice(DynamicUpdateSliceOperation::new()), &inputs)
     }
 }
 
