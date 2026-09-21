@@ -1192,30 +1192,27 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
-where
-    V: Value<Type = ArrayIrType>
-        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
-        + DimensionSize
+impl<
+    V: Value<Type = ArrayIrType, DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant>
+        + ValueProjection<
+            ArrayType,
+            Projected: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
+                           + Broadcast
+                           + Reshape
+                           + Concatenate
+                           + ConvertElementType
+                           + Compare
+                           + Add
+                           + Select
+                           + Reverse
+                           + Scatter
+                           + TransferToMemory,
+        > + DimensionSize
         + DimensionToScalar
         + DynamicScatter
         + DynamicReshape
         + DynamicBroadcast,
-    V::Projected: Broadcast
-        + Reshape
-        + Concatenate
-        + ConvertElementType
-        + Compare
-        + Add
-        + Select
-        + Reverse
-        + Scatter
-        + TransferToMemory,
-    <V::Projected as Value>::ExecutionDomain: Context,
-    <<V::Projected as Value>::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
-    V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
+> Indexed<'_, '_, '_, V, ArrayIrType>
 {
     /// Overwrites the selected elements of an array that may have a symbolic shape, returning a new value and leaving
     /// the input unchanged. Updates broadcast to the selected shape, using dimension values for symbolic extents.
@@ -1226,6 +1223,7 @@ where
     ///   - `options`: Scatter bounds policy and placement/promises for concrete geometry. Symbolic geometry rejects
     ///     explicit output sharding and index promises. Refer to [`Indexed`] for supported geometry and the shared
     ///     bounds and index-promise contracts.
+    #[inline]
     pub fn set(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Overwrite, options)
     }
@@ -1233,13 +1231,15 @@ where
     /// Adds every selected update, including duplicates, into an array that may have a symbolic shape. Updates
     /// broadcast to the selected shape, using dimension values for symbolic extents. Refer to the documentation of
     /// [`set`](Self::set) for the shared parameter contract.
+    #[inline]
     pub fn add(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Add, options)
     }
 
-    /// Multiplies selected updates into an array that may have a symbolic shape; scatter's differentiation
-    /// restrictions apply. Updates broadcast to the selected shape, using dimension values for symbolic extents. Refer
-    /// to the documentation of [`set`](Self::set) for the shared parameter contract.
+    /// Multiplies selected updates into an array that may have a symbolic shape; scatter's differentiation restrictions
+    /// apply. Updates broadcast to the selected shape, using dimension values for symbolic extents. Refer to the
+    /// documentation of [`set`](Self::set) for the shared parameter contract.
+    #[inline]
     pub fn mul(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Mul, options)
     }
@@ -1247,6 +1247,7 @@ where
     /// Combines selected updates with an array that may have a symbolic shape using the elementwise minimum. Updates
     /// broadcast to the selected shape, using dimension values for symbolic extents. Refer to the documentation of
     /// [`set`](Self::set) for the shared parameter contract.
+    #[inline]
     pub fn min(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Min, options)
     }
@@ -1254,6 +1255,7 @@ where
     /// Combines selected updates with an array that may have a symbolic shape using the elementwise maximum. Updates
     /// broadcast to the selected shape, using dimension values for symbolic extents. Refer to the documentation of
     /// [`set`](Self::set) for the shared parameter contract.
+    #[inline]
     pub fn max(&self, updates: &V, options: &ScatterOptions) -> Result<V, ProgramError> {
         self.update(updates, ScatterReductionKind::Max, options)
     }
@@ -1261,10 +1263,10 @@ where
     /// Shared implementation of [`set`](Self::set), [`add`](Self::add), [`mul`](Self::mul), [`min`](Self::min), and
     /// [`max`](Self::max) for arrays that may have symbolic shapes. A selection whose input and index arrays all have
     /// concrete shapes is served by the implementation for array values, with the result lifted back into this value
-    /// family. A selection with a symbolic shape is instead resolved by
-    /// [`dynamic_plan`](Self::dynamic_plan), which keeps the dimension values available, and then scattered along its
-    /// single queried axis with dynamic operations. The reversed input is updated in selection order and reversed
-    /// back, so the returned value has the original geometry.
+    /// family. A selection with a symbolic shape is instead resolved by [`dynamic_plan`](Self::dynamic_plan), which
+    /// keeps the dimension values available, and then scattered along its single queried axis with dynamic operations.
+    /// The reversed input is updated in selection order and reversed back, so the returned value has the original
+    /// geometry.
     ///
     /// # Parameters
     ///
@@ -1278,11 +1280,13 @@ where
                 .with_projected_selection(|selection| selection.update(&updates, kind, options))
                 .map(V::from_projected);
         }
+
         Self::validate_symbolic_options(
             options.output_sharding().is_some(),
             options.indices_are_sorted(),
             options.unique_indices(),
         )?;
+
         let plan = self.dynamic_plan(options.mode() == ScatterMode::PromiseInBounds)?;
         let input_type = self.input.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
@@ -1300,10 +1304,12 @@ where
             }
             dimensions.push(self.input.dimension_size(axis)?);
         }
+
         let mut selected_dimensions = dimensions.clone();
         for &axis in &plan.inserted_axes {
             selected_dimensions.insert(axis, self.input.dispatch_domain().dimension_constant(1)?);
         }
+
         let updates = updates.dynamic_broadcast_to(&selected_dimensions)?;
         let updates = if plan.inserted_axes.is_empty() { updates } else { updates.dynamic_reshape(&dimensions)? };
         let base = Self::reversed(self.input, &plan.reversed_axes)?;
@@ -1321,9 +1327,12 @@ where
                 options,
             )?)
         };
+
         Self::reversed(&output, &plan.reversed_axes)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
 where
