@@ -1502,22 +1502,19 @@ impl<V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceD
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
-where
-    V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceDynamicIndex + ReferenceRead,
+impl<V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceDynamicIndex + ReferenceRead>
+    Indexed<'_, '_, '_, V, ArrayIrType>
 {
-    /// Reads the selected region of a reference input as an immutable snapshot. This is
-    /// [`view`](Self::view) followed by [`read`](ReferenceRead::read), so it supports exactly the selections that
-    /// [`view`](Self::view) accepts and observes the reference state at the point of the read in program order.
+    /// Reads the selected region of a reference input as an immutable snapshot. This is [`view`](Self::view) followed
+    /// by [`read`](ReferenceRead::read), so it supports exactly the selections that [`view`](Self::view) accepts and
+    /// observes the reference state at the point of the read in program order.
+    #[inline]
     pub fn read(&self) -> Result<V, ProgramError> {
         self.view()?.read()
     }
 }
 
-impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
-where
+impl<
     V: Value<Type = ArrayIrType>
         + ReferenceIndex
         + ReferenceSlice
@@ -1525,15 +1522,12 @@ where
         + ReferenceWrite
         + ReferenceAddUpdate
         + ReferenceSwap,
+> Indexed<'_, '_, '_, V, ArrayIrType>
 {
     /// Overwrites the selected region of a reference input in place. This is [`view`](Self::view) followed by
     /// [`write`](ReferenceWrite::write), so it supports exactly the selections that [`view`](Self::view) accepts. It
     /// is the in-place counterpart of the functional [`set`](Self::set) on array values: the reference's state is
     /// updated in program order and nothing is returned.
-    ///
-    /// # Parameters
-    ///
-    ///   - `replacement`: Array value with the selected region's type.
     ///
     /// # Example
     ///
@@ -1546,37 +1540,73 @@ where
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub fn write(&self, replacement: &V) -> Result<(), ProgramError> {
         self.view()?.write(replacement)
     }
 
-    /// Adds `update` into the selected region of a reference input in place. This is [`view`](Self::view) followed by
-    /// [`add_update`](ReferenceAddUpdate::add_update), and the in-place counterpart of the functional
+    /// Adds `update` into the selected region of a reference input in place. This is [`view`](Self::view)
+    /// followed by [`add_update`](ReferenceAddUpdate::add_update), and the in-place counterpart of the functional
     /// [`add`](Self::add) on array values. Refer to the documentation of [`write`](Self::write) for the shared
     /// selection contract.
+    #[inline]
     pub fn add_update(&self, update: &V) -> Result<(), ProgramError> {
         self.view()?.add_update(update)
     }
 
-    /// Overwrites the selected region of a reference input in place and returns the previously stored region. This is
-    /// [`view`](Self::view) followed by [`swap`](ReferenceSwap::swap). Refer to the documentation of
+    /// Overwrites the selected region of a reference input in place and returns the previously stored region.
+    /// This is [`view`](Self::view) followed by [`swap`](ReferenceSwap::swap). Refer to the documentation of
     /// [`write`](Self::write) for the shared selection contract.
+    #[inline]
     pub fn swap(&self, replacement: &V) -> Result<V, ProgramError> {
         self.view()?.swap(replacement)
     }
 }
 
-impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+// TODO(eaplatanios): Review from here onwards.
+
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>>
+    Indexed<'_, '_, '_, V, ArrayIrType>
 {
+    /// Returns whether the input or an index array has a non-concrete dimension in its shape.
+    fn has_symbolic_shape(&self) -> Result<bool, ProgramError> {
+        let r#type = self.input.r#type();
+        if <&ArrayType>::try_from(r#type.as_ref())?
+            .shape()
+            .dimensions()
+            .iter()
+            .any(|dimension| dimension.value().is_none())
+        {
+            return Ok(true);
+        }
+
+        for selector in self.selectors {
+            if let IndexSelector::Array(value) = selector {
+                let r#type = value.r#type();
+                if <&ArrayType>::try_from(r#type.as_ref())?
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .any(|dimension| dimension.value().is_none())
+                {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
     /// Serves a concrete-geometry selection through the implementation for array values by projecting the input and
     /// every index array out of this value family, re-borrowing the selectors over those projections, and handing the
     /// projected selection to `select`.
-    fn with_projected_selection<R, F>(&self, select: F) -> Result<R, ProgramError>
-    where
+    fn with_projected_selection<
+        R,
         F: FnOnce(Indexed<'_, '_, '_, V::Projected, ArrayType>) -> Result<R, ProgramError>,
-    {
+    >(
+        &self,
+        select: F,
+    ) -> Result<R, ProgramError> {
         let input = self.input.clone().into_projected()?;
         let values = self
             .selectors
@@ -1597,33 +1627,6 @@ where
             })
             .collect::<Vec<_>>();
         select(input.at(&selectors))
-    }
-
-    /// Returns whether the input or an index array retains a non-concrete dimension.
-    fn has_symbolic_shape(&self) -> Result<bool, ProgramError> {
-        let r#type = self.input.r#type();
-        if <&ArrayType>::try_from(r#type.as_ref())?
-            .shape()
-            .dimensions()
-            .iter()
-            .any(|dimension| dimension.value().is_none())
-        {
-            return Ok(true);
-        }
-        for selector in self.selectors {
-            if let IndexSelector::Array(value) = selector {
-                let r#type = value.r#type();
-                if <&ArrayType>::try_from(r#type.as_ref())?
-                    .shape()
-                    .dimensions()
-                    .iter()
-                    .any(|dimension| dimension.value().is_none())
-                {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
     }
 
     /// Rejects the read and update options that the symbolic frontend does not remap yet: explicit output sharding
