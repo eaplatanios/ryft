@@ -883,27 +883,6 @@ impl<
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Lifts a host coordinate using the input's memory space and execution domain.
-    #[inline]
-    fn constant(&self, value: Array) -> Result<V, ProgramError> {
-        portable_constant(self.input, value)
-    }
-
-    /// Converts integer queries without wrapping large unsigned values into valid signed positions. Negative signed
-    /// indices add the axis extent once; values still outside the axis are left to the requested bounds policy.
-    fn normalized_indices(&self, value: &V, extent: usize) -> Result<V, ProgramError> {
-        let extent = i64::try_from(extent).map_err(|_| TypeError::invalid("indexed axis extent exceeds `i64::MAX`"))?;
-        let value = if value.r#type().data_type() == DataType::U64 {
-            let maximum = self.constant(Array::scalar(i64::MAX as u64)?)?;
-            V::select(&value.greater_than(&maximum)?, &maximum, value)?.convert_element_type(DataType::I64)?
-        } else {
-            value.convert_element_type(DataType::I64)?
-        };
-        let zero = self.constant(Array::scalar(0_i64)?)?;
-        let extent = self.constant(Array::scalar(extent)?)?;
-        V::select(&value.less_than(&zero)?, &value.add(&extent)?, &value)
-    }
-
     /// Builds one shared window/query mapping, preserving contiguous windows rather than constructing a full grid
     /// over every output element. Only genuinely strided slices add coordinate-query axes.
     fn plan(&self, expanded: &[ExpandedIndexSelector<V>], promise: bool) -> Result<IndexPlan<V>, ProgramError> {
@@ -987,7 +966,22 @@ impl<
                     axis += 1;
                 }
                 ExpandedIndexSelector::Array(value) => {
-                    components.push((axis, self.normalized_indices(value, shape[axis])?, None));
+                    // Convert the query to `i64` without wrapping large unsigned values into valid signed positions,
+                    // then add the axis extent once to negative indices. Values still outside the axis are left to the
+                    // requested bounds policy.
+                    let extent = i64::try_from(shape[axis])
+                        .map_err(|_| TypeError::invalid("indexed axis extent exceeds `i64::MAX`"))?;
+                    let indices = if value.r#type().data_type() == DataType::U64 {
+                        let maximum = self.constant(Array::scalar(i64::MAX as u64)?)?;
+                        V::select(&value.greater_than(&maximum)?, &maximum, value)?
+                            .convert_element_type(DataType::I64)?
+                    } else {
+                        value.convert_element_type(DataType::I64)?
+                    };
+                    let zero = self.constant(Array::scalar(0_i64)?)?;
+                    let extent = self.constant(Array::scalar(extent)?)?;
+                    let indices = V::select(&indices.less_than(&zero)?, &indices.add(&extent)?, &indices)?;
+                    components.push((axis, indices, None));
                     collapsed.push(axis);
                     axis += 1;
                 }
@@ -1093,6 +1087,25 @@ impl<
             output_shape,
             new_axes,
         })
+    }
+}
+
+impl<V> Indexed<'_, '_, '_, V, ArrayType>
+where
+    V: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>,
+{
+    /// Lifts a host coordinate literal into the input's execution domain, placed in the input's memory space. A
+    /// backend's stored constant family may contain capture handles, so coordinate literals use the ordinary constant
+    /// operation payload instead, which compiled contexts lower directly.
+    fn constant(&self, value: Array) -> Result<V, ProgramError> {
+        let r#type = value.r#type().into_owned().with_memory(self.input.r#type().memory());
+        let mut outputs = self.input.execution_domain().bind(
+            ConstantOperation::new(Array::new(r#type, value.storage_bytes().to_vec())?),
+            Vec::new(),
+            &[],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -1297,377 +1310,6 @@ struct DynamicIndexPlan<V> {
     inserted_axes: Vec<usize>,
 }
 
-/// Binds a portable coordinate literal in the execution domain of `exemplar`, placed in its memory space. A
-/// backend's stored constant family may contain capture handles, so coordinate literals use the ordinary constant
-/// operation payload instead, which compiled contexts lower directly.
-fn portable_constant<V>(exemplar: &V, value: Array) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType>,
-    V::ExecutionDomain: Context,
-    <V::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
-{
-    let r#type = value.r#type().into_owned().with_memory(exemplar.r#type().memory());
-    let mut outputs = exemplar.execution_domain().bind(
-        ConstantOperation::new(Array::new(r#type, value.storage_bytes().to_vec())?),
-        Vec::new(),
-        &[],
-    )?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
-
-/// Binds a portable coordinate literal in the projected array execution domain of a mixed-IR `input`. Refer to the
-/// documentation of [`portable_constant`] for more information.
-fn dynamic_index_constant<V>(input: &V, value: Array) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    <V::Projected as Value>::ExecutionDomain: Context,
-    <<V::Projected as Value>::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
-{
-    Ok(V::from_projected(portable_constant(&input.clone().into_projected()?, value)?))
-}
-
-/// Rejects the read and update options that the symbolic frontend does not remap yet: explicit output sharding and
-/// the sortedness and uniqueness index promises. Bounds modes and fills remain available.
-fn validate_symbolic_index_options(
-    has_output_sharding: bool,
-    indices_are_sorted: bool,
-    unique_indices: bool,
-) -> Result<(), ProgramError> {
-    if has_output_sharding || indices_are_sorted || unique_indices {
-        return Err(TypeError::invalid(
-            "symbolic indexing does not yet support explicit output sharding or index promises",
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Returns `input` with the projected array member reversed along `axes`, or an unchanged clone when no axis is
-/// reversed, so that callers keep the mixed-IR value family on both paths.
-fn reversed_projection<V>(input: &V, axes: &[usize]) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Reverse>,
-{
-    if axes.is_empty() {
-        return Ok(input.clone());
-    }
-    Ok(V::from_projected(input.clone().into_projected()?.reverse(axes.to_vec())?))
-}
-
-/// Resolves the supported symbolic selection geometry without reading traced array data on the host.
-fn dynamic_index_plan<V>(
-    input: &V,
-    selectors: &[IndexSelector<'_, V>],
-    promise_in_bounds: bool,
-) -> Result<DynamicIndexPlan<V>, ProgramError>
-where
-    V: Value<Type = ArrayIrType> + DimensionSize + DimensionToScalar + ValueProjection<ArrayType>,
-    V::Projected: Value<Type = ArrayType> + ConvertElementType + Compare + Add + Select + TransferToMemory,
-    <V::Projected as Value>::ExecutionDomain: Context,
-    <<V::Projected as Value>::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
-{
-    let input_type = input.r#type();
-    let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
-    let consumed = selectors
-        .iter()
-        .filter(|selector| !matches!(selector, IndexSelector::Basic(BasicIndex::NewAxis | BasicIndex::Ellipsis)))
-        .count();
-    let rank = input_type.rank();
-    if consumed > rank {
-        return Err(
-            TypeError::invalid(format!("index selection consumes {consumed} axes but input rank is {rank}")).into()
-        );
-    }
-    let ellipses = selectors
-        .iter()
-        .filter(|selector| matches!(selector, IndexSelector::Basic(BasicIndex::Ellipsis)))
-        .count();
-    if ellipses > 1 {
-        return Err(TypeError::invalid("index selection contains more than one ellipsis").into());
-    }
-    // Validate the whole selector list before lifting constants or staging dimension reads. A bad later selector
-    // must not leave a partly staged indexing expression in the caller's context.
-    let mut validation_axis = 0;
-    let mut query_count = 0;
-    for selector in selectors {
-        match selector {
-            IndexSelector::Basic(BasicIndex::Ellipsis) => validation_axis += input_type.rank() - consumed,
-            IndexSelector::Basic(BasicIndex::NewAxis) => {}
-            IndexSelector::Basic(BasicIndex::Slice(slice)) => {
-                if slice.start().is_some() || slice.stop().is_some() || !matches!(slice.step(), -1 | 1) {
-                    return Err(TypeError::invalid(
-                        "symbolic indexing currently requires full slices with step `1` or `-1`",
-                    )
-                    .into());
-                }
-                validation_axis += 1;
-            }
-            IndexSelector::Basic(BasicIndex::Integer(index)) => {
-                i64::try_from(*index).map_err(|_| {
-                    TypeError::invalid("symbolic indexing requires host integer indices representable as `i64`")
-                })?;
-                if promise_in_bounds {
-                    // Dynamic upper bounds are exclusive. Even when the actual extent is unavailable, an index
-                    // outside the largest permitted extent cannot satisfy the caller's in-bounds promise.
-                    let dimension = input_type.dimension(validation_axis);
-                    let maximum = dimension.value().or_else(|| dimension.bounds().upper().map(|upper| upper - 1));
-                    if maximum.is_some_and(|maximum| *index >= maximum as i128 || *index < -(maximum as i128)) {
-                        return Err(
-                            TypeError::invalid("host integer index is out of bounds under `PromiseInBounds`").into()
-                        );
-                    }
-                }
-                query_count += 1;
-                validation_axis += 1;
-            }
-            IndexSelector::Array(indices) => {
-                let indices_type = indices.r#type();
-                let indices_type = <&ArrayType>::try_from(indices_type.as_ref())?;
-                if !indices_type.data_type().is_integer() || !indices_type.data_type().is_signed() {
-                    return Err(TypeError::invalid("symbolic indexing requires signed integer query arrays").into());
-                }
-                if indices_type.memory() != input_type.memory() {
-                    return Err(TypeError::invalid("index arrays and input must share one memory space").into());
-                }
-                query_count += 1;
-                validation_axis += 1;
-            }
-            IndexSelector::Mask(_) => {
-                return Err(
-                    TypeError::invalid("index masks require a concrete input shape in symbolic indexing").into()
-                );
-            }
-        }
-    }
-    if query_count > 1 {
-        return Err(TypeError::invalid("symbolic indexing currently supports one indexed axis").into());
-    }
-    let mut query = None;
-    let mut reversed_axes = Vec::new();
-    let mut inserted_axes = Vec::new();
-    let mut input_axis = 0;
-    let mut output_axis = 0;
-    for selector in selectors {
-        let indices = match selector {
-            IndexSelector::Basic(BasicIndex::Ellipsis) => {
-                let omitted = input_type.rank() - consumed;
-                input_axis += omitted;
-                output_axis += omitted;
-                continue;
-            }
-            IndexSelector::Basic(BasicIndex::NewAxis) => {
-                inserted_axes.push(output_axis);
-                output_axis += 1;
-                continue;
-            }
-            IndexSelector::Basic(BasicIndex::Slice(slice)) => {
-                if slice.step() < 0 {
-                    reversed_axes.push(input_axis);
-                }
-                input_axis += 1;
-                output_axis += 1;
-                continue;
-            }
-            IndexSelector::Basic(BasicIndex::Integer(index)) => {
-                let index = i64::try_from(*index).unwrap();
-                dynamic_index_constant(input, Array::scalar(index)?)?
-            }
-            IndexSelector::Array(indices) => (*indices).clone(),
-            IndexSelector::Mask(_) => unreachable!("masks are rejected while validating the selector list"),
-        };
-        let indices_type = indices.r#type();
-        let indices_type = <&ArrayType>::try_from(indices_type.as_ref())?;
-        output_axis += indices_type.rank();
-        // Normalize negatives using the actual retained dimension value. This is ordinary array arithmetic,
-        // preserving the index array's symbolic shape and structural-zero tangent rather than concretizing it.
-        let indices = indices.clone().into_projected()?.convert_element_type(DataType::I64)?;
-        let extent = input
-            .dimension_size(input_axis)?
-            .to_scalar()?
-            .into_projected()?
-            .transfer_to_memory(input_type.memory())?;
-        let zero = dynamic_index_constant(input, Array::scalar(0_i64)?)?.into_projected()?;
-        let negative = indices.less_than(&zero)?;
-        let wrapped = indices.add(&extent)?;
-        let indices = V::from_projected(V::Projected::select(&negative, &wrapped, &indices)?);
-        query = Some((input_axis, indices));
-        input_axis += 1;
-    }
-    Ok(DynamicIndexPlan { query, reversed_axes, inserted_axes })
-}
-
-/// Selects through existing mixed-IR capabilities, retaining dimensions rather than encoding symbolic window sizes
-/// as host integers. Explicit placement and index promises are rejected until their frontend remapping is defined.
-fn dynamic_index_get<V>(
-    input: &V,
-    selectors: &[IndexSelector<'_, V>],
-    options: &GatherOptions,
-) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayIrType>
-        + DimensionSize
-        + DimensionToScalar
-        + DynamicGather
-        + DynamicReshape
-        + ValueProjection<ArrayType>,
-    V::Projected: Value<Type = ArrayType> + ConvertElementType + Compare + Add + Select + TransferToMemory + Reverse,
-    V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
-    <V::Projected as Value>::ExecutionDomain: Context,
-    <<V::Projected as Value>::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
-{
-    validate_symbolic_index_options(
-        options.output_sharding().is_some(),
-        options.indices_are_sorted(),
-        options.unique_indices(),
-    )?;
-    // Identity and full-reversal selections skip gather, but explicit fills still have the same scalar/data-type
-    // contract as indexed reads. Validate before those fast paths instead of silently accepting a malformed fill.
-    if matches!(options.mode(), GatherMode::Fill { value: Some(_) }) {
-        let input_type = input.r#type();
-        options.resolved_fill_value(<&ArrayType>::try_from(input_type.as_ref())?.data_type())?;
-    }
-    let plan = dynamic_index_plan(input, selectors, matches!(options.mode(), GatherMode::PromiseInBounds))?;
-    let mut output = reversed_projection(input, &plan.reversed_axes)?;
-    if let Some((axis, indices)) = plan.query {
-        output = output.dynamic_gather_axis(&indices, axis, options.mode().clone())?;
-    }
-    for axis in plan.inserted_axes {
-        output = output.dynamic_expand_dimensions(axis)?;
-    }
-    Ok(output)
-}
-
-/// Applies an indexed update using runtime dimension values for broadcasting and removal of inserted axes. The
-/// reversed input is updated in selection order and reversed back, so the returned value has the original geometry.
-fn dynamic_index_update<V>(
-    input: &V,
-    selectors: &[IndexSelector<'_, V>],
-    updates: &V,
-    kind: ScatterReductionKind,
-    options: &ScatterOptions,
-) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayIrType>
-        + DimensionSize
-        + DimensionToScalar
-        + DynamicScatter
-        + DynamicReshape
-        + DynamicBroadcast
-        + ValueProjection<ArrayType>,
-    V::Projected:
-        Value<Type = ArrayType> + ConvertElementType + Compare + Add + Select + TransferToMemory + Reverse + Scatter,
-    V::DispatchDomain: Context<Type = ArrayIrType> + DimensionConstant,
-    <V::Projected as Value>::ExecutionDomain: Context,
-    <<V::Projected as Value>::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
-{
-    validate_symbolic_index_options(
-        options.output_sharding().is_some(),
-        options.indices_are_sorted(),
-        options.unique_indices(),
-    )?;
-    let plan = dynamic_index_plan(input, selectors, options.mode() == ScatterMode::PromiseInBounds)?;
-    let input_type = input.r#type();
-    let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
-    let mut dimensions = Vec::new();
-    for axis in 0..input_type.rank() {
-        if let Some((query_axis, indices)) = &plan.query
-            && *query_axis == axis
-        {
-            let indices_type = indices.r#type();
-            let indices_type = <&ArrayType>::try_from(indices_type.as_ref())?;
-            for query_axis in 0..indices_type.rank() {
-                dimensions.push(indices.dimension_size(query_axis)?);
-            }
-            continue;
-        }
-        dimensions.push(input.dimension_size(axis)?);
-    }
-    let mut selected_dimensions = dimensions.clone();
-    for &axis in &plan.inserted_axes {
-        selected_dimensions.insert(axis, input.dispatch_domain().dimension_constant(1)?);
-    }
-    let updates = updates.dynamic_broadcast_to(&selected_dimensions)?;
-    let updates = if plan.inserted_axes.is_empty() { updates } else { updates.dynamic_reshape(&dimensions)? };
-    let base = reversed_projection(input, &plan.reversed_axes)?;
-    let output = if let Some((axis, indices)) = plan.query {
-        base.dynamic_scatter_axis(&indices, &updates, axis, kind, options.mode())?
-    } else {
-        // A zero-width index vector describes a single whole-array update without inventing a runtime-sized
-        // window. All update axes are window axes and every input element is updated exactly once.
-        let indices = dynamic_index_constant(input, Array::vector(Vec::<i64>::new())?)?;
-        V::from_projected(base.into_projected()?.scatter(
-            &indices.into_projected()?,
-            &updates.into_projected()?,
-            &ScatterDimensionNumbers::new((0..input_type.rank()).collect(), vec![], vec![]),
-            kind,
-            options,
-        )?)
-    };
-    reversed_projection(&output, &plan.reversed_axes)
-}
-
-impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    /// Serves a concrete-geometry selection through the homogeneous frontend by projecting the input and every index
-    /// array into the array member family, re-borrowing the selectors over those projections, and handing the
-    /// projected selection to `select`.
-    fn with_projected_selection<R, F>(&self, select: F) -> Result<R, ProgramError>
-    where
-        F: FnOnce(Indexed<'_, '_, '_, V::Projected, ArrayType>) -> Result<R, ProgramError>,
-    {
-        let input = self.input.clone().into_projected()?;
-        let values = self
-            .selectors
-            .iter()
-            .map(|selector| match selector {
-                IndexSelector::Array(value) => Ok(Some((*value).clone().into_projected()?)),
-                _ => Ok(None),
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?;
-        let selectors = self
-            .selectors
-            .iter()
-            .zip(&values)
-            .map(|(selector, value)| match selector {
-                IndexSelector::Basic(value) => IndexSelector::Basic(*value),
-                IndexSelector::Array(_) => IndexSelector::Array(value.as_ref().unwrap()),
-                IndexSelector::Mask(mask) => IndexSelector::Mask(mask),
-            })
-            .collect::<Vec<_>>();
-        select(input.at(&selectors))
-    }
-
-    /// Returns whether the input or an index array retains a non-concrete dimension.
-    fn has_symbolic_shape(&self) -> Result<bool, ProgramError> {
-        let r#type = self.input.r#type();
-        if <&ArrayType>::try_from(r#type.as_ref())?
-            .shape()
-            .dimensions()
-            .iter()
-            .any(|dimension| dimension.value().is_none())
-        {
-            return Ok(true);
-        }
-        for selector in self.selectors {
-            if let IndexSelector::Array(value) = selector {
-                let r#type = value.r#type();
-                if <&ArrayType>::try_from(r#type.as_ref())?
-                    .shape()
-                    .dimensions()
-                    .iter()
-                    .any(|dimension| dimension.value().is_none())
-                {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-}
-
 impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
 where
     V: Value<Type = ArrayIrType>
@@ -1705,10 +1347,29 @@ where
     ///   - `options`: Bounds handling and optional fill. Symbolic geometry rejects explicit output sharding and
     ///     index promises. Concrete geometry also supports placement and uniqueness as described on [`Indexed`].
     pub fn get(&self, options: &GatherOptions) -> Result<V, ProgramError> {
-        if self.has_symbolic_shape()? {
-            return dynamic_index_get(self.input, self.selectors, options);
+        if !self.has_symbolic_shape()? {
+            return self.with_projected_selection(|selection| selection.get(options)).map(V::from_projected);
         }
-        self.with_projected_selection(|selection| selection.get(options)).map(V::from_projected)
+        Self::validate_symbolic_options(
+            options.output_sharding().is_some(),
+            options.indices_are_sorted(),
+            options.unique_indices(),
+        )?;
+        // Identity and full-reversal selections skip gather, but explicit fills still have the same scalar/data-type
+        // contract as indexed reads. Validate before those fast paths instead of silently accepting a malformed fill.
+        if matches!(options.mode(), GatherMode::Fill { value: Some(_) }) {
+            let input_type = self.input.r#type();
+            options.resolved_fill_value(<&ArrayType>::try_from(input_type.as_ref())?.data_type())?;
+        }
+        let plan = self.dynamic_plan(matches!(options.mode(), GatherMode::PromiseInBounds))?;
+        let mut output = Self::reversed(self.input, &plan.reversed_axes)?;
+        if let Some((axis, indices)) = plan.query {
+            output = output.dynamic_gather_axis(&indices, axis, options.mode().clone())?;
+        }
+        for axis in plan.inserted_axes {
+            output = output.dynamic_expand_dimensions(axis)?;
+        }
+        Ok(output)
     }
 }
 
@@ -1779,9 +1440,10 @@ where
     /// Shared implementation of the mixed-IR [`set`](Self::set), [`add`](Self::add), [`mul`](Self::mul),
     /// [`min`](Self::min), and [`max`](Self::max). A selection whose input and index arrays all have concrete shapes
     /// is projected into the array member family and served by the homogeneous [`Indexed`] implementation, with the
-    /// result lifted back into the mixed family. A selection with a symbolic shape instead goes through
-    /// [`dynamic_index_update`], which keeps the dimension values available so that the scatter geometry can be
-    /// expressed with dynamic operations.
+    /// result lifted back into the mixed family. A selection with a symbolic shape is instead resolved by
+    /// [`dynamic_plan`](Self::dynamic_plan), which keeps the dimension values available, and then scattered along its
+    /// single queried axis with dynamic operations. The reversed input is updated in selection order and reversed
+    /// back, so the returned value has the original geometry.
     ///
     /// # Parameters
     ///
@@ -1789,12 +1451,56 @@ where
     ///   - `kind`: Scatter reduction combining each update with the element it lands on.
     ///   - `options`: Bounds handling, output placement, and index promises, as described on [`Indexed`].
     fn update(&self, updates: &V, kind: ScatterReductionKind, options: &ScatterOptions) -> Result<V, ProgramError> {
-        if self.has_symbolic_shape()? {
-            return dynamic_index_update(self.input, self.selectors, updates, kind, options);
+        if !self.has_symbolic_shape()? {
+            let updates = updates.clone().into_projected()?;
+            return self
+                .with_projected_selection(|selection| selection.update(&updates, kind, options))
+                .map(V::from_projected);
         }
-        let updates = updates.clone().into_projected()?;
-        self.with_projected_selection(|selection| selection.update(&updates, kind, options))
-            .map(V::from_projected)
+        Self::validate_symbolic_options(
+            options.output_sharding().is_some(),
+            options.indices_are_sorted(),
+            options.unique_indices(),
+        )?;
+        let plan = self.dynamic_plan(options.mode() == ScatterMode::PromiseInBounds)?;
+        let input_type = self.input.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let mut dimensions = Vec::new();
+        for axis in 0..input_type.rank() {
+            if let Some((query_axis, indices)) = &plan.query
+                && *query_axis == axis
+            {
+                let indices_type = indices.r#type();
+                let indices_type = <&ArrayType>::try_from(indices_type.as_ref())?;
+                for query_axis in 0..indices_type.rank() {
+                    dimensions.push(indices.dimension_size(query_axis)?);
+                }
+                continue;
+            }
+            dimensions.push(self.input.dimension_size(axis)?);
+        }
+        let mut selected_dimensions = dimensions.clone();
+        for &axis in &plan.inserted_axes {
+            selected_dimensions.insert(axis, self.input.dispatch_domain().dimension_constant(1)?);
+        }
+        let updates = updates.dynamic_broadcast_to(&selected_dimensions)?;
+        let updates = if plan.inserted_axes.is_empty() { updates } else { updates.dynamic_reshape(&dimensions)? };
+        let base = Self::reversed(self.input, &plan.reversed_axes)?;
+        let output = if let Some((axis, indices)) = plan.query {
+            base.dynamic_scatter_axis(&indices, &updates, axis, kind, options.mode())?
+        } else {
+            // A zero-width index vector describes a single whole-array update without inventing a runtime-sized
+            // window. All update axes are window axes and every input element is updated exactly once.
+            let indices = self.constant(Array::vector(Vec::<i64>::new())?)?;
+            V::from_projected(base.into_projected()?.scatter(
+                &indices.into_projected()?,
+                &updates.into_projected()?,
+                &ScatterDimensionNumbers::new((0..input_type.rank()).collect(), vec![], vec![]),
+                kind,
+                options,
+            )?)
+        };
+        Self::reversed(&output, &plan.reversed_axes)
     }
 }
 
@@ -2022,6 +1728,240 @@ where
     }
 }
 
+impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
+where
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    /// Serves a concrete-geometry selection through the homogeneous frontend by projecting the input and every index
+    /// array into the array member family, re-borrowing the selectors over those projections, and handing the
+    /// projected selection to `select`.
+    fn with_projected_selection<R, F>(&self, select: F) -> Result<R, ProgramError>
+    where
+        F: FnOnce(Indexed<'_, '_, '_, V::Projected, ArrayType>) -> Result<R, ProgramError>,
+    {
+        let input = self.input.clone().into_projected()?;
+        let values = self
+            .selectors
+            .iter()
+            .map(|selector| match selector {
+                IndexSelector::Array(value) => Ok(Some((*value).clone().into_projected()?)),
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+        let selectors = self
+            .selectors
+            .iter()
+            .zip(&values)
+            .map(|(selector, value)| match selector {
+                IndexSelector::Basic(value) => IndexSelector::Basic(*value),
+                IndexSelector::Array(_) => IndexSelector::Array(value.as_ref().unwrap()),
+                IndexSelector::Mask(mask) => IndexSelector::Mask(mask),
+            })
+            .collect::<Vec<_>>();
+        select(input.at(&selectors))
+    }
+
+    /// Returns whether the input or an index array retains a non-concrete dimension.
+    fn has_symbolic_shape(&self) -> Result<bool, ProgramError> {
+        let r#type = self.input.r#type();
+        if <&ArrayType>::try_from(r#type.as_ref())?
+            .shape()
+            .dimensions()
+            .iter()
+            .any(|dimension| dimension.value().is_none())
+        {
+            return Ok(true);
+        }
+        for selector in self.selectors {
+            if let IndexSelector::Array(value) = selector {
+                let r#type = value.r#type();
+                if <&ArrayType>::try_from(r#type.as_ref())?
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .any(|dimension| dimension.value().is_none())
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Rejects the read and update options that the symbolic frontend does not remap yet: explicit output sharding
+    /// and the sortedness and uniqueness index promises. Bounds modes and fills remain available.
+    fn validate_symbolic_options(
+        has_output_sharding: bool,
+        indices_are_sorted: bool,
+        unique_indices: bool,
+    ) -> Result<(), ProgramError> {
+        if has_output_sharding || indices_are_sorted || unique_indices {
+            return Err(TypeError::invalid(
+                "symbolic indexing does not yet support explicit output sharding or index promises",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
+where
+    V: Value<Type = ArrayIrType> + DimensionSize + DimensionToScalar + ValueProjection<ArrayType>,
+    V::Projected: Value<Type = ArrayType> + ConvertElementType + Compare + Add + Select + TransferToMemory + Reverse,
+    <V::Projected as Value>::ExecutionDomain: Context,
+    <<V::Projected as Value>::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
+{
+    /// Lifts a host coordinate literal through the projected array member of the input. Refer to the documentation of
+    /// the homogeneous [`constant`](Indexed::constant) for more information.
+    fn constant(&self, value: Array) -> Result<V, ProgramError> {
+        Ok(V::from_projected(self.input.clone().into_projected()?.at(&[]).constant(value)?))
+    }
+
+    /// Returns `value` with its projected array member reversed along `axes`, or an unchanged clone when no axis is
+    /// reversed, so that both paths stay in the mixed-IR value family.
+    fn reversed(value: &V, axes: &[usize]) -> Result<V, ProgramError> {
+        if axes.is_empty() {
+            return Ok(value.clone());
+        }
+        Ok(V::from_projected(value.clone().into_projected()?.reverse(axes.to_vec())?))
+    }
+
+    /// Resolves the supported symbolic selection geometry without reading traced array data on the host. One host-side
+    /// pass over the selectors validates every one of them and records the reversed axes, the inserted axes, and the
+    /// single queried axis; only then is that query staged, so that a bad later selector never leaves a partly staged
+    /// indexing expression in the caller's context.
+    ///
+    /// # Parameters
+    ///
+    ///   - `promise_in_bounds`: Whether the caller promised in-bounds indices, in which case host integers that cannot
+    ///     lie within the largest admitted extent of their axis are rejected here.
+    fn dynamic_plan(&self, promise_in_bounds: bool) -> Result<DynamicIndexPlan<V>, ProgramError> {
+        let input_type = self.input.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let rank = input_type.rank();
+        let consumed = self
+            .selectors
+            .iter()
+            .filter(|selector| !matches!(selector, IndexSelector::Basic(BasicIndex::NewAxis | BasicIndex::Ellipsis)))
+            .count();
+        if consumed > rank {
+            return Err(TypeError::invalid(format!(
+                "index selection consumes {consumed} axes but input rank is {rank}"
+            ))
+            .into());
+        }
+        let ellipses = self
+            .selectors
+            .iter()
+            .filter(|selector| matches!(selector, IndexSelector::Basic(BasicIndex::Ellipsis)))
+            .count();
+        if ellipses > 1 {
+            return Err(TypeError::invalid("index selection contains more than one ellipsis").into());
+        }
+        let mut query = None;
+        let mut query_count = 0;
+        let mut reversed_axes = Vec::new();
+        let mut inserted_axes = Vec::new();
+        let mut input_axis = 0;
+        let mut output_axis = 0;
+        for selector in self.selectors {
+            match selector {
+                IndexSelector::Basic(BasicIndex::Ellipsis) => {
+                    let omitted = rank - consumed;
+                    input_axis += omitted;
+                    output_axis += omitted;
+                }
+                IndexSelector::Basic(BasicIndex::NewAxis) => {
+                    inserted_axes.push(output_axis);
+                    output_axis += 1;
+                }
+                IndexSelector::Basic(BasicIndex::Slice(slice)) => {
+                    if slice.start().is_some() || slice.stop().is_some() || !matches!(slice.step(), -1 | 1) {
+                        return Err(TypeError::invalid(
+                            "symbolic indexing currently requires full slices with step `1` or `-1`",
+                        )
+                        .into());
+                    }
+                    if slice.step() < 0 {
+                        reversed_axes.push(input_axis);
+                    }
+                    input_axis += 1;
+                    output_axis += 1;
+                }
+                IndexSelector::Basic(BasicIndex::Integer(index)) => {
+                    i64::try_from(*index).map_err(|_| {
+                        TypeError::invalid("symbolic indexing requires host integer indices representable as `i64`")
+                    })?;
+                    if promise_in_bounds {
+                        // Dynamic upper bounds are exclusive. Even when the actual extent is unavailable, an index
+                        // outside the largest permitted extent cannot satisfy the caller's in-bounds promise.
+                        let dimension = input_type.dimension(input_axis);
+                        let maximum = dimension.value().or_else(|| dimension.bounds().upper().map(|upper| upper - 1));
+                        if maximum.is_some_and(|maximum| *index >= maximum as i128 || *index < -(maximum as i128)) {
+                            return Err(TypeError::invalid(
+                                "host integer index is out of bounds under `PromiseInBounds`",
+                            )
+                            .into());
+                        }
+                    }
+                    query.get_or_insert((input_axis, selector));
+                    query_count += 1;
+                    input_axis += 1;
+                }
+                IndexSelector::Array(indices) => {
+                    let indices_type = indices.r#type();
+                    let indices_type = <&ArrayType>::try_from(indices_type.as_ref())?;
+                    if !indices_type.data_type().is_integer() || !indices_type.data_type().is_signed() {
+                        return Err(TypeError::invalid("symbolic indexing requires signed integer query arrays").into());
+                    }
+                    if indices_type.memory() != input_type.memory() {
+                        return Err(TypeError::invalid("index arrays and input must share one memory space").into());
+                    }
+                    query.get_or_insert((input_axis, selector));
+                    query_count += 1;
+                    input_axis += 1;
+                    output_axis += indices_type.rank();
+                }
+                IndexSelector::Mask(_) => {
+                    return Err(
+                        TypeError::invalid("index masks require a concrete input shape in symbolic indexing").into()
+                    );
+                }
+            }
+        }
+        if query_count > 1 {
+            return Err(TypeError::invalid("symbolic indexing currently supports one indexed axis").into());
+        }
+        let query = match query {
+            None => None,
+            Some((axis, selector)) => {
+                let indices = match selector {
+                    IndexSelector::Basic(BasicIndex::Integer(index)) => {
+                        self.constant(Array::scalar(i64::try_from(*index).unwrap())?)?
+                    }
+                    IndexSelector::Array(indices) => (*indices).clone(),
+                    _ => unreachable!("only host integers and index arrays are recorded as queries"),
+                };
+                // Normalize negatives using the actual retained dimension value. This is ordinary array arithmetic,
+                // preserving the index array's symbolic shape and structural-zero tangent rather than concretizing it.
+                let indices = indices.into_projected()?.convert_element_type(DataType::I64)?;
+                let extent = self
+                    .input
+                    .dimension_size(axis)?
+                    .to_scalar()?
+                    .into_projected()?
+                    .transfer_to_memory(input_type.memory())?;
+                let zero = self.constant(Array::scalar(0_i64)?)?.into_projected()?;
+                let negative = indices.less_than(&zero)?;
+                let wrapped = indices.add(&extent)?;
+                Some((axis, V::from_projected(V::Projected::select(&negative, &wrapped, &indices)?)))
+            }
+        };
+        Ok(DynamicIndexPlan { query, reversed_axes, inserted_axes })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -2164,28 +2104,28 @@ mod tests {
         assert_eq!(IndexSelector::<Array>::from(-1_i32), IndexSelector::Basic(BasicIndex::Integer(-1)));
         assert_eq!(
             IndexSelector::<Array>::from(usize::MAX),
-            IndexSelector::Basic(BasicIndex::Integer(usize::MAX as i128))
+            IndexSelector::Basic(BasicIndex::Integer(usize::MAX as i128)),
         );
         assert_eq!(
             IndexSelector::<Array>::from(1..3),
-            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(1), Some(3), 1)))
+            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(1), Some(3), 1))),
         );
         assert_eq!(
             IndexSelector::<Array>::from(1..),
-            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(1), None, 1)))
+            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(1), None, 1))),
         );
         assert_eq!(
             IndexSelector::<Array>::from(..3),
-            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(None, Some(3), 1)))
+            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(None, Some(3), 1))),
         );
         assert_eq!(
             IndexSelector::<Array>::from(..),
-            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(None, None, 1)))
+            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(None, None, 1))),
         );
         assert_eq!(IndexSelector::<Array>::from(BasicIndex::NewAxis), IndexSelector::Basic(BasicIndex::NewAxis));
         assert_eq!(
             IndexSelector::<Array>::from(IndexSlice::new(Some(-2), None, -1)),
-            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(-2), None, -1)))
+            IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(-2), None, -1))),
         );
         let rows = Array::vector(vec![0_i32, 2]).unwrap();
         assert_eq!(IndexSelector::from(&rows), IndexSelector::Array(&rows));
@@ -2207,13 +2147,13 @@ mod tests {
         let input = Array::matrix(3, 4, (0_i32..12).collect()).unwrap();
         assert_eq!(
             input.at(&index![1..3, 1..4 by 2]).get(&GatherOptions::new()),
-            Array::matrix(2, 2, vec![5_i32, 7, 9, 11])
+            Array::matrix(2, 2, vec![5_i32, 7, 9, 11]),
         );
         assert_eq!(input.at(&index![..., -1]).get(&GatherOptions::new()), Array::vector(vec![3_i32, 7, 11]));
         assert_eq!(input.at(&index![]).get(&GatherOptions::new()), Ok(input.clone()));
         assert_eq!(
             input.at(&index![new_axis, 1, ..]).get(&GatherOptions::new()),
-            Array::matrix(1, 4, vec![4_i32, 5, 6, 7])
+            Array::matrix(1, 4, vec![4_i32, 5, 6, 7]),
         );
     }
 
@@ -2238,34 +2178,34 @@ mod tests {
         let columns = Array::vector(vec![1_i32, 3]).unwrap();
         assert_eq!(
             input.at(&index![.., &rows, &columns]).get(&GatherOptions::new()),
-            Array::matrix(3, 2, vec![1_i32, 13, 21, 33, 41, 53])
+            Array::matrix(3, 2, vec![1_i32, 13, 21, 33, 41, 53]),
         );
         // An ellipsis remains a separator even when it expands to zero axes.
         assert_eq!(
             input.at(&index![.., &rows, ..., &columns]).get(&GatherOptions::new()),
-            Array::matrix(2, 3, vec![1_i32, 21, 41, 13, 33, 53])
+            Array::matrix(2, 3, vec![1_i32, 21, 41, 13, 33, 53]),
         );
         assert_eq!(
             input.at(&index![1, .., &columns]).get(&GatherOptions::new()),
-            Array::matrix(2, 4, vec![21_i32, 26, 31, 36, 23, 28, 33, 38])
+            Array::matrix(2, 4, vec![21_i32, 26, 31, 36, 23, 28, 33, 38]),
         );
         assert_eq!(
             input.at(&index![.., 1, &columns]).get(&GatherOptions::new()),
-            Array::matrix(3, 2, vec![6_i32, 8, 26, 28, 46, 48])
+            Array::matrix(3, 2, vec![6_i32, 8, 26, 28, 46, 48]),
         );
         let scalar = Array::scalar(1_i32).unwrap();
         assert_eq!(
             input.at(&index![&scalar, .., &columns]).get(&GatherOptions::new()),
-            Array::matrix(2, 4, vec![21_i32, 26, 31, 36, 23, 28, 33, 38])
+            Array::matrix(2, 4, vec![21_i32, 26, 31, 36, 23, 28, 33, 38]),
         );
         assert_eq!(
             input.at(&index![.., &rows, new_axis, &columns]).get(&GatherOptions::new()),
-            Array::from_elements(ArrayType::new_static(DataType::I32, [2, 3, 1]), &[1_i32, 21, 41, 13, 33, 53])
+            Array::from_elements(ArrayType::new_static(DataType::I32, [2, 3, 1]), &[1_i32, 21, 41, 13, 33, 53]),
         );
         let rows = Array::matrix(2, 1, vec![0_i32, 2]).unwrap();
         assert_eq!(
             input.at(&index![&rows, &columns, 1]).get(&GatherOptions::new()),
-            Array::matrix(2, 2, vec![6_i32, 16, 46, 56])
+            Array::matrix(2, 2, vec![6_i32, 16, 46, 56]),
         );
     }
 
@@ -2277,17 +2217,17 @@ mod tests {
         let empty = IndexMask::new(vec![2], vec![false, false]).unwrap();
         assert_eq!(
             input.at(&index![&empty]).get(&GatherOptions::new()),
-            Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [0, 3]), &[])
+            Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [0, 3]), &[]),
         );
         let active = IndexMask::new(vec![], vec![true]).unwrap();
         assert_eq!(
             input.at(&index![&active]).get(&GatherOptions::new()),
-            Array::from_elements(ArrayType::new_static(DataType::I32, [1, 2, 3]), &[0_i32, 1, 2, 3, 4, 5])
+            Array::from_elements(ArrayType::new_static(DataType::I32, [1, 2, 3]), &[0_i32, 1, 2, 3, 4, 5]),
         );
         let inactive = IndexMask::new(vec![], vec![false]).unwrap();
         assert_eq!(
             input.at(&index![&inactive]).get(&GatherOptions::new()),
-            Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [0, 2, 3]), &[])
+            Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [0, 2, 3]), &[]),
         );
     }
 
@@ -2401,7 +2341,7 @@ mod tests {
         let indices = Array::vector(vec![0_u64, 2, u64::MAX]).unwrap();
         let fill =
             GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(-99_i32).unwrap())) });
-        assert_eq!(input.at(&index![&indices]).get(&fill), Array::vector(vec![10_i32, 30, -99]),);
+        assert_eq!(input.at(&index![&indices]).get(&fill), Array::vector(vec![10_i32, 30, -99]));
         assert_eq!(
             input.at(&index![&indices]).get(&GatherOptions::new().with_mode(GatherMode::Clip)),
             Array::vector(vec![10_i32, 30, 30]),
@@ -2429,7 +2369,7 @@ mod tests {
                 %2:f64[2] = reshape [shape=[2]] %1
             in (%2)
         "}
-            .trim_end()
+            .trim_end(),
         );
         assert_eq!(
             program.interpret(Array::matrix(2, 3, vec![10_f64, 20., 30., 40., 50., 60.]).unwrap()),
@@ -2785,7 +2725,7 @@ mod tests {
                 ArrayType::new_static(DataType::I32, [1, 2, 2]).with_sharding(requested).unwrap(),
                 &[1_i32, 3, 9, 11],
             )
-            .unwrap()
+            .unwrap(),
         );
     }
 
@@ -2800,8 +2740,8 @@ mod tests {
         // Generated zero and extent literals must share the query/input memory before index normalization.
         assert_eq!(
             input.at(&index![&indices]).get(&GatherOptions::new()),
-            Ok(Array::from_elements(ArrayType::new_static(DataType::I32, [2]).with_memory(memory), &[30_i32, 10],)
-                .unwrap())
+            Ok(Array::from_elements(ArrayType::new_static(DataType::I32, [2]).with_memory(memory), &[30_i32, 10])
+                .unwrap()),
         );
     }
 
@@ -2902,7 +2842,7 @@ mod tests {
                 ArrayType::new_static(DataType::F64, [2, 2, 2]),
                 &[2_f64, 0., 5., 3., 8., 6., 11., 9.],
             )
-            .unwrap()
+            .unwrap(),
         );
     }
 
@@ -2912,12 +2852,12 @@ mod tests {
         let updates = Array::scalar(9_i32).unwrap();
         assert_eq!(
             input.at(&index![.., 1..3]).set(&updates, &ScatterOptions::new()),
-            Array::matrix(2, 3, vec![0_i32, 9, 9, 3, 9, 9])
+            Array::matrix(2, 3, vec![0_i32, 9, 9, 3, 9, 9]),
         );
         let indices = Array::vector(vec![0_i32, 2]).unwrap();
         assert_eq!(
             input.at(&index![1, &indices]).set(&Array::vector(vec![7_i32, 8]).unwrap(), &ScatterOptions::new()),
-            Array::matrix(2, 3, vec![0_i32, 1, 2, 7, 4, 8])
+            Array::matrix(2, 3, vec![0_i32, 1, 2, 7, 4, 8]),
         );
         assert_eq!(input, Array::matrix(2, 3, vec![0_i32, 1, 2, 3, 4, 5]).unwrap());
     }
@@ -2927,19 +2867,19 @@ mod tests {
         let input = Array::vector(vec![0_i32, 1, 2, 3, 4]).unwrap();
         assert_eq!(
             input.at(&index![..by - 2]).set(&Array::vector(vec![7_i32, 8, 9]).unwrap(), &ScatterOptions::new()),
-            Array::vector(vec![9_i32, 1, 8, 3, 7])
+            Array::vector(vec![9_i32, 1, 8, 3, 7]),
         );
         let mask = IndexMask::new(vec![5], vec![false, true, false, true, false]).unwrap();
         assert_eq!(
             input.at(&index![&mask]).set(&Array::scalar(6_i32).unwrap(), &ScatterOptions::new()),
-            Array::vector(vec![0_i32, 6, 2, 6, 4])
+            Array::vector(vec![0_i32, 6, 2, 6, 4]),
         );
         let invalid = Array::vector(vec![-6_i32, 5]).unwrap();
         assert_eq!(
             input
                 .at(&index![&invalid])
                 .set(&Array::scalar(9_i32).unwrap(), &ScatterOptions::new().with_mode(ScatterMode::Drop)),
-            Ok(input)
+            Ok(input),
         );
     }
 
@@ -2956,7 +2896,7 @@ mod tests {
             input.at(&index![&indices]).set(&updates, &ScatterOptions::new().with_mode(ScatterMode::Clip)),
             Ok(input.clone()),
         );
-        assert_eq!(input.at(&index![..]).set(&updates, &ScatterOptions::new()), Ok(input),);
+        assert_eq!(input.at(&index![..]).set(&updates, &ScatterOptions::new()), Ok(input));
     }
 
     #[test]
@@ -2966,7 +2906,7 @@ mod tests {
         let updates = Array::vector(vec![2_i32, 3, 4]).unwrap();
         assert_eq!(
             input.at(&index![&indices]).add(&updates, &ScatterOptions::new()),
-            Array::vector(vec![10_i32, 25, 34])
+            Array::vector(vec![10_i32, 25, 34]),
         );
     }
 
@@ -3087,7 +3027,7 @@ mod tests {
                 ArrayType::new_static(DataType::F64, [2]).with_sharding(sharding.clone()).unwrap(),
                 &[30_f64, 10.],
             )
-            .unwrap())
+            .unwrap()),
         );
         assert_eq!(
             input.at(&index![&indices]).add(&updates, &ScatterOptions::new()),
@@ -3095,7 +3035,7 @@ mod tests {
                 ArrayType::new_static(DataType::F64, [3]).with_sharding(sharding).unwrap(),
                 &[17_f64, 20., 35.],
             )
-            .unwrap())
+            .unwrap()),
         );
     }
 
@@ -3120,7 +3060,7 @@ mod tests {
         let updates = Array::vector(vec![2_i32, 3, 4]).unwrap();
         assert_eq!(
             input.at(&index![&indices]).mul(&updates, &ScatterOptions::new()),
-            Array::vector(vec![10_i32, 120, 120])
+            Array::vector(vec![10_i32, 120, 120]),
         );
     }
 
@@ -3131,7 +3071,7 @@ mod tests {
         let updates = Array::vector(vec![2_i32, 3, 4]).unwrap();
         assert_eq!(
             input.at(&index![&indices]).min(&updates, &ScatterOptions::new()),
-            Array::vector(vec![10_i32, 2, 4])
+            Array::vector(vec![10_i32, 2, 4]),
         );
     }
 
@@ -3142,7 +3082,7 @@ mod tests {
         let updates = Array::vector(vec![2_i32, 3, 4]).unwrap();
         assert_eq!(
             input.at(&index![&indices]).max(&updates, &ScatterOptions::new()),
-            Array::vector(vec![10_i32, 20, 30])
+            Array::vector(vec![10_i32, 20, 30]),
         );
     }
 
@@ -3313,7 +3253,7 @@ mod tests {
         buffer.write(&ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap())).unwrap();
         assert_eq!(
             buffer.at(&index![1, 1..]).read(),
-            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0]).unwrap())),
         );
     }
 
@@ -3337,7 +3277,7 @@ mod tests {
             buffer
                 .at(&index![1])
                 .write(&ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()))
-                .is_err()
+                .is_err(),
         );
     }
 
@@ -3408,16 +3348,16 @@ mod tests {
             2isize
         }];
         assert_eq!(evaluations, ["start", "stop", "step"]);
-        assert_eq!(selection, [IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(1), Some(9), 2)))],);
+        assert_eq!(selection, [IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(1), Some(9), 2)))]);
         let grouped: [IndexSelector<'_, Array>; 1] = index![(|first, second| first + second)(1, 2)..9 by 2];
-        assert_eq!(grouped, [IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(3), Some(9), 2)))],);
+        assert_eq!(grouped, [IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(3), Some(9), 2)))]);
     }
 
     #[test]
     fn test_index_array_borrow() {
         let rows = Array::vector(vec![0_i32, 2]).unwrap();
         let selection = index![&rows, ...];
-        assert_eq!(selection, [IndexSelector::Array(&rows), IndexSelector::Basic(BasicIndex::Ellipsis)],);
+        assert_eq!(selection, [IndexSelector::Array(&rows), IndexSelector::Basic(BasicIndex::Ellipsis)]);
         // Constructing descriptors keeps the original array available to the caller.
         assert_eq!(rows, Array::vector(vec![0_i32, 2]).unwrap());
     }
