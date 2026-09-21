@@ -605,7 +605,8 @@ impl<
                 &gather_options,
             )?;
 
-            if plan.shape.iter().all(|&extent| extent != 0) && !matches!(options.mode(), GatherMode::Fill { .. }) {
+            if plan.output_shape.iter().all(|&extent| extent != 0) && !matches!(options.mode(), GatherMode::Fill { .. })
+            {
                 return Err(TypeError::invalid(
                     "cannot index a nonempty selection from an empty axis without fill mode",
                 )
@@ -738,12 +739,23 @@ impl<
 
         let expanded = self.expanded()?;
         let plan = self.plan(&expanded, matches!(options.mode(), ScatterMode::PromiseInBounds))?;
-        let updates = updates.broadcast_to(Shape::from(plan.output_shape))?.reshape(Shape::from(plan.shape))?;
+
+        // The scatter update has the selection shape without the inserted axes, which consume no input axis.
+        let update_shape = plan
+            .output_shape
+            .iter()
+            .enumerate()
+            .filter(|(axis, _)| !plan.new_axes.contains(axis))
+            .map(|(_, &extent)| extent)
+            .collect::<Vec<_>>();
+        let updates = updates.broadcast_to(Shape::from(plan.output_shape))?.reshape(Shape::from(update_shape))?;
+
         let dimensions = ScatterDimensionNumbers::new(
             plan.dimensions.offset_dimensions().to_vec(),
             plan.dimensions.collapsed_slice_dimensions().to_vec(),
             plan.dimensions.start_index_map().to_vec(),
         );
+
         let options = options.clone().with_indices_are_sorted(false);
         self.input.scatter(&plan.indices, &updates, &dimensions, kind, &options)
     }
@@ -1041,7 +1053,6 @@ impl<
         }
 
         let mut query_shape = Vec::new();
-        let mut shape = Vec::new();
         let mut output_shape = Vec::new();
         let mut offsets = Vec::new();
         let mut new_axes = Vec::new();
@@ -1057,19 +1068,17 @@ impl<
                     for &extent in &broadcast {
                         advanced_axes.push(query_shape.len());
                         query_shape.push(extent);
-                        shape.push(extent);
                         output_shape.push(extent);
                     }
                 }
                 OutputAxis::Query(query) => {
                     slice_query_axes[query] = query_shape.len();
                     query_shape.push(query_lengths[query]);
-                    shape.push(query_lengths[query]);
                     output_shape.push(query_lengths[query]);
                 }
                 OutputAxis::Window(axis) => {
-                    offsets.push(shape.len());
-                    shape.push(sizes[axis]);
+                    // Offsets index the gather result, which has no inserted axes.
+                    offsets.push(output_shape.len() - new_axes.len());
                     output_shape.push(sizes[axis]);
                 }
             }
@@ -1115,7 +1124,6 @@ impl<
             indices,
             dimensions: GatherDimensionNumbers::new(offsets, collapsed, start_map),
             sizes,
-            shape,
             output_shape,
             new_axes,
         })
@@ -1877,11 +1885,6 @@ impl<
 /// ```
 #[macro_export]
 macro_rules! index {
-    // The public form accepts comma-separated selectors and an optional trailing comma.
-    ($($selectors:tt)*) => {
-        $crate::index!(@items [] [] $($selectors)*)
-    };
-
     // Finish the accumulated descriptor array, including the empty selection.
     (@items [$($items:expr,)*] []) => { [$($items,)*] };
 
@@ -1969,6 +1972,12 @@ macro_rules! index {
     (@$state:ident $($rest:tt)*) => {
         compile_error!("invalid indexing selector syntax")
     };
+
+    // The public form accepts comma-separated selectors and an optional trailing comma. It must follow the internal
+    // `@`-prefixed arms, because it matches any token sequence, including theirs.
+    ($($selectors:tt)*) => {
+        $crate::index!(@items [] [] $($selectors)*)
+    };
 }
 
 // The macro is exported at the crate root by `#[macro_export]`; this re-export lets callers that import the
@@ -1993,14 +2002,12 @@ enum ExpandedIndexSelector<V> {
     Boolean(bool),
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// The gather or scatter that realizes one expanded selection. [`plan`](Indexed::plan) builds it once from the
 /// [`ExpandedIndexSelector`]s, and reads and updates share it so that both address exactly the same input positions.
 /// Contiguous slices become gather windows, and only strided slices and advanced indices contribute coordinates, which
-/// keeps the coordinate array small. The gather result and the scatter update have [`shape`](Self::shape), while the
-/// caller sees [`output_shape`](Self::output_shape), which differs only by the inserted extent-one axes; reads reshape
-/// after gathering and updates reshape before scattering.
+/// keeps the coordinate array small. The caller sees [`output_shape`](Self::output_shape), whereas the gather result
+/// and the scatter update have that shape without the axes at [`new_axes`](Self::new_axes), because an inserted axis
+/// consumes no input axis; reads reshape after gathering and updates reshape before scattering.
 struct IndexPlan<V> {
     /// Jointly broadcast coordinates of every strided slice and advanced index, with a trailing index-vector axis.
     indices: V,
@@ -2012,14 +2019,24 @@ struct IndexPlan<V> {
     /// Window size on every input axis: the slice length for a contiguous slice and one everywhere else.
     sizes: Vec<usize>,
 
-    /// Shape of the gather result and of the scatter update, before the inserted extent-one axes.
-    shape: Vec<usize>,
-
     /// Shape the caller sees, including the inserted extent-one axes.
     output_shape: Vec<usize>,
 
     /// Positions of the inserted extent-one axes within [`output_shape`](Self::output_shape).
     new_axes: Vec<usize>,
+}
+
+/// Runtime geometry for a selection with at most one array or scalar index. Full slices preserve their dimension
+/// identities; inserted axes are recorded separately so gather/scatter continue to operate on the original rank.
+struct DynamicIndexPlan<V> {
+    /// Optional input axis and normalized signed query array.
+    query: Option<(usize, V)>,
+
+    /// Full input axes traversed backward.
+    reversed_axes: Vec<usize>,
+
+    /// Positions of inserted size-one axes in the selected result.
+    inserted_axes: Vec<usize>,
 }
 
 /// Axis contribution in the public selection order, before the advanced broadcast dimensions are inserted.
@@ -2051,19 +2068,6 @@ enum ReferenceAxisSelection<'i, V> {
 
     /// A scalar integer value that removes the axis at run time.
     Dynamic(&'i V),
-}
-
-/// Runtime geometry for a selection with at most one array or scalar index. Full slices preserve their dimension
-/// identities; inserted axes are recorded separately so gather/scatter continue to operate on the original rank.
-struct DynamicIndexPlan<V> {
-    /// Optional input axis and normalized signed query array.
-    query: Option<(usize, V)>,
-
-    /// Full input axes traversed backward.
-    reversed_axes: Vec<usize>,
-
-    /// Positions of inserted size-one axes in the selected result.
-    inserted_axes: Vec<usize>,
 }
 
 #[cfg(test)]
