@@ -4590,6 +4590,7 @@ mod tests {
         assert_eq!(operation.limit_indices(), &[2, 3]);
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+
         // Program rendering uses the canonical operation name and includes the captured indices.
         let mut builder = ProgramBuilder::<Array, SliceOperation>::new();
         let program_input = builder.add_input(input_type);
@@ -4622,9 +4623,9 @@ mod tests {
 
     #[test]
     fn test_slice_type_inference() {
-        let operation = SliceOperation::new(vec![1, 1], vec![2, 3]);
         // Type inference validates the slice bounds and returns the sliced type, and the type-level (abstract)
         // capability backs it without consuming the borrowed input type.
+        let operation = SliceOperation::new(vec![1, 1], vec![2, 3]);
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         let dynamic_type = ArrayType::new(
@@ -4653,7 +4654,7 @@ mod tests {
                     input_types = [dynamic_type],
                     error = format!(
                         "`{SLICE_OPERATION_NAME}` limit index 2 exceeds the guaranteed minimum extent 0 of dynamic \
-                         axis 0"
+                         axis 0",
                     ),
                 },
             ],
@@ -4688,25 +4689,25 @@ mod tests {
         assert_eq!(
             SliceOperation::new(vec![0, 0], vec![2, 3]).with_strides(vec![2]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{SLICE_OPERATION_NAME}` `strides` has length 1 but `start_indices` has length 2"
+                "`{SLICE_OPERATION_NAME}` `strides` has length 1 but `start_indices` has length 2",
             )))),
         );
         assert_eq!(
             SliceOperation::new(vec![0, 0], vec![2, 3]).with_strides(vec![1, 0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{SLICE_OPERATION_NAME}` strides must be at least 1 but axis 1 has stride 0"
+                "`{SLICE_OPERATION_NAME}` strides must be at least 1 but axis 1 has stride 0",
             )))),
         );
         assert_eq!(
             input_type.slice(&[0, 0], &[2, 3], &[1]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{SLICE_OPERATION_NAME}` `strides` has length 1 but input has rank 2"
+                "`{SLICE_OPERATION_NAME}` `strides` has length 1 but input has rank 2",
             )))),
         );
         assert_eq!(
             input_type.slice(&[0, 0], &[2, 3], &[1, 0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{SLICE_OPERATION_NAME}` strides must be at least 1 but axis 1 has stride 0"
+                "`{SLICE_OPERATION_NAME}` strides must be at least 1 but axis 1 has stride 0",
             )))),
         );
 
@@ -4747,6 +4748,7 @@ mod tests {
     fn test_slice_interpretation() {
         let operation = SliceOperation::new(vec![1, 1], vec![2, 3]);
         let output_type = ArrayType::new_static(DataType::F64, [1, 2]);
+
         // Interpretation copies the selected block out of the row-major payload.
         let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let output = operation
@@ -4876,12 +4878,13 @@ mod tests {
         );
         assert_eq!(
             SliceOperation::new(vec![0], vec![2])
-                .batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input.clone(), BatchAxis::new(0)).unwrap()],)
+                .batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input.clone(), BatchAxis::new(0)).unwrap()])
                 .unwrap_err(),
             BatchingError::DynamicBatchAxis { r#type: Box::new(input.r#type().into_owned()), axis: Axis::from(0) },
         );
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+
         // The full input is [2 (batch), 4]: the batch axis is replicated and the data axis is sharded over `x`.
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]))
             .with_sharding(
@@ -4889,6 +4892,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
+
         // Each batch item slices its `x`-sharded [4] vector to [2] (2 is divisible by the `x` mesh-axis size, so the
         // slice keeps the sharding); batching restores the replicated batch axis, so the staged slice's output stays
         // sharded.
@@ -5023,7 +5027,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             primal_outputs[0],
-            ArrayIrValue::Array(Array::from_elements(output_type.clone(), &[1.0_f64, 3.0]).unwrap())
+            ArrayIrValue::Array(Array::from_elements(output_type.clone(), &[1.0_f64, 3.0]).unwrap()),
         );
         let residuals = primal_outputs.split_off(1);
         let mut tangent_inputs = vec![ArrayIrValue::Array(
@@ -5142,7 +5146,7 @@ mod tests {
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
             TypeError::invalid(format!(
-                "`{SLICE_OPERATION_NAME}` transpose requires a static input shape but got `f64[elements]`"
+                "`{SLICE_OPERATION_NAME}` transpose requires a static input shape but got `f64[elements]`",
             ))
             .into(),
         );
@@ -5163,7 +5167,7 @@ mod tests {
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
             TypeError::invalid(format!(
-                "`{SLICE_OPERATION_NAME}` transpose requires a static input shape but axis 0 has size elements"
+                "`{SLICE_OPERATION_NAME}` transpose requires a static input shape but axis 0 has size elements",
             ))
             .into(),
         );
@@ -5198,6 +5202,7 @@ mod tests {
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         assert!(pullback.output_ids().is_empty());
+
         // Both overlapping slices update the supplied buffer directly through views. There is no dense zero, pad, or
         // full-gradient result, and the second invocation adds another contribution without resetting the buffer.
         assert_eq!(
@@ -5220,12 +5225,12 @@ mod tests {
         assert_eq!(pullback.interpret(vec![seeds[0].clone(), seeds[1].clone(), buffer.clone()]), Ok(vec![]));
         assert_eq!(
             buffer.read(),
-            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 11.0, 16.0, 18.0, 16.0]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 11.0, 16.0, 18.0, 16.0]).unwrap())),
         );
         assert_eq!(pullback.interpret(vec![seeds[0].clone(), seeds[1].clone(), buffer.clone()]), Ok(vec![]));
         assert_eq!(
             buffer.read(),
-            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 22.0, 26.0, 22.0]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 22.0, 26.0, 22.0]).unwrap())),
         );
 
         let returned = program.transpose_with_respect_to(&[0], &[]).unwrap();
@@ -5258,8 +5263,8 @@ mod tests {
             input.slice(&[0, 0], &[3, 4], &[1, 1]),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{SLICE_OPERATION_NAME}` on a dimension sharded over explicit mesh axes requires the output size (3) \
-                 at axis 0 to be divisible by the mesh-axis product (2)"
-            ))))
+                 at axis 0 to be divisible by the mesh-axis product (2)",
+            )))),
         );
     }
 
@@ -5334,7 +5339,7 @@ mod tests {
         assert_eq!(input.slice_axis(0, 1, 2, 1), Ok(Array::matrix(1, 3, vec![40i32, 50, 60]).unwrap()));
         assert!(matches!(input.slice_axis(1, 0, 3, 0), Err(ProgramError::Type(error))
         if error == TypeError::invalid(format!(
-            "`{SLICE_OPERATION_NAME}` strides must be at least 1 but axis 1 has stride 0"
+            "`{SLICE_OPERATION_NAME}` strides must be at least 1 but axis 1 has stride 0",
         ))));
 
         // Every unsliced axis must have a static extent because the static operation needs its complete limit.
@@ -5372,6 +5377,7 @@ mod tests {
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
+
         // Program rendering uses the canonical operation name and includes the captured indices.
         let mut builder = ProgramBuilder::<Array, UpdateSliceOperation>::new();
         let program_input = builder.add_input(input_type);
@@ -5430,7 +5436,7 @@ mod tests {
                         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
                     ],
                     error = format!(
-                        "`{UPDATE_SLICE_OPERATION_NAME}` input data type `f64` does not match update data type `f32`"
+                        "`{UPDATE_SLICE_OPERATION_NAME}` input data type `f64` does not match update data type `f32`",
                     ),
                 },
                 {
@@ -5441,14 +5447,14 @@ mod tests {
                     input_types = [input_type.clone(), dynamic_update_type],
                     error = format!(
                         "`{UPDATE_SLICE_OPERATION_NAME}` does not support dynamic update axis 0 with size dynamic; \
-                         update shapes must be static"
+                         update shapes must be static",
                     ),
                 },
                 {
                     input_types = [dynamic_input_type, update_type.clone()],
                     error = format!(
                         "`{UPDATE_SLICE_OPERATION_NAME}` update limit 1 exceeds the guaranteed minimum extent 0 of \
-                         dynamic axis 0"
+                         dynamic axis 0",
                     ),
                 },
             ],
@@ -5476,7 +5482,7 @@ mod tests {
                 input_types = [input_type.clone(), update_type.clone()],
                 error = format!(
                     "`{UPDATE_SLICE_OPERATION_NAME}` update axis 1 with start index 2 and size 2 does not fit in \
-                     input size 3"
+                     input size 3",
                 ),
             }],
         );
@@ -5517,22 +5523,6 @@ mod tests {
 
     #[test]
     fn test_update_slice_interpretation() {
-        // Applying output sharding metadata preserves the non-dense layout and the untouched input values.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let input_type =
-            ArrayType::new_static(DataType::I32, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-4])));
-        let update_type = ArrayType::new_static(DataType::I32, [1])
-            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
-            .unwrap();
-        let input = Array::from_elements(input_type.clone(), &[1_i32, 2, 3]).unwrap();
-        let update = Array::from_elements(update_type, &[9_i32]).unwrap();
-        let output = input.update_slice(&update, &[1]).unwrap();
-        let expected_type = input_type
-            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
-            .unwrap();
-        assert_eq!(output, Array::from_elements(expected_type, &[1_i32, 9, 3]).unwrap());
-        assert_eq!(input.elements::<i32>(), Ok(vec![1, 2, 3]));
-
         let operation = UpdateSliceOperation::new(vec![0, 1]);
         let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
         // Interpretation overwrites the selected block of the row-major payload.
@@ -5554,6 +5544,22 @@ mod tests {
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
+
+        // Applying output sharding metadata preserves the non-dense layout and the untouched input values.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type =
+            ArrayType::new_static(DataType::I32, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-4])));
+        let update_type = ArrayType::new_static(DataType::I32, [1])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let input = Array::from_elements(input_type.clone(), &[1_i32, 2, 3]).unwrap();
+        let update = Array::from_elements(update_type, &[9_i32]).unwrap();
+        let output = input.update_slice(&update, &[1]).unwrap();
+        let expected_type = input_type
+            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        assert_eq!(output, Array::from_elements(expected_type, &[1_i32, 9, 3]).unwrap());
+        assert_eq!(input.elements::<i32>(), Ok(vec![1, 2, 3]));
     }
 
     #[test]
@@ -5636,8 +5642,8 @@ mod tests {
 
     #[test]
     fn test_update_slice_batching_sharding() {
-        // A mapped input sharded over an explicit mesh axis keeps its placement through both the static and the dynamic
-        // update rule: the replicated update is aligned to the mapped input before each item writes its own block.
+        // A mapped input sharded over an explicit mesh axis keeps its placement: the replicated update is aligned to
+        // the mapped input before each item writes its own block.
         let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let explicit_sharding = Sharding::new(
             explicit_mesh.clone(),
@@ -5657,19 +5663,7 @@ mod tests {
         .unwrap();
         let update = ArrayBatch::replicated(Array::from_elements::<f64>(update_type, &[9.0, 9.0]).unwrap());
         let outputs = UpdateSliceOperation::new(vec![1])
-            .batch(&context, &EmptyRegionDriver, &[input.clone(), update.clone()])
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].r#type().sharding(), Some(&explicit_sharding));
-        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
-        let outputs = DynamicUpdateSliceOperation::new()
-            .batch(
-                &context,
-                &EmptyRegionDriver,
-                &[input, update, ArrayBatch::replicated(Array::scalar(1_i32).unwrap())],
-            )
+            .batch(&context, &EmptyRegionDriver, &[input, update])
             .unwrap()
             .into_parts()
             .0;
@@ -5697,19 +5691,7 @@ mod tests {
         .unwrap();
         let update = ArrayBatch::replicated(Array::from_elements::<f64>(update_type, &[9.0, 9.0]).unwrap());
         let outputs = UpdateSliceOperation::new(vec![1])
-            .batch(&context, &EmptyRegionDriver, &[input.clone(), update.clone()])
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].r#type().sharding(), Some(&manual_sharding));
-        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
-        let outputs = DynamicUpdateSliceOperation::new()
-            .batch(
-                &context,
-                &EmptyRegionDriver,
-                &[input, update, ArrayBatch::replicated(Array::scalar(1_i32).unwrap())],
-            )
+            .batch(&context, &EmptyRegionDriver, &[input, update])
             .unwrap()
             .into_parts()
             .0;
@@ -5740,7 +5722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_slice_differentiation_dynamic_input() {
+    fn test_update_slice_differentiation_array_ir() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(3, Some(6)).unwrap());
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -5805,13 +5787,13 @@ mod tests {
         tangent_inputs.extend(outputs.clone());
         assert_eq!(
             input_only.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 0.0, 0.0, 40.0]).unwrap())])
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 0.0, 0.0, 40.0]).unwrap())]),
         );
         let mut cotangents = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap())];
         cotangents.extend(outputs);
         assert_eq!(
             input_only.pullback().unwrap().interpret(cotangents),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0]).unwrap())])
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 4.0]).unwrap())]),
         );
 
         // With only the update tangent live, retain the runtime input extent to construct its missing zero tangent.
@@ -5830,14 +5812,14 @@ mod tests {
         tangent_inputs.extend(outputs.clone());
         assert_eq!(
             update_only.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 6.0, 0.0]).unwrap())])
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 6.0, 0.0]).unwrap())]),
         );
         let pullback = update_only.pullback().unwrap();
         let mut cotangents = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap())];
         cotangents.extend(outputs);
         assert_eq!(
             pullback.interpret(cotangents),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap())])
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap())]),
         );
 
         let mut outputs = update_only
@@ -5852,13 +5834,13 @@ mod tests {
         tangent_inputs.extend(outputs.clone());
         assert_eq!(
             update_only.tangent().interpret(tangent_inputs),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 6.0, 0.0, 0.0]).unwrap())])
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 5.0, 6.0, 0.0, 0.0]).unwrap())]),
         );
         let mut cotangents = vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0]).unwrap())];
         cotangents.extend(outputs);
         assert_eq!(
             pullback.interpret(cotangents),
-            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap())])
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]).unwrap())]),
         );
     }
 
@@ -5989,8 +5971,8 @@ mod tests {
             host_input.update_slice(&ArrayType::new_static(DataType::F32, [2]), &[0]),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{UPDATE_SLICE_OPERATION_NAME}` input and update must share one memory space but reside in \
-                 `Host[Pinned]` and `Device`"
-            ))))
+                 `Host[Pinned]` and `Device`",
+            )))),
         );
 
         // Resizing keeps explicit placement only when the resulting dimension remains evenly divisible.
@@ -6013,7 +5995,7 @@ mod tests {
                 "`{UPDATE_SLICE_OPERATION_NAME}` input and update must be sharded identically, but got `{}` and `{}`",
                 input.sharding().unwrap(),
                 conflicting.sharding().unwrap(),
-            ))))
+            )))),
         );
         // A varying manual update changes the dependency metadata while retaining explicit placement.
         let varying = matching.clone().with_sharding(sharding.with_varying_manual_axes(["m"]).unwrap()).unwrap();
@@ -6028,6 +6010,7 @@ mod tests {
             Shape::new(vec![Dimension::Static(2), Dimension::Static(3), Dimension::Static(4)]),
         );
         let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
+
         // The matching update-slice writes the block back into place.
         let update = Array::from_elements::<f64>(
             ArrayType::new(
@@ -6089,29 +6072,7 @@ mod tests {
             &[10i32, 40, 30],
         )
         .unwrap();
-        assert_eq!(input.update_slice(&update, &[1]), Ok(expected.clone()));
-        assert_eq!(input.dynamic_update_slice(&update, &[Array::scalar(1i32).unwrap()]), Ok(expected));
-
-        // A discrete start can vary over a manual axis even when both array inputs are invariant.
-        let index = Array::from_elements(
-            ArrayType::scalar(DataType::I32)
-                .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_varying_manual_axes(["m"]).unwrap())
-                .unwrap(),
-            &[1i32],
-        )
-        .unwrap();
-        assert_eq!(
-            input.dynamic_slice(std::slice::from_ref(&index), &[1]).unwrap().r#type().sharding(),
-            Some(&varying)
-        );
-        assert_eq!(
-            input
-                .dynamic_update_slice(&Array::vector(vec![40i32]).unwrap(), &[index])
-                .unwrap()
-                .r#type()
-                .sharding(),
-            Some(&varying)
-        );
+        assert_eq!(input.update_slice(&update, &[1]), Ok(expected));
 
         // An unsharded base is invariant. A varying update still makes the written block vary over its mesh.
         let plain = Array::vector(vec![10i32, 20, 30]).unwrap();
@@ -6120,8 +6081,7 @@ mod tests {
             &[10i32, 40, 30],
         )
         .unwrap();
-        assert_eq!(plain.update_slice(&update, &[1]), Ok(expected.clone()));
-        assert_eq!(plain.dynamic_update_slice(&update, &[Array::scalar(1i32).unwrap()]), Ok(expected));
+        assert_eq!(plain.update_slice(&update, &[1]), Ok(expected));
     }
 
     #[test]
@@ -6130,7 +6090,7 @@ mod tests {
         let update = ArrayIrValue::Array(Array::vector(vec![40i32]).unwrap());
         assert_eq!(
             input.update_slice(&update, &[1]),
-            Ok(ArrayIrValue::Array(Array::vector(vec![10i32, 40, 30]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::vector(vec![10i32, 40, 30]).unwrap())),
         );
     }
 
@@ -6151,6 +6111,7 @@ mod tests {
 
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let index_type = ArrayType::scalar(DataType::I32);
+
         // Program rendering uses the canonical operation name and includes the captured sizes.
         let mut builder = ProgramBuilder::<Array, DynamicSliceOperation>::new();
         let program_input = builder.add_input(input_type);
@@ -6175,8 +6136,8 @@ mod tests {
 
     #[test]
     fn test_dynamic_slice_type_inference() {
-        let operation = DynamicSliceOperation::new(vec![1, 2]);
         // Type inference validates the sizes and index input types and returns the statically shaped output.
+        let operation = DynamicSliceOperation::new(vec![1, 2]);
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let index_type = ArrayType::scalar(DataType::I32);
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
@@ -6219,26 +6180,26 @@ mod tests {
                     ],
                     error = format!(
                         "`{DYNAMIC_SLICE_OPERATION_NAME}` size 1 exceeds the guaranteed minimum extent 0 of dynamic \
-                         axis 0"
+                         axis 0",
                     ),
                 },
                 {
                     input_types = [],
                     error = format!(
                         "`{DYNAMIC_SLICE_OPERATION_NAME}` expects an array input followed by its start index inputs \
-                         but got no inputs"
+                         but got no inputs",
                     ),
                 },
                 {
                     input_types = [input_type.clone(), index_type.clone()],
                     error = format!(
-                        "`{DYNAMIC_SLICE_OPERATION_NAME}` expects one start index per input axis (2) but got 1"
+                        "`{DYNAMIC_SLICE_OPERATION_NAME}` expects one start index per input axis (2) but got 1",
                     ),
                 },
                 {
                     input_types = [input_type.clone(), ArrayType::scalar(DataType::F64), index_type.clone()],
                     error = format!(
-                        "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `f64[]`"
+                        "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `f64[]`",
                     ),
                 },
                 {
@@ -6248,14 +6209,14 @@ mod tests {
                         index_type.clone(),
                     ],
                     error = format!(
-                        "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `i32[2]`"
+                        "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `i32[2]`",
                     ),
                 },
                 {
                     input_types = [input_type.clone(), index_type.clone(), ArrayType::scalar(DataType::I64)],
                     error = format!(
                         "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must share one integer type but index 1 has \
-                         type `i64[]` and index 0 has type `i32[]`"
+                         type `i64[]` and index 0 has type `i32[]`",
                     ),
                 },
             ],
@@ -6321,6 +6282,7 @@ mod tests {
     fn test_dynamic_slice_interpretation() {
         let operation = DynamicSliceOperation::new(vec![1, 2]);
         let output_type = ArrayType::new_static(DataType::F64, [1, 2]);
+
         // Interpretation extracts the block at the in-band start indices.
         let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let output = operation
@@ -6343,6 +6305,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(clamped[0].to_f64s(), vec![5.0, 6.0]);
+
         // Without the negative-index policy, the column start `-2` is out of bounds and clamps to zero.
         let clamped = DynamicSliceOperation::new(vec![1, 2])
             .with_allow_negative_indices(false)
@@ -6393,32 +6356,8 @@ mod tests {
 
     #[test]
     fn test_dynamic_slice_batching() {
-        // Index-varying empty batches preserve formats with no zero encoding without materializing a scalar zero.
-        let input = ArrayBatch::replicated(
-            Array::from_elements::<f8e8m0fnu>(
-                ArrayType::new_static(DataType::F8E8M0FNU, [3]),
-                &[f8e8m0fnu::from_f32(1.0).unwrap(); 3],
-            )
-            .unwrap(),
-        );
-        let indices = ArrayBatch::new(
-            Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [0]), &[]).unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(&BatchingContext::new(EagerContext::<Array>::new(), 0), &EmptyRegionDriver, &[input, indices])
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(
-            outputs[0].value(),
-            &Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [0, 2]), vec![]).unwrap()
-        );
-
-        let start = Array::scalar(1_i32).unwrap();
         // Replicated starts lift by inserting a zero start for the mapped axis.
+        let start = Array::scalar(1i32).unwrap();
         check_operation_batching!(
             @exact,
             operation = DynamicSliceOperation::new(vec![2]),
@@ -6475,7 +6414,7 @@ mod tests {
         assert_eq!(
             operation.batch(&context, &EmptyRegionDriver, &[vectors]).unwrap_err(),
             BatchingError::Type(TypeError::invalid(format!(
-                "`{DYNAMIC_SLICE_OPERATION_NAME}` expects one start index per input axis (1) but got 0"
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` expects one start index per input axis (1) but got 0",
             ))),
         );
     }
@@ -6577,6 +6516,31 @@ mod tests {
             Ok(Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, 2]), &[]).unwrap()),
         );
 
+        // An empty index batch over a format with no zero encoding is synthesized without materializing a scalar
+        // zero.
+        let input = ArrayBatch::replicated(
+            Array::from_elements::<f8e8m0fnu>(
+                ArrayType::new_static(DataType::F8E8M0FNU, [3]),
+                &[f8e8m0fnu::from_f32(1.0).unwrap(); 3],
+            )
+            .unwrap(),
+        );
+        let indices = ArrayBatch::new(
+            Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [0]), &[]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let outputs = DynamicSliceOperation::new(vec![2])
+            .batch(&BatchingContext::new(EagerContext::<Array>::new(), 0), &EmptyRegionDriver, &[input, indices])
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            outputs[0].value(),
+            &Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [0, 2]), vec![]).unwrap(),
+        );
+
         // Mapped signed starts count from the end before the clipping gather, exactly as the unbatched kernel resolves
         // each item: `-1` reads the last window, `-9` stays negative after one wrap and clamps to the first window,
         // and `3` clamps to the last valid origin. The clamp-only policy resolves both negative starts to zero.
@@ -6615,7 +6579,7 @@ mod tests {
                 BatchAxis::new(0),
                 None,
             ),
-            Ok(Array::from_elements(ArrayType::new_static(DataType::F64, [2, 1, 3]), &[6.0, 7.0, 8.0, 6.0, 7.0, 8.0],)
+            Ok(Array::from_elements(ArrayType::new_static(DataType::F64, [2, 1, 3]), &[6.0, 7.0, 8.0, 6.0, 7.0, 8.0])
                 .unwrap()),
         );
         assert_eq!(
@@ -6629,6 +6593,47 @@ mod tests {
             Ok(Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 0, 3]), &[]).unwrap()),
         );
 
+        // A batched input pairs item `i` of the input with item `i` of the indices; item 1's start index 3 is
+        // clamped to 2 so the extracted block stays in bounds.
+        let input = ArrayBatch::new(
+            Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let outputs = DynamicSliceOperation::new(vec![2])
+            .batch(
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
+                &[input, batch_varying_indices(vec![1, 3])],
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 6.0, 7.0]);
+
+        // An input batched on a non-leading axis is realigned to the fresh leading batch axis first: the physical `[4,
+        // 2]` input carries per-item vectors `[0, 1, 2, 3]` and `[4, 5, 6, 7]` along axis 1.
+        let trailing = ArrayBatch::new(
+            Array::matrix(4, 2, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]).unwrap(),
+            BatchAxis::new(1),
+        )
+        .unwrap();
+        let outputs = DynamicSliceOperation::new(vec![2])
+            .batch(
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
+                &[trailing, batch_varying_indices(vec![1, 2])],
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn test_dynamic_slice_batching_sharding() {
         // The gather keeps mapped placement and host memory for a shared source and for a paired mapped source.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let mapped_sharding =
@@ -6672,46 +6677,7 @@ mod tests {
         assert_eq!(outputs[0].r#type().memory(), Memory::Host { pinned: true });
         assert_eq!(outputs[0].r#type().sharding(), Some(&mapped_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 1.0, 2.0, 3.0]);
-
-        // A batched input pairs item `i` of the input with item `i` of the indices; item 1's start index 3 is
-        // clamped to 2 so the extracted block stays in bounds.
-        let input = ArrayBatch::new(
-            Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(
-                &BatchingContext::new(EagerContext::<Array>::new(), 2),
-                &EmptyRegionDriver,
-                &[input, batch_varying_indices(vec![1, 3])],
-            )
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 6.0, 7.0]);
-
-        // An input batched on a non-leading axis is realigned to the fresh leading batch axis first: the physical `[4,
-        // 2]` input carries per-item vectors `[0, 1, 2, 3]` and `[4, 5, 6, 7]` along axis 1.
-        let trailing = ArrayBatch::new(
-            Array::matrix(4, 2, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]).unwrap(),
-            BatchAxis::new(1),
-        )
-        .unwrap();
-        let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(
-                &BatchingContext::new(EagerContext::<Array>::new(), 2),
-                &EmptyRegionDriver,
-                &[trailing, batch_varying_indices(vec![1, 2])],
-            )
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 6.0, 7.0]);
     }
-
     #[test]
     fn test_dynamic_slice_batching_nested() {
         // Both maps supply independent starts while sharing one input and a fixed two-element window.
@@ -6938,6 +6904,7 @@ mod tests {
                 (stacked * weights).reduce(&[0, 1], ReductionKind::Sum)
             })
             .unwrap();
+
         // f = 1 * 2 + 2 * 3 + 3 * 3 + 4 * 4 = 33.
         assert_abs_diff_eq!(value.to_f64s()[0], 33.0, epsilon = 1e-9);
         assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 5.0, 4.0]);
@@ -7074,7 +7041,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             pullback.apply(Array::vector(vec![1.0_f32; 3]).unwrap()),
-            Ok(Array::vector(vec![0.0_f32, 2.0, 0.0]).unwrap())
+            Ok(Array::vector(vec![0.0_f32, 2.0, 0.0]).unwrap()),
         );
     }
 
@@ -7178,7 +7145,6 @@ mod tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let cotangent = Array::matrix(1, 2, vec![5.0, 7.0]).unwrap();
         let sizes = vec![1, 2];
-
         check_operation_transposition!(
             @exact,
             operation = DynamicSliceOperation::new(sizes),
@@ -7216,6 +7182,7 @@ mod tests {
         assert!(cotangents[1].is_zero());
         assert!(context.builder().borrow().instructions().is_empty());
         let outputs = [MaybeZero::Value(context.input(output_type.cotangent().unwrap()))];
+
         // Unknown starts and a dynamic input would fail the nonzero, needed path. Neither is inspected when the
         // input cotangent is unneeded, so this still stages no instructions.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(8)).unwrap());
@@ -7277,7 +7244,6 @@ mod tests {
     fn test_dynamic_slice_transposition_dynamic_input() {
         let elements = DimensionVariable::new("elements", DimensionBounds::new(4, Some(8)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(elements)]));
-
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(dynamic_type);
         let start = builder.add_input(ArrayType::scalar(DataType::I32));
@@ -7290,7 +7256,7 @@ mod tests {
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
             TypeError::invalid(format!(
-                "`{DYNAMIC_SLICE_OPERATION_NAME}` transpose requires a statically shaped input but got `f64[elements]`"
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` transpose requires a statically shaped input but got `f64[elements]`",
             ))
             .into(),
         );
@@ -7318,6 +7284,7 @@ mod tests {
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         assert!(pullback.output_ids().is_empty());
+
         // The buffer's selected block is read, incremented, and written back through a dynamic update at the same
         // runtime start; no dense zero gradient is constructed.
         assert_eq!(
@@ -7345,7 +7312,7 @@ mod tests {
         );
         assert_eq!(
             buffer.read(),
-            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 10.0, 10.0]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 10.0, 10.0]).unwrap())),
         );
         assert_eq!(
             pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(20_i32).unwrap())]),
@@ -7353,7 +7320,7 @@ mod tests {
         );
         assert_eq!(
             buffer.read(),
-            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 12.0, 13.0]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 12.0, 13.0]).unwrap())),
         );
         assert_eq!(
             pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(-1_i32).unwrap())]),
@@ -7361,7 +7328,7 @@ mod tests {
         );
         assert_eq!(
             buffer.read(),
-            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 14.0, 16.0]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 14.0, 16.0]).unwrap())),
         );
 
         // The same retained rule returns a dense value when requested, while Ignore constructs no scratch buffer and
@@ -7407,11 +7374,12 @@ mod tests {
             BatchAxis::new(0),
             None,
         );
+
         // Each mapped buffer keeps its existing contents outside the selected coordinate, and batching preserves
         // additive updates to the selected coordinate rather than sharing one member's temporary storage.
         assert_eq!(
             result,
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![10.0_f32, 12.0, 10.0, 10.0, 12.0, 10.0]).unwrap()))
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![10.0_f32, 12.0, 10.0, 10.0, 12.0, 10.0]).unwrap())),
         );
         assert_eq!(destination.read(), Ok(Array::matrix(2, 3, vec![10.0_f32, 12.0, 10.0, 10.0, 12.0, 10.0]).unwrap()));
     }
@@ -7459,6 +7427,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![10.0_f32, 35.0, 10.0]).unwrap()));
+
         // The inner slice receives the caller's buffer directly. Its seed depends on the differentiated value, so the
         // outer pullback must differentiate the emitted buffer read/update/write operations as well.
         assert_eq!(
@@ -7473,7 +7442,7 @@ mod tests {
         let host_index = ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true });
         assert_eq!(
             host_input.dynamic_slice(std::slice::from_ref(&host_index), &[2]).unwrap().memory(),
-            Memory::Host { pinned: true }
+            Memory::Host { pinned: true },
         );
         let laid_out = host_input.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         assert_eq!(laid_out.dynamic_slice(std::slice::from_ref(&host_index), &[4]), Ok(laid_out.clone()));
@@ -7481,8 +7450,8 @@ mod tests {
             host_input.dynamic_slice(&[ArrayType::scalar(DataType::I32)], &[2]),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` input and start indices must share one memory space but start \
-                 index 0 resides in `Device` and the input resides in `Host[Pinned]`"
-            ))))
+                 index 0 resides in `Device` and the input resides in `Host[Pinned]`",
+            )))),
         );
 
         // Resizing keeps explicit placement only when the resulting dimension remains evenly divisible.
@@ -7502,104 +7471,40 @@ mod tests {
             input.dynamic_slice(&starts, &[3, 4]),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` on a dimension sharded over explicit mesh axes requires the output \
-                 size (3) at axis 0 to be divisible by the mesh-axis product (2)"
-            ))))
+                 size (3) at axis 0 to be divisible by the mesh-axis product (2)",
+            )))),
         );
-    }
 
-    #[test]
-    fn test_array_type_dynamic_slice_index_placement() {
-        // A replicated start index contributes no manual-axis variation, so an unsharded input stays unsharded, for
-        // both callers of the shared index-placement rule.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let input = ArrayType::new_static(DataType::F32, [4]);
-        let update = ArrayType::new_static(DataType::F32, [2]);
-        let replicated_index =
-            ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
-        assert_eq!(input.dynamic_slice(std::slice::from_ref(&replicated_index), &[2]), Ok(update.clone()));
-        assert_eq!(input.dynamic_update_slice(&update, std::slice::from_ref(&replicated_index)), Ok(input.clone()));
-
-        // A start index varying over a manual axis makes the output vary over it: an unsharded output acquires a
-        // replicated placement on the index's mesh carrying that variation.
+        // A start index varying over a manual axis makes the output vary over it, and every sharded start index must
+        // use one mesh. Refer to `test_infer_dynamic_slice_output_type` for the complete placement contract.
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let varying_index = ArrayType::scalar(DataType::I32)
-            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
+            .with_sharding(Sharding::replicated(manual_mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
-        let acquired = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
         assert_eq!(
-            input.dynamic_slice(std::slice::from_ref(&varying_index), &[2]).unwrap().sharding(),
-            Some(&acquired),
+            ArrayType::new_static(DataType::F32, [4]).dynamic_slice(std::slice::from_ref(&varying_index), &[2]),
+            Ok(ArrayType::new_static(DataType::F32, [2])
+                .with_sharding(Sharding::replicated(manual_mesh, 1).with_varying_manual_axes(["x"]).unwrap())
+                .unwrap()),
         );
-        assert_eq!(
-            input.dynamic_update_slice(&update, std::slice::from_ref(&varying_index)).unwrap().sharding(),
-            Some(&acquired),
-        );
-
-        // An input that is already sharded keeps its placement and reduction state and only gains the variation.
-        let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["m"]).unwrap();
-        let sharded_input = input.clone().with_sharding(unreduced.clone()).unwrap();
-        let sharded_update = update.clone().with_sharding(unreduced.clone()).unwrap();
-        let combined = unreduced.with_varying_manual_axes(["x"]).unwrap();
-        assert_eq!(
-            sharded_input.dynamic_slice(std::slice::from_ref(&varying_index), &[2]).unwrap().sharding(),
-            Some(&combined),
-        );
-        assert_eq!(
-            sharded_input
-                .dynamic_update_slice(&sharded_update, std::slice::from_ref(&varying_index))
-                .unwrap()
-                .sharding(),
-            Some(&combined),
-        );
-
-        // Every sharded start index must use one mesh, whether or not it contributes variation and in either order,
-        // even when the array itself is unsharded.
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let other_replicated_index =
-            ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(other_mesh.clone(), 0)).unwrap();
-        let matrix = ArrayType::new_static(DataType::F32, [4, 4]);
-        let block = ArrayType::new_static(DataType::F32, [2, 2]);
-        let same_mesh_error = Err(ProgramError::Type(TypeError::invalid(format!(
-            "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must use the same mesh"
-        ))));
-        let same_mesh_update_error = Err(ProgramError::Type(TypeError::invalid(format!(
-            "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` start indices must use the same mesh"
-        ))));
+        let other_index = ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(other_mesh, 0)).unwrap();
         assert_eq!(
-            matrix.dynamic_slice(&[replicated_index.clone(), other_replicated_index.clone()], &[2, 2]),
-            same_mesh_error,
-        );
-        assert_eq!(
-            matrix.dynamic_slice(&[varying_index.clone(), other_replicated_index.clone()], &[2, 2]),
-            same_mesh_error,
-        );
-        assert_eq!(
-            matrix.dynamic_slice(&[other_replicated_index.clone(), varying_index.clone()], &[2, 2]),
-            same_mesh_error,
-        );
-        assert_eq!(
-            matrix.dynamic_update_slice(&block, &[replicated_index, other_replicated_index.clone()]),
-            same_mesh_update_error,
-        );
-        assert_eq!(
-            matrix.dynamic_update_slice(&block, &[varying_index.clone(), other_replicated_index.clone()]),
-            same_mesh_update_error,
-        );
-        assert_eq!(
-            matrix.dynamic_update_slice(&block, &[other_replicated_index, varying_index]),
-            same_mesh_update_error,
+            ArrayType::new_static(DataType::F32, [4, 4]).dynamic_slice(&[varying_index, other_index], &[2, 2]),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must use the same mesh",
+            )))),
         );
     }
 
     #[test]
     fn test_array_dynamic_slice() {
         let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+
         // Dynamic start indices clamp so the block stays in bounds.
         let start = [Array::scalar(4i64).unwrap()];
         assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![4.0, 5.0]).unwrap());
+
         // Index decoding is typed and supports sub-byte integers directly; a negative start counts from the end.
         let start = [Array::scalar(i4::new(-1).unwrap()).unwrap()];
         assert_eq!(vector.dynamic_slice(&start, &[2]).unwrap(), Array::vector(vec![4.0, 5.0]).unwrap());
@@ -7608,27 +7513,43 @@ mod tests {
             Array::vector(vec![1.0, 2.0]).unwrap(),
         );
 
+        // Signed and unsigned extremes are decoded exactly and clamp to the ends of the axis.
+        let input = Array::vector(vec![1_i32, 2, 3]).unwrap();
+        assert_eq!(
+            input.dynamic_slice(&[Array::scalar(u64::MAX).unwrap()], &[1]),
+            Ok(Array::vector(vec![3_i32]).unwrap()),
+        );
+        assert_eq!(
+            input.dynamic_slice(&[Array::scalar(i64::MIN).unwrap()], &[1]),
+            Ok(Array::vector(vec![1_i32]).unwrap()),
+        );
+
+        // A discrete start varying over a manual axis makes the window vary over that axis.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated])
+            .unwrap()
+            .with_varying_manual_axes(["m"])
+            .unwrap();
+        let index = Array::from_elements(
+            ArrayType::scalar(DataType::I32)
+                .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_varying_manual_axes(["m"]).unwrap())
+                .unwrap(),
+            &[1i32],
+        )
+        .unwrap();
+        assert_eq!(
+            input.dynamic_slice(std::slice::from_ref(&index), &[1]).unwrap().r#type().sharding(),
+            Some(&varying),
+        );
+
         // A nonscalar start must fail before any indexing takes place.
         assert_eq!(
             Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
                 .unwrap()
                 .dynamic_slice(&[Array::scalar(0_i32).unwrap(), Array::vector(vec![1.0, 2.0]).unwrap()], &[1, 2]),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 1 must be a scalar integer but has type `f64[2]`"
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 1 must be a scalar integer but has type `f64[2]`",
             )))),
-        );
-    }
-
-    #[test]
-    fn test_array_dynamic_slice_unsigned_extreme() {
-        let input = Array::vector(vec![1_i32, 2, 3]).unwrap();
-        assert_eq!(
-            input.dynamic_slice(&[Array::scalar(u64::MAX).unwrap()], &[1]),
-            Ok(Array::vector(vec![3_i32]).unwrap())
-        );
-        assert_eq!(
-            input.dynamic_slice(&[Array::scalar(i64::MIN).unwrap()], &[1]),
-            Ok(Array::vector(vec![1_i32]).unwrap())
         );
     }
 
@@ -7640,27 +7561,106 @@ mod tests {
     }
 
     #[test]
+    fn test_array_dynamic_slice_in_axis() {
+        // The traced start counts from the end of the sliced axis and clamps so that the window fits, while every
+        // other axis is kept in full through a zero start.
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            matrix.dynamic_slice_in_axis(&Array::scalar(-2_i32).unwrap(), 2, 1).unwrap(),
+            Array::matrix(2, 2, vec![2.0, 3.0, 5.0, 6.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_slice_in_axis(&Array::scalar(5_i32).unwrap(), 2, -1).unwrap(),
+            Array::matrix(2, 2, vec![2.0, 3.0, 5.0, 6.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_slice_in_axis(&Array::scalar(-9_i32).unwrap(), 2, 1).unwrap(),
+            Array::matrix(2, 2, vec![1.0, 2.0, 4.0, 5.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_slice_in_axis(&Array::scalar(-1_i32).unwrap(), 1, 0).unwrap(),
+            Array::matrix(1, 3, vec![4.0, 5.0, 6.0]).unwrap(),
+        );
+
+        // Tracing stages the zero starts from the traced start and one ordinary dynamic slice.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(input, start)| input.dynamic_slice_in_axis(&start, 2, 1),
+            (ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::scalar(DataType::I32)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3], %1:i32[] .
+                let %2:i32[] = zero_like %1
+                    %3:f32[2, 2] = dynamic_slice [sizes=[2, 2]] %0 %2 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
+        // Every other axis must be static because the window spans it in full.
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap())),
+                Dimension::Static(3),
+            ]),
+        );
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |(input, start)| input.dynamic_slice_in_axis(&start, 2, 1),
+                (dynamic_type.clone(), ArrayType::scalar(DataType::I32)),
+            )
+            .map(|_| ()),
+            Err(TypeError::invalid(format!(
+                "`dynamic_slice` along axis 1 requires static extents on the other axes but axis 0 of \
+                 `{dynamic_type}` is dynamic",
+            ))
+            .into()),
+        );
+    }
+
+    #[test]
+    fn test_array_dynamic_index_in_axis() {
+        // The traced index counts from the end and clamps into bounds; the selected axis is squeezed unless kept.
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            matrix.dynamic_index_in_axis(&Array::scalar(-1_i32).unwrap(), 1, false).unwrap(),
+            Array::vector(vec![3.0, 6.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_index_in_axis(&Array::scalar(-1_i32).unwrap(), 1, true).unwrap(),
+            Array::matrix(2, 1, vec![3.0, 6.0]).unwrap(),
+        );
+        assert_eq!(
+            matrix.dynamic_index_in_axis(&Array::scalar(7_i32).unwrap(), -2, false).unwrap(),
+            Array::vector(vec![4.0, 5.0, 6.0]).unwrap(),
+        );
+    }
+    #[test]
     fn test_dynamic_slice_array_ir() {
         let operation = DynamicSliceOperation::<ArrayIrType>::from_rank(2).with_strides(vec![1, 2]).unwrap();
 
-        // Operation identity, accessors, and the conservative constructor assertion effect. Unit strides are always rendered.
+        // Operation identity, accessors, and the conservative constructor assertion effect. Unit strides are always
+        // rendered.
         assert_eq!(operation.name(), DYNAMIC_SLICE_OPERATION_NAME);
         assert_eq!(operation.strides(), &[1, 2]);
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
             format!("{operation}"),
-            "dynamic_slice [strides=[1, 2], bounds=checked, requires_runtime_assertion=true]"
+            "dynamic_slice [strides=[1, 2], bounds=checked, requires_runtime_assertion=true]",
         );
         assert_eq!(
             format!("{}", DynamicSliceOperation::<ArrayIrType>::from_rank(1)),
-            "dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true]"
+            "dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true]",
         );
 
         // The constructor rejects a stride list of the wrong length and zero strides.
         assert_eq!(
             DynamicSliceOperation::<ArrayIrType>::from_rank(2).with_strides(vec![1]),
             Err(TypeError::invalid(format!(
-                "`{DYNAMIC_SLICE_OPERATION_NAME}` `strides` has length 1 but input has rank 2"
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` `strides` has length 1 but input has rank 2",
             ))),
         );
         assert_eq!(
@@ -7696,7 +7696,11 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[4, 6], %1:dimension<0>, %2:dimension<1>, %3:dimension<rows ∈ [1, 4)>, %4:dimension<2> .
-                let %5:f64[rows, 2] = dynamic_slice [strides=[1, 2], bounds=checked, requires_runtime_assertion=true] %0 %1 %2 %3 %4
+                let %5:f64[rows, 2] = dynamic_slice [\
+                    strides=[1, 2], \
+                    bounds=checked, \
+                    requires_runtime_assertion=true\
+                ] %0 %1 %2 %3 %4
                 in (%5)
             "}
             .trim_end(),
@@ -7722,7 +7726,7 @@ mod tests {
             Err(TypeError::invalid(
                 "`dynamic_slice` was constructed without a runtime window check but these input types require one"
                     .to_string(),
-            ))
+            )),
         );
         let clamped = operation.with_bounds(DynamicSliceBounds::Clamp).with_input_types(&wider).unwrap();
         assert!(!clamped.requires_runtime_assertion());
@@ -7779,14 +7783,14 @@ mod tests {
                     input_types = [ArrayIrType::Array(input.clone()), dimension(3), dimension(2)],
                     error = format!(
                         "`{DYNAMIC_SLICE_OPERATION_NAME}` minimum limit 5 exceeds maximum input extent 4 on \
-                         axis 0"
+                         axis 0",
                     ),
                 },
                 {
                     input_types = [ArrayIrType::Array(bounded_input), dimension(2), dimension(3)],
                     error = format!(
                         "`{DYNAMIC_SLICE_OPERATION_NAME}` minimum limit 5 exceeds maximum input extent 3 on \
-                         axis 0"
+                         axis 0",
                     ),
                 },
                 {
@@ -7818,6 +7822,7 @@ mod tests {
                 },
             ],
         );
+
         // The payload's stride count must match the input rank before any bound is inspected.
         check_operation_type_inference!(
             operation = DynamicSliceOperation::<ArrayIrType>::from_rank(2),
@@ -7892,23 +7897,27 @@ mod tests {
         // Bound counts are validated against the input rank, naming the list that is wrong, and the span and limit
         // arithmetic reports overflow instead of wrapping.
         assert_eq!(
-            input.dynamic_slice_with_dimensions(&[start.clone()], &[], &[1]),
+            input.dynamic_slice_with_dimensions(std::slice::from_ref(&start), &[], &[1]),
             Err(TypeError::invalid(format!(
-                "`{DYNAMIC_SLICE_OPERATION_NAME}` expects one size per input axis (1) but got 0"
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` expects one size per input axis (1) but got 0",
             ))
             .into()),
         );
         assert_eq!(
-            input.dynamic_slice_with_dimensions(&[], &[size.clone()], &[1]),
+            input.dynamic_slice_with_dimensions(&[], std::slice::from_ref(&size), &[1]),
             Err(TypeError::invalid(format!(
-                "`{DYNAMIC_SLICE_OPERATION_NAME}` expects one start index per input axis (1) but got 0"
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` expects one start index per input axis (1) but got 0",
             ))
             .into()),
         );
         let huge = ArrayIrValue::Dimension(DimensionValue::constant(i64::MAX as usize).unwrap());
         assert_eq!(
             input.dynamic_slice_with_dimensions(std::slice::from_ref(&start), std::slice::from_ref(&huge), &[3]),
-            Err(TypeError::invalid(format!("`{DYNAMIC_SLICE_OPERATION_NAME}` span overflows `usize` on axis 0")).into()),
+            Err(TypeError::invalid(format!(
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` span overflows `usize` \
+                 on axis 0",
+            ))
+            .into()),
         );
         assert_eq!(
             input.dynamic_slice_with_dimensions(std::slice::from_ref(&huge), std::slice::from_ref(&huge), &[2]),
@@ -7941,11 +7950,11 @@ mod tests {
             ArrayIrValue::Array(Array::vector(vec![1_i32, 2, 3, 4]).unwrap()).dynamic_slice_with_dimensions(
                 &[start],
                 &[size],
-                &[1]
+                &[1],
             ),
             Err(ProgramError::Type(
                 DimensionError::InputDimensionMismatch { dimension: "extent".to_string(), expected: 1, actual: 2 }
-                    .into()
+                    .into(),
             )),
         );
     }
@@ -8034,6 +8043,7 @@ mod tests {
         let start = ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap());
         let size = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
         let expected = ArrayIrValue::Array(Array::vector(vec![20_i32, 30]).unwrap());
+
         // Known bounds execute their assertion when folded; an unknown array retains the checked operation.
         check_operation_partial_evaluation!(
             backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
@@ -8119,7 +8129,11 @@ mod tests {
         let mapped_size =
             ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![1_i64, 2]).unwrap()), BatchAxis::new(0)).unwrap();
         assert!(matches!(
-            DynamicSliceOperation::<ArrayIrType>::from_rank(1).batch(&context, &EmptyRegionDriver, &[vector, start, mapped_size]),
+            DynamicSliceOperation::<ArrayIrType>::from_rank(1).batch(
+                &context,
+                &EmptyRegionDriver,
+                &[vector, start, mapped_size],
+            ),
             Err(BatchingError::Type(error))
                 if error == TypeError::invalid("expected dimension type but got array type"),
         ));
@@ -8131,10 +8145,14 @@ mod tests {
         let start = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()));
         let size = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()));
         assert!(matches!(
-            DynamicSliceOperation::<ArrayIrType>::from_rank(1).batch(&context, &EmptyRegionDriver, &[input, start, size]),
+            DynamicSliceOperation::<ArrayIrType>::from_rank(1).batch(
+                &context,
+                &EmptyRegionDriver,
+                &[input, start, size],
+            ),
             Err(BatchingError::MisalignedBatchAxes { message })
                 if message == format!(
-                    "`{DYNAMIC_SLICE_OPERATION_NAME}` mapped input extent 3 does not match batching extent 2"
+                    "`{DYNAMIC_SLICE_OPERATION_NAME}` mapped input extent 3 does not match batching extent 2",
                 ),
         ));
 
@@ -8153,19 +8171,23 @@ mod tests {
         let start = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap()));
         let size = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()));
         assert!(matches!(
-            DynamicSliceOperation::<ArrayIrType>::from_rank(1).batch(&context, &EmptyRegionDriver, &[input, start, size]),
+            DynamicSliceOperation::<ArrayIrType>::from_rank(1).batch(
+                &context,
+                &EmptyRegionDriver,
+                &[input, start, size],
+            ),
             Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == format!(
-                    "`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs"
+                    "`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs",
                 ),
         ));
     }
 
     #[test]
     fn test_dynamic_slice_array_ir_differentiation() {
-        let dimension = |extent| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
         // The slice geometry is discrete, but the array input remains linear: JVP applies the same runtime slice to the
         // primal and tangent instead of treating the complete mixed operation as a constant.
+        let dimension = |extent| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)])).into());
         let start = builder.add_constant(dimension(1));
@@ -8226,15 +8248,15 @@ mod tests {
         assert!(outputs[0].tangent().is_zero());
         assert_eq!(
             outputs[0].tangent().r#type().as_ref(),
-            &ArrayIrType::Array(ArrayType::new_static(DataType::F64, [1]))
+            &ArrayIrType::Array(ArrayType::new_static(DataType::F64, [1])),
         );
         assert_eq!(trace.builder().borrow().instructions().len(), 1);
     }
 
     #[test]
     fn test_dynamic_slice_array_ir_transposition() {
-        let dimension = |extent| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
         // The transpose inserts each cotangent at its selected input coordinate.
+        let dimension = |extent| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)])).into());
         let start = builder.add_constant(dimension(1));
@@ -8299,6 +8321,7 @@ mod tests {
             .unwrap();
         let mut arguments = vec![ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap())];
         arguments.extend_from_slice(&primal[1..]);
+
         // Differentiating the pullback again must retain its paired slice map, including possibly empty source
         // bounds. A generic gather transpose would require a positive lower bound on each destination axis.
         let second = pullback.linearize_with_respect_to(&[0]).unwrap();
@@ -8309,14 +8332,15 @@ mod tests {
         second_arguments.extend(second_outputs.split_off(1));
         assert_eq!(
             forward_again.interpret(second_arguments),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 2, vec![0.0_f64, 2.0, 8.0, 10.0]).unwrap(),)])
+            Ok(vec![ArrayIrValue::Array(Array::matrix(2, 2, vec![0.0_f64, 2.0, 8.0, 10.0]).unwrap())]),
         );
         assert_eq!(
             pullback.interpret(arguments),
             Ok(vec![ArrayIrValue::Array(
                 Array::matrix(3, 4, vec![1.0_f64, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 4.0, 0.0]).unwrap(),
-            )])
+            )]),
         );
+
         // Batch cotangent seeds while keeping the runtime geometry shared across mapped items.
         let mut batched_arguments = vec![ArrayIrValue::Array(
             Array::from_elements(
@@ -8347,7 +8371,7 @@ mod tests {
                     ],
                 )
                 .unwrap()
-            )]
+            )],
         );
         let primal = linearization
             .primal()
@@ -8361,10 +8385,70 @@ mod tests {
         arguments.extend_from_slice(&primal[1..]);
         assert_eq!(
             pullback.interpret(arguments),
-            Ok(vec![ArrayIrValue::Array(Array::matrix(0, 4, Vec::<f64>::new()).unwrap(),)])
+            Ok(vec![ArrayIrValue::Array(Array::matrix(0, 4, Vec::<f64>::new()).unwrap())]),
         );
     }
 
+    #[test]
+    fn test_array_ir_value_dynamic_slice_with_bounds() {
+        let input = ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30, 40]).unwrap());
+        let start = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let size = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+
+        // `Clamp` moves a start whose window extends past the input back so that the window fits, whereas `Checked.
+        // rejects it. Both reject a window wider than the input.
+        assert_eq!(
+            input.dynamic_slice_with_bounds(
+                std::slice::from_ref(&start),
+                std::slice::from_ref(&size),
+                &[1],
+                DynamicSliceBounds::Clamp,
+            ),
+            Ok(ArrayIrValue::Array(Array::vector(vec![30_i32, 40]).unwrap())),
+        );
+        assert!(matches!(
+            input.dynamic_slice_with_bounds(std::slice::from_ref(&start), &[size], &[1], DynamicSliceBounds::Checked),
+            Err(ProgramError::InvalidArgument { message })
+                if message == format!("`{DYNAMIC_SLICE_OPERATION_NAME}` limit 5 exceeds input axis 0 extent 4"),
+        ));
+        let zero = ArrayIrValue::Dimension(DimensionValue::constant(0).unwrap());
+        let wide = ArrayIrValue::Dimension(DimensionValue::constant(5).unwrap());
+        assert!(matches!(
+            input.dynamic_slice_with_bounds(&[zero], &[wide], &[1], DynamicSliceBounds::Clamp),
+            Err(ProgramError::InvalidArgument { message })
+                if message == format!("`{DYNAMIC_SLICE_OPERATION_NAME}` limit 5 exceeds input axis 0 extent 4"),
+        ));
+
+        // Tracing records the policy on the staged operation, which then clamps at run time.
+        let start_type = DimensionType::new("start", DimensionBounds::new(0, Some(4)).unwrap());
+        let size_type = DimensionType::new("size", DimensionBounds::new(0, Some(3)).unwrap());
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, start, size)| input.dynamic_slice_with_bounds(&[start], &[size], &[1], DynamicSliceBounds::Clamp),
+            (
+                ArrayIrType::Array(ArrayType::new_static(DataType::I32, [4])),
+                ArrayIrType::Dimension(start_type.clone()),
+                ArrayIrType::Dimension(size_type.clone()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i32[4], %1:dimension<start ∈ [0, 4)>, %2:dimension<size ∈ [0, 3)> .
+                let %3:i32[size] = dynamic_slice [strides=[1], bounds=clamp, requires_runtime_assertion=false] %0 %1 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret((
+                input,
+                ArrayIrValue::Dimension(DimensionValue::new(start_type, 3).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(size_type, 2).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::vector(vec![30_i32, 40]).unwrap())),
+        );
+    }
     #[test]
     fn test_dynamic_slice_array_ir_dynamic_slice_axis() {
         // An empty selection of an empty axis stages a program that passes the empty array through.
@@ -8491,92 +8575,14 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_slice_in_axis() {
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        // The traced start counts from the end of the sliced axis and clamps so that the window fits, while every
-        // other axis is kept in full through a zero start.
-        assert_eq!(
-            matrix.dynamic_slice_in_axis(&Array::scalar(-2_i32).unwrap(), 2, 1).unwrap(),
-            Array::matrix(2, 2, vec![2.0, 3.0, 5.0, 6.0]).unwrap(),
-        );
-        assert_eq!(
-            matrix.dynamic_slice_in_axis(&Array::scalar(5_i32).unwrap(), 2, -1).unwrap(),
-            Array::matrix(2, 2, vec![2.0, 3.0, 5.0, 6.0]).unwrap(),
-        );
-        assert_eq!(
-            matrix.dynamic_slice_in_axis(&Array::scalar(-9_i32).unwrap(), 2, 1).unwrap(),
-            Array::matrix(2, 2, vec![1.0, 2.0, 4.0, 5.0]).unwrap(),
-        );
-        assert_eq!(
-            matrix.dynamic_slice_in_axis(&Array::scalar(-1_i32).unwrap(), 1, 0).unwrap(),
-            Array::matrix(1, 3, vec![4.0, 5.0, 6.0]).unwrap(),
-        );
-
-        // Tracing stages the zero starts from the traced start and one ordinary dynamic slice.
-        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |(input, start)| input.dynamic_slice_in_axis(&start, 2, 1),
-            (ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::scalar(DataType::I32)),
-        )
-        .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[2, 3], %1:i32[] .
-                let %2:i32[] = zero_like %1
-                    %3:f32[2, 2] = dynamic_slice [sizes=[2, 2]] %0 %2 %1
-                in (%3)
-            "}
-            .trim_end(),
-        );
-
-        // Every other axis must be static because the window spans it in full.
-        let dynamic_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![
-                Dimension::Dynamic(DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap())),
-                Dimension::Static(3),
-            ]),
-        );
-        assert_eq!(
-            TracingContext::<Array, ArrayOperation<Array>>::trace(
-                |(input, start)| input.dynamic_slice_in_axis(&start, 2, 1),
-                (dynamic_type.clone(), ArrayType::scalar(DataType::I32)),
-            )
-            .map(|_| ()),
-            Err(TypeError::invalid(format!(
-                "`dynamic_slice` along axis 1 requires static extents on the other axes but axis 0 of \
-                 `{dynamic_type}` is dynamic",
-            ))
-            .into()),
-        );
-    }
-
-    #[test]
-    fn test_dynamic_index_in_axis() {
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        // The traced index counts from the end and clamps into bounds; the selected axis is squeezed unless kept.
-        assert_eq!(
-            matrix.dynamic_index_in_axis(&Array::scalar(-1_i32).unwrap(), 1, false).unwrap(),
-            Array::vector(vec![3.0, 6.0]).unwrap(),
-        );
-        assert_eq!(
-            matrix.dynamic_index_in_axis(&Array::scalar(-1_i32).unwrap(), 1, true).unwrap(),
-            Array::matrix(2, 1, vec![3.0, 6.0]).unwrap(),
-        );
-        assert_eq!(
-            matrix.dynamic_index_in_axis(&Array::scalar(7_i32).unwrap(), -2, false).unwrap(),
-            Array::vector(vec![4.0, 5.0, 6.0]).unwrap(),
-        );
-    }
-
-    #[test]
     fn test_dynamic_update_slice() {
         let operation = DynamicUpdateSliceOperation::new();
 
-        // Operation identity.
+        // Operation identity and the default policy, which `Default` shares with `new`.
         assert_eq!(operation.name(), DYNAMIC_UPDATE_SLICE_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "dynamic_update_slice");
         assert!(operation.allows_negative_indices());
+        assert_eq!(DynamicUpdateSliceOperation::default(), operation);
 
         // The default negative-index policy is implied by the rendering; only the clamp-only policy is shown.
         let clamping = operation.with_allow_negative_indices(false);
@@ -8586,6 +8592,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         let index_type = ArrayType::scalar(DataType::I32);
+
         // Program rendering uses the canonical operation name.
         let mut builder = ProgramBuilder::<Array, DynamicUpdateSliceOperation>::new();
         let program_input = builder.add_input(input_type);
@@ -8620,8 +8627,8 @@ mod tests {
 
     #[test]
     fn test_dynamic_update_slice_type_inference() {
-        let operation = DynamicUpdateSliceOperation::new();
         // Type inference validates the update and index input types and returns the input type.
+        let operation = DynamicUpdateSliceOperation::new();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         let index_type = ArrayType::scalar(DataType::I32);
@@ -8650,13 +8657,13 @@ mod tests {
                     input_types = [input_type.clone()],
                     error = format!(
                         "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` expects an array input and an update input followed \
-                         by start index inputs but got 1 inputs"
+                         by start index inputs but got 1 inputs",
                     ),
                 },
                 {
                     input_types = [input_type.clone(), update_type.clone(), index_type.clone()],
                     error = format!(
-                        "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` expects one start index per input axis (2) but got 1"
+                        "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` expects one start index per input axis (2) but got 1",
                     ),
                 },
                 {
@@ -8668,7 +8675,7 @@ mod tests {
                     ],
                     error = format!(
                         "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` input data type `f64` does not match update data \
-                         type `f32`"
+                         type `f32`",
                     ),
                 },
                 {
@@ -8685,7 +8692,7 @@ mod tests {
                     input_types = [input_type.clone(), dynamic_update_type, index_type.clone(), index_type.clone()],
                     error = format!(
                         "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` does not support dynamic update axis 0 with size \
-                         dynamic; update shapes must be static"
+                         dynamic; update shapes must be static",
                     ),
                 },
                 {
@@ -8696,14 +8703,14 @@ mod tests {
                         index_type.clone(),
                     ],
                     error = format!(
-                        "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` update axis 1 has size 4 which exceeds input size 3"
+                        "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` update axis 1 has size 4 which exceeds input size 3",
                     ),
                 },
                 {
                     input_types = [dynamic_input_type, update_type.clone(), index_type.clone(), index_type.clone()],
                     error = format!(
                         "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` update size 1 exceeds the guaranteed minimum extent \
-                         0 of dynamic axis 0"
+                         0 of dynamic axis 0",
                     ),
                 },
                 {
@@ -8715,7 +8722,7 @@ mod tests {
                     ],
                     error = format!(
                         "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type \
-                         `f64[]`"
+                         `f64[]`",
                     ),
                 },
             ],
@@ -8764,6 +8771,62 @@ mod tests {
 
     #[test]
     fn test_dynamic_update_slice_interpretation() {
+        let operation = DynamicUpdateSliceOperation::new();
+        let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
+
+        // Interpretation overwrites the block at the in-band start indices.
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
+        let output = operation
+            .interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[input.clone(), update.clone(), Array::scalar(0_i32).unwrap(), Array::scalar(1_i32).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(*output[0].r#type(), input_type);
+        assert_eq!(output[0].to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
+
+        // Out-of-bounds start indices resolve like the capability documents: the row start `5` clamps to the last
+        // valid origin `1`, and the column start `-3` counts from the end of the extent-3 axis to `0`.
+        let clamped = operation
+            .interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[input.clone(), update.clone(), Array::scalar(5_i32).unwrap(), Array::scalar(-3_i32).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(clamped[0].to_f64s(), vec![1.0, 2.0, 3.0, 8.0, 9.0, 6.0]);
+
+        // Without the negative-index policy, the column start `-3` is out of bounds and clamps to zero as well, so
+        // the two policies agree here; a column start of `-1` separates them.
+        let clamped = DynamicUpdateSliceOperation::new()
+            .with_allow_negative_indices(false)
+            .interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[input.clone(), update.clone(), Array::scalar(0_i32).unwrap(), Array::scalar(-1_i32).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(clamped[0].to_f64s(), vec![8.0, 9.0, 3.0, 4.0, 5.0, 6.0]);
+        let wrapped = operation
+            .interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[input.clone(), update.clone(), Array::scalar(0_i32).unwrap(), Array::scalar(-1_i32).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(wrapped[0].to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+        );
+
         // Applying output sharding metadata preserves the non-dense layout and the untouched input values.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type =
@@ -8779,41 +8842,6 @@ mod tests {
             .unwrap();
         assert_eq!(output, Array::from_elements(expected_type, &[1_i32, 9, 3]).unwrap());
         assert_eq!(input.elements::<i32>(), Ok(vec![1, 2, 3]));
-
-        let operation = DynamicUpdateSliceOperation::new();
-        let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
-        // Interpretation overwrites the block at the in-band start indices.
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
-        let output = operation
-            .interpret(
-                &EagerContext::<Array>::new(),
-                &EmptyRegionDriver,
-                &[input.clone(), update.clone(), Array::scalar(0_i32).unwrap(), Array::scalar(1_i32).unwrap()],
-            )
-            .unwrap();
-        assert_eq!(*output[0].r#type(), input_type);
-        assert_eq!(output[0].to_f64s(), vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]);
-
-        // Out-of-bounds start indices clamp per StableHLO semantics: the effective start index along axis `d` is
-        // `clamp(0, start_indices[d], input_dimension[d] - update_dimension[d])`.
-        let clamped = operation
-            .interpret(
-                &EagerContext::<Array>::new(),
-                &EmptyRegionDriver,
-                &[input.clone(), update.clone(), Array::scalar(5_i32).unwrap(), Array::scalar(-3_i32).unwrap()],
-            )
-            .unwrap();
-        assert_eq!(clamped[0].to_f64s(), vec![1.0, 2.0, 3.0, 8.0, 9.0, 6.0]);
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::<Array>::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
-        );
     }
 
     #[test]
@@ -8847,9 +8875,9 @@ mod tests {
 
     #[test]
     fn test_dynamic_update_slice_batching() {
+        // Replicated starts align the input and update on one mapped axis.
         let start = Array::scalar(1_i32).unwrap();
         let update = Array::vector(vec![8.0, 9.0]).unwrap();
-        // Replicated starts align the input and update on one mapped axis.
         check_operation_batching!(
             @exact,
             operation = DynamicUpdateSliceOperation::new(),
@@ -8883,7 +8911,7 @@ mod tests {
             ),
             Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == format!(
-                    "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs"
+                    "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs",
                 ),
         ));
         let input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
@@ -8905,6 +8933,19 @@ mod tests {
             .0;
         assert_eq!(outputs, vec![updates]);
 
+        // A replicated scalar update is repeated across the mapped scalar inputs it replaces.
+        let outputs = DynamicUpdateSliceOperation::new()
+            .batch(
+                &context,
+                &EmptyRegionDriver,
+                &[scalars.clone(), ArrayBatch::replicated(Array::scalar(9.0_f64).unwrap())],
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value(), &Array::vector(vec![9.0, 9.0]).unwrap());
+
         // Missing starts are invalid for per-item vectors even when both arrays have a mapped axis.
         let vectors =
             ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(), BatchAxis::new(0))
@@ -8915,7 +8956,7 @@ mod tests {
                 .batch(&context, &EmptyRegionDriver, &[vectors, updates])
                 .unwrap_err(),
             BatchingError::Type(TypeError::invalid(format!(
-                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` expects one start index per input axis (1) but got 0"
+                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` expects one start index per input axis (1) but got 0",
             ))),
         );
 
@@ -8926,29 +8967,13 @@ mod tests {
                 .batch(&context, &EmptyRegionDriver, &[scalars, integer_updates])
                 .unwrap_err(),
             BatchingError::Type(TypeError::invalid(format!(
-                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` input data type `f64` does not match update data type `i32`"
+                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` input data type `f64` does not match update data type `i32`",
             ))),
         );
     }
 
     #[test]
-    fn test_dynamic_update_slice_batching_expands_batch_varying_indices() {
-        // A scalar update still has to be repeated when only the overwritten scalar input is mapped.
-        let outputs = DynamicUpdateSliceOperation::new()
-            .batch(
-                &BatchingContext::new(EagerContext::<Array>::new(), 2),
-                &EmptyRegionDriver,
-                &[
-                    ArrayBatch::new(Array::vector(vec![1.0, 2.0]).unwrap(), BatchAxis::new(0)).unwrap(),
-                    ArrayBatch::replicated(Array::scalar(9.0f64).unwrap()),
-                ],
-            )
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value(), &Array::vector(vec![9.0, 9.0]).unwrap());
-
+    fn test_dynamic_update_slice_batching_with_mapped_indices() {
         // A batched update with batch-varying start indices over a replicated input expands per item: item 0 writes
         // `[9, 9]` at offset 0 and item 1 writes `[8, 8]` at offset 2 of the shared input.
         let uniform_input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
@@ -8988,6 +9013,66 @@ mod tests {
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 9.0, 9.0, 6.0, 7.0]);
     }
 
+    #[test]
+    fn test_dynamic_update_slice_batching_sharding() {
+        // A mapped input sharded over an explicit mesh axis keeps its placement: the replicated update and start are
+        // aligned to the mapped input before each item writes its own block.
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let explicit_sharding = Sharding::new(
+            explicit_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let input_type = ArrayType::new_static(DataType::F64, [2, 4]).with_sharding(explicit_sharding.clone()).unwrap();
+        let update_type = ArrayType::new_static(DataType::F64, [2])
+            .with_sharding(Sharding::replicated(explicit_mesh, 1))
+            .unwrap();
+        let context =
+            BatchingContext::new(EagerContext::<Array>::new(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
+        let input = ArrayBatch::new(
+            Array::from_elements::<f64>(input_type, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let update = ArrayBatch::replicated(Array::from_elements::<f64>(update_type, &[9.0, 9.0]).unwrap());
+        let start = ArrayBatch::replicated(Array::scalar(1_i32).unwrap());
+        let outputs = DynamicUpdateSliceOperation::new()
+            .batch(&context, &EmptyRegionDriver, &[input, update, start.clone()])
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].r#type().sharding(), Some(&explicit_sharding));
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
+
+        // A mapped input varying over a manual mesh axis keeps both its placement and its variation.
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let manual_sharding = Sharding::new(
+            manual_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap()
+        .with_varying_manual_axes(["x"])
+        .unwrap();
+        let input_type = ArrayType::new_static(DataType::F64, [2, 4]).with_sharding(manual_sharding.clone()).unwrap();
+        let update_type = ArrayType::new_static(DataType::F64, [2])
+            .with_sharding(Sharding::replicated(manual_mesh, 1))
+            .unwrap();
+        let input = ArrayBatch::new(
+            Array::from_elements::<f64>(input_type, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let update = ArrayBatch::replicated(Array::from_elements::<f64>(update_type, &[9.0, 9.0]).unwrap());
+        let outputs = DynamicUpdateSliceOperation::new()
+            .batch(&context, &EmptyRegionDriver, &[input, update, start])
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].r#type().sharding(), Some(&manual_sharding));
+        assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
+    }
     #[test]
     fn test_dynamic_update_slice_differentiation() {
         // Composing JVP and transposition must retain the captured start index: the input gradient is the output
@@ -9262,6 +9347,7 @@ mod tests {
         assert!(cotangents.iter().all(MaybeZero::is_zero));
         assert!(context.builder().borrow().instructions().is_empty());
         let outputs = [MaybeZero::Value(context.input(input_type.cotangent().unwrap()))];
+
         // Unknown starts would fail the needed path, but no contribution needs to read them here.
         let unneeded_inputs = [
             PartialValue::Unknown(input_type.clone()),
@@ -9289,10 +9375,16 @@ mod tests {
         ];
         let needed = transpose.cotangent_accumulators(&dynamic_inputs, &[true, true, false]).unwrap();
         assert_eq!(
-            operation.transpose(&mut transpose, &EmptyRegionDriver, &dynamic_inputs, &outputs, &needed).unwrap_err(),
-            DifferentiationError::Program(TypeError::invalid(format!(
-                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` transpose requires a static update shape but axis 0 has size extent"
-            )).into()),
+            operation
+                .transpose(&mut transpose, &EmptyRegionDriver, &dynamic_inputs, &outputs, &needed)
+                .unwrap_err(),
+            DifferentiationError::Program(
+                TypeError::invalid(format!(
+                    "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` transpose requires a static update shape but axis 0 has \
+                     size extent",
+                ))
+                .into()
+            ),
         );
 
         // Each contribution is staged only when its accumulator is needed: the input cotangent zeroes the update
@@ -9353,22 +9445,23 @@ mod tests {
         let host_index = ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true });
         assert_eq!(
             host_input.dynamic_update_slice(&host_update, std::slice::from_ref(&host_index)).unwrap().memory(),
-            Memory::Host { pinned: true }
+            Memory::Host { pinned: true },
         );
+
         // The update and every start index must share the input's memory space.
         assert_eq!(
             host_input.dynamic_update_slice(&ArrayType::new_static(DataType::F32, [2]), &[host_index]),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` input and update must share one memory space but reside in \
-                 `Host[Pinned]` and `Device`"
-            ))))
+                 `Host[Pinned]` and `Device`",
+            )))),
         );
         assert_eq!(
             host_input.dynamic_update_slice(&host_update, &[ArrayType::scalar(DataType::I32)]),
             Err(ProgramError::Type(TypeError::invalid(format!(
                 "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` input and start indices must share one memory space but \
-                 start index 0 resides in `Device` and the input resides in `Host[Pinned]`"
-            ))))
+                 start index 0 resides in `Device` and the input resides in `Host[Pinned]`",
+            )))),
         );
 
         // Resizing keeps explicit placement only when the resulting dimension remains evenly divisible.
@@ -9389,19 +9482,136 @@ mod tests {
         assert_eq!(
             input.dynamic_update_slice(&conflicting, &starts),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` input and update must be sharded identically, but got `{}` \
-                 and `{}`",
+                "`{}` input and update must be sharded identically, but got `{}` and `{}`",
+                DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
                 input.sharding().unwrap(),
                 conflicting.sharding().unwrap(),
-            ))))
+            )))),
+        );
+
+        // A start index varying over a manual axis makes the output vary over it, and every sharded start index must
+        // use one mesh. Refer to `test_infer_dynamic_slice_output_type` for the complete placement contract.
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_index = ArrayType::scalar(DataType::I32)
+            .with_sharding(Sharding::replicated(manual_mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let vector = ArrayType::new_static(DataType::F32, [4]);
+        let update = ArrayType::new_static(DataType::F32, [2]);
+        assert_eq!(
+            vector.dynamic_update_slice(&update, std::slice::from_ref(&varying_index)),
+            Ok(vector
+                .clone()
+                .with_sharding(Sharding::replicated(manual_mesh, 1).with_varying_manual_axes(["x"]).unwrap())
+                .unwrap()),
+        );
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let other_index = ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(other_mesh, 0)).unwrap();
+        assert_eq!(
+            ArrayType::new_static(DataType::F32, [4, 4])
+                .dynamic_update_slice(&ArrayType::new_static(DataType::F32, [2, 2]), &[varying_index, other_index]),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` start indices must use the same mesh",
+            )))),
         );
     }
 
     #[test]
-    fn test_dynamic_update_slice_in_axis() {
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    fn test_array_dynamic_update_slice() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let update = Array::vector(vec![10.0, 20.0]).unwrap();
+
+        // Dynamic start indices clamp so the block stays in bounds.
+        let start = [Array::scalar(4i64).unwrap()];
+        assert_eq!(
+            vector.dynamic_update_slice(&update, &start).unwrap(),
+            Array::vector(vec![1.0, 2.0, 3.0, 10.0, 20.0]).unwrap(),
+        );
+
+        // A negative start counts from the end under the default policy and clamps to zero without it.
+        let start = [Array::scalar(i4::new(-1).unwrap()).unwrap()];
+        assert_eq!(
+            vector.dynamic_update_slice(&update, &start).unwrap(),
+            Array::vector(vec![1.0, 2.0, 3.0, 10.0, 20.0]).unwrap(),
+        );
+        assert_eq!(
+            vector.dynamic_update_slice_with_negative_indices(&update, &start, false).unwrap(),
+            Array::vector(vec![10.0, 20.0, 3.0, 4.0, 5.0]).unwrap(),
+        );
+
+        // Updating also validates the complete start vector before accessing the payload.
+        assert_eq!(
+            Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap()
+                .dynamic_update_slice(&Array::matrix(1, 2, vec![8.0, 9.0]).unwrap(), &[Array::scalar(0_i32).unwrap()]),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` expects one start index per input axis (2) but got 1",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_array_dynamic_update_slice_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::Replicated]).unwrap();
+        let varying = sharding.clone().with_varying_manual_axes(["m"]).unwrap();
+        let input = Array::from_elements(
+            ArrayType::new_static(DataType::I32, [3]).with_sharding(sharding).unwrap(),
+            &[10i32, 20, 30],
+        )
+        .unwrap();
+        let update = Array::from_elements(
+            ArrayType::new_static(DataType::I32, [1]).with_sharding(varying.clone()).unwrap(),
+            &[40i32],
+        )
+        .unwrap();
+        let expected = Array::from_elements(
+            ArrayType::new_static(DataType::I32, [3]).with_sharding(varying.clone()).unwrap(),
+            &[10i32, 40, 30],
+        )
+        .unwrap();
+        assert_eq!(input.dynamic_update_slice(&update, &[Array::scalar(1i32).unwrap()]), Ok(expected));
+
+        // A discrete start can vary over a manual axis even when both array inputs are invariant.
+        let index = Array::from_elements(
+            ArrayType::scalar(DataType::I32)
+                .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_varying_manual_axes(["m"]).unwrap())
+                .unwrap(),
+            &[1i32],
+        )
+        .unwrap();
+        assert_eq!(
+            input
+                .dynamic_update_slice(&Array::vector(vec![40i32]).unwrap(), &[index])
+                .unwrap()
+                .r#type()
+                .sharding(),
+            Some(&varying),
+        );
+
+        // An unsharded base is invariant. A varying update still makes the written block vary over its mesh.
+        let plain = Array::vector(vec![10i32, 20, 30]).unwrap();
+        let expected = Array::from_elements(
+            ArrayType::new_static(DataType::I32, [3]).with_sharding(varying).unwrap(),
+            &[10i32, 40, 30],
+        )
+        .unwrap();
+        assert_eq!(plain.dynamic_update_slice(&update, &[Array::scalar(1i32).unwrap()]), Ok(expected));
+    }
+    #[test]
+    fn test_array_ir_value_dynamic_update_slice() {
+        let input = ArrayIrValue::Array(Array::vector(vec![10i32, 20, 30]).unwrap());
+        let update = ArrayIrValue::Array(Array::vector(vec![40i32]).unwrap());
+        assert_eq!(
+            input.dynamic_update_slice(&update, &[ArrayIrValue::Array(Array::scalar(1i32).unwrap())]),
+            Ok(ArrayIrValue::Array(Array::vector(vec![10i32, 40, 30]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_array_dynamic_update_slice_in_axis() {
         // The traced start counts from the end of the updated axis and clamps so that the update fits, while the
         // update's extent on the other axis need not match the input's.
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
         assert_eq!(
             matrix.dynamic_update_slice_in_axis(&update, &Array::scalar(-1_i32).unwrap(), 1).unwrap(),
@@ -9418,9 +9628,9 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_update_index_in_axis() {
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    fn test_array_dynamic_update_index_in_axis() {
         // A rank-deficient update gains the indexed axis with extent one; a full-rank update is written as is.
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             matrix
                 .dynamic_update_index_in_axis(
@@ -9454,41 +9664,10 @@ mod tests {
     }
 
     #[test]
-    fn test_array_dynamic_update_slice() {
-        let vector = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-        // Dynamic start indices clamp so the block stays in bounds.
-        let start = [Array::scalar(4i64).unwrap()];
-        assert_eq!(
-            vector.dynamic_update_slice(&Array::vector(vec![10.0, 20.0]).unwrap(), &start).unwrap(),
-            Array::vector(vec![1.0, 2.0, 3.0, 10.0, 20.0]).unwrap(),
-        );
-
-        // Updating also validates the complete start vector before accessing the payload.
-        assert_eq!(
-            Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-                .unwrap()
-                .dynamic_update_slice(&Array::matrix(1, 2, vec![8.0, 9.0]).unwrap(), &[Array::scalar(0_i32).unwrap()]),
-            Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` expects one start index per input axis (2) but got 1"
-            )))),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_value_dynamic_update_slice() {
-        let input = ArrayIrValue::Array(Array::vector(vec![10i32, 20, 30]).unwrap());
-        let update = ArrayIrValue::Array(Array::vector(vec![40i32]).unwrap());
-        assert_eq!(
-            input.dynamic_update_slice(&update, &[ArrayIrValue::Array(Array::scalar(1i32).unwrap())]),
-            Ok(ArrayIrValue::Array(Array::vector(vec![10i32, 40, 30]).unwrap()))
-        );
-    }
-
-    #[test]
-    fn test_clamped_start_indices() {
-        let input_shape = StaticShape::new(vec![4, 3]);
+    fn test_array_clamped_start_indices() {
         // In-bounds starts pass through, and starts past the last valid origin clamp to `extent - size`, so the block
         // always stays in bounds.
+        let input_shape = StaticShape::new(vec![4, 3]);
         assert_eq!(
             Array::clamped_start_indices(
                 &[Array::scalar(1_i32).unwrap(), Array::scalar(0_i32).unwrap()],
@@ -9507,6 +9686,7 @@ mod tests {
             ),
             vec![2, 2],
         );
+
         // A negative signed start counts from the end of its axis once and then clamps: `-1` on the extent-4 axis names
         // origin 3, which the size-2 window clamps to 2, while `-7` stays negative after one wrap and clamps to zero.
         assert_eq!(
@@ -9527,6 +9707,7 @@ mod tests {
             ),
             vec![3, 0],
         );
+
         // Without the policy, negative starts are out of bounds and clamp to zero directly.
         assert_eq!(
             Array::clamped_start_indices(
@@ -9537,6 +9718,7 @@ mod tests {
             ),
             vec![0, 0],
         );
+
         // Signed and unsigned extremes are decoded exactly: the unsigned maximum clamps without any signed
         // reinterpretation, and the signed minimum stays negative after one wrap and clamps to zero under either
         // policy.
@@ -9551,6 +9733,7 @@ mod tests {
                 vec![3, 0],
             );
         }
+
         // A full-extent window always starts at zero, and a rank-0 slice has no starts.
         assert_eq!(
             Array::clamped_start_indices(
@@ -9590,7 +9773,7 @@ mod tests {
                 &[ArrayType::new_static(DataType::I32, [1])]
             ),
             Err(TypeError::invalid(format!(
-                "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `i32[1]`"
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `i32[1]`",
             ))
             .into()),
         );
@@ -9601,7 +9784,7 @@ mod tests {
                 &[ArrayType::scalar(DataType::F32)]
             ),
             Err(TypeError::invalid(format!(
-                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `f32[]`"
+                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `f32[]`",
             ))
             .into()),
         );
@@ -9613,7 +9796,7 @@ mod tests {
             ),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` input and start indices must share one memory space but start \
-                 index 0 resides in `Host[Pinned]` and the input resides in `Device`"
+                 index 0 resides in `Host[Pinned]` and the input resides in `Device`",
             ))
             .into()),
         );
@@ -9629,23 +9812,23 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["m"]).unwrap())
             .unwrap();
         let reduction_state_error = Err(TypeError::invalid(format!(
-            "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must not carry reduction state"
+            "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must not carry reduction state",
         ))
         .into());
         assert_eq!(
             validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[unreduced_index]),
-            reduction_state_error
+            reduction_state_error,
         );
         assert_eq!(
             validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[reduced_index]),
-            reduction_state_error
+            reduction_state_error,
         );
         let sharded_input = input.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
         let other_index = index.clone().with_sharding(Sharding::replicated(other_mesh, 0)).unwrap();
         assert_eq!(
             validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &sharded_input, &[other_index]),
             Err(TypeError::invalid(format!(
-                "`{DYNAMIC_SLICE_OPERATION_NAME}` input and start indices must use the same mesh"
+                "`{DYNAMIC_SLICE_OPERATION_NAME}` input and start indices must use the same mesh",
             ))
             .into()),
         );
@@ -9661,7 +9844,7 @@ mod tests {
             validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &unreduced_input, &[varying_index]),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must be invariant when the input carries reduction \
-                 state"
+                 state",
             ))
             .into()),
         );
@@ -9684,7 +9867,7 @@ mod tests {
             ),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must share one integer type but index 1 has type \
-                 `i64[]` and index 0 has type `i32[]`"
+                 `i64[]` and index 0 has type `i32[]`",
             ))
             .into()),
         );
@@ -9711,7 +9894,7 @@ mod tests {
         // it, as a replicated sharding on the indices' mesh carrying that variation.
         assert_eq!(
             infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output.clone(), &[index]),
-            Ok(output.clone())
+            Ok(output.clone()),
         );
         assert_eq!(
             infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output.clone(), &[replicated_index.clone()]),
@@ -9771,7 +9954,7 @@ mod tests {
         assert_eq!(
             infer_dynamic_slice_output_type(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, output, &[other_index, varying_index]),
             Err(TypeError::invalid(format!(
-                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` start indices must use the same mesh"
+                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` start indices must use the same mesh",
             ))
             .into()),
         );
@@ -9794,7 +9977,7 @@ mod tests {
         let replicated_update = update.clone().with_sharding(Sharding::replicated(mesh.clone(), 2)).unwrap();
         assert_eq!(
             infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &input, &replicated_update),
-            Ok(None)
+            Ok(None),
         );
         let varying = Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["m"]).unwrap();
         let varying_update = update.clone().with_sharding(varying.clone()).unwrap();
@@ -9809,7 +9992,7 @@ mod tests {
         assert_eq!(
             infer_update_slice_output_sharding(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, &unreduced_input, &update),
             Err(TypeError::invalid(format!(
-                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` input and update must carry identical reduction state"
+                "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` input and update must carry identical reduction state",
             ))),
         );
 
@@ -9850,7 +10033,7 @@ mod tests {
             infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &sharded_input, &conflicting_update),
             Err(TypeError::invalid(format!(
                 "`{UPDATE_SLICE_OPERATION_NAME}` input and update must be sharded identically, but got `{sharded}` \
-                 and `{conflicting}`"
+                 and `{conflicting}`",
             ))),
         );
     }
@@ -10003,7 +10186,7 @@ mod tests {
         let index = ArrayBatch::replicated(trace.input(ArrayType::scalar(DataType::I32)));
         let context = BatchingContext::new(trace, 2);
         assert_eq!(
-            batch_by_item_expansion(&context, &DynamicSliceOperation::new(vec![1]), &[dynamic, index], 2,).unwrap_err(),
+            batch_by_item_expansion(&context, &DynamicSliceOperation::new(vec![1]), &[dynamic, index], 2).unwrap_err(),
             BatchingError::Program(
                 TypeError::invalid(format!(
                     "`{DYNAMIC_SLICE_OPERATION_NAME}` per-item expansion requires static batched input types but got \
