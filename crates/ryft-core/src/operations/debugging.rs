@@ -6,18 +6,17 @@
 //!   - The [`Print`] value capability, whose [`print`](Print::print) returns its input unchanged while printing it to
 //!     standard error under a label, and whose [`print_with_effect_class`](Print::print_with_effect_class) selects how
 //!     strongly the print is ordered relative to other I/O.
-//!   - The [`PrintOperation`] that the capability stages. By default it declares the
-//!     [`EffectClass::OrderedIo`](crate::EffectClass::OrderedIo) effect, so dead-code elimination never removes it and
-//!     prints appear in program order across all participating devices.
-//!     [`EffectClass::DeviceOrderedIo`](crate::EffectClass::DeviceOrderedIo) keeps program order only among the
-//!     prints executing on the same device, which lets a print inside a `shard_map` body run once per device, and
-//!     [`EffectClass::UnorderedIo`](crate::EffectClass::UnorderedIo) retains the print without ordering it at all.
+//!   - The [`PrintOperation`] that the capability stages. By default, it declares the [`EffectClass::OrderedIo`]
+//!     effect, so dead-code elimination never removes it and prints appear in program order across all participating
+//!     devices. [`EffectClass::DeviceOrderedIo`] keeps program order only among the prints executing on the same
+//!     device, which lets a print inside a `shard_map` body run once per device, and
+//!     [`EffectClass::UnorderedIo`] retains the print without ordering it at all.
 //!
-//! Program transforms treat prints as identities on their data. Batching prints the whole batch, partial evaluation
-//! prints known inputs when it encounters them and residualizes unknown ones, and differentiation prints the primal
-//! value while passing the tangent through unchanged. Backends decide how the effect is realized; the XLA backend
-//! lowers a print to a host callback that is threaded through a token chain so that ordered prints stay ordered
-//! within one dispatch.
+//! Program transforms treat print operations as identities on their data. Batching prints the whole batch, partial
+//! evaluation prints known inputs when it encounters them and residualizes unknown ones, and differentiation prints
+//! the primal value while passing the tangent through unchanged. Backends decide how the effect is realized. For
+//! example, the XLA backend lowers a print to a host callback that is threaded through a token chain so that ordered
+//! prints stay ordered within one dispatch.
 //!
 //! # Example
 //!
@@ -37,6 +36,7 @@
 //!     },
 //!     ArrayType::scalar(DataType::F64),
 //! )?;
+//!
 //! assert_eq!(
 //!     program.to_string(),
 //!     indoc! {"
@@ -45,6 +45,7 @@
 //!             %2:f64[] = print [label=squared, effect_class=unordered_io] %1
 //!         in (%2)"},
 //! );
+//!
 //! // Interpreting the program prints `squared = 9` to standard error and returns the squared input.
 //! assert_eq!(program.interpret(Array::scalar(3.0_f64)?)?, Array::scalar(9.0_f64)?);
 //! # Ok(())
@@ -69,32 +70,31 @@ use crate::programs::{
 /// Canonical operation name for [`PrintOperation`].
 pub const PRINT_OPERATION_NAME: &str = "print";
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// [`Operation`] that returns its input unchanged while printing it to standard error with a label.
-/// Refer to the documentation of [`Print`] for more information.
 ///
 /// By default, [`Operation::effects`] reports [`EffectClass::OrderedIo`], so program transforms never eliminate it as
 /// dead code (even when nothing consumes its output) and preserve its execution order relative to other ordered-I/O
 /// operations across every participating device. [`with_effect_class`](Self::with_effect_class) selects a weaker
 /// contract instead: [`EffectClass::DeviceOrderedIo`] keeps program order only among the ordered I/O executing on
-/// the same device, which allows the print to run once per device inside `shard_map` bodies, and
-/// [`EffectClass::UnorderedIo`] retains the print without ordering it relative to other I/O. Partial evaluation
-/// places it on the known side when its input is known (printing at partial-evaluation time under an eager known-side
-/// context, which also makes linearization print during the forward pass), and residualizes it otherwise.
-/// Differentiation passes the tangent through unchanged while printing the primal value. The primitive transposition
-/// rule passes the cotangent through without printing it; whole-program transposition rejects effectful linear
-/// instructions, so reverse differentiation transposes the print-free tangent program.
+/// the same device, which allows the print to run once per device inside "shard map" bodies, for example, and
+/// [`EffectClass::UnorderedIo`] retains the print without ordering it relative to other I/O. Partial evaluation places
+/// it on the known side when its input is known (printing at partial-evaluation time under an eager known-side context,
+/// which also makes linearization print during the forward pass), and residualizes it otherwise. Differentiation passes
+/// the tangent through unchanged while printing the primal value. The primitive transposition rule passes the cotangent
+/// through without printing it. Whole-program transposition rejects effectful linear instructions, so reverse
+/// differentiation transposes the print-free tangent program.
 ///
 /// Eager interpretation prints directly. The XLA backend lowers this operation to a StableHLO host-callback custom
-/// call (`@ryft.print`), using a token chain for ordered I/O to preserve execution order within one dispatch,
-/// including through `while`/`if` regions; refer to `ryft-xla`'s `experimental::debugging` module for the calling
-/// convention and the capturable output sink.
+/// call (i.e., `@ryft.print`), using a token chain for ordered I/O to preserve execution order within one dispatch,
+/// including through `if`/`while` regions.
 ///
 /// The `T` parameter fixes this payload's type universe, so each concrete [`PrintOperation`] implements exactly one
 /// [`Operation`] contract.
+///
+/// Refer to the documentation of [`Print`] for more information.
 #[derive(Clone, Debug)]
 pub struct PrintOperation<T: Type> {
+    // TODO(eaplatanios): Should this be optional?
     /// Refer to the documentation of [`label`](Self::label) for more information.
     label: String,
 
@@ -112,8 +112,8 @@ impl<T: Type> PrintOperation<T> {
         Self { label: label.into(), effect_class: EffectClass::OrderedIo, marker: PhantomData }
     }
 
-    /// Returns a copy of this [`PrintOperation`] with its effect class set to the provided `effect_class`.
-    /// Use [`EffectClass::OrderedIo`], [`EffectClass::DeviceOrderedIo`], or [`EffectClass::UnorderedIo`] to select
+    /// Returns a copy of this [`PrintOperation`] with its effect class set to the provided `effect_class`. Use
+    /// [`EffectClass::OrderedIo`], [`EffectClass::DeviceOrderedIo`], or [`EffectClass::UnorderedIo`] to select
     /// the I/O ordering contract described in the type documentation.
     #[inline]
     pub fn with_effect_class(mut self, effect_class: EffectClass) -> Self {
@@ -135,6 +135,7 @@ impl<T: Type> PrintOperation<T> {
 }
 
 impl<T: Type> Display for PrintOperation<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -163,6 +164,7 @@ impl<T: Type> Operation for PrintOperation<T> {
         Cow::Owned(Effects::explicit(EffectClasses::single(self.effect_class)))
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, PRINT_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("label", &self.label)?;
@@ -194,9 +196,6 @@ impl<C: Domain> InterpretableOperation<C> for PrintOperation<C::Type> {
     }
 }
 
-// Partial evaluation uses the default behavior of `Program::partially_evaluate`: the print folds into the known
-// side when its input is known and residualizes otherwise. Dead-code elimination keeps residual prints alive
-// because the operation declares an observable effect.
 impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation<C::Type> where
     C::Operation: From<PrintOperation<C::Type>>
 {
@@ -205,15 +204,16 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation<C::Type> wh
 impl_differentiable_elementwise_operation! {
     @linear<T>
     PrintOperation<T>,
-    rule = [@positive]
+    rule = [@positive],
 }
 
 /// Represents the ability to print values in programs with labels. [`Print`] stages a [`PrintOperation`], which is
-/// effectively an identity function that prints its input to standard error when executed. Because the staged
-/// operation defaults to [`EffectClass::OrderedIo`], the print survives dead-code elimination and keeps its execution
-/// order relative to other ordered prints.
+/// effectively an identity function that prints its input to standard error when executed. Because the staged operation
+/// defaults to [`EffectClass::OrderedIo`], the print survives dead-code elimination and keeps its execution order
+/// relative to other ordered print instructions.
 pub trait Print: Sized {
     /// Returns this value unchanged while printing it to standard error with `label`.
+    #[inline]
     fn print(self, label: &str) -> Self {
         self.print_with_effect_class(label, EffectClass::OrderedIo)
     }
@@ -226,15 +226,13 @@ pub trait Print: Sized {
     fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Self;
 }
 
-// Any context-carrying value prints by binding a `PrintOperation` through its own context. The
-// `From<PrintOperation<V::Type>>` bound makes this disjoint from the eager value types (whose context operation is
-// `ConstantOperation`), so it covers the transform tracers without conflicting with concrete implementations.
-impl<V: Value> Print for V
-where
-    V::DispatchDomain: Context<Operation: From<PrintOperation<V::Type>>>,
-{
+impl<V: Value<DispatchDomain: Context<Operation: From<PrintOperation<V::Type>>>>> Print for V {
     #[inline]
     fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Self {
+        // Any context-carrying value prints by binding a `PrintOperation` through its own context. The
+        // `From<PrintOperation<V::Type>>` bound makes this disjoint from the eager value types (whose context
+        // operation is `ConstantOperation`), so it covers the transform tracers without conflicting with
+        // concrete implementations.
         self.dispatch_domain()
             .bind(PrintOperation::new(label).with_effect_class(effect_class), Vec::new(), std::slice::from_ref(&self))
             .expect("`print` operation failed")

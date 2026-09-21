@@ -2076,8 +2076,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionVariable, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionValue, DimensionVariable,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext};
@@ -2157,8 +2157,8 @@ mod tests {
             IndexSlice::new(None, None, -1).normalize(5).unwrap(),
             NormalizedIndexSlice { start: 0, limit: 5, stride: 1, length: 5, reversed: true },
         );
-        // An explicit -1 is the last element, whereas the omitted reverse stop lies before the first element.
         assert_eq!(
+            // An explicit -1 is the last element, whereas the omitted reverse stop lies before the first element.
             IndexSlice::new(None, Some(-1), -1).normalize(5).unwrap(),
             NormalizedIndexSlice { start: 0, limit: 0, stride: 1, length: 0, reversed: true },
         );
@@ -2285,7 +2285,6 @@ mod tests {
 
     #[test]
     fn test_indexed_get_advanced() {
-        // Expected values were independently generated with NumPy 2.3.5.
         let input =
             Array::from_elements(ArrayType::new_static(DataType::I32, [3, 4, 5]), &(0_i32..60).collect::<Vec<_>>())
                 .unwrap();
@@ -2295,8 +2294,8 @@ mod tests {
             input.at(&index![.., &rows, &columns]).get(&GatherOptions::new()),
             Array::matrix(3, 2, vec![1_i32, 13, 21, 33, 41, 53]),
         );
-        // An ellipsis remains a separator even when it expands to zero axes.
         assert_eq!(
+            // An ellipsis remains a separator even when it expands to zero axes.
             input.at(&index![.., &rows, ..., &columns]).get(&GatherOptions::new()),
             Array::matrix(2, 3, vec![1_i32, 21, 41, 13, 33, 53]),
         );
@@ -2353,6 +2352,7 @@ mod tests {
         let clip = GatherOptions::new().with_mode(GatherMode::Clip);
         let fill =
             GatherOptions::new().with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(-99_i32).unwrap())) });
+
         // Negative coordinates count from the end once; the remaining invalid coordinates clip or fill.
         assert_eq!(input.at(&index![&indices]).get(&clip), Array::vector(vec![10_i32, 30, 10, 30, 30]));
         assert_eq!(input.at(&index![&indices]).get(&fill), Array::vector(vec![-99_i32, 30, 10, -99, -99]));
@@ -2390,6 +2390,7 @@ mod tests {
     #[test]
     fn test_indexed_get_validation() {
         let input = Array::vector(vec![10_i32, 20, 30]).unwrap();
+
         // A host integer that stays out of bounds after normalization violates the default in-bounds promise.
         assert!(matches!(
             input.at(&index![3]).get(&GatherOptions::new()),
@@ -2461,12 +2462,6 @@ mod tests {
             input.at(&index![&indices]).get(&GatherOptions::new().with_mode(GatherMode::Clip)),
             Array::vector(vec![10_i32, 30, 30]),
         );
-        assert_eq!(
-            input
-                .at(&index![&indices])
-                .set(&Array::scalar(7_i32).unwrap(), &ScatterOptions::new().with_mode(ScatterMode::Drop)),
-            Array::vector(vec![7_i32, 20, 7]),
-        );
     }
 
     #[test]
@@ -2479,11 +2474,11 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-            lambda %0:f64[2, 3] .
-            let %1:f64[2, 1] = slice [start_indices=[0, 1], limit_indices=[2, 2]] %0
-                %2:f64[2] = reshape [shape=[2]] %1
-            in (%2)
-        "}
+                lambda %0:f64[2, 3] .
+                let %1:f64[2, 1] = slice [start_indices=[0, 1], limit_indices=[2, 2]] %0
+                    %2:f64[2] = reshape [shape=[2]] %1
+                in (%2)
+            "}
             .trim_end(),
         );
         assert_eq!(
@@ -2557,6 +2552,7 @@ mod tests {
             vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"]), ShardingDimension::Replicated],
         )
         .unwrap();
+
         // Query arrays broadcast to [2, 2]; the inserted leading axis must not shift the requested query placement.
         let output = input
             .at(&index![new_axis, &rows, &columns])
@@ -2573,6 +2569,27 @@ mod tests {
     }
 
     #[test]
+    fn test_indexed_get_reduction_state() {
+        // A gather from an unreduced input keeps its reduction state on the selection.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap();
+        let input = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [3]).with_sharding(sharding.clone()).unwrap(),
+            &[10_f64, 20., 30.],
+        )
+        .unwrap();
+        let indices = Array::vector(vec![2_i32, 0]).unwrap();
+        assert_eq!(
+            input.at(&index![&indices]).get(&GatherOptions::new()),
+            Ok(Array::from_elements(
+                ArrayType::new_static(DataType::F64, [2]).with_sharding(sharding).unwrap(),
+                &[30_f64, 10.],
+            )
+            .unwrap()),
+        );
+    }
+
+    #[test]
     fn test_indexed_get_memory() {
         let memory = Memory::Host { pinned: true };
         let input =
@@ -2580,6 +2597,7 @@ mod tests {
                 .unwrap();
         let indices =
             Array::from_elements(ArrayType::new_static(DataType::I32, [2]).with_memory(memory), &[-1_i32, 0]).unwrap();
+
         // Generated zero and extent literals must share the query/input memory before index normalization.
         assert_eq!(
             input.at(&index![&indices]).get(&GatherOptions::new()),
@@ -2717,12 +2735,28 @@ mod tests {
             input.at(&index![&mask]).set(&Array::scalar(6_i32).unwrap(), &ScatterOptions::new()),
             Array::vector(vec![0_i32, 6, 2, 6, 4]),
         );
+    }
+
+    #[test]
+    fn test_indexed_set_bounds() {
+        // Negative coordinates count from the end once; coordinates that remain invalid are dropped under `Drop`.
+        let input = Array::vector(vec![0_i32, 1, 2, 3, 4]).unwrap();
         let invalid = Array::vector(vec![-6_i32, 5]).unwrap();
         assert_eq!(
             input
                 .at(&index![&invalid])
                 .set(&Array::scalar(9_i32).unwrap(), &ScatterOptions::new().with_mode(ScatterMode::Drop)),
             Ok(input),
+        );
+
+        // Unsigned extremes are decoded exactly rather than reinterpreted as negative coordinates.
+        let input = Array::vector(vec![10_i32, 20, 30]).unwrap();
+        let indices = Array::vector(vec![0_u64, 2, u64::MAX]).unwrap();
+        assert_eq!(
+            input
+                .at(&index![&indices])
+                .set(&Array::scalar(7_i32).unwrap(), &ScatterOptions::new().with_mode(ScatterMode::Drop)),
+            Array::vector(vec![7_i32, 20, 7]),
         );
     }
 
@@ -2768,14 +2802,8 @@ mod tests {
             &[5_f64, 7.],
         )
         .unwrap();
-        assert_eq!(
-            input.at(&index![&indices]).get(&GatherOptions::new()),
-            Ok(Array::from_elements(
-                ArrayType::new_static(DataType::F64, [2]).with_sharding(sharding.clone()).unwrap(),
-                &[30_f64, 10.],
-            )
-            .unwrap()),
-        );
+
+        // The unreduced input and updates agree, so the scattered result carries the same reduction state.
         assert_eq!(
             input.at(&index![&indices]).add(&updates, &ScatterOptions::new()),
             Ok(Array::from_elements(
@@ -3014,6 +3042,14 @@ mod tests {
             .map(|_| ())
         };
 
+        // Only array inputs can be indexed.
+        assert_eq!(
+            ArrayIrValue::<Array>::Dimension(DimensionValue::constant(1).unwrap())
+                .at(&index![0])
+                .get(&GatherOptions::new()),
+            Err(TypeError::invalid("expected array type but got dimension type").into()),
+        );
+
         // Only full forward or reverse slices, one indexed axis, and `i64`-representable host integers are supported.
         assert_eq!(
             trace(|input, _| input.at(&index![0.., ..]).get(&GatherOptions::new()), indices_type.clone()),
@@ -3081,25 +3117,10 @@ mod tests {
                 |input, indices| input
                     .at(&index![.., indices])
                     .get(&GatherOptions::new().with_indices_are_sorted(true)),
-                indices_type.clone(),
-            ),
-            Err(TypeError::invalid(
-                "symbolic indexing does not yet support explicit output sharding or index promises"
-            )
-            .into()),
-        );
-        assert_eq!(
-            trace(
-                |input, indices| {
-                    let updates = ValueProjection::<ArrayType>::into_projected(indices.clone())?
-                        .convert_element_type(DataType::F64)?;
-                    let updates = <ArrayIrTracer as ValueProjection<ArrayType>>::from_projected(updates);
-                    input.at(&index![.., indices]).set(&updates, &ScatterOptions::new().with_unique_indices(true))
-                },
                 indices_type,
             ),
             Err(TypeError::invalid(
-                "symbolic indexing does not yet support explicit output sharding or index promises"
+                "symbolic indexing does not yet support explicit output sharding or index promises",
             )
             .into()),
         );
@@ -3134,23 +3155,6 @@ mod tests {
             )),
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![8_f64, 20., 7., 8., 50., 7.]).unwrap())),
         );
-        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |(input, indices, updates)| input.at(&index![..by - 1, &indices]).max(&updates, &ScatterOptions::new()),
-            (
-                input_type.clone(),
-                ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])),
-                ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2])),
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            program.interpret((
-                matrix.clone(),
-                indices.clone(),
-                ArrayIrValue::Array(Array::vector(vec![70_f64, 80.]).unwrap()),
-            )),
-            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![80_f64, 20., 70., 80., 50., 70.]).unwrap())),
-        );
 
         // Without a query, the whole array is updated through a zero-width index vector.
         let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
@@ -3167,7 +3171,7 @@ mod tests {
         let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(input, indices, updates)| input.at(&index![new_axis, .., &indices]).set(&updates, &ScatterOptions::new()),
             (
-                input_type,
+                input_type.clone(),
                 ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])),
                 ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
             ),
@@ -3176,6 +3180,26 @@ mod tests {
         assert_eq!(
             program.interpret((matrix, indices, ArrayIrValue::Array(Array::scalar(5_f64).unwrap()))),
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![5_f64, 20., 5., 5., 50., 5.]).unwrap())),
+        );
+
+        // Explicit placement and index promises are not remapped by the symbolic frontend yet,
+        // for updates as for reads.
+        assert_eq!(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |(input, indices, updates)| input
+                    .at(&index![.., &indices])
+                    .set(&updates, &ScatterOptions::new().with_unique_indices(true)),
+                (
+                    input_type,
+                    ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])),
+                    ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
+                ),
+            )
+            .map(|_| ()),
+            Err(TypeError::invalid(
+                "symbolic indexing does not yet support explicit output sharding or index promises",
+            )
+            .into()),
         );
     }
 
@@ -3202,8 +3226,31 @@ mod tests {
     }
 
     #[test]
+    fn test_indexed_max_staging_symbolic() {
+        // A reduction kind other than overwrite follows the same reversed scatter and reversal back.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(6)).unwrap());
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(input, indices, updates)| input.at(&index![..by - 1, &indices]).max(&updates, &ScatterOptions::new()),
+            (
+                ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(rows), 3.into()]))),
+                ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F64, [2])),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![10_f64, 20., 30., 40., 50., 60.]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![-1_i32, 0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![70_f64, 80.]).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![80_f64, 20., 70., 80., 50., 70.]).unwrap())),
+        );
+    }
+    #[test]
     fn test_indexed_view() {
         let buffer = reference_matrix();
+
         // Host integers remove their axis, slices keep theirs, an ellipsis and omitted trailing axes select in full,
         // and negative coordinates count from the end.
         let view = buffer.at(&index![1]).view().unwrap();
@@ -3214,11 +3261,13 @@ mod tests {
         assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())));
         let view = buffer.at(&index![..., -1]).view().unwrap();
         assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::vector(vec![3.0_f32, 6.0]).unwrap())));
+
         // Full selections derive no view transform and hand back the input allocation.
         let view = buffer.at(&index![.., 0..3]).view().unwrap();
         assert_eq!(view.r#type(), buffer.r#type());
         assert_eq!(view.read(), buffer.read());
         assert_eq!(buffer.at(&[]).view().unwrap().read(), buffer.read());
+
         // Scalar integer arrays select one position at run time, clamped into bounds.
         let index = ArrayIrValue::Array(Array::scalar(1_i32).unwrap());
         let view = buffer.at(&index![&index, 2]).view().unwrap();
@@ -3226,6 +3275,7 @@ mod tests {
         let index = ArrayIrValue::Array(Array::scalar(7_i32).unwrap());
         let view = buffer.at(&index![.., &index]).view().unwrap();
         assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::vector(vec![3.0_f32, 6.0]).unwrap())));
+
         // Views alias the allocation, so writes through the input are visible through an earlier view.
         let view = buffer.at(&index![0, 0]).view().unwrap();
         buffer.write(&ArrayIrValue::Array(Array::matrix(2, 3, vec![9.0_f32; 6]).unwrap())).unwrap();
@@ -3234,6 +3284,8 @@ mod tests {
 
     #[test]
     fn test_indexed_view_validation() {
+        // Unsupported selector kinds, malformed selector lists, and out-of-range host integers are rejected before any
+        // view is derived.
         let buffer = reference_matrix();
         assert_eq!(
             buffer.at(&index![new_axis]).view(),
@@ -3278,9 +3330,13 @@ mod tests {
             buffer.at(&index![&float]).view(),
             Err(TypeError::invalid("reference views support only scalar integer index arrays but got `f32[]`").into()),
         );
+
         // Array inputs have no reference to view.
         let array = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap());
-        assert!(matches!(array.at(&index![0]).view(), Err(ProgramError::Type(_))));
+        assert_eq!(
+            array.at(&index![0]).view(),
+            Err(TypeError::invalid("expected reference type but got array type").into()),
+        );
 
         // Axes touched by host integers or slices must have static extents.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
@@ -3288,20 +3344,24 @@ mod tests {
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(3)]),
         ));
-        let indexed: [IndexSelector<'_, ArrayIrTracer>; 1] = index![0];
-        let sliced: [IndexSelector<'_, ArrayIrTracer>; 2] = index![.., 1..3];
-        for selectors in [indexed.as_slice(), sliced.as_slice()] {
-            let error = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-                |input| input.reference_new()?.at(selectors).view().map(|_| ()),
+        let static_extent_error =
+            Err(TypeError::invalid("reference views require a static extent on axis 0 but got `f32[rows, 3]`").into());
+        assert_eq!(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |input| input.reference_new()?.at(&index![0]).view().map(|_| ()),
                 dynamic_type.clone(),
             )
-            .unwrap_err();
-            assert!(matches!(
-                error,
-                ProgramError::Type(TypeError::Invalid { message })
-                    if message.starts_with("reference views require a static extent on axis 0 but got `"),
-            ));
-        }
+            .map(|_| ()),
+            static_extent_error,
+        );
+        assert_eq!(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |input| input.reference_new()?.at(&index![.., 1..3]).view().map(|_| ()),
+                dynamic_type,
+            )
+            .map(|_| ()),
+            static_extent_error,
+        );
     }
 
     #[test]
@@ -3357,6 +3417,7 @@ mod tests {
             buffer.at(&index![1, 1..]).read(),
             Ok(ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0]).unwrap())),
         );
+
         // Reads observe the reference state at the time of the read.
         buffer.write(&ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]).unwrap())).unwrap();
         assert_eq!(
@@ -3380,6 +3441,7 @@ mod tests {
             buffer.read(),
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![10.0_f32, 2.0, 3.0, 40.0, 50.0, 60.0]).unwrap())),
         );
+
         // The replacement must match the selected region's type.
         assert!(
             buffer
@@ -3466,6 +3528,7 @@ mod tests {
         let rows = Array::vector(vec![0_i32, 2]).unwrap();
         let selection = index![&rows, ...];
         assert_eq!(selection, [IndexSelector::Array(&rows), IndexSelector::Basic(BasicIndex::Ellipsis)]);
+
         // Constructing descriptors keeps the original array available to the caller.
         assert_eq!(rows, Array::vector(vec![0_i32, 2]).unwrap());
     }
