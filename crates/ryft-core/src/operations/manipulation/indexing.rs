@@ -1332,31 +1332,28 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
-where
-    V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceDynamicIndex,
+impl<V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceDynamicIndex>
+    Indexed<'_, '_, '_, V, ArrayIrType>
 {
     /// Derives a reference view of the selected region of a reference input without accessing its state. The view
     /// shares the input's allocation, so reads through it observe later writes to the input and writes through it are
     /// visible to the input, which is the reference counterpart of NumPy's basic-indexing views and of `ref.at[...]`
-    /// in JAX. Reference views are restricted to the transforms the reference machinery can reconstruct: host integers
-    /// remove their axis, unit-stride forward slices keep theirs, an ellipsis expands over the unspecified axes, and a
-    /// scalar integer array selects one position on its axis at run time (clamped into bounds, as for
-    /// [`reference_dynamic_index`](ReferenceDynamicIndex::reference_dynamic_index)). Inserted axes, masks,
-    /// non-scalar index arrays, strided or reversed slices, and out-of-bounds host integers are rejected. Every axis
-    /// that a host integer or slice touches must have a static extent, and when any slice is present the whole
-    /// referent shape must be static. A selection that touches no axis returns the input itself.
+    /// in [JAX](https://docs.jax.dev/en/latest/jax.ref.html). Reference views are restricted to the transforms the
+    /// reference machinery can reconstruct:host integers remove their axis, unit-stride forward slices keep theirs, an
+    /// ellipsis expands over the unspecified axes, and a scalar integer array selects one position on its axis at run
+    /// time (clamped into bounds, as for [`reference_dynamic_index`](ReferenceDynamicIndex::reference_dynamic_index)).
+    /// Inserted axes, masks, non-scalar index arrays, strided or reversed slices, and out-of-bounds host integers are
+    /// rejected. Every axis that a host integer or slice touches must have a static extent, and when any slice is
+    /// present the whole referent shape must be static. A selection that touches no axis returns the input itself.
     ///
     /// # Example
     ///
     /// ```rust
     /// # use ryft_core::{Array, ArrayIrValue, Indexing, ProgramError, ReferenceNew, ReferenceRead, index};
     /// # fn main() -> Result<(), ProgramError> {
-    /// let buffer = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0])?).reference_new()?;
+    /// let buffer = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0])?).reference_new()?;
     /// let row = buffer.at(&index![1, 1..]).view()?;
-    /// assert_eq!(row.read()?, ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0])?));
+    /// assert_eq!(row.read()?, ArrayIrValue::Array(Array::vector(vec![5.0f32, 6.0])?));
     /// # Ok(())
     /// # }
     /// ```
@@ -1381,15 +1378,18 @@ where
                 IndexSelector::Basic(_) | IndexSelector::Array(_) => consumed += 1,
             }
         }
+
         if ellipses > 1 {
             return Err(TypeError::invalid("index selection contains more than one ellipsis").into());
         }
+
         if consumed > rank {
             return Err(TypeError::invalid(format!(
-                "index selection consumes {consumed} axes but input rank is {rank}"
+                "index selection consumes {consumed} axes but input rank is {rank}",
             ))
             .into());
         }
+
         let mut assigned = vec![None; rank];
         let mut axis = 0;
         for selector in self.selectors {
@@ -1411,6 +1411,7 @@ where
                 .into()
             })
         };
+
         let mut selections = Vec::with_capacity(rank);
         for (axis, selector) in assigned.iter().enumerate() {
             let selection = match selector {
@@ -1422,7 +1423,7 @@ where
                     let normalized = if *index < 0 { *index + extent as i128 } else { *index };
                     if normalized < 0 || normalized >= extent as i128 {
                         return Err(TypeError::invalid(format!(
-                            "index {index} is out of bounds for axis {axis} with extent {extent}"
+                            "index {index} is out of bounds for axis {axis} with extent {extent}",
                         ))
                         .into());
                     }
@@ -1432,17 +1433,20 @@ where
                     if slice.step() < 0 {
                         return Err(TypeError::invalid("reference views do not support reversed slices").into());
                     }
+
                     // A complete unit-stride slice selects its axis in full whatever the extent, so it never needs a
                     // static extent, which keeps dynamic axes that are not touched selectable through `..`.
                     if slice.start().is_none() && slice.stop().is_none() && slice.step() == 1 {
                         selections.push(ReferenceAxisSelection::Full);
                         continue;
                     }
+
                     let extent = extent(axis)?;
                     let normalized = slice.normalize(extent)?;
                     if normalized.stride != 1 {
                         return Err(TypeError::invalid("reference views do not support strided slices").into());
                     }
+
                     if normalized.start == 0 && normalized.length == extent {
                         ReferenceAxisSelection::Full
                     } else {
@@ -1464,8 +1468,8 @@ where
             selections.push(selection);
         }
 
-        // Windows are applied first through one rank-preserving slice over every axis, and then the indexed axes are
-        // removed from the sliced view in ascending order, adjusting for the axes removed before them.
+        // Windows are applied first through one rank-preserving slice over every axis, and then the indexed axes
+        // are removed from the sliced view in ascending order, adjusting for the axes removed before them.
         let mut view = self.input.clone();
         if selections.iter().any(|selection| matches!(selection, ReferenceAxisSelection::Window(_))) {
             let axes = selections
@@ -1478,6 +1482,7 @@ where
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             view = view.reference_slice(&axes)?;
         }
+
         let mut removed = 0;
         for (axis, selection) in selections.iter().enumerate() {
             match selection {
@@ -1492,9 +1497,12 @@ where
                 ReferenceAxisSelection::Full | ReferenceAxisSelection::Window(_) => {}
             }
         }
+
         Ok(view)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
 where
