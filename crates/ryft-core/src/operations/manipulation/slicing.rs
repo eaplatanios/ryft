@@ -1774,7 +1774,6 @@ where
 
             return Ok(batch_by_item_expansion(
                 context,
-                DYNAMIC_SLICE_OPERATION_NAME,
                 self,
                 inputs,
                 axis_size.ok_or_else(|| ProgramError::UnsupportedOperation {
@@ -3361,7 +3360,6 @@ where
         if batch_axes[2..].iter().any(Option::is_some) {
             return Ok(batch_by_item_expansion(
                 context,
-                DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
                 self,
                 inputs,
                 axis_size.ok_or_else(|| ProgramError::UnsupportedOperation {
@@ -4360,39 +4358,37 @@ fn validate_dynamic_slice_bound_counts(rank: usize, start_count: usize, size_cou
     Ok(())
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Applies a single-output `operation` independently per batch item and restacks the results along a fresh leading
-/// batch axis: every input is realigned so any mapped batch axis sits at the leading physical axis, item `item` of each
+/// batch axis. Every input is realigned so any mapped batch axis sits at the leading physical axis, item `item` of each
 /// batched input is selected with [`Slice::index_axis`] (replicated inputs are used whole), and the per-item outputs
-/// are expanded with a replicated leading axis and concatenated. This is the fallback for batch-varying start
-/// indices, which cannot ride along structurally, and it stages `O(axis_size)` operations because everything goes
-/// through the value capability traits in both eager and tracing contexts. For an empty batch, it infers the per-item
-/// output type and synthesizes the correctly typed empty packed result without interpreting a nonexistent item; this
-/// requires the operation's output to have the input's rank and element type with extents within the input's, which
-/// every slicing operation satisfies. Non-empty explicitly sharded mapped inputs are resharded to replicated placement
-/// before item extraction, and the completed replicated result is resharded once to the context's mapped placement.
-/// This avoids assigning a nontrivial sharding to the extent-one slices used internally by the expansion.
-fn batch_by_item_expansion<C, O, P: ArrayExtentBatchingPolicy<C>>(
+/// are expanded with a replicated leading axis and concatenated. This is the fallback for batch-varying start indices,
+/// which cannot ride along structurally, and it stages `O(axis_size)` operations because everything goes through the
+/// value capability traits in both eager and tracing contexts. For an empty batch, it infers the per-item output type
+/// and synthesizes the correctly typed empty packed result without interpreting a nonexistent item. This requires the
+/// operation's output to have the input's rank and element type with extents within the input's, which every slicing
+/// operation satisfies. Non-empty explicitly sharded mapped inputs are resharded to replicated placement before item
+/// extraction, and the completed replicated result is resharded once to the context's mapped placement. This avoids
+/// assigning a nontrivial sharding to the extent-one slices used internally by the expansion.
+fn batch_by_item_expansion<
+    O: Operation<Type = ArrayType> + InterpretableOperation<C>,
+    C: Context<Type = ArrayType, Value: Broadcast + Transpose + Slice + Reshape + Concatenate + Reshard>,
+    P: ArrayExtentBatchingPolicy<C>,
+>(
     context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-    operation_name: &'static str,
     operation: &O,
     inputs: &[ArrayBatch<C::Value>],
     axis_size: usize,
-) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
-where
-    C: Context<Type = ArrayType>,
-    C::Value: Broadcast + Transpose + Slice + Reshape + Concatenate + Reshard,
-    O: Operation<Type = ArrayType> + InterpretableOperation<C>,
-{
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
     if inputs.is_empty() {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     }
+
     if axis_size == 0 {
         let input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>();
         let mut output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
         check_count!("output", output_types, 1, ProgramError);
         let output_type = output_types.remove(0);
+
         // The callers are slicing operations: their output has the input's rank and element type within its extents.
         // Reuse an empty mapped input and slice its geometry, avoiding a non-empty scalar-zero construction for
         // formats such as `F8E8M0FNU` that cannot represent zero.
@@ -4400,11 +4396,14 @@ where
         if input.unbatched_type() == output_type {
             return Ok(vec![input]);
         }
+
         let output_shape = output_type.static_shape().ok_or_else(|| {
             TypeError::invalid(format!(
-                "`{operation_name}` batching over an empty batch requires a statically known result shape"
+                "`{}` batching over an empty batch requires a statically known result shape",
+                operation.name(),
             ))
         })?;
+
         let mut limits = vec![0];
         limits.extend_from_slice(output_shape.as_slice());
         let output = input.value().slice(&vec![0; limits.len()], &limits, &vec![1; limits.len()])?;
@@ -4412,6 +4411,7 @@ where
         let output = output.broadcast(output_type, &(0..limits.len()).collect::<Vec<_>>())?;
         return Ok(vec![ArrayBatch::new(output, BatchAxis::new(0))?]);
     }
+
     let aligned = inputs
         .iter()
         .map(|input| {
@@ -4420,12 +4420,14 @@ where
             let (Some(0), Some(sharding)) = (aligned.batch_axis_position(), aligned_type.sharding()) else {
                 return Ok(aligned);
             };
+
             if sharding.dimensions()[0] == ShardingDimension::Replicated {
                 return Ok(aligned);
             }
+
             // Slicing one global batch item cannot retain a nontrivial Explicit placement on its new extent-one
-            // dimension. Replicate the packed input once, run the expansion over replicated slices, and restore the
-            // mapped placement once on the completed output accumulator.
+            // dimension. Replicate the packed input once, run the expansion over replicated slices, and restore
+            // the mapped placement once on the completed output accumulator.
             let mut dimensions = sharding.dimensions().to_vec();
             dimensions[0] = ShardingDimension::Replicated;
             let replicated = sharding
@@ -4435,8 +4437,9 @@ where
             ArrayBatch::new(value, BatchAxis::new(0))
         })
         .collect::<Result<Vec<_>, BatchingError>>()?;
-    // Concatenate singleton-axis items once. Repeated immutable updates would copy the entire eager output for
-    // every item. Keep the new axis replicated until the complete batch can carry its mapped sharding.
+
+    // Concatenate singleton-axis items once. Repeated immutable updates would copy the entire eager output
+    // for every item. Keep the new axis replicated until the complete batch can carry its mapped sharding.
     let items = (0..axis_size)
         .map(|item| {
             let item_inputs = aligned
@@ -4445,14 +4448,17 @@ where
                     if input.batch_axis().is_replicated() {
                         return Ok(input.value().clone());
                     }
+
                     let input_type = input.r#type();
                     if input_type.static_shape().is_none() {
                         return Err(TypeError::invalid(format!(
-                            "`{operation_name}` per-item expansion requires static batched input types but got \
-                         {input_type}",
+                            "`{}` per-item expansion requires static batched input types but got {}",
+                            operation.name(),
+                            input_type,
                         ))
                         .into());
                     }
+
                     input.value().index_axis(0, item, false)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -4461,6 +4467,7 @@ where
             outputs.remove(0).expand_dimensions(0)
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
+
     let accumulator = C::Value::concatenate(&items, 0)?;
     let batch_dimension = context.axis_sharding();
     let accumulator = match accumulator.r#type().sharding() {
@@ -4474,8 +4481,8 @@ where
         }
         _ => accumulator,
     };
-    let stacked = ArrayBatch::new(accumulator, Some(0))?;
-    Ok(vec![stacked])
+
+    Ok(vec![ArrayBatch::new(accumulator, Some(0))?])
 }
 
 #[cfg(test)]
@@ -9853,14 +9860,7 @@ mod tests {
         // No inputs is an arity error.
         let empty_context = BatchingContext::new(EagerContext::<Array>::new(), 0);
         assert_eq!(
-            batch_by_item_expansion(
-                &empty_context,
-                DYNAMIC_SLICE_OPERATION_NAME,
-                &DynamicSliceOperation::new(vec![2]),
-                &[],
-                0
-            )
-            .unwrap_err(),
+            batch_by_item_expansion(&empty_context, &DynamicSliceOperation::new(vec![2]), &[], 0).unwrap_err(),
             BatchingError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
@@ -9873,14 +9873,9 @@ mod tests {
         )
         .unwrap();
         let plain = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
-        let outputs = batch_by_item_expansion(
-            &empty_context,
-            DYNAMIC_SLICE_OPERATION_NAME,
-            &DynamicSliceOperation::new(vec![4]),
-            &[plain, indices.clone()],
-            0,
-        )
-        .unwrap();
+        let outputs =
+            batch_by_item_expansion(&empty_context, &DynamicSliceOperation::new(vec![4]), &[plain, indices.clone()], 0)
+                .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].unbatched_type(), ArrayType::new_static(DataType::F64, [4]));
@@ -9888,14 +9883,9 @@ mod tests {
         let layout_type =
             ArrayType::new_static(DataType::F64, [4]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let laid_out = ArrayBatch::replicated(Array::from_elements(layout_type, &[0.0, 1.0, 2.0, 3.0]).unwrap());
-        let outputs = batch_by_item_expansion(
-            &empty_context,
-            DYNAMIC_SLICE_OPERATION_NAME,
-            &DynamicSliceOperation::new(vec![2]),
-            &[laid_out, indices],
-            0,
-        )
-        .unwrap();
+        let outputs =
+            batch_by_item_expansion(&empty_context, &DynamicSliceOperation::new(vec![2]), &[laid_out, indices], 0)
+                .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].unbatched_type(), ArrayType::new_static(DataType::F64, [2]));
@@ -9912,7 +9902,6 @@ mod tests {
         .unwrap();
         let outputs = batch_by_item_expansion(
             &context,
-            DYNAMIC_SLICE_OPERATION_NAME,
             &DynamicSliceOperation::new(vec![2]),
             &[input, batch_varying_indices(vec![1, 3])],
             2,
@@ -9926,7 +9915,6 @@ mod tests {
         let singleton_context = BatchingContext::new(EagerContext::<Array>::new(), 1);
         let outputs = batch_by_item_expansion(
             &singleton_context,
-            SLICE_OPERATION_NAME,
             &SliceOperation::new(vec![], vec![]),
             &[ArrayBatch::replicated(Array::scalar(7.0).unwrap())],
             1,
@@ -9957,14 +9945,8 @@ mod tests {
             BatchAxis::new(0),
         )
         .unwrap();
-        let outputs = batch_by_item_expansion(
-            &context,
-            DYNAMIC_SLICE_OPERATION_NAME,
-            &DynamicSliceOperation::new(vec![2]),
-            &[input, indices],
-            2,
-        )
-        .unwrap();
+        let outputs =
+            batch_by_item_expansion(&context, &DynamicSliceOperation::new(vec![2]), &[input, indices], 2).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().sharding(), Some(&mapped_sharding));
         let program = trace
@@ -10021,14 +10003,7 @@ mod tests {
         let index = ArrayBatch::replicated(trace.input(ArrayType::scalar(DataType::I32)));
         let context = BatchingContext::new(trace, 2);
         assert_eq!(
-            batch_by_item_expansion(
-                &context,
-                DYNAMIC_SLICE_OPERATION_NAME,
-                &DynamicSliceOperation::new(vec![1]),
-                &[dynamic, index],
-                2,
-            )
-            .unwrap_err(),
+            batch_by_item_expansion(&context, &DynamicSliceOperation::new(vec![1]), &[dynamic, index], 2,).unwrap_err(),
             BatchingError::Program(
                 TypeError::invalid(format!(
                     "`{DYNAMIC_SLICE_OPERATION_NAME}` per-item expansion requires static batched input types but got \
