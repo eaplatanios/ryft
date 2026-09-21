@@ -5,7 +5,7 @@ use crate::arrays::{
     Array, ArrayIrType, ArraySliceAxis, ArrayType, Broadcastable, DataType, Dimension, ReferenceDynamicIndex,
     ReferenceIndex, ReferenceSlice, Shape,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::operations::compare::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -1164,11 +1164,14 @@ impl<
             return self.with_projected_selection(|selection| selection.get(options)).map(V::from_projected);
         }
 
-        Self::validate_symbolic_options(
-            options.output_sharding().is_some(),
-            options.indices_are_sorted(),
-            options.unique_indices(),
-        )?;
+        // The symbolic path does not remap explicit output sharding or the index promises yet;
+        // bounds modes and fills remain available.
+        if options.output_sharding().is_some() || options.indices_are_sorted() || options.unique_indices() {
+            return Err(TypeError::invalid(
+                "symbolic indexing does not yet support explicit output sharding or index promises",
+            )
+            .into());
+        }
 
         // Identity and full-reversal selections skip gather, but explicit fills still have the same scalar/data-type
         // contract as indexed reads. Validate before those fast paths instead of silently accepting a malformed fill.
@@ -1281,11 +1284,14 @@ impl<
                 .map(V::from_projected);
         }
 
-        Self::validate_symbolic_options(
-            options.output_sharding().is_some(),
-            options.indices_are_sorted(),
-            options.unique_indices(),
-        )?;
+        // The symbolic path does not remap explicit output sharding or the index promises yet;
+        // bounds modes and fills remain available.
+        if options.output_sharding().is_some() || options.indices_are_sorted() || options.unique_indices() {
+            return Err(TypeError::invalid(
+                "symbolic indexing does not yet support explicit output sharding or index promises",
+            )
+            .into());
+        }
 
         let plan = self.dynamic_plan(options.mode() == ScatterMode::PromiseInBounds)?;
         let input_type = self.input.r#type();
@@ -1563,8 +1569,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>>
     Indexed<'_, '_, '_, V, ArrayIrType>
 {
@@ -1597,15 +1601,21 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<
         Ok(false)
     }
 
-    /// Serves a concrete-geometry selection through the implementation for array values by projecting the input and
-    /// every index array out of this value family, re-borrowing the selectors over those projections, and handing the
-    /// projected selection to `select`.
+    /// Rebuilds this selection over the array projected out of the input and calls `select` with it, so that a
+    /// selection with concrete shapes can be served by the implementation for array values. Every index array is
+    /// projected the same way and the selectors are re-borrowed over those projections, which is why the projected
+    /// selection only lives for the duration of the call. The result of `select` is returned as is, and callers lift
+    /// it back into this value family when it is a value.
+    ///
+    /// # Parameters
+    ///
+    ///   - `select`: Terminal function applied to the projected selection (e.g., its `get` or `update`).
     fn with_projected_selection<
         R,
         F: FnOnce(Indexed<'_, '_, '_, V::Projected, ArrayType>) -> Result<R, ProgramError>,
     >(
         &self,
-        select: F,
+        select_fn: F,
     ) -> Result<R, ProgramError> {
         let input = self.input.clone().into_projected()?;
         let values = self
@@ -1626,32 +1636,25 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<
                 IndexSelector::Mask(mask) => IndexSelector::Mask(mask),
             })
             .collect::<Vec<_>>();
-        select(input.at(&selectors))
-    }
-
-    /// Rejects the read and update options that the symbolic frontend does not remap yet: explicit output sharding
-    /// and the sortedness and uniqueness index promises. Bounds modes and fills remain available.
-    fn validate_symbolic_options(
-        has_output_sharding: bool,
-        indices_are_sorted: bool,
-        unique_indices: bool,
-    ) -> Result<(), ProgramError> {
-        if has_output_sharding || indices_are_sorted || unique_indices {
-            return Err(TypeError::invalid(
-                "symbolic indexing does not yet support explicit output sharding or index promises",
-            )
-            .into());
-        }
-        Ok(())
+        select_fn(input.at(&selectors))
     }
 }
 
-impl<V> Indexed<'_, '_, '_, V, ArrayIrType>
-where
-    V: Value<Type = ArrayIrType> + DimensionSize + DimensionToScalar + ValueProjection<ArrayType>,
-    V::Projected: Value<Type = ArrayType> + ConvertElementType + Compare + Add + Select + TransferToMemory + Reverse,
-    <V::Projected as Value>::ExecutionDomain: Context,
-    <<V::Projected as Value>::ExecutionDomain as Domain>::Operation: From<ConstantOperation<Array>>,
+impl<
+    V: Value<Type = ArrayIrType>
+        + DimensionSize
+        + DimensionToScalar
+        + ValueProjection<
+            ArrayType,
+            Projected: Value<Type = ArrayType, ExecutionDomain: Context<Operation: From<ConstantOperation<Array>>>>
+                           + ConvertElementType
+                           + Compare
+                           + Add
+                           + Select
+                           + TransferToMemory
+                           + Reverse,
+        >,
+> Indexed<'_, '_, '_, V, ArrayIrType>
 {
     /// Lifts a host coordinate literal through the array projected out of the input. Refer to the documentation of the
     /// array-valued [`constant`](Indexed::constant) for more information.
@@ -1681,6 +1684,7 @@ where
         let input_type = self.input.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
         let rank = input_type.rank();
+
         let consumed = self
             .selectors
             .iter()
@@ -1688,10 +1692,11 @@ where
             .count();
         if consumed > rank {
             return Err(TypeError::invalid(format!(
-                "index selection consumes {consumed} axes but input rank is {rank}"
+                "index selection consumes {consumed} axes but input rank is {rank}",
             ))
             .into());
         }
+
         let ellipses = self
             .selectors
             .iter()
@@ -1700,6 +1705,7 @@ where
         if ellipses > 1 {
             return Err(TypeError::invalid("index selection contains more than one ellipsis").into());
         }
+
         let mut query = None;
         let mut query_count = 0;
         let mut reversed_axes = Vec::new();
@@ -1724,9 +1730,11 @@ where
                         )
                         .into());
                     }
+
                     if slice.step() < 0 {
                         reversed_axes.push(input_axis);
                     }
+
                     input_axis += 1;
                     output_axis += 1;
                 }
@@ -1734,6 +1742,7 @@ where
                     i64::try_from(*index).map_err(|_| {
                         TypeError::invalid("symbolic indexing requires host integer indices representable as `i64`")
                     })?;
+
                     if promise_in_bounds {
                         // Dynamic upper bounds are exclusive. Even when the actual extent is unavailable, an index
                         // outside the largest permitted extent cannot satisfy the caller's in-bounds promise.
@@ -1746,6 +1755,7 @@ where
                             .into());
                         }
                     }
+
                     query.get_or_insert((input_axis, selector));
                     query_count += 1;
                     input_axis += 1;
@@ -1753,12 +1763,15 @@ where
                 IndexSelector::Array(indices) => {
                     let indices_type = indices.r#type();
                     let indices_type = <&ArrayType>::try_from(indices_type.as_ref())?;
+
                     if !indices_type.data_type().is_integer() || !indices_type.data_type().is_signed() {
                         return Err(TypeError::invalid("symbolic indexing requires signed integer query arrays").into());
                     }
+
                     if indices_type.memory() != input_type.memory() {
                         return Err(TypeError::invalid("index arrays and input must share one memory space").into());
                     }
+
                     query.get_or_insert((input_axis, selector));
                     query_count += 1;
                     input_axis += 1;
@@ -1771,9 +1784,11 @@ where
                 }
             }
         }
+
         if query_count > 1 {
             return Err(TypeError::invalid("symbolic indexing currently supports one indexed axis").into());
         }
+
         let query = match query {
             None => None,
             Some((axis, selector)) => {
@@ -1784,6 +1799,7 @@ where
                     IndexSelector::Array(indices) => (*indices).clone(),
                     _ => unreachable!("only host integers and index arrays are recorded as queries"),
                 };
+
                 // Normalize negatives using the actual retained dimension value. This is ordinary array arithmetic,
                 // preserving the index array's symbolic shape and structural-zero tangent rather than concretizing it.
                 let indices = indices.into_projected()?.convert_element_type(DataType::I64)?;
@@ -1793,127 +1809,173 @@ where
                     .to_scalar()?
                     .into_projected()?
                     .transfer_to_memory(input_type.memory())?;
-                let zero = self.constant(Array::scalar(0_i64)?)?.into_projected()?;
+                let zero = self.constant(Array::scalar(0i64)?)?.into_projected()?;
                 let negative = indices.less_than(&zero)?;
                 let wrapped = indices.add(&extent)?;
+
                 Some((axis, V::from_projected(V::Projected::select(&negative, &wrapped, &indices)?)))
             }
         };
+
         Ok(DynamicIndexPlan { query, reversed_axes, inserted_axes })
     }
 }
 
-/// Constructs a fixed-size array of indexing descriptors for [`Indexing::at`].
+/// Constructs a fixed-size array of [`IndexSelector`]s for [`Indexing::at`] from a comma-separated list of selectors
+/// written in [NumPy-style](https://numpy.org/doc/stable/user/basics.indexing.html) notation, one per input axis in
+/// order. Axes not mentioned at the end of the list are selected in full.
 ///
-/// Integer expressions select one position, ordinary exclusive Rust ranges select a slice, and `range by step`
-/// supplies a signed stride. `..` selects a complete axis, `...` expands to the remaining axes, and `new_axis`
-/// inserts an axis of size one. Borrowed integer arrays select multiple positions, and borrowed [`IndexMask`]
-/// descriptors select positions identified by a concrete Boolean mask.
+/// # Syntax
 ///
-/// This macro only constructs selectors; it does not execute an operation. Each expression is evaluated once. Use
-/// parentheses around expressions containing top-level commas, such as explicit generic argument lists. The receiver
-/// of `at` determines the array-value parameter of the descriptors, so basic indexing requires no explicit type
-/// annotation when used directly with a receiver.
+/// | Selector      | Meaning                                                                                       |
+/// |---------------|-----------------------------------------------------------------------------------------------|
+/// | `i`           | Selects position `i` and removes the axis; a negative `i` counts from the end of the axis.    |
+/// | `a..b`        | Selects the exclusive range with a unit stride; either endpoint may be omitted, as in `..`.   |
+/// | `a..b by s`   | Strides the range by `s`; a negative `s` walks the axis backward.                             |
+/// | `&values`     | Borrows an integer array whose elements select positions.                                     |
+/// | `&mask`       | Borrows an [`IndexMask`] whose `true` entries select positions.                               |
+/// | `new_axis`    | Inserts an axis of extent one without consuming an input axis.                                |
+/// | `...`         | Expands to full slices over every axis not mentioned elsewhere in the list.                   |
+///
+/// Integer positions, endpoints, and strides may be any expression of a type implementing [`IndexInteger`], and
+/// each expression is evaluated exactly once. Wrap an expression that contains a top-level comma, such as an explicit
+/// generic argument list, in parentheses. The macro only builds descriptors; nothing executes until a terminal function
+/// of [`Indexed`] is called. The value type of the descriptors is inferred from the receiver of `at`, so a selection
+/// passed straight to it needs no annotation.
 ///
 /// # Examples
 ///
+/// Each selector becomes one descriptor:
+///
 /// ```rust
-/// # use ryft_core::{Array, BasicIndex, IndexSelector, IndexSlice};
-/// use ryft_core::index;
-/// let selection: [IndexSelector<'_, Array>; 3] = index![1..9 by 2, new_axis, ...];
-/// assert_eq!(selection[0], IndexSelector::Basic(BasicIndex::Slice(
-///     IndexSlice::new(Some(1), Some(9), 2),
-/// )));
+/// # use ryft_core::{Array, BasicIndex, IndexSelector, IndexSlice, index};
+/// let selection: [IndexSelector<'_, Array>; 4] = index![1, 1..9 by 2, new_axis, ...];
+/// assert_eq!(selection[0], IndexSelector::Basic(BasicIndex::Integer(1)));
+/// assert_eq!(selection[1], IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(1), Some(9), 2))));
+/// assert_eq!(selection[2], IndexSelector::Basic(BasicIndex::NewAxis));
+/// assert_eq!(selection[3], IndexSelector::Basic(BasicIndex::Ellipsis));
+/// ```
+///
+/// Selections read like array indexing when passed to `at`:
+///
+/// ```rust
+/// # use ryft_core::{Array, GatherOptions, Indexing, ProgramError, index};
+/// # fn main() -> Result<(), ProgramError> {
+/// let matrix = Array::matrix(3, 4, (0..12).collect::<Vec<i32>>())?;
+///
+/// // The last row, every other column.
+/// assert_eq!(matrix.at(&index![-1, .. by 2]).get(&GatherOptions::new())?, Array::vector(vec![8i32, 10])?);
+///
+/// // Rows picked by an index array, with the columns reversed.
+/// let rows = Array::vector(vec![2i32, 0])?;
+/// assert_eq!(
+///     matrix.at(&index![&rows, .. by -1]).get(&GatherOptions::new())?,
+///     Array::matrix(2, 4, vec![11i32, 10, 9, 8, 3, 2, 1, 0])?,
+/// );
+/// # Ok(())
+/// # }
 /// ```
 #[macro_export]
 macro_rules! index {
+    // The public form accepts comma-separated selectors and an optional trailing comma.
+    ($($selectors:tt)*) => {
+        $crate::index!(@items [] [] $($selectors)*)
+    };
+
     // Finish the accumulated descriptor array, including the empty selection.
     (@items [$($items:expr,)*] []) => { [$($items,)*] };
+
     // A final selector does not need a trailing comma.
     (@items [$($items:expr,)*] [$($selector:tt)+]) => {
         [$($items,)* $crate::index!(@selector [] $($selector)+)]
     };
+
     // Commas separate selectors; grouped token trees retain their internal commas.
     (@items [$($items:expr,)*] [$($selector:tt)+] , $($rest:tt)*) => {
         $crate::index!(@items [$($items,)* $crate::index!(@selector [] $($selector)+),] [] $($rest)*)
     };
+
     // Collect one selector without evaluating any of its expressions.
     (@items [$($items:expr,)*] [$($selector:tt)*] $next:tt $($rest:tt)*) => {
         $crate::index!(@items [$($items,)*] [$($selector)* $next] $($rest)*)
     };
+
     // Ellipsis consumes all otherwise unmentioned input axes.
     (@selector [] ...) => {
-        $crate::operations::manipulation::IndexSelector::Basic(
-            $crate::operations::manipulation::BasicIndex::Ellipsis,
-        )
+        $crate::IndexSelector::Basic($crate::BasicIndex::Ellipsis)
     };
+
     // A new axis contributes a size-one output axis without consuming an input axis.
     (@selector [] new_axis) => {
-        $crate::operations::manipulation::IndexSelector::Basic(
-            $crate::operations::manipulation::BasicIndex::NewAxis,
-        )
+        $crate::IndexSelector::Basic($crate::BasicIndex::NewAxis)
     };
+
     // A range with an omitted start retains that omission for negative-stride normalization.
     (@selector [] .. $($rest:tt)*) => {
         $crate::index!(@stop [None] [] $($rest)*)
     };
+
     // Separate an exclusive range's start from its stop and optional stride.
     (@selector [$($start:tt)+] .. $($rest:tt)*) => {
         $crate::index!(@stop [Some($crate::index!(@integer $($start)+))] [] $($rest)*)
     };
+
     // Plain expressions use type-directed conversions, including borrowed index arrays.
     (@selector [$($value:tt)+]) => {
-        $crate::operations::manipulation::IndexSelector::from($($value)+)
+        $crate::IndexSelector::from($($value)+)
     };
+
     // Scan for an exclusive range token while preserving grouped expressions.
     (@selector [$($value:tt)*] $next:tt $($rest:tt)*) => {
         $crate::index!(@selector [$($value)* $next] $($rest)*)
     };
+
     // A supplied stride and omitted stop preserve Python-style reversal semantics.
     (@stop [$start:expr] [] by $step:expr) => {
         $crate::index!(@slice $start, None, $crate::index!(@integer $step))
     };
+
     // A supplied stop and stride each evaluate exactly once.
     (@stop [$start:expr] [$($stop:tt)+] by $step:expr) => {
         $crate::index!(@slice $start, Some($crate::index!(@integer $($stop)+)), $crate::index!(@integer $step))
     };
+
     // An omitted stop and stride denote the remainder of the axis in forward order.
     (@stop [$start:expr] []) => {
         $crate::index!(@slice $start, None, 1)
     };
+
     // An ordinary exclusive range defaults to a stride of one.
     (@stop [$start:expr] [$($stop:tt)+]) => {
         $crate::index!(@slice $start, Some($crate::index!(@integer $($stop)+)), 1)
     };
+
     // Collect the stop expression up to the optional `by` keyword.
     (@stop [$start:expr] [$($stop:tt)*] $next:tt $($rest:tt)*) => {
         $crate::index!(@stop [$start] [$($stop)* $next] $($rest)*)
     };
+
     // Construct a basic slice without erasing omitted endpoints.
     (@slice $start:expr, $stop:expr, $step:expr) => {
-        $crate::operations::manipulation::IndexSelector::Basic(
-            $crate::operations::manipulation::BasicIndex::Slice(
-                $crate::operations::manipulation::IndexSlice::new($start, $stop, $step),
-            ),
-        )
+        $crate::IndexSelector::Basic($crate::BasicIndex::Slice($crate::IndexSlice::new($start, $stop, $step)))
     };
+
     // Convert integer expressions through the supported, lossless host-integer conversions.
     (@integer $value:expr) => {
-        $crate::operations::manipulation::IndexInteger::to_index_integer($value)
+        $crate::IndexInteger::to_index_integer($value)
     };
+
     // Reject malformed internal parser states without recursively treating them as public syntax.
     (@$state:ident $($rest:tt)*) => {
         compile_error!("invalid indexing selector syntax")
-    };
-    // The public form accepts comma-separated selectors and an optional trailing comma.
-    ($($selectors:tt)*) => {
-        $crate::index!(@items [] [] $($selectors)*)
     };
 }
 
 // The macro is exported at the crate root by `#[macro_export]`; this re-export lets callers that import the
 // manipulation facade reach it through the module path as well.
 pub use crate::index;
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// One entry of a selection after [`expanded`](Indexed::expanded) has made it explicit. The public [`IndexSelector`]
 /// list is what the caller wrote; this is what the planner reads. By this point the ellipsis has been replaced by
