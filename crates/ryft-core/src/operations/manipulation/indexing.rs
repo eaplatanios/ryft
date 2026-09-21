@@ -1975,8 +1975,6 @@ macro_rules! index {
 // manipulation facade reach it through the module path as well.
 pub use crate::index;
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// One entry of a selection after [`expanded`](Indexed::expanded) has made it explicit. The public [`IndexSelector`]
 /// list is what the caller wrote; this is what the planner reads. By this point the ellipsis has been replaced by
 /// full slices over the unspecified axes, every mask has been turned into the integer coordinate arrays of its true
@@ -1990,10 +1988,12 @@ enum ExpandedIndexSelector<V> {
     /// Owned integer coordinate array, cloned from the caller's index array or produced from a mask.
     Array(V),
 
-    /// Scalar mask, contributing an advanced axis of extent one (`true`) or zero (`false`) without consuming an input
-    /// axis.
+    /// Scalar mask, contributing an advanced axis of extent one (i.e., `true`) or zero (i.e., `false`)
+    /// without consuming an input axis.
     Boolean(bool),
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// The gather or scatter that realizes one expanded selection. [`plan`](Indexed::plan) builds it once from the
 /// [`ExpandedIndexSelector`]s, and reads and updates share it so that both address exactly the same input positions.
@@ -2005,8 +2005,8 @@ struct IndexPlan<V> {
     /// Jointly broadcast coordinates of every strided slice and advanced index, with a trailing index-vector axis.
     indices: V,
 
-    /// Gather dimension numbers mapping windows, collapsed axes, and coordinate components onto the input axes. The
-    /// scatter reuses the same mapping.
+    /// [`GatherDimensionNumbers`] mapping windows, collapsed axes, and coordinate components onto the input axes.
+    /// The scatter reuses the same mapping.
     dimensions: GatherDimensionNumbers,
 
     /// Window size on every input axis: the slice length for a contiguous slice and one everywhere else.
