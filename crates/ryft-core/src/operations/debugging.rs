@@ -20,8 +20,8 @@
 //!
 //! # Example
 //!
-//! Eager values print immediately, whereas traced values stage a `print` instruction that runs whenever the program
-//! is interpreted or executed. Its output value is the input, so the print is transparent to consumers:
+//! A traced value stages a `print` instruction that prints whenever the program is interpreted or executed. Its output
+//! value is the input, so the print is transparent to consumers:
 //!
 //! ```rust
 //! # use indoc::indoc;
@@ -94,7 +94,6 @@ pub const PRINT_OPERATION_NAME: &str = "print";
 /// Refer to the documentation of [`Print`] for more information.
 #[derive(Clone, Debug)]
 pub struct PrintOperation<T: Type> {
-    // TODO(eaplatanios): Should this be optional?
     /// Refer to the documentation of [`label`](Self::label) for more information.
     label: String,
 
@@ -253,7 +252,7 @@ mod tests {
         check_operation_type_inference,
     };
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, Program};
     use crate::tracing::{DomainTracer, Trace, TracingContext};
 
     use super::*;
@@ -262,10 +261,11 @@ mod tests {
     fn test_print() {
         let operation = PrintOperation::<ArrayType>::new("x");
 
-        assert_eq!(operation.label(), "x");
-        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        // Operation identity, accessors, the default ordered-I/O effect, and rendering, which omits the default class.
         assert_eq!(operation.name(), PRINT_OPERATION_NAME);
+        assert_eq!(operation.label(), "x");
         assert_eq!(operation.effect_class(), EffectClass::OrderedIo);
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert_eq!(operation.input_count(), 1);
         assert_eq!(operation.to_string(), "print [label=x]");
     }
@@ -310,6 +310,7 @@ mod tests {
         let context = EagerContext::<Array>::new();
         let input = Array::scalar(3.0).unwrap();
         let operation = PrintOperation::new("x");
+
         // Standard error capture is not available here; verify the returned value and input validation.
         assert_eq!(
             operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
@@ -368,9 +369,8 @@ mod tests {
 
     #[test]
     fn test_print_differentiation_unused_output() {
-        // The JVP rule re-prints the primal and passes the tangent through, so the effect survives on the primal
-        // side of the linearization without perturbing the gradient. The dead primal print (its output is unused by
-        // the gradient) exercises the effect keep-alive of the partition projections.
+        // A print whose output nothing consumes must not perturb the gradient: the JVP rule re-prints the primal and
+        // passes the tangent through, so the effect rides the primal side of the linearization.
         let (value, gradient) = differentiate_at(Array::scalar(3.0).unwrap())
             .value_and_gradient(|input| {
                 input.clone().print("x");
@@ -379,13 +379,10 @@ mod tests {
             .unwrap();
         assert_eq!(value, Array::scalar(9.0).unwrap());
         assert_eq!(gradient, Array::scalar(6.0).unwrap());
-    }
 
-    #[test]
-    fn test_print_differentiation_preserves_primal_effects() {
-        // Linearizing the computation partitions its JVP program into primal and tangent stages: the dead print rides
-        // the primal (known) stage through the partition projections' effect keep-alive, and the tangent stage stays
-        // print-free because the JVP rule keeps the effect on the primal side.
+        // Linearizing the same computation partitions its JVP program into primal and tangent stages: the dead print
+        // survives in the primal stage through the partition projections' effect keep-alive, carrying its effect
+        // class with it, and the tangent stage stays print-free.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 input.clone().print("x");
@@ -395,20 +392,17 @@ mod tests {
         )
         .unwrap();
         let linearization = program.to_flat_program().linearize().unwrap();
-        let primal_prints = linearization
-            .primal()
-            .instructions()
-            .iter()
-            .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Print(_)))
-            .count();
-        let tangent_prints = linearization
-            .tangent()
-            .instructions()
-            .iter()
-            .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Print(_)))
-            .count();
-        assert_eq!(primal_prints, 1);
-        assert_eq!(tangent_prints, 0);
+        let prints = |program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>| {
+            program
+                .instructions()
+                .iter()
+                .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Print(_)))
+                .count()
+        };
+        assert_eq!(prints(linearization.primal()), 1);
+        assert_eq!(linearization.primal().effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+        assert_eq!(prints(linearization.tangent()), 0);
+        assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
     }
 
     #[test]
@@ -456,19 +450,22 @@ mod tests {
 
     #[test]
     fn test_print_staging_with_effect_class() {
+        // The selected class is recorded on the staged instruction and summarized as the program's effect.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                input.clone().print_with_effect_class("x", EffectClass::UnorderedIo);
-                Ok(input.clone() * input)
+                Ok(input.print_with_effect_class("x", EffectClass::UnorderedIo))
             },
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
         let program = program.to_flat_program();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = print [label=x, effect_class=unordered_io] %0
+                in (%1)"},
+        );
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
-        // An unused unordered print survives the primal partition, retaining its class through differentiation.
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.primal().effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
-        assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
     }
 }
