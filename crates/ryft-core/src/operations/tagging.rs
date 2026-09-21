@@ -1,6 +1,6 @@
-//! Operations that attach string keys to values so that program transforms can recognize them later. Tags are
-//! identity functions on their data: interpretation, batching, partial evaluation, and backend lowering all pass the
-//! input through unchanged, and the key lives only in the staged instruction. This module provides the following:
+//! Operations that attach string keys to values so that program transforms can recognize them later. Tags are identity
+//! functions on their data: interpretation, batching, partial evaluation, and backend lowering all pass the input
+//! through unchanged, and the key lives only in the staged instruction. This module provides the following:
 //!
 //!   - The [`Tag`] value capability, whose [`tag`](Tag::tag) returns its input unchanged while marking the producing
 //!     instruction with a key.
@@ -9,12 +9,12 @@
 //!     body of a function is still present on the instructions that define the residuals of its linearization.
 //!
 //! The main consumer of tags is key-based rematerialization. Policies such as
-//! [`SaveOnlyTheseNames`](crate::tracing_v2::rematerialization::SaveOnlyTheseNames),
-//! [`SaveAnyNamesButThese`](crate::tracing_v2::rematerialization::SaveAnyNamesButThese), and
-//! [`SaveAndOffloadOnlyTheseNames`](crate::tracing_v2::rematerialization::SaveAndOffloadOnlyTheseNames) decide
-//! whether to save, offload, or recompute each residual of a [`rematerialize`](crate::tracing_v2::rematerialize)d
-//! function by looking at the key of the [`TagOperation`] that produced it, which mirrors the role of
-//! `checkpoint_name` in JAX. Tags carry no other semantics, so they are safe to leave in production programs.
+//! [`SaveOnlyTheseNames`](crate::SaveOnlyTheseNames), [`SaveAnyNamesButThese`](crate::SaveAnyNamesButThese), and
+//! [`SaveAndOffloadOnlyTheseNames`](crate::SaveAndOffloadOnlyTheseNames) decide whether to save, offload, or recompute
+//! each residual of a [`rematerialize`](crate::rematerialize)d function by looking at the key of the [`TagOperation`]
+//! that produced it, which mirrors the role of [`checkpoint_name` in JAX](
+//! https://docs.jax.dev/en/latest/_autosummary/jax.ad_checkpoint.checkpoint_name.html).
+//! Tags carry no other semantics, so they are safe to leave in production programs.
 //!
 //! # Example
 //!
@@ -36,7 +36,7 @@
 //!             %2:f64[] = tag [key=squared] %1
 //!         in (%2)"},
 //! );
-//! assert_eq!(program.interpret(Array::scalar(3.0_f64)?)?, Array::scalar(9.0_f64)?);
+//! assert_eq!(program.interpret(Array::scalar(3.0f64)?)?, Array::scalar(9.0f64)?);
 //! # Ok(())
 //! # }
 //! ```
@@ -87,6 +87,7 @@ impl<T: Type> TagOperation<T> {
 }
 
 impl<T: Type> Display for TagOperation<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -142,23 +143,23 @@ impl<C: Context<Operation: From<TagOperation<C::Type>>>> PartiallyEvaluatableOpe
 impl_differentiable_elementwise_operation! {
     @linear<T>
     TagOperation<T>,
-    rule = [@positive]
+    rule = [@positive],
 }
 
 /// Represents the ability to tag values in programs with keys. [`Tag`] stages a [`TagOperation`], which is effectively
 /// an identity function carrying a string-valued key. The tag gets attached to traced values and survives forward-mode
-/// differentiation (the [`DifferentiableOperation`](crate::differentiation::DifferentiableOperation) rule re-tags the
-/// primal value and passes the tangent value through), so that it marks the instructions that define linearization
+/// differentiation rule (i.e., the [`DifferentiableOperation`](crate::DifferentiableOperation) implementation re-tags
+/// the primal value and passes the tangent value through), so that it marks the instructions that define linearization
 /// residuals, which rematerialization policies classify by key through the producing [`TagOperation`].
 pub trait Tag: Sized {
     /// Returns this value unchanged while tagging it with `key`.
     fn tag(self, key: &str) -> Self;
 }
 
-// Tagging is metadata for staged programs only, so a concrete array carries itself through unchanged.
 impl Tag for Array {
     #[inline]
     fn tag(self, _key: &str) -> Self {
+        // Tagging is metadata for staged programs only, so a concrete array carries itself through unchanged.
         self
     }
 }
@@ -173,10 +174,6 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation<V::Type>>>>> 
     }
 }
 
-// TODO(eaplatanios): Add unit tests mirroring the structure and style of the tests in
-//  `ryft_core::operations::math::add`, including checks for the `DifferentiableOperation` and the
-//  `TransposableOperation` implementations.
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -188,7 +185,7 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::programs::EmptyRegionDriver;
+    use crate::programs::{EffectClasses, EmptyRegionDriver};
     use crate::tracing::{DomainTracer, Trace};
 
     use super::*;
@@ -196,6 +193,8 @@ mod tests {
     #[test]
     fn test_tag() {
         let operation = TagOperation::<ArrayType>::new("residual");
+
+        // Operation identity, accessors, and rendering.
         assert_eq!(operation.name(), TAG_OPERATION_NAME);
         assert_eq!(operation.key(), "residual");
         assert_eq!(operation.input_count(), 1);
@@ -209,19 +208,37 @@ mod tests {
             cases = [{
                 input_types = [ArrayType::scalar(DataType::F64)],
                 output_types = [ArrayType::scalar(DataType::F64)],
+            }, {
+                input_types = [ArrayType::new_static(DataType::I32, [2, 3])],
+                output_types = [ArrayType::new_static(DataType::I32, [2, 3])],
+            }, {
+                input_types = [],
+                error = "expected 1 input but got 0",
+            }, {
+                input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+                error = "expected 1 input but got 2",
             }],
         );
     }
 
     #[test]
     fn test_tag_interpretation() {
+        let context = EagerContext::<Array>::new();
+        let input = Array::scalar(3.0).unwrap();
+        let operation = TagOperation::new("residual");
+
+        // Interpretation passes the input through unchanged and validates the input count.
         assert_eq!(
-            TagOperation::new("residual").interpret(
-                &EagerContext::<Array>::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(3.0).unwrap()],
-            ),
-            Ok(vec![Array::scalar(3.0).unwrap()]),
+            operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
+            Ok(vec![input.clone()]),
+        );
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, &[input.clone(), input]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
         );
     }
 
@@ -249,6 +266,8 @@ mod tests {
 
     #[test]
     fn test_tag_differentiation() {
+        // The JVP re-tags the primal and passes the tangent through untagged, so the key marks the instruction that
+        // defines the linearization residual rather than the tangent program.
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = TagOperation::new("residual"),
@@ -257,6 +276,11 @@ mod tests {
                 tangents = [Array::scalar(2.0).unwrap()],
                 primal_outputs = [Array::scalar(3.0).unwrap()],
                 tangent_outputs = [Array::scalar(2.0).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = tag [key=residual] %0
+                    in (%2, %1)
+                "},
             }],
         );
     }
@@ -275,18 +299,29 @@ mod tests {
     }
 
     #[test]
+    fn test_array_tag() {
+        // Tags are metadata for staged programs, so an eager array is returned unchanged.
+        let input = Array::vector(vec![1.0_f32, 2.0]).unwrap();
+        assert_eq!(input.clone().tag("residual"), input);
+    }
+
+    #[test]
     fn test_tag_staging() {
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.tag("residual")),
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
+        let program = program.to_flat_program();
         assert_eq!(
-            program.to_flat_program().to_string(),
+            program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = tag [key=residual] %0
                 in (%1)"},
         );
+
+        // Tags declare no effects, so unlike prints they do not pin an otherwise dead value.
+        assert_eq!(program.effects().classes(), EffectClasses::NONE);
     }
 }

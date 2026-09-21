@@ -186,7 +186,10 @@ pub use tracing::{
     DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,
     infer_output_type, trace,
 };
-pub use tracing_v2::rematerialization::{REMATERIALIZE_OPERATION_NAME, RematerializeOperation};
+pub use tracing_v2::rematerialization::{
+    REMATERIALIZE_OPERATION_NAME, RematerializeOperation, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
+    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, rematerialize,
+};
 
 #[cfg(test)]
 pub(crate) mod tests {
