@@ -19,20 +19,18 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`ConvertElementTypeOperation`].
 pub const CONVERT_ELEMENT_TYPE_OPERATION_NAME: &str = "convert_element_type";
 
 /// Unary [`Operation`] that converts elements to a requested [`DataType`], numerically or by bit reinterpretation.
-/// Numerical conversion preserves shape, sharding, and memory space. Bit reinterpretation can add or consume a trailing
-/// axis to conserve the number of encoding bits. Refer to [`ConvertElementType`] for value semantics and
+/// Numerical conversion preserves shape, sharding, and memory space. Bit reinterpretation can add or consume a
+/// trailing axis to conserve the number of encoding bits. Refer to [`ConvertElementType`] for value semantics and
 /// [`ElementType`] for metadata rules. Type inference rejects token conversions. Structural zeros permit only numerical
 /// identity conversion. Numerical conversion uses the destination format's explicit saturation and NaN rules.
 ///
 /// The `T` parameter fixes the type universe, so each payload instantiation implements one [`Operation`] contract.
 /// Array batching preserves the mapped position except when widening bits would consume it. Numerical differentiation
-/// converts the primal and aligns its tangent with the result's differential type; transposition aligns cotangents with
+/// converts the primal and aligns its tangent with the result's differential type. Transposition aligns cotangents with
 /// the input's cotangent type. Types with no differential space produce structural zeros. Bit reinterpretation always
 /// has a structural zero derivative and does not support direct transposition as a linear operation.
 ///
@@ -51,8 +49,9 @@ pub struct ConvertElementTypeOperation<T: ElementType> {
 }
 
 impl<T: ElementType> ConvertElementTypeOperation<T> {
-    /// Creates a conversion to `data_type`. The source element type comes from the input, and validation takes place
-    /// during type inference and execution. Refer to [`ConvertElementType`] for the conversion contract.
+    /// Creates a new [`ConvertElementTypeOperation`] targeting `data_type`. The source element type comes from the
+    /// input, and validation takes place during type inference and execution. Refer to [`ConvertElementType`] for the
+    /// conversion contract.
     ///
     /// # Parameters
     ///
@@ -69,7 +68,7 @@ impl<T: ElementType> ConvertElementTypeOperation<T> {
         self.data_type
     }
 
-    /// Returns whether this operation reinterprets bits rather than converting numeric values.
+    /// Returns whether this [`ConvertElementTypeOperation`] reinterprets bits rather than converting numeric values.
     #[inline]
     pub fn bitcast(&self) -> bool {
         self.bitcast
@@ -104,7 +103,6 @@ impl<T: ElementType> Operation for ConvertElementTypeOperation<T> {
         CONVERT_ELEMENT_TYPE_OPERATION_NAME
     }
 
-    #[inline]
     fn infer_output_types(
         &self,
         input_types: &[T],
@@ -114,19 +112,24 @@ impl<T: ElementType> Operation for ConvertElementTypeOperation<T> {
         if self.bitcast {
             return Ok(vec![input_types[0].with_bitcast_element_type(self.data_type)?]);
         }
+
         if input_types[0].element_type().is_token() || self.data_type.is_token() {
             return Err(TypeError::invalid(format!(
                 "cannot convert values to or from the `{}` data type",
                 DataType::Token,
             )));
         }
+
         if input_types[0].element_type().is_zero() != self.data_type.is_zero() {
-            return Err(TypeError::invalid("cannot convert values to or from the `zero` data type"));
+            return Err(TypeError::invalid(format!(
+                "cannot convert values to or from the `{}` data type",
+                DataType::Zero
+            )));
         }
+
         Ok(vec![input_types[0].with_element_type(self.data_type)])
     }
 
-    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("data_type", self.data_type)?;
@@ -171,24 +174,26 @@ impl<C: Context<Type = ArrayType, Value: ConvertElementType + Transpose>, P: Arr
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
-        check_count!("input", inputs, 1, ProgramError);
         // Ordinary conversion keeps the mapped position. A widening bitcast can consume the packed final axis,
         // so move a mapped axis out of that position before combining the remaining logical pieces.
+        check_count!("input", inputs, 1, ProgramError);
         self.infer_output_types(&[inputs[0].unbatched_type()], &[])?;
-        let widening = self.bitcast
-            && Self::element_bit_width(inputs[0].value().r#type().data_type())
-                < Self::element_bit_width(self.data_type);
+        let source_bit_width = Self::element_bit_width(inputs[0].value().r#type().data_type());
+        let target_bit_width = Self::element_bit_width(self.data_type);
+        let widening = self.bitcast && source_bit_width < target_bit_width;
         let input = if widening && inputs[0].batch_axis_position() == Some(inputs[0].value().r#type().rank() - 1) {
             inputs[0].move_axis(0)?
         } else {
             inputs[0].clone()
         };
+
         if widening && input.ragged_axes().iter().any(|axis| axis.axis() + 1 == input.value().r#type().rank()) {
             return Err(TypeError::invalid(
                 "`convert_element_type` in bitcast mode cannot consume a ragged trailing dimension",
             )
             .into());
         }
+
         let mut outputs =
             self.interpret_with_batch_axes(context, std::slice::from_ref(&input), &[input.batch_axis()])?;
         let output = outputs.remove(0).with_ragged_axes(input.ragged_axes().to_vec())?;
@@ -238,21 +243,25 @@ impl_differentiable_operation! {
                     message: format!("operation `{}` is not transposable in bitcast mode", operation.name()),
                 }.into());
             }
+
             // Convert a live output cotangent back to the input's complete cotangent type. Structural zeros remain
             // structural, and an input with no cotangent space receives the structural zero of that space.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
+
             let input_cotangent_type = inputs[0].r#type().cotangent()?;
             if input_cotangent_type.is_zero_space() {
                 return Ok(());
             }
+
             let contribution = match &outputs[0] {
                 MaybeZero::Zero(_) => MaybeZero::Zero(input_cotangent_type),
                 MaybeZero::Value(cotangent) => {
                     MaybeZero::Value(cotangent.unalign_cotangent(&input_cotangent_type)?)
                 }
             };
+
             accumulators[0].accumulate(context, contribution)?;
             Ok(())
         }
@@ -260,17 +269,17 @@ impl_differentiable_operation! {
 }
 
 /// Describes a type's element [`DataType`] independently of its remaining structure and placement metadata. Replacing
-/// the element type changes metadata only: it does not convert values, validate their representability, or enforce the
+/// the element type changes metadata only. It does not convert values, validate their representability, or enforce the
 /// promotion lattice. [`ConvertElementTypeOperation`] uses this contract to infer its result type.
 ///
 /// Numerical replacement through [`Self::with_element_type`] returns the requested [`DataType`] itself or preserves an
 /// [`ArrayType`]'s shape, sharding, memory space, and element-based tiled layout. A byte-stride layout is cleared when
 /// the element storage width changes, because its offsets need not accommodate the new elements. Equal-width
 /// replacement preserves it. [`Self::with_bitcast_element_type`] instead conserves encoding bits by adjusting the
-/// trailing shape; bare data types support only equal-width reinterpretation because they cannot describe that shape
+/// trailing shape. Bare data types support only equal-width reinterpretation because they cannot describe that shape
 /// change.
 ///
-/// # Examples
+/// # Example
 ///
 /// ```rust
 /// # use ryft_core::{ArrayType, DataType, ElementType, Shape};
@@ -284,9 +293,9 @@ pub trait ElementType: Type {
     /// Returns the element [`DataType`].
     fn element_type(&self) -> DataType;
 
-    /// Returns a copy with `data_type` as its element type, preserving structural and placement metadata while
-    /// clearing byte-stride layouts invalidated by a changed element storage width. This does not validate numerical
-    /// conversion; use [`ConvertElementType::convert_element_type`] to convert actual values.
+    /// Returns a copy with `data_type` as its element type, preserving structural and placement metadata while clearing
+    /// byte-stride layouts invalidated by a changed element storage width. This does not validate numerical conversion.
+    /// Use [`ConvertElementType::convert_element_type`] to convert actual values.
     fn with_element_type(&self, data_type: DataType) -> Self;
 
     /// Returns the metadata for bit reinterpretation as `data_type`. Array descriptors may add or remove a trailing
@@ -315,13 +324,14 @@ impl ElementType for DataType {
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl ElementType for ArrayType {
     #[inline]
     fn element_type(&self) -> DataType {
         self.data_type()
     }
 
-    #[inline]
     fn with_element_type(&self, data_type: DataType) -> Self {
         let output = self.clone().with_data_type(data_type);
         if matches!(self.layout(), Some(Layout::Strided(_)))
