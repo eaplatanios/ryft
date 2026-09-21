@@ -136,7 +136,7 @@ impl<
         // that backend lowering cannot silently relabel the tangent when the primal result is placed differently from
         // this operand.
         if requires_reshard && let Some(sharding) = target.sharding() {
-            value = value.reshard(sharding);
+            value = value.reshard(sharding)?;
         }
 
         // The exemplar path infers its result type from its operands, so pin any remaining metadata-only difference
@@ -218,7 +218,7 @@ where
         if contribution.r#type().sharding() != target.sharding()
             && let Some(sharding) = target.sharding()
         {
-            contribution = contribution.reshard(sharding);
+            contribution = contribution.reshard(sharding)?;
         }
 
         // Pin any remaining metadata-only difference (e.g., a layout that no step above can attach) with an
@@ -305,7 +305,7 @@ pub(crate) fn reduce_broadcast_cotangent<V: Value<Type = ArrayType> + Reduce + T
     let mut contribution = if reduce_axes.is_empty() {
         cotangent.clone()
     } else {
-        cotangent.reduce(reduce_axes.as_slice(), ReductionKind::Sum)
+        cotangent.reduce(reduce_axes.as_slice(), ReductionKind::Sum)?
     };
 
     // The reduction leaves the kept axes in this cotangent's axis order but an explicit broadcast may have permuted
@@ -1274,7 +1274,7 @@ mod tests {
                 Array::matrix(rows, 2, values).unwrap(),
                 Array::vector(scale_values.clone()).unwrap(),
             ))
-            .vjp(|(input, scale)| Ok((input * scale).reduce(&[0, 1], ReductionKind::Sum)))
+            .vjp(|(input, scale)| Ok((input * scale).reduce(&[0, 1], ReductionKind::Sum)?))
             .unwrap();
             let (input_cotangent, scale_cotangent) = eager_pullback.apply(Array::scalar(1.0).unwrap()).unwrap();
             assert_eq!(primal_outputs, vec![ArrayIrValue::Array(eager_loss)]);

@@ -80,8 +80,8 @@ impl_differentiable_operation! {
                     (None, None) => left.dot(right, operation.dimensions()),
                 }
             };
-            let primal = stage_dot(left.primal(), right.primal());
-            Ok(vec![bilinear_array_jvp(context, primal, left, right, |left, right| Ok(stage_dot(left, right)))?])
+            let primal = stage_dot(left.primal(), right.primal())?;
+            Ok(vec![bilinear_array_jvp(context, primal, left, right, |left, right| Ok(stage_dot(left, right)?))?])
         }
     },
     transpose<V, O>

@@ -2215,7 +2215,7 @@ mod tests {
         // summing every prefix weights element `i` by the number of prefixes that contain it, so the gradient is
         // the reverse scan of ones.
         let total: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
-            |x| x.cumulative_sum(0).unwrap().reduce(&[0], ReductionKind::Sum),
+            |x| x.cumulative_sum(0).unwrap().reduce(&[0], ReductionKind::Sum).unwrap(),
             input_type.clone(),
             &engine,
             mesh.clone(),
@@ -4482,7 +4482,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
-            compile(|x| x.clone() * x.stop_gradient(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            compile(|x| x.clone() * x.stop_gradient().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
         let source = Array::from_host_buffer(
@@ -6326,7 +6326,8 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
             .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
-            compile(|x| x.sin().unwrap().reduce(&[0, 1], ReductionKind::Sum), input_type, &domain, mesh).unwrap();
+            compile(|x| x.sin().unwrap().reduce(&[0, 1], ReductionKind::Sum).unwrap(), input_type, &domain, mesh)
+                .unwrap();
 
         domain.compilation_context().clear_statistics();
         let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
@@ -6733,9 +6734,9 @@ mod tests {
             .dynamic_slice(&[token, zero_index.clone()], &[1, dimension])?
             .reshape(static_shape(&[dimension]))?;
         let vector_times_matrix = DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new());
-        let query = embedding.dot(query_weights, &vector_times_matrix);
-        let key = embedding.dot(key_weights, &vector_times_matrix);
-        let value = embedding.dot(value_weights, &vector_times_matrix);
+        let query = embedding.dot(query_weights, &vector_times_matrix).unwrap();
+        let key = embedding.dot(key_weights, &vector_times_matrix).unwrap();
+        let value = embedding.dot(value_weights, &vector_times_matrix).unwrap();
         let cache_keys = state[2].dynamic_update_slice(
             &key.reshape(static_shape(&[1, dimension]))?,
             &[position.clone(), zero_index.clone()],
@@ -6746,8 +6747,9 @@ mod tests {
         // Masked scaled dot-product attention over the visible cache prefix `[0, position]`.
         let attended = match attention {
             DecodeAttention::Composed => {
-                let scores =
-                    cache_keys.dot(&query, &DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()));
+                let scores = cache_keys
+                    .dot(&query, &DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()))
+                    .unwrap();
                 let scores_type = scores.r#type().into_owned();
                 let scale = context.fill(&scores_type, 1.0 / (dimension as f32).sqrt())?;
                 let scores = scores.mul(&scale)?;
@@ -6756,12 +6758,14 @@ mod tests {
                 let visible = positions
                     .compare(&position.broadcast(positions_type, &[])?, ComparisonDirection::LessThanOrEqual)?;
                 let masked = V::select(&visible, &scores, &context.fill(&scores_type, -1.0e30f32)?)?;
-                let stabilized =
-                    masked.sub(&masked.reduce(&[0], ReductionKind::Max).broadcast(scores_type.clone(), &[])?)?;
+                let stabilized = masked
+                    .sub(&masked.reduce(&[0], ReductionKind::Max).unwrap().broadcast(scores_type.clone(), &[])?)?;
                 let exponentials = stabilized.exp()?;
-                let weights =
-                    exponentials.div(&exponentials.reduce(&[0], ReductionKind::Sum).broadcast(scores_type, &[])?)?;
-                weights.dot(&cache_values, &DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new()))
+                let weights = exponentials
+                    .div(&exponentials.reduce(&[0], ReductionKind::Sum).unwrap().broadcast(scores_type, &[])?)?;
+                weights
+                    .dot(&cache_values, &DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new()))
+                    .unwrap()
             }
             DecodeAttention::CustomCall => {
                 let operation =
@@ -6772,9 +6776,9 @@ mod tests {
         };
 
         // Gated multilayer perceptron, output projection, and next-token selection.
-        let hidden = attended.dot(hidden_weights, &vector_times_matrix).tanh()?;
-        let gate = attended.dot(gate_weights, &vector_times_matrix).logistic()?;
-        let logits = hidden.mul(&gate)?.dot(output_weights, &vector_times_matrix);
+        let hidden = attended.dot(hidden_weights, &vector_times_matrix).unwrap().tanh()?;
+        let gate = attended.dot(gate_weights, &vector_times_matrix).unwrap().logistic()?;
+        let logits = hidden.mul(&gate)?.dot(output_weights, &vector_times_matrix).unwrap();
         let (generator, next_token) = match sampling {
             DecodeSampling::Greedy => (generator, logits.argmax(0)?),
             DecodeSampling::TopK => {

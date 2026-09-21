@@ -7310,13 +7310,13 @@ mod tests {
         }
 
         check_gradient!(
-            |input| square(input).reduce(&[0], ReductionKind::Sum),
+            |input| square(input).reduce(&[0], ReductionKind::Sum).unwrap(),
             at = Array::vector(vec![0.7f64, -1.3, 2.1]).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,
         );
         check_gradient!(
-            |input| input.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum)),
+            |input| input.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum).unwrap()),
             at = Array::vector(vec![Complex::new(0.7f64, -0.3), Complex::new(-1.2f64, 0.8)]).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,
@@ -7326,7 +7326,7 @@ mod tests {
     #[test]
     fn test_check_gradient_with_captures() {
         fn scaled_sum_squares<V: Clone + std::ops::Mul<Output = V> + Reduce>(input: V, scale: V) -> V {
-            (input.clone() * input).reduce(&[0], ReductionKind::Sum) * scale
+            (input.clone() * input).reduce(&[0], ReductionKind::Sum).unwrap() * scale
         }
 
         check_gradient!(
@@ -7348,7 +7348,7 @@ mod tests {
     #[should_panic(expected = "finite-difference gradient checking requires an f64 or c128 input but got f32")]
     fn test_check_gradient_array_unsupported_input_type() {
         check_gradient!(
-            |input| input.reduce(&[0], ReductionKind::Sum),
+            |input| input.reduce(&[0], ReductionKind::Sum).unwrap(),
             at = Array::vector(vec![0.7f32, -1.3]).unwrap(),
             step = 1e-3,
             tolerance = 1e-3,

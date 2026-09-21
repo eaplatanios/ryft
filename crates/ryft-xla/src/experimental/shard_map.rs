@@ -3092,7 +3092,7 @@ mod tests {
                                     &receive_sizes,
                                     vec![vec![0, 2], vec![3, 1]],
                                 )?
-                                .reduce(&[0], ReductionKind::Sum))
+                                .reduce(&[0], ReductionKind::Sum)?)
                         },
                     )
                     .unwrap();
@@ -3350,7 +3350,7 @@ mod tests {
                                                 &output_offsets,
                                                 &receive_sizes,
                                             )
-                                            .map(|result| result.reduce(&[0], ReductionKind::Sum))
+                                            .map(|result| result.reduce(&[0], ReductionKind::Sum).unwrap())
                                     },
                                 )
                                 .unwrap()
@@ -3723,7 +3723,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(2)])),
         );
         let traced: TracedShardMap<(ArrayType, ArrayType), ArrayType> = shard_map(
-            |(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
+            |(lhs, rhs)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()).unwrap(),
             global_input_types,
             device_mesh.logical_mesh().clone(),
             (lhs_sharding.clone(), rhs_sharding.clone()),
@@ -4405,7 +4405,8 @@ mod tests {
                             let predicate = local_x
                                 .compare(&local_x, ComparisonDirection::Equal)
                                 .unwrap()
-                                .reduce(&[0], ReductionKind::Any);
+                                .reduce(&[0], ReductionKind::Any)
+                                .unwrap();
                             let context = local_x.value().context().clone();
                             let mut outputs = context
                                 .stage_operation(

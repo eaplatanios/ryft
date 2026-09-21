@@ -2052,7 +2052,7 @@ mod tests {
                     BatchAxis::new(0),
                     BatchAxisSpecification::named("x"),
                 )?;
-                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
+                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum)?)
             })
             .unwrap();
 
@@ -2090,7 +2090,7 @@ mod tests {
                     BatchAxis::new(0),
                     BatchAxisSpecification::named("x"),
                 )?;
-                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
+                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum)?)
             },
             at = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap(),
             with = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]).unwrap(),
@@ -2127,7 +2127,7 @@ mod tests {
                     BatchAxis::new(0),
                     BatchAxisSpecification::named("x"),
                 )?;
-                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
+                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum)?)
             },
             at = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0],).unwrap(),
             with = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap(),
@@ -2153,7 +2153,7 @@ mod tests {
                                     &output_offsets,
                                     &receive_sizes,
                                 )?
-                                .reduce(&[0], ReductionKind::Sum))
+                                .reduce(&[0], ReductionKind::Sum)?)
                         },
                     )
                     .map_err(ProgramError::from)

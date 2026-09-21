@@ -651,11 +651,11 @@ where
     let input = P::match_collective_axis(context, input, input_extents.as_slice())?;
     let summed = input.into_value().reduce(&[0], ReductionKind::Sum);
     let scattered = match operation.options.mode {
-        CollectiveMode::Untiled => summed.move_axis(operation.scatter_axis, 0)?,
+        CollectiveMode::Untiled => summed?.move_axis(operation.scatter_axis, 0)?,
         CollectiveMode::Tiled => {
             let mut split_extents = output_extents.clone();
             split_extents.insert(operation.scatter_axis, axis_extent.clone());
-            P::reshape_collective(context, summed, split_extents.as_slice(), None)?
+            P::reshape_collective(context, summed?, split_extents.as_slice(), None)?
                 .move_axis(operation.scatter_axis, 0)?
         }
     };

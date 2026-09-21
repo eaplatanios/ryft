@@ -2755,7 +2755,7 @@ mod tests {
     where
         V: Clone + Sin + Dot + std::ops::Mul<Output = V>,
     {
-        let u = x.dot(&x, &DotDimensionNumbers::inner_product());
+        let u = x.dot(&x, &DotDimensionNumbers::inner_product()).unwrap();
         u.clone() * u.sin().unwrap()
     }
 
@@ -3260,7 +3260,7 @@ mod tests {
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (primal, tangent) = domain
             .jvp(
-                |x, ()| Ok((x.clone() * x).tag("square")),
+                |x, ()| Ok((x.clone() * x).tag("square")?),
                 Array::scalar(2.0).unwrap(),
                 Array::scalar(1.0).unwrap(),
                 (),
@@ -3270,7 +3270,7 @@ mod tests {
         assert_eq!(tangent, Array::scalar(4.0).unwrap());
         let (value, gradient) = domain
             .differentiate_at(Array::scalar(3.0).unwrap())
-            .value_and_gradient(|x| (x.clone() * x).tag("square"))
+            .value_and_gradient(|x| (x.clone() * x).tag("square").unwrap())
             .unwrap();
         assert_eq!(value, Array::scalar(9.0).unwrap());
         assert_eq!(gradient, Array::scalar(6.0).unwrap());
@@ -3278,13 +3278,13 @@ mod tests {
 
     #[test]
     fn test_name_based_rematerialization_policies_classify_tagged_residuals() {
-        // `f(x) = u * sin(u)` with `u = (x · x).tag("u")`: the tagged dot output is one of the three
+        // `f(x) = u * sin(u)` with `u = (x · x).tag("u").unwrap()`: the tagged dot output is one of the three
         // instruction-produced residuals (`u`, `sin(u)`, and the sine rule's `cos(u)` factor), so name-based
         // policies can select it (or its complement) by tag.
         fn body(
             x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
         ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
-            let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
+            let u = x.dot(&x, &DotDimensionNumbers::inner_product())?.tag("u")?;
             Ok(u.clone() * u.sin()?)
         }
         let input = Array::from_elements::<f64>(vector_type(2), &[0.5, 1.5]).unwrap();
@@ -3439,7 +3439,7 @@ mod tests {
             |(a, x): (
                 DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
                 DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
-            )| { Ok((a * x.clone()).sin()?.dot(&x, &DotDimensionNumbers::inner_product())) },
+            )| { Ok((a * x.clone()).sin()?.dot(&x, &DotDimensionNumbers::inner_product())?) },
         );
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs| function.call(inputs),
@@ -3478,7 +3478,7 @@ mod tests {
         let outer = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let y = inner.call(x.clone())?;
-                Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
+                Ok(y.dot(&x, &DotDimensionNumbers::inner_product())?)
             },
         );
         // f(x) = Σᵢ sin(xᵢ²) xᵢ, so ∂f/∂xⱼ = sin(xⱼ²) + 2 xⱼ² cos(xⱼ²).
@@ -3500,7 +3500,7 @@ mod tests {
         let outer = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let y = inner.call(x.clone())?;
-                Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
+                Ok(y.dot(&x, &DotDimensionNumbers::inner_product())?)
             },
         );
         let (_, program) =
@@ -3534,7 +3534,7 @@ mod tests {
         let outer = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
                 let y = inner.call(x.clone())?;
-                Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
+                Ok(y.dot(&x, &DotDimensionNumbers::inner_product())?)
             },
         );
         let (primal, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
@@ -3682,7 +3682,7 @@ mod tests {
                 let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> =
                     Batch::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
                         .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
+                mapped.reduce(&[0], ReductionKind::Sum).unwrap()
             })
             .unwrap();
         // f(x) = Σᵢ sin(xᵢ²), so ∂f/∂xⱼ = 2 xⱼ cos(xⱼ²).
@@ -3757,8 +3757,8 @@ mod tests {
             x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
         ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
             let batched = DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]);
-            let u = x.dot(&x, &batched);
-            let v = u.dot(&u, &DotDimensionNumbers::inner_product());
+            let u = x.dot(&x, &batched)?;
+            let v = u.dot(&u, &DotDimensionNumbers::inner_product())?;
             Ok(v.clone() * v.sin()?)
         }
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
@@ -3783,8 +3783,8 @@ mod tests {
         fn body(
             x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
         ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
-            let u = x.dot(&x, &DotDimensionNumbers::inner_product());
-            let s = u.sin()?.tag("s");
+            let u = x.dot(&x, &DotDimensionNumbers::inner_product())?;
+            let s = u.sin()?.tag("s")?;
             Ok(u * s)
         }
         fn check(policy: impl TestPolicy, expected_forward_outputs: usize) {
@@ -3810,8 +3810,8 @@ mod tests {
         fn body(
             x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
         ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
-            let u = x.dot(&x, &DotDimensionNumbers::inner_product());
-            let s = u.sin()?.tag("s");
+            let u = x.dot(&x, &DotDimensionNumbers::inner_product())?;
+            let s = u.sin()?.tag("s")?;
             Ok(u * s)
         }
         // Custom policies see the complete producing operation and match their operation family directly, without
@@ -3951,7 +3951,7 @@ mod tests {
     fn tagged_dot_sine_body(
         x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
     ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
-        let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
+        let u = x.dot(&x, &DotDimensionNumbers::inner_product())?.tag("u")?;
         Ok(u.clone() * u.sin()?)
     }
 
@@ -4060,8 +4060,8 @@ mod tests {
         fn body(
             x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
         ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
-            let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
-            let v = u.sin()?.tag("v");
+            let u = x.dot(&x, &DotDimensionNumbers::inner_product())?.tag("u")?;
+            let v = u.sin()?.tag("v")?;
             Ok(u * v)
         }
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
@@ -4141,7 +4141,7 @@ mod tests {
                 let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> =
                     Batch::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
                         .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
+                mapped.reduce(&[0], ReductionKind::Sum).unwrap()
             })
             .unwrap();
         for (row, values) in rows.iter().enumerate() {
@@ -4631,7 +4631,7 @@ mod tests {
         fn body(
             x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
         ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
-            let printed = (x.clone() * x.clone()).print("u");
+            let printed = (x.clone() * x.clone()).print("u")?;
             Ok(printed * x)
         }
         let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body);
@@ -5353,7 +5353,7 @@ mod tests {
         fn body(
             x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
         ) -> Result<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
-            let printed = (x.clone() * x.clone()).print("p");
+            let printed = (x.clone() * x.clone()).print("p")?;
             let y = printed.clone() * printed;
             Ok(y * x)
         }

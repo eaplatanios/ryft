@@ -169,7 +169,7 @@ impl<C: Domain<Type = ArrayType, Value: Reshard>> InterpretableOperation<C> for 
         check_count!("input", inputs, 1, ProgramError);
         // The resharding flows through the capability so interpretation over staging values (program batching,
         // re-tracing) preserves it; concrete values pass through unchanged.
-        Ok(vec![inputs[0].reshard(&self.sharding)])
+        Ok(vec![inputs[0].reshard(&self.sharding)?])
     }
 }
 
@@ -219,10 +219,10 @@ impl_differentiable_operation! {
             // the same target sharding as the primal. The shared all-zero fast path handles a zero operand tangent
             // before this rule is consulted, so the operand tangent reaching here is always live.
             check_count!("input", inputs, 1, ProgramError);
-            let primal = inputs[0].primal().reshard(operation.sharding());
+            let primal = inputs[0].primal().reshard(operation.sharding())?;
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshard(operation.sharding())),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshard(operation.sharding())?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
@@ -244,7 +244,7 @@ impl_differentiable_operation! {
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
                     let contribution = match input_cotangent_type.sharding() {
-                        Some(input_cotangent_sharding) => cotangent.reshard(input_cotangent_sharding),
+                        Some(input_cotangent_sharding) => cotangent.reshard(input_cotangent_sharding)?,
                         None => cotangent.broadcast(
                             input_cotangent_type.clone(),
                             &(0..input_cotangent_type.shape().rank()).collect::<Vec<_>>(),
@@ -269,10 +269,11 @@ impl_differentiable_operation! {
 /// transforms that apply operations through interpretation (e.g. program batching and re-tracing) from silently
 /// dropping the resharding.
 pub trait Reshard: Clone {
-    /// Reshards `self` to `sharding`.
-    fn reshard(&self, sharding: &Sharding) -> Self {
+    /// Reshards `self` to `sharding`, and returns a [`ProgramError`] if `sharding` is not a valid target for `self` or
+    /// the resharding cannot be recorded in the value's context.
+    fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
         let _ = sharding;
-        self.clone()
+        Ok(self.clone())
     }
 }
 
@@ -284,29 +285,36 @@ where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<ReshardOperation>,
 {
-    fn reshard(&self, sharding: &Sharding) -> Self {
-        self.dispatch_domain()
-            .bind(ReshardOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(self))
-            .expect("`reshard` operation failed")
-            .remove(0)
+    fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
+        let mut outputs = self.dispatch_domain().bind(
+            ReshardOperation::new(sharding.clone()),
+            Vec::new(),
+            std::slice::from_ref(self),
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
 // An `Array` is a concrete single-device value, so resharding is a no-op on its payload. Its type still records the
 // requested distribution metadata — mirroring the `ReshardOperation` type-inference rule, which carries the input's
 // varying manual axes over to the target sharding — so interpreted programs preserve their declared boundaries
-// exactly. The infallible capability signature makes an invalid target sharding a panic rather than an error, which
-// the type-level validation performed before interpretation rules out for staged programs.
+// exactly. An invalid target sharding is reported as an error, which the type-level validation performed before
+// interpretation rules out for staged programs.
 impl Reshard for Array {
-    fn reshard(&self, sharding: &Sharding) -> Self {
+    fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
         let varying_manual_axes =
             self.r#type().sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
         let sharding = sharding
             .clone()
             .with_varying_manual_axes(varying_manual_axes)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let r#type = self.r#type().into_owned().with_sharding(sharding).unwrap_or_else(|error| panic!("{error}"));
-        Self::new_unchecked(r#type, self.shared_storage().clone())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        let r#type = self
+            .r#type()
+            .into_owned()
+            .with_sharding(sharding)
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        Ok(Self::new_unchecked(r#type, self.shared_storage().clone()))
     }
 }
 
@@ -407,7 +415,7 @@ impl<C: Domain<Type = ArrayType, Value: ConstrainSharding>> InterpretableOperati
         check_count!("input", inputs, 1, ProgramError);
         // The hint flows through the capability so interpretation over staging values preserves it; concrete values
         // pass through unchanged.
-        Ok(vec![inputs[0].constrain_sharding(&self.sharding)])
+        Ok(vec![inputs[0].constrain_sharding(&self.sharding)?])
     }
 }
 
@@ -461,10 +469,10 @@ impl_differentiable_operation! {
             // applies to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this
             // rule is consulted, so the operand tangent reaching here is always live.
             check_count!("input", inputs, 1, ProgramError);
-            let primal = inputs[0].primal().constrain_sharding(operation.sharding());
+            let primal = inputs[0].primal().constrain_sharding(operation.sharding())?;
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.constrain_sharding(operation.sharding())),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.constrain_sharding(operation.sharding())?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
@@ -484,7 +492,7 @@ impl_differentiable_operation! {
             check_count!("accumulator", accumulators, 1, DifferentiationError);
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
-                    let contribution = MaybeZero::Value(cotangent.constrain_sharding(operation.sharding()));
+                    let contribution = MaybeZero::Value(cotangent.constrain_sharding(operation.sharding())?);
                     accumulators[0].accumulate(context, contribution)?;
                     Ok(())
                 }
@@ -499,10 +507,11 @@ impl_differentiable_operation! {
 /// metadata, meaningful only at lowering); staging values override it to stage the operation so interpretation-driven
 /// transforms do not drop the hint.
 pub trait ConstrainSharding: Clone {
-    /// Records `sharding` as a propagation hint on `self`.
-    fn constrain_sharding(&self, sharding: &Sharding) -> Self {
+    /// Records `sharding` as a propagation hint on `self`, and returns a [`ProgramError`] if the hint cannot be
+    /// recorded in the value's context.
+    fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
         let _ = sharding;
-        self.clone()
+        Ok(self.clone())
     }
 }
 
@@ -515,11 +524,14 @@ where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<ShardingConstraintOperation>,
 {
-    fn constrain_sharding(&self, sharding: &Sharding) -> Self {
-        self.dispatch_domain()
-            .bind(ShardingConstraintOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(self))
-            .expect("`constrain_sharding` operation failed")
-            .remove(0)
+    fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
+        let mut outputs = self.dispatch_domain().bind(
+            ShardingConstraintOperation::new(sharding.clone()),
+            Vec::new(),
+            std::slice::from_ref(self),
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -619,7 +631,8 @@ mod tests {
         let (_output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
                 let target = target.clone();
-                Ok(batch(move |item| Ok(item.reshard(&target)), x, BatchAxis::new(0), BatchAxis::new(0), None).unwrap())
+                Ok(batch(move |item| Ok(item.reshard(&target)?), x, BatchAxis::new(0), BatchAxis::new(0), None)
+                    .unwrap())
             },
             matrix_type(2, 3),
         )
@@ -647,7 +660,7 @@ mod tests {
         let (_output, pullback) = differentiate_at(input)
             .vjp({
                 let target = target.clone();
-                move |x| Ok(x.reshard(&target))
+                move |x| Ok(x.reshard(&target)?)
             })
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
@@ -693,7 +706,7 @@ mod tests {
         let (output, pullback) = differentiate_at(input.clone())
             .vjp({
                 let target = target.clone();
-                move |x| Ok(x.reshard(&target))
+                move |x| Ok(x.reshard(&target)?)
             })
             .unwrap();
         let cotangent = pullback
@@ -705,7 +718,7 @@ mod tests {
         let jacobian = differentiate_at(input)
             .jacobian_reverse({
                 let target = target.clone();
-                move |x| Ok(x.reshard(&target))
+                move |x| Ok(x.reshard(&target)?)
             })
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
@@ -735,7 +748,7 @@ mod tests {
         )
         .unwrap();
         let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let resharded = input.reshard(&target);
+        let resharded = input.reshard(&target).unwrap();
         assert_eq!(resharded.r#type().sharding(), Some(&target.clone().with_varying_manual_axes(["m"]).unwrap()),);
         assert_eq!(resharded.storage_bytes(), input.storage_bytes());
     }
@@ -781,7 +794,7 @@ mod tests {
         let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["a"])]).unwrap();
 
         // An untracked hint preserves the payload and all existing type metadata, including manual-axis variation.
-        assert_eq!(input.constrain_sharding(&target), input);
+        assert_eq!(input.constrain_sharding(&target).unwrap(), input);
         assert_eq!(
             ShardingConstraintOperation::new(target).interpret(
                 &EagerContext::<Array>::new(),
@@ -802,8 +815,14 @@ mod tests {
         let (_output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
                 let hint = hint.clone();
-                Ok(batch(move |item| Ok(item.constrain_sharding(&hint)), x, BatchAxis::new(0), BatchAxis::new(0), None)
-                    .unwrap())
+                Ok(batch(
+                    move |item| Ok(item.constrain_sharding(&hint)?),
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap())
             },
             matrix_type(2, 3),
         )
@@ -823,7 +842,7 @@ mod tests {
         let (_output, pullback) = differentiate_at(Array::vector(vec![1.0; 8]).unwrap())
             .vjp({
                 let hint = hint.clone();
-                move |x| Ok(x.constrain_sharding(&hint))
+                move |x| Ok(x.constrain_sharding(&hint)?)
             })
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();

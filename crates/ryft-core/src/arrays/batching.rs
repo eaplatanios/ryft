@@ -5720,7 +5720,7 @@ mod tests {
         let adapted = <ArrayBatchingPolicy as BatchingPolicy<Parent>>::adapt_batched_program(
             batched,
             Some(&[BatchAxis::replicated(), BatchAxis::new(0)]),
-            |_, output, axis| Ok(output.reduce(&[axis.normalize(2)?], ReductionKind::Sum)),
+            |_, output, axis| Ok(output.reduce(&[axis.normalize(2)?], ReductionKind::Sum)?),
         )?;
         assert_eq!(adapted.output_axes(), &[BatchAxis::replicated(), BatchAxis::new(0)]);
         assert_eq!(
@@ -6304,7 +6304,7 @@ mod tests {
             Some(&[BatchAxis::replicated()]),
             |_, output, axis| {
                 let output = ValueProjection::<ArrayType>::into_projected(output)?;
-                Ok(output.reduce(&[axis.normalize(2)?], ReductionKind::Sum).into_value())
+                Ok(output.reduce(&[axis.normalize(2)?], ReductionKind::Sum)?.into_value())
             },
         )?;
         assert_eq!(adapted.output_axes(), &[BatchAxis::replicated()]);
@@ -6487,7 +6487,7 @@ mod tests {
         let repeated = value.dynamic_broadcast_to(&[extent])?;
         let repeated = ValueProjection::<ArrayType>::into_projected(repeated)?;
         let squared = repeated.clone() * repeated;
-        let output = squared.reduce(&[0], ReductionKind::Sum).into_value();
+        let output = squared.reduce(&[0], ReductionKind::Sum)?.into_value();
         let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![output.atom_id()?],
             vec![Placeholder, Placeholder],
@@ -8556,7 +8556,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
+                mapped.reduce(&[0], ReductionKind::Sum).unwrap()
             })
             .unwrap();
         assert_eq!(value, Array::scalar(13.0).unwrap());
@@ -8578,7 +8578,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
+                mapped.reduce(&[0], ReductionKind::Sum).unwrap()
             })
             .unwrap();
         assert_eq!(value, Array::scalar(20.0).unwrap());
@@ -8765,7 +8765,7 @@ mod tests {
                     |_, cotangents| Ok(cotangents.to_vec()),
                 )?;
                 let squared = ValueProjection::<ArrayType>::into_projected(squared.remove(0))?;
-                Ok(squared.reduce(&[0], ReductionKind::Sum).into_value())
+                Ok(squared.reduce(&[0], ReductionKind::Sum)?.into_value())
             },
             (
                 ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0]).unwrap()),
@@ -8811,7 +8811,7 @@ mod tests {
                     |_, cotangents| Ok(cotangents.to_vec()),
                 )?;
                 let squared = ValueProjection::<ArrayType>::into_projected(squared.remove(0))?;
-                Ok(squared.reduce(&[0], ReductionKind::Sum).into_value())
+                Ok(squared.reduce(&[0], ReductionKind::Sum)?.into_value())
             },
             (values, extents),
             (BatchAxis::new(0), BatchAxis::new(0)),

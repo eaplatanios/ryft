@@ -619,12 +619,12 @@ mod tests {
         // Finite differences independently confirm these reverse-mode weights.
         assert_eq!(
             differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]).unwrap())
-                .gradient(|xs| Ok(xs.cumulative_sum(0)?.reduce(&[0], ReductionKind::Sum)))
+                .gradient(|xs| Ok(xs.cumulative_sum(0)?.reduce(&[0], ReductionKind::Sum)?))
                 .unwrap(),
             Array::vector(vec![3.0, 2.0, 1.0]).unwrap(),
         );
         check_gradient!(
-            |xs| Ok(xs.cumulative_sum(0)?.reduce(&[0], ReductionKind::Sum)),
+            |xs| Ok(xs.cumulative_sum(0)?.reduce(&[0], ReductionKind::Sum)?),
             at = Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
             step = 1e-3,
             tolerance = 1e-6,

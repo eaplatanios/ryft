@@ -464,7 +464,7 @@ fn sum_mapped_array_cotangents<V: Typed<Type = ArrayType> + Reduce>(
     let normalized_axis = axis
         .normalize(cotangent.r#type().rank())
         .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(cotangent.r#type().into_owned()), axis })?;
-    Ok(cotangent.reduce(&[normalized_axis], ReductionKind::Sum))
+    Ok(cotangent.reduce(&[normalized_axis], ReductionKind::Sum)?)
 }
 
 /// Materializes one array operand's forward-mode tangent as a concrete projected array value, reading whatever runtime

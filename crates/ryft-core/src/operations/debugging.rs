@@ -32,7 +32,7 @@
 //! let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
 //!     |input| {
 //!         let squared = input.clone().mul(&input)?;
-//!         Ok(squared.print_with_effect_class("squared", EffectClass::UnorderedIo))
+//!         squared.print_with_effect_class("squared", EffectClass::UnorderedIo)
 //!     },
 //!     ArrayType::scalar(DataType::F64),
 //! )?;
@@ -211,31 +211,38 @@ impl_differentiable_elementwise_operation! {
 /// defaults to [`EffectClass::OrderedIo`], the print survives dead-code elimination and keeps its execution order
 /// relative to other ordered print instructions.
 pub trait Print: Sized {
-    /// Returns this value unchanged while printing it to standard error with `label`.
+    /// Returns this value unchanged while printing it to standard error with `label`, and a [`ProgramError`] if the
+    /// value's context fails to bind the operation. Tracing contexts never fail here, because the value is always
+    /// native to its own context, but contexts that execute operations eagerly (e.g., a backend running operation
+    /// by operation) may.
     #[inline]
-    fn print(self, label: &str) -> Self {
+    fn print(self, label: &str) -> Result<Self, ProgramError> {
         self.print_with_effect_class(label, EffectClass::OrderedIo)
     }
 
-    /// Returns this value unchanged while printing it with the provided I/O [`EffectClass`].
+    /// Returns this value unchanged while printing it with the provided I/O [`EffectClass`], and a [`ProgramError`]
+    /// if the value's context fails to bind the operation.
     ///
     /// [`EffectClass::DeviceOrderedIo`] keeps the print ordered only relative to the ordered I/O on the same device,
     /// and [`EffectClass::UnorderedIo`] lets it run independently of other prints while remaining observable. The
     /// effect class does not determine whether a backend executes the call inline or asynchronously.
-    fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Self;
+    fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Result<Self, ProgramError>;
 }
 
 impl<V: Value<DispatchDomain: Context<Operation: From<PrintOperation<V::Type>>>>> Print for V {
     #[inline]
-    fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Self {
+    fn print_with_effect_class(self, label: &str, effect_class: EffectClass) -> Result<Self, ProgramError> {
         // Any context-carrying value prints by binding a `PrintOperation` through its own context. The
         // `From<PrintOperation<V::Type>>` bound makes this disjoint from the eager value types (whose context
         // operation is `ConstantOperation`), so it covers the transform tracers without conflicting with
         // concrete implementations.
-        self.dispatch_domain()
-            .bind(PrintOperation::new(label).with_effect_class(effect_class), Vec::new(), std::slice::from_ref(&self))
-            .expect("`print` operation failed")
-            .remove(0)
+        let mut outputs = self.dispatch_domain().bind(
+            PrintOperation::new(label).with_effect_class(effect_class),
+            Vec::new(),
+            std::slice::from_ref(&self),
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -373,7 +380,7 @@ mod tests {
         // passes the tangent through, so the effect rides the primal side of the linearization.
         let (value, gradient) = differentiate_at(Array::scalar(3.0).unwrap())
             .value_and_gradient(|input| {
-                input.clone().print("x");
+                input.clone().print("x").unwrap();
                 input.clone() * input
             })
             .unwrap();
@@ -385,7 +392,7 @@ mod tests {
         // class with it, and the tangent stage stays print-free.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                input.clone().print("x");
+                input.clone().print("x").unwrap();
                 Ok(input.clone() * input)
             },
             ArrayType::scalar(DataType::F64),
@@ -433,7 +440,7 @@ mod tests {
     #[test]
     fn test_print_staging() {
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.print("x")),
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.print("x")?),
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
@@ -453,7 +460,7 @@ mod tests {
         // The selected class is recorded on the staged instruction and summarized as the program's effect.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                Ok(input.print_with_effect_class("x", EffectClass::UnorderedIo))
+                Ok(input.print_with_effect_class("x", EffectClass::UnorderedIo)?)
             },
             ArrayType::scalar(DataType::F64),
         )

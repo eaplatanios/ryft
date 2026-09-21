@@ -141,14 +141,14 @@ where
         let (scale, smallest_scale) = match scale_type {
             // NVFP4-style linear scaling: the block maximum maps to the element type's maximum magnitude. The clamp
             // floor is the scale type's smallest positive normal, `2^-6`.
-            DataType::F8E4M3FN => (block_max.div(&fill(element_max)?)?, (-6.0f64).exp2()),
+            DataType::F8E4M3FN => (block_max?.div(&fill(element_max)?)?, (-6.0f64).exp2()),
             // OCP MX power-of-two scaling: `2^(floor(log2(max_abs)) - emax)` with the boundary nudge documented on
             // the trait, folded into one subtraction because `floor(x + ε) - emax = floor(x + ε - emax)` for the
             // integer `emax`. The clamp floor is the scale type's smallest representable value, `2^-127` (which
             // also absorbs the `exp(-inf) = 0` produced by all-zero blocks).
             DataType::F8E8M0FNU => {
                 let log_2 = fill(std::f64::consts::LN_2)?;
-                let exponent = block_max.log()?.div(&log_2)?.sub(&fill(element_max_exponent - 1e-4)?)?.floor()?;
+                let exponent = block_max?.log()?.div(&log_2)?.sub(&fill(element_max_exponent - 1e-4)?)?.floor()?;
                 (exponent.mul(&log_2)?.exp()?, (-127.0f64).exp2())
             }
             scale_type => {
@@ -223,7 +223,7 @@ mod tests {
         let product = elements
             .scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))
             .unwrap();
-        let expected = input.dot(&input, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()));
+        let expected = input.dot(&input, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new())).unwrap();
         assert_eq!(product.to_f64s(), expected.to_f64s());
 
         // Contract violations report clear errors.
@@ -288,7 +288,7 @@ mod tests {
         let product = elements
             .scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))
             .unwrap();
-        let expected = input.dot(&input, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()));
+        let expected = input.dot(&input, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new())).unwrap();
         assert_eq!(product.to_f64s(), expected.to_f64s());
     }
 
@@ -311,7 +311,7 @@ mod tests {
         let product = elements
             .scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))
             .unwrap();
-        let expected = input.dot(&input, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()));
+        let expected = input.dot(&input, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new())).unwrap();
         let expected_value = expected.to_f64s()[0];
         let actual_value = product.to_f64s()[0];
         assert_abs_diff_eq!(actual_value, expected_value, epsilon = 0.05 * expected_value);

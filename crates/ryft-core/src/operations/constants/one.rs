@@ -684,7 +684,7 @@ mod tests {
             let input = <_ as ValueProjection<ArrayType>>::into_projected(input)?;
             let squared = input.mul(&input)?;
             Ok::<_, ProgramError>(ValueProjection::<ArrayType>::from_projected(
-                squared.reduce(&[0], ReductionKind::Sum),
+                squared.reduce(&[0], ReductionKind::Sum).unwrap(),
             ))
         };
 

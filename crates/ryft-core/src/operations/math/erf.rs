@@ -194,7 +194,7 @@ mod tests {
             }],
         );
         check_gradient!(
-            |x| x.erf().map(|values| values.reduce(&[0], ReductionKind::Sum)),
+            |x| x.erf().map(|values| values.reduce(&[0], ReductionKind::Sum).unwrap()),
             at = Array::vector(vec![-2.5f64, -0.3, 0.0, 0.9, 3.0]).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,

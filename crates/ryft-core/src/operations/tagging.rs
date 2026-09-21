@@ -25,7 +25,7 @@
 //! # use ryft_core::{Array, ArrayOperation, ArrayType, DataType, Mul, ProgramError, Tag, Trace, TracingContext};
 //! # fn main() -> Result<(), ProgramError> {
 //! let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-//!     |input| Ok(input.clone().mul(&input)?.tag("squared")),
+//!     |input| input.clone().mul(&input)?.tag("squared"),
 //!     ArrayType::scalar(DataType::F64),
 //! )?;
 //! assert_eq!(
@@ -152,25 +152,27 @@ impl_differentiable_elementwise_operation! {
 /// the primal value and passes the tangent value through), so that it marks the instructions that define linearization
 /// residuals, which rematerialization policies classify by key through the producing [`TagOperation`].
 pub trait Tag: Sized {
-    /// Returns this value unchanged while tagging it with `key`.
-    fn tag(self, key: &str) -> Self;
+    /// Returns this value unchanged while tagging it with `key`, and a [`ProgramError`] if the value's context fails
+    /// to bind the operation. Tracing contexts never fail here, because the value is always native to its own context,
+    /// but contexts that execute operations eagerly (e.g., a backend running operation by operation) may.
+    fn tag(self, key: &str) -> Result<Self, ProgramError>;
 }
 
 impl Tag for Array {
     #[inline]
-    fn tag(self, _key: &str) -> Self {
+    fn tag(self, _key: &str) -> Result<Self, ProgramError> {
         // Tagging is metadata for staged programs only, so a concrete array carries itself through unchanged.
-        self
+        Ok(self)
     }
 }
 
 impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation<V::Type>>>>> Tag for V {
     #[inline]
-    fn tag(self, key: &str) -> Self {
-        self.dispatch_domain()
-            .bind(TagOperation::new(key), Vec::new(), std::slice::from_ref(&self))
-            .expect("`tag` operation failed")
-            .remove(0)
+    fn tag(self, key: &str) -> Result<Self, ProgramError> {
+        let mut outputs =
+            self.dispatch_domain().bind(TagOperation::new(key), Vec::new(), std::slice::from_ref(&self))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -302,13 +304,13 @@ mod tests {
     fn test_array_tag() {
         // Tags are metadata for staged programs, so an eager array is returned unchanged.
         let input = Array::vector(vec![1.0_f32, 2.0]).unwrap();
-        assert_eq!(input.clone().tag("residual"), input);
+        assert_eq!(input.clone().tag("residual").unwrap(), input);
     }
 
     #[test]
     fn test_tag_staging() {
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.tag("residual")),
+            |input: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(input.tag("residual")?),
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();

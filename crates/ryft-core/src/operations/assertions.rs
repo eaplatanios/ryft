@@ -315,10 +315,10 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
             let coordinates = indices(&condition.r#type().into_owned().with_data_type(DataType::I32))?;
             // Passing items may tie the last coordinate: when any item fails, the minimum still identifies the
             // first failure. Successful and empty batches are handled by the independent Boolean reduction.
-            let sentinel = coordinates.reduce(&[0], ReductionKind::Max);
+            let sentinel = coordinates.reduce(&[0], ReductionKind::Max)?;
             let candidates = V::select(&condition, &sentinel, &coordinates)?;
-            let index = candidates.reduce(&[0], ReductionKind::Min);
-            let condition = condition.reduce(&[0], ReductionKind::All);
+            let index = candidates.reduce(&[0], ReductionKind::Min)?;
+            let condition = condition.reduce(&[0], ReductionKind::All)?;
             // Empty and successful batches use index zero. A padded observation makes this valid even at extent zero.
             let index = V::select(&condition, &index.zero_like()?, &index)?;
             (condition, index)
@@ -649,7 +649,7 @@ where
             |condition| {
                 if extent.bounds().lower() == 0 {
                     let condition = P::match_axis(context, &ArrayBatch::replicated(condition), Axis::from(0))?;
-                    return Ok(condition.value().reduce(&[0], ReductionKind::All));
+                    return condition.value().reduce(&[0], ReductionKind::All);
                 }
                 Ok(condition)
             },

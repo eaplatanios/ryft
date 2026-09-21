@@ -5480,7 +5480,7 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (_, program) = NestedTracingContext::trace(
             context,
-            |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone() + inputs[1].stop_gradient()]),
+            |inputs| Ok(vec![inputs[0].clone() * inputs[0].clone() + inputs[1].stop_gradient()?]),
             vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
         )
         .unwrap();

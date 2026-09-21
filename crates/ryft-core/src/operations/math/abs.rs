@@ -396,7 +396,7 @@ mod tests {
         // The array universe agrees: summing the elementwise magnitudes of a complex vector is again ℂⁿ → ℝ, and the
         // finite-difference oracle perturbs each element's real and imaginary parts independently.
         check_gradient!(
-            |z| z.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum)),
+            |z| z.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum).unwrap()),
             at = Array::vector(vec![ComplexNumber::new(0.7f64, -0.3), ComplexNumber::new(-1.2f64, 0.8)]).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,

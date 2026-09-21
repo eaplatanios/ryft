@@ -1246,7 +1246,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
+                mapped.reduce(&[0], ReductionKind::Sum).unwrap()
             })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);

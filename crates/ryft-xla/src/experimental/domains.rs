@@ -14624,9 +14624,9 @@ mod tests {
                 .unwrap()
         };
         let ((first_pending, second_pending), lines) = with_captured_prints(|| {
-            drop(first.print("first"));
+            drop(first.print("first").unwrap());
             let first_pending = tail_pending();
-            drop(second.print("second"));
+            drop(second.print("second").unwrap());
             let second_pending = tail_pending();
             if let Some(manager) = &manager {
                 manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true).unwrap().r#await().unwrap();

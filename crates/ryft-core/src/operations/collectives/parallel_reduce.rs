@@ -389,7 +389,7 @@ where
     };
     // Reduce along the mapped batch axis with the corresponding reduction kind. The output is replicated: every
     // batch item sees the same reduced value, matching JAX's `psum`/`pmean`/`pmax` broadcast semantics.
-    let mut output_value = input.value().clone().reduce(&[batch_axis], kind.reduction_kind());
+    let mut output_value = input.value().clone().reduce(&[batch_axis], kind.reduction_kind())?;
     if matches!(kind, ParallelReductionKind::Mean) {
         // Mean divides the summed value by the batch size, which must be statically known to scale by `1 / N`.
         let inverse_axis_size = 1.0 / parallel_mean_batch_size(&input)? as f64;
@@ -401,11 +401,13 @@ where
         .iter()
         .map(|ragged_axis| {
             let extent_batch_axis = ragged_axis.extent_axes().iter().position(|axis| *axis == batch_axis);
-            let extents = extent_batch_axis.map_or_else(
-                || ragged_axis.extents().clone(),
-                |extent_batch_axis| ragged_axis.extents().clone().reduce(&[extent_batch_axis], ReductionKind::Max),
-            );
-            RaggedAxis::new(
+            let extents = match extent_batch_axis {
+                None => ragged_axis.extents().clone(),
+                Some(extent_batch_axis) => {
+                    ragged_axis.extents().clone().reduce(&[extent_batch_axis], ReductionKind::Max)?
+                }
+            };
+            Ok(RaggedAxis::new(
                 ragged_axis.axis() - usize::from(batch_axis < ragged_axis.axis()),
                 extents,
                 ragged_axis.dimension().clone(),
@@ -414,9 +416,9 @@ where
                     .iter()
                     .filter_map(|axis| (*axis != batch_axis).then_some(*axis - usize::from(batch_axis < *axis)))
                     .collect(),
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, ProgramError>>()?;
     Ok(vec![ArrayBatch::new(output_value, BatchAxis::replicated())?.with_ragged_axes(ragged_axes)?])
 }
 

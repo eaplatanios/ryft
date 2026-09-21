@@ -114,28 +114,32 @@ impl_non_transposable_operation!(<T> StopGradientOperation<T> where T: Type);
 /// Value-level gradient stopping capability. [`StopGradient`] fills the same role for [`StopGradientOperation`]
 /// that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
 pub trait StopGradient: Sized {
-    /// Returns this value unchanged while marking it as a constant for differentiation purposes.
-    fn stop_gradient(&self) -> Self;
+    /// Returns this value unchanged while marking it as a constant for differentiation purposes, and a [`ProgramError`]
+    /// if the value's context fails to bind the operation. Tracing contexts never fail here, because the value is
+    /// always native to its own context, but contexts that execute operations eagerly (e.g., a backend running
+    /// operation by operation) may.
+    fn stop_gradient(&self) -> Result<Self, ProgramError>;
 }
 
-// Any context-carrying value stops gradients by binding a `StopGradientOperation` through its own context. A staged
-// tracer records the operation, while batching and Jacobian-Vector Product (JVP) tracers apply their transform rules.
-// The `From<StopGradientOperation<V::Type>>` bound makes this blanket disjoint from the concrete eager value types
-// (whose context operation is `ConstantOperation`), which implement `StopGradient` directly.
 impl<V: Value<DispatchDomain: Context<Operation: From<StopGradientOperation<V::Type>>>>> StopGradient for V {
     #[inline]
-    fn stop_gradient(&self) -> Self {
-        self.dispatch_domain()
-            .bind(StopGradientOperation::new(), Vec::new(), std::slice::from_ref(self))
-            .unwrap()
-            .remove(0)
+    fn stop_gradient(&self) -> Result<Self, ProgramError> {
+        // Any context-carrying value stops gradients by binding a `StopGradientOperation` through its own context.
+        // A staged tracer records the operation, while batching and Jacobian-Vector Product (JVP) tracers apply their
+        // transform rules. The `From<StopGradientOperation<V::Type>>` bound makes this blanket disjoint from the
+        // concrete eager value types (whose context operation is `ConstantOperation`), which implement `StopGradient`
+        // directly.
+        let mut outputs =
+            self.dispatch_domain().bind(StopGradientOperation::new(), Vec::new(), std::slice::from_ref(self))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
 impl StopGradient for Array {
     #[inline]
-    fn stop_gradient(&self) -> Self {
-        self.clone()
+    fn stop_gradient(&self) -> Result<Self, ProgramError> {
+        Ok(self.clone())
     }
 }
 
@@ -144,13 +148,14 @@ impl StopGradient for Array {
 /// It supports nested tuples, vectors, and custom [`Parameterized`] types, returning an unchanged primal structure
 /// whose leaves are constants to every enclosing differentiation transform.
 pub trait StopGradients<P: Parameter + StopGradient>: Parameterized<P> {
-    /// Stops gradient propagation through every [`Parameter`] leaf in this structure.
+    /// Stops gradient propagation through every [`Parameter`] leaf in this structure, and returns a [`ProgramError`]
+    /// if any leaf cannot be marked.
     #[inline]
-    fn stop_gradients(mut self) -> Self {
+    fn stop_gradients(mut self) -> Result<Self, ProgramError> {
         for parameter in self.parameters_mut() {
-            *parameter = parameter.stop_gradient();
+            *parameter = parameter.stop_gradient()?;
         }
-        self
+        Ok(self)
     }
 }
 
@@ -215,7 +220,7 @@ mod tests {
         );
 
         let input = Array::vector(vec![1.0, -2.0]).unwrap();
-        assert_eq!(input.stop_gradient(), input);
+        assert_eq!(input.stop_gradient().unwrap(), input);
     }
 
     #[test]
@@ -337,7 +342,7 @@ mod tests {
     fn test_stop_gradient_composes_with_batching() {
         // Gradient stopping composes with batching: `x * stop_gradient(x)` batches like `x * x`.
         let output: Array = batch(
-            |x| Ok(x.clone() * x.stop_gradient()),
+            |x| Ok(x.clone() * x.stop_gradient()?),
             Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
             BatchAxis::new(0),
             BatchAxis::new(0),
@@ -350,7 +355,7 @@ mod tests {
         // differentiation context instead of cloning the packed differentiation tracer.
         let (primal, tangent) = differentiate_at(Array::vector(vec![2.0, 3.0]).unwrap())
             .jvp(Array::vector(vec![5.0, 7.0]).unwrap(), |x| {
-                Ok(batch(|item| Ok(item.stop_gradient()), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
+                Ok(batch(|item| Ok(item.stop_gradient()?), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
             })
             .unwrap();
         assert_eq!(primal.to_f64s(), vec![2.0, 3.0]);
@@ -361,13 +366,13 @@ mod tests {
         let (value, gradient) = differentiate_at(Array::vector(vec![2.0, 3.0]).unwrap())
             .value_and_gradient(|x| {
                 let mapped = batch(
-                    |item| Ok(item.clone() * item.stop_gradient()),
+                    |item| Ok(item.clone() * item.stop_gradient()?),
                     x,
                     BatchAxis::new(0),
                     BatchAxis::new(0),
                     None,
                 )?;
-                Ok(mapped.reduce(&[0], ReductionKind::Sum))
+                Ok(mapped.reduce(&[0], ReductionKind::Sum)?)
             })
             .unwrap();
         assert_eq!(value.to_f64s(), vec![13.0]);
@@ -379,7 +384,7 @@ mod tests {
         // The JVP passes the primal through and severs the tangent. This intentionally differs from the numerical
         // derivative of the identity primal function, so the finite-difference operation helper does not apply.
         let (primal, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
-            .jvp(Array::scalar(3.0).unwrap(), |x| Ok(x.stop_gradient()))
+            .jvp(Array::scalar(3.0).unwrap(), |x| Ok(x.stop_gradient()?))
             .unwrap();
         assert_eq!(primal, Array::scalar(2.0).unwrap());
         assert_eq!(tangent, Array::scalar(0.0).unwrap());
@@ -387,7 +392,7 @@ mod tests {
         // The JAX documentation example: `f(x) = x * stop_gradient(x)` differentiates like `x * c` with `c` frozen
         // at the primal value, so `f'(x) = stop_gradient(x)`.
         let (value, first_derivative) = differentiate_at(Array::scalar(3.0).unwrap())
-            .value_and_gradient(|x| x.clone() * x.stop_gradient())
+            .value_and_gradient(|x| x.clone() * x.stop_gradient().unwrap())
             .unwrap();
         assert_eq!(value, Array::scalar(9.0).unwrap());
         assert_eq!(first_derivative, Array::scalar(3.0).unwrap());
@@ -395,7 +400,7 @@ mod tests {
         // A stop-gradient barrier applies to every active differentiation level. The first derivative of
         // `x * stop_gradient(x)` is the frozen primal `x`, but an enclosing derivative cannot differentiate it again.
         let second_derivative = differentiate_at(Array::scalar(3.0).unwrap())
-            .gradient(|x| differentiate_at(x).gradient(|y| y.clone() * y.stop_gradient()).map_err(Into::into))
+            .gradient(|x| differentiate_at(x).gradient(|y| y.clone() * y.stop_gradient().unwrap()).map_err(Into::into))
             .unwrap();
         assert_eq!(second_derivative, Array::scalar(0.0).unwrap());
 
@@ -440,14 +445,14 @@ mod tests {
                 Array::scalar(true).unwrap(),
             ],
         );
-        assert_eq!(values.clone().stop_gradients(), values);
+        assert_eq!(values.clone().stop_gradients().unwrap(), values);
 
-        assert!(Vec::<Array>::new().stop_gradients().is_empty());
-        assert_eq!(<() as StopGradients<Array>>::stop_gradients(()), ());
+        assert!(Vec::<Array>::new().stop_gradients().unwrap().is_empty());
+        assert_eq!(<() as StopGradients<Array>>::stop_gradients(()), Ok(()));
 
         let first_derivative = differentiate_at(Array::scalar(2.0).unwrap())
             .gradient(|input| {
-                let stopped = (input.clone(), vec![input.clone(), input]).stop_gradients();
+                let stopped = (input.clone(), vec![input.clone(), input]).stop_gradients().unwrap();
                 stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
             })
             .unwrap();
@@ -457,7 +462,7 @@ mod tests {
             .gradient(|input| {
                 differentiate_at(input)
                     .gradient(|inner| {
-                        let stopped = (inner.clone(), vec![inner.clone(), inner]).stop_gradients();
+                        let stopped = (inner.clone(), vec![inner.clone(), inner]).stop_gradients().unwrap();
                         stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
                     })
                     .map_err(Into::into)

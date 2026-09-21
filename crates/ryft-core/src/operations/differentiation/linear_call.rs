@@ -1571,7 +1571,7 @@ mod tests {
                     |_, cotangents| Ok(cotangents.to_vec()),
                 )?;
                 let repeated = ValueProjection::<ArrayType>::into_projected(repeated.remove(0))?;
-                Ok(repeated.reduce(&[0], ReductionKind::Sum).into_value())
+                Ok(repeated.reduce(&[0], ReductionKind::Sum)?.into_value())
             },
             (values, extents),
             (BatchAxis::new(0), BatchAxis::new(0)),

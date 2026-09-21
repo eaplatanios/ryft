@@ -219,7 +219,9 @@ mod tests {
         // zero gradients while value has unit gradient.
         let (output, gradients) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .differentiate_at(inputs)
-            .value_and_gradient(|inputs| function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum))
+            .value_and_gradient(|inputs| {
+                function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
+            })
             .unwrap();
 
         assert_eq!(output.to_f64s(), vec![5.0]);
@@ -248,7 +250,9 @@ mod tests {
         };
         let (_, gradients) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .differentiate_at(inputs)
-            .value_and_gradient(|inputs| function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum))
+            .value_and_gradient(|inputs| {
+                function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
+            })
             .unwrap();
 
         assert_eq!(gradients.bias.unwrap().r#type().data_type(), DataType::Zero);

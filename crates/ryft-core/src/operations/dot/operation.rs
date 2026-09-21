@@ -156,12 +156,12 @@ impl<C: Domain<Type = ArrayType, Value: Dot>> InterpretableOperation<C> for DotO
         // ignore the sharding and upcast for the accumulation type. Type inference rejects combining the two.
         Ok(vec![match (&self.accumulation_type, &self.output_sharding) {
             (Some(accumulation_type), _) => {
-                inputs[0].dot_with_accumulation_type(&inputs[1], &self.dimensions, *accumulation_type)
+                inputs[0].dot_with_accumulation_type(&inputs[1], &self.dimensions, *accumulation_type)?
             }
             (None, Some(output_sharding)) => {
-                inputs[0].dot_with_output_sharding(&inputs[1], &self.dimensions, output_sharding)
+                inputs[0].dot_with_output_sharding(&inputs[1], &self.dimensions, output_sharding)?
             }
-            (None, None) => inputs[0].dot(&inputs[1], &self.dimensions),
+            (None, None) => inputs[0].dot(&inputs[1], &self.dimensions)?,
         }])
     }
 }
@@ -178,8 +178,9 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 /// described by `dimensions`, supporting standard matrix multiplication, batched matrix multiplication, vector inner
 /// products, and arbitrary tensor contractions.
 pub trait Dot<Rhs = Self>: Sized {
-    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`.
-    fn dot(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers) -> Self;
+    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, and returns a [`ProgramError`] if
+    /// the operands are incompatible with `dimensions` or the contraction cannot be recorded in the value's context.
+    fn dot(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError>;
 
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding`
     /// for the result. The requested sharding overrides the inferred output sharding and is validated by the staged
@@ -192,7 +193,7 @@ pub trait Dot<Rhs = Self>: Sized {
         rhs: &Rhs,
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
-    ) -> Self {
+    ) -> Result<Self, ProgramError> {
         let _ = output_sharding;
         self.dot(rhs, dimensions)
     }
@@ -205,7 +206,7 @@ pub trait Dot<Rhs = Self>: Sized {
         rhs: &Rhs,
         dimensions: &DotDimensionNumbers,
         accumulation_type: DataType,
-    ) -> Self;
+    ) -> Result<Self, ProgramError>;
 }
 
 // Context-carrying values stage a dot through their context. The `From<DotOperation>` bound keeps this implementation
@@ -215,11 +216,14 @@ where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<DotOperation>,
 {
-    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
-        self.dispatch_domain()
-            .bind(DotOperation::new(dimensions.clone()), Vec::new(), &[self.clone(), rhs.clone()])
-            .expect("`dot` operation failed")
-            .remove(0)
+    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError> {
+        let mut outputs = self.dispatch_domain().bind(
+            DotOperation::new(dimensions.clone()),
+            Vec::new(),
+            &[self.clone(), rhs.clone()],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 
     fn dot_with_accumulation_type(
@@ -227,15 +231,14 @@ where
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
         accumulation_type: DataType,
-    ) -> Self {
-        self.dispatch_domain()
-            .bind(
-                DotOperation::new(dimensions.clone()).with_accumulation_type(accumulation_type),
-                Vec::new(),
-                &[self.clone(), rhs.clone()],
-            )
-            .expect("`dot` operation failed")
-            .remove(0)
+    ) -> Result<Self, ProgramError> {
+        let mut outputs = self.dispatch_domain().bind(
+            DotOperation::new(dimensions.clone()).with_accumulation_type(accumulation_type),
+            Vec::new(),
+            &[self.clone(), rhs.clone()],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 
     fn dot_with_output_sharding(
@@ -243,15 +246,14 @@ where
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
-    ) -> Self {
-        self.dispatch_domain()
-            .bind(
-                DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()),
-                Vec::new(),
-                &[self.clone(), rhs.clone()],
-            )
-            .expect("`dot` operation failed")
-            .remove(0)
+    ) -> Result<Self, ProgramError> {
+        let mut outputs = self.dispatch_domain().bind(
+            DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()),
+            Vec::new(),
+            &[self.clone(), rhs.clone()],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 

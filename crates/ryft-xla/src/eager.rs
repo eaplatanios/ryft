@@ -625,10 +625,22 @@ mod tests {
         );
 
         // Reductions agree, including the divide-by-count semantics of `Mean`.
-        assert_parity(&left.reduce(&[0], ReductionKind::Sum), &reference_left.reduce(&[0], ReductionKind::Sum));
-        assert_parity(&left.reduce(&[0], ReductionKind::Mean), &reference_left.reduce(&[0], ReductionKind::Mean));
-        assert_parity(&left.reduce(&[0], ReductionKind::Max), &reference_left.reduce(&[0], ReductionKind::Max));
-        assert_parity(&left.reduce(&[0], ReductionKind::Min), &reference_left.reduce(&[0], ReductionKind::Min));
+        assert_parity(
+            &left.reduce(&[0], ReductionKind::Sum).unwrap(),
+            &reference_left.reduce(&[0], ReductionKind::Sum).unwrap(),
+        );
+        assert_parity(
+            &left.reduce(&[0], ReductionKind::Mean).unwrap(),
+            &reference_left.reduce(&[0], ReductionKind::Mean).unwrap(),
+        );
+        assert_parity(
+            &left.reduce(&[0], ReductionKind::Max).unwrap(),
+            &reference_left.reduce(&[0], ReductionKind::Max).unwrap(),
+        );
+        assert_parity(
+            &left.reduce(&[0], ReductionKind::Min).unwrap(),
+            &reference_left.reduce(&[0], ReductionKind::Min).unwrap(),
+        );
 
         // Integer reductions agree exactly, including the truncating integer division of `Mean`.
         let integer_values = [5i32, -2, 7, 0];
@@ -645,8 +657,8 @@ mod tests {
         )
         .unwrap();
         for kind in [ReductionKind::Sum, ReductionKind::Mean, ReductionKind::Max, ReductionKind::Min] {
-            let device_values = read_i32s(&integer.reduce(&[0], kind));
-            let reference_values = reference_integer.reduce(&[0], kind).elements::<i32>().unwrap();
+            let device_values = read_i32s(&integer.reduce(&[0], kind).unwrap());
+            let reference_values = reference_integer.reduce(&[0], kind).unwrap().elements::<i32>().unwrap();
             assert_eq!(device_values, reference_values, "integer `{kind}` reduction disagrees");
         }
 
@@ -1218,8 +1230,8 @@ mod tests {
         let empty_booleans =
             Array::from_host_buffer(&client, replicated_type(&mesh, DataType::Boolean, &[0]), mesh.clone(), &[])
                 .unwrap();
-        assert_eq!(read_booleans(&empty_booleans.reduce(&[0], ReductionKind::Max)), vec![false]);
-        assert_eq!(read_booleans(&empty_booleans.reduce(&[0], ReductionKind::Min)), vec![true]);
+        assert_eq!(read_booleans(&empty_booleans.reduce(&[0], ReductionKind::Max).unwrap()), vec![false]);
+        assert_eq!(read_booleans(&empty_booleans.reduce(&[0], ReductionKind::Min).unwrap()), vec![true]);
 
         // Floating-point extrema propagate NaNs and order negative zero below positive zero.
         let nan_values = [1.0f32, f32::NAN];
@@ -1230,7 +1242,7 @@ mod tests {
             values_to_bytes(&nan_values).as_slice(),
         )
         .unwrap();
-        assert!(read_f32s(&nan.reduce(&[0], ReductionKind::Max))[0].is_nan());
+        assert!(read_f32s(&nan.reduce(&[0], ReductionKind::Max).unwrap())[0].is_nan());
         let zero_values = [-0.0f32, 0.0];
         let zeros = Array::from_host_buffer(
             &client,
@@ -1239,8 +1251,8 @@ mod tests {
             values_to_bytes(&zero_values).as_slice(),
         )
         .unwrap();
-        assert_eq!(read_f32s(&zeros.reduce(&[0], ReductionKind::Max))[0].to_bits(), 0.0f32.to_bits());
-        assert_eq!(read_f32s(&zeros.reduce(&[0], ReductionKind::Min))[0].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(read_f32s(&zeros.reduce(&[0], ReductionKind::Max).unwrap())[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!(read_f32s(&zeros.reduce(&[0], ReductionKind::Min).unwrap())[0].to_bits(), (-0.0f32).to_bits());
 
         // Complex extrema compare `(real, imaginary)` lexicographically in reductions and scatter combiners.
         let complex_values = [
@@ -1255,12 +1267,18 @@ mod tests {
             values_to_bytes(&complex_values).as_slice(),
         )
         .unwrap();
-        assert_eq!(read_c64s(&complex.reduce(&[0], ReductionKind::Max)), vec![num_complex::Complex::new(2.0, 4.0)]);
-        assert_eq!(read_c64s(&complex.reduce(&[0], ReductionKind::Min)), vec![num_complex::Complex::new(1.0, 5.0)]);
+        assert_eq!(
+            read_c64s(&complex.reduce(&[0], ReductionKind::Max).unwrap()),
+            vec![num_complex::Complex::new(2.0, 4.0)]
+        );
+        assert_eq!(
+            read_c64s(&complex.reduce(&[0], ReductionKind::Min).unwrap()),
+            vec![num_complex::Complex::new(1.0, 5.0)]
+        );
         let empty_complex =
             Array::from_host_buffer(&client, replicated_type(&mesh, DataType::C64, &[0]), mesh.clone(), &[]).unwrap();
         assert_eq!(
-            read_c64s(&empty_complex.reduce(&[0], ReductionKind::Max)),
+            read_c64s(&empty_complex.reduce(&[0], ReductionKind::Max).unwrap()),
             vec![num_complex::Complex::new(f32::NEG_INFINITY, 0.0)],
         );
 
@@ -1562,7 +1580,7 @@ mod tests {
         );
         let (value, gradient) = domain
             .differentiate_at(input)
-            .value_and_gradient(|x| function.call(x).unwrap().reduce(&[0], ReductionKind::Sum))
+            .value_and_gradient(|x| function.call(x).unwrap().reduce(&[0], ReductionKind::Sum).unwrap())
             .unwrap();
         assert_eq!(read_f32s(&value), vec![6.0]);
         assert_eq!(read_f32s(&gradient), vec![1.0, 1.0]);
@@ -1924,9 +1942,11 @@ mod tests {
         let lhs = Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), lhs_bytes.as_slice()).unwrap();
         let rhs = Array::from_host_buffer(&client, device_type, mesh.clone(), rhs_bytes.as_slice()).unwrap();
 
-        let device_product = lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F32);
-        let reference_product =
-            reference_lhs.dot_with_accumulation_type(&reference_rhs, &DotDimensionNumbers::matmul(), DataType::F32);
+        let device_product =
+            lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F32).unwrap();
+        let reference_product = reference_lhs
+            .dot_with_accumulation_type(&reference_rhs, &DotDimensionNumbers::matmul(), DataType::F32)
+            .unwrap();
         assert_eq!(device_product.r#type().data_type(), DataType::F32);
         let device_value_f64s = read_f32s(&device_product).iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
         assert_eq!(device_value_f64s, reference_product.to_f64s());
@@ -2144,7 +2164,9 @@ mod tests {
         let domain = inputs.query.execution_domain();
         let (loss, gradients) = domain
             .differentiate_at(inputs)
-            .value_and_gradient(|inputs| function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum))
+            .value_and_gradient(|inputs| {
+                function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
+            })
             .unwrap();
 
         let reference_function =
@@ -2152,7 +2174,7 @@ mod tests {
         let (reference_loss, reference_gradients) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .differentiate_at(AttentionInputs::new(reference(), reference(), reference()))
             .value_and_gradient(|inputs| {
-                reference_function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+                reference_function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
             })
             .unwrap();
 
@@ -2263,14 +2285,14 @@ mod tests {
         assert_eq!(read_f32s(&trimmed_and_dilated), vec![0.5, 2.0, 0.5, 3.0, 0.5, 4.0, 0.5]);
 
         // Reduction sums along the requested axis, and the like-constants match the receiver's shape.
-        let total = vector.reduce(&[0], ReductionKind::Sum);
+        let total = vector.reduce(&[0], ReductionKind::Sum).unwrap();
         assert_eq!(read_f32s(&total), vec![10.0]);
         assert_eq!(read_f32s(&vector.zero_like().unwrap()), vec![0.0, 0.0, 0.0, 0.0]);
         assert_eq!(read_f32s(&vector.one_like().unwrap()), vec![1.0, 1.0, 1.0, 1.0]);
 
         // Tag and stop-gradient behave as eager identities on the payload.
-        assert_eq!(read_f32s(&vector.clone().tag("residual")), vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(read_f32s(&vector.stop_gradient()), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(read_f32s(&vector.clone().tag("residual").unwrap()), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(read_f32s(&vector.stop_gradient().unwrap()), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
@@ -2303,6 +2325,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 })
                 .unwrap();
             assert_eq!(read_f32s(&value), vec![7.0]);
@@ -2327,6 +2350,7 @@ mod tests {
                     )
                     .unwrap()
                     .reduce(&[0], ReductionKind::Sum)
+                    .unwrap()
             })
             .unwrap();
         assert_eq!(read_f32s(&input_gradient), vec![0.0, 1.0]);
@@ -2360,6 +2384,7 @@ mod tests {
                     .gather(&indices, &GatherDimensionNumbers::new(vec![], vec![0], vec![0]), &[1], &options)
                     .unwrap()
                     .reduce(&[0], ReductionKind::Sum)
+                    .unwrap()
             })
             .unwrap();
         assert_eq!(read_f32s(&value), vec![54.0]);
@@ -2631,7 +2656,7 @@ mod tests {
             .differentiate_at(x.clone())
             .value_and_gradient(|x| {
                 let squared = Mul::mul(&x, &x).unwrap();
-                squared.reduce(&[0], ReductionKind::Sum)
+                squared.reduce(&[0], ReductionKind::Sum).unwrap()
             })
             .unwrap();
         assert_eq!(read_f32s(&value), vec![14.0]);
@@ -2653,7 +2678,7 @@ mod tests {
             .differentiate_at(x.clone())
             .gradient(|x| {
                 let squared = Mul::mul(&x, &x).unwrap();
-                squared.reduce(&[0], ReductionKind::Sum)
+                squared.reduce(&[0], ReductionKind::Sum).unwrap()
             })
             .unwrap();
         assert_eq!(read_f32s(&gradient), vec![2.0, 4.0, 6.0]);
@@ -2751,7 +2776,7 @@ mod tests {
             .value_and_gradient(|x| {
                 let squared = Mul::mul(&x, &x).unwrap();
                 let aux = Add::add(&x, &x).unwrap();
-                (squared.reduce(&[0], ReductionKind::Sum), aux)
+                (squared.reduce(&[0], ReductionKind::Sum).unwrap(), aux)
             })
             .unwrap();
         assert_eq!(read_f32s(&value), vec![14.0]);
@@ -2789,7 +2814,9 @@ mod tests {
         let (value, gradient) = differentiate_at(primal.clone())
             .with_captures(capture.clone())
             .in_context(&primal.execution_domain())
-            .value_and_gradient(|input, capture| Mul::mul(&input, &capture).unwrap().reduce(&[0], ReductionKind::Sum))
+            .value_and_gradient(|input, capture| {
+                Mul::mul(&input, &capture).unwrap().reduce(&[0], ReductionKind::Sum).unwrap()
+            })
             .unwrap();
         assert_eq!(read_f32s(&value), vec![60.0]);
         assert_eq!(read_f64_coordinates(&gradient), vec![4.0, 5.0, 6.0, 7.0]);
@@ -2827,7 +2854,7 @@ mod tests {
             .gradient(|x| {
                 let squared =
                     batch(|item| Ok(item.clone() * item), x, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
-                squared.reduce(&[0], ReductionKind::Sum)
+                squared.reduce(&[0], ReductionKind::Sum).unwrap()
             })
             .unwrap();
         assert_eq!(read_f32s(&gradient), vec![2.0, 4.0, 6.0]);
@@ -3084,7 +3111,7 @@ mod tests {
             .differentiate_at(x)
             .hessian(|x| {
                 let squared = Mul::mul(&x, &x).unwrap();
-                Ok(squared.reduce(&[0], ReductionKind::Sum))
+                Ok(squared.reduce(&[0], ReductionKind::Sum)?)
             })
             .unwrap();
 

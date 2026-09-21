@@ -1726,9 +1726,9 @@ where
                                         .filter(|candidate| *candidate != source_axis)
                                         .collect::<Vec<_>>();
                                     let ones = source.convert_element_type(DataType::I64)?.one_like()?;
-                                    ones.reduce(&other_axes, ReductionKind::Sum)
+                                    ones.reduce(&other_axes, ReductionKind::Sum)?
                                         .one_like()?
-                                        .reduce(&[0], ReductionKind::Sum)
+                                        .reduce(&[0], ReductionKind::Sum)?
                                 }
                             };
                             let extent = extent
@@ -4433,7 +4433,7 @@ fn batch_by_item_expansion<
             let replicated = sharding
                 .with_dimensions(dimensions)
                 .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
-            let value = aligned.value().reshard(&replicated);
+            let value = aligned.value().reshard(&replicated)?;
             ArrayBatch::new(value, BatchAxis::new(0))
         })
         .collect::<Result<Vec<_>, BatchingError>>()?;
@@ -4477,7 +4477,7 @@ fn batch_by_item_expansion<
             let sharding = sharding
                 .with_dimensions(dimensions)
                 .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
-            accumulator.reshard(&sharding)
+            accumulator.reshard(&sharding)?
         }
         _ => accumulator,
     };
@@ -6901,7 +6901,7 @@ mod tests {
                 )
                 .unwrap();
                 let weights = context.lift(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap()).unwrap();
-                (stacked * weights).reduce(&[0, 1], ReductionKind::Sum)
+                (stacked * weights).reduce(&[0, 1], ReductionKind::Sum).unwrap()
             })
             .unwrap();
 
@@ -6931,7 +6931,7 @@ mod tests {
             |x| {
                 let start = index_constant(&x, 1);
                 let window = x.dynamic_slice(&[start], &[2])?;
-                Ok((window.clone() * window).reduce(&[0], ReductionKind::Sum))
+                (window.clone() * window).reduce(&[0], ReductionKind::Sum)
             },
             at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
             step = 1e-3,
@@ -6941,7 +6941,7 @@ mod tests {
             |x| {
                 let start = index_constant(&x, 9);
                 let window = x.dynamic_slice(&[start], &[2])?;
-                Ok((window.clone() * window).reduce(&[0], ReductionKind::Sum))
+                (window.clone() * window).reduce(&[0], ReductionKind::Sum)
             },
             at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
             step = 1e-3,
@@ -6963,7 +6963,7 @@ mod tests {
                 |x| {
                     let start = index_constant(&x, start);
                     let window = x.dynamic_slice(&[start], &[2])?;
-                    Ok((window.clone() * window).reduce(&[0], ReductionKind::Sum))
+                    (window.clone() * window).reduce(&[0], ReductionKind::Sum)
                 },
                 at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
                 step = 1e-3,
@@ -9083,7 +9083,7 @@ mod tests {
         ))
         .value_and_gradient(|(x, update)| {
             let start = index_constant(&x, 1);
-            x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
+            x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum).unwrap()
         })
         .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 20.0, epsilon = 1e-9);
@@ -9097,7 +9097,7 @@ mod tests {
             |input, update| {
                 let start = index_constant(&input, 1);
                 let updated = input.dynamic_update_slice(&update, &[start])?;
-                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum))
+                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum)?)
             },
             at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
             with = Array::vector(vec![7.0, 8.0]).unwrap(),
@@ -9108,7 +9108,7 @@ mod tests {
             |update, input| {
                 let start = index_constant(&input, 1);
                 let updated = input.dynamic_update_slice(&update, &[start])?;
-                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum))
+                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum)?)
             },
             at = Array::vector(vec![7.0, 8.0]).unwrap(),
             with = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
@@ -9119,7 +9119,7 @@ mod tests {
             |input, update| {
                 let start = index_constant(&input, 9);
                 let updated = input.dynamic_update_slice(&update, &[start])?;
-                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum))
+                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum)?)
             },
             at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
             with = Array::vector(vec![7.0, 8.0]).unwrap(),
@@ -9135,7 +9135,7 @@ mod tests {
         ))
         .value_and_gradient(|(x, update)| {
             let start = index_constant(&x, -1);
-            x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
+            x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum).unwrap()
         })
         .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 18.0, epsilon = 1e-9);
@@ -9145,7 +9145,7 @@ mod tests {
             |input, update| {
                 let start = index_constant(&input, -1);
                 let updated = input.dynamic_update_slice(&update, &[start])?;
-                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum))
+                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum)?)
             },
             at = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
             with = Array::vector(vec![7.0, 8.0]).unwrap(),
@@ -9156,7 +9156,7 @@ mod tests {
             |update, input| {
                 let start = index_constant(&input, 9);
                 let updated = input.dynamic_update_slice(&update, &[start])?;
-                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum))
+                Ok((updated.clone() * updated).reduce(&[0], ReductionKind::Sum)?)
             },
             at = Array::vector(vec![7.0, 8.0]).unwrap(),
             with = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
@@ -9180,6 +9180,7 @@ mod tests {
             )
             .unwrap()
             .reduce(&[0, 1], ReductionKind::Sum)
+            .unwrap()
         })
         .unwrap();
         assert_eq!(input_gradient, Array::vector(vec![2.0_f32, 1.0, 0.0, 1.0]).unwrap());

@@ -2801,7 +2801,7 @@ mod tests {
                     BatchAxis::new(0),
                     None,
                 )?;
-                Ok(mapped.reduce(&[0], ReductionKind::Sum))
+                Ok(mapped.reduce(&[0], ReductionKind::Sum)?)
             })
             .unwrap();
         assert_eq!(value.to_f64s(), vec![23.0]);

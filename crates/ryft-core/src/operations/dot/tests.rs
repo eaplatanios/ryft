@@ -497,7 +497,9 @@ fn test_dot_accumulation_type() {
         &[1.0, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
     )
     .unwrap();
-    let product = lhs_values.dot_with_accumulation_type(&rhs_values, &DotDimensionNumbers::matmul(), DataType::F32);
+    let product = lhs_values
+        .dot_with_accumulation_type(&rhs_values, &DotDimensionNumbers::matmul(), DataType::F32)
+        .unwrap();
     assert_eq!(
         product.r#type().as_ref(),
         &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
@@ -738,7 +740,7 @@ fn test_dot_batching_lifts_dimension_numbers() {
     let x = Array::matrix(3, 4, x_data).unwrap();
 
     let output: Array = batch(
-        |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())),
+        |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())?),
         x,
         BatchAxis::new(0),
         BatchAxis::new(0),
@@ -1017,7 +1019,7 @@ fn test_dot_differentiation() {
 
     // Reverse mode batches the pullback's adjoint dots over output-coordinate cotangents.
     let jacobian = differentiate_at(inputs.clone())
-        .jacobian_reverse(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())))
+        .jacobian_reverse(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())?))
         .unwrap();
     let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
     let [left, right] = blocks.as_slice() else { unreachable!() };
@@ -1026,7 +1028,7 @@ fn test_dot_differentiation() {
 
     // Forward mode batches input-coordinate basis tangents through the dot pushforward.
     let jacobian = differentiate_at(inputs)
-        .jacobian_forward(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())))
+        .jacobian_forward(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())?))
         .unwrap();
     let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
     let [left, right] = blocks.as_slice() else { unreachable!() };
@@ -1072,7 +1074,7 @@ fn test_dot_transposition_prunes_unrequested_pullback_gradient() {
     let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let right = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
     let (_, pullback) = differentiate_at((left, right))
-        .vjp(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::matmul())))
+        .vjp(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::matmul())?))
         .unwrap();
     let both = pullback.transposed_program(&[CotangentDestinationKind::Return; 2]).unwrap();
     let selected = pullback

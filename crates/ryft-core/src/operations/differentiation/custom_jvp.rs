@@ -1122,7 +1122,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
+                mapped.reduce(&[0], ReductionKind::Sum).unwrap()
             })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
@@ -1987,7 +1987,7 @@ mod tests {
         let function = custom_jvp(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.sin()?),
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>, dx| {
-                Ok((x.sin()?, dx.dot(&dx, &DotDimensionNumbers::inner_product())))
+                Ok((x.sin()?, dx.dot(&dx, &DotDimensionNumbers::inner_product())?))
             },
         );
         let error =

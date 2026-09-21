@@ -201,7 +201,7 @@ impl_differentiable_operation! {
                     let weights = (primal_input.clone() - broadcast_primal).exp()?;
                     let weights = weights.align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
                     let weighted = weights * input_tangent.clone();
-                    MaybeZero::Value(weighted.reduce(operation.axes.as_slice(), ReductionKind::Sum))
+                    MaybeZero::Value(weighted.reduce(operation.axes.as_slice(), ReductionKind::Sum)?)
                 }
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])

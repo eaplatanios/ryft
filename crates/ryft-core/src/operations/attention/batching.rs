@@ -219,7 +219,7 @@ where
                         .collect::<Vec<_>>();
                     let target = inputs[*input_index].match_axis(0, axis_size, axis_sharding.clone())?;
                     normalized
-                        .reduce(reduction_axes.as_slice(), ReductionKind::Sum)
+                        .reduce(reduction_axes.as_slice(), ReductionKind::Sum)?
                         .reshape(target.r#type().shape().clone())?
                 }
             };

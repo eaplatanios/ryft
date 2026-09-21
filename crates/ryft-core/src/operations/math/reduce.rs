@@ -221,9 +221,9 @@ impl<C: Domain<Type = ArrayType, Value: Reduce>> InterpretableOperation<C> for R
         // values (e.g., during program batching) preserves it; concrete values ignore it.
         Ok(vec![match &self.output_sharding {
             Some(output_sharding) => {
-                inputs[0].clone().reduce_with_output_sharding(self.axes.as_slice(), self.kind, output_sharding)
+                inputs[0].clone().reduce_with_output_sharding(self.axes.as_slice(), self.kind, output_sharding)?
             }
-            None => inputs[0].clone().reduce(self.axes.as_slice(), self.kind),
+            None => inputs[0].clone().reduce(self.axes.as_slice(), self.kind)?,
         }])
     }
 }
@@ -313,10 +313,10 @@ impl_differentiable_operation! {
                         }
                         None => value.reduce(operation.axes(), operation.kind()),
                     };
-                    let primal = reduce(inputs[0].primal());
+                    let primal = reduce(inputs[0].primal())?;
                     let tangent = match inputs[0].tangent() {
                         MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-                        MaybeZero::Value(tangent) => MaybeZero::Value(reduce(tangent)),
+                        MaybeZero::Value(tangent) => MaybeZero::Value(reduce(tangent)?),
                     };
                     Ok(vec![DifferentiationDual::new(primal, tangent)?])
                 }
@@ -326,7 +326,7 @@ impl_differentiable_operation! {
                     // type, normalize it by the number of ties, and route the operand tangent through that normalized
                     // mask.
                     let primal_input = inputs[0].primal();
-                    let primal = primal_input.reduce(operation.axes(), kind);
+                    let primal = primal_input.reduce(operation.axes(), kind)?;
                     let input_type = primal_input.r#type().into_owned();
                     let output_axes = output_to_input_axis_map(input_type.rank(), operation.axes());
                     let broadcast_primal = primal.broadcast(input_type, output_axes.as_slice())?;
@@ -337,9 +337,9 @@ impl_differentiable_operation! {
                             let numeric_mask = context
                                 .primal_to_tangent(mask.clone())?
                                 .align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
-                            let tie_count = numeric_mask.clone().reduce(operation.axes(), ReductionKind::Sum);
+                            let tie_count = numeric_mask.clone().reduce(operation.axes(), ReductionKind::Sum)?;
                             let masked_tangent = numeric_mask * input_tangent.clone();
-                            MaybeZero::Value(masked_tangent.reduce(operation.axes(), ReductionKind::Sum) / tie_count)
+                            MaybeZero::Value(masked_tangent.reduce(operation.axes(), ReductionKind::Sum)? / tie_count)
                         }
                     };
                     Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -713,15 +713,21 @@ where
 /// receiver along `axes` using the operator/identity pair described by `kind`, returning a value whose rank is
 /// `self.rank() - axes.len()`.
 pub trait Reduce: Sized {
-    /// Reduces `self` along `axes` using the operator selected by `kind`.
-    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self;
+    /// Reduces `self` along `axes` using the operator selected by `kind`, and returns a [`ProgramError`] if `axes` or
+    /// `kind` are incompatible with `self` or the reduction cannot be recorded in the value's context.
+    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError>;
 
     /// Reduces `self` along `axes` using `kind`, requesting `output_sharding` for the result (refer to the
     /// documentation of [`ReduceOperation::with_output_sharding`]). The default implementation ignores the requested
     /// sharding and delegates to [`Self::reduce`], which is correct for concrete (single-device) values, for which a
     /// sharding only describes distribution metadata; staging implementations override this to attach the requested
     /// sharding to the staged operation.
-    fn reduce_with_output_sharding(&self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
+    fn reduce_with_output_sharding(
+        &self,
+        axes: &[usize],
+        kind: ReductionKind,
+        output_sharding: &Sharding,
+    ) -> Result<Self, ProgramError> {
         let _ = output_sharding;
         self.reduce(axes, kind)
     }
@@ -736,41 +742,47 @@ where
     <V::DispatchDomain as Domain>::Operation: From<ReduceOperation>,
 {
     #[inline]
-    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self {
+    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError> {
         if axes.is_empty() {
-            return self.clone();
+            return Ok(self.clone());
         }
-        self.dispatch_domain()
-            .bind(ReduceOperation::new(axes.to_vec(), kind), Vec::new(), std::slice::from_ref(self))
-            .expect("`reduce` operation failed")
-            .remove(0)
+        let mut outputs = self.dispatch_domain().bind(
+            ReduceOperation::new(axes.to_vec(), kind),
+            Vec::new(),
+            std::slice::from_ref(self),
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 
     #[inline]
-    fn reduce_with_output_sharding(&self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
-        self.dispatch_domain()
-            .bind(
-                ReduceOperation::new(axes.to_vec(), kind).with_output_sharding(output_sharding.clone()),
-                Vec::new(),
-                std::slice::from_ref(self),
-            )
-            .expect("`reduce` operation failed")
-            .remove(0)
+    fn reduce_with_output_sharding(
+        &self,
+        axes: &[usize],
+        kind: ReductionKind,
+        output_sharding: &Sharding,
+    ) -> Result<Self, ProgramError> {
+        let mut outputs = self.dispatch_domain().bind(
+            ReduceOperation::new(axes.to_vec(), kind).with_output_sharding(output_sharding.clone()),
+            Vec::new(),
+            std::slice::from_ref(self),
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
 impl Reduce for Array {
-    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self {
+    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError> {
         if axes.is_empty() {
-            return self.clone();
+            return Ok(self.clone());
         }
         let data_type = self.r#type().data_type();
         // Reuse the abstract rule for validation and for the complete result metadata. The concrete kernel below then
         // decodes directly from the input's physical layout into the result's addressed storage.
-        let output_type =
-            reduce_abstract(self.r#type().as_ref(), axes, kind, "reduce").unwrap_or_else(|error| panic!("{error}"));
+        let output_type = reduce_abstract(self.r#type().as_ref(), axes, kind, "reduce")?;
         if data_type == DataType::Zero {
-            return Self::new(output_type, Vec::new()).unwrap();
+            return Self::new(output_type, Vec::new());
         }
         let output = match kind {
             ReductionKind::Sum | ReductionKind::Mean => {
@@ -803,7 +815,7 @@ impl Reduce for Array {
             }
             ReductionKind::All => self.reduce_elements::<bool>(output_type, axes, true, |left, right| Ok(left & right)),
         };
-        output.unwrap_or_else(|error| panic!("{error}"))
+        output
     }
 }
 
@@ -1488,33 +1500,33 @@ mod tests {
     #[test]
     fn test_array_reduce() {
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        assert_eq!(matrix.reduce(&[1], ReductionKind::Sum), Array::vector(vec![6.0, 15.0]).unwrap());
-        assert_eq!(matrix.reduce(&[1], ReductionKind::Mean), Array::vector(vec![2.0, 5.0]).unwrap());
+        assert_eq!(matrix.reduce(&[1], ReductionKind::Sum).unwrap(), Array::vector(vec![6.0, 15.0]).unwrap());
+        assert_eq!(matrix.reduce(&[1], ReductionKind::Mean).unwrap(), Array::vector(vec![2.0, 5.0]).unwrap());
         assert_eq!(
-            matrix.reduce(&[0, 1], ReductionKind::Sum),
+            matrix.reduce(&[0, 1], ReductionKind::Sum).unwrap(),
             Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, []), &[21.0]).unwrap()
         );
-        assert_eq!(matrix.reduce(&[], ReductionKind::Sum), matrix);
+        assert_eq!(matrix.reduce(&[], ReductionKind::Sum).unwrap(), matrix);
         // Max and min use the data type's reduction identities and ordinary ordering.
         let integers = Array::vector(vec![3i32, -1, 2]).unwrap();
-        assert_eq!(integers.reduce(&[0], ReductionKind::Max).elements::<i32>(), Ok(vec![3]));
-        assert_eq!(integers.reduce(&[0], ReductionKind::Min).elements::<i32>(), Ok(vec![-1]));
+        assert_eq!(integers.reduce(&[0], ReductionKind::Max).unwrap().elements::<i32>(), Ok(vec![3]));
+        assert_eq!(integers.reduce(&[0], ReductionKind::Min).unwrap().elements::<i32>(), Ok(vec![-1]));
         // Boolean reductions.
         let booleans = Array::vector(vec![true, false, true]).unwrap();
-        assert_eq!(booleans.reduce(&[0], ReductionKind::Any).elements::<bool>(), Ok(vec![true]));
-        assert_eq!(booleans.reduce(&[0], ReductionKind::All).elements::<bool>(), Ok(vec![false]));
-        assert_eq!(booleans.reduce(&[0], ReductionKind::Max).elements::<bool>(), Ok(vec![true]));
-        assert_eq!(booleans.reduce(&[0], ReductionKind::Min).elements::<bool>(), Ok(vec![false]));
+        assert_eq!(booleans.reduce(&[0], ReductionKind::Any).unwrap().elements::<bool>(), Ok(vec![true]));
+        assert_eq!(booleans.reduce(&[0], ReductionKind::All).unwrap().elements::<bool>(), Ok(vec![false]));
+        assert_eq!(booleans.reduce(&[0], ReductionKind::Max).unwrap().elements::<bool>(), Ok(vec![true]));
+        assert_eq!(booleans.reduce(&[0], ReductionKind::Min).unwrap().elements::<bool>(), Ok(vec![false]));
 
         // Numeric and Boolean reductions traverse arbitrary layouts and produce the abstract rule's dense result.
         let r#type =
             ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 2])));
         let matrix = Array::from_elements(r#type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
-        assert_eq!(matrix.reduce(&[1], ReductionKind::Sum).elements::<u16>(), Ok(vec![6, 15]));
+        assert_eq!(matrix.reduce(&[1], ReductionKind::Sum).unwrap().elements::<u16>(), Ok(vec![6, 15]));
         let r#type =
             ArrayType::new_static(DataType::Boolean, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
         let booleans = Array::from_elements(r#type, &[true, false, true]).unwrap();
-        assert_eq!(booleans.reduce(&[0], ReductionKind::Any).elements::<bool>(), Ok(vec![true]));
+        assert_eq!(booleans.reduce(&[0], ReductionKind::Any).unwrap().elements::<bool>(), Ok(vec![true]));
 
         // Sub-byte accumulation wraps in the declared width, and low-precision accumulation re-encodes each step.
         let narrow = Array::matrix(
@@ -1524,35 +1536,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            narrow.reduce(&[1], ReductionKind::Sum).elements::<i4>(),
+            narrow.reduce(&[1], ReductionKind::Sum).unwrap().elements::<i4>(),
             Ok(vec![i4::new(-7).unwrap(), i4::new(5).unwrap()]),
         );
         let low_precision =
             Array::vector(vec![f8e4m3fn::from_f64(1.0).unwrap(), f8e4m3fn::from_f64(0.5).unwrap()]).unwrap();
         assert_eq!(
-            low_precision.reduce(&[0], ReductionKind::Sum).elements::<f8e4m3fn>(),
+            low_precision.reduce(&[0], ReductionKind::Sum).unwrap().elements::<f8e4m3fn>(),
             Ok(vec![f8e4m3fn::from_f64(1.5).unwrap()]),
         );
 
         // Complex sums and means preserve both components, while empty sums materialize the numeric identity.
         let complex = Array::vector(vec![ComplexNumber::new(2.0f32, 4.0), ComplexNumber::new(4.0, 8.0)]).unwrap();
         assert_eq!(
-            complex.reduce(&[0], ReductionKind::Sum).elements::<ComplexNumber<f32>>(),
+            complex.reduce(&[0], ReductionKind::Sum).unwrap().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(6.0, 12.0)]),
         );
         assert_eq!(
-            complex.reduce(&[0], ReductionKind::Mean).elements::<ComplexNumber<f32>>(),
+            complex.reduce(&[0], ReductionKind::Mean).unwrap().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(3.0, 6.0)]),
         );
         let empty = Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [2, 0]), &[]).unwrap();
-        assert_eq!(empty.reduce(&[1], ReductionKind::Sum).elements::<i32>(), Ok(vec![0, 0]));
+        assert_eq!(empty.reduce(&[1], ReductionKind::Sum).unwrap().elements::<i32>(), Ok(vec![0, 0]));
 
         // Floating-point extrema propagate NaNs and order negative zero below positive zero.
         let nan = Array::vector(vec![1.0f32, f32::NAN]).unwrap();
-        assert!(nan.reduce(&[0], ReductionKind::Max).elements::<f32>().unwrap()[0].is_nan());
+        assert!(nan.reduce(&[0], ReductionKind::Max).unwrap().elements::<f32>().unwrap()[0].is_nan());
         let zeros = Array::vector(vec![-0.0f32, 0.0]).unwrap();
-        assert_eq!(zeros.reduce(&[0], ReductionKind::Max).elements::<f32>().unwrap()[0].to_bits(), 0.0f32.to_bits(),);
-        assert_eq!(zeros.reduce(&[0], ReductionKind::Min).elements::<f32>().unwrap()[0].to_bits(), (-0.0f32).to_bits(),);
+        assert_eq!(
+            zeros.reduce(&[0], ReductionKind::Max).unwrap().elements::<f32>().unwrap()[0].to_bits(),
+            0.0f32.to_bits(),
+        );
+        assert_eq!(
+            zeros.reduce(&[0], ReductionKind::Min).unwrap().elements::<f32>().unwrap()[0].to_bits(),
+            (-0.0f32).to_bits(),
+        );
 
         // Complex extrema compare `(real, imaginary)` lexicographically, including their JAX-compatible identities.
         let complex = Array::vector(vec![
@@ -1562,26 +1580,26 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            complex.reduce(&[0], ReductionKind::Max).elements::<ComplexNumber<f32>>(),
+            complex.reduce(&[0], ReductionKind::Max).unwrap().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(2.0, 4.0)]),
         );
         assert_eq!(
-            complex.reduce(&[0], ReductionKind::Min).elements::<ComplexNumber<f32>>(),
+            complex.reduce(&[0], ReductionKind::Min).unwrap().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(1.0, 5.0)]),
         );
         let empty =
             Array::from_elements::<ComplexNumber<f32>>(ArrayType::new_static(DataType::C64, [2, 0]), &[]).unwrap();
         assert_eq!(
-            empty.reduce(&[1], ReductionKind::Max).elements::<ComplexNumber<f32>>(),
+            empty.reduce(&[1], ReductionKind::Max).unwrap().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(f32::NEG_INFINITY, 0.0), ComplexNumber::new(f32::NEG_INFINITY, 0.0),]),
         );
         let empty = Array::from_elements::<f8e8m0fnu>(ArrayType::new_static(DataType::F8E8M0FNU, [2, 0]), &[]).unwrap();
         assert_eq!(
-            empty.reduce(&[1], ReductionKind::Max).elements::<f8e8m0fnu>(),
+            empty.reduce(&[1], ReductionKind::Max).unwrap().elements::<f8e8m0fnu>(),
             Ok(vec![f8e8m0fnu::MIN, f8e8m0fnu::MIN]),
         );
         assert_eq!(
-            empty.reduce(&[1], ReductionKind::Min).elements::<f8e8m0fnu>(),
+            empty.reduce(&[1], ReductionKind::Min).unwrap().elements::<f8e8m0fnu>(),
             Ok(vec![f8e8m0fnu::MAX, f8e8m0fnu::MAX]),
         );
     }
@@ -1651,13 +1669,13 @@ mod tests {
         for kind in [ReductionKind::Max, ReductionKind::Min] {
             let input = Array::vector(vec![1.0, 1.0]).unwrap();
             let (primal, tangent) = differentiate_at(input.clone())
-                .jvp(Array::vector(vec![1.0, 3.0]).unwrap(), |input| Ok(input.reduce(&[0], kind)))
+                .jvp(Array::vector(vec![1.0, 3.0]).unwrap(), |input| Ok(input.reduce(&[0], kind)?))
                 .unwrap();
             assert_eq!(primal.to_f64s(), vec![1.0]);
             assert_eq!(tangent.to_f64s(), vec![2.0]);
 
             let (primal, gradient) =
-                differentiate_at(input).value_and_gradient(|input| Ok(input.reduce(&[0], kind))).unwrap();
+                differentiate_at(input).value_and_gradient(|input| Ok(input.reduce(&[0], kind)?)).unwrap();
             assert_eq!(primal.to_f64s(), vec![1.0]);
             assert_abs_diff_eq!(gradient.to_f64s()[0], 0.5, epsilon = 1e-9);
             assert_abs_diff_eq!(gradient.to_f64s()[1], 0.5, epsilon = 1e-9);
@@ -2074,7 +2092,10 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let builder = context.builder().clone();
         let input_atom = builder.borrow_mut().add_input(input_type);
-        let output = context.tracer(input_atom, None).reduce_with_output_sharding(&[0], ReductionKind::Sum, &unreduced);
+        let output = context
+            .tracer(input_atom, None)
+            .reduce_with_output_sharding(&[0], ReductionKind::Sum, &unreduced)
+            .unwrap();
         let output_atom = output.atom_id().unwrap();
         drop(output);
         drop(context);

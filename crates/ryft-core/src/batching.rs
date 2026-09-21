@@ -2282,7 +2282,7 @@ mod tests {
                    output: Tracer<TracingContext<Array, ArrayOperation<Array>>>,
                    axis: Axis| {
             let _ = context;
-            Ok(output.reduce(&[axis.normalize(output.r#type().rank()).unwrap()], ReductionKind::Sum))
+            Ok(output.reduce(&[axis.normalize(output.r#type().rank()).unwrap()], ReductionKind::Sum)?)
         };
 
         // Parts that need no adjustment (no widening outputs and no required axes) are rewrapped without a replay.

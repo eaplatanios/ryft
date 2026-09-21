@@ -479,9 +479,9 @@ where
     let lhs = dequantize_block_scaled_ir(lhs, lhs_scale, dimensions.lhs_contracting_dimensions())?;
     let rhs = dequantize_block_scaled_ir(rhs, rhs_scale, dimensions.rhs_contracting_dimensions())?;
     Ok(if preferred_element_type == DataType::BF16 {
-        lhs.dot(&rhs, dimensions)
+        lhs.dot(&rhs, dimensions)?
     } else {
-        lhs.dot_with_accumulation_type(&rhs, dimensions, preferred_element_type)
+        lhs.dot_with_accumulation_type(&rhs, dimensions, preferred_element_type)?
     })
 }
 

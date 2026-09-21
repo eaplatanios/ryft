@@ -4052,6 +4052,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 },
                 at = Array::vector(vec![2.0, 5.0, 7.0]).unwrap(),
                 with = Array::vector(vec![0.0, 3.0]).unwrap(),
@@ -4071,6 +4072,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 },
                 at = Array::vector(vec![0.0, 3.0]).unwrap(),
                 with = Array::vector(vec![2.0, 5.0, 7.0]).unwrap(),
@@ -4130,6 +4132,7 @@ mod tests {
                     )
                     .unwrap()
                     .reduce(&[0], ReductionKind::Sum)
+                    .unwrap()
             })
             .unwrap();
             assert!(value.to_f64s()[0].is_nan());
@@ -4152,6 +4155,7 @@ mod tests {
                     )
                     .unwrap()
                     .reduce(&[0], ReductionKind::Sum)
+                    .unwrap()
             })
             .unwrap();
         assert_eq!(value.to_f64s(), vec![f64::INFINITY]);
@@ -4173,6 +4177,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 })
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
@@ -4193,6 +4198,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 })
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![7.0]);
@@ -4213,6 +4219,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 })
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![12.0]);
@@ -4235,6 +4242,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 })
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![15.0]);
@@ -4292,7 +4300,7 @@ mod tests {
                     )
                     .unwrap();
                 let scale = output.context().lift(Array::vector(vec![1e-300]).unwrap()).unwrap();
-                output.mul(&scale).unwrap().reduce(&[0], ReductionKind::Sum)
+                output.mul(&scale).unwrap().reduce(&[0], ReductionKind::Sum).unwrap()
             })
             .unwrap();
         assert_eq!(gradient.to_f64s(), vec![1e100]);
@@ -4397,6 +4405,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 })
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![2.0]);
@@ -4417,6 +4426,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 })
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![5.0]);
@@ -4436,6 +4446,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 })
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![0.0]);
@@ -4457,6 +4468,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 })
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![10.0]);
@@ -4478,6 +4490,7 @@ mod tests {
                         )
                         .unwrap()
                         .reduce(&[0], ReductionKind::Sum)
+                        .unwrap()
                 })
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![22.0]);

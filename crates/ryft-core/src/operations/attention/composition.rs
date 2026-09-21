@@ -382,7 +382,7 @@ where
     let scores = project_array::<V>(query.clone())?.dot(
         &project_array::<V>(expanded_key.clone())?,
         &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]),
-    );
+    )?;
     let scores = if data_type == logits_type { scores } else { scores.convert_element_type(logits_type)? };
     let mut scores = <V as ValueProjection<ArrayType>>::from_projected(scores);
     let scale = configuration.scale().unwrap_or(1.0 / (dimensions.head_dimension as f64).sqrt());
@@ -487,12 +487,12 @@ where
 
     let prepared = prepare_attention_ir(inputs, configuration, &dimensions)?;
     let logits = <V as ValueProjection<ArrayType>>::from_projected(prepared.logits.clone());
-    let maxima = prepared.logits.reduce(&[3], ReductionKind::Max);
+    let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
     let maxima_broadcast = broadcast_like::<V>(maxima.clone(), &logits, &[0, 1, 2])?;
     let shifted = prepared.logits.sub(&project_array::<V>(maxima_broadcast)?)?;
     let exponentials = shifted.exp()?;
     let exponentials_ir = <V as ValueProjection<ArrayType>>::from_projected(exponentials.clone());
-    let sums = exponentials.reduce(&[3], ReductionKind::Sum);
+    let sums = exponentials.reduce(&[3], ReductionKind::Sum)?;
     let sums_broadcast = broadcast_like::<V>(sums.clone(), &exponentials_ir, &[0, 1, 2])?;
     let weights = exponentials.div(&project_array::<V>(sums_broadcast)?)?;
     let weights = if prepared.data_type == prepared.softmax_type {
@@ -503,7 +503,7 @@ where
     let attended = weights.dot(
         &project_array::<V>(prepared.expanded_value)?,
         &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]),
-    );
+    )?;
     let mut output = attended.transpose([0, 2, 1, 3])?;
     if let Some(query_lengths) = &inputs.query_sequence_lengths {
         output = zero_query_rows_ir::<V>(output, query_lengths, 1)?;
@@ -517,7 +517,7 @@ where
             statistic.convert_element_type(prepared.data_type)?
         };
         let statistic = statistic.transpose([0, 2, 1])?;
-        Some(denormalize_attention_output_ir::<V>(statistic, query_rank)?.stop_gradient())
+        Some(denormalize_attention_output_ir::<V>(statistic, query_rank)?.stop_gradient()?)
     } else {
         None
     };
@@ -654,10 +654,10 @@ where
     let softmax_output = convert(project_array::<V>(output)?)?;
     let softmax_output_cotangent = convert(output_cotangent)?;
     let weight_cotangents = softmax_output_cotangent
-        .dot(&softmax_value, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]));
+        .dot(&softmax_value, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?;
     let delta = softmax_output_cotangent
         .mul(&softmax_output)?
-        .reduce(&[3], ReductionKind::Sum)
+        .reduce(&[3], ReductionKind::Sum)?
         .transpose([0, 2, 1])?;
     let weights_ir = <V as ValueProjection<ArrayType>>::from_projected(weights.clone());
     let delta = broadcast_like::<V>(delta, &weights_ir, &[0, 1, 2])?;
@@ -666,16 +666,16 @@ where
     let scale_value = fill_like(&logit_cotangents_ir, prepared.scale)?;
     let scaled_logit_cotangents = logit_cotangents.mul(&project_array::<V>(scale_value)?)?;
     let mut query_cotangent = scaled_logit_cotangents
-        .dot(&softmax_key, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))
+        .dot(&softmax_key, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?
         .transpose([0, 2, 1, 3])?;
     if let Some(query_lengths) = &inputs.query_sequence_lengths {
         query_cotangent = zero_query_rows_ir::<V>(query_cotangent, query_lengths, 1)?;
     }
     let key_cotangent = scaled_logit_cotangents
-        .dot(&softmax_query, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))
+        .dot(&softmax_query, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))?
         .transpose([0, 2, 1, 3])?;
     let value_cotangent = weights
-        .dot(&softmax_output_cotangent, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))
+        .dot(&softmax_output_cotangent, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))?
         .transpose([0, 2, 1, 3])?;
 
     let (key_cotangent, value_cotangent) = if dimensions.key_value_heads == dimensions.query_heads {
@@ -694,8 +694,8 @@ where
         let grouped_value =
             <V as ValueProjection<ArrayType>>::from_projected(value_cotangent).dynamic_reshape(&grouped_dimensions)?;
         (
-            project_array::<V>(grouped_key)?.reduce(&[3], ReductionKind::Sum),
-            project_array::<V>(grouped_value)?.reduce(&[3], ReductionKind::Sum),
+            project_array::<V>(grouped_key)?.reduce(&[3], ReductionKind::Sum)?,
+            project_array::<V>(grouped_value)?.reduce(&[3], ReductionKind::Sum)?,
         )
     };
     let cotangents = [query_cotangent, key_cotangent, value_cotangent]
@@ -732,7 +732,7 @@ where
         let bias_cotangent = if reduce_axes.is_empty() {
             logit_cotangents
         } else {
-            logit_cotangents.reduce(reduce_axes.as_slice(), ReductionKind::Sum)
+            logit_cotangents.reduce(reduce_axes.as_slice(), ReductionKind::Sum)?
         };
         let bias_dimensions = array_dimensions(bias)?;
         let bias_cotangent = <V as ValueProjection<ArrayType>>::from_projected(bias_cotangent)

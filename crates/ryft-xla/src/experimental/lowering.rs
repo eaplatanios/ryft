@@ -15985,7 +15985,7 @@ mod tests {
         let mesh = test_manual_mesh("x", 2);
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
             |x| {
-                let product = x.transpose(vec![1, 0]).unwrap().dot(&x, &DotDimensionNumbers::matmul());
+                let product = x.transpose(vec![1, 0]).unwrap().dot(&x, &DotDimensionNumbers::matmul()).unwrap();
                 let waveform = (-product).cos().unwrap().sin().unwrap();
                 (waveform.clone() * waveform.one_like().unwrap()) + waveform.zero_like().unwrap()
             },
@@ -22060,8 +22060,8 @@ mod tests {
             .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             |x| {
-                let x = x.print("x");
-                (x.clone() + x).print("doubled")
+                let x = x.print("x").unwrap();
+                (x.clone() + x).print("doubled").unwrap()
             },
             input_type.clone(),
             &engine,
