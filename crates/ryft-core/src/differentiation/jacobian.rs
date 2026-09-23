@@ -719,10 +719,7 @@ mod tests {
 
     /// Returns `2x` for positive `x` and `3x` otherwise, expressed generically so both dense Jacobian modes exercise
     /// comparison, selection, and arithmetic while constructing their coordinate-basis replays.
-    fn piecewise_select<V: Value<Type = ArrayType>>(x: V) -> V
-    where
-        V::DispatchDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
-    {
+    fn piecewise_select<V: Value<Type = ArrayType> + Add + Compare + Select + ZeroLike>(x: V) -> V {
         let condition = x.compare(&x.zero_like().unwrap(), ComparisonDirection::GreaterThan).unwrap();
         let doubled = x.add(&x).unwrap();
         let tripled = doubled.add(&x).unwrap();

@@ -674,8 +674,8 @@ mod tests {
         assert_eq!(Axis::from(-1).normalize(3), Ok(2));
         assert_eq!(Axis::from(-3).normalize(3), Ok(0));
         assert_eq!(Axis::from(usize::MAX).value(), i128::try_from(usize::MAX).unwrap());
-        assert_eq!(Axis::from(3).normalize(3), Err(AxisError::OutOfBounds { axis: Axis::from(3), rank: 3 }),);
-        assert_eq!(Axis::from(-4).normalize(3), Err(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 }),);
+        assert_eq!(Axis::from(3).normalize(3), Err(AxisError::OutOfBounds { axis: Axis::from(3), rank: 3 }));
+        assert_eq!(Axis::from(-4).normalize(3), Err(AxisError::OutOfBounds { axis: Axis::from(-4), rank: 3 }));
         assert_eq!(
             Axis::from(i128::MIN).normalize(usize::MAX),
             Err(AxisError::OutOfBounds { axis: Axis::from(i128::MIN), rank: usize::MAX }),
@@ -738,7 +738,7 @@ mod tests {
             operation.infer_output_types(&[], &[]),
             Ok(vec![
                 ArrayType::scalar(DataType::U64)
-                    .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap(),)
+                    .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap())
                     .unwrap()
             ]),
         );
@@ -764,16 +764,16 @@ mod tests {
         assert_eq!(
             output_type,
             ArrayType::scalar(DataType::U64)
-                .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["device"]).unwrap(),)
+                .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["device"]).unwrap())
                 .unwrap()
         );
         assert_eq!(
             program.to_string(),
-            indoc! {r#"
+            indoc! {"
                 lambda %0:f64[] .
                 let %1:u64[][sharding={mesh<['device'=4:manual]>, [], varying_manual={'device'}}] = \
-                    axis_index [axis_name="device", mesh=['device'=4:manual]]
-                in (%1)"#},
+                    axis_index [axis_name=\"device\", mesh=['device'=4:manual]]
+                in (%1)"},
         );
     }
 

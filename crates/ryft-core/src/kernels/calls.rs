@@ -1074,6 +1074,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Sort(_)
                 | ArrayOperation::RngBitGenerator(_)
                 | ArrayOperation::ParallelReduce(_)
+                | ArrayOperation::ParallelVary(_)
                 | ArrayOperation::AllGather(_)
                 | ArrayOperation::ParallelSumScatter(_)
                 | ArrayOperation::ParallelPermute(_)

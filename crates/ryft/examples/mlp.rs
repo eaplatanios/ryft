@@ -38,15 +38,15 @@ impl<P: Parameter> Linear<P> {
         Self { weights, bias }
     }
 
-    fn forward(&self, inputs: &P) -> P
+    fn forward(&self, inputs: &P) -> Result<P, ProgramError>
     where
         P: Clone + Add<Output = P> + Dot,
     {
-        let outputs = inputs.dot(&self.weights, &DotDimensionNumbers::matmul());
-        match &self.bias {
+        let outputs = inputs.dot(&self.weights, &DotDimensionNumbers::matmul())?;
+        Ok(match &self.bias {
             Some(bias) => outputs + bias.clone(),
             None => outputs,
-        }
+        })
     }
 }
 
@@ -66,8 +66,8 @@ impl<P: Parameter> Mlp<P> {
         })?;
         let hidden = hidden_layers
             .iter()
-            .try_fold(inputs.clone(), |activations, layer| layer.forward(&activations).tanh())?;
-        Ok(output_layer.forward(&hidden))
+            .try_fold(inputs.clone(), |activations, layer| layer.forward(&activations)?.tanh())?;
+        output_layer.forward(&hidden)
     }
 }
 
@@ -83,7 +83,7 @@ where
     A: Clone + Parameter + Add<Output = A> + Sub<Output = A> + Mul<Output = A> + Dot + Reduce + Tanh,
 {
     let residuals = model.forward(inputs)? - targets.clone();
-    Ok((residuals.clone() * residuals).reduce(&[0, 1], ReductionKind::Sum) * mean_scale.clone())
+    Ok((residuals.clone() * residuals).reduce(&[0, 1], ReductionKind::Sum)? * mean_scale.clone())
 }
 
 /// Applies one gradient-descent update to all trainable arrays.

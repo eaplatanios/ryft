@@ -2349,6 +2349,7 @@ mod tests {
     use ryft_macros::Parameterized;
 
     use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType};
+    use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
     use crate::operations::complex::{Complex, Real};
@@ -2852,6 +2853,12 @@ mod tests {
 
             fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
                 self.0.invoke_with_provenance_scope(scope, function)
+            }
+        }
+
+        impl NamedAxes for ExplicitContext {
+            fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+                self.0.named_axis(name)
             }
         }
 
