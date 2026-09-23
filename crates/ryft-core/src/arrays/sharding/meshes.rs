@@ -87,6 +87,13 @@ impl MeshAxis {
     }
 }
 
+impl Display for MeshAxis {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}={}:{}", render_mesh_axis_name(&self.name), self.size, self.r#type)
+    }
+}
+
 /// Key used to intern [`LogicalMesh`] instances.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct LogicalMeshKey {
@@ -182,6 +189,15 @@ impl LogicalMesh {
     #[inline]
     pub fn device_count(&self) -> usize {
         self.axes.iter().fold(1usize, |count, axis| count * axis.size)
+    }
+}
+
+impl Display for LogicalMesh {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Renders the bracketed axis list (e.g., `['x'=2:manual, 'y'=4:explicit]`) that operation renderings embed
+        // as a field and that sharding renderings wrap as `mesh<...>`.
+        write!(formatter, "[{}]", self.axes.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
     }
 }
 
@@ -335,6 +351,14 @@ impl DeviceMesh {
     }
 }
 
+/// Renders a [`MeshAxis`] name inside single quotes, escaping it with Rust's character escaping. [`MeshAxis::new`] only
+/// rejects empty names, so a name may contain quotes, backslashes, or control characters. Escaping all of them, rather
+/// than only the quotes, keeps every rendering that embeds axis names injective: a name ending in a backslash cannot
+/// turn its closing quote into an escaped one and thereby imitate the separator between two names.
+pub(crate) fn render_mesh_axis_name(name: &str) -> String {
+    format!("'{}'", name.chars().flat_map(char::escape_debug).collect::<String>())
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -357,6 +381,9 @@ mod tests {
         assert_eq!(axis.name, "y");
         assert_eq!(axis.size, 3);
         assert_eq!(axis.r#type, MeshAxisType::Manual);
+
+        assert_eq!(axis.to_string(), "'y'=3:manual");
+        assert_eq!(MeshAxis::new("a'b", 2, MeshAxisType::Explicit).unwrap().to_string(), "'a\\'b'=2:explicit");
 
         assert!(matches!(MeshAxis::new("", 4, MeshAxisType::Auto), Err(ShardingError::EmptyMeshAxisName)));
         assert!(matches!(
@@ -393,6 +420,19 @@ mod tests {
         assert_eq!(mesh.axis_type("z"), Some(MeshAxisType::Explicit));
         assert_eq!(mesh.axis_type("w"), None);
         assert_eq!(mesh.device_count(), 6);
+        assert_eq!(mesh.to_string(), "['x'=2:auto, 'y'=3:manual, 'z'=1:explicit]");
+        assert_eq!(LogicalMesh::new(Vec::new()).unwrap().to_string(), "[]");
+
+        // A quote, backslash, or control character inside a name cannot imitate the separator between two names.
+        let render = |names: &[&str]| {
+            LogicalMesh::new(names.iter().map(|name| MeshAxis::new(*name, 2, MeshAxisType::Manual).unwrap()).collect())
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(render(&["a", "b"]), render(&["a'=2:manual, 'b"]));
+        assert_ne!(render(&["a\\", "b"]), render(&["a\\'=2:manual, 'b"]));
+        assert_ne!(render(&["a\nb"]), render(&["a\\nb"]));
+        assert_eq!(render(&["a'b", "c\\d", "e\nf"]), r"['a\'b'=2:manual, 'c\\d'=2:manual, 'e\nf'=2:manual]");
 
         assert!(matches!(
             LogicalMesh::new(vec![

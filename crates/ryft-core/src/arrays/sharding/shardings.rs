@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use ryft_macros::Parameter;
 
 use crate::arrays::sharding::ShardingError;
-use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxisType};
+use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxisType, render_mesh_axis_name};
 use crate::parameters::Parameter;
 
 /// Describes how a single dimension of an array/tensor is distributed across [`LogicalMesh`] axes.
@@ -77,9 +77,9 @@ impl Display for ShardingDimension {
             Self::Sharded(axis_names) => {
                 write!(formatter, "{{")?;
                 if let Some((first_axis_name, remaining_axis_names)) = axis_names.split_first() {
-                    write!(formatter, "'{}'", first_axis_name.replace('\'', "\\'"))?;
+                    write!(formatter, "{}", render_mesh_axis_name(first_axis_name))?;
                     for axis_name in remaining_axis_names {
-                        write!(formatter, ", '{}'", axis_name.replace('\'', "\\'"))?;
+                        write!(formatter, ", {}", render_mesh_axis_name(axis_name))?;
                     }
                 }
                 write!(formatter, "}}")
@@ -709,27 +709,12 @@ impl Display for Sharding {
             write!(
                 formatter,
                 "{}",
-                names
-                    .into_iter()
-                    .map(|name| format!("'{}'", name.as_ref().replace('\'', "\\'")))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                names.into_iter().map(|name| render_mesh_axis_name(name.as_ref())).collect::<Vec<_>>().join(", ")
             )?;
             write!(formatter, "}}")
         }
 
-        write!(formatter, "{{mesh<[")?;
-        write!(
-            formatter,
-            "{}",
-            self.mesh
-                .axes()
-                .iter()
-                .map(|axis| format!("'{}'={}:{}", axis.name().replace('\'', "\\'"), axis.size(), axis.r#type()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )?;
-        write!(formatter, "]>")?;
+        write!(formatter, "{{mesh<{}>", self.mesh)?;
 
         write!(formatter, ", [")?;
         write!(formatter, "{}", self.dimensions.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))?;
@@ -773,7 +758,7 @@ mod tests {
         assert_eq!(ShardingDimension::unconstrained().to_string(), "{?}");
         assert_eq!(ShardingDimension::sharded(["x"]).to_string(), "{'x'}");
         assert_eq!(ShardingDimension::sharded(["x", "y"]).to_string(), "{'x', 'y'}");
-        assert_eq!(ShardingDimension::sharded([r"path\to", "x'y"]).to_string(), "{'path\\to', 'x\\'y'}");
+        assert_eq!(ShardingDimension::sharded([r"path\to", "x'y"]).to_string(), r"{'path\\to', 'x\'y'}");
         assert_eq!(ShardingDimension::sharded(["x", "data"]).manual_axes(&mesh), vec!["x".to_string()]);
         assert!(ShardingDimension::sharded(["data"]).manual_axes(&mesh).is_empty());
         assert!(ShardingDimension::replicated().manual_axes(&mesh).is_empty());

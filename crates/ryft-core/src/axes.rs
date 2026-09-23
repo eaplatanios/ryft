@@ -50,7 +50,8 @@ use thiserror::Error;
 use ryft_macros::Parameter;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension, Shape,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh,
+    MeshAxisType, Shape, Sharding,
 };
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, RecursiveBatchingPolicy,
@@ -255,11 +256,11 @@ impl_axis_conversions!(usize);
 
 /// A named axis resolved by a [`NamedAxes`] context specifying what an axis name is currently bound to, and by which
 /// kind of transform, at a given trace level. This carries only the *value-free* facts about a binding (i.e., its kind
-/// and any statically known size), not which dimension of any particular value carries the axis. That per-value mapping
-/// is partial (a replicated operand has no such dimension even though a collective over it is still meaningful) and is
-/// supplied at consumption time by the owning transform's rule dispatch (e.g., for batching, an [`ArrayBatch`]'s
+/// and any statically known size or owning mesh), not which dimension of any particular value carries the axis. That
+/// per-value mapping is partial (a replicated input has no such dimension even though a collective over it is still
+/// meaningful) and is supplied at consumption time by the owning transform's rule dispatch (e.g., an [`ArrayBatch`]'s
 /// [`batch_axis`](ArrayBatch::batch_axis)).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NamedAxis {
     /// Axis bound by an enclosing batching (i.e., vectorization) level.
     Batched {
@@ -270,6 +271,9 @@ pub enum NamedAxis {
 
     /// Axis bound to a device mesh axis by an enclosing manual sharding region.
     Mesh {
+        /// [`LogicalMesh`] that owns the binding, including the axis kinds used for value metadata.
+        mesh: LogicalMesh,
+
         /// Index of the mesh axis this name resolves to.
         axis: usize,
 
@@ -281,8 +285,8 @@ pub enum NamedAxis {
 /// Capability for resolving named axes visible at one context-stack level. Named axes are dynamically scoped binders
 /// introduced by transforms and manual sharding regions, then consumed by named-axis operations such as collectives.
 /// Resolution is innermost-first, so a nearer binder shadows a farther one. The returned [`NamedAxis`] carries only
-/// value-free kind and size facts; the owning operation rule remains responsible for how a use consumes that logical
-/// axis and which physical dimension of each value carries it.
+/// value-free kind, size, and mesh facts; the owning operation rule remains responsible for how a use consumes that
+/// logical axis and which physical dimension of each value carries it.
 ///
 /// # Dynamic-Scope Lookup
 ///
@@ -341,7 +345,7 @@ impl<V: Value, O: Operation<Type = V::Type>, C> NamedAxes for TracingContext<V, 
         // A `TracingContext` is a leaf of the resolution stack and it resolves only the named axes it was seeded with
         // (e.g., a `shard_map` body's device mesh axes) and reports every other name unbound. Ordinary traces are
         // seeded with no axes. Named-axis binders such as `BatchingContext` wrap a base trace and resolve against it.
-        self.named_axes().iter().find(|(axis_name, _)| axis_name == name).map(|(_, axis)| *axis)
+        self.named_axes().iter().find(|(axis_name, _)| axis_name == name).map(|(_, axis)| axis.clone())
     }
 }
 
@@ -355,7 +359,7 @@ impl<C: NamedAxes> NamedAxes for NestedTracingContext<C> {
         self.named_axes()
             .iter()
             .find(|(axis_name, _)| axis_name == name)
-            .map(|(_, axis)| *axis)
+            .map(|(_, axis)| axis.clone())
             .or_else(|| self.parent().named_axis(name))
     }
 }
@@ -434,10 +438,12 @@ impl<C: Context<Operation: From<AxisIndexOperation>> + NamedAxes> AxisIndex for 
         // interpretation) is not supported. The operation is interpreted before any batching rule can consume it
         // and reports `ProgramError::UnsupportedOperation`. Mesh axes are unaffected, as they are meant to survive
         // interpretation.
-        if self.named_axis(name).is_none() {
-            return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: name.to_string() }).into());
-        }
-        let mut outputs = self.bind(AxisIndexOperation::new(name.to_string()), Vec::new(), &[])?;
+        let operation = match self.named_axis(name) {
+            Some(NamedAxis::Mesh { mesh, .. }) => AxisIndexOperation::new(name.to_string()).with_mesh(mesh),
+            Some(NamedAxis::Batched { .. }) => AxisIndexOperation::new(name.to_string()),
+            None => return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: name.to_string() }).into()),
+        };
+        let mut outputs = self.bind(operation, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -480,19 +486,37 @@ pub const AXIS_INDEX_OPERATION_NAME: &str = "axis_index";
 pub struct AxisIndexOperation {
     /// Name of the device mesh axis whose per-shard index this [`AxisIndexOperation`] produces.
     axis_name: String,
+
+    /// [`LogicalMesh`] for a checked device coordinate, or `None` when manual variation is not tracked.
+    mesh: Option<LogicalMesh>,
 }
 
 impl AxisIndexOperation {
-    /// Creates a new [`AxisIndexOperation`] referencing the mesh axis `axis_name`.
+    /// Creates a new [`AxisIndexOperation`] without tracked mesh variation. Use [`Self::with_mesh`] when constructing
+    /// a checked device coordinate directly; [`AxisIndex::axis_index`] supplies that metadata automatically.
     #[inline]
     pub fn new(axis_name: String) -> Self {
-        Self { axis_name }
+        Self { axis_name, mesh: None }
+    }
+
+    /// Returns a copy of this [`AxisIndexOperation`] with the provided logical mesh. Its output varies over
+    /// [`Self::axis_name`] on that mesh, which must name a manual axis. Validation occurs during type inference.
+    #[inline]
+    pub fn with_mesh(mut self, mesh: LogicalMesh) -> Self {
+        self.mesh = Some(mesh);
+        self
     }
 
     /// Returns the mesh axis name referenced by this [`AxisIndexOperation`].
     #[inline]
     pub fn axis_name(&self) -> &str {
         &self.axis_name
+    }
+
+    /// Returns the logical mesh for a checked device coordinate, or `None` when manual variation is not tracked.
+    #[inline]
+    pub fn mesh(&self) -> Option<&LogicalMesh> {
+        self.mesh.as_ref()
     }
 }
 
@@ -511,20 +535,39 @@ impl Operation for AxisIndexOperation {
         AXIS_INDEX_OPERATION_NAME
     }
 
-    #[inline]
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
-        Ok(vec![ArrayType::scalar(DataType::U64)])
+        let mut output = ArrayType::scalar(DataType::U64);
+        if let Some(mesh) = &self.mesh {
+            if mesh.axis_type(&self.axis_name) != Some(MeshAxisType::Manual) {
+                return Err(TypeError::invalid(format!(
+                    "`{}` mesh axis `{}` must be manual",
+                    AXIS_INDEX_OPERATION_NAME, self.axis_name,
+                )));
+            }
+            output = output
+                .with_sharding(
+                    Sharding::replicated(mesh.clone(), 0)
+                        .with_varying_manual_axes([self.axis_name.clone()])
+                        .map_err(|error| TypeError::invalid(error.to_string()))?,
+                )
+                .map_err(|error| TypeError::invalid(error.to_string()))?;
+        }
+        Ok(vec![output])
     }
 
-    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, AXIS_INDEX_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("axis_name", format_args!("{:?}", self.axis_name)))
+        OperationFormatter::new(formatter, indentation, AXIS_INDEX_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
+            if let Some(mesh) = &self.mesh {
+                operation.field("mesh", mesh)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -579,7 +622,7 @@ impl<
         _driver: &D,
         _inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
-        if context.axis_name() == Some(self.axis_name.as_str()) {
+        if self.mesh.is_none() && context.axis_name() == Some(self.axis_name.as_str()) {
             // This level binds the axis. The per-item index is the length-`size` `iota(0)`, bound into the parent and
             // mapped on this level's batch axis (position 0). The mapped packed `[size]` dimension is then stripped
             // back to the per-item scalar `u64`.
@@ -592,7 +635,7 @@ impl<
         } else {
             // The axis is bound by an outer `batch` level or a device mesh. Re-bind into the parent, which repeats the
             // resolution and present the forwarded index as replicated across this level.
-            let operation = AxisIndexOperation::new(self.axis_name.clone());
+            let operation = self.clone();
             let mut index = context.parent().bind(operation, Vec::new(), &[])?;
             check_count!("output", index, 1, ProgramError);
             Ok(vec![ArrayBatch::replicated(index.remove(0))].into())
@@ -607,7 +650,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, Shape};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, MeshAxis, MeshAxisType, Shape};
     use crate::batching::{Batch, BatchAxis, BatchAxisSpecification, BatchingError, batch};
     use crate::contexts::EagerContext;
     use crate::programs::Typed;
@@ -653,38 +696,83 @@ mod tests {
 
     #[test]
     fn test_named_axis_equality_and_hashing() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
         assert_eq!(NamedAxis::Batched { size: Some(3) }, NamedAxis::Batched { size: Some(3) });
         assert_ne!(NamedAxis::Batched { size: Some(3) }, NamedAxis::Batched { size: Some(4) });
         assert_ne!(NamedAxis::Batched { size: Some(3) }, NamedAxis::Batched { size: None });
-        assert_eq!(NamedAxis::Mesh { axis: 1, size: 2 }, NamedAxis::Mesh { axis: 1, size: 2 });
-        assert_ne!(NamedAxis::Mesh { axis: 0, size: 2 }, NamedAxis::Mesh { axis: 1, size: 2 });
+        assert_eq!(
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2 },
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2 }
+        );
+        assert_ne!(
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 },
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2 }
+        );
 
         // A batched axis never equals a mesh axis, even when their sizes match.
-        assert_ne!(NamedAxis::Batched { size: Some(2) }, NamedAxis::Mesh { axis: 0, size: 2 });
+        assert_ne!(NamedAxis::Batched { size: Some(2) }, NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 });
 
-        let axes = HashSet::from([NamedAxis::Batched { size: Some(3) }, NamedAxis::Mesh { axis: 1, size: 2 }]);
+        let axes = HashSet::from([
+            NamedAxis::Batched { size: Some(3) },
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2 },
+        ]);
         assert!(axes.contains(&NamedAxis::Batched { size: Some(3) }));
-        assert!(axes.contains(&NamedAxis::Mesh { axis: 1, size: 2 }));
+        assert!(axes.contains(&NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2 }));
         assert!(!axes.contains(&NamedAxis::Batched { size: Some(2) }));
+    }
+
+    #[test]
+    fn test_axis_index_operation() {
+        let operation = AxisIndexOperation::new("devices".to_string());
+        assert_eq!(operation.axis_name(), "devices");
+        assert_eq!(operation.mesh(), None);
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::U64)]));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let operation = operation.with_mesh(mesh.clone());
+        assert_eq!(operation.mesh(), Some(&mesh));
+        assert_eq!(
+            operation.infer_output_types(&[], &[]),
+            Ok(vec![
+                ArrayType::scalar(DataType::U64)
+                    .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap(),)
+                    .unwrap()
+            ]),
+        );
+        let explicit = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        assert_eq!(
+            operation.with_mesh(explicit).infer_output_types(&[], &[]),
+            Err(TypeError::invalid("`axis_index` mesh axis `devices` must be manual")),
+        );
     }
 
     #[test]
     fn test_axis_index_stages_a_nullary_operation_for_a_bound_axis() {
         // Validate `name` against the seeded `NamedAxes` environment and stage a nullary `AxisIndexOperation`
         // producing a scalar `u64`, regardless of whether the axis is batch- or mesh-bound.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let (output_type, program) =
             DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
                 |input| input.context().axis_index("device"),
                 ArrayType::scalar(DataType::F64),
-                vec![("device".to_string(), NamedAxis::Mesh { axis: 0, size: 4 })],
+                vec![("device".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 4 })],
             )
             .unwrap();
-        assert_eq!(output_type, ArrayType::scalar(DataType::U64));
+        assert_eq!(
+            output_type,
+            ArrayType::scalar(DataType::U64)
+                .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["device"]).unwrap(),)
+                .unwrap()
+        );
         assert_eq!(
             program.to_string(),
             indoc! {r#"
                 lambda %0:f64[] .
-                let %1:u64[] = axis_index [axis_name="device"]
+                let %1:u64[][sharding={mesh<['device'=4:manual]>, [], varying_manual={'device'}}] = \
+                    axis_index [axis_name="device", mesh=['device'=4:manual]]
                 in (%1)"#},
         );
     }
@@ -693,10 +781,11 @@ mod tests {
     fn test_axis_index_rejects_an_unbound_axis() {
         // A name that no enclosing binder binds fails fast at the reader, before any operation is staged, surfacing
         // `AxisError::UnboundAxisName` through the `BatchingError::Axis` channel riding `ProgramError`.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let error = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
             |input| input.context().axis_index("missing"),
             ArrayType::scalar(DataType::F64),
-            vec![("device".to_string(), NamedAxis::Mesh { axis: 0, size: 4 })],
+            vec![("device".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 4 })],
         )
         .unwrap_err();
         assert!(matches!(

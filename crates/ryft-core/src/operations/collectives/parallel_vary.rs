@@ -108,11 +108,6 @@ impl Operation for ParallelVaryOperation {
     }
 
     #[inline]
-    fn transitions_manual_variation(&self) -> bool {
-        true
-    }
-
-    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("axis_name", format_args!("{:?}", self.axis_name)))
@@ -288,7 +283,9 @@ impl<A: Value<Type = ArrayType>> From<ParallelVaryOperation> for ArrayIrOperatio
 /// gathering, dots, sorts, etc.) insert it on whichever inputs lack the variation of their peers, and the XLA
 /// `shard_map` operation inserts it on an invariant output that is returned along a tiled axis. Users must call it when
 /// an operation family or a hand-built program does not. [`parallel_reduce`](crate::ParallelReduce::parallel_reduce)
-/// calls it on an invariant input so that every copy is counted by the reduction.
+/// calls it on an invariant input so that every copy is counted by the reduction. Type inference rejects the mismatch
+/// that a missing call leaves behind as every operation with several array inputs enforces matching variation through
+/// [`ArrayType::check_matching_manual_variation`], and a downstream operation should do the same.
 ///
 /// The axis must be bound by an enclosing manual region (i.e., a [`NamedAxis::Mesh`] binding). Named batch axes and
 /// participant subgroups do not establish the full-axis invariance that the transition weakens, so a `batch` level that
@@ -456,7 +453,6 @@ mod tests {
         let operation = ParallelVaryOperation::new("m".to_string());
         assert_eq!(operation.axis_name(), "m");
         assert_eq!(operation.name(), PARALLEL_VARY_OPERATION_NAME);
-        assert!(operation.transitions_manual_variation());
         assert_eq!(operation.to_string(), "parallel_vary [axis_name=\"m\"]");
     }
 
