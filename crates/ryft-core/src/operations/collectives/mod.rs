@@ -53,6 +53,7 @@ pub mod all_to_all;
 pub mod parallel_permute;
 pub mod parallel_reduce;
 pub mod parallel_sum_scatter;
+pub mod parallel_vary;
 pub mod ragged_all_to_all;
 
 pub use all_gather::{ALL_GATHER_OPERATION_NAME, AllGather, AllGatherOperation, AllGatherOutputVariance};
@@ -62,6 +63,7 @@ pub use parallel_permute::{
 };
 pub use parallel_reduce::{ParallelReduce, ParallelReduceOperation, ParallelReductionKind};
 pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation};
+pub use parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
 pub use ragged_all_to_all::{RAGGED_ALL_TO_ALL_OPERATION_NAME, RaggedAllToAll, RaggedAllToAllOperation};
 
 /// Shape semantics used by collectives that can either materialize a named axis or tile an existing array axis.
@@ -722,6 +724,11 @@ macro_rules! shape_changing_collective {
             #[inline]
             fn name(&self) -> &'static str {
                 $operation_name
+            }
+
+            #[inline]
+            fn transitions_manual_variation(&self) -> bool {
+                true
             }
 
             fn infer_output_types(
