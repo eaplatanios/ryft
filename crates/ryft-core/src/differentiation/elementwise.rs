@@ -128,15 +128,21 @@ impl<
             value.add(&exemplar.zero_like()?)?
         } else {
             let output_axes = (0..rank).map(|axis| axis + offset).collect::<Vec<_>>();
-            value.broadcast(target.clone(), output_axes.as_slice())?
+            let sharding = value
+                .r#type()
+                .sharding()
+                .map(|sharding| sharding.with_broadcasted_dimensions(target.rank(), &output_axes))
+                .transpose()
+                .map_err(|error| TypeError::invalid(error.to_string()))?;
+            let output_type =
+                target.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+            value.broadcast(output_type, output_axes.as_slice())?
         };
 
-        // The broadcasting operation carries the requested output type, but changing an explicit/manual sharding is a
-        // semantic redistribution rather than a metadata-only broadcast. Here we stage that transition explicitly so
-        // that backend lowering cannot silently relabel the tangent when the primal result is placed differently from
-        // this operand.
+        // Geometry preserves input placement. Explicit redistribution is a separate operation as manual variation
+        // has already been made explicit by forward input binding and is never repaired here.
         if requires_reshard && let Some(sharding) = target.sharding() {
-            value = value.reshard(sharding)?;
+            value = value.reshard(&sharding.without_manual_reduction_axes())?;
         }
 
         // The exemplar path infers its result type from its operands, so pin any remaining metadata-only difference
@@ -145,6 +151,15 @@ impl<
         if requires_runtime_shape && value.r#type().as_ref() != target {
             let output_axes = (0..target.rank()).collect::<Vec<_>>();
             value = value.broadcast(target.clone(), output_axes.as_slice())?;
+        }
+
+        if value.r#type().as_ref() != target {
+            return Err(TypeError::invalid(format!(
+                "aligned tangent type `{}` does not match required output tangent type `{}`",
+                value.r#type(),
+                target,
+            ))
+            .into());
         }
 
         Ok(value)
@@ -218,7 +233,7 @@ where
         if contribution.r#type().sharding() != target.sharding()
             && let Some(sharding) = target.sharding()
         {
-            contribution = contribution.reshard(sharding)?;
+            contribution = contribution.reshard(&sharding.without_manual_reduction_axes())?;
         }
 
         // Pin any remaining metadata-only difference (e.g., a layout that no step above can attach) with an

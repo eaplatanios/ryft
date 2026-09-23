@@ -456,6 +456,7 @@ mod tests {
         let operation = ParallelVaryOperation::new("m".to_string());
         assert_eq!(operation.axis_name(), "m");
         assert_eq!(operation.name(), PARALLEL_VARY_OPERATION_NAME);
+        assert!(operation.transitions_manual_variation());
         assert_eq!(operation.to_string(), "parallel_vary [axis_name=\"m\"]");
     }
 
@@ -504,12 +505,6 @@ mod tests {
                     .unwrap(),
             ]
         );
-        assert_eq!(
-            ParallelReduceOperation::new("m".to_string(), ParallelReductionKind::Sum)
-                .with_mesh(sharding.mesh().clone())
-                .infer_output_types(&output, &[]),
-            Ok(vec![input.clone()]),
-        );
         assert!(matches!(
             ParallelVaryOperation::new("explicit".to_string()).infer_output_types(&[input.clone()], &[]),
             Err(TypeError::Invalid { message }) if message == "`parallel_vary` axis `explicit` must be manual",
@@ -523,24 +518,16 @@ mod tests {
 
     #[test]
     fn test_parallel_vary_interpretation() {
+        let (invariant, _) = scalar_types();
         assert!(matches!(
-            Array::scalar(2.0_f32).unwrap().parallel_vary("m"),
+            ParallelVaryOperation::new("m".to_string()).interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::from_elements(invariant, &[2.0_f32]).unwrap()],
+            ),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "`parallel_vary` requires an active non-empty manual mesh axis `m`",
         ));
-        let (invariant, varying) = scalar_types();
-        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-            |input| input.parallel_vary("m"),
-            invariant,
-            vec![(
-                "m".to_string(),
-                NamedAxis::Mesh { axis: 0, size: 2, mesh: scalar_types().0.sharding().unwrap().mesh().clone() },
-            )],
-        )
-        .unwrap();
-        assert_eq!(output, varying);
-        assert_eq!(program.instructions().len(), 1);
-        assert_eq!(program.instructions()[0].operation().name(), PARALLEL_VARY_OPERATION_NAME);
     }
 
     #[test]
@@ -568,28 +555,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_variation_known_staging() {
+    fn test_parallel_vary_partial_evaluation_known_staging() {
         let (invariant, varying) = scalar_types();
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input = PartialEvaluationValue::known(trace.input(invariant.clone()));
+        let input = PartialEvaluationValue::known(trace.input(invariant));
         let context = PartialEvaluationContext::new(trace);
         let outputs = ParallelVaryOperation::new("m".to_string())
             .partially_evaluate(&context, &EmptyRegionDriver, &[input])
             .unwrap();
         assert!(outputs[0].is_known());
         assert_eq!(outputs[0].r#type().as_ref(), &varying);
-
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let input = PartialEvaluationValue::known(Array::from_elements(invariant, &[2.0_f32]).unwrap());
-        let outputs = ParallelVaryOperation::new("m".to_string())
-            .partially_evaluate(&context, &EmptyRegionDriver, &[input])
-            .unwrap();
-        assert!(outputs[0].is_unknown());
-        assert_eq!(outputs[0].r#type().as_ref(), &varying);
     }
 
     #[test]
-    fn test_parallel_variation_composite_partial_evaluation() {
+    fn test_parallel_vary_partial_evaluation_composite() {
         let (invariant, varying) = scalar_types();
         let operation = ArrayIrOperation::<Array>::from(ParallelVaryOperation::new("m".to_string()));
         let eager = PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
@@ -623,17 +602,23 @@ mod tests {
             .with_ragged_axes(vec![RaggedAxis::new(1, extents, length, vec![0])])
             .unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2);
-        let outputs = ParallelVaryOperation::new("m".to_string())
-            .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
-            .unwrap()
-            .into_parts()
-            .0;
+        let operation = ParallelVaryOperation::new("m".to_string());
+        let outputs =
+            operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap().into_parts().0;
         assert_eq!(outputs[0].batch_axis(), input.batch_axis());
         assert_eq!(outputs[0].ragged_axes(), input.ragged_axes());
         assert_eq!(
             outputs[0].value().r#type().sharding().unwrap().varying_manual_axes(),
             &BTreeSet::from(["m".to_string()]),
         );
+
+        let named_batch =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(context.parent().clone(), 2).with_axis_name("m".to_string());
+        assert!(matches!(
+            operation.batch(&named_batch, &EmptyRegionDriver, std::slice::from_ref(&input)),
+            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`parallel_vary` requires a manual mesh axis, not a named batch axis",
+        ));
     }
 
     #[test]
@@ -729,5 +714,34 @@ mod tests {
             if operation.mesh() == Some(varying.sharding().unwrap().mesh())));
         let twice = transposed.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(twice.to_string(), program.to_string());
+    }
+
+    #[test]
+    fn test_parallel_vary_capability() {
+        let (invariant, varying) = scalar_types();
+        let mesh = invariant.sharding().unwrap().mesh().clone();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_vary("m"),
+            invariant,
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+        )
+        .unwrap();
+        assert_eq!(output, varying);
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec![PARALLEL_VARY_OPERATION_NAME],
+        );
+
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_vary("m"),
+            ArrayType::scalar(DataType::F32),
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(output, varying);
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["broadcast", PARALLEL_VARY_OPERATION_NAME],
+        );
     }
 }

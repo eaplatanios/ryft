@@ -1118,7 +1118,8 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     ///   - When *all* of the operation's inputs are [`Known`](PartialValue::Known), it **folds** the operation by
     ///     [`bind`](Context::bind)ing it in the known-side context, interpreting it immediately under an eager context,
     ///     and staging it into the outer program under a [`StagingContext`], so that the operation's outputs become
-    ///     known values and the operation contributes nothing to the residual [`Program`].
+    ///     known values and the operation contributes nothing to the residual [`Program`]. Pure regionless operations
+    ///     without references remain residual when eager execution returns [`ProgramError::UnsupportedOperation`].
     ///   - Otherwise, it **residualizes** the operation unchanged, meaning that it emits the operation into the
     ///     residual program over its inputs' residual program [`Atom`](crate::Atom)s, materializing each known input as
     ///     a residual input for a known variable or as an inlined residual program constant for a literal, so that the
@@ -1490,12 +1491,14 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Known inputs permit folding only when doing so preserves effect order. Once an ordered operation is deferred,
     /// later ordered operations remain residual so they cannot run ahead of it, even when their inputs are known.
     ///
-    /// An eager parent executes folded operations immediately. [`ReferencePlacement::Stage`] instead residualizes
-    /// every operation touching references, including allocation and aliasing, so eager specialization cannot observe
-    /// or mutate live reference state. [`ReferencePlacement::Execute`] permits known reference operations to execute.
-    /// A staging parent appends folded operations to its outer program, which executes before the residual program;
-    /// reference placement adds no restriction there. A deferred sibling still retains all effects regardless of
-    /// whether its parent is eager or staged.
+    /// An eager parent attempts to execute known operations. A pure regionless operation without reference inputs
+    /// or outputs remains residual if execution returns [`ProgramError::UnsupportedOperation`], allowing execution
+    /// environments that support it to run it later. Other failures propagate. [`ReferencePlacement::Stage`]
+    /// residualizes every operation touching references, including allocation and aliasing, so eager specialization
+    /// cannot observe or mutate live reference state. [`ReferencePlacement::Execute`] permits known reference
+    /// operations to execute. A staging parent appends folded operations to its outer program, which executes before
+    /// the residual program; reference placement adds no restriction there. A deferred sibling still retains all
+    /// effects regardless of whether its parent is eager or staged.
     ///
     /// Fixed-point probes must never fold effectful programs through the live parent context as each probe would
     /// execute or stage the effects again. Control flow rules instead retain such programs whole, without changing
@@ -1522,6 +1525,15 @@ impl<C: Context> PartialEvaluationContext<C> {
 
         let operation = operation.into();
 
+        // Specifies whether this operation may stay in the residual program when an eager parent reports that it cannot
+        // execute it (i.e., returns `ProgramError::UnsupportedOperation`), rather than failing partial evaluation. This
+        // is how work that has no eager value on this backend, such as a reduction over a manual mesh axis, survives
+        // for an execution environment that supports it. The flag starts as `false` and becomes `true` only after the
+        // validation below proves that the operation is regionless and that no input, output, or effect declaration
+        // involves references as deferring such an operation cannot skip observable state changes. The eager binding
+        // further down also requires the operation to have no effects before it acts on this flag.
+        let mut can_defer_unsupported = false;
+
         // Reference and region applications retain their existing binding and failure-ordering paths. Local
         // regionless folds resolve before substitution: an input replacement preserves that input's shared
         // materialization slot, and a singleton replacement becomes a known constant of the inferred output type.
@@ -1532,6 +1544,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                     operation.validate_region_count(0)?;
                     let output_types = operation.infer_output_types(&input_types, &[])?;
                     operation.effects().validate_application(operation.name(), &input_types, &output_types)?;
+                    can_defer_unsupported = !output_types.iter().any(Type::is_reference);
                     Ok(operation.resolve_fold::<C::Constant>(&input_types, &[], &output_types)?)
                 })()
                 .inspect_err(|_| {
@@ -1589,9 +1602,20 @@ impl<C: Context> PartialEvaluationContext<C> {
         }
 
         let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
-        let outputs = self
-            .parent
-            .bind(operation, regions, &known)?
+        let outputs = if self.parent.is_eager() && can_defer_unsupported && effects.is_empty() {
+            // Unsupported pure kernels can remain residual without repeating observable work. The validation above
+            // excludes references and regions; execution errors other than unsupported kernels remain failures.
+            match self.parent.bind(operation.clone(), Vec::new(), &known) {
+                Err(ProgramError::UnsupportedOperation { .. }) => {
+                    return self.residualize_with_effects(operation, regions, inputs, effects);
+                }
+                outputs => outputs?,
+            }
+        } else {
+            self.parent.bind(operation, regions, &known)?
+        };
+
+        let outputs = outputs
             .into_iter()
             .map(|value| {
                 // A folded value that owns a type identity must remain a producer when it crosses into residual
@@ -2868,13 +2892,16 @@ mod tests {
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, StagingContext};
+    use crate::interpretation::InterpretationDriver;
     use crate::operations::{
         AddOperation, ConditionOperation, LinearCallOperation, MulOperation, NegOperation, PrintOperation,
         ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
         ReferenceWriteOperation, SubOperation, Zero,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{AtomId, Concretizable, EffectClasses, Effects, ProgramBuilder, ProgramError, ReferenceType};
+    use crate::programs::{
+        AtomId, Concretizable, EffectClasses, Effects, ProgramBuilder, ProgramError, ReferenceType, RegionInterface,
+    };
     use crate::tests::{
         TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayOperation, TestArrayTracingContext,
         TestOrderedStateOperation,
@@ -3478,6 +3505,89 @@ mod tests {
             evaluation.interpret(&EagerContext::new(), &[Array::scalar(7.0).unwrap()]),
             Ok(vec![Array::scalar(-7.0).unwrap()])
         );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_fold_or_residualize_unsupported_eager_execution() {
+        /// Operation with a controlled execution failure and effect classification.
+        #[derive(Clone, Debug)]
+        struct UnavailableOperation {
+            /// Error reported by eager execution after successful type inference.
+            error: ProgramError,
+
+            /// Observable effects that forbid deferring a failed execution attempt.
+            effects: Effects,
+        }
+
+        impl Operation for UnavailableOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "unavailable"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                check_count!("region", region_interfaces, 0, TypeError);
+                Ok(input_types.to_vec())
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                Cow::Borrowed(&self.effects)
+            }
+        }
+
+        impl InterpretableOperation<EagerContext<Array, Self>> for UnavailableOperation {
+            fn interpret<D: InterpretationDriver<EagerContext<Array, Self>>>(
+                &self,
+                _context: &EagerContext<Array, Self>,
+                _driver: &D,
+                _inputs: &[Array],
+            ) -> Result<Vec<Array>, ProgramError> {
+                Err(self.error.clone())
+            }
+        }
+
+        let unsupported = ProgramError::UnsupportedOperation { message: "kernel is unavailable".to_string() };
+        let operation = UnavailableOperation { error: unsupported.clone(), effects: Effects::empty().clone() };
+        let inputs = [PartialEvaluationValue::known(Array::scalar(2.0_f32).unwrap())];
+        let context = PartialEvaluationContext::new(EagerContext::<Array, UnavailableOperation>::new());
+        let outputs = context.fold_or_residualize(operation.clone(), Vec::new(), &inputs).unwrap();
+        assert!(outputs[0].is_unknown());
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F32));
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        assert_eq!(evaluation.program.instructions()[0].operation().name(), "unavailable");
+
+        // Staging a known operation does not attempt execution, so its outputs stay known.
+        let parent = TracingContext::<Array, UnavailableOperation>::new();
+        let input = PartialEvaluationValue::known(parent.input(ArrayType::scalar(DataType::F32)));
+        let context = PartialEvaluationContext::new(parent);
+        let outputs = context.fold_or_residualize(operation.clone(), Vec::new(), &[input]).unwrap();
+        assert!(outputs[0].is_known());
+        assert_eq!(outputs[0].r#type().into_owned(), ArrayType::scalar(DataType::F32));
+
+        // A failed effectful execution cannot be retried later because it might have already performed effects.
+        let effectful = UnavailableOperation {
+            effects: Effects::new(EffectClasses::single(EffectClass::OrderedIo), Vec::new(), Vec::new()).unwrap(),
+            ..operation.clone()
+        };
+        let context = PartialEvaluationContext::new(EagerContext::<Array, UnavailableOperation>::new());
+        assert_eq!(context.fold_or_residualize(effectful, Vec::new(), &inputs).unwrap_err(), unsupported);
+
+        // Unsupported execution does not conceal malformed boundaries or other runtime errors.
+        assert_eq!(
+            context.fold_or_residualize(operation.clone(), Vec::new(), &[]).unwrap_err(),
+            ProgramError::Type(TypeError::invalid("expected 1 input but got 0")),
+        );
+        let context = PartialEvaluationContext::new(EagerContext::<Array, UnavailableOperation>::new());
+        let invalid = ProgramError::Type(TypeError::invalid("invalid kernel input"));
+        let operation = UnavailableOperation { error: invalid.clone(), ..operation };
+        assert_eq!(context.fold_or_residualize(operation, Vec::new(), &inputs).unwrap_err(), invalid);
     }
 
     #[test]

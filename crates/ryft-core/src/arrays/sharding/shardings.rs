@@ -349,6 +349,47 @@ impl Sharding {
         }
     }
 
+    /// Returns the local placement inside a region binding `manual_axes`. Dimension assignments over those axes
+    /// become variation facts, while outer placements and reduction state remain unchanged. Shapes must be localized
+    /// separately by the region boundary. This function does not move data or change dimension sizes.
+    pub fn local_sharding(&self, manual_axes: &[String]) -> Result<Self, ShardingError> {
+        for axis in manual_axes {
+            if self.mesh.axis_type(axis) != Some(MeshAxisType::Manual) {
+                return Err(ShardingError::ExpectedManualMeshAxis { name: axis.clone() });
+            }
+        }
+
+        let mut varying = self.varying_manual_axes.clone();
+        let dimensions = self
+            .dimensions
+            .iter()
+            .map(|dimension| match dimension {
+                ShardingDimension::Sharded(axes) => {
+                    let remaining = axes
+                        .iter()
+                        .filter(|axis| {
+                            if manual_axes.contains(axis) {
+                                varying.insert((*axis).clone());
+                                false
+                            } else {
+                                true
+                            }
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if remaining.is_empty() {
+                        ShardingDimension::Replicated
+                    } else {
+                        ShardingDimension::Sharded(remaining)
+                    }
+                }
+                dimension => dimension.clone(),
+            })
+            .collect();
+
+        self.with_dimensions(dimensions)?.with_varying_manual_axes(varying)
+    }
+
     /// Returns this [`Sharding`] with its per-array dimension assignments replaced by `dimensions`, while preserving
     /// its mesh and auxiliary axis state. The resulting sharding is revalidated against all preserved axis sets.
     pub fn with_dimensions(&self, dimensions: Vec<ShardingDimension>) -> Result<Self, ShardingError> {
@@ -500,6 +541,20 @@ impl Sharding {
             .cloned()
             .collect();
         Self { dimensions, unreduced_axes, reduced_axes, ..self.clone() }
+    }
+
+    /// Returns a copy of this [`Sharding`] with every [`MeshAxisType::Manual`] mesh axis removed from its reduction
+    /// state (i.e., from [`Self::unreduced_axes`] and [`Self::reduced_axes`]), keeping its dimension placements and
+    /// varying manual axes unchanged. A [`Reshard`](crate::Reshard) target may only name [`MeshAxisType::Explicit`]
+    /// mesh axes, and resharding carries the manual reduction state of its input over to its output rather than taking
+    /// it from the target. Code that reshards a value onto the full type of another value therefore requests this
+    /// projection of that type's sharding: the manual reduction state it drops is already carried by the value being
+    /// resharded, while any remaining state is a genuine redistribution request.
+    pub fn without_manual_reduction_axes(&self) -> Self {
+        let is_not_manual = |name: &&String| self.mesh.axis_type(name) != Some(MeshAxisType::Manual);
+        let unreduced_axes = self.unreduced_axes.iter().filter(is_not_manual).cloned().collect();
+        let reduced_axes = self.reduced_axes.iter().filter(is_not_manual).cloned().collect();
+        Self { unreduced_axes, reduced_axes, ..self.clone() }
     }
 
     /// Returns a copy of this [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`,
@@ -829,6 +884,40 @@ mod tests {
     }
 
     #[test]
+    fn test_sharding_local_sharding() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("outer", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("r", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x", "m"]), ShardingDimension::sharded(["outer"])],
+        )
+        .unwrap()
+        .with_unreduced_axes(["r"])
+        .unwrap();
+        let local = sharding.local_sharding(&["m".to_string()]).unwrap();
+        assert_eq!(
+            local,
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["outer"]),])
+                .unwrap()
+                .with_unreduced_axes(["r"])
+                .unwrap()
+                .with_varying_manual_axes(["m"])
+                .unwrap()
+        );
+        assert_eq!(local.local_sharding(&["m".to_string()]), Ok(local.clone()));
+        assert_eq!(sharding.local_sharding(&[]), Ok(sharding.clone()));
+        assert_eq!(
+            sharding.local_sharding(&["x".to_string()]),
+            Err(ShardingError::ExpectedManualMeshAxis { name: "x".to_string() })
+        );
+    }
+
+    #[test]
     fn test_sharding_with_dimensions() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -1078,6 +1167,42 @@ mod tests {
                 .with_varying_manual_axes(["x"])
                 .unwrap(),
         );
+    }
+
+    #[test]
+    fn test_sharding_without_manual_reduction_axes() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("outer", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("explicit", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("placement", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("auto", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("varying", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["placement"])])
+            .unwrap()
+            .with_unreduced_axes(["manual", "explicit"])
+            .unwrap()
+            .with_reduced_axes(["outer", "auto"])
+            .unwrap()
+            .with_varying_manual_axes(["varying"])
+            .unwrap();
+
+        // Manual reduction state is removed; explicit and auto reduction state, placement, and variation are kept.
+        assert_eq!(
+            sharding.without_manual_reduction_axes(),
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["placement"])])
+                .unwrap()
+                .with_unreduced_axes(["explicit"])
+                .unwrap()
+                .with_reduced_axes(["auto"])
+                .unwrap()
+                .with_varying_manual_axes(["varying"])
+                .unwrap(),
+        );
+        let explicit = sharding.without_manual_reduction_axes();
+        assert_eq!(explicit.without_manual_reduction_axes(), explicit);
     }
 
     #[test]

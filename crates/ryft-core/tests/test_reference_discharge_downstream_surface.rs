@@ -58,21 +58,22 @@ use ryft_core::{
     DifferentiationPolicy, DivOperation, Domain, EagerContext, EffectClass, EffectClasses, Effects,
     ExternalReferenceBinding, InputRegionProvenance, InstructionId, InterpretableOperation, InterpretationDriver,
     MaybeZero, MemberDifferentiableOperation, MemberTransposableOperation, MulOperation, NegOperation, NoIdentity,
-    OneLikeOperation, OneOperation, Operation, OperationProvider, OutputRegionProvenance, Parameter, PartialValue,
-    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError,
-    ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, ReduceOperation, Reference,
-    ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge,
-    ReferenceAliasKind, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
-    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceDischargeableType, ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId,
-    ReferenceMemberType, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSource,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewOverlap,
-    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation,
-    RegionId, RegionInterface, RegionRef, RegionSlot, ReshapeOperation, ReshardOperation, ResidualZeroProvider, Trace,
-    Tracer, TracingContext, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type,
-    TypeError, Typed, Value, ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation, batch, check_count,
-    differentiate_at, discharge_reference_free_operation, jvp_projected_operation, transpose_projected_operation,
+    OneLikeOperation, OneOperation, Operation, OperationProvider, OutputRegionProvenance, ParallelVaryOperation,
+    Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
+    ProgramBuilder, ProgramError, ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver,
+    ReduceOperation, Reference, ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAlias,
+    ReferenceAliasEdge, ReferenceAliasKind, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
+    ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceMemberType, ReferenceNew, ReferenceNewOperation,
+    ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceType,
+    ReferenceView, ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep,
+    ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef,
+    RegionSlot, ReshapeOperation, ReshardOperation, ResidualZeroProvider, Trace, Tracer, TracingContext,
+    TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed,
+    Value, ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation, batch, check_count, differentiate_at,
+    discharge_reference_free_operation, jvp_projected_operation, transpose_projected_operation,
     validate_reference_boundary,
 };
 
@@ -2542,6 +2543,17 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         Reshard(ReshardOperation),
         Compare(CompareOperation<ArrayType>),
         Div(DivOperation<ArrayType>),
+    }
+
+    impl OperationProvider<ArrayType, ParallelVaryOperation> for ValueOnlyArrayOperation {
+        type Operation = Self;
+
+        fn provide(_request: ParallelVaryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+            check_count!("input", input_types, 1, ProgramError);
+            Err(ProgramError::UnsupportedOperation {
+                message: "value-only test operation family cannot align manual variation".to_string(),
+            })
+        }
     }
 
     /// A downstream composite family containing only constants and ordinary array operations.
