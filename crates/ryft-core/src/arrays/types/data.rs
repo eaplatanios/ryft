@@ -1168,6 +1168,45 @@ impl DataType {
         self.is_real() || self.is_complex()
     }
 
+    /// Returns the number of bits that encode one value of this [`DataType`]. This is the element bit width that
+    /// [StableHLO's `bitcast_convert`](https://openxla.org/stablehlo/spec#bitcast_convert) uses to relate the shapes
+    /// of its operand and result, and it matches XLA's `primitive_util::BitWidth`. Sub-byte types report their exact
+    /// encoding width (e.g., `4` for [`DataType::I4`] and `6` for [`DataType::F6E2M3FN`]), [`DataType::Boolean`]
+    /// reports `8` even though only `0` and `1` are valid values, complex types count both of their components (e.g.,
+    /// `64` for [`DataType::C64`]), and [`DataType::Token`] and [`DataType::Zero`] report `0`.
+    ///
+    /// This width may differ from the storage an element occupies. Ryft's host arrays store every element in a whole
+    /// number of bytes and keep sub-byte values unpacked in the low bits of their own byte, so the host storage width
+    /// is this bit width rounded up to whole bytes (refer to the documentation of
+    /// [`ArrayAddressing::element_byte_width`](crate::ArrayAddressing::element_byte_width) for more information).
+    /// Device backends may pack sub-byte elements differently (e.g., XLA stores two 4-bit elements per byte), so
+    /// neither width describes the layout of a device buffer. Reinterpreting values as another type of a different
+    /// bit width therefore changes element counts at the encoding level, not by reinterpreting host bytes.
+    pub const fn bit_width(self) -> usize {
+        match self {
+            Self::Token | Self::Zero => 0,
+            Self::I1 | Self::U1 => 1,
+            Self::I2 | Self::U2 => 2,
+            Self::I4 | Self::U4 | Self::F4E2M1FN => 4,
+            Self::F6E2M3FN | Self::F6E3M2FN => 6,
+            Self::Boolean
+            | Self::I8
+            | Self::U8
+            | Self::F8E3M4
+            | Self::F8E4M3
+            | Self::F8E4M3FN
+            | Self::F8E4M3FNUZ
+            | Self::F8E4M3B11FNUZ
+            | Self::F8E5M2
+            | Self::F8E5M2FNUZ
+            | Self::F8E8M0FNU => 8,
+            Self::I16 | Self::U16 | Self::BF16 | Self::F16 => 16,
+            Self::I32 | Self::U32 | Self::F32 => 32,
+            Self::I64 | Self::U64 | Self::F64 | Self::C64 => 64,
+            Self::C128 => 128,
+        }
+    }
+
     /// Returns the promoted [`DataType`] for the provided data types, which is defined as the least upper bound of
     /// the input [`DataType`]s in the type promotion lattice described in the documentation of [`DataType`]. In other
     /// words, it returns the _smallest_ [`DataType`] that every input type can be promoted to, automatically. Note
@@ -1624,6 +1663,50 @@ mod tests {
                     || floating_point.contains(&data_type)
                     || complex.contains(&data_type),
             );
+        }
+    }
+
+    #[test]
+    fn test_data_type_bit_width() {
+        let cases = [
+            (DataType::Token, 0),
+            (DataType::Zero, 0),
+            (DataType::Boolean, 8),
+            (DataType::I1, 1),
+            (DataType::I2, 2),
+            (DataType::I4, 4),
+            (DataType::I8, 8),
+            (DataType::I16, 16),
+            (DataType::I32, 32),
+            (DataType::I64, 64),
+            (DataType::U1, 1),
+            (DataType::U2, 2),
+            (DataType::U4, 4),
+            (DataType::U8, 8),
+            (DataType::U16, 16),
+            (DataType::U32, 32),
+            (DataType::U64, 64),
+            (DataType::F4E2M1FN, 4),
+            (DataType::F6E2M3FN, 6),
+            (DataType::F6E3M2FN, 6),
+            (DataType::F8E3M4, 8),
+            (DataType::F8E4M3, 8),
+            (DataType::F8E4M3FN, 8),
+            (DataType::F8E4M3FNUZ, 8),
+            (DataType::F8E4M3B11FNUZ, 8),
+            (DataType::F8E5M2, 8),
+            (DataType::F8E5M2FNUZ, 8),
+            (DataType::F8E8M0FNU, 8),
+            (DataType::BF16, 16),
+            (DataType::F16, 16),
+            (DataType::F32, 32),
+            (DataType::F64, 64),
+            (DataType::C64, 64),
+            (DataType::C128, 128),
+        ];
+        assert_eq!(cases.len(), DataType::ALL.len());
+        for (data_type, bit_width) in cases {
+            assert_eq!(data_type.bit_width(), bit_width, "{data_type}");
         }
     }
 

@@ -229,8 +229,7 @@ impl<C: Context<Type = ArrayType, Value: ConvertElementType + Transpose>, P: Arr
         // Numerical conversion and equal-width bitcasts keep the mapped axis in place. A widening bitcast consumes
         // the packed trailing axis, so a bounded ragged axis in that position cannot be consumed at all, because its
         // padding would be folded into the wider elements, and a mapped axis in that position moves to the front first.
-        let widening = self.bitcast
-            && element_bit_width(inputs[0].value().r#type().data_type()) < element_bit_width(self.data_type);
+        let widening = self.bitcast && inputs[0].value().r#type().data_type().bit_width() < self.data_type.bit_width();
         let rank = inputs[0].value().r#type().rank();
         if widening && inputs[0].ragged_axes().iter().any(|axis| axis.axis() + 1 == rank) {
             return Err(BatchingError::UnsupportedOperation {
@@ -429,8 +428,8 @@ impl ElementType for ArrayType {
             )));
         }
 
-        let input_bits = element_bit_width(source);
-        let output_bits = element_bit_width(data_type);
+        let input_bits = source.bit_width();
+        let output_bits = data_type.bit_width();
         if !input_bits.max(output_bits).is_multiple_of(input_bits.min(output_bits)) {
             return Err(TypeError::invalid(format!(
                 "`{CONVERT_ELEMENT_TYPE_OPERATION_NAME}` in bitcast mode requires one element bit width \
@@ -604,8 +603,8 @@ impl ConvertElementType for Array {
             return Ok(self.clone());
         }
 
-        let input_bits = element_bit_width(self.r#type().data_type());
-        let output_bits = element_bit_width(data_type);
+        let input_bits = self.r#type().data_type().bit_width();
+        let output_bits = data_type.bit_width();
         let bytes = self.logical_bytes();
         if input_bits >= 8 && output_bits >= 8 || input_bits == output_bits {
             return Array::from_logical_bytes(output_type, &bytes);
@@ -632,18 +631,6 @@ impl ConvertElementType for Array {
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Returns the number of meaningful encoding bits of one element of `data_type`, excluding the padding that sub-byte
-/// elements occupy in host storage.
-fn element_bit_width(data_type: DataType) -> usize {
-    match data_type {
-        DataType::I1 | DataType::U1 => 1,
-        DataType::I2 | DataType::U2 => 2,
-        DataType::I4 | DataType::U4 | DataType::F4E2M1FN => 4,
-        DataType::F6E2M3FN | DataType::F6E3M2FN => 6,
-        _ => ArrayAddressing::element_byte_width_for_data_type(data_type) * 8,
-    }
-}
 
 #[cfg(test)]
 mod tests {

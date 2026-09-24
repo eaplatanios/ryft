@@ -164,35 +164,11 @@ impl ArrayAddressing {
         Self::element_byte_width_for_data_type(self.r#type.data_type())
     }
 
-    /// Returns the byte width of one element of the provided [`DataType`].
+    /// Returns the byte width of one element of the provided [`DataType`], which is its [`DataType::bit_width`] rounded
+    /// up to whole bytes. Refer to the documentation of [`element_byte_width`](Self::element_byte_width) for how
+    /// sub-byte elements occupy their bytes.
     pub const fn element_byte_width_for_data_type(data_type: DataType) -> usize {
-        match data_type {
-            DataType::Token | DataType::Zero => 0,
-            DataType::Boolean
-            | DataType::I1
-            | DataType::I2
-            | DataType::I4
-            | DataType::I8
-            | DataType::U1
-            | DataType::U2
-            | DataType::U4
-            | DataType::U8
-            | DataType::F4E2M1FN
-            | DataType::F6E2M3FN
-            | DataType::F6E3M2FN
-            | DataType::F8E3M4
-            | DataType::F8E4M3
-            | DataType::F8E4M3FN
-            | DataType::F8E4M3FNUZ
-            | DataType::F8E4M3B11FNUZ
-            | DataType::F8E5M2
-            | DataType::F8E5M2FNUZ
-            | DataType::F8E8M0FNU => 1,
-            DataType::I16 | DataType::U16 | DataType::BF16 | DataType::F16 => 2,
-            DataType::I32 | DataType::U32 | DataType::F32 => 4,
-            DataType::I64 | DataType::U64 | DataType::F64 | DataType::C64 => 8,
-            DataType::C128 => 16,
-        }
+        data_type.bit_width().div_ceil(8)
     }
 
     /// Returns the number of logical elements in the addressed array.
