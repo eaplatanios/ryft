@@ -24,7 +24,7 @@ use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::dot::{Dot, DotDimensionNumbers};
-use crate::operations::logical::and::And;
+use crate::operations::logical::And;
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};

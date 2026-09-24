@@ -40,7 +40,7 @@ use crate::operations::control_flow::scan::{ScanOperation, stacked_scan_type, va
 use crate::operations::control_flow::select::SelectOperation;
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
-use crate::operations::logical::and::AndOperation;
+use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::DynamicUpdateSliceOperation;
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
