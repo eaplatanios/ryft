@@ -31,8 +31,10 @@
 //! constraint on the staged instruction:
 //!
 //! ```rust
+//! # use indoc::indoc;
+//! # use pretty_assertions::assert_eq;
 //! # use ryft_core::{
-//! #     Array, ArrayOperation, ArrayType, ConstrainSharding, DataType, LogicalMesh, MeshAxis, MeshAxisType, Operation,
+//! #     Array, ArrayOperation, ArrayType, ConstrainSharding, DataType, LogicalMesh, MeshAxis, MeshAxisType,
 //! #     Reshard, Sharding, ShardingDimension, TracingContext,
 //! # };
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,8 +49,18 @@
 //!     ArrayType::new_static(DataType::F32, [4]),
 //! )?;
 //! assert_eq!(output_type.sharding(), Some(&target));
-//! let operations = program.instructions().iter().map(|instruction| instruction.operation().name());
-//! assert_eq!(operations.collect::<Vec<_>>(), ["reshard", "constrain_sharding"]);
+//! assert_eq!(
+//!     program.to_string(),
+//!     indoc! {"
+//!         lambda %0:f32[4] .
+//!         let %1:f32[4][sharding={mesh<['x'=2:explicit, 'a'=2:auto]>, [{'x'}]}] = reshard \
+//!                 [sharding={mesh<['x'=2:explicit, 'a'=2:auto]>, [{'x'}]}] %0
+//!             %2:f32[4][sharding={mesh<['x'=2:explicit, 'a'=2:auto]>, [{'x'}]}] = constrain_sharding \
+//!                 [sharding={mesh<['x'=2:explicit, 'a'=2:auto]>, [{'a'}]}] %1
+//!         in (%2)
+//!     "}
+//!     .trim_end(),
+//! );
 //! # Ok(())
 //! # }
 //! ```
