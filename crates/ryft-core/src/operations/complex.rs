@@ -174,17 +174,14 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 define_elementwise_capability!(
     @binary
     /// Represents the ability to construct complex values from real and imaginary parts. Concrete arrays compute
-    /// immediately; context-carrying values apply [`ComplexOperation`] through their context. The parts must have
-    /// identical types with `f32` or `f64` elements; construction neither promotes nor broadcasts them.
+    /// immediately while context-carrying values apply [`ComplexOperation`] through their context. The parts must have
+    /// identical types with `f32` or `f64` elements as construction neither promotes nor broadcasts them.
     Complex,
     /// Constructs `self + imaginary·i` elementwise, producing `c64` from `f32` parts or `c128` from `f64` parts.
-    /// Returns an error if the parts have different types or unsupported element types. Refer to [`ComplexOperation`]
-    /// for output metadata and differentiation semantics.
+    /// Returns an error if the parts have different types or unsupported element types.
     ///
     /// # Parameters
     ///
@@ -198,12 +195,14 @@ impl Complex for Array {
         // Construction requires identical part types and combines their values without promotion or broadcasting.
         if self.r#type() != imaginary.r#type() {
             return Err(TypeError::invalid(format!(
-                "`{COMPLEX_OPERATION_NAME}` requires identical part types but got `{}` and `{}`",
+                "`{}` requires identical part types but got `{}` and `{}`",
+                COMPLEX_OPERATION_NAME,
                 self.r#type(),
                 imaginary.r#type(),
             ))
             .into());
         }
+
         let data_type = match self.r#type().data_type() {
             DataType::F32 => DataType::C64,
             DataType::F64 => DataType::C128,
@@ -214,6 +213,7 @@ impl Complex for Array {
                 .into());
             }
         };
+
         let output_type = self.r#type().with_element_type(data_type);
         if data_type == DataType::C64 {
             self.map_element_pairs::<f32, ComplexNumber<f32>>(imaginary, output_type, |real, imaginary| {
@@ -236,9 +236,11 @@ define_elementwise_operation!(
     /// the imaginary part) while preserving its type metadata. Only `c64` and `c128` inputs are supported.
     ///
     /// Conjugation is ℝ-linear but not ℂ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's
-    /// transposition uses over complex types, it is self-adjoint: the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
-    ConjugateOperation, CONJUGATE_OPERATION_NAME,
-    Conjugate, conjugate,
+    /// transposition uses over complex types, it is self-adjoint (i.e., the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`).
+    ConjugateOperation,
+    CONJUGATE_OPERATION_NAME,
+    Conjugate,
+    conjugate,
     infer_data_types = |input_types: &[DataType]| {
         match input_types[0] {
             DataType::C64 | DataType::C128 => Ok(vec![input_types[0]]),
@@ -263,12 +265,13 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let input = &inputs[0];
             let primal = input.primal().conjugate()?;
-            // Conjugation is ℝ-linear (but not ℂ-linear): `d(z̄) = d̄z`. A structural zero tangent stays
-            // symbolic.
+
+            // Conjugation is ℝ-linear (but not ℂ-linear): `d(z̄) = d̄z`. A structural zero tangent stays symbolic.
             let tangent = match input.tangent() {
                 MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
                 MaybeZero::Value(tangent) => MaybeZero::Value(tangent.conjugate()?),
             };
+
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
@@ -279,9 +282,9 @@ impl_differentiable_operation! {
         O: From<ConjugateOperation<V::Type>>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
-            // Transpose rule for the ℝ-linear [`ConjugateOperation`]. Under the bilinear (i.e., conjugation-free)
-            // pairing that Ryft's transposition uses over complex types, conjugation is self-adjoint: pairing
-            // `Re(ȳ · z̄)` against `z` shows that the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
+            // Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses over complex
+            // types, conjugation is self-adjoint: pairing `Re(ȳ · z̄)` against `z` shows that the transpose of
+            // `z ↦ z̄` is `ȳ ↦ ȳ̄`.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -299,12 +302,11 @@ impl_differentiable_operation! {
 
 define_elementwise_capability!(
     @unary
-    /// Represents the ability to conjugate complex values elementwise. Concrete arrays compute immediately;
+    /// Represents the ability to conjugate complex values elementwise. Concrete arrays compute immediately while
     /// context-carrying values apply [`ConjugateOperation`] through their context. Conjugation preserves the input
     /// type and negates each imaginary component.
     Conjugate,
     /// Returns the elementwise complex conjugate, or an error if the input does not have `c64` or `c128` elements.
-    /// Refer to [`ConjugateOperation`] for differentiation semantics.
     conjugate,
     ConjugateOperation,
 );
@@ -330,15 +332,17 @@ pub const REAL_OPERATION_NAME: &str = "real";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that extracts the elementwise real part of one complex value (i.e., `z ↦ Re(z)`, with
-    /// `c64 ↦ f32` and `c128 ↦ f64`) while preserving shape, sharding, and memory placement. Byte-strided layouts are
-    /// cleared because the output elements are narrower. This is the analogue of
-    /// [JAX's `lax.real`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.real.html).
+    /// [`Operation`] that extracts the elementwise real part of one complex value (i.e., `z ↦ Re(z)`, with `c64 ↦ f32`
+    /// and `c128 ↦ f64`) while preserving shape, sharding, and memory placement. Note however that byte-strided layouts
+    /// are cleared because the output elements are narrower. This operation is the Ryft analogue of JAX's
+    /// [`lax.real`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.real.html).
     ///
     /// The extraction is ℝ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses
     /// over complex types, the transpose of `z ↦ Re(z)` is `ȳ ↦ complex(ȳ, 0)`.
-    RealOperation, REAL_OPERATION_NAME,
-    Real, real,
+    RealOperation,
+    REAL_OPERATION_NAME,
+    Real,
+    real,
     infer_data_types = |input_types: &[DataType]| {
         let data_type = match input_types[0] {
             DataType::C64 => DataType::F32,
@@ -381,12 +385,14 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let input = &inputs[0];
             let primal = input.primal().real()?;
+
             // Real-part extraction is ℝ-linear: `d(Re(z)) = Re(dz)`. A structural zero tangent stays symbolic,
-            // retyped to the real output type.
+            // but is retyped to the real output type.
             let tangent = match input.tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(tangent.real()?),
             };
+
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
@@ -397,9 +403,9 @@ impl_differentiable_operation! {
         O: From<ComplexOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
-            // Transpose rule for the ℝ-linear [`RealOperation`]. Under the bilinear (i.e., conjugation-free) pairing
-            // that Ryft's transposition uses over complex types, pairing `t · Re(z)` against `z` shows that the
-            // transpose of `z ↦ Re(z)` is `t ↦ complex(t, 0)`, injecting the real cotangent with a zero imaginary part.
+            // Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses over complex types,
+            // pairing `t · Re(z)` against `z` shows that the transpose of `z ↦ Re(z)` is `t ↦ complex(t, 0)`, injecting
+            // the real cotangent with a zero imaginary part.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -418,12 +424,11 @@ impl_differentiable_operation! {
 
 define_elementwise_capability!(
     @unary
-    /// Represents the ability to extract the real component of complex values elementwise. Concrete arrays
-    /// compute immediately; context-carrying values apply [`RealOperation`] through their context. The output has
-    /// `f32` elements for `c64` inputs and `f64` elements for `c128` inputs.
+    /// Represents the ability to extract the real component of complex values elementwise. Concrete arrays compute
+    /// immediately while context-carrying values apply [`RealOperation`] through their context. The output has `f32`
+    /// elements for `c64` inputs and `f64` elements for `c128` inputs.
     Real,
-    /// Returns the elementwise real component, or an error if the input is not complex valued. Refer to
-    /// [`RealOperation`] for output metadata and differentiation semantics.
+    /// Returns the elementwise real component, or an error if the input is not complex valued.
     real,
     RealOperation,
 );
@@ -454,14 +459,16 @@ pub const IMAGINARY_OPERATION_NAME: &str = "imaginary";
 define_elementwise_operation!(
     @unary
     /// [`Operation`] that extracts the elementwise imaginary part of one complex value (i.e., `z ↦ Im(z)`, with
-    /// `c64 ↦ f32` and `c128 ↦ f64`) while preserving shape, sharding, and memory placement. Byte-strided layouts are
-    /// cleared because the output elements are narrower. This is the analogue of
-    /// [JAX's `lax.imag`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.imag.html).
+    /// `c64 ↦ f32` and `c128 ↦ f64`) while preserving shape, sharding, and memory placement. Note however that
+    /// byte-strided layouts are cleared because the output elements are narrower. This operation is the Ryft analogue
+    /// of JAX's [`lax.imag`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.imag.html).
     ///
     /// The extraction is ℝ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses
     /// over complex types, the transpose of `z ↦ Im(z)` is `ȳ ↦ complex(0, -ȳ)`.
-    ImaginaryOperation, IMAGINARY_OPERATION_NAME,
-    Imaginary, imaginary,
+    ImaginaryOperation,
+    IMAGINARY_OPERATION_NAME,
+    Imaginary,
+    imaginary,
     infer_data_types = |input_types: &[DataType]| {
         let data_type = match input_types[0] {
             DataType::C64 => DataType::F32,
@@ -504,12 +511,14 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let input = &inputs[0];
             let primal = input.primal().imaginary()?;
+
             // Imaginary-part extraction is ℝ-linear: `d(Im(z)) = Im(dz)`. A structural zero tangent stays symbolic,
-            // retyped to the real output type.
+            // but is retyped to the real output type.
             let tangent = match input.tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(tangent.imaginary()?),
             };
+
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     },
@@ -520,10 +529,9 @@ impl_differentiable_operation! {
         O: From<NegOperation<V::Type>> + From<ComplexOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
-            // Transpose rule for the ℝ-linear [`ImaginaryOperation`]. Under the bilinear (i.e., conjugation-free)
-            // pairing that Ryft's transposition uses over complex types, pairing `t · Im(z)` against `z` shows that the
-            // transpose of `z ↦ Im(z)` is `t ↦ complex(0, -t)`, injecting the *negated* real cotangent as the imaginary
-            // part.
+            // Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses over complex types,
+            // pairing `t · Im(z)` against `z` shows that the transpose of `z ↦ Im(z)` is `t ↦ complex(0, -t)`,
+            // injecting the _negated_ real cotangent as the imaginary part.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -543,12 +551,11 @@ impl_differentiable_operation! {
 
 define_elementwise_capability!(
     @unary
-    /// Represents the ability to extract the imaginary component of complex values elementwise. Concrete arrays
-    /// compute immediately; context-carrying values apply [`ImaginaryOperation`] through their context. The output has
+    /// Represents the ability to extract the imaginary component of complex values elementwise. Concrete arrays compute
+    /// immediately while context-carrying values apply [`ImaginaryOperation`] through their context. The output has
     /// `f32` elements for `c64` inputs and `f64` elements for `c128` inputs.
     Imaginary,
-    /// Returns the elementwise imaginary component, or an error if the input is not complex valued. Refer to
-    /// [`ImaginaryOperation`] for output metadata and differentiation semantics.
+    /// Returns the elementwise imaginary component, or an error if the input is not complex valued.
     imaginary,
     ImaginaryOperation,
 );
@@ -572,6 +579,8 @@ impl Imaginary for Array {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
