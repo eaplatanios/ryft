@@ -260,7 +260,15 @@ impl<C: Context<Type = ArrayType, Value: Reshard>, P: ArrayExtentBatchingPolicy<
             Some(batch_axis) => self.sharding().batched(batch_axis, ArrayBatch::sharding_for_inputs(inputs)?)?,
             None => self.sharding().clone(),
         };
-        rebatch_geometry_preserving_output(context, &ReshardOperation::new(lifted_sharding), inputs)
+
+        // Sharding changes preserve the packed shape, so the batch axis and ragged-axis metadata carry over unchanged.
+        let batch_axis = BatchAxis::from_optional_position(inputs[0].batch_axis_position());
+        let mut outputs =
+            ReshardOperation::new(lifted_sharding).interpret_with_batch_axes(context, inputs, &[batch_axis])?;
+        check_count!("output", outputs, 1, ProgramError);
+        let output = ArrayBatch::new(outputs.remove(0).into_value(), batch_axis)?
+            .with_ragged_axes(inputs[0].ragged_axes().to_vec())?;
+        Ok(vec![output].into())
     }
 }
 
@@ -577,7 +585,18 @@ impl<C: Context<Type = ArrayType, Value: ConstrainSharding>, P: ArrayExtentBatch
             Some(batch_axis) => self.sharding().batched(batch_axis, ShardingDimension::Unconstrained)?,
             None => self.sharding().clone(),
         };
-        rebatch_geometry_preserving_output(context, &ConstrainShardingOperation::new(lifted_sharding), inputs)
+
+        // Sharding changes preserve the packed shape, so the batch axis and ragged-axis metadata carry over unchanged.
+        let batch_axis = BatchAxis::from_optional_position(inputs[0].batch_axis_position());
+        let mut outputs = ConstrainShardingOperation::new(lifted_sharding).interpret_with_batch_axes(
+            context,
+            inputs,
+            &[batch_axis],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        let output = ArrayBatch::new(outputs.remove(0).into_value(), batch_axis)?
+            .with_ragged_axes(inputs[0].ragged_axes().to_vec())?;
+        Ok(vec![output].into())
     }
 }
 
@@ -665,27 +684,6 @@ impl ConstrainSharding for Array {
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Interprets the lifted geometry-preserving `operation` on the packed value of the single batch in `inputs` and
-/// repackages its output with that batch's axis and bounded ragged axes. Both sharding-control operations leave the
-/// packed geometry untouched, so every piece of batch metadata carries over as is.
-fn rebatch_geometry_preserving_output<
-    O: InterpretableOperation<C>,
-    C: Context<Type = ArrayType>,
-    P: ArrayExtentBatchingPolicy<C>,
->(
-    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-    operation: &O,
-    inputs: &[ArrayBatch<C::Value>],
-) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
-    check_count!("input", inputs, 1, ProgramError);
-    let batch_axis = BatchAxis::from_optional_position(inputs[0].batch_axis_position());
-    let mut outputs = operation.interpret_with_batch_axes(context, inputs, &[batch_axis])?;
-    check_count!("output", outputs, 1, ProgramError);
-    let output = ArrayBatch::new(outputs.remove(0).into_value(), batch_axis)?
-        .with_ragged_axes(inputs[0].ragged_axes().to_vec())?;
-    Ok(vec![output].into())
-}
 
 #[cfg(test)]
 mod tests {
