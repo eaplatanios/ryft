@@ -1003,8 +1003,6 @@ impl<'c> Domain for XlaDomain<'c> {
     type Operation = XlaOperation;
 }
 
-impl ryft_core::AssertionContext for XlaDomain<'_> {}
-
 impl ryft_core::NamedAxes for XlaDomain<'_> {
     fn named_axis(&self, _name: &str) -> Option<ryft_core::NamedAxis> {
         None

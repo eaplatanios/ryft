@@ -12,15 +12,13 @@
 //!   - The [`AssertOperation`] that the capability stages, which consumes the condition and the observations and
 //!     produces no outputs. It declares the [`EffectClass::OrderedAssertion`] effect, so dead-code elimination never
 //!     removes it and separate assertions keep their relative order.
-//!   - The [`AssertionContext`] dispatch trait, which decides what binding an assertion means in each context. Eager
-//!     execution reports failures immediately. Tracing elides conditions that are known to hold, stages symbolic
-//!     conditions, and keeps conditions that are known to fail so that the failure is reported when the program runs.
-//!     Transform contexts (e.g., batching, partial evaluation, and differentiation) forward to their parent so that,
-//!     for example, a batched assertion reports the first failing batch item and differentiation retains assertions
-//!     only in the primal computation.
 //!   - [`AssertionValue`], which concrete values implement to render their observations, and [`AssertionError`] with
 //!     its per-element [`AssertionFailure`] records, which is the error that a failed assertion produces and that
 //!     callers can recover from a [`ProgramError`] with [`downcast_custom`](ProgramError::downcast_custom).
+//!
+//! Eager execution reports failures immediately. The value capability omits validated conditions that resolve to
+//! scalar `true`; all other conditions follow ordinary operation binding. Tracing stages potential failures for
+//! execution, batching reports failing items, and differentiation retains assertions only in the primal computation.
 //!
 //! Assertions remain enabled independently of debug builds. A failing assertion does not guard the operations that
 //! follow it within an eager computation, because the error is raised at the assertion itself. In a staged program,
@@ -88,8 +86,7 @@ use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
 use crate::captures::CaptureReference;
-use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, ValueResolution};
-use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
+use crate::contexts::{Context, Domain, ValueResolution};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
@@ -117,7 +114,6 @@ use crate::programs::{
     Concretizable, EffectClass, EffectClasses, Effects, Operation, OperationFormatter, ProgramError, RegionInterface,
     Type, TypeError, Typed, Value, ValueProjection,
 };
-use crate::tracing::{NestedTracingContext, TracingContext};
 
 /// Failure of a correctness assertion, including the named values observed at that assertion.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -318,26 +314,6 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
     pub fn failure_limit(&self) -> Option<NonZeroUsize> {
         self.failure_limit
     }
-
-    /// Validates the inputs and skips binding if the condition resolves to a constant scalar `true`. Otherwise,
-    /// binds the assertion, preserving known failures for execution rather than raising them during tracing.
-    /// Used only at tracing boundaries so transform contexts can apply their own assertion rules first.
-    fn bind_unless_known_true<C: Context<Type = T, Constant: AssertionValue, Operation: From<Self>>>(
-        &self,
-        context: &C,
-        inputs: &[C::Value],
-    ) -> Result<(), ProgramError> {
-        self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-        if let ValueResolution::Constant(condition) = context.resolve(&inputs[0]) {
-            match condition.concretize() {
-                Ok(true) => return Ok(()),
-                Ok(false) | Err(ProgramError::Concretization { .. }) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        context.bind(self.clone(), Vec::new(), inputs)?;
-        Ok(())
-    }
 }
 
 impl<T: Type + Into<ArrayIrType>> Display for AssertOperation<T> {
@@ -515,7 +491,9 @@ impl<C: Context<Type: Into<ArrayIrType>, Constant: AssertionValue, Operation: Fr
     }
 }
 
-impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P> for AssertOperation<C::Type> {
+impl<C: Context<Type: Into<ArrayIrType>, Value: Assert>, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P>
+    for AssertOperation<C::Type>
+{
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
@@ -541,9 +519,15 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
 
         // Preserve individual conditions and observations so the parent can report multiple failing elements.
         // Materialization broadcasts replicated inputs and arranges mapped inputs along the batch axis.
-        if self.failure_limit.is_some() {
+        if let Some(limit) = self.failure_limit {
             let arguments = P::materialize_inputs(context, inputs)?;
-            context.parent().assert(self.clone(), &arguments)?;
+            let observations = self
+                .labels
+                .iter()
+                .zip(&arguments[1..])
+                .map(|(label, value)| (label.as_str(), value.clone()))
+                .collect::<Vec<_>>();
+            arguments[0].assert_with_limit(&self.message, &observations, limit)?;
             return Ok(Vec::new().into());
         }
 
@@ -554,7 +538,13 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
             let mut arguments = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
             arguments[0] =
                 P::from_array_value(P::mask_empty_batch_condition(context, P::array_value(arguments[0].clone())?)?);
-            context.parent().assert(self.clone(), &arguments)?;
+            let observations = self
+                .labels
+                .iter()
+                .zip(&arguments[1..])
+                .map(|(label, value)| (label.as_str(), value.clone()))
+                .collect::<Vec<_>>();
+            arguments[0].assert(&self.message, &observations)?;
             return Ok(Vec::new().into());
         }
 
@@ -634,7 +624,12 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
         labels.push(label);
 
         // Delegate the scalar assertion to the parent so any enclosing transforms apply their own rules.
-        context.parent().assert(self.clone().with_labels(labels), &arguments)?;
+        let observations = labels
+            .iter()
+            .zip(&arguments[1..])
+            .map(|(label, value)| (label.as_str(), value.clone()))
+            .collect::<Vec<_>>();
+        arguments[0].assert(&self.message, &observations)?;
         Ok(Vec::new().into())
     }
 }
@@ -651,7 +646,7 @@ impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<Arr
 /// trace time and a dynamic-extent policy only knows when the program runs, when it may also be zero. This trait
 /// captures exactly those differences, so that one [`BatchableOperation`] implementation serves every policy that
 /// implements it.
-pub(crate) trait AssertionBatchingPolicy<C: AssertionContext>: BatchingPolicy<C> {
+pub(crate) trait AssertionBatchingPolicy<C: Context>: BatchingPolicy<C> {
     /// [`ArrayType`]d value that the shared batching rule computes with, which is `C::Value` itself for array batching
     /// and its array projection for array IR batching.
     type ArrayValue: Value<Type = ArrayType> + Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike;
@@ -697,7 +692,7 @@ pub(crate) trait AssertionBatchingPolicy<C: AssertionContext>: BatchingPolicy<C>
 }
 
 impl<
-    C: AssertionContext<
+    C: Context<
             Type = ArrayType,
             Value: Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
             Operation: From<IotaOperation<ArrayType>> + From<BroadcastOperation>,
@@ -794,7 +789,7 @@ impl<
 }
 
 impl<
-    C: AssertionContext<
+    C: Context<
             Type = ArrayIrType,
             Value: ValueProjection<
                 ArrayType,
@@ -1048,14 +1043,35 @@ impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
     }
 }
 
-impl<V: Value<Type: Into<ArrayIrType>, DispatchDomain: AssertionContext>> Assert for V {
+impl<
+    V: Value<
+            Type: Into<ArrayIrType>,
+            DispatchDomain: Context<Constant: Concretizable<bool>, Operation: From<AssertOperation<V::Type>>>,
+        >,
+> Assert for V
+{
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {
         let operation = AssertOperation::new(message)
             .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect());
         let inputs = std::iter::once(self.clone())
             .chain(observations.iter().map(|(_, input)| input.clone()))
             .collect::<Vec<_>>();
-        self.dispatch_domain().assert(operation, &inputs)
+        operation
+            .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
+        let context = self.dispatch_domain();
+
+        // A validated success has no observable effect. False or unresolved conditions must reach normal binding
+        // so batching can handle empty batches and partial evaluation can preserve effect ordering.
+        if let ValueResolution::Constant(condition) = context.resolve(self) {
+            match condition.concretize() {
+                Ok(true) => return Ok(()),
+                Ok(false) | Err(ProgramError::Concretization { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        context.bind(operation, Vec::new(), &inputs)?;
+        Ok(())
     }
 
     fn assert_with_limit(
@@ -1070,96 +1086,26 @@ impl<V: Value<Type: Into<ArrayIrType>, DispatchDomain: AssertionContext>> Assert
         let inputs = std::iter::once(self.clone())
             .chain(observations.iter().map(|(_, input)| input.clone()))
             .collect::<Vec<_>>();
-        self.dispatch_domain().assert(operation, &inputs)
-    }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Context dispatch for [`Assert`]. Tracing elides known successes and stages potential failures. Transform
-/// contexts bind first so batching applies its empty-batch semantics, partial evaluation honors effect-folding
-/// policy, and differentiation retains assertions only in the primal computation.
-pub trait AssertionContext:
-    Context<Type: Into<ArrayIrType>, Operation: From<AssertOperation<<Self as Domain>::Type>>>
-{
-    /// Applies an assertion to parent-owned inputs after validating its complete signature.
-    fn assert(&self, operation: AssertOperation<Self::Type>, inputs: &[Self::Value]) -> Result<(), ProgramError> {
         operation
             .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-        self.bind(operation, Vec::new(), inputs)?;
+        let context = self.dispatch_domain();
+
+        // A validated success has no observable effect. False or unresolved conditions must reach normal binding
+        // so batching can handle empty batches and partial evaluation can preserve effect ordering.
+        if let ValueResolution::Constant(condition) = context.resolve(self) {
+            match condition.concretize() {
+                Ok(true) => return Ok(()),
+                Ok(false) | Err(ProgramError::Concretization { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        context.bind(operation, Vec::new(), &inputs)?;
         Ok(())
     }
 }
 
-// Concrete execution reaches the eager value capability through ordinary operation interpretation.
-impl<V: Value, O: Operation<Type = V::Type>> AssertionContext for EagerContext<V, O>
-where
-    Self: Context<Type = V::Type, Operation: From<AssertOperation<V::Type>>>,
-    V::Type: Into<ArrayIrType>,
-{
-}
-
-impl<C: AssertionContext, T: Type + Into<ArrayIrType>> AssertionContext for ProjectedContext<C, T>
-where
-    Self: Context<Type = T, Operation: From<AssertOperation<T>>>,
-    C::Value: ValueProjection<T, Projected = <Self as Domain>::Value>,
-{
-    fn assert(&self, operation: AssertOperation<T>, inputs: &[Self::Value]) -> Result<(), ProgramError> {
-        operation
-            .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-        self.parent().assert(
-            AssertOperation {
-                message: operation.message,
-                labels: operation.labels,
-                failure_limit: operation.failure_limit,
-                marker: PhantomData,
-            },
-            &inputs.iter().cloned().map(C::Value::from_projected).collect::<Vec<_>>(),
-        )
-    }
-}
-
-impl<V: AssertionValue, O: Operation<Type = V::Type> + From<AssertOperation<V::Type>>, C> AssertionContext
-    for TracingContext<V, O, C>
-where
-    V::Type: Into<ArrayIrType>,
-{
-    fn assert(&self, operation: AssertOperation<V::Type>, inputs: &[Self::Value]) -> Result<(), ProgramError> {
-        operation.bind_unless_known_true(self, inputs)
-    }
-}
-
-impl<C: Context> AssertionContext for NestedTracingContext<C>
-where
-    C::Type: Into<ArrayIrType>,
-    C::Constant: AssertionValue,
-    C::Operation: From<AssertOperation<C::Type>>,
-{
-    fn assert(&self, operation: AssertOperation<Self::Type>, inputs: &[Self::Value]) -> Result<(), ProgramError> {
-        operation.bind_unless_known_true(self, inputs)
-    }
-}
-
-impl<C: Context> AssertionContext for PartialEvaluationContext<C>
-where
-    Self: Context<Type = C::Type, Operation: From<AssertOperation<C::Type>>>,
-    C::Type: Into<ArrayIrType>,
-{
-}
-
-impl<C: Context, P: BatchingPolicy<C>> AssertionContext for BatchingContext<C, P>
-where
-    Self: Context<Type = C::Type, Operation: From<AssertOperation<C::Type>>>,
-    C::Type: Into<ArrayIrType>,
-{
-}
-
-impl<C: Context, P: DifferentiationPolicy<C>> AssertionContext for DifferentiationContext<C, P>
-where
-    Self: Context<Type = C::Type, Operation: From<AssertOperation<C::Type>>>,
-    C::Type: Into<ArrayIrType>,
-{
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents concrete values that can be inspected to check assertions and render their observations.
 /// Implementations preserve unsigned integer ranges when rendering scalar observations and provide an array view
@@ -1171,8 +1117,6 @@ pub trait AssertionValue: Value + Concretizable<bool> {
 
     /// Materializes an array for logical element inspection, or returns `None` for a non-array scalar value.
     fn assertion_array(&self) -> Result<Option<Array>, ProgramError>;
-
-    // TODO(eaplatanios): Review from here onwards.
 
     /// Validates and checks this concrete Boolean condition without binding an operation. Scalar assertions report
     /// their named observations on failure; a failure limit enables elementwise checking with a bounded sample of
@@ -1336,13 +1280,15 @@ mod tests {
 
     use crate::arrays::{ArrayBatch, ArrayIrBatch, ArrayIrOperation, ArrayOperation, DimensionBounds, Shape};
     use crate::batching::{BatchAxis, batch};
-    use crate::contexts::StagingContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::macros::check_operation_type_inference;
     use crate::operations::compare::Compare;
     use crate::operations::control_flow::ConditionOperation;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialTracer, PartialValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, Provenance, ProvenanceScope};
+
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -1511,6 +1457,14 @@ mod tests {
         let condition = partial.lift(Array::scalar(false).unwrap()).unwrap();
         let observation =
             PartialTracer::new(partial.clone(), partial.unknown_input(ArrayType::scalar(DataType::I32), 0));
+        // Known successes need no diagnostic values, even when a failure limit is configured.
+        let success = partial.lift(Array::scalar(true).unwrap()).unwrap();
+        assert_eq!(success.assert("known success", &[("value", observation.clone())]), Ok(()));
+        assert_eq!(
+            success.assert_with_limit("known success", &[("value", observation.clone())], NonZeroUsize::MIN),
+            Ok(()),
+        );
+        drop(success);
         condition.assert("residual failure", &[("value", observation.clone())]).unwrap();
         drop((condition, observation));
         let evaluation = partial.into_evaluation(Vec::new()).unwrap();
@@ -1895,6 +1849,16 @@ mod tests {
         assert!(context.builder().borrow().instructions().is_empty());
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let condition = context.lift(Array::scalar(true).unwrap()).unwrap();
+        // Validate observations before omitting a known success in either capability function.
+        let invalid = context.lift(Array::vector(vec![1_i32]).unwrap()).unwrap();
+        assert_eq!(
+            condition.assert("invalid observation", &[("value", invalid.clone())]),
+            Err(TypeError::invalid("assertion observation `value` has unsupported type `i32[1]`").into()),
+        );
+        assert_eq!(
+            condition.assert_with_limit("invalid observation", &[("value", invalid)], NonZeroUsize::MIN),
+            Err(TypeError::invalid("assertion observation `value` has unsupported type `i32[1]`").into()),
+        );
         let batching = BatchingContext::new(context.clone(), 3);
         AssertOperation::new("replicated true")
             .batch(&batching, &EmptyRegionDriver, &[ArrayBatch::replicated(condition)])

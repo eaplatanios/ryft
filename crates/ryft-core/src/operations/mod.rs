@@ -27,7 +27,7 @@ pub mod tagging;
 
 // TODO(eaplatanios): We should be importing specific symbols here wherever possible / relevant.
 pub use assertions::{
-    ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionContext, AssertionError, AssertionFailure, AssertionValue,
+    ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionError, AssertionFailure, AssertionValue,
 };
 pub use collectives::{
     ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelReduce, ParallelReduceOperation,
