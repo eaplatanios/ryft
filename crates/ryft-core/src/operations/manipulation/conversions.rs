@@ -469,14 +469,12 @@ impl ElementType for ArrayType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Converts elements numerically or reinterprets their encoding bits as another [`DataType`]. Numerical conversion
-/// preserves shape, sharding, and memory space. Byte-stride layouts are cleared when the element storage width changes;
-/// tiled layouts are preserved. Numerical conversion may narrow precision or change numerical category.
+/// preserves shape, sharding, and memory space. Byte-stride layouts are cleared when the element storage width
+/// changes; tiled layouts are preserved. Numerical conversion may narrow precision or change numerical category.
 /// [`Self::bitcast_element_type`] instead preserves encoding bits and changes the trailing shape when source and
-/// destination bit widths differ. [`Self::promote_element_type`] additionally checks that the requested conversion is
-/// permitted by the type promotion lattice.
+/// destination bit widths differ. [`Self::promote_element_type`] additionally checks that the requested conversion
+/// is permitted by the type promotion lattice.
 ///
 /// For the reference [`Array`] backend, [`ArrayElement::convert_to`](crate::ArrayElement::convert_to) defines
 /// per-element rounding, truncation, saturation, and exceptional-value handling. [`Array::converted_to`] documents
@@ -493,12 +491,12 @@ impl ElementType for ArrayType {
 /// # use ryft_core::{Array, ConvertElementType, DataType, ProgramError};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// let input = Array::vector(vec![1.75_f64, -2.5]).unwrap();
+/// let input = Array::vector(vec![1.75f64, -2.5]).unwrap();
 /// let output = input.convert_element_type(DataType::I32)?;
-/// assert_eq!(output, Array::vector(vec![1_i32, -2]).unwrap());
+/// assert_eq!(output, Array::vector(vec![1i32, -2]).unwrap());
 ///
-/// let input = Array::vector(vec![1.0_f32, 2.0]).unwrap();
-/// assert_eq!(input.promote_element_type(DataType::F64)?, Array::vector(vec![1.0_f64, 2.0]).unwrap());
+/// let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
+/// assert_eq!(input.promote_element_type(DataType::F64)?, Array::vector(vec![1.0f64, 2.0]).unwrap());
 /// # Ok(())
 /// # }
 /// ```
@@ -524,26 +522,26 @@ pub trait ConvertElementType: Sized {
     ///
     /// Core eager arrays order pieces from least to most significant bits, including padded sub-byte encodings.
     /// Equal-width conversions preserve layout; rank changes clear layout and preserve compatible sharding and memory.
-    /// Widening requires the consumed axis to be replicated when sharding is specified; partitioned or unconstrained
+    /// Widening requires the consumed axis to be replicated when sharding is specified. Partitioned or unconstrained
     /// trailing axes must be resharded first so all pieces of each output element are available on the same device.
     /// Boolean and complex elements support only identity reinterpretation. Tokens and structural zeros are rejected.
     /// Reinterpretation has a zero derivative, including when source and destination element types are equal. In the
     /// Ryft XLA backend, XLA lowering supports equal-width casts without finite dimension bounds. Rank-changing casts
     /// require finite bounds for physical allocation but this does not restrict core eager or symbolic type inference.
     ///
-    /// # Parameters
-    ///
-    ///   - `data_type`: Destination element encoding; it determines both the values and any trailing-axis change.
-    ///
     /// # Example
     ///
     /// ```
     /// # use ryft_core::{Array, ConvertElementType, DataType};
-    /// let pieces = Array::scalar(0x12345678_u32).unwrap().bitcast_element_type(DataType::U16)?;
-    /// assert_eq!(pieces, Array::vector(vec![0x5678_u16, 0x1234]).unwrap());
-    /// assert_eq!(pieces.bitcast_element_type(DataType::U32)?, Array::scalar(0x12345678_u32).unwrap());
+    /// let pieces = Array::scalar(0x12345678u32).unwrap().bitcast_element_type(DataType::U16)?;
+    /// assert_eq!(pieces, Array::vector(vec![0x5678u16, 0x1234]).unwrap());
+    /// assert_eq!(pieces.bitcast_element_type(DataType::U32)?, Array::scalar(0x12345678u32).unwrap());
     /// # Ok::<(), ryft_core::ProgramError>(())
     /// ```
+    ///
+    /// # Parameters
+    ///
+    ///   - `data_type`: Destination element encoding; it determines both the values and any trailing-axis change.
     fn bitcast_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>;
 
     /// Converts each element to `data_type` after checking [`DataType::promote_to`]. A conversion outside the promotion
@@ -558,8 +556,7 @@ pub trait ConvertElementType: Sized {
     #[inline]
     fn promote_element_type(&self, data_type: DataType) -> Result<Self, ProgramError>
     where
-        Self: Typed,
-        Self::Type: ElementType,
+        Self: Typed<Type: ElementType>,
     {
         self.r#type()
             .element_type()
@@ -572,7 +569,6 @@ pub trait ConvertElementType: Sized {
 impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<ConvertElementTypeOperation<V::Type>>>>>
     ConvertElementType for V
 {
-    #[inline]
     fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
         let operation = ConvertElementTypeOperation::<V::Type>::new(data_type, false);
         let input_type = self.r#type();
@@ -585,9 +581,8 @@ impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<Convert
         Ok(outputs.remove(0))
     }
 
-    #[inline]
     fn bitcast_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
-        // Even an identity bitcast must be staged: its declared derivative is zero rather than the identity.
+        // Even an identity bitcast must be staged. Its declared derivative is zero rather than the identity.
         let operation = ConvertElementTypeOperation::<V::Type>::new(data_type, true);
         let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
@@ -608,12 +603,14 @@ impl ConvertElementType for Array {
         if self.r#type().data_type() == data_type {
             return Ok(self.clone());
         }
+
         let input_bits = element_bit_width(self.r#type().data_type());
         let output_bits = element_bit_width(data_type);
         let bytes = self.logical_bytes();
         if input_bits >= 8 && output_bits >= 8 || input_bits == output_bits {
             return Array::from_logical_bytes(output_type, &bytes);
         }
+
         // Sub-byte host elements occupy separate padded bytes, so the meaningful bits are walked in logical order and
         // the padding is restored at each output element boundary instead of being reinterpreted as input data.
         let output_count = Array::materialized_element_count(&output_type)?;
@@ -629,9 +626,12 @@ impl ConvertElementType for Array {
                 element[bit / 8] |= value << (bit % 8);
             }
         }
+
         Array::from_logical_bytes(output_type, &output)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the number of meaningful encoding bits of one element of `data_type`, excluding the padding that sub-byte
 /// elements occupy in host storage.

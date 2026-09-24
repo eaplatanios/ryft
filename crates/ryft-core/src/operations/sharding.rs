@@ -1,30 +1,34 @@
 //! Operations that control how an array is distributed over a device mesh without changing its elements. Both are
 //! identity functions on their data and carry a target [`Sharding`]. They only differ in whether the type system tracks
 //! that sharding, which mirrors the split between JAX's [`reshard`](https://docs.jax.dev/en/latest/jax.sharding.html)
-//! and [`with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html)
+//! and [`with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html).
 //! This module provides the following:
 //!
 //!   - The [`Reshard`] value capability and the [`ReshardOperation`] it stages, which perform a tracked sharding
-//!     transition over [`Explicit`](MeshAxisType::Explicit) and [`Manual`](MeshAxisType::Manual) mesh axes. Type
+//!     transition over [`Explicit`](MeshAxisType::Explicit) mesh axes. Type
 //!     inference replaces the output's sharding with the requested one, so the transition is visible to every later
 //!     type check, and transposition reshards the cotangent to the dual of the input's sharding so that the input
 //!     cotangent is distributed like the input. Requests that name [`Auto`](MeshAxisType::Auto) axes are rejected,
 //!     because placement over those axes belongs to the compiler.
-//!   - The [`ConstrainSharding`] value capability and the [`ShardingConstraintOperation`] it stages, which record an
-//!     untracked propagation hint over [`Auto`](MeshAxisType::Auto) mesh axes. Type inference is the identity, so the
-//!     hint never becomes type-level state, transposition applies the same hint to the cotangent, and the hint only
-//!     takes effect when a backend lowers the program and its compiler propagates shardings. Requests that shard a
-//!     dimension over a non-auto axis are rejected in favor of a reshard.
+//!   - The [`ConstrainSharding`] value capability and the [`ShardingConstraintOperation`] it stages, which record a
+//!     sharding constraint over [`Auto`](MeshAxisType::Auto) mesh axes that the type system does not track. Type
+//!     inference is the identity, so the constraint never becomes type-level state, transposition applies the same
+//!     constraint to the cotangent, and the constraint is enforced when a backend lowers the program: the backend
+//!     compiler must place the value as requested over the auto axes, and remains free everywhere the constraint is
+//!     unconstrained. Requests that shard a dimension over a non-auto axis are rejected in favor of a reshard.
 //!
 //! Batching lifts both operations by inserting an entry for the new batch axis into the target sharding: a reshard
 //! takes the mapped axis's own sharding, whereas a constraint leaves the new axis unconstrained for the compiler to
 //! fill. Backends lower both to the same sharding-constraint construct (e.g., `sdy.sharding_constraint` in the XLA
-//! backend); the only difference at that boundary is whether the type system already tracked the result.
+//! backend). A reshard lowers its target as is, since that target is the tracked output sharding, whereas a constraint
+//! lowers the merge of the input's tracked placement with its own auto-axis placement (refer to the documentation of
+//! [`ShardingConstraintOperation::lowered_sharding`] for more information), so that the emitted constraint never
+//! contradicts the type the program was checked against.
 //!
 //! # Example
 //!
 //! A reshard changes the traced value's type, whereas a sharding constraint leaves it unchanged and only records the
-//! hint on the staged instruction:
+//! constraint on the staged instruction:
 //!
 //! ```rust
 //! # use ryft_core::{
@@ -37,9 +41,9 @@
 //!     MeshAxis::new("a", 2, MeshAxisType::Auto)?,
 //! ])?;
 //! let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])?;
-//! let hint = Sharding::new(mesh, vec![ShardingDimension::sharded(["a"])])?;
+//! let constraint = Sharding::new(mesh, vec![ShardingDimension::sharded(["a"])])?;
 //! let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-//!     |input| input.reshard(&target)?.constrain_sharding(&hint),
+//!     |input| input.reshard(&target)?.constrain_sharding(&constraint),
 //!     ArrayType::new_static(DataType::F32, [4]),
 //! )?;
 //! assert_eq!(output_type.sharding(), Some(&target));
@@ -77,10 +81,10 @@ pub const RESHARD_OPERATION_NAME: &str = "reshard";
 /// [`Operation`] that reshards its input to a target [`Sharding`], the analogue of JAX's
 /// [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html). The array's elements, shape, and data
 /// type are unchanged, and the output type carries the target sharding in place of the input's, extended with the
-/// manual axes the input varied over, since that variation is orthogonal to placement. The target may only name
-/// [`Explicit`](MeshAxisType::Explicit) and [`Manual`](MeshAxisType::Manual) mesh axes; placement over
-/// [`Auto`](MeshAxisType::Auto) axes is hinted with a [`ShardingConstraintOperation`] instead. Refer to the
-/// documentation of [`Reshard`] for more information.
+/// manual variation and reduction facts of its input. The target may only name
+/// [`Explicit`](MeshAxisType::Explicit) mesh axes. Placement over [`Auto`](MeshAxisType::Auto) axes belongs to the
+/// compiler and is constrained with a [`ShardingConstraintOperation`]; transitions over manual axes require their
+/// corresponding collectives. Refer to the documentation of [`Reshard`] for more information.
 ///
 /// Interpretation passes the value through and records the target on its type. Batching inserts the mapped axis's
 /// sharding into the target at the new batch axis. Differentiation reshards the tangent to the same target, and
@@ -148,17 +152,58 @@ impl Operation for ReshardOperation {
         {
             return Err(TypeError::invalid(format!(
                 "`{RESHARD_OPERATION_NAME}` cannot target auto mesh axes; use `{SHARDING_CONSTRAINT_OPERATION_NAME}` \
-                 to hint propagation over them"
+                 to constrain placement over them"
             )));
         }
-        // The resharded value still varies across whatever manual axes the input varied across; that fact is
-        // orthogonal to the requested placement, so it is carried over rather than taken from the target.
-        let varying_manual_axes =
-            input.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
+        if self
+            .sharding
+            .dimensions()
+            .iter()
+            .flat_map(|dimension| match dimension {
+                ShardingDimension::Sharded(axes) => axes.as_slice(),
+                _ => &[],
+            })
+            .chain(self.sharding.unreduced_axes())
+            .chain(self.sharding.reduced_axes())
+            .any(|axis| self.sharding.mesh().axis_type(axis) == Some(MeshAxisType::Manual))
+        {
+            return Err(TypeError::invalid(
+                "`reshard` cannot target manual mesh axes; use manual collectives for transitions over them",
+            ));
+        }
+        // Explicit redistribution preserves manual variation and reduction obligations. Their transitions belong
+        // to manual collectives, including when a cotangent dual swaps reduced and unreduced state.
+        let input_sharding = input.sharding();
+        let manual_unreduced = input_sharding
+            .into_iter()
+            .flat_map(|sharding| {
+                sharding
+                    .unreduced_axes()
+                    .iter()
+                    .filter(|axis| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Manual))
+            })
+            .cloned();
+        let manual_reduced = input_sharding
+            .into_iter()
+            .flat_map(|sharding| {
+                sharding
+                    .reduced_axes()
+                    .iter()
+                    .filter(|axis| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Manual))
+            })
+            .cloned();
         let sharding = self
             .sharding
             .clone()
-            .with_varying_manual_axes(varying_manual_axes)
+            .with_unreduced_axes(self.sharding.unreduced_axes().iter().cloned().chain(manual_unreduced))
+            .and_then(|sharding| {
+                sharding.with_reduced_axes(self.sharding.reduced_axes().iter().cloned().chain(manual_reduced))
+            })
+            .and_then(|sharding| {
+                sharding.with_varying_manual_axes(
+                    input_sharding.into_iter().flat_map(|sharding| sharding.varying_manual_axes()).cloned(),
+                )
+            })
             .map_err(|error| TypeError::invalid(error.to_string()))?;
         Ok(vec![input.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?])
     }
@@ -186,7 +231,8 @@ impl<C: Domain<Type = ArrayType, Value: Reshard>> InterpretableOperation<C> for 
 impl<C: Context> PartiallyEvaluatableOperation<C> for ReshardOperation where C::Operation: From<ReshardOperation> {}
 
 // Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
-// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension.
+// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension. Lifting needs
+// only the batch axis's position and placement, never its extent, so mapped axes with dynamic extents lift as well.
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ReshardOperation
 where
@@ -199,19 +245,11 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        // Validates that a mapped batch axis has a static size before lifting.
-        ArrayBatch::common_batch_size(inputs)?;
-        let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
-            Some(batch_axis) => {
-                let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
-                let lifted = self.sharding().batched(batch_axis, axis_sharding)?;
-                (lifted, Some(batch_axis))
-            }
-            None => (self.sharding().clone(), None),
+        let lifted_sharding = match inputs[0].batch_axis_position() {
+            Some(batch_axis) => self.sharding().batched(batch_axis, ArrayBatch::sharding_for_inputs(inputs)?)?,
+            None => self.sharding().clone(),
         };
-        Ok(ReshardOperation::new(lifted_sharding)
-            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])?
-            .into())
+        rebatch_geometry_preserving_output(context, &ReshardOperation::new(lifted_sharding), inputs)
     }
 }
 
@@ -251,7 +289,11 @@ impl_differentiable_operation! {
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
                     let contribution = match input_cotangent_type.sharding() {
-                        Some(input_cotangent_sharding) => cotangent.reshard(input_cotangent_sharding)?,
+                        Some(input_cotangent_sharding) => {
+                            // The operation carries only explicit placement; the input cotangent already carries
+                            // the preserved manual reduction state, so it must not be requested as a transition.
+                            cotangent.reshard(&input_cotangent_sharding.without_manual_reduction_axes())?
+                        },
                         None => cotangent.broadcast(
                             input_cotangent_type.clone(),
                             &(0..input_cotangent_type.shape().rank()).collect::<Vec<_>>(),
@@ -267,17 +309,15 @@ impl_differentiable_operation! {
 }
 
 /// Represents the ability to reshard a value to a target [`Sharding`]. [`Reshard`] stages a [`ReshardOperation`],
-/// which is an identity function on the array's elements whose output type carries the target sharding. The provided
-/// default returns the value unchanged, which is correct for concrete single-device values, for which a sharding only
-/// describes distribution metadata; context-carrying values stage the operation instead, so that transforms that apply
-/// operations through interpretation (e.g., program batching and re-tracing) preserve the resharding.
+/// which is an identity function on the array's elements whose output type carries the target sharding. Concrete
+/// single-device values record the target on their type and leave their payload untouched, and context-carrying values
+/// stage the operation instead, so that transforms that apply operations through interpretation (e.g., program
+/// batching and re-tracing) preserve the resharding. Every implementation validates the target exactly like
+/// [`ReshardOperation`] type inference does, so that eager and staged evaluation accept the same programs.
 pub trait Reshard: Clone {
     /// Reshards `self` to `sharding`, and returns a [`ProgramError`] if `sharding` is not a valid target for `self` or
     /// the resharding cannot be recorded in the value's context.
-    fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
-        let _ = sharding;
-        Ok(self.clone())
-    }
+    fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
 }
 
 // Any context-carrying value reshards by binding a [`ReshardOperation`] through its own context. The
@@ -300,41 +340,35 @@ where
 }
 
 // An `Array` is a concrete single-device value, so resharding is a no-op on its payload. Its type still records the
-// requested distribution metadata — mirroring the `ReshardOperation` type-inference rule, which carries the input's
-// varying manual axes over to the target sharding — so interpreted programs preserve their declared boundaries
-// exactly. An invalid target sharding is reported as an error, which the type-level validation performed before
-// interpretation rules out for staged programs.
+// target, and the output type comes from the `ReshardOperation` type-inference rule itself, so that eager evaluation
+// validates the target and carries the input's varying manual axes over exactly like staged programs do.
 impl Reshard for Array {
     fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
-        let varying_manual_axes =
-            self.r#type().sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
-        let sharding = sharding
-            .clone()
-            .with_varying_manual_axes(varying_manual_axes)
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        let r#type = self
-            .r#type()
-            .into_owned()
-            .with_sharding(sharding)
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        Ok(Self::new_unchecked(r#type, self.shared_storage().clone()))
+        let input_type = self.r#type().into_owned();
+        let mut output_types = ReshardOperation::new(sharding.clone()).infer_output_types(&[input_type], &[])?;
+        check_count!("output", output_types, 1, ProgramError);
+        Ok(Self::new_unchecked(output_types.remove(0), self.shared_storage().clone()))
     }
 }
 
 /// Canonical operation name for [`ShardingConstraintOperation`].
 pub const SHARDING_CONSTRAINT_OPERATION_NAME: &str = "sharding_constraint";
 
-/// [`Operation`] that records a sharding-propagation hint on its input, the analogue of JAX's
+/// [`Operation`] that constrains the placement of its input over [`Auto`](MeshAxisType::Auto) mesh axes, the analogue
+/// of JAX's
 /// [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html).
-/// Type inference is the identity, so the output type, sharding included, equals the input type and the hint never
-/// becomes type-level state; it only steers the backend compiler's sharding propagation over
-/// [`Auto`](MeshAxisType::Auto) mesh axes when the program is lowered. A hint that shards a dimension over a
-/// non-auto axis is rejected, because such placements are tracked transitions that belong to a [`ReshardOperation`].
-/// Refer to the documentation of [`ConstrainSharding`] for more information.
+/// Type inference is the identity, so the output type, sharding included, equals the input type and the constraint
+/// never becomes type-level state. The constraint is nevertheless binding: when the program is lowered, the backend
+/// compiler must place the value as requested over the auto axes and only remains free where the constraint is
+/// unconstrained. A constraint that shards a dimension over a non-auto axis is rejected, because such placements are
+/// tracked transitions that belong to a [`ReshardOperation`], and a constraint on a different mesh than the input's
+/// tracked sharding is rejected as well. Refer to the documentation of [`ConstrainSharding`] for more information.
 ///
 /// Interpretation passes the value through unchanged. Batching leaves the new batch axis unconstrained in the lifted
-/// hint, so that the compiler remains free to place it. Differentiation applies the same hint to the tangent, and the
-/// operation is self-adjoint under transposition, so the same hint applies to the cotangent as well.
+/// constraint, so that the compiler remains free to place it. Differentiation applies the same constraint to the
+/// tangent, and the operation is self-adjoint under transposition, so the same constraint applies to the cotangent as
+/// well. Backends lower [`lowered_sharding`](Self::lowered_sharding) rather than the constraint itself, so that the
+/// emitted constraint also carries the input's tracked placement.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ShardingConstraintOperation {
     /// Refer to the documentation of [`sharding`](Self::sharding) for more information.
@@ -342,16 +376,80 @@ pub struct ShardingConstraintOperation {
 }
 
 impl ShardingConstraintOperation {
-    /// Creates a new [`ShardingConstraintOperation`] that records `sharding` as a hint on its input.
+    /// Creates a new [`ShardingConstraintOperation`] that constrains the placement of its input to `sharding`.
     #[inline]
     pub fn new(sharding: Sharding) -> Self {
         Self { sharding }
     }
 
-    /// Returns the [`Sharding`] hint recorded for the backend's propagation over auto mesh axes.
+    /// Returns the [`Sharding`] constraint over auto mesh axes.
     #[inline]
     pub fn sharding(&self) -> &Sharding {
         &self.sharding
+    }
+
+    /// Returns the [`Sharding`] a backend must constrain an input of type `input_type` to. An input without a tracked
+    /// sharding is constrained to [`sharding`](Self::sharding) as is. Otherwise, the tracked placement is merged into
+    /// the constraint dimension by dimension, so that the emitted constraint never contradicts the type the program
+    /// was checked against: a tracked sharded dimension keeps its axes and gains the constraint's auto axes after them
+    /// (mirroring JAX's `with_sharding_constraint` lowering), or stays as is where the constraint is replicated or
+    /// unconstrained, whereas a tracked replicated dimension takes the constraint's entry, since a tracked type is
+    /// only replicated over the axes the type system governs and leaves the auto axes to the compiler. The tracked
+    /// unreduced, reduced, and varying manual axes are carried over as well.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_type`: Type of the input this operation is applied to, whose rank and mesh (if it carries a
+    ///     sharding) must match those of this constraint.
+    pub fn lowered_sharding(&self, input_type: &ArrayType) -> Result<Sharding, TypeError> {
+        let Some(tracked) = input_type.sharding() else {
+            return Ok(self.sharding.clone());
+        };
+        // A tracked type may still name auto axes (e.g., the actual placement of a concrete input), but placement
+        // over those axes is the compiler's to decide and exactly what this constraint overrides, so only the
+        // placement the type system governs is carried over.
+        let tracked = tracked.without_auto_axes();
+        if tracked.rank() != self.sharding.rank() {
+            return Err(TypeError::invalid(format!(
+                "`{SHARDING_CONSTRAINT_OPERATION_NAME}` rank ({}) does not match the input rank ({})",
+                self.sharding.rank(),
+                tracked.rank(),
+            )));
+        }
+        if tracked.mesh() != self.sharding.mesh() {
+            return Err(TypeError::invalid(format!(
+                "`{SHARDING_CONSTRAINT_OPERATION_NAME}` sharding {} is on a different mesh than the input sharding {}",
+                self.sharding, tracked,
+            )));
+        }
+        let dimensions = tracked
+            .dimensions()
+            .iter()
+            .zip(self.sharding.dimensions())
+            .map(|(tracked, constrained)| match (tracked, constrained) {
+                (ShardingDimension::Sharded(tracked_axes), ShardingDimension::Sharded(constrained_axes)) => {
+                    ShardingDimension::Sharded(tracked_axes.iter().chain(constrained_axes).cloned().collect())
+                }
+                (ShardingDimension::Sharded(_), ShardingDimension::Replicated | ShardingDimension::Unconstrained) => {
+                    tracked.clone()
+                }
+                (ShardingDimension::Replicated | ShardingDimension::Unconstrained, constrained) => constrained.clone(),
+            })
+            .collect();
+        self.sharding
+            .with_dimensions(dimensions)
+            .and_then(|sharding| {
+                sharding.with_unreduced_axes(tracked.unreduced_axes().union(self.sharding.unreduced_axes()).cloned())
+            })
+            .and_then(|sharding| {
+                sharding.with_reduced_axes(tracked.reduced_axes().union(self.sharding.reduced_axes()).cloned())
+            })
+            .and_then(|sharding| {
+                sharding.with_varying_manual_axes(
+                    tracked.varying_manual_axes().union(self.sharding.varying_manual_axes()).cloned(),
+                )
+            })
+            .map_err(|error| TypeError::invalid(error.to_string()))
     }
 }
 
@@ -379,13 +477,21 @@ impl Operation for ShardingConstraintOperation {
         let input = &input_types[0];
         if input.rank() != self.sharding.rank() {
             return Err(TypeError::invalid(format!(
-                "`{SHARDING_CONSTRAINT_OPERATION_NAME}` hint rank ({}) does not match the input rank ({})",
+                "`{SHARDING_CONSTRAINT_OPERATION_NAME}` rank ({}) does not match the input rank ({})",
                 self.sharding.rank(),
                 input.rank(),
             )));
         }
-        // The hint may only place dimensions over auto axes, which are the axes the compiler propagates; naming an
-        // explicit or manual axis is the mirror image of the auto-axis rejection of `reshard`.
+        if let Some(tracked) = input.sharding()
+            && tracked.mesh() != self.sharding.mesh()
+        {
+            return Err(TypeError::invalid(format!(
+                "`{SHARDING_CONSTRAINT_OPERATION_NAME}` sharding {} is on a different mesh than the input sharding {}",
+                self.sharding, tracked,
+            )));
+        }
+        // The constraint may only place dimensions over auto axes, which are the axes the compiler propagates; naming
+        // an explicit or manual axis is the mirror image of the auto-axis rejection of `reshard`.
         for dimension in self.sharding.dimensions() {
             let ShardingDimension::Sharded(axis_names) = dimension else {
                 continue;
@@ -395,13 +501,13 @@ impl Operation for ShardingConstraintOperation {
                 .find(|axis_name| self.sharding.mesh().axis_type(axis_name) != Some(MeshAxisType::Auto))
             {
                 return Err(TypeError::invalid(format!(
-                    "`{SHARDING_CONSTRAINT_OPERATION_NAME}` can only hint placement over auto mesh axes but \
-                     `{axis_name}` is not one; use `{RESHARD_OPERATION_NAME}` for explicit or manual axes"
+                    "`{SHARDING_CONSTRAINT_OPERATION_NAME}` can only constrain placement over auto mesh axes but \
+                     `{axis_name}` is not one; use `{RESHARD_OPERATION_NAME}` for explicit axes"
                 )));
             }
         }
-        // The hint is untracked: the output type, sharding included, is identical to the input, and the requested
-        // sharding only takes effect when the backend lowers the operation.
+        // The constraint is untracked: the output type, sharding included, is identical to the input, and the
+        // constraint is enforced only when the backend lowers the operation.
         Ok(vec![input.clone()])
     }
 
@@ -419,8 +525,8 @@ impl<C: Domain<Type = ArrayType, Value: ConstrainSharding>> InterpretableOperati
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        // The hint flows through the capability so interpretation over staging values preserves it; concrete values
-        // pass through unchanged.
+        // The constraint flows through the capability so interpretation over staging values preserves it; concrete
+        // values pass through unchanged.
         Ok(vec![inputs[0].constrain_sharding(&self.sharding)?])
     }
 }
@@ -430,10 +536,11 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for ShardingConstraintOperatio
 {
 }
 
-// Batching rule for [`ShardingConstraintOperation`]. The lifted hint gains a [`ShardingDimension::Unconstrained`]
-// entry at the new batch dimension: the hint governs only the compiler-propagated auto axes, so the new dimension
-// is left open for the backend to fill rather than pinned to a derived or replicated entry (matching JAX's
-// `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
+// Batching rule for [`ShardingConstraintOperation`]. The lifted constraint gains a
+// [`ShardingDimension::Unconstrained`] entry at the new batch dimension: the constraint governs only the
+// compiler-propagated auto axes, so the new dimension is left open for the backend to fill rather than pinned to a
+// derived or replicated entry (matching JAX's `with_sharding_constraint` batcher, which inserts
+// `PartitionSpec.UNCONSTRAINED`). Like the reshard rule, lifting never needs the batch axis's extent.
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ShardingConstraintOperation
 where
@@ -446,18 +553,11 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        // Validates that a mapped batch axis has a static size before lifting.
-        ArrayBatch::common_batch_size(inputs)?;
-        let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
-            Some(batch_axis) => {
-                let lifted = self.sharding().batched(batch_axis, ShardingDimension::Unconstrained)?;
-                (lifted, Some(batch_axis))
-            }
-            None => (self.sharding().clone(), None),
+        let lifted_sharding = match inputs[0].batch_axis_position() {
+            Some(batch_axis) => self.sharding().batched(batch_axis, ShardingDimension::Unconstrained)?,
+            None => self.sharding().clone(),
         };
-        Ok(ShardingConstraintOperation::new(lifted_sharding)
-            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])?
-            .into())
+        rebatch_geometry_preserving_output(context, &ShardingConstraintOperation::new(lifted_sharding), inputs)
     }
 }
 
@@ -470,9 +570,7 @@ impl_differentiable_operation! {
         C::Value: ConstrainSharding,
     {
         |operation, _context, _driver, inputs| {
-            // Forward-mode rule for [`ShardingConstraintOperation`]: the sharding hint is linear, so the same hint
-            // applies to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this
-            // rule is consulted, so the operand tangent reaching here is always live.
+            // The constraint is linear, so the same constraint applies to the tangent as to the primal.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().constrain_sharding(operation.sharding())?;
             let tangent = match inputs[0].tangent() {
@@ -488,10 +586,9 @@ impl_differentiable_operation! {
         O: Operation<Type = ArrayType> + From<ShardingConstraintOperation>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Transpose rule for [`ShardingConstraintOperation`]: the operation is self-adjoint, so the cotangent of
-            // the output is constrained by the *same* hint (mirroring JAX registering `with_sharding_constraint` with
-            // `ad.deflinear2`). Unlike [`ReshardOperation`], the input's sharding is not consulted — the hint is the
-            // operation's own.
+            // The operation is self-adjoint, so the output cotangent is constrained by the same constraint (mirroring
+            // JAX registering `with_sharding_constraint` with `ad.deflinear2`). Unlike [`ReshardOperation`], the
+            // input's sharding is not consulted, because the constraint is the operation's own.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -507,18 +604,16 @@ impl_differentiable_operation! {
     },
 }
 
-/// Represents the ability to record a sharding-propagation hint on a value. [`ConstrainSharding`] stages a
-/// [`ShardingConstraintOperation`], which is an identity function whose hint only takes effect when a backend lowers
-/// the program. The provided default returns the value unchanged, which is correct for concrete single-device values;
-/// context-carrying values stage the operation instead, so that transforms that apply operations through
-/// interpretation preserve the hint.
+/// Represents the ability to constrain the placement of a value over auto mesh axes. [`ConstrainSharding`] stages a
+/// [`ShardingConstraintOperation`], which is an identity function whose constraint is enforced when a backend lowers
+/// the program. Concrete single-device values are returned unchanged, and context-carrying values stage the operation
+/// instead, so that transforms that apply operations through interpretation preserve the constraint. Every
+/// implementation validates the constraint exactly like [`ShardingConstraintOperation`] type inference does, so that
+/// eager and staged evaluation accept the same programs.
 pub trait ConstrainSharding: Clone {
-    /// Records `sharding` as a propagation hint on `self`, and returns a [`ProgramError`] if the hint cannot be
-    /// recorded in the value's context.
-    fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
-        let _ = sharding;
-        Ok(self.clone())
-    }
+    /// Constrains the placement of `self` to `sharding`, and returns a [`ProgramError`] if `sharding` is not a valid
+    /// constraint for `self` or the constraint cannot be recorded in the value's context.
+    fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
 }
 
 // Any context-carrying value constrains its sharding by binding a [`ShardingConstraintOperation`] through its own
@@ -541,20 +636,52 @@ where
     }
 }
 
-// The sharding-constraint hint is untracked: the output type (sharding included) is identical to the input, so the
-// identity default is exactly the `ShardingConstraintOperation` interpretation contract for a concrete value.
-impl ConstrainSharding for Array {}
+// The constraint is untracked, so the output of a concrete single-device value is the value itself once the
+// `ShardingConstraintOperation` type-inference rule has accepted the constraint for its type.
+impl ConstrainSharding for Array {
+    fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
+        let input_type = self.r#type().into_owned();
+        ShardingConstraintOperation::new(sharding.clone()).infer_output_types(&[input_type], &[])?;
+        Ok(self.clone())
+    }
+}
+
+/// Interprets the lifted geometry-preserving `operation` on the packed value of the single batch in `inputs` and
+/// repackages its output with that batch's axis and bounded ragged axes. Both sharding-control operations leave the
+/// packed geometry untouched, so every piece of batch metadata carries over as is.
+fn rebatch_geometry_preserving_output<C, P, O>(
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+    operation: &O,
+    inputs: &[ArrayBatch<C::Value>],
+) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    P: ArrayExtentBatchingPolicy<C>,
+    O: InterpretableOperation<C>,
+{
+    check_count!("input", inputs, 1, ProgramError);
+    let batch_axis = BatchAxis::from_optional_position(inputs[0].batch_axis_position());
+    let mut outputs = operation.interpret_with_batch_axes(context, inputs, &[batch_axis])?;
+    check_count!("output", outputs, 1, ProgramError);
+    let output = ArrayBatch::new(outputs.remove(0).into_value(), batch_axis)?
+        .with_ragged_axes(inputs[0].ragged_axes().to_vec())?;
+    Ok(vec![output].into())
+}
 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, DataType, LogicalMesh, MeshAxis, f8e8m0fnu};
+    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
+        DimensionVariable, LogicalMesh, MeshAxis, RaggedAxis, Shape, f8e8m0fnu,
+    };
     use crate::batching::{BatchAxis, batch};
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::differentiate_at;
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
-    use crate::programs::{EffectClasses, EmptyRegionDriver};
+    use crate::programs::{EffectClasses, EmptyRegionDriver, ValueProjection};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -612,11 +739,11 @@ mod tests {
         );
 
         // Placement over auto axes belongs to the compiler, whether the axis shards a dimension or carries reduction
-        // state, and the operation cannot own nested regions.
+        // state.
         let auto_target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         let auto_error = format!(
             "`{RESHARD_OPERATION_NAME}` cannot target auto mesh axes; use `{SHARDING_CONSTRAINT_OPERATION_NAME}` to \
-             hint propagation over them"
+             constrain placement over them"
         );
         check_operation_type_inference!(
             operation = ReshardOperation::new(auto_target),
@@ -625,7 +752,7 @@ mod tests {
                 error = auto_error.clone(),
             }],
         );
-        let auto_unreduced_target = Sharding::replicated(mesh, 1).with_unreduced_axes(["a"]).unwrap();
+        let auto_unreduced_target = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["a"]).unwrap();
         check_operation_type_inference!(
             operation = ReshardOperation::new(auto_unreduced_target),
             cases = [{
@@ -633,6 +760,35 @@ mod tests {
                 error = auto_error,
             }],
         );
+
+        // Explicit redistribution preserves manual reduction obligations; targets cannot create or discharge them.
+        let unreduced_input_type = input_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["m"]).unwrap())
+            .unwrap();
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(target.clone()),
+            cases = [{
+                input_types = [unreduced_input_type],
+                output_types = [input_type.clone().with_sharding(target.clone().with_unreduced_axes(["m"]).unwrap()).unwrap()],
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["m"]).unwrap()),
+            cases = [{
+                input_types = [input_type.clone()],
+                error = "`reshard` cannot target manual mesh axes; use manual collectives for transitions over them",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(Sharding::new(mesh, vec![ShardingDimension::sharded(["m"])]).unwrap()),
+            cases = [{
+                input_types = [input_type.clone()],
+                error = "`reshard` cannot target manual mesh axes; use manual collectives for transitions over them",
+            }],
+        );
+
+        // The operation cannot own nested regions.
         assert_eq!(
             ReshardOperation::new(target).infer_output_types(
                 std::slice::from_ref(&input_type),
@@ -696,6 +852,44 @@ mod tests {
             panic!("expected the batched program to stage a reshard operation");
         };
         assert_eq!(operation.sharding(), &expected_lifted);
+
+        // Resharding preserves the packed geometry, so a bounded ragged axis on the input carries over to the output.
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
+        let array =
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1_f32, 2., 3., 4., 5., 6.]).unwrap();
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 3]).unwrap();
+        let input = ArrayBatch::new(array, BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, extents, variable, vec![0])])
+            .unwrap();
+        let ragged_axes = input.ragged_axes().to_vec();
+        let (outputs, _) = ReshardOperation::new(target.clone())
+            .batch(&context, &EmptyRegionDriver, &[input])
+            .unwrap()
+            .into_parts();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis_position(), Some(0));
+        assert_eq!(outputs[0].ragged_axes(), ragged_axes.as_slice());
+        assert_eq!(outputs[0].r#type().sharding(), Some(&expected_lifted));
+
+        // Lifting needs only the batch axis's position and placement, so a mapped axis with a dynamic extent lifts.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+        let extent = trace.input(DimensionType::from(items.clone()).into());
+        let shape = Shape::new(vec![Dimension::Dynamic(items), Dimension::Static(3)]);
+        let input = trace.input(ArrayType::new(DataType::F32, shape.clone()).into());
+        let input = <_ as ValueProjection<ArrayType>>::into_projected(input).unwrap();
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(trace),
+            extent,
+        );
+        let input = ArrayBatch::new(input, BatchAxis::new(0)).unwrap();
+        let (outputs, _) =
+            ReshardOperation::new(target).batch(&context, &EmptyRegionDriver, &[input]).unwrap().into_parts();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].r#type().shape(), &shape);
+        assert_eq!(outputs[0].r#type().sharding(), Some(&expected_lifted));
     }
 
     #[test]
@@ -722,13 +916,19 @@ mod tests {
         )
         .unwrap();
         let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let (_, pullback) = differentiate_at(input).vjp(|x| x.reshard(&target)).unwrap();
+        let input_cotangent_type = input.r#type().cotangent().unwrap();
+        let (output, pullback) = differentiate_at(input).vjp(|x| x.reshard(&target)).unwrap();
+        let cotangent = pullback
+            .apply(Array::from_elements::<f64>(output.r#type().cotangent().unwrap(), &[1.0; 8]).unwrap())
+            .unwrap();
+        assert_eq!(cotangent.r#type().as_ref(), &input_cotangent_type);
+        assert_eq!(cotangent.to_f64s(), vec![1.0; 8]);
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
         let staged = pullback.instructions().iter().find_map(|instruction| match instruction.operation() {
             ArrayOperation::Reshard(operation) => Some(operation.sharding().clone()),
             _ => None,
         });
-        assert_eq!(staged, Some(input_sharding.cotangent()));
+        assert_eq!(staged, Some(Sharding::replicated(input_sharding.mesh().clone(), 1)));
     }
 
     #[test]
@@ -773,41 +973,51 @@ mod tests {
             &[1.0, 2.0],
         )
         .unwrap();
-        let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let resharded = input.reshard(&target).unwrap();
         assert_eq!(resharded.r#type().sharding(), Some(&target.clone().with_varying_manual_axes(["m"]).unwrap()));
         assert_eq!(resharded.storage_bytes(), input.storage_bytes());
 
-        // A target on a mesh without the input's varying manual axes is not a valid destination.
-        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let other_target = Sharding::new(other_mesh, vec![ShardingDimension::sharded(["y"])]).unwrap();
-        assert!(matches!(input.reshard(&other_target), Err(ProgramError::Type(TypeError::Invalid { .. }))));
+        // Eager evaluation validates the target exactly like staged programs do.
+        assert!(matches!(
+            input.reshard(&Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!(
+                    "`{RESHARD_OPERATION_NAME}` cannot target auto mesh axes; use \
+                     `{SHARDING_CONSTRAINT_OPERATION_NAME}` to constrain placement over them"
+                ),
+        ));
+        assert!(matches!(
+            input.reshard(&Sharding::replicated(mesh, 2)),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`reshard` target sharding rank (2) does not match the input rank (1)",
+        ));
     }
 
     #[test]
     fn test_sharding_constraint() {
-        let hint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
-        let operation = ShardingConstraintOperation::new(hint.clone());
+        let constraint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let operation = ShardingConstraintOperation::new(constraint.clone());
 
         // Operation identity, accessors, and rendering.
         assert_eq!(operation.name(), SHARDING_CONSTRAINT_OPERATION_NAME);
-        assert_eq!(operation.sharding(), &hint);
-        assert_eq!(operation.to_string(), format!("sharding_constraint [sharding={hint}]"));
+        assert_eq!(operation.sharding(), &constraint);
+        assert_eq!(operation.to_string(), format!("sharding_constraint [sharding={constraint}]"));
     }
 
     #[test]
     fn test_sharding_constraint_type_inference() {
         let mesh = mesh();
-        let hint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let constraint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [8]);
         let sharded_input_type = input_type
             .clone()
             .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
         // Inference is the identity: the input type passes through untouched, whether or not it carries a sharding of
-        // its own, and the hint never appears on it.
+        // its own, and the constraint never appears on it.
         check_operation_type_inference!(
-            operation = ShardingConstraintOperation::new(hint.clone()),
+            operation = ShardingConstraintOperation::new(constraint.clone()),
             cases = [{
                 input_types = [input_type.clone()],
                 output_types = [input_type.clone()],
@@ -816,27 +1026,38 @@ mod tests {
                 output_types = [sharded_input_type],
             }, {
                 input_types = [ArrayType::new_static(DataType::F32, [8, 2])],
-                error = "`sharding_constraint` hint rank (1) does not match the input rank (2)",
+                error = "`sharding_constraint` rank (1) does not match the input rank (2)",
             }, {
                 input_types = [],
                 error = "expected 1 input but got 0",
             }],
         );
 
-        // Placement over explicit or manual axes is a tracked transition, and the operation cannot own nested regions.
-        let explicit_hint = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        // A tracked sharding on another mesh cannot be merged with the constraint, placement over explicit or manual
+        // axes is a tracked transition, and the operation cannot own nested regions.
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let other_input_type = input_type.clone().with_sharding(Sharding::replicated(other_mesh, 1)).unwrap();
         check_operation_type_inference!(
-            operation = ShardingConstraintOperation::new(explicit_hint),
+            operation = ShardingConstraintOperation::new(constraint.clone()),
+            cases = [{
+                input_types = [other_input_type],
+                error = "`sharding_constraint` sharding {mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'a'}]} \
+                         is on a different mesh than the input sharding {mesh<['y'=2:explicit]>, [{}]}",
+            }],
+        );
+        let explicit_constraint = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        check_operation_type_inference!(
+            operation = ShardingConstraintOperation::new(explicit_constraint),
             cases = [{
                 input_types = [input_type.clone()],
                 error = format!(
-                    "`{SHARDING_CONSTRAINT_OPERATION_NAME}` can only hint placement over auto mesh axes but `x` is \
-                     not one; use `{RESHARD_OPERATION_NAME}` for explicit or manual axes"
+                    "`{SHARDING_CONSTRAINT_OPERATION_NAME}` can only constrain placement over auto mesh axes but `x` \
+                     is not one; use `{RESHARD_OPERATION_NAME}` for explicit axes"
                 ),
             }],
         );
         assert_eq!(
-            ShardingConstraintOperation::new(hint).infer_output_types(
+            ShardingConstraintOperation::new(constraint).infer_output_types(
                 std::slice::from_ref(&input_type),
                 &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)],
             ),
@@ -845,11 +1066,123 @@ mod tests {
     }
 
     #[test]
+    fn test_sharding_constraint_lowered_sharding() {
+        let mesh = mesh();
+        let constraint = Sharding::new(
+            mesh.clone(),
+            vec![
+                ShardingDimension::sharded(["a"]),
+                ShardingDimension::replicated(),
+                ShardingDimension::unconstrained(),
+            ],
+        )
+        .unwrap();
+        let operation = ShardingConstraintOperation::new(constraint.clone());
+        let input_type = ArrayType::new_static(DataType::F32, [8, 4, 2]);
+
+        // An input without a tracked sharding is constrained to the constraint as is.
+        assert_eq!(operation.lowered_sharding(&input_type), Ok(constraint));
+
+        // A tracked sharded dimension keeps its axes and gains the constraint's auto axes after them, or stays as is
+        // where the constraint is replicated or unconstrained, whereas a tracked replicated dimension takes the
+        // constraint's entry. Tracked variation and reduction state carries over.
+        let tracked = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["m"]), ShardingDimension::replicated()],
+        )
+        .unwrap()
+        .with_varying_manual_axes(["m"])
+        .unwrap();
+        assert_eq!(
+            operation.lowered_sharding(&input_type.clone().with_sharding(tracked).unwrap()),
+            Ok(Sharding::new(
+                mesh.clone(),
+                vec![
+                    ShardingDimension::sharded(["x", "a"]),
+                    ShardingDimension::sharded(["m"]),
+                    ShardingDimension::unconstrained(),
+                ],
+            )
+            .unwrap()
+            .with_varying_manual_axes(["m"])
+            .unwrap()),
+        );
+        let tracked = Sharding::replicated(mesh.clone(), 3).with_unreduced_axes(["x"]).unwrap();
+        assert_eq!(
+            operation.lowered_sharding(&input_type.clone().with_sharding(tracked).unwrap()),
+            Ok(Sharding::new(
+                mesh.clone(),
+                vec![
+                    ShardingDimension::sharded(["a"]),
+                    ShardingDimension::replicated(),
+                    ShardingDimension::unconstrained(),
+                ],
+            )
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap()),
+        );
+        let tracked = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            operation.lowered_sharding(&input_type.clone().with_sharding(tracked).unwrap()),
+            Ok(Sharding::new(
+                mesh.clone(),
+                vec![
+                    ShardingDimension::sharded(["a"]),
+                    ShardingDimension::sharded(["x"]),
+                    ShardingDimension::unconstrained(),
+                ],
+            )
+            .unwrap()),
+        );
+
+        // Tracked placement over auto axes is the compiler's to decide and is overridden by the constraint.
+        let tracked = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["a"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        assert_eq!(
+            operation.lowered_sharding(&input_type.clone().with_sharding(tracked).unwrap()),
+            Ok(Sharding::new(
+                mesh.clone(),
+                vec![
+                    ShardingDimension::sharded(["a"]),
+                    ShardingDimension::replicated(),
+                    ShardingDimension::unconstrained(),
+                ],
+            )
+            .unwrap()),
+        );
+
+        // A tracked sharding on another mesh or of another rank cannot be merged.
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        assert_eq!(
+            operation.lowered_sharding(&input_type.clone().with_sharding(Sharding::replicated(other_mesh, 3)).unwrap()),
+            Err(TypeError::invalid(
+                "`sharding_constraint` sharding {mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'a'}, {}, {?}]} \
+                 is on a different mesh than the input sharding {mesh<['y'=2:explicit]>, [{}, {}, {}]}"
+            )),
+        );
+        assert_eq!(
+            operation.lowered_sharding(
+                &ArrayType::new_static(DataType::F32, [8]).with_sharding(Sharding::replicated(mesh, 1)).unwrap()
+            ),
+            Err(TypeError::invalid("`sharding_constraint` rank (3) does not match the input rank (1)")),
+        );
+    }
+
+    #[test]
     fn test_sharding_constraint_interpretation() {
         let mesh = mesh();
-        let hint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
-        let operation = ShardingConstraintOperation::new(hint);
-        // An untracked hint preserves the payload and all existing type metadata, including manual-axis variation.
+        let constraint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let operation = ShardingConstraintOperation::new(constraint);
+        // An untracked constraint preserves the payload and all existing type metadata, including manual-axis
+        // variation.
         let input = Array::from_elements::<f64>(
             ArrayType::new_static(DataType::F64, [2])
                 .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
@@ -869,9 +1202,9 @@ mod tests {
 
     #[test]
     fn test_sharding_constraint_partial_evaluation() {
-        let hint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let constraint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         check_operation_partial_evaluation!(
-            operation = ShardingConstraintOperation::new(hint),
+            operation = ShardingConstraintOperation::new(constraint),
             inputs = [Array::vector(vec![1.0_f32, 2.0]).unwrap()],
             expected = Array::vector(vec![1.0_f32, 2.0]).unwrap(),
         );
@@ -879,14 +1212,20 @@ mod tests {
 
     #[test]
     fn test_sharding_constraint_batching() {
-        // The hint governs only the compiler-propagated auto axes, so batching leaves the new batch axis unconstrained
-        // for the backend to fill rather than pinning it to a derived or replicated entry.
-        let hint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
-        let expected_lifted = hint.with_inserted_dimension(0, ShardingDimension::Unconstrained).unwrap();
+        // The constraint governs only the compiler-propagated auto axes, so batching leaves the new batch axis
+        // unconstrained for the backend to fill rather than pinning it to a derived or replicated entry.
+        let constraint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let expected_lifted = constraint.with_inserted_dimension(0, ShardingDimension::Unconstrained).unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
-                let hint = hint.clone();
-                Ok(batch(move |item| item.constrain_sharding(&hint), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
+                let constraint = constraint.clone();
+                Ok(batch(
+                    move |item| item.constrain_sharding(&constraint),
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )?)
             },
             ArrayType::new_static(DataType::F64, [2, 3]),
         )
@@ -895,19 +1234,60 @@ mod tests {
             panic!("expected the batched program to stage a sharding_constraint operation");
         };
         assert_eq!(operation.sharding(), &expected_lifted);
+
+        // The constraint preserves the packed geometry, so a bounded ragged axis on the input carries over to the
+        // output.
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
+        let array =
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1_f32, 2., 3., 4., 5., 6.]).unwrap();
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 3]).unwrap();
+        let input = ArrayBatch::new(array.clone(), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, extents, variable, vec![0])])
+            .unwrap();
+        let ragged_axes = input.ragged_axes().to_vec();
+        let (outputs, _) = ShardingConstraintOperation::new(constraint.clone())
+            .batch(&context, &EmptyRegionDriver, &[input])
+            .unwrap()
+            .into_parts();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis_position(), Some(0));
+        assert_eq!(outputs[0].ragged_axes(), ragged_axes.as_slice());
+        assert_eq!(outputs[0].value(), &array);
+
+        // Lifting needs only the batch axis's position, so a mapped axis with a dynamic extent lifts.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+        let extent = trace.input(DimensionType::from(items.clone()).into());
+        let shape = Shape::new(vec![Dimension::Dynamic(items), Dimension::Static(3)]);
+        let input = trace.input(ArrayType::new(DataType::F32, shape.clone()).into());
+        let input = <_ as ValueProjection<ArrayType>>::into_projected(input).unwrap();
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(trace),
+            extent,
+        );
+        let input = ArrayBatch::new(input, BatchAxis::new(0)).unwrap();
+        let (outputs, _) = ShardingConstraintOperation::new(constraint)
+            .batch(&context, &EmptyRegionDriver, &[input])
+            .unwrap()
+            .into_parts();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].r#type().shape(), &shape);
+        assert_eq!(outputs[0].r#type().sharding(), None);
     }
 
     #[test]
     fn test_sharding_constraint_differentiation() {
-        // The hint is linear, so the JVP applies the same hint to the primal and to the tangent.
-        let hint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        // The constraint is linear, so the JVP applies the same constraint to the primal and to the tangent.
+        let constraint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |x| x.constrain_sharding(&hint),
+            |x| x.constrain_sharding(&constraint),
             ArrayType::new_static(DataType::F32, [4]),
         )
         .unwrap();
         let jvp = program.to_flat_program().jvp().unwrap();
-        let hints = jvp
+        let constraints = jvp
             .instructions()
             .iter()
             .map(|instruction| match instruction.operation() {
@@ -915,29 +1295,46 @@ mod tests {
                 operation => panic!("expected only sharding constraints but got `{operation}`"),
             })
             .collect::<Vec<_>>();
-        assert_eq!(hints, vec![hint.clone(), hint]);
+        assert_eq!(constraints, vec![constraint.clone(), constraint]);
     }
 
     #[test]
     fn test_sharding_constraint_transposition() {
-        // The constraint is self-adjoint, so its transpose re-applies the same hint to the cotangent rather than
+        // The constraint is self-adjoint, so its transpose re-applies the same constraint to the cotangent rather than
         // dualizing it.
-        let hint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
-        let (_, pullback) =
-            differentiate_at(Array::vector(vec![1.0; 8]).unwrap()).vjp(|x| x.constrain_sharding(&hint)).unwrap();
+        let constraint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let (_, pullback) = differentiate_at(Array::vector(vec![1.0; 8]).unwrap())
+            .vjp(|x| x.constrain_sharding(&constraint))
+            .unwrap();
         let (pullback, _) = pullback.into_transposed_parts().unwrap();
         let staged = pullback.instructions().iter().find_map(|instruction| match instruction.operation() {
             ArrayOperation::ShardingConstraint(operation) => Some(operation.sharding().clone()),
             _ => None,
         });
-        assert_eq!(staged, Some(hint));
+        assert_eq!(staged, Some(constraint));
     }
 
     #[test]
     fn test_array_constrain_sharding() {
-        // The hint is metadata for lowering only, so a concrete array is returned unchanged.
-        let hint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        // The constraint is metadata for lowering only, so a concrete array is returned unchanged.
+        let mesh = mesh();
+        let constraint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         let input = Array::vector(vec![1.0_f32, 2.0]).unwrap();
-        assert_eq!(input.constrain_sharding(&hint), Ok(input));
+        assert_eq!(input.constrain_sharding(&constraint), Ok(input.clone()));
+
+        // Eager evaluation validates the constraint exactly like staged programs do.
+        assert!(matches!(
+            input.constrain_sharding(&Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == format!(
+                    "`{SHARDING_CONSTRAINT_OPERATION_NAME}` can only constrain placement over auto mesh axes but `x` \
+                     is not one; use `{RESHARD_OPERATION_NAME}` for explicit axes"
+                ),
+        ));
+        assert!(matches!(
+            input.constrain_sharding(&Sharding::replicated(mesh, 2)),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`sharding_constraint` rank (2) does not match the input rank (1)",
+        ));
     }
 }
