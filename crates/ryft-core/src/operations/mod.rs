@@ -5,7 +5,7 @@ use crate::programs::{Operation, TypeError};
 pub mod assertions;
 pub mod attention;
 pub mod collectives;
-pub mod compare;
+pub mod comparisons;
 pub mod complex;
 pub mod constants;
 pub mod control_flow;
@@ -33,7 +33,7 @@ pub use collectives::{
     ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelReduce, ParallelReduceOperation,
     ParallelReductionKind, ParallelVary, ParallelVaryOperation, forward_collective_to_parent,
 };
-pub use compare::*;
+pub use comparisons::*;
 pub use constants::*;
 pub use control_flow::*;
 pub use cumulative::*;

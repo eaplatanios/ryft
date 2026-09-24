@@ -6,7 +6,7 @@ use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, dispatch_on_array_element_type,
     impl_differentiable_operation,
 };
-use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
 use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;

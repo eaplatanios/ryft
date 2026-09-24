@@ -2795,7 +2795,7 @@ mod tests {
     use crate::differentiation::{
         Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::constant::Constant;
     use crate::operations::constants::fill::Fill;
     use crate::operations::constants::iota::Iota;

@@ -119,8 +119,12 @@ update this file so that they do not need to remind you again in the future.
   `ArrayIrValue`, `ProjectedContext`, `StagingContext`, `PartialEvaluationContext`, `BatchingContext`,
   `DifferentiationContext`, and `TranspositionContext`. Keep shared blanket implementations and substantial helper
   submodules shared rather than duplicating them to reproduce this ordering at each call site.
+- Keep domain-specific construction and transform-specific execution policy out of the central `Operation` trait.
+  Prefer existing operation providers and the owning transform's validated execution path; add a core hook only when
+  a general operation contract requires it, rather than to simplify one domain's dispatch.
 - Keep core reference validation independent of transform-specific argument roles and policies. Let callers supply
-  diagnostic positions; keep tangent/cotangent roles, validation order, and primal-boundary diagnostics in differentiation.
+  diagnostic positions; keep tangent/cotangent roles, validation order, and primal-boundary diagnostics in
+  differentiation.
 - When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
   parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
   abstraction and keep one source of truth.
@@ -154,7 +158,9 @@ update this file so that they do not need to remind you again in the future.
 
 #### Formatting & Naming
 
-- Follow workspace formatting (`rustfmt.toml`): `max_width = 120`.
+- Follow workspace formatting (i.e., `rustfmt.toml`): `max_width = 120`.
+- Write numeric type suffixes without a separating underscore (e.g., `0f32`, `1.0f64`, and `2usize`, instead of
+  `0_f32`, `1.0_f64`, or `2_usize`). Keep underscores used as digit separators where useful.
 - Use import grouping in this order:
   - `std` imports
   - third-party crate imports

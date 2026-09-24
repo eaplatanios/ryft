@@ -31,7 +31,7 @@ use crate::differentiation::{
 };
 use crate::macros::check_count;
 use crate::operations::assertions::Assert;
-use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_max::DimensionMax;

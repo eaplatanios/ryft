@@ -690,7 +690,7 @@ mod tests {
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{Differentiate, DifferentiationTracer, ForwardModeDifferentiate, LinearizationTracer};
     use crate::operations::assertions::{AssertOperation, AssertionError};
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::differentiation::tests::{

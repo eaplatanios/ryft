@@ -22,7 +22,7 @@ use crate::macros::{
     check_count, dispatch_on_array_element_type, impl_differentiable_operation, impl_reference_dischargeable_operation,
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
-use crate::operations::compare::Compare;
+use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::iota::{Iota, IotaOperation};
 use crate::operations::constants::one_like::OneLike;

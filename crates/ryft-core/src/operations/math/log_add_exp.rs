@@ -7,7 +7,7 @@ use crate::differentiation::{
 use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
 };
-use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;

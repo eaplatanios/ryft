@@ -1893,10 +1893,9 @@ mod tests {
     };
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::{
-        AddOperation, ConditionOperation, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation,
-        WhileOperation,
+        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, ReferenceAddUpdateOperation,
+        ReferenceReadOperation, ReferenceWriteOperation, WhileOperation,
     };
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;

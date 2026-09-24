@@ -26,7 +26,7 @@ use crate::interpretation::{
 };
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
-use crate::operations::compare::{Compare, CompareOperation};
+use crate::operations::comparisons::{Compare, CompareOperation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::iota::IotaOperation;
 use crate::operations::constants::one::{One, OneOperation};

@@ -19,7 +19,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::assertions::{Assert, AssertionValue};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
-use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::DimensionSize;

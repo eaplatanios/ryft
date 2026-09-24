@@ -92,7 +92,7 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
-use crate::operations::compare::{CompareOperation, ComparisonDirection};
+use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::iota::IotaOperation;
 use crate::operations::constants::zero::ZeroOperation;

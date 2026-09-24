@@ -3,7 +3,7 @@ use std::ops::{Mul as StandardMul, Sub as StandardSub};
 use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
 };
-use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;

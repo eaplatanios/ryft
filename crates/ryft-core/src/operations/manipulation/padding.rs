@@ -23,7 +23,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
-use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::iota::DynamicIota;
 use crate::operations::constants::one::{One, OneOperation};

@@ -25,7 +25,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::assertions::Assert;
-use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::select::{Select, SelectOperation};
@@ -1701,7 +1701,7 @@ mod tests {
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::assertions::AssertionError;
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::tests::CountingBatchingDriver;
     use crate::operations::math::add::AddOperation;

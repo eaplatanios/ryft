@@ -7,7 +7,7 @@ use crate::arrays::{
 };
 use crate::contexts::Context;
 use crate::macros::check_count;
-use crate::operations::compare::Compare;
+use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_size::DimensionSize;

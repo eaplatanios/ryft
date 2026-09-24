@@ -24,7 +24,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
-use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
+use crate::operations::comparisons::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::differentiation::linear_call::LinearCallOperation;

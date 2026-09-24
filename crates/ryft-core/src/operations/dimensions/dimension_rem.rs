@@ -115,7 +115,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayIrType, ArrayIrValue, DimensionBounds, DimensionOperation, DimensionValue};
     use crate::operations::assertions::AssertOperation;
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;

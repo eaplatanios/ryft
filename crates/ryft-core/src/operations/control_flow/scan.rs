@@ -29,7 +29,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::assertions::{AssertOperation, AssertionError};
-use crate::operations::compare::{CompareOperation, ComparisonDirection};
+use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -3896,7 +3896,7 @@ mod tests {
         CotangentDestination, CotangentSeed, Differentiate, LinearizationTracer, ReverseModeDifferentiate,
         differentiate_at,
     };
-    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::tests::CountingBatchingDriver;
