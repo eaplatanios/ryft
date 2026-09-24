@@ -1105,8 +1105,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents concrete values that can be inspected to check assertions and render their observations. Implementations
 /// preserve unsigned integer ranges when rendering scalar observations and provide an array view for elementwise
 /// checks. [`check_assertion`](Self::check_assertion) supplies the shared concrete execution used by [`Assert`],
@@ -1156,7 +1154,8 @@ pub trait AssertionValue: Value + Concretizable<bool> {
     where
         Self::Type: Into<ArrayIrType>,
     {
-        // Reuse operation type inference so eager and staged assertions validate the same signature.
+        // Reuse operation type inference so eager and staged assertions validate the same signature. Validate
+        // observations before checking the condition, including when it succeeds or has no elements.
         let mut operation = AssertOperation::new(message)
             .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect());
         if let Some(limit) = failure_limit {
@@ -1167,6 +1166,8 @@ pub trait AssertionValue: Value + Concretizable<bool> {
             .collect::<Vec<_>>();
         operation.infer_output_types(&input_types, &[])?;
 
+        // Without a failure limit, validation requires a scalar condition and scalar observations. A success
+        // needs no diagnostic values while a failure renders the observations through the shared error constructor.
         let Some(limit) = failure_limit else {
             if Concretizable::<bool>::concretize(self)? {
                 return Ok(());
@@ -1178,12 +1179,16 @@ pub trait AssertionValue: Value + Concretizable<bool> {
             .into());
         };
 
+        // Validation guarantees an array condition. Count all failures so the diagnostic can report how many
+        // were omitted, even though only the first `limit` failures are rendered. Empty arrays pass vacuously.
         let condition = self.assertion_array()?.unwrap();
         let values = condition.elements::<bool>()?;
         let failure_count = values.iter().filter(|value| !**value).count();
         if failure_count == 0 {
             return Ok(());
         }
+
+        // Concrete array dimensions give the shape needed to turn flat element positions into logical indices.
         let shape = condition
             .r#type()
             .shape()
@@ -1191,6 +1196,9 @@ pub trait AssertionValue: Value + Concretizable<bool> {
             .iter()
             .map(|dimension| dimension.value().unwrap())
             .collect::<Vec<_>>();
+
+        // Materialize each array observation once, and only after finding a failure. Non-array scalar
+        // observations retain their original representation for rendering at each failing index.
         let observations = observations
             .iter()
             .map(|(label, value)| Ok((*label, value, value.assertion_array()?)))
@@ -1198,6 +1206,8 @@ pub trait AssertionValue: Value + Concretizable<bool> {
         let limit = limit.get();
         let mut failures = Vec::new();
         for position in values.iter().enumerate().filter_map(|(index, value)| (!value).then_some(index)).take(limit) {
+            // Decode the flat row-major position from the last axis backwards. A failing element guarantees
+            // that no dimension is empty; a rank-zero condition naturally has an empty index.
             let mut remaining = position;
             let mut index = vec![0; shape.len()];
             for axis in (0..shape.len()).rev() {
@@ -1209,6 +1219,8 @@ pub trait AssertionValue: Value + Concretizable<bool> {
             let observations = observations
                 .iter()
                 .map(|(label, value, array)| {
+                    // Sample shaped observations at the failing index and reshape the single element to a scalar
+                    // for rendering. Scalar arrays and non-array scalars are reused unchanged at every index.
                     let observation = match array {
                         Some(array) if array.r#type().rank() > 0 => {
                             array.dynamic_slice(&starts, &vec![1; index.len()])?.reshape([])?.assertion_observation()?
@@ -1221,12 +1233,29 @@ pub trait AssertionValue: Value + Concretizable<bool> {
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             failures.push(AssertionFailure { index, observations });
         }
+
         Err(AssertionError::FailedElements {
             message: message.to_owned(),
             failures,
             omitted: failure_count.saturating_sub(limit),
         }
         .into())
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+impl<T: Type> AssertionValue for CaptureReference<T> {
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        Err(ProgramError::Concretization {
+            message: "cannot inspect a captured assertion observation before execution".to_owned(),
+        })
+    }
+
+    fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
+        Err(ProgramError::Concretization {
+            message: "cannot inspect a captured assertion array before execution".to_owned(),
+        })
     }
 }
 
@@ -1269,20 +1298,6 @@ impl<A: AssertionValue<Type = ArrayType>> AssertionValue for ArrayIrValue<A> {
                 Err(ProgramError::Concretization { message: "assertion observations cannot be references".to_owned() })
             }
         }
-    }
-}
-
-impl<T: Type> AssertionValue for CaptureReference<T> {
-    fn assertion_observation(&self) -> Result<String, ProgramError> {
-        Err(ProgramError::Concretization {
-            message: "cannot inspect a captured assertion observation before execution".to_owned(),
-        })
-    }
-
-    fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
-        Err(ProgramError::Concretization {
-            message: "cannot inspect a captured assertion array before execution".to_owned(),
-        })
     }
 }
 
