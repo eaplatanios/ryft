@@ -69,10 +69,15 @@ impl_capability_for_primitive!(usize);
 impl Not for Array {
     fn not(&self) -> Result<Self, ProgramError> {
         let mask = match self.r#type().data_type() {
-            DataType::Boolean | DataType::I1 | DataType::U1 => 0b1,
-            DataType::I2 | DataType::U2 => 0b11,
-            DataType::I4 | DataType::U4 => 0b1111,
-            data_type if data_type.is_integer() => u8::MAX,
+            DataType::Boolean => {
+                // A Boolean occupies a whole byte, but only its lowest bit encodes its value.
+                0b1
+            }
+            data_type if data_type.is_integer() => {
+                // An integer's value occupies the low `bit_width` bits of each of its bytes, which is all of them
+                // for any integer that is at least one byte wide.
+                u8::MAX >> (8 - data_type.bit_width().min(8))
+            }
             data_type => {
                 return Err(TypeError::invalid(format!(
                     "cannot apply `{NOT_OPERATION_NAME}` to an array of element data type `{data_type}`"

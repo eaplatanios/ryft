@@ -50,8 +50,8 @@
 //! );
 //!
 //! assert_eq!(
-//!     program.interpret(Array::vector(vec![1.0_f64, -2.0, 0.5])?)?,
-//!     Array::vector(vec![0x3f800000_u32, 0xc0000000, 0x3f000000])?,
+//!     program.interpret(Array::vector(vec![1.0f64, -2.0, 0.5])?)?,
+//!     Array::vector(vec![0x3f800000u32, 0xc0000000, 0x3f000000])?,
 //! );
 //! # Ok(())
 //! # }
@@ -615,7 +615,7 @@ impl ConvertElementType for Array {
         let output_count = Array::materialized_element_count(&output_type)?;
         let input_bytes = input_bits.div_ceil(8);
         let output_bytes = output_bits.div_ceil(8);
-        let mut output = vec![0_u8; output_count * output_bytes];
+        let mut output = vec![0u8; output_count * output_bytes];
         for (output_index, element) in output.chunks_exact_mut(output_bytes).enumerate() {
             for bit in 0..output_bits {
                 let source_bit = output_index * output_bits + bit;
@@ -630,12 +630,11 @@ impl ConvertElementType for Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use indoc::indoc;
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
@@ -676,8 +675,8 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_type_inference() {
+        // Numerical conversion replaces the element type and validates arity and token inputs.
         let array_operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, false);
-
         check_operation_type_inference!(
             operation = array_operation,
             cases = [
@@ -700,6 +699,7 @@ mod tests {
             ],
         );
 
+        // Shape and memory space are preserved, while byte strides are cleared when the element width changes.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
             .with_memory(Memory::Host { pinned: true });
@@ -711,6 +711,7 @@ mod tests {
             }],
         );
 
+        // Tokens cannot be produced by conversion either.
         check_operation_type_inference!(
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::Token, false),
             cases = [{
@@ -731,6 +732,7 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_type_inference_data_type() {
+        // The same operation infers bare element types in the `DataType` universe.
         check_operation_type_inference!(
             operation = ConvertElementTypeOperation::<DataType>::new(DataType::F32, false),
             cases = [{
@@ -742,6 +744,7 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_type_inference_structural_zero() {
+        // Structural zeros have no materialized elements, so they only convert to themselves.
         check_operation_type_inference!(
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::Zero, false),
             cases = [
@@ -755,6 +758,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, false),
             cases = [{
@@ -766,6 +770,8 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_type_inference_bitcast() {
+        // Equal-width reinterpretation keeps the shape, widening consumes a trailing axis of the width ratio, and only
+        // element types with an unambiguous bit representation are accepted.
         check_operation_type_inference!(
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true),
             cases = [
@@ -811,6 +817,8 @@ mod tests {
                 },
             ],
         );
+
+        // Narrowing adds a trailing axis, and widths that do not divide each other are rejected.
         check_operation_type_inference!(
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::U16, true),
             cases = [{
@@ -829,6 +837,8 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_type_inference_bitcast_layout() {
+        // Equal-width reinterpretation preserves layout and memory space, while rank-changing reinterpretation clears
+        // the layout because its strides no longer describe the new shape.
         let input = ArrayType::new_static(DataType::F32, [2])
             .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
             .with_memory(Memory::Host { pinned: true });
@@ -878,6 +888,7 @@ mod tests {
             MeshAxis::new("explicit", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
+
         // Neither manual partitioning nor a compiler-selected partition can be discarded while assembling bits.
         for dimension in [
             ShardingDimension::sharded(["manual"]),
@@ -891,7 +902,7 @@ mod tests {
                 ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true).infer_output_types(&[input], &[]),
                 Err(TypeError::invalid(
                     "`convert_element_type` in bitcast mode requires a replicated trailing dimension when widening \
-                     elements"
+                     elements",
                 )),
             );
         }
@@ -900,9 +911,9 @@ mod tests {
     #[test]
     fn test_convert_element_type_interpretation() {
         let output = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, false)
-            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(2.0_f64).unwrap()])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(2.0f64).unwrap()])
             .unwrap();
-        assert_eq!(output, vec![Array::scalar(2.0_f32).unwrap()]);
+        assert_eq!(output, vec![Array::scalar(2.0f32).unwrap()]);
     }
 
     #[test]
@@ -919,7 +930,7 @@ mod tests {
             operation.interpret(
                 &context,
                 &EmptyRegionDriver,
-                &[Array::scalar(2.0_f64).unwrap(), Array::scalar(3.0_f64).unwrap()]
+                &[Array::scalar(2.0f64).unwrap(), Array::scalar(3.0f64).unwrap()]
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
         ));
@@ -938,7 +949,7 @@ mod tests {
             ConvertElementTypeOperation::<ArrayType>::new(DataType::Token, false).interpret(
                 &context,
                 &EmptyRegionDriver,
-                &[Array::scalar(2.0_f64).unwrap()],
+                &[Array::scalar(2.0f64).unwrap()],
             ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot convert values to or from the `token` data type",
@@ -948,62 +959,13 @@ mod tests {
     #[test]
     fn test_convert_element_type_interpretation_bitcast() {
         // Signed zero and NaN payloads survive without numeric conversion or canonicalization.
-        let input = Array::vector(vec![0x80000000_u32, 0x7fc01234]).unwrap();
+        let input = Array::vector(vec![0x80000000u32, 0x7fc01234]).unwrap();
         let output = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true)
             .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input.clone()])
             .unwrap()
             .remove(0);
         assert_eq!(output.logical_bytes(), input.logical_bytes());
         assert_eq!(output.bitcast_element_type(DataType::U32), Ok(input));
-
-        let pieces = Array::scalar(0x12345678_u32).unwrap().bitcast_element_type(DataType::U16).unwrap();
-        assert_eq!(pieces, Array::vector(vec![0x5678_u16, 0x1234]).unwrap());
-        assert_eq!(pieces.bitcast_element_type(DataType::U32), Ok(Array::scalar(0x12345678_u32).unwrap()));
-    }
-
-    #[test]
-    fn test_convert_element_type_interpretation_bitcast_layout() {
-        // Physical holes do not contribute bits when an element splits into a new logical trailing axis.
-        let input_type =
-            ArrayType::new_static(DataType::U32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
-        let input = Array::from_elements(input_type, &[0x12345678_u32, 0x89abcdef]).unwrap();
-        assert_eq!(
-            input.bitcast_element_type(DataType::U16),
-            Ok(Array::matrix(2, 2, vec![0x5678_u16, 0x1234, 0xcdef, 0x89ab]).unwrap()),
-        );
-        assert_eq!(
-            Array::vector(Vec::<u32>::new()).unwrap().bitcast_element_type(DataType::U16),
-            Ok(Array::matrix(0, 2, Vec::<u16>::new()).unwrap()),
-        );
-    }
-
-    #[test]
-    fn test_convert_element_type_interpretation_bitcast_subbyte() {
-        // FP6 occupies padded host bytes, but only its six meaningful bits participate in reinterpretation.
-        let encodings = (0_u8..64).collect::<Vec<_>>();
-        for data_type in [DataType::F6E2M3FN, DataType::F6E3M2FN] {
-            let input = Array::from_logical_bytes(ArrayType::new_static(data_type, [64]), &encodings).unwrap();
-            for (pieces_type, width) in [(DataType::U1, 1), (DataType::U2, 2)] {
-                let pieces = input.bitcast_element_type(pieces_type).unwrap();
-                let expected = encodings
-                    .iter()
-                    .flat_map(|encoding| {
-                        (0..6 / width).map(move |index| (encoding >> (width * index)) & ((1 << width) - 1))
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(pieces.r#type().as_ref(), &ArrayType::new_static(pieces_type, [64, 6 / width]));
-                assert_eq!(pieces.logical_bytes(), expected);
-                assert_eq!(pieces.bitcast_element_type(data_type), Ok(input.clone()));
-            }
-        }
-
-        let pieces = Array::scalar(0xab_u8).unwrap().bitcast_element_type(DataType::U4).unwrap();
-        assert_eq!(pieces.elements::<u4>().unwrap(), vec![u4::new(11).unwrap(), u4::new(10).unwrap()]);
-        assert_eq!(pieces.bitcast_element_type(DataType::U8), Ok(Array::scalar(0xab_u8).unwrap()));
-        assert_eq!(
-            Array::scalar(true).unwrap().bitcast_element_type(DataType::Boolean),
-            Ok(Array::scalar(true).unwrap()),
-        );
     }
 
     #[test]
@@ -1013,8 +975,8 @@ mod tests {
         // Known inputs fold to converted values; unknown inputs retain the conversion.
         check_operation_partial_evaluation!(
             operation = array_operation,
-            inputs = [Array::scalar(2.0_f64).unwrap()],
-            expected = Array::scalar(2.0_f32).unwrap(),
+            inputs = [Array::scalar(2.0f64).unwrap()],
+            expected = Array::scalar(2.0f32).unwrap(),
         );
     }
 
@@ -1022,73 +984,71 @@ mod tests {
     fn test_convert_element_type_partial_evaluation_bitcast() {
         check_operation_partial_evaluation!(
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true),
-            inputs = [Array::scalar(1.0_f32).unwrap()],
-            expected = Array::scalar(0x3f800000_u32).unwrap(),
+            inputs = [Array::scalar(1.0f32).unwrap()],
+            expected = Array::scalar(0x3f800000u32).unwrap(),
         );
     }
 
     #[test]
     fn test_convert_element_type_batching() {
+        // Numerical conversion preserves a leading mapped axis.
         let array_operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, false);
-
         check_operation_batching!(
             @exact,
             operation = array_operation,
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, 2.0]).unwrap())],
-                outputs = [(
-                    @mapped(axis = 0),
-                    Array::from_elements::<f32>(
-                        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])),
-                        &[1.0, 2.0],
-                    ).unwrap()
-                )],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0f32, 2.0]).unwrap())],
             }],
         );
+
         // Numerical conversion preserves a non-leading mapped axis.
         check_operation_batching!(
             @exact,
             operation = array_operation,
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0_f64, 2.0]).unwrap())],
-                outputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0_f32, 2.0]).unwrap())],
+                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0f64, 2.0]).unwrap())],
+                outputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0f32, 2.0]).unwrap())],
             }],
         );
     }
 
     #[test]
     fn test_convert_element_type_batching_bitcast() {
+        // Widening moves a trailing mapped axis to the front before consuming the trailing axis.
         check_operation_batching!(
             @exact,
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(2, 2, vec![0x5678_u16, 0xcdef, 0x1234, 0x89ab]).unwrap())],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![0x12345678_u32, 0x89abcdef]).unwrap())],
+                inputs = [(@mapped(axis = 1), Array::matrix(2, 2, vec![0x5678u16, 0xcdef, 0x1234, 0x89ab]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0x12345678u32, 0x89abcdef]).unwrap())],
             }],
         );
+
         // Equal-width reinterpretation keeps the mapped position unchanged.
         check_operation_batching!(
             @exact,
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0_f32, -0.0]).unwrap())],
-                outputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![0x3f800000_u32, 0x80000000]).unwrap())],
+                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0f32, -0.0]).unwrap())],
+                outputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![0x3f800000u32, 0x80000000]).unwrap())],
             }],
         );
+
         // Narrowing appends the encoding-piece axis after the existing mapped axis.
         check_operation_batching!(
             @exact,
             operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::U16, true),
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![0x12345678_u32, 0x89abcdef]).unwrap())],
+                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![0x12345678u32, 0x89abcdef]).unwrap())],
                 outputs = [(@mapped(axis = 1), Array::from_elements(
                     ArrayType::new_static(DataType::U16, [1, 2, 2]),
-                    &[0x5678_u16, 0x1234, 0xcdef, 0x89ab],
+                    &[0x5678u16, 0x1234, 0xcdef, 0x89ab],
                 ).unwrap())],
             }],
         );
@@ -1096,9 +1056,9 @@ mod tests {
         // Widening consumes the trailing axis, so a bounded ragged axis in that position cannot be batched, whereas a
         // ragged axis elsewhere carries over to the output.
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
-        let array = Array::from_elements(ArrayType::new_static(DataType::U16, [2, 3, 2]), &[0_u16; 12]).unwrap();
+        let array = Array::from_elements(ArrayType::new_static(DataType::U16, [2, 3, 2]), &[0u16; 12]).unwrap();
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 3]).unwrap();
+        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 3]).unwrap();
         let input = ArrayBatch::new(array.clone(), BatchAxis::new(0))
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
@@ -1122,7 +1082,7 @@ mod tests {
             BatchingError::UnsupportedOperation {
                 message: format!(
                     "`{CONVERT_ELEMENT_TYPE_OPERATION_NAME}` in bitcast mode does not support consuming a bounded \
-                     ragged trailing dimension"
+                     ragged trailing dimension",
                 ),
             },
         );
@@ -1135,10 +1095,10 @@ mod tests {
             @approx(step = 0.125, epsilon = 1e-6),
             operation = ConvertElementTypeOperation::new(DataType::F64, false),
             cases = [{
-                primals = [Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[2.0]).unwrap()],
-                tangents = [Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[2.0]).unwrap()],
-                primal_outputs = [Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[2.0]).unwrap()],
-                tangent_outputs = [Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[2.0]).unwrap()],
+                primals = [Array::scalar(2.0f32).unwrap()],
+                tangents = [Array::scalar(2.0f32).unwrap()],
+                primal_outputs = [Array::scalar(2.0f64).unwrap()],
+                tangent_outputs = [Array::scalar(2.0f64).unwrap()],
             }],
         );
     }
@@ -1151,36 +1111,36 @@ mod tests {
             &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
         )
         .unwrap();
-        let tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
+        let tangent = Array::scalar(3.0f32).unwrap();
         let (output, output_tangent) =
             differentiate_at(primal).jvp(tangent, |value| value.convert_element_type(DataType::F32)).unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F32));
-        assert_eq!(output_tangent, Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap());
+        assert_eq!(output_tangent, Array::scalar(3.0f32).unwrap());
 
-        let primal = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[2.0]).unwrap();
-        let tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
+        let primal = Array::scalar(2.0f32).unwrap();
+        let tangent = Array::scalar(3.0f32).unwrap();
         let (_, output_tangent) = differentiate_at(primal)
             .jvp(tangent, |value| value.convert_element_type(DataType::F8E8M0FNU))
             .unwrap();
-        assert_eq!(output_tangent, Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap());
+        assert_eq!(output_tangent, Array::scalar(3.0f32).unwrap());
     }
 
     #[test]
     fn test_convert_element_type_differentiation_layout() {
         // Conversions between different storage widths discard byte layouts in both primal and tangent outputs.
         let layout = Layout::Strided(StridedLayout::new(vec![1]));
-        let laid_out_f32 =
+        let laid_outf32 =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
         let laid_out_f8 =
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
-        let plain_f32 = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]));
+        let plainf32 = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]));
 
-        let (_, tangent) = differentiate_at(Array::from_elements::<f32>(laid_out_f32.clone(), &[2.0]).unwrap())
-            .jvp(Array::from_elements::<f32>(laid_out_f32.clone(), &[3.0]).unwrap(), |value| {
+        let (_, tangent) = differentiate_at(Array::from_elements::<f32>(laid_outf32.clone(), &[2.0]).unwrap())
+            .jvp(Array::from_elements::<f32>(laid_outf32.clone(), &[3.0]).unwrap(), |value| {
                 value.convert_element_type(DataType::F8E8M0FNU)
             })
             .unwrap();
-        assert_eq!(tangent, Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap());
+        assert_eq!(tangent, Array::from_elements::<f32>(plainf32.clone(), &[3.0]).unwrap());
 
         let (_, tangent) = differentiate_at(
             Array::from_elements::<f8e8m0fnu>(
@@ -1189,71 +1149,51 @@ mod tests {
             )
             .unwrap(),
         )
-        .jvp(Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap(), |value| {
+        .jvp(Array::from_elements::<f32>(plainf32.clone(), &[3.0]).unwrap(), |value| {
             value.convert_element_type(DataType::F32)
         })
         .unwrap();
-        assert_eq!(tangent, Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap());
+        assert_eq!(tangent, Array::from_elements::<f32>(plainf32.clone(), &[3.0]).unwrap());
     }
 
     #[test]
     fn test_convert_element_type_differentiation_narrowing() {
         // Narrowing real and complex primals also narrows their concrete tangent values.
-        let (_, tangent) =
-            differentiate_at(Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[2.0]).unwrap())
-                .jvp(Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[3.0]).unwrap(), |value| {
-                    value.convert_element_type(DataType::F32)
-                })
-                .unwrap();
-        assert_eq!(tangent, Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap());
+        let (_, tangent) = differentiate_at(Array::scalar(2.0f64).unwrap())
+            .jvp(Array::scalar(3.0f64).unwrap(), |value| value.convert_element_type(DataType::F32))
+            .unwrap();
+        assert_eq!(tangent, Array::scalar(3.0f32).unwrap());
 
-        let (_, tangent) = differentiate_at(
-            Array::from_elements::<ComplexNumber<f64>>(
-                ArrayType::scalar(DataType::C128),
-                &[2.0].map(|value| ComplexNumber::new(value, 0.0)),
-            )
-            .unwrap(),
-        )
-        .jvp(
-            Array::from_elements::<ComplexNumber<f64>>(
-                ArrayType::scalar(DataType::C128),
-                &[3.0].map(|value| ComplexNumber::new(value, 0.0)),
-            )
-            .unwrap(),
-            |value| value.convert_element_type(DataType::C64),
-        )
-        .unwrap();
-        assert_eq!(
-            tangent,
-            Array::from_elements::<ComplexNumber<f32>>(
-                ArrayType::scalar(DataType::C64),
-                &[3.0].map(|value| ComplexNumber::new(value, 0.0))
-            )
-            .unwrap(),
-        );
+        let (_, tangent) = differentiate_at(Array::scalar(ComplexNumber::new(2.0f64, 0.0)).unwrap())
+            .jvp(Array::scalar(ComplexNumber::new(3.0f64, 0.0)).unwrap(), |value| {
+                value.convert_element_type(DataType::C64)
+            })
+            .unwrap();
+        assert_eq!(tangent, Array::scalar(ComplexNumber::new(3.0f32, 0.0)).unwrap());
     }
 
     #[test]
     fn test_convert_element_type_differentiation_complex() {
         // Real-to-complex conversion inserts zero imaginary components in both primal and tangent values.
-        let (primal, tangent) = differentiate_at(Array::scalar(2.0_f32).unwrap())
-            .jvp(Array::scalar(3.0_f32).unwrap(), |value| value.convert_element_type(DataType::C64))
+        let (primal, tangent) = differentiate_at(Array::scalar(2.0f32).unwrap())
+            .jvp(Array::scalar(3.0f32).unwrap(), |value| value.convert_element_type(DataType::C64))
             .unwrap();
-        assert_eq!(primal, Array::scalar(ComplexNumber::new(2.0_f32, 0.0)).unwrap());
-        assert_eq!(tangent, Array::scalar(ComplexNumber::new(3.0_f32, 0.0)).unwrap());
+        assert_eq!(primal, Array::scalar(ComplexNumber::new(2.0f32, 0.0)).unwrap());
+        assert_eq!(tangent, Array::scalar(ComplexNumber::new(3.0f32, 0.0)).unwrap());
 
         // Complex-to-real conversion discards the imaginary primal and tangent components independently.
-        let (primal, tangent) = differentiate_at(Array::scalar(ComplexNumber::new(2.0_f32, 5.0)).unwrap())
-            .jvp(Array::scalar(ComplexNumber::new(3.0_f32, -7.0)).unwrap(), |value| {
+        let (primal, tangent) = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 5.0)).unwrap())
+            .jvp(Array::scalar(ComplexNumber::new(3.0f32, -7.0)).unwrap(), |value| {
                 value.convert_element_type(DataType::F32)
             })
             .unwrap();
-        assert_eq!(primal, Array::scalar(2.0_f32).unwrap());
-        assert_eq!(tangent, Array::scalar(3.0_f32).unwrap());
+        assert_eq!(primal, Array::scalar(2.0f32).unwrap());
+        assert_eq!(tangent, Array::scalar(3.0f32).unwrap());
     }
 
     #[test]
     fn test_convert_element_type_differentiation_structural_zero() {
+        // A structural-zero tangent stays structural and adopts the output's tangent type.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let primal = context.input(ArrayType::scalar(DataType::C64));
         let outputs = ConvertElementTypeOperation::new(DataType::F64, false)
@@ -1265,6 +1205,7 @@ mod tests {
             .unwrap();
         assert!(outputs[0].tangent().is_zero());
         assert_eq!(outputs[0].tangent().r#type().as_ref(), &ArrayType::scalar(DataType::F64));
+
         // Only the primal conversion is staged: the zero tangent needs no materialization or conversion.
         assert_eq!(context.builder().borrow().instructions().len(), 1);
     }
@@ -1272,31 +1213,32 @@ mod tests {
     #[test]
     fn test_convert_element_type_differentiation_discrete_intermediate() {
         // Passing through an element type with a zero-dimensional tangent space erases the incoming tangent.
-        let primal = Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[2.75]).unwrap();
-        let tangent = Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[3.0]).unwrap();
+        let primal = Array::scalar(2.75f64).unwrap();
+        let tangent = Array::scalar(3.0f64).unwrap();
         let (output, output_tangent) = differentiate_at(primal)
             .jvp(tangent, |value| value.convert_element_type(DataType::I32)?.convert_element_type(DataType::F64))
             .unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
-        assert_eq!(output_tangent, Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[0.0]).unwrap());
+        assert_eq!(output_tangent, Array::scalar(0.0f64).unwrap());
     }
 
     #[test]
     fn test_convert_element_type_differentiation_bitcast() {
         // Even identity bit reinterpretation declares a structural zero derivative.
-        let (output, tangent) = differentiate_at(Array::scalar(2.0_f32).unwrap())
-            .jvp(Array::scalar(3.0_f32).unwrap(), |value| value.bitcast_element_type(DataType::F32))
+        let (output, tangent) = differentiate_at(Array::scalar(2.0f32).unwrap())
+            .jvp(Array::scalar(3.0f32).unwrap(), |value| value.bitcast_element_type(DataType::F32))
             .unwrap();
-        assert_eq!(output, Array::scalar(2.0_f32).unwrap());
-        assert_eq!(tangent, Array::scalar(0.0_f32).unwrap());
-        let gradient = differentiate_at(Array::scalar(2.0_f32).unwrap())
+        assert_eq!(output, Array::scalar(2.0f32).unwrap());
+        assert_eq!(tangent, Array::scalar(0.0f32).unwrap());
+        let gradient = differentiate_at(Array::scalar(2.0f32).unwrap())
             .gradient(|value| value.bitcast_element_type(DataType::F32))
             .unwrap();
-        assert_eq!(gradient, Array::scalar(0.0_f32).unwrap());
+        assert_eq!(gradient, Array::scalar(0.0f32).unwrap());
     }
 
     #[test]
     fn test_convert_element_type_transposition() {
+        // Cotangents convert back to the input's cotangent type, and an input with no cotangent space receives a zero.
         check_operation_transposition!(
             @exact,
             operation = ConvertElementTypeOperation::new(DataType::F32, false),
@@ -1304,14 +1246,14 @@ mod tests {
                 {
                     inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
                     output_cotangents = [
-                        Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap(),
+                        Array::scalar(3.0f32).unwrap(),
                     ],
-                    input_cotangents = [Array::from_elements::<f64>(ArrayType::scalar(DataType::F64), &[3.0]).unwrap()],
+                    input_cotangents = [Array::scalar(3.0f64).unwrap()],
                 },
                 {
                     inputs = [(@linear(type = ArrayType::scalar(DataType::I32)))],
                     output_cotangents = [
-                        Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap(),
+                        Array::scalar(3.0f32).unwrap(),
                     ],
                     input_cotangents = [Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()],
                 },
@@ -1353,28 +1295,29 @@ mod tests {
     #[test]
     fn test_convert_element_type_transposition_complex() {
         // Pulling a complex cotangent back through real-to-complex conversion discards its imaginary component.
-        let (primal, pullback) = differentiate_at(Array::scalar(2.0_f32).unwrap())
+        let (primal, pullback) = differentiate_at(Array::scalar(2.0f32).unwrap())
             .vjp(|value| value.convert_element_type(DataType::C64))
             .unwrap();
-        assert_eq!(primal, Array::scalar(ComplexNumber::new(2.0_f32, 0.0)).unwrap());
+        assert_eq!(primal, Array::scalar(ComplexNumber::new(2.0f32, 0.0)).unwrap());
         assert_eq!(
-            pullback.apply(Array::scalar(ComplexNumber::new(3.0_f32, -7.0)).unwrap()).unwrap(),
-            Array::scalar(3.0_f32).unwrap(),
+            pullback.apply(Array::scalar(ComplexNumber::new(3.0f32, -7.0)).unwrap()).unwrap(),
+            Array::scalar(3.0f32).unwrap(),
         );
 
         // Pulling back through complex-to-real conversion inserts a zero imaginary cotangent.
-        let (primal, pullback) = differentiate_at(Array::scalar(ComplexNumber::new(2.0_f32, 5.0)).unwrap())
+        let (primal, pullback) = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 5.0)).unwrap())
             .vjp(|value| value.convert_element_type(DataType::F32))
             .unwrap();
-        assert_eq!(primal, Array::scalar(2.0_f32).unwrap());
+        assert_eq!(primal, Array::scalar(2.0f32).unwrap());
         assert_eq!(
-            pullback.apply(Array::scalar(3.0_f32).unwrap()).unwrap(),
-            Array::scalar(ComplexNumber::new(3.0_f32, 0.0)).unwrap(),
+            pullback.apply(Array::scalar(3.0f32).unwrap()).unwrap(),
+            Array::scalar(ComplexNumber::new(3.0f32, 0.0)).unwrap(),
         );
     }
 
     #[test]
     fn test_convert_element_type_transposition_structural_zero() {
+        // A structural-zero cotangent stays structural, adopts the input's cotangent type, and stages nothing.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let mut rule_context = TranspositionContext::new(context.clone());
         let inputs = [PartialValue::Unknown(ArrayType::scalar(DataType::C64))];
@@ -1396,6 +1339,7 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_transposition_bitcast() {
+        // A bitcast has a zero derivative, so its transposition is rejected instead of treated as the identity.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let mut rule_context = TranspositionContext::new(context);
         let inputs = [PartialValue::Unknown(ArrayType::scalar(DataType::F32))];
@@ -1437,6 +1381,14 @@ mod tests {
         );
         assert_eq!(input_type.with_element_type(DataType::F64), input_type);
         assert_eq!(input_type.element_type(), DataType::F64);
+
+        // Byte strides stay valid when the element storage width is unchanged, and tiled layouts count elements.
+        let strided =
+            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        assert_eq!(strided.with_element_type(DataType::I32), strided.clone().with_data_type(DataType::I32));
+        let tiled = ArrayType::new_static(DataType::F32, [3])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
+        assert_eq!(tiled.with_element_type(DataType::F64), tiled.clone().with_data_type(DataType::F64));
     }
 
     #[test]
@@ -1455,17 +1407,25 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_convert_element_type() {
-        // Explicit conversion permits narrowing independently of the promotion lattice.
+        // Context-carrying values stage one numerical conversion through their own context.
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| input.convert_element_type(DataType::F32),
+            ArrayType::new_static(DataType::F64, [2]),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::new_static(DataType::F32, [2]));
         assert_eq!(
-            Array::scalar(2.75_f64).unwrap().convert_element_type(DataType::I32),
-            Ok(Array::scalar(2_i32).unwrap()),
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:f32[2] = convert_element_type [data_type=f32] %0
+                in (%1)"},
         );
-        let input = Array::vector(vec![1.0_f64, 2.0]).unwrap();
-        assert_eq!(input.convert_element_type(DataType::F64), Ok(input));
     }
 
     #[test]
     fn test_convert_element_type_convert_element_type_identity() {
+        // A conversion to the input's own element type returns the input without staging anything.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input_type = ArrayType::new_static(DataType::F32, [2])
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
@@ -1478,6 +1438,7 @@ mod tests {
         let zero = context.input(ArrayType::scalar(DataType::Zero));
         let output_zero = zero.convert_element_type(DataType::Zero).unwrap();
         assert_eq!(output_zero.atom_id(), zero.atom_id());
+
         // Validation runs before identity elimination, so an identity conversion cannot make tokens convertible.
         let token = context.input(ArrayType::scalar(DataType::Token));
         assert!(matches!(
@@ -1490,10 +1451,21 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_bitcast_element_type() {
+        // Context-carrying values stage every bitcast, and rank-changing bitcasts record their trailing axis.
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| input.bitcast_element_type(DataType::U16),
+            ArrayType::new_static(DataType::U32, [3]),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::new_static(DataType::U16, [3, 2]));
         assert_eq!(
-            Array::scalar(1.0_f32).unwrap().bitcast_element_type(DataType::U32),
-            Ok(Array::scalar(0x3f800000_u32).unwrap()),
+            program.to_string(),
+            indoc! {"
+                lambda %0:u32[3] .
+                let %1:u16[3, 2] = convert_element_type [data_type=u16, bitcast=true] %0
+                in (%1)"},
         );
+
         // Identity bitcasts remain explicit in staged code so their zero derivative cannot become an identity map.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::scalar(DataType::F32));
@@ -1506,8 +1478,8 @@ mod tests {
     #[test]
     fn test_convert_element_type_promote_element_type() {
         assert_eq!(
-            Array::scalar(2.0_f32).unwrap().promote_element_type(DataType::F64),
-            Ok(Array::scalar(2.0_f64).unwrap()),
+            Array::scalar(2.0f32).unwrap().promote_element_type(DataType::F64),
+            Ok(Array::scalar(2.0f64).unwrap()),
         );
 
         // An already-promoted value retains its complete metadata and element contents.
@@ -1521,12 +1493,12 @@ mod tests {
     #[test]
     fn test_convert_element_type_promote_element_type_disallowed() {
         assert!(matches!(
-            Array::scalar(2.0_f64).unwrap().promote_element_type(DataType::F32),
+            Array::scalar(2.0f64).unwrap().promote_element_type(DataType::F32),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot promote type `f64` to type `f32`",
         ));
         assert!(matches!(
-            Array::scalar(2.0_f64).unwrap().promote_element_type(DataType::I32),
+            Array::scalar(2.0f64).unwrap().promote_element_type(DataType::I32),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot promote type `f64` to type `i32`",
         ));
@@ -1629,7 +1601,7 @@ mod tests {
     #[test]
     fn test_array_convert_element_type_low_precision() {
         // Preserve low integer bits when rounding across a BF16 midpoint.
-        let value = (1_u64 << 60) + (1_u64 << 52) + 1;
+        let value = (1u64 << 60) + (1u64 << 52) + 1;
         let rounded = Array::scalar(value).unwrap().convert_element_type(DataType::BF16).unwrap();
         assert_eq!(rounded.elements::<bf16>().unwrap()[0].to_bits(), 0x5d81);
 
@@ -1692,7 +1664,7 @@ mod tests {
         // A tightly packed input remains valid when widening would otherwise create overlapping byte strides.
         let input_type =
             ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
-        let widened = Array::from_elements(input_type, &[1.5_f32, -2.5])
+        let widened = Array::from_elements(input_type, &[1.5f32, -2.5])
             .unwrap()
             .convert_element_type(DataType::F64)
             .unwrap();
@@ -1703,7 +1675,7 @@ mod tests {
         // Equal-width conversion preserves byte strides, including their direction and unused storage bytes.
         let input_type =
             ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-8])));
-        let converted = Array::from_elements(input_type.clone(), &[1.5_f32, -2.5])
+        let converted = Array::from_elements(input_type.clone(), &[1.5f32, -2.5])
             .unwrap()
             .convert_element_type(DataType::I32)
             .unwrap();
@@ -1714,7 +1686,7 @@ mod tests {
         // Tiled layouts count elements, so widening preserves their tile geometry and logical element order.
         let input_type = ArrayType::new_static(DataType::F32, [3])
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])));
-        let widened = Array::from_elements(input_type.clone(), &[1.5_f32, -2.5, 3.0])
+        let widened = Array::from_elements(input_type.clone(), &[1.5f32, -2.5, 3.0])
             .unwrap()
             .convert_element_type(DataType::F64)
             .unwrap();
@@ -1758,5 +1730,68 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot convert values to or from the `zero` data type",
         ));
+    }
+
+    #[test]
+    fn test_array_bitcast_element_type() {
+        // Equal-width reinterpretation keeps the shape and every encoding bit.
+        assert_eq!(
+            Array::scalar(1.0f32).unwrap().bitcast_element_type(DataType::U32),
+            Ok(Array::scalar(0x3f800000u32).unwrap()),
+        );
+
+        // Narrowing adds a trailing axis of pieces, ordered from least to most significant bits, and widening consumes
+        // that axis.
+        let pieces = Array::scalar(0x12345678u32).unwrap().bitcast_element_type(DataType::U16).unwrap();
+        assert_eq!(pieces, Array::vector(vec![0x5678u16, 0x1234]).unwrap());
+        assert_eq!(pieces.bitcast_element_type(DataType::U32), Ok(Array::scalar(0x12345678u32).unwrap()));
+
+        // Identity reinterpretation returns the input unchanged, including for Boolean elements.
+        let input = Array::scalar(true).unwrap();
+        let output = input.bitcast_element_type(DataType::Boolean).unwrap();
+        assert!(Arc::ptr_eq(input.shared_storage(), output.shared_storage()));
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_array_bitcast_element_type_layout() {
+        // Physical holes do not contribute bits when an element splits into a new logical trailing axis.
+        let input_type =
+            ArrayType::new_static(DataType::U32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let input = Array::from_elements(input_type, &[0x12345678u32, 0x89abcdef]).unwrap();
+        assert_eq!(
+            input.bitcast_element_type(DataType::U16),
+            Ok(Array::matrix(2, 2, vec![0x5678u16, 0x1234, 0xcdef, 0x89ab]).unwrap()),
+        );
+        assert_eq!(
+            Array::vector(Vec::<u32>::new()).unwrap().bitcast_element_type(DataType::U16),
+            Ok(Array::matrix(0, 2, Vec::<u16>::new()).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_array_bitcast_element_type_sub_byte() {
+        // FP6 occupies padded host bytes, but only its six meaningful bits participate in reinterpretation.
+        let encodings = (0u8..64).collect::<Vec<_>>();
+        for data_type in [DataType::F6E2M3FN, DataType::F6E3M2FN] {
+            let input = Array::from_logical_bytes(ArrayType::new_static(data_type, [64]), &encodings).unwrap();
+            for (pieces_type, width) in [(DataType::U1, 1), (DataType::U2, 2)] {
+                let pieces = input.bitcast_element_type(pieces_type).unwrap();
+                let expected = encodings
+                    .iter()
+                    .flat_map(|encoding| {
+                        (0..6 / width).map(move |index| (encoding >> (width * index)) & ((1 << width) - 1))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(pieces.r#type().as_ref(), &ArrayType::new_static(pieces_type, [64, 6 / width]));
+                assert_eq!(pieces.logical_bytes(), expected);
+                assert_eq!(pieces.bitcast_element_type(data_type), Ok(input.clone()));
+            }
+        }
+
+        // Byte-wide elements split into sub-byte pieces from least to most significant bits.
+        let pieces = Array::scalar(0xabu8).unwrap().bitcast_element_type(DataType::U4).unwrap();
+        assert_eq!(pieces.elements::<u4>().unwrap(), vec![u4::new(11).unwrap(), u4::new(10).unwrap()]);
+        assert_eq!(pieces.bitcast_element_type(DataType::U8), Ok(Array::scalar(0xabu8).unwrap()));
     }
 }

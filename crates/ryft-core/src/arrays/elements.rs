@@ -2707,16 +2707,14 @@ pub fn decode_logical_bytes(r#type: &ArrayType, bytes: &[u8]) -> Result<Vec<u8>,
     Ok(logical_bytes)
 }
 
-/// Validates one element's data-type-specific bit representation. Sub-byte integer encodings are two's complement in
-/// the low bits of one storage byte, matching the [`i1`], [`i2`], [`i4`], [`u1`], [`u2`], and [`u4`] element types in
-/// this module, so all of their higher bits must be zero.
+/// Validates one element's data-type-specific bit representation. A sub-byte element occupies the low
+/// [`bit_width`](DataType::bit_width) bits of one storage byte, as two's complement for the [`i1`], [`i2`], and [`i4`]
+/// element types in this module, so all of its higher bits must be zero. A Boolean occupies a whole byte whose only
+/// valid encodings are `0` and `1`.
 pub(crate) fn validate_element_bytes(data_type: DataType, element: usize, bytes: &[u8]) -> Result<(), ProgramError> {
-    let valid = match data_type {
-        DataType::Boolean => matches!(bytes, [0 | 1]),
-        DataType::I1 | DataType::U1 => bytes[0] & !0b1 == 0,
-        DataType::I2 | DataType::U2 => bytes[0] & !0b11 == 0,
-        DataType::I4 | DataType::U4 | DataType::F4E2M1FN => bytes[0] & !0b1111 == 0,
-        DataType::F6E2M3FN | DataType::F6E3M2FN => bytes[0] & !0b11_1111 == 0,
+    let valid = match (data_type, data_type.bit_width()) {
+        (DataType::Boolean, _) => matches!(bytes, [0 | 1]),
+        (_, bit_width @ 1..8) => bytes[0] >> bit_width == 0,
         _ => true,
     };
     if !valid {
@@ -4224,6 +4222,13 @@ mod tests {
             encode_logical_bytes(&low_precision, &[0b1_0000]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "array element 0 has invalid f4e2m1fn byte encoding [16]",
+        ));
+        let six_bit = ArrayType::scalar(DataType::F6E2M3FN);
+        assert_eq!(encode_logical_bytes(&six_bit, &[0b11_1111]), Ok(vec![0b11_1111]));
+        assert!(matches!(
+            encode_logical_bytes(&six_bit, &[0b100_0000]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "array element 0 has invalid f6e2m3fn byte encoding [64]",
         ));
 
         assert!(matches!(
