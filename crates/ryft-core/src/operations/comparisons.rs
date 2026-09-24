@@ -71,6 +71,65 @@ pub enum ComparisonDirection {
     GreaterThanOrEqual,
 }
 
+impl ComparisonDirection {
+    /// Returns whether this predicate holds between `left` and `right` as proved by their dimension identities and
+    /// representable extent intervals, or [`None`] when it depends on runtime extents. An entry in `exact` narrows
+    /// the corresponding input to a known extent. Conflicting exact extents take precedence over a shared symbolic
+    /// identity. Invalid extent bounds return an error.
+    fn prove_for_dimensions(
+        self,
+        left: &DimensionType,
+        right: &DimensionType,
+        exact: [Option<usize>; 2],
+    ) -> Result<Option<bool>, ProgramError> {
+        let left_range = left.bounds().representable_extent_range()?;
+        let right_range = right.bounds().representable_extent_range()?;
+        let (left_minimum, left_maximum) = exact[0].map_or(left_range, |extent| (extent, extent));
+        let (right_minimum, right_maximum) = exact[1].map_or(right_range, |extent| (extent, extent));
+
+        // Resolved extents take precedence over symbolic identity, including inconsistent concrete inputs supplied
+        // directly to partial evaluation rather than through a program's dimension binding validation.
+        let identical =
+            left.variable() == right.variable() && !matches!(exact, [Some(left), Some(right)] if left != right);
+        let equal = if identical
+            || (left_minimum == left_maximum && right_minimum == right_maximum && left_minimum == right_minimum)
+        {
+            Some(true)
+        } else if left_maximum < right_minimum || right_maximum < left_minimum {
+            Some(false)
+        } else {
+            None
+        };
+
+        Ok(match self {
+            Self::Equal => equal,
+            Self::NotEqual => equal.map(|equal| !equal),
+            Self::LessThan => {
+                if identical || left_minimum >= right_maximum {
+                    Some(false)
+                } else if left_maximum < right_minimum {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            Self::LessThanOrEqual => {
+                if identical || left_maximum <= right_minimum {
+                    Some(true)
+                } else if left_minimum > right_maximum {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            Self::GreaterThan => Self::LessThan.prove_for_dimensions(right, left, [exact[1], exact[0]])?,
+            Self::GreaterThanOrEqual => {
+                Self::LessThanOrEqual.prove_for_dimensions(right, left, [exact[1], exact[0]])?
+            }
+        })
+    }
+}
+
 impl Display for ComparisonDirection {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -231,7 +290,7 @@ impl<
         }
 
         // A proven predicate is a Boolean constant. Unresolved predicates follow ordinary partial evaluation.
-        if let Some(output) = prove_dimension_comparison(left, right, exact, self.direction)? {
+        if let Some(output) = self.direction.prove_for_dimensions(left, right, exact)? {
             return Ok(vec![PartialEvaluationValue::known(context.parent().lift(C::Constant::try_from(output)?)?)]);
         }
 
@@ -476,11 +535,10 @@ impl Compare<Array> for DimensionValue {
 
 impl<A: Value<Type = ArrayType> + TryFrom<bool, Error = ProgramError>> Compare<ArrayIrValue<A>> for DimensionValue {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<ArrayIrValue<A>, ProgramError> {
-        let output = prove_dimension_comparison(
+        let output = direction.prove_for_dimensions(
             self.r#type().as_ref(),
             other.r#type().as_ref(),
             [Some(self.extent()), Some(other.extent())],
-            direction,
         )?;
 
         // Both extents are known, so the comparison always resolves to a Boolean and so the `.unwrap()` is safe.
@@ -513,7 +571,7 @@ impl<
 {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<V, ProgramError> {
         if let Some(output) =
-            prove_dimension_comparison(self.r#type().as_ref(), other.r#type().as_ref(), [None, None], direction)?
+            direction.prove_for_dimensions(self.r#type().as_ref(), other.r#type().as_ref(), [None, None])?
         {
             return self.value().dispatch_domain().lift(<V::DispatchDomain as Domain>::Constant::try_from(output)?);
         }
@@ -536,63 +594,6 @@ impl<
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         Ok(self.dispatch_domain().bind(CompareOperation::new(direction), Vec::new(), &inputs)?.remove(0))
     }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Returns a predicate proved by dimension identities and representable extent intervals, or `None` when it depends
-/// on runtime extents. An entry in `exact` narrows that input to a known extent; conflicting exact extents take
-/// precedence over a shared symbolic identity. Invalid extent bounds return an error.
-fn prove_dimension_comparison(
-    left: &DimensionType,
-    right: &DimensionType,
-    exact: [Option<usize>; 2],
-    direction: ComparisonDirection,
-) -> Result<Option<bool>, ProgramError> {
-    let left_range = left.bounds().representable_extent_range()?;
-    let right_range = right.bounds().representable_extent_range()?;
-    let (left_minimum, left_maximum) = exact[0].map_or(left_range, |extent| (extent, extent));
-    let (right_minimum, right_maximum) = exact[1].map_or(right_range, |extent| (extent, extent));
-    // Resolved extents take precedence over symbolic identity, including inconsistent concrete inputs supplied
-    // directly to partial evaluation rather than through a program's dimension binding validation.
-    let identical = left.variable() == right.variable() && !matches!(exact, [Some(left), Some(right)] if left != right);
-    let equal = if identical
-        || (left_minimum == left_maximum && right_minimum == right_maximum && left_minimum == right_minimum)
-    {
-        Some(true)
-    } else if left_maximum < right_minimum || right_maximum < left_minimum {
-        Some(false)
-    } else {
-        None
-    };
-    Ok(match direction {
-        ComparisonDirection::Equal => equal,
-        ComparisonDirection::NotEqual => equal.map(|equal| !equal),
-        ComparisonDirection::LessThan => {
-            if identical || left_minimum >= right_maximum {
-                Some(false)
-            } else if left_maximum < right_minimum {
-                Some(true)
-            } else {
-                None
-            }
-        }
-        ComparisonDirection::LessThanOrEqual => {
-            if identical || left_maximum <= right_minimum {
-                Some(true)
-            } else if left_minimum > right_maximum {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        ComparisonDirection::GreaterThan => {
-            prove_dimension_comparison(right, left, [exact[1], exact[0]], ComparisonDirection::LessThan)?
-        }
-        ComparisonDirection::GreaterThanOrEqual => {
-            prove_dimension_comparison(right, left, [exact[1], exact[0]], ComparisonDirection::LessThanOrEqual)?
-        }
-    })
 }
 
 #[cfg(test)]
@@ -630,6 +631,67 @@ mod tests {
         ] {
             assert_eq!(direction.to_string(), expected);
             assert_eq!(format!("{direction:?}"), expected);
+        }
+    }
+
+    #[test]
+    fn test_comparison_direction_prove_for_dimensions() {
+        let directions = [
+            ComparisonDirection::Equal,
+            ComparisonDirection::NotEqual,
+            ComparisonDirection::LessThan,
+            ComparisonDirection::LessThanOrEqual,
+            ComparisonDirection::GreaterThan,
+            ComparisonDirection::GreaterThanOrEqual,
+        ];
+
+        // Exhaustively compare interval proofs with concrete outcomes over a small domain. This checks
+        // endpoint strictness and overlapping intervals independently of the implementation's interval rules.
+        for left_minimum in 0..4 {
+            for left_maximum in left_minimum..4 {
+                for right_minimum in 0..4 {
+                    for right_maximum in right_minimum..4 {
+                        let left = DimensionType::new(
+                            "left",
+                            DimensionBounds::new(left_minimum, Some(left_maximum + 1)).unwrap(),
+                        );
+                        let right = DimensionType::new(
+                            "right",
+                            DimensionBounds::new(right_minimum, Some(right_maximum + 1)).unwrap(),
+                        );
+                        for direction in directions {
+                            let mut outcomes = Vec::new();
+                            for left in left_minimum..=left_maximum {
+                                for right in right_minimum..=right_maximum {
+                                    outcomes.push(match direction {
+                                        ComparisonDirection::Equal => left == right,
+                                        ComparisonDirection::NotEqual => left != right,
+                                        ComparisonDirection::LessThan => left < right,
+                                        ComparisonDirection::LessThanOrEqual => left <= right,
+                                        ComparisonDirection::GreaterThan => left > right,
+                                        ComparisonDirection::GreaterThanOrEqual => left >= right,
+                                    });
+                                }
+                            }
+                            let expected =
+                                outcomes.iter().all(|outcome| *outcome == outcomes[0]).then_some(outcomes[0]);
+                            assert_eq!(direction.prove_for_dimensions(&left, &right, [None, None]).unwrap(), expected);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Shared identities prove reflexive predicates even without finite bounds; exact values take precedence.
+        let dimension = DimensionType::new("dimension", DimensionBounds::new(0, None).unwrap());
+        for (direction, expected) in directions.into_iter().zip([true, false, false, true, false, true]) {
+            assert_eq!(direction.prove_for_dimensions(&dimension, &dimension, [None, None]).unwrap(), Some(expected));
+        }
+        for (direction, expected) in directions.into_iter().zip([false, true, true, true, false, false]) {
+            assert_eq!(
+                direction.prove_for_dimensions(&dimension, &dimension, [Some(4), Some(5)]).unwrap(),
+                Some(expected),
+            );
         }
     }
 
@@ -708,6 +770,7 @@ mod tests {
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
+
         // The shared operation contract rejects attached regions for every type universe.
         assert_eq!(
             ordered_scalar.infer_output_types(
@@ -779,12 +842,8 @@ mod tests {
                 // Concrete dimensions fold to an ordinary Boolean array.
                 {
                     inputs = [
-                        (@known, ArrayIrValue::Dimension(
-                            DimensionValue::new(left_type.clone(), 3).unwrap(),
-                        )),
-                        (@known, ArrayIrValue::Dimension(
-                            DimensionValue::new(right_type.clone(), 5).unwrap(),
-                        )),
+                        (@known, ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap())),
+                        (@known, ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 5).unwrap())),
                     ],
                     outputs = [
                         (@known, ArrayIrValue::Array(Array::scalar(true).unwrap())),
@@ -796,15 +855,11 @@ mod tests {
                     inputs = [
                         (@unknown(
                             type = ArrayIrType::Dimension(left_type.clone()),
-                            replay = ArrayIrValue::Dimension(
-                                DimensionValue::new(left_type.clone(), 3).unwrap(),
-                            )
+                            replay = ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap()),
                         )),
                         (@unknown(
                             type = ArrayIrType::Dimension(right_type.clone()),
-                            replay = ArrayIrValue::Dimension(
-                                DimensionValue::new(right_type.clone(), 5).unwrap(),
-                            )
+                            replay = ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 5).unwrap()),
                         )),
                     ],
                     outputs = [
@@ -817,11 +872,11 @@ mod tests {
                     inputs = [
                         (@unknown(
                             type = ArrayIrType::Dimension(left_type.clone()),
-                            replay = ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap())
+                            replay = ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap()),
                         )),
                         (@unknown(
                             type = ArrayIrType::Dimension(left_type.clone()),
-                            replay = ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap())
+                            replay = ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap()),
                         )),
                     ],
                     outputs = [(@known, ArrayIrValue::Array(Array::scalar(false).unwrap()))],
@@ -833,7 +888,7 @@ mod tests {
                         (@known, ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 8).unwrap())),
                         (@unknown(
                             type = ArrayIrType::Dimension(right_type.clone()),
-                            replay = ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 5).unwrap())
+                            replay = ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 5).unwrap()),
                         )),
                     ],
                     outputs = [(@known, ArrayIrValue::Array(Array::scalar(false).unwrap()))],
@@ -1130,70 +1185,5 @@ mod tests {
         assert_eq!(left.less_than_or_equal(&right), Ok(Array::scalar(true).unwrap()));
         assert_eq!(left.greater_than(&right), Ok(Array::scalar(false).unwrap()));
         assert_eq!(left.greater_than_or_equal(&right), Ok(Array::scalar(false).unwrap()));
-    }
-
-    #[test]
-    fn test_prove_dimension_comparison() {
-        let directions = [
-            ComparisonDirection::Equal,
-            ComparisonDirection::NotEqual,
-            ComparisonDirection::LessThan,
-            ComparisonDirection::LessThanOrEqual,
-            ComparisonDirection::GreaterThan,
-            ComparisonDirection::GreaterThanOrEqual,
-        ];
-        // Exhaustively compare interval proofs with concrete outcomes over a small domain. This checks
-        // endpoint strictness and overlapping intervals independently of the implementation's interval rules.
-        for left_minimum in 0..4 {
-            for left_maximum in left_minimum..4 {
-                for right_minimum in 0..4 {
-                    for right_maximum in right_minimum..4 {
-                        let left = DimensionType::new(
-                            "left",
-                            DimensionBounds::new(left_minimum, Some(left_maximum + 1)).unwrap(),
-                        );
-                        let right = DimensionType::new(
-                            "right",
-                            DimensionBounds::new(right_minimum, Some(right_maximum + 1)).unwrap(),
-                        );
-                        for direction in directions {
-                            let mut outcomes = Vec::new();
-                            for left in left_minimum..=left_maximum {
-                                for right in right_minimum..=right_maximum {
-                                    outcomes.push(match direction {
-                                        ComparisonDirection::Equal => left == right,
-                                        ComparisonDirection::NotEqual => left != right,
-                                        ComparisonDirection::LessThan => left < right,
-                                        ComparisonDirection::LessThanOrEqual => left <= right,
-                                        ComparisonDirection::GreaterThan => left > right,
-                                        ComparisonDirection::GreaterThanOrEqual => left >= right,
-                                    });
-                                }
-                            }
-                            let expected =
-                                outcomes.iter().all(|outcome| *outcome == outcomes[0]).then_some(outcomes[0]);
-                            assert_eq!(
-                                prove_dimension_comparison(&left, &right, [None, None], direction).unwrap(),
-                                expected,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        // Shared identities prove reflexive predicates even without finite bounds; exact values take precedence.
-        let dimension = DimensionType::new("dimension", DimensionBounds::new(0, None).unwrap());
-        for (direction, expected) in directions.into_iter().zip([true, false, false, true, false, true]) {
-            assert_eq!(
-                prove_dimension_comparison(&dimension, &dimension, [None, None], direction).unwrap(),
-                Some(expected),
-            );
-        }
-        for (direction, expected) in directions.into_iter().zip([false, true, true, true, false, false]) {
-            assert_eq!(
-                prove_dimension_comparison(&dimension, &dimension, [Some(4), Some(5)], direction).unwrap(),
-                Some(expected),
-            );
-        }
     }
 }
