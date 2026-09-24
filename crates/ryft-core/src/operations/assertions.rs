@@ -154,6 +154,43 @@ pub enum AssertionError {
     },
 }
 
+impl AssertionError {
+    /// Constructs a scalar [`AssertionError::Failed`] from a message and validated labeled observations, without
+    /// checking the condition. Missing or non-concretizable dimension values use their extent or dimension type.
+    /// Other unavailable values appear as `<unknown>` and other observation-rendering errors are propagated.
+    fn from_observations<
+        'a,
+        V: AssertionValue<Type: Into<ArrayIrType>>,
+        I: IntoIterator<Item = (&'a str, Option<V>, V::Type)>,
+    >(
+        message: &str,
+        observations: I,
+    ) -> Result<Self, ProgramError> {
+        let observations = observations
+            .into_iter()
+            .map(|(label, input, r#type)| {
+                let fallback = || match r#type.into() {
+                    ArrayIrType::Dimension(dimension) => match dimension.extent() {
+                        Some(extent) => extent.to_string(),
+                        None => format!("<unknown: `{dimension}`>"),
+                    },
+                    _ => "<unknown>".to_owned(),
+                };
+                let observation = match input {
+                    Some(input) => match input.assertion_observation() {
+                        Ok(value) => value,
+                        Err(ProgramError::Concretization { .. }) => fallback(),
+                        Err(error) => return Err(error),
+                    },
+                    None => fallback(),
+                };
+                Ok((label.to_owned(), observation))
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        Ok(Self::Failed { message: message.to_owned(), observations })
+    }
+}
+
 impl Display for AssertionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -300,104 +337,6 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         }
         context.bind(self.clone(), Vec::new(), inputs)?;
         Ok(())
-    }
-
-    /// Validates the inputs and checks every Boolean element of the concrete condition. Empty conditions pass.
-    /// On failure, reports up to the configured failure limit in row-major order, including each failing index and its
-    /// observations, plus the number of omitted failures. Scalar observations are reused at every index while array
-    /// observations are sampled at that index. Requires a configured failure limit.
-    fn assert_elements<V: AssertionValue<Type = T>>(
-        &self,
-        condition: &V,
-        observations: &[(&str, V)],
-    ) -> Result<(), ProgramError> {
-        let input_types = std::iter::once(condition.r#type().into_owned())
-            .chain(observations.iter().map(|(_, value)| value.r#type().into_owned()))
-            .collect::<Vec<_>>();
-        self.infer_output_types(&input_types, &[])?;
-        let condition = condition.assertion_array()?.unwrap();
-        let values = condition.elements::<bool>()?;
-        let failure_count = values.iter().filter(|value| !**value).count();
-        if failure_count == 0 {
-            return Ok(());
-        }
-        let shape = condition
-            .r#type()
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|dimension| dimension.value().unwrap())
-            .collect::<Vec<_>>();
-        let observations = observations
-            .iter()
-            .map(|(label, value)| Ok((*label, value, value.assertion_array()?)))
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        let limit = self.failure_limit.unwrap().get();
-        let mut failures = Vec::new();
-        for position in values.iter().enumerate().filter_map(|(index, value)| (!value).then_some(index)).take(limit) {
-            let mut remaining = position;
-            let mut index = vec![0; shape.len()];
-            for axis in (0..shape.len()).rev() {
-                index[axis] = remaining % shape[axis];
-                remaining /= shape[axis];
-            }
-            let starts =
-                index.iter().map(|&coordinate| Array::scalar(coordinate as i64)).collect::<Result<Vec<_>, _>>()?;
-            let observations = observations
-                .iter()
-                .map(|(label, value, array)| {
-                    let observation = match array {
-                        Some(array) if array.r#type().rank() > 0 => {
-                            array.dynamic_slice(&starts, &vec![1; index.len()])?.reshape([])?.assertion_observation()?
-                        }
-                        Some(array) => array.assertion_observation()?,
-                        None => value.assertion_observation()?,
-                    };
-                    Ok(((*label).to_owned(), observation))
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-            failures.push(AssertionFailure { index, observations });
-        }
-        Err(AssertionError::FailedElements {
-            message: self.message.clone(),
-            failures,
-            omitted: failure_count.saturating_sub(limit),
-        }
-        .into())
-    }
-
-    /// Constructs an [`AssertionError::Failed`] with this operation's message and labeled observations, without
-    /// checking the condition. Observations must match the previously validated signature and label order. Missing
-    /// or non-concretizable dimension values use their extent or dimension type. Other unavailable values appear as
-    /// `<unknown>` and other observation-rendering errors are propagated.
-    fn failure_from_observations<V: AssertionValue<Type = T>, I: IntoIterator<Item = (Option<V>, T)>>(
-        &self,
-        observations: I,
-    ) -> Result<AssertionError, ProgramError> {
-        let observations = self
-            .labels
-            .iter()
-            .zip(observations)
-            .map(|(label, (input, r#type))| {
-                let fallback = || match r#type.into() {
-                    ArrayIrType::Dimension(dimension) => match dimension.extent() {
-                        Some(extent) => extent.to_string(),
-                        None => format!("<unknown: `{dimension}`>"),
-                    },
-                    _ => "<unknown>".to_owned(),
-                };
-                let observation = match input {
-                    Some(input) => match input.assertion_observation() {
-                        Ok(value) => value,
-                        Err(ProgramError::Concretization { .. }) => fallback(),
-                        Err(error) => return Err(error),
-                    },
-                    None => fallback(),
-                };
-                Ok((label.clone(), observation))
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        Ok(AssertionError::Failed { message: self.message.clone(), observations })
     }
 }
 
@@ -558,15 +497,17 @@ impl<C: Context<Type: Into<ArrayIrType>, Constant: AssertionValue, Operation: Fr
 
             // The condition is false and may fail now. Render resolved observations, using type information or
             // unknown placeholders for observations that are still symbolic rather than requiring their execution.
-            return Err(self
-                .failure_from_observations(inputs[1..].iter().map(|input| {
+            return Err(AssertionError::from_observations(
+                &self.message,
+                self.labels.iter().zip(&inputs[1..]).map(|(label, input)| {
                     let value = input.as_known().and_then(|input| match context.parent().resolve(input) {
                         ValueResolution::Constant(input) => Some(input),
                         _ => None,
                     });
-                    (value, input.r#type().into_owned())
-                }))?
-                .into());
+                    (label.as_str(), value, input.r#type().into_owned())
+                }),
+            )?
+            .into());
         }
 
         // Without a concrete condition, preserve the assertion through the default partial evaluation policy.
@@ -1074,66 +1015,120 @@ pub trait Assert: Sized {
 }
 
 impl Assert for Array {
+    #[inline]
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {
-        let operation = AssertOperation::new(message)
-            .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect());
-        let input_types = std::iter::once(self.r#type().into_owned())
-            .chain(observations.iter().map(|(_, input)| input.r#type().into_owned()))
-            .collect::<Vec<_>>();
-        operation.infer_output_types(&input_types, &[])?;
-
-        if Concretizable::<bool>::concretize(self)? {
-            return Ok(());
-        }
-
-        let observations = observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned()));
-        Err(operation.failure_from_observations(observations)?.into())
+        assert_value(self, message, observations, None)
     }
 
+    #[inline]
     fn assert_with_limit(
         &self,
         message: &str,
         observations: &[(&str, Self)],
         limit: NonZeroUsize,
     ) -> Result<(), ProgramError> {
-        let operation = AssertOperation::new(message)
-            .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect())
-            .with_failure_limit(limit);
-        operation.assert_elements(self, observations)
+        assert_value(self, message, observations, Some(limit))
+    }
+}
+
+impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
+    #[inline]
+    fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {
+        assert_value(self, message, observations, None)
+    }
+
+    #[inline]
+    fn assert_with_limit(
+        &self,
+        message: &str,
+        observations: &[(&str, Self)],
+        limit: NonZeroUsize,
+    ) -> Result<(), ProgramError> {
+        assert_value(self, message, observations, Some(limit))
     }
 }
 
 // TODO(eaplatanios): Review from here onwards.
 
-impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
-    fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {
-        let operation = AssertOperation::new(message)
-            .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect());
-        let input_types = std::iter::once(self.r#type().into_owned())
-            .chain(observations.iter().map(|(_, input)| input.r#type().into_owned()))
-            .collect::<Vec<_>>();
-        operation.infer_output_types(&input_types, &[])?;
-        if Concretizable::<bool>::concretize(self)? {
+/// Validates and checks a concrete assertion without binding an operation. Scalar assertions report their named
+/// observations on failure; a failure limit enables elementwise checking with a bounded sample of failing indices
+/// and observations in row-major order. Empty conditions pass, and scalar observations are reused at each index.
+fn assert_value<V: AssertionValue<Type: Into<ArrayIrType>>>(
+    condition: &V,
+    message: &str,
+    observations: &[(&str, V)],
+    failure_limit: Option<NonZeroUsize>,
+) -> Result<(), ProgramError> {
+    // Reuse operation type inference so eager and staged assertions validate the same signature.
+    let mut operation =
+        AssertOperation::new(message).with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect());
+    if let Some(limit) = failure_limit {
+        operation = operation.with_failure_limit(limit);
+    }
+    let input_types = std::iter::once(condition.r#type().into_owned())
+        .chain(observations.iter().map(|(_, value)| value.r#type().into_owned()))
+        .collect::<Vec<_>>();
+    operation.infer_output_types(&input_types, &[])?;
+
+    let Some(limit) = failure_limit else {
+        if Concretizable::<bool>::concretize(condition)? {
             return Ok(());
         }
-        Err(operation
-            .failure_from_observations(
-                observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned())),
-            )?
-            .into())
-    }
+        return Err(AssertionError::from_observations(
+            message,
+            observations.iter().map(|(label, input)| (*label, Some(input.clone()), input.r#type().into_owned())),
+        )?
+        .into());
+    };
 
-    fn assert_with_limit(
-        &self,
-        message: &str,
-        observations: &[(&str, Self)],
-        limit: NonZeroUsize,
-    ) -> Result<(), ProgramError> {
-        let operation = AssertOperation::new(message)
-            .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect())
-            .with_failure_limit(limit);
-        operation.assert_elements(self, observations)
+    let condition = condition.assertion_array()?.unwrap();
+    let values = condition.elements::<bool>()?;
+    let failure_count = values.iter().filter(|value| !**value).count();
+    if failure_count == 0 {
+        return Ok(());
     }
+    let shape = condition
+        .r#type()
+        .shape()
+        .dimensions()
+        .iter()
+        .map(|dimension| dimension.value().unwrap())
+        .collect::<Vec<_>>();
+    let observations = observations
+        .iter()
+        .map(|(label, value)| Ok((*label, value, value.assertion_array()?)))
+        .collect::<Result<Vec<_>, ProgramError>>()?;
+    let limit = limit.get();
+    let mut failures = Vec::new();
+    for position in values.iter().enumerate().filter_map(|(index, value)| (!value).then_some(index)).take(limit) {
+        let mut remaining = position;
+        let mut index = vec![0; shape.len()];
+        for axis in (0..shape.len()).rev() {
+            index[axis] = remaining % shape[axis];
+            remaining /= shape[axis];
+        }
+        let starts = index.iter().map(|&coordinate| Array::scalar(coordinate as i64)).collect::<Result<Vec<_>, _>>()?;
+        let observations = observations
+            .iter()
+            .map(|(label, value, array)| {
+                let observation = match array {
+                    Some(array) if array.r#type().rank() > 0 => {
+                        array.dynamic_slice(&starts, &vec![1; index.len()])?.reshape([])?.assertion_observation()?
+                    }
+                    Some(array) => array.assertion_observation()?,
+                    None => value.assertion_observation()?,
+                };
+                Ok(((*label).to_owned(), observation))
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        failures.push(AssertionFailure { index, observations });
+    }
+    Err(AssertionError::FailedElements {
+        message: message.to_owned(),
+        failures,
+        omitted: failure_count.saturating_sub(limit),
+    }
+    .into())
 }
 
 impl<V: Value> Assert for V
