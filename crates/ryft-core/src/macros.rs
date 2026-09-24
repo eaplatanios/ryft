@@ -4306,13 +4306,13 @@ macro_rules! check_operation_batching {
     }};
 
     // This internal branch converts a mapped value declaration into an `ArrayBatch` at the requested physical axis.
-    (@batch_value (@mapped(axis = $axis:expr), $value:expr)) => {{
+    (@batch_value (@mapped(axis = $axis:expr), $value:expr $(,)?)) => {{
         let value = $value;
         $crate::ArrayBatch::new(value, $crate::batching::BatchAxis::new($axis)).unwrap()
     }};
 
     // This internal branch converts a replicated value declaration into a replicated `ArrayBatch`.
-    (@batch_value (@replicated, $value:expr)) => {
+    (@batch_value (@replicated, $value:expr $(,)?)) => {
         $crate::ArrayBatch::replicated($value)
     };
 

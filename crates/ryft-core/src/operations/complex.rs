@@ -1,17 +1,23 @@
-//! Construction, conjugation, and component extraction for complex values.
+//! Operations that construct complex values from their real and imaginary parts, conjugate them, and extract their
+//! parts. Each operation is defined by an [`Operation`](crate::Operation) type (e.g., [`ComplexOperation`]) together
+//! with a value capability trait (e.g., [`Complex`]) whose functions apply it to eager [`Array`]s and traced values
+//! alike, so the same code executes immediately or records into a program depending on the value it runs on:
 //!
-//! This module provides the following:
+//!   - [`Complex`] combines a real and an imaginary part into one complex value (i.e., `(re, im) ↦ re + im·i`). The
+//!     parts must have identical types, so construction neither broadcasts nor promotes them.
+//!   - [`Conjugate`] negates the imaginary part of a complex value (i.e., `z ↦ z̄`), preserving its type.
+//!   - [`Real`] and [`Imaginary`] extract the real and imaginary parts of a complex value
+//!     (i.e., `z ↦ Re(z)` and `z ↦ Im(z)`).
 //!
-//!   - [`Complex`] and [`ComplexOperation`], which combine identically typed real and imaginary parts.
-//!   - [`Conjugate`] and [`ConjugateOperation`], which negate the imaginary component.
-//!   - [`Real`] and [`RealOperation`], which extract the real component.
-//!   - [`Imaginary`] and [`ImaginaryOperation`], which extract the imaginary component.
+//! Construction and extraction preserve shape, sharding, and memory placement, but clear byte-strided layouts because
+//! they change the element width, whereas conjugation preserves the entire type. Batching maps each operation
+//! elementwise over the batch axis.
 //!
-//! Parts have `f32` or `f64` elements, corresponding to `c64` or `c128` complex elements. Construction and extraction
-//! preserve shape, sharding, and memory placement, but clear byte-strided layouts when element width changes.
-//! Conjugation preserves the entire type. Partial evaluation folds known inputs, and batching applies each operation
-//! elementwise. Differentiation treats these maps as real-linear; transposition uses Ryft's bilinear complex pairing,
-//! including the negative imaginary cotangent for construction and imaginary-part extraction.
+//! Every operation is ℝ-linear, so its tangent applies the same operation to the input tangents (e.g., the tangent
+//! of `z̄` is the conjugate of the tangent of `z`). Transposition pairs complex values bilinearly (i.e., without
+//! conjugation). Under that pairing, conjugation is self-adjoint, the transpose of construction maps an output
+//! cotangent `ȳ` to `(Re(ȳ), -Im(ȳ))`, and the transposes of real-part and imaginary-part extraction map a cotangent
+//! `t` to `complex(t, 0)` and `complex(0, -t)`, respectively.
 //!
 //! # Example
 //!
@@ -42,29 +48,32 @@ use crate::operations::manipulation::conversions::ElementType;
 use crate::operations::math::neg::NegOperation;
 use crate::programs::{MaybeZero, ProgramError, Type, TypeError, Typed};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`ComplexOperation`].
 pub const COMPLEX_OPERATION_NAME: &str = "complex";
 
 define_elementwise_operation!(
     @binary
     /// [`Operation`] that constructs a complex value from its real and imaginary parts (i.e., `(re, im) ↦ re + im·i`,
-    /// with `(f32, f32) ↦ c64` and `(f64, f64) ↦ c128`). This is the analogue of
-    /// [JAX's `lax.complex`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.complex.html) and the inverse of the
-    /// [`RealOperation`]/[`ImaginaryOperation`] pair. The two parts must have identical types. Array shape, sharding,
-    /// and memory placement are preserved; byte-strided layouts are cleared because complex elements are wider.
+    /// with `(f32, f32) ↦ c64` and `(f64, f64) ↦ c128`). This operation is the Ryft analogue of JAX's
+    /// [`lax.complex`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.complex.html) and the inverse of the
+    /// [`RealOperation`] and [`ImaginaryOperation`] pair. The two parts must have identical types. Array shape,
+    /// sharding, and memory placement are preserved. Note however that byte-strided layouts are cleared because
+    /// complex elements are wider.
     ///
-    /// As a map from the pair of real parts, the operation is linear, and its transpose is the
-    /// `ȳ ↦ (real(ȳ), imaginary(-ȳ))` pair under the bilinear (i.e., conjugation-free) pairing that Ryft's
-    /// transposition uses over complex types.
-    ComplexOperation, COMPLEX_OPERATION_NAME,
-    Complex, complex,
+    /// As a map from the pair of real parts, the operation is linear, and its transpose is the `ȳ ↦ (real(ȳ),
+    /// imaginary(-ȳ))` pair under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses over
+    /// complex types.
+    ComplexOperation,
+    COMPLEX_OPERATION_NAME,
+    Complex,
+    complex,
     infer_data_types = |input_types: &[DataType]| {
         if input_types[0] != input_types[1] {
             return Err(TypeError::invalid(format!(
-                "`{COMPLEX_OPERATION_NAME}` requires identical part types but got `{}` and `{}`",
-                input_types[0], input_types[1],
+                "`{}` requires identical part types but got `{}` and `{}`",
+                COMPLEX_OPERATION_NAME,
+                input_types[0],
+                input_types[1],
             )));
         }
         Ok(vec![part_to_complex_data_type(input_types[0], COMPLEX_OPERATION_NAME)?])
@@ -72,8 +81,10 @@ define_elementwise_operation!(
     infer_array_types = |input_types: &[ArrayType]| {
         if input_types[0] != input_types[1] {
             return Err(TypeError::invalid(format!(
-                "`{COMPLEX_OPERATION_NAME}` requires identical part types but got `{}` and `{}`",
-                input_types[0], input_types[1],
+                "`{}` requires identical part types but got `{}` and `{}`",
+                COMPLEX_OPERATION_NAME,
+                input_types[0],
+                input_types[1],
             )));
         }
         let data_type = part_to_complex_data_type(input_types[0].data_type(), COMPLEX_OPERATION_NAME)?;
@@ -87,18 +98,18 @@ impl_differentiable_operation! {
     where
         T: Type,
         C::Type: DifferentiableType,
-        C: Zero<C::Value>,
         C::Value: Complex,
+        C: Zero<C::Value>,
     {
         |_operation, context, _driver, inputs| {
+            // Complex construction is linear in its two real parts: `d(complex(re, im)) = complex(dre, dim)`. When both
+            // part tangents are structural zeros the output tangent stays a symbolic zero of the complex output type.
+            // When only one is, the missing part is materialized as a real zero through the context so the staged
+            // `complex` keeps its two-part arity.
             check_count!("input", inputs, 2, ProgramError);
             let real = &inputs[0];
             let imaginary = &inputs[1];
             let primal = real.primal().complex(imaginary.primal())?;
-            // Complex construction is linear in its two real parts: `d(complex(re, im)) = complex(dre, dim)`. When both
-            // part tangents are structural zeros the output tangent stays a symbolic zero of the complex output type;
-            // when only one is, the missing part is materialized as a real zero through the context so the staged
-            // `complex` keeps its two-part arity.
             let tangent = match (real.tangent(), imaginary.tangent()) {
                 (MaybeZero::Zero(_), MaybeZero::Zero(_)) => MaybeZero::Zero(primal.r#type().tangent()?),
                 (real_tangent, imaginary_tangent) => MaybeZero::Value(
@@ -118,12 +129,11 @@ impl_differentiable_operation! {
         O: From<NegOperation<V::Type>> + From<RealOperation<V::Type>> + From<ImaginaryOperation<V::Type>>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
-            // Transpose rule for the linear [`ComplexOperation`]. Under the bilinear (i.e., conjugation-free) pairing
-            // used for complex transposition, the transpose of `(re, im) ↦ re + im·i` maps the output cotangent `ȳ`
-            // to `(real(ȳ), imaginary(-ȳ))`: pairing `Re(ȳ · (re + im·i))` against
-            // `(re, im)` picks out the real part of `ȳ` for `re` and the *negated* imaginary part for `im`. Like the
-            // `Add` rule, a known part contributes an additive constant whose adjoint is dropped at the pullback
-            // output boundary.
+            // Under the bilinear (i.e., conjugation-free) pairing used for complex transposition, the
+            // transpose of `(re, im) ↦ re + im·i` maps the output cotangent `ȳ` to `(real(ȳ), imaginary(-ȳ))`:
+            // pairing `Re(ȳ · (re + im·i))` against `(re, im)` picks out the real part of `ȳ` for `re` and the
+            // _negated_ imaginary part for `im`. Like the `Add` rule, a known part contributes an additive constant
+            // whose adjoint is dropped at the pullback output boundary.
             check_count!("input", inputs, 2, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 2, DifferentiationError);
@@ -132,8 +142,9 @@ impl_differentiable_operation! {
                 MaybeZero::Value(output_cotangent) => {
                     let contribution = MaybeZero::Value(output_cotangent.unary(RealOperation::new()));
                     accumulators[0].accumulate(context, contribution)?;
-                    let contribution =
-                        MaybeZero::Value(output_cotangent.unary(NegOperation::new()).unary(ImaginaryOperation::new()));
+                    let contribution = MaybeZero::Value(
+                        output_cotangent.unary(NegOperation::new()).unary(ImaginaryOperation::new()),
+                    );
                     accumulators[1].accumulate(context, contribution)?;
                     Ok(())
                 }
@@ -141,6 +152,8 @@ impl_differentiable_operation! {
         }
     },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 define_elementwise_capability!(
     @binary
@@ -158,8 +171,6 @@ define_elementwise_capability!(
     complex(imaginary),
     ComplexOperation,
 );
-
-// TODO(eaplatanios): Review this.
 
 impl Complex for Array {
     fn complex(&self, imaginary: &Self) -> Result<Self, ProgramError> {
@@ -515,20 +526,26 @@ fn complex_to_part_data_type(complex: DataType, operation_name: &'static str) ->
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, Layout, StridedLayout};
+    use crate::arrays::{Array, ArrayOperation, Layout, Memory, StridedLayout};
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::differentiate_at;
+    use crate::differentiation::{DifferentiableOperation, DifferentiationContext, differentiate_at};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
-        check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
-        check_operation_type_inference,
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
     };
     use crate::programs::{EmptyRegionDriver, Operation};
 
     use super::*;
+
+    #[test]
+    fn test_complex() {
+        assert_eq!(ComplexOperation::<ArrayType>::new().to_string(), "complex");
+    }
 
     #[test]
     fn test_complex_type_inference() {
@@ -553,20 +570,30 @@ mod tests {
                 },
             ],
         );
+
+        // Array parts must have identical types, so construction neither broadcasts nor promotes them.
+        check_operation_type_inference!(
+            operation = ComplexOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [ArrayType::new_static(DataType::F32, [1]), ArrayType::new_static(DataType::F32, [2])],
+                error = "`complex` requires identical part types but got `f32[1]` and `f32[2]`",
+            }],
+        );
     }
 
     #[test]
     fn test_complex_type_inference_layout() {
-        // Byte strides are cleared when the element width changes.
-        let input_type =
-            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        // Construction preserves memory placement but clears byte strides because complex elements are wider.
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
+            .with_memory(Memory::Host { pinned: true });
         assert_eq!(
             Operation::infer_output_types(
                 &ComplexOperation::<ArrayType>::new(),
                 &[input_type.clone(), input_type],
                 &[],
             ),
-            Ok(vec![ArrayType::new_static(DataType::C64, [2])]),
+            Ok(vec![ArrayType::new_static(DataType::C64, [2]).with_memory(Memory::Host { pinned: true })]),
         );
     }
 
@@ -578,7 +605,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[Array::scalar(1.5f32).unwrap(), Array::scalar(-2.0f32).unwrap()],
             ),
-            Ok(vec![Array::scalar(ComplexNumber::new(1.5f32, -2.0f32)).unwrap()]),
+            Ok(vec![Array::scalar(ComplexNumber::new(1.5f32, -2.0)).unwrap()]),
         );
     }
 
@@ -587,7 +614,7 @@ mod tests {
         check_operation_partial_evaluation!(
             operation = ComplexOperation::new(),
             inputs = [Array::scalar(1.5f64).unwrap(), Array::scalar(-2.0f64).unwrap()],
-            expected = Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)).unwrap(),
+            expected = Array::scalar(ComplexNumber::new(1.5f64, -2.0)).unwrap(),
         );
     }
 
@@ -599,15 +626,12 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [
-                    (@mapped(axis = 0), Array::vector(vec![1.5f64, 0.5f64]).unwrap()),
-                    (@mapped(axis = 0), Array::vector(vec![-2.0f64, 1.0f64]).unwrap()),
+                    (@mapped(axis = 0), Array::vector(vec![1.5f64, 0.5]).unwrap()),
+                    (@mapped(axis = 0), Array::vector(vec![-2.0f64, 1.0]).unwrap()),
                 ],
                 outputs = [(
                     @mapped(axis = 0),
-                    Array::vector(vec![
-                        ComplexNumber::new(1.5f64, -2.0f64),
-                        ComplexNumber::new(0.5f64, 1.0f64),
-                    ]).unwrap()
+                    Array::vector(vec![ComplexNumber::new(1.5f64, -2.0), ComplexNumber::new(0.5f64, 1.0)]).unwrap(),
                 )],
             }],
         );
@@ -615,22 +639,53 @@ mod tests {
 
     #[test]
     fn test_complex_differentiation() {
-        // Construction: d(complex(re, im)) = complex(dre, dim), including the mixed case where one part tangent is a
-        // structural zero that must be materialized to keep the staged `complex` arity.
-        let (primal, tangent) = differentiate_at((Array::scalar(1.5f64).unwrap(), Array::scalar(-2.0f64).unwrap()))
-            .jvp((Array::scalar(0.25f64).unwrap(), Array::scalar(4.0f64).unwrap()), |(real, imaginary)| {
-                real.complex(&imaginary)
-            })
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = ComplexOperation::new(),
+            cases = [{
+                primals = [Array::scalar(1.5f64).unwrap(), Array::scalar(-2.0f64).unwrap()],
+                tangents = [Array::scalar(0.25f64).unwrap(), Array::scalar(4.0f64).unwrap()],
+                primal_outputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0)).unwrap()],
+                tangent_outputs = [Array::scalar(ComplexNumber::new(0.25f64, 4.0)).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:c128[] = complex %0 %1
+                        %5:c128[] = complex %2 %3
+                    in (%4, %5)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_complex_differentiation_zero_tangents() {
+        // A structural zero part tangent is materialized as a real zero so that the tangent keeps both parts.
+        assert_eq!(
+            differentiate_at((Array::scalar(1.5f64).unwrap(), Array::scalar(-2.0f64).unwrap()))
+                .jvp((Array::scalar(0.25f64).unwrap(), Array::scalar(4.0f64).unwrap()), |(real, imaginary)| real
+                    .complex(&imaginary.context().lift(Array::scalar(0.0f64).unwrap())?),),
+            Ok((
+                Array::scalar(ComplexNumber::new(1.5f64, 0.0)).unwrap(),
+                Array::scalar(ComplexNumber::new(0.25f64, 0.0)).unwrap(),
+            )),
+        );
+
+        // When both part tangents are structural zeros, the output tangent stays a symbolic zero of the complex type.
+        let outputs = ComplexOperation::<ArrayType>::new()
+            .jvp(
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(1.5f64).unwrap()).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(-2.0f64).unwrap()).unwrap(),
+                ],
+            )
             .unwrap();
-        assert_eq!(primal, Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)).unwrap());
-        assert_eq!(tangent, Array::scalar(ComplexNumber::new(0.25f64, 4.0f64)).unwrap());
-        let (_, tangent) = differentiate_at((Array::scalar(1.5f64).unwrap(), Array::scalar(-2.0f64).unwrap()))
-            .jvp((Array::scalar(0.25f64).unwrap(), Array::scalar(4.0f64).unwrap()), |(real, imaginary)| {
-                let constant = imaginary.context().lift(Array::scalar(0.0f64).unwrap())?;
-                real.complex(&constant)
-            })
-            .unwrap();
-        assert_eq!(tangent, Array::scalar(ComplexNumber::new(0.25f64, 0.0f64)).unwrap());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(ComplexNumber::new(1.5f64, -2.0)).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::C128))
+        );
     }
 
     #[test]
@@ -643,15 +698,22 @@ mod tests {
                     (@linear(type = ArrayType::scalar(DataType::F64))),
                     (@linear(type = ArrayType::scalar(DataType::F64))),
                 ],
-                output_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, -4.0f64)).unwrap()],
+                output_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, -4.0)).unwrap()],
                 input_cotangents = [Array::scalar(3.0f64).unwrap(), Array::scalar(4.0f64).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:c128[] .
+                    let %1:f64[] = real %0
+                        %2:c128[] = neg %0
+                        %3:f64[] = imaginary %2
+                    in (%1, %3)
+                "},
             }],
         );
     }
 
     #[test]
-    fn test_array_complex() {
-        // Construction retains both components at each supported precision.
+    fn test_complex_for_array() {
+        // Construction retains both parts at each supported precision.
         assert_eq!(
             Array::vector(vec![1f32, 2.0]).unwrap().complex(&Array::vector(vec![3f32, -4.0]).unwrap()),
             Ok(Array::vector(vec![ComplexNumber::new(1f32, 3.0), ComplexNumber::new(2f32, -4.0)]).unwrap()),
@@ -661,7 +723,7 @@ mod tests {
             Ok(Array::vector(vec![ComplexNumber::new(1f64, 3.0), ComplexNumber::new(2f64, -4.0)]).unwrap()),
         );
 
-        // Part types must agree, and integer parts cannot represent a complex array.
+        // Part types must agree exactly, and integer parts cannot represent a complex array.
         assert_eq!(
             Array::scalar(1f32).unwrap().complex(&Array::scalar(2f64).unwrap()),
             Err(TypeError::invalid("`complex` requires identical part types but got `f32[]` and `f64[]`").into()),
@@ -677,8 +739,8 @@ mod tests {
     }
 
     #[test]
-    fn test_array_complex_layout() {
-        // Byte strides are cleared when the output element width changes.
+    fn test_complex_for_array_layout() {
+        // Construction traverses strided parts and produces a densely laid out complex array.
         let input_type =
             ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let input = Array::from_elements(input_type, &[1f32, 2.0]).unwrap();
@@ -690,6 +752,11 @@ mod tests {
             )
             .unwrap()),
         );
+    }
+
+    #[test]
+    fn test_conjugate() {
+        assert_eq!(ConjugateOperation::<ArrayType>::new().to_string(), "conjugate");
     }
 
     #[test]
@@ -716,9 +783,9 @@ mod tests {
 
     #[test]
     fn test_conjugate_type_inference_layout() {
-        // Byte strides are cleared when the element width changes.
+        // Conjugation preserves byte strides because the element width is unchanged.
         let input_type =
-            ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+            ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![16])));
         assert_eq!(
             Operation::infer_output_types(&ConjugateOperation::<ArrayType>::new(), &[input_type.clone()], &[]),
             Ok(vec![input_type]),
@@ -731,12 +798,9 @@ mod tests {
             ConjugateOperation::<ArrayType>::new().interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])
-                    .unwrap()],
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0), ComplexNumber::new(0.5f64, 1.0)]).unwrap()],
             ),
-            Ok(vec![
-                Array::vector(vec![ComplexNumber::new(1.5f64, 2.0f64), ComplexNumber::new(0.5f64, -1.0f64)]).unwrap(),
-            ]),
+            Ok(vec![Array::vector(vec![ComplexNumber::new(1.5f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap()]),
         );
     }
 
@@ -744,8 +808,8 @@ mod tests {
     fn test_conjugate_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = ConjugateOperation::new(),
-            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)).unwrap()],
-            expected = Array::scalar(ComplexNumber::new(1.5f64, 2.0f64)).unwrap(),
+            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0)).unwrap()],
+            expected = Array::scalar(ComplexNumber::new(1.5f64, 2.0)).unwrap(),
         );
     }
 
@@ -758,17 +822,11 @@ mod tests {
             cases = [{
                 inputs = [(
                     @mapped(axis = 0),
-                    Array::vector(vec![
-                        ComplexNumber::new(1.5f64, -2.0f64),
-                        ComplexNumber::new(0.5f64, 1.0f64),
-                    ]).unwrap()
+                    Array::vector(vec![ComplexNumber::new(1.5f64, -2.0), ComplexNumber::new(0.5f64, 1.0)]).unwrap(),
                 )],
                 outputs = [(
                     @mapped(axis = 0),
-                    Array::vector(vec![
-                        ComplexNumber::new(1.5f64, 2.0f64),
-                        ComplexNumber::new(0.5f64, -1.0f64),
-                    ]).unwrap()
+                    Array::vector(vec![ComplexNumber::new(1.5f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap(),
                 )],
             }],
         );
@@ -776,34 +834,45 @@ mod tests {
 
     #[test]
     fn test_conjugate_differentiation() {
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
-
-        // Conjugation: d(z̄) = d̄z.
-        let (primal, tangent) = differentiate_at(Array::scalar(input).unwrap())
-            .jvp(Array::scalar(tangent_seed).unwrap(), |input| input.conjugate())
-            .unwrap();
-        assert_eq!(primal, Array::scalar(input.conj()).unwrap());
-        assert_eq!(tangent, Array::scalar(tangent_seed.conj()).unwrap());
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = ConjugateOperation::new(),
+            cases = [{
+                primals = [Array::scalar(ComplexNumber::new(0.7f64, -0.3)).unwrap()],
+                tangents = [Array::scalar(ComplexNumber::new(0.5f64, 2.0)).unwrap()],
+                primal_outputs = [Array::scalar(ComplexNumber::new(0.7f64, 0.3)).unwrap()],
+                tangent_outputs = [Array::scalar(ComplexNumber::new(0.5f64, -2.0)).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:c128[], %1:c128[] .
+                    let %2:c128[] = conjugate %0
+                        %3:c128[] = conjugate %1
+                    in (%2, %3)
+                "},
+            }],
+        );
     }
 
     #[test]
     fn test_conjugate_differentiation_squared_magnitude() {
-        // The squared magnitude is real-valued and non-holomorphic. The conjugation-free transposition pairing
+        // The squared magnitude is real valued and non-holomorphic. The conjugation-free transposition pairing
         // contributes the conjugate input through each multiplication branch, giving twice the conjugate input.
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        let gradient = differentiate_at(Array::scalar(input).unwrap())
-            .gradient(|input| (input.clone() * input.conjugate().unwrap()).real().unwrap())
-            .unwrap();
-        assert_eq!(gradient, Array::scalar(input.conj() + input.conj()).unwrap());
+        let input = ComplexNumber::new(0.7f64, -0.3);
+        assert_eq!(
+            differentiate_at(Array::scalar(input).unwrap())
+                .gradient(|input| (input.clone() * input.conjugate().unwrap()).real().unwrap()),
+            Ok(Array::scalar(input.conj() + input.conj()).unwrap()),
+        );
 
-        // Forward and reverse agree through the ℝ-linear rules: the jvp of f at tangent ż is 2·Re(z̄ · ż).
-        let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
-        let (primal, tangent) = differentiate_at(Array::scalar(input).unwrap())
-            .jvp(Array::scalar(tangent_seed).unwrap(), |input| (input.clone() * input.conjugate()?).real())
-            .unwrap();
-        assert_eq!(primal, Array::scalar(input.norm_sqr()).unwrap());
-        assert_eq!(tangent, Array::scalar((tangent_seed * input.conj() + input * tangent_seed.conj()).re).unwrap());
+        // Forward and reverse mode agree through the ℝ-linear rules: the tangent at `ż` is `2·Re(z̄·ż)`.
+        let tangent = ComplexNumber::new(0.5f64, 2.0);
+        assert_eq!(
+            differentiate_at(Array::scalar(input).unwrap())
+                .jvp(Array::scalar(tangent).unwrap(), |input| (input.clone() * input.conjugate()?).real()),
+            Ok((
+                Array::scalar(input.norm_sqr()).unwrap(),
+                Array::scalar((tangent * input.conj() + input * tangent.conj()).re).unwrap(),
+            )),
+        );
     }
 
     #[test]
@@ -813,14 +882,20 @@ mod tests {
             operation = ConjugateOperation::new(),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::C128)))],
-                output_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, -4.0f64)).unwrap()],
-                input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 4.0f64)).unwrap()],
+                output_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, -4.0)).unwrap()],
+                input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 4.0)).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:c128[] .
+                    let %1:c128[] = conjugate %0
+                    in (%1)
+                "},
             }],
         );
     }
 
     #[test]
-    fn test_array_conjugate() {
+    fn test_conjugate_for_array() {
+        // Conjugation negates the imaginary part at each supported precision and rejects real inputs.
         assert_eq!(
             Array::vector(vec![ComplexNumber::new(1f32, 3.0), ComplexNumber::new(2f32, -4.0)])
                 .unwrap()
@@ -840,10 +915,10 @@ mod tests {
     }
 
     #[test]
-    fn test_array_conjugate_layout() {
+    fn test_conjugate_for_array_layout() {
         // Conjugation preserves byte strides because the element width is unchanged.
         let input_type =
-            ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+            ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![16])));
         let input =
             Array::from_elements(input_type.clone(), &[ComplexNumber::new(1f32, 3.0), ComplexNumber::new(2f32, -4.0)])
                 .unwrap();
@@ -852,6 +927,11 @@ mod tests {
             Ok(Array::from_elements(input_type, &[ComplexNumber::new(1f32, -3.0), ComplexNumber::new(2f32, 4.0)])
                 .unwrap()),
         );
+    }
+
+    #[test]
+    fn test_real() {
+        assert_eq!(RealOperation::<ArrayType>::new().to_string(), "real");
     }
 
     #[test]
@@ -877,12 +957,13 @@ mod tests {
 
     #[test]
     fn test_real_type_inference_layout() {
-        // Byte strides are cleared when the element width changes.
-        let input_type =
-            ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        // Extraction preserves memory placement but clears byte strides because real parts are narrower.
+        let input_type = ArrayType::new_static(DataType::C64, [2])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
+            .with_memory(Memory::Host { pinned: true });
         assert_eq!(
             Operation::infer_output_types(&RealOperation::<ArrayType>::new(), &[input_type], &[]),
-            Ok(vec![ArrayType::new_static(DataType::F32, [2])]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [2]).with_memory(Memory::Host { pinned: true })]),
         );
     }
 
@@ -892,10 +973,9 @@ mod tests {
             RealOperation::<ArrayType>::new().interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])
-                    .unwrap()],
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0), ComplexNumber::new(0.5f64, 1.0)]).unwrap()],
             ),
-            Ok(vec![Array::vector(vec![1.5f64, 0.5f64]).unwrap()]),
+            Ok(vec![Array::vector(vec![1.5f64, 0.5]).unwrap()]),
         );
     }
 
@@ -903,7 +983,7 @@ mod tests {
     fn test_real_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = RealOperation::new(),
-            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)).unwrap()],
+            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0)).unwrap()],
             expected = Array::scalar(1.5f64).unwrap(),
         );
     }
@@ -917,27 +997,47 @@ mod tests {
             cases = [{
                 inputs = [(
                     @mapped(axis = 0),
-                    Array::vector(vec![
-                        ComplexNumber::new(1.5f64, -2.0f64),
-                        ComplexNumber::new(0.5f64, 1.0f64),
-                    ]).unwrap()
+                    Array::vector(vec![ComplexNumber::new(1.5f64, -2.0), ComplexNumber::new(0.5f64, 1.0)]).unwrap(),
                 )],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![1.5f64, 0.5f64]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.5f64, 0.5]).unwrap())],
             }],
         );
     }
 
     #[test]
     fn test_real_differentiation() {
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = RealOperation::new(),
+            cases = [{
+                primals = [Array::scalar(ComplexNumber::new(0.7f64, -0.3)).unwrap()],
+                tangents = [Array::scalar(ComplexNumber::new(0.5f64, 2.0)).unwrap()],
+                primal_outputs = [Array::scalar(0.7f64).unwrap()],
+                tangent_outputs = [Array::scalar(0.5f64).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:c128[], %1:c128[] .
+                    let %2:f64[] = real %0
+                        %3:f64[] = real %1
+                    in (%2, %3)
+                "},
+            }],
+        );
+    }
 
-        // Real-part extraction propagates the real component of the tangent.
-        let (primal, tangent) = differentiate_at(Array::scalar(input).unwrap())
-            .jvp(Array::scalar(tangent_seed).unwrap(), |input| input.real())
+    #[test]
+    fn test_real_differentiation_zero_tangent() {
+        // A structural zero tangent stays symbolic and is retyped to the real output type.
+        let outputs = RealOperation::<ArrayType>::new()
+            .jvp(
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new_with_zero_tangent(Array::scalar(ComplexNumber::new(0.7f64, -0.3)).unwrap())
+                    .unwrap()],
+            )
             .unwrap();
-        assert_eq!(primal, Array::scalar(input.re).unwrap());
-        assert_eq!(tangent, Array::scalar(tangent_seed.re).unwrap());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(0.7f64).unwrap());
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
     }
 
     #[test]
@@ -948,13 +1048,20 @@ mod tests {
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::C128)))],
                 output_cotangents = [Array::scalar(3.0f64).unwrap()],
-                input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 0.0f64)).unwrap()],
+                input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 0.0)).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f64[] .
+                    let %1:f64[] = zero_like %0
+                        %2:c128[] = complex %0 %1
+                    in (%2)
+                "},
             }],
         );
     }
 
     #[test]
-    fn test_array_real() {
+    fn test_real_for_array() {
+        // Extraction keeps each supported precision and rejects real inputs.
         assert_eq!(
             Array::vector(vec![ComplexNumber::new(1f32, 3.0), ComplexNumber::new(2f32, -4.0)]).unwrap().real(),
             Ok(Array::vector(vec![1f32, 2.0]).unwrap()),
@@ -970,16 +1077,21 @@ mod tests {
     }
 
     #[test]
-    fn test_array_real_layout() {
-        // Extraction clears byte strides because the output elements are narrower.
+    fn test_real_for_array_layout() {
+        // Extraction traverses strided inputs and produces a densely laid out real array.
         let input_type =
-            ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+            ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![16])));
         let input =
             Array::from_elements(input_type, &[ComplexNumber::new(1f32, 3.0), ComplexNumber::new(2f32, -4.0)]).unwrap();
         assert_eq!(
             input.real(),
             Ok(Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1f32, 2.0]).unwrap()),
         );
+    }
+
+    #[test]
+    fn test_imaginary() {
+        assert_eq!(ImaginaryOperation::<ArrayType>::new().to_string(), "imaginary");
     }
 
     #[test]
@@ -1005,12 +1117,13 @@ mod tests {
 
     #[test]
     fn test_imaginary_type_inference_layout() {
-        // Byte strides are cleared when the element width changes.
-        let input_type =
-            ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        // Extraction preserves memory placement but clears byte strides because imaginary parts are narrower.
+        let input_type = ArrayType::new_static(DataType::C64, [2])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
+            .with_memory(Memory::Host { pinned: true });
         assert_eq!(
             Operation::infer_output_types(&ImaginaryOperation::<ArrayType>::new(), &[input_type], &[]),
-            Ok(vec![ArrayType::new_static(DataType::F32, [2])]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [2]).with_memory(Memory::Host { pinned: true })]),
         );
     }
 
@@ -1020,10 +1133,9 @@ mod tests {
             ImaginaryOperation::<ArrayType>::new().interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
-                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])
-                    .unwrap()],
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0), ComplexNumber::new(0.5f64, 1.0)]).unwrap()],
             ),
-            Ok(vec![Array::vector(vec![-2.0f64, 1.0f64]).unwrap()]),
+            Ok(vec![Array::vector(vec![-2.0f64, 1.0]).unwrap()]),
         );
     }
 
@@ -1031,7 +1143,7 @@ mod tests {
     fn test_imaginary_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = ImaginaryOperation::new(),
-            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)).unwrap()],
+            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0)).unwrap()],
             expected = Array::scalar(-2.0f64).unwrap(),
         );
     }
@@ -1045,26 +1157,47 @@ mod tests {
             cases = [{
                 inputs = [(
                     @mapped(axis = 0),
-                    Array::vector(vec![
-                        ComplexNumber::new(1.5f64, -2.0f64),
-                        ComplexNumber::new(0.5f64, 1.0f64),
-                    ]).unwrap()
+                    Array::vector(vec![ComplexNumber::new(1.5f64, -2.0), ComplexNumber::new(0.5f64, 1.0)]).unwrap(),
                 )],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![-2.0f64, 1.0f64]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![-2.0f64, 1.0]).unwrap())],
             }],
         );
     }
 
     #[test]
     fn test_imaginary_differentiation() {
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = ImaginaryOperation::new(),
+            cases = [{
+                primals = [Array::scalar(ComplexNumber::new(0.7f64, -0.3)).unwrap()],
+                tangents = [Array::scalar(ComplexNumber::new(0.5f64, 2.0)).unwrap()],
+                primal_outputs = [Array::scalar(-0.3f64).unwrap()],
+                tangent_outputs = [Array::scalar(2.0f64).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:c128[], %1:c128[] .
+                    let %2:f64[] = imaginary %0
+                        %3:f64[] = imaginary %1
+                    in (%2, %3)
+                "},
+            }],
+        );
+    }
 
-        let (primal, tangent) = differentiate_at(Array::scalar(input).unwrap())
-            .jvp(Array::scalar(tangent_seed).unwrap(), |input| input.imaginary())
+    #[test]
+    fn test_imaginary_differentiation_zero_tangent() {
+        // A structural zero tangent stays symbolic and is retyped to the real output type.
+        let outputs = ImaginaryOperation::<ArrayType>::new()
+            .jvp(
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new_with_zero_tangent(Array::scalar(ComplexNumber::new(0.7f64, -0.3)).unwrap())
+                    .unwrap()],
+            )
             .unwrap();
-        assert_eq!(primal, Array::scalar(input.im).unwrap());
-        assert_eq!(tangent, Array::scalar(tangent_seed.im).unwrap());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(-0.3f64).unwrap());
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
     }
 
     #[test]
@@ -1075,13 +1208,21 @@ mod tests {
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::C128)))],
                 output_cotangents = [Array::scalar(3.0f64).unwrap()],
-                input_cotangents = [Array::scalar(ComplexNumber::new(0.0f64, -3.0f64)).unwrap()],
+                input_cotangents = [Array::scalar(ComplexNumber::new(0.0f64, -3.0)).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f64[] .
+                    let %1:f64[] = zero_like %0
+                        %2:f64[] = neg %0
+                        %3:c128[] = complex %1 %2
+                    in (%3)
+                "},
             }],
         );
     }
 
     #[test]
-    fn test_array_imaginary() {
+    fn test_imaginary_for_array() {
+        // Extraction keeps each supported precision and rejects real inputs.
         assert_eq!(
             Array::vector(vec![ComplexNumber::new(1f32, 3.0), ComplexNumber::new(2f32, -4.0)])
                 .unwrap()
@@ -1101,10 +1242,10 @@ mod tests {
     }
 
     #[test]
-    fn test_array_imaginary_layout() {
-        // Extraction clears byte strides because the output elements are narrower.
+    fn test_imaginary_for_array_layout() {
+        // Extraction traverses strided inputs and produces a densely laid out real array.
         let input_type =
-            ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+            ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![16])));
         let input =
             Array::from_elements(input_type, &[ComplexNumber::new(1f32, 3.0), ComplexNumber::new(2f32, -4.0)]).unwrap();
         assert_eq!(
