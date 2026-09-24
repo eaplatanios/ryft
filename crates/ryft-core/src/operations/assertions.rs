@@ -1017,7 +1017,7 @@ pub trait Assert: Sized {
 impl Assert for Array {
     #[inline]
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {
-        assert_value(self, message, observations, None)
+        self.check_assertion(message, observations, None)
     }
 
     #[inline]
@@ -1027,14 +1027,14 @@ impl Assert for Array {
         observations: &[(&str, Self)],
         limit: NonZeroUsize,
     ) -> Result<(), ProgramError> {
-        assert_value(self, message, observations, Some(limit))
+        self.check_assertion(message, observations, Some(limit))
     }
 }
 
 impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
     #[inline]
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {
-        assert_value(self, message, observations, None)
+        self.check_assertion(message, observations, None)
     }
 
     #[inline]
@@ -1044,98 +1044,11 @@ impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
         observations: &[(&str, Self)],
         limit: NonZeroUsize,
     ) -> Result<(), ProgramError> {
-        assert_value(self, message, observations, Some(limit))
+        self.check_assertion(message, observations, Some(limit))
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Validates and checks a concrete assertion without binding an operation. Scalar assertions report their named
-/// observations on failure; a failure limit enables elementwise checking with a bounded sample of failing indices
-/// and observations in row-major order. Empty conditions pass, and scalar observations are reused at each index.
-fn assert_value<V: AssertionValue<Type: Into<ArrayIrType>>>(
-    condition: &V,
-    message: &str,
-    observations: &[(&str, V)],
-    failure_limit: Option<NonZeroUsize>,
-) -> Result<(), ProgramError> {
-    // Reuse operation type inference so eager and staged assertions validate the same signature.
-    let mut operation =
-        AssertOperation::new(message).with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect());
-    if let Some(limit) = failure_limit {
-        operation = operation.with_failure_limit(limit);
-    }
-    let input_types = std::iter::once(condition.r#type().into_owned())
-        .chain(observations.iter().map(|(_, value)| value.r#type().into_owned()))
-        .collect::<Vec<_>>();
-    operation.infer_output_types(&input_types, &[])?;
-
-    let Some(limit) = failure_limit else {
-        if Concretizable::<bool>::concretize(condition)? {
-            return Ok(());
-        }
-        return Err(AssertionError::from_observations(
-            message,
-            observations.iter().map(|(label, input)| (*label, Some(input.clone()), input.r#type().into_owned())),
-        )?
-        .into());
-    };
-
-    let condition = condition.assertion_array()?.unwrap();
-    let values = condition.elements::<bool>()?;
-    let failure_count = values.iter().filter(|value| !**value).count();
-    if failure_count == 0 {
-        return Ok(());
-    }
-    let shape = condition
-        .r#type()
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| dimension.value().unwrap())
-        .collect::<Vec<_>>();
-    let observations = observations
-        .iter()
-        .map(|(label, value)| Ok((*label, value, value.assertion_array()?)))
-        .collect::<Result<Vec<_>, ProgramError>>()?;
-    let limit = limit.get();
-    let mut failures = Vec::new();
-    for position in values.iter().enumerate().filter_map(|(index, value)| (!value).then_some(index)).take(limit) {
-        let mut remaining = position;
-        let mut index = vec![0; shape.len()];
-        for axis in (0..shape.len()).rev() {
-            index[axis] = remaining % shape[axis];
-            remaining /= shape[axis];
-        }
-        let starts = index.iter().map(|&coordinate| Array::scalar(coordinate as i64)).collect::<Result<Vec<_>, _>>()?;
-        let observations = observations
-            .iter()
-            .map(|(label, value, array)| {
-                let observation = match array {
-                    Some(array) if array.r#type().rank() > 0 => {
-                        array.dynamic_slice(&starts, &vec![1; index.len()])?.reshape([])?.assertion_observation()?
-                    }
-                    Some(array) => array.assertion_observation()?,
-                    None => value.assertion_observation()?,
-                };
-                Ok(((*label).to_owned(), observation))
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        failures.push(AssertionFailure { index, observations });
-    }
-    Err(AssertionError::FailedElements {
-        message: message.to_owned(),
-        failures,
-        omitted: failure_count.saturating_sub(limit),
-    }
-    .into())
-}
-
-impl<V: Value> Assert for V
-where
-    V::Type: Into<ArrayIrType>,
-    V::DispatchDomain: AssertionContext,
-{
+impl<V: Value<Type: Into<ArrayIrType>, DispatchDomain: AssertionContext>> Assert for V {
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {
         let operation = AssertOperation::new(message)
             .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect());
@@ -1160,6 +1073,8 @@ where
         self.dispatch_domain().assert(operation, &inputs)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Context dispatch for [`Assert`]. Tracing elides known successes and stages potential failures. Transform
 /// contexts bind first so batching applies its empty-batch semantics, partial evaluation honors effect-folding
@@ -1246,14 +1161,116 @@ where
 {
 }
 
-/// Concrete scalar values that can report observations for a failed [`AssertOperation`].
-/// Implementations preserve unsigned integer ranges and render only the observed scalar value.
+/// Represents concrete values that can be inspected to check assertions and render their observations.
+/// Implementations preserve unsigned integer ranges when rendering scalar observations and provide an array view
+/// for elementwise checks. [`check_assertion`](Self::check_assertion) supplies the shared concrete execution used by
+/// [`Assert`], without binding an [`AssertOperation`].
 pub trait AssertionValue: Value + Concretizable<bool> {
     /// Renders the concrete scalar observation, rejecting unsupported representations.
     fn assertion_observation(&self) -> Result<String, ProgramError>;
 
     /// Materializes an array for logical element inspection, or returns `None` for a non-array scalar value.
     fn assertion_array(&self) -> Result<Option<Array>, ProgramError>;
+
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Validates and checks this concrete Boolean condition without binding an operation. Scalar assertions report
+    /// their named observations on failure; a failure limit enables elementwise checking with a bounded sample of
+    /// failing indices and observations in row-major order. Empty array conditions pass.
+    ///
+    /// # Parameters
+    ///
+    ///   - `message`: Literal description of the requirement, included in the failure diagnostic.
+    ///   - `observations`: Label-value pairs to report on failure. Scalars are reused for each failing element;
+    ///     array observations must have the condition's shape and require a failure limit.
+    ///   - `failure_limit`: Maximum number of failing elements to report, or `None` to require a scalar condition
+    ///     and scalar observations. Limits diagnostic output, not the amount of data inspected.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if input validation or concrete value inspection fails, or an [`AssertionError`]
+    /// wrapped in a [`ProgramError`] if the condition fails.
+    fn check_assertion(
+        &self,
+        message: &str,
+        observations: &[(&str, Self)],
+        failure_limit: Option<NonZeroUsize>,
+    ) -> Result<(), ProgramError>
+    where
+        Self::Type: Into<ArrayIrType>,
+    {
+        // Reuse operation type inference so eager and staged assertions validate the same signature.
+        let mut operation = AssertOperation::new(message)
+            .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect());
+        if let Some(limit) = failure_limit {
+            operation = operation.with_failure_limit(limit);
+        }
+        let input_types = std::iter::once(self.r#type().into_owned())
+            .chain(observations.iter().map(|(_, value)| value.r#type().into_owned()))
+            .collect::<Vec<_>>();
+        operation.infer_output_types(&input_types, &[])?;
+
+        let Some(limit) = failure_limit else {
+            if Concretizable::<bool>::concretize(self)? {
+                return Ok(());
+            }
+            return Err(AssertionError::from_observations(
+                message,
+                observations.iter().map(|(label, input)| (*label, Some(input.clone()), input.r#type().into_owned())),
+            )?
+            .into());
+        };
+
+        let condition = self.assertion_array()?.unwrap();
+        let values = condition.elements::<bool>()?;
+        let failure_count = values.iter().filter(|value| !**value).count();
+        if failure_count == 0 {
+            return Ok(());
+        }
+        let shape = condition
+            .r#type()
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| dimension.value().unwrap())
+            .collect::<Vec<_>>();
+        let observations = observations
+            .iter()
+            .map(|(label, value)| Ok((*label, value, value.assertion_array()?)))
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        let limit = limit.get();
+        let mut failures = Vec::new();
+        for position in values.iter().enumerate().filter_map(|(index, value)| (!value).then_some(index)).take(limit) {
+            let mut remaining = position;
+            let mut index = vec![0; shape.len()];
+            for axis in (0..shape.len()).rev() {
+                index[axis] = remaining % shape[axis];
+                remaining /= shape[axis];
+            }
+            let starts =
+                index.iter().map(|&coordinate| Array::scalar(coordinate as i64)).collect::<Result<Vec<_>, _>>()?;
+            let observations = observations
+                .iter()
+                .map(|(label, value, array)| {
+                    let observation = match array {
+                        Some(array) if array.r#type().rank() > 0 => {
+                            array.dynamic_slice(&starts, &vec![1; index.len()])?.reshape([])?.assertion_observation()?
+                        }
+                        Some(array) => array.assertion_observation()?,
+                        None => value.assertion_observation()?,
+                    };
+                    Ok(((*label).to_owned(), observation))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            failures.push(AssertionFailure { index, observations });
+        }
+        Err(AssertionError::FailedElements {
+            message: message.to_owned(),
+            failures,
+            omitted: failure_count.saturating_sub(limit),
+        }
+        .into())
+    }
 }
 
 impl AssertionValue for Array {
