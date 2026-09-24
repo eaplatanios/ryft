@@ -10,21 +10,20 @@
 //!     Boolean, integer, and floating-point arrays, and with a failure limit they may also be arrays with the
 //!     condition's shape, in which case each failing element reports its own observed values.
 //!   - The [`AssertOperation`] that the capability stages, which consumes the condition and the observations and
-//!     produces no outputs. It declares the [`EffectClass::OrderedAssertion`](crate::EffectClass::OrderedAssertion)
-//!     effect, so dead-code elimination never removes it and separate assertions keep their relative order.
+//!     produces no outputs. It declares the [`EffectClass::OrderedAssertion`] effect, so dead-code elimination never
+//!     removes it and separate assertions keep their relative order.
 //!   - The [`AssertionContext`] dispatch trait, which decides what binding an assertion means in each context. Eager
 //!     execution reports failures immediately. Tracing elides conditions that are known to hold, stages symbolic
 //!     conditions, and keeps conditions that are known to fail so that the failure is reported when the program runs.
-//!     Transform contexts (batching, partial evaluation, and differentiation) forward to their parent so that, for
-//!     example, a batched assertion reports the first failing batch item and differentiation retains assertions only
-//!     in the primal computation.
+//!     Transform contexts (e.g., batching, partial evaluation, and differentiation) forward to their parent so that,
+//!     for example, a batched assertion reports the first failing batch item and differentiation retains assertions
+//!     only in the primal computation.
 //!   - [`AssertionValue`], which concrete values implement to render their observations, and [`AssertionError`] with
 //!     its per-element [`AssertionFailure`] records, which is the error that a failed assertion produces and that
-//!     callers can recover from a [`ProgramError`](crate::ProgramError) with
-//!     [`downcast_custom`](crate::ProgramError::downcast_custom).
+//!     callers can recover from a [`ProgramError`] with [`downcast_custom`](ProgramError::downcast_custom).
 //!
 //! Assertions remain enabled independently of debug builds. A failing assertion does not guard the operations that
-//! follow it within an eager computation, because the error is raised at the assertion itself; in a staged program,
+//! follow it within an eager computation, because the error is raised at the assertion itself. In a staged program,
 //! the ordered effect guarantees that the failure is observed even when nothing consumes the values being checked.
 //!
 //! # Examples
@@ -34,8 +33,8 @@
 //! ```rust
 //! # use ryft_core::{Array, Assert, AssertionError, Compare, ProgramError};
 //! # fn main() -> Result<(), ProgramError> {
-//! let left = Array::scalar(2_i32)?;
-//! let right = Array::scalar(3_i32)?;
+//! let left = Array::scalar(2i32)?;
+//! let right = Array::scalar(3i32)?;
 //! left.not_equal(&right)?.assert("left must differ from right", &[("left", left.clone())])?;
 //! let error = left.equal(&right)?.assert("left must equal right", &[("left", left), ("right", right)]).unwrap_err();
 //! assert_eq!(error.to_string(), "assertion failed: left must equal right; left=2, right=3");
@@ -72,8 +71,6 @@
 //! # Ok(())
 //! # }
 //! ```
-
-// TODO(eaplatanios): Review from here onwards.
 
 use std::borrow::Cow;
 use std::fmt::Display;
@@ -126,21 +123,35 @@ use crate::tracing::{NestedTracingContext, TracingContext};
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AssertionError {
     /// The Boolean condition was false.
-    Failed { message: String, observations: Vec<(String, String)> },
+    Failed {
+        /// Message that the assertion was created with, describing the fact that was required to hold (e.g.,
+        /// `"left must equal right"`). It is reported verbatim after the `assertion failed: ` prefix.
+        message: String,
+
+        /// Named values observed when the condition failed, as `(label, value)` pairs in the order in which the
+        /// assertion listed them, with each value rendered as text (e.g., `("left", "2")` and `("right", "3")`, which
+        /// are reported as `left=2, right=3`). A dimension whose extent cannot be resolved when the failure is reported
+        /// renders as `<unknown: ...>` with the dimension's type, and any other unresolvable value as `<unknown>`.
+        observations: Vec<(String, String)>,
+    },
 
     /// One or more logical elements of the condition were false, with a bounded diagnostic sample and the number
     /// of failures omitted from it.
-    FailedElements { message: String, failures: Vec<AssertionFailure>, omitted: usize },
-}
+    FailedElements {
+        /// Message that the assertion was created with, describing the fact that was required to hold for every
+        /// element (e.g., `"all elements must hold"`). It is reported verbatim after the `assertion failed: ` prefix.
+        message: String,
 
-/// Coordinates and named observations for one failed logical element of an assertion condition.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct AssertionFailure {
-    /// Logical row-major coordinates of the failed element.
-    pub index: Vec<usize>,
+        /// Failed elements in logical row-major order, holding at most as many elements as the assertion's failure
+        /// limit (refer to [`Assert::assert_with_limit`]). For example, the condition `[true, false, false]` with a
+        /// failure limit of `1` reports only the element at index `[1]`.
+        failures: Vec<AssertionFailure>,
 
-    /// Named scalar values observed at the failed element.
-    pub observations: Vec<(String, String)>,
+        /// Number of failed elements beyond the failure limit that [`failures`](Self::FailedElements::failures) does
+        /// not report, which is `0` when every failed element is reported. For example, it is `1` for the condition
+        /// `[true, false, false]` with a failure limit of `1`, since the element at index `[2]` is omitted.
+        omitted: usize,
+    },
 }
 
 impl Display for AssertionError {
@@ -174,10 +185,27 @@ impl Display for AssertionError {
 impl std::error::Error for AssertionError {}
 
 impl From<AssertionError> for ProgramError {
+    #[inline]
     fn from(error: AssertionError) -> Self {
         Self::custom(error)
     }
 }
+
+/// Coordinates and named observations for one failed logical element of an assertion condition.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AssertionFailure {
+    /// Logical row-major coordinates of the failed element, with one entry per axis of the condition (e.g., `[1, 0]`
+    /// for the element in the second row and first column of a matrix condition).
+    pub index: Vec<usize>,
+
+    /// Named scalar values observed at the failed element, as `(label, value)` pairs in the order in which the
+    /// assertion listed them. A scalar observation reports the same value for every failed element, while an
+    /// observation with the condition's shape reports its own element at [`index`](Self::index) (e.g.,
+    /// `("value", "-3")` for a negative entry that violated a non-negativity condition).
+    pub observations: Vec<(String, String)>,
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`AssertOperation`].
 pub const ASSERT_OPERATION_NAME: &str = "assert";
