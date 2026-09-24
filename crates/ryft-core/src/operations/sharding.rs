@@ -624,30 +624,26 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the ability to constrain the placement of a value over auto mesh axes. [`ConstrainSharding`] stages a
 /// [`ConstrainShardingOperation`], which is an identity function whose constraint is enforced when a backend lowers
 /// the program. Concrete single-device values are returned unchanged, and context-carrying values stage the operation
 /// instead, so that transforms that apply operations through interpretation preserve the constraint. Every
-/// implementation validates the constraint exactly like [`ConstrainShardingOperation`] type inference does, so that
-/// eager and staged evaluation accept the same programs.
+/// implementation validates the constraint exactly like [`ConstrainShardingOperation`] type inference does,
+/// so that eager and staged evaluation accept the same programs.
 pub trait ConstrainSharding: Clone {
     /// Constrains the placement of `self` to `sharding`, and returns a [`ProgramError`] if `sharding` is not a valid
     /// constraint for `self` or the constraint cannot be recorded in the value's context.
     fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
 }
 
-// Any context-carrying value constrains its sharding by binding a [`ConstrainShardingOperation`] through its own
-// context. The `From<ConstrainShardingOperation>` bound makes this disjoint from the eager value types (whose
-// context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
-// implementations.
-impl<V: Value<Type = ArrayType>> ConstrainSharding for V
-where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<ConstrainShardingOperation>,
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ConstrainShardingOperation>>>>
+    ConstrainSharding for V
 {
     fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
+        // Any context-carrying value constrains its sharding by binding a `ConstrainShardingOperation` through its own
+        // context. The `From<ConstrainShardingOperation>` bound makes this disjoint from the eager value types (whose
+        // context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the
+        // concrete implementations.
         let mut outputs = self.dispatch_domain().bind(
             ConstrainShardingOperation::new(sharding.clone()),
             Vec::new(),
@@ -658,29 +654,30 @@ where
     }
 }
 
-// The constraint is untracked, so the output of a concrete single-device value is the value itself once the
-// `ConstrainShardingOperation` type-inference rule has accepted the constraint for its type.
 impl ConstrainSharding for Array {
     fn constrain_sharding(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
+        // The constraint is untracked, and so the output of a concrete single-device value is the value itself
+        // once the `ConstrainShardingOperation` type inference rule has accepted the constraint for its type.
         let input_type = self.r#type().into_owned();
         ConstrainShardingOperation::new(sharding.clone()).infer_output_types(&[input_type], &[])?;
         Ok(self.clone())
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Interprets the lifted geometry-preserving `operation` on the packed value of the single batch in `inputs` and
 /// repackages its output with that batch's axis and bounded ragged axes. Both sharding-control operations leave the
 /// packed geometry untouched, so every piece of batch metadata carries over as is.
-fn rebatch_geometry_preserving_output<C, P, O>(
+fn rebatch_geometry_preserving_output<
+    O: InterpretableOperation<C>,
+    C: Context<Type = ArrayType>,
+    P: ArrayExtentBatchingPolicy<C>,
+>(
     context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     operation: &O,
     inputs: &[ArrayBatch<C::Value>],
-) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
-where
-    C: Context<Type = ArrayType>,
-    P: ArrayExtentBatchingPolicy<C>,
-    O: InterpretableOperation<C>,
-{
+) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
     check_count!("input", inputs, 1, ProgramError);
     let batch_axis = BatchAxis::from_optional_position(inputs[0].batch_axis_position());
     let mut outputs = operation.interpret_with_batch_axes(context, inputs, &[batch_axis])?;
