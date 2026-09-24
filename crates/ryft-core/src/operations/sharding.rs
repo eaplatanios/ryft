@@ -243,15 +243,8 @@ impl<C: Domain<Type = ArrayType, Value: Reshard>> InterpretableOperation<C> for 
 
 impl<C: Context<Operation: From<ReshardOperation>>> PartiallyEvaluatableOperation<C> for ReshardOperation {}
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
-// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension. Lifting needs
-// only the batch axis's position and placement, never its extent, so mapped axes with dynamic extents lift as well.
-impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
-    for ReshardOperation
-where
-    ReshardOperation: InterpretableOperation<C>,
+impl<C: Context<Type = ArrayType, Value: Reshard>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for ReshardOperation
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -259,6 +252,9 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // The lifted reshard's target sharding gains the mapped axis's sharding (derived from the batched inputs via
+        // `ArrayBatch::sharding_for_inputs`) at the new batch dimension. Lifting needs only the batch axis's position
+        // and placement, never its extent, so mapped axes with dynamic extents lift as well.
         check_count!("input", inputs, 1, ProgramError);
         let lifted_sharding = match inputs[0].batch_axis_position() {
             Some(batch_axis) => self.sharding().batched(batch_axis, ArrayBatch::sharding_for_inputs(inputs)?)?,
@@ -273,8 +269,8 @@ impl_differentiable_operation! {
     jvp<C>
     where
         C: Context<Type = ArrayType>,
-        C::Operation: From<ReshardOperation>,
         C::Value: Reshard,
+        C::Operation: From<ReshardOperation>,
     {
         |operation, _context, _driver, inputs| {
             // Resharding is linear, so the tangent is resharded to the same target sharding as the primal.
@@ -293,15 +289,16 @@ impl_differentiable_operation! {
         O: Operation<Type = ArrayType> + From<BroadcastOperation> + From<ReshardOperation>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
-            // Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output
-            // cotangent to the cotangent dual of the *input*'s sharding (swapping its unreduced and reduced axes), so
-            // the produced input cotangent is distributed like the input. An input that carries no sharding receives
-            // an exactly unsharded cotangent through an identity-axis broadcast.
+            // The cotangent of a reshard is itself a reshard of the output cotangent to the cotangent dual of the
+            // _input_'s sharding (swapping its unreduced and reduced axes), so the produced input cotangent is
+            // distributed like the input. An input that carries no sharding receives an exactly unsharded cotangent
+            // through an identity-axis broadcast.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
             let input_cotangent_type = inputs[0].r#type().cotangent()?;
             match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(()),
                 MaybeZero::Value(cotangent) => {
                     let contribution = match input_cotangent_type.sharding() {
                         Some(input_cotangent_sharding) => {
@@ -317,11 +314,12 @@ impl_differentiable_operation! {
                     accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
                     Ok(())
                 }
-                MaybeZero::Zero(_) => Ok(()),
             }
         }
     },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to reshard a value to a target [`Sharding`]. [`Reshard`] stages a [`ReshardOperation`],
 /// which is an identity function on the array's elements whose output type carries the target sharding. Concrete
