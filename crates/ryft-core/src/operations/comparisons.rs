@@ -124,15 +124,17 @@ impl<T: Type> Clone for CompareOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<T: Type> Display for CompareOperation<T> {
+impl<T: Type> Display for CompareOperation<T>
+where
+    Self: Operation<Type = T>,
+{
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        OperationFormatter::new(formatter, 0, COMPARE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("direction", self.direction))
+        self.render(formatter, 0)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Operation for CompareOperation<DataType> {
     type Type = DataType;
