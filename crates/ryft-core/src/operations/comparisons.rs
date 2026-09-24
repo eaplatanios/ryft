@@ -1,16 +1,22 @@
-//! Pairwise comparisons that produce Boolean values from arrays or first-class dimensions.
+//! Operations that compare pairs of values and produce Boolean data. Every comparison is defined by the
+//! [`CompareOperation`] type together with the [`Compare`] value capability trait, whose functions apply it to eager
+//! [`Array`]s and traced values alike, so the same code executes immediately or records into a program depending on
+//! the value it runs on. A [`ComparisonDirection`] selects the predicate, and [`Compare`] additionally provides one
+//! named function per direction (e.g., [`less_than`](Compare::less_than)). Comparisons apply to two kinds of inputs:
 //!
-//! This module provides the following:
+//!   - **Arrays:** The inputs are broadcast to a common shape and their element types are promoted before
+//!     they are compared elementwise, producing [`Boolean`](DataType::Boolean) elements, as in StableHLO's
+//!     [`compare`](https://openxla.org/stablehlo/spec#compare). Equality and inequality support complex elements,
+//!     whereas ordered comparisons reject them, and a comparison involving a floating-point NaN is false for every
+//!     direction except [`NotEqual`](ComparisonDirection::NotEqual).
+//!   - **Dimensions:** [`DimensionValue`]s and dimension-typed traced values compare their extents and produce
+//!     rank-zero Boolean arrays. Predicates that dimension identities and extent bounds already prove (e.g., that
+//!     a dimension is equal to itself) become Boolean constants without staging an operation, both when tracing
+//!     and during partial evaluation.
 //!
-//!   - [`ComparisonDirection`], which selects equality, inequality, or an ordered comparison.
-//!   - [`CompareOperation`], which represents a comparison in a program.
-//!   - [`Compare`], the value capability for comparisons and their named convenience functions.
-//!
-//! Array comparisons broadcast shapes and promote element types. Complex elements support only equality and
-//! inequality; floating-point NaNs satisfy only inequality. Dimension comparisons produce rank-zero Boolean arrays.
-//! Partial evaluation can prove dimension predicates from identities and extent bounds. Batching maps array
-//! comparisons elementwise and keeps dimension comparisons replicated. Comparison outputs have zero tangents, and
-//! comparisons cannot be transposed directly.
+//! Batching maps array comparisons elementwise over the batch axis, whereas dimension comparisons require replicated
+//! inputs, since a dimension describes one array shape that every batch item shares, and produce replicated outputs.
+//! Comparisons are not differentiable (i.e., their outputs have zero tangents) and cannot be transposed.
 //!
 //! # Example
 //!
@@ -19,8 +25,8 @@
 //! ```rust
 //! # use ryft_core::{Array, Compare, ProgramError};
 //! # fn main() -> Result<(), ProgramError> {
-//! let input = Array::vector(vec![1.0_f32, 2.0, 3.0])?;
-//! let threshold = Array::scalar(2.0_f32)?;
+//! let input = Array::vector(vec![1.0f32, 2.0, 3.0])?;
+//! let threshold = Array::scalar(2.0f32)?;
 //! assert_eq!(input.less_than(&threshold)?, Array::vector(vec![true, false, false])?);
 //! # Ok(())
 //! # }
@@ -53,10 +59,8 @@ use crate::programs::{
     ValueProjection,
 };
 
-// TODO(eaplatanios): Review this module.
-
-/// Direction of the pairwise comparison performed by a [`CompareOperation`]. Each direction corresponds to one
-/// comparison predicate.
+/// Direction of the pairwise comparison performed by a [`CompareOperation`].
+/// Each direction corresponds to a comparison predicate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ComparisonDirection {
     Equal,
@@ -68,6 +72,7 @@ pub enum ComparisonDirection {
 }
 
 impl Display for ComparisonDirection {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Equal => "Equal",
@@ -85,15 +90,29 @@ pub const COMPARE_OPERATION_NAME: &str = "compare";
 
 /// [`Operation`] that performs pairwise comparisons in the `T` type universe. [`DataType`] and [`ArrayType`]
 /// instantiations compare scalar element types and arrays, respectively. The [`ArrayIrType`] instantiation accepts
-/// two dimension inputs and produces a rank-zero Boolean array; it does not accept array-member inputs. Refer to
+/// two dimension inputs and produces a rank-zero Boolean array. It does not accept array-member inputs. Refer to
 /// [`Compare`] for the corresponding value-level semantics.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct CompareOperation<T: Type> {
-    /// Refer to the documentation of [`direction`](Self::direction) for more information.
+    /// [`ComparisonDirection`] used by this [`CompareOperation`].
     direction: ComparisonDirection,
 
-    /// Type universe whose comparison contract this payload represents.
-    type_marker: PhantomData<T>,
+    /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.
+    marker: PhantomData<T>,
+}
+
+impl<T: Type> CompareOperation<T> {
+    /// Creates a new [`CompareOperation`] with the provided [`ComparisonDirection`].
+    #[inline]
+    pub fn new(direction: ComparisonDirection) -> Self {
+        Self { direction, marker: PhantomData }
+    }
+
+    /// Returns the [`ComparisonDirection`] used by this [`CompareOperation`].
+    #[inline]
+    pub fn direction(&self) -> ComparisonDirection {
+        self.direction
+    }
 }
 
 impl<T: Type> Copy for CompareOperation<T> {}
@@ -105,21 +124,10 @@ impl<T: Type> Clone for CompareOperation<T> {
     }
 }
 
-impl<T: Type> CompareOperation<T> {
-    /// Creates a new [`CompareOperation`] with the provided [`ComparisonDirection`].
-    #[inline]
-    pub fn new(direction: ComparisonDirection) -> Self {
-        Self { direction, type_marker: PhantomData }
-    }
-
-    /// Returns the [`ComparisonDirection`] used by this [`CompareOperation`].
-    #[inline]
-    pub fn direction(&self) -> ComparisonDirection {
-        self.direction
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: Type> Display for CompareOperation<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         OperationFormatter::new(formatter, 0, COMPARE_OPERATION_NAME)?
             .bracketed(|operation| operation.field("direction", self.direction))
@@ -411,8 +419,6 @@ pub trait Compare<Output = Self>: Sized {
     }
 }
 
-// TODO(eaplatanios): Review this module.
-
 impl Compare for Array {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
         // Broadcast the input types together (including element-type promotion) so mixed-precision comparisons
@@ -518,8 +524,6 @@ where
             .remove(0))
     }
 }
-
-// TODO(eaplatanios): Review this.
 
 impl Compare<Array> for DimensionValue {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Array, ProgramError> {
