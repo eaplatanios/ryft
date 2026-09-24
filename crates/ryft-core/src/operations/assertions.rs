@@ -282,114 +282,10 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         self.failure_limit
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Batches logical scalar inputs, selecting one observed failing batch item at the current transform level.
-    fn batch_inputs<C, P, V, Project, Lift, Indices, MaskEmpty, PadEmpty, Pack, Driver>(
-        &self,
-        context: &BatchingContext<C, P>,
-        driver: &Driver,
-        inputs: &[P::Batch],
-        extent: Dimension,
-        project: Project,
-        lift: Lift,
-        indices: Indices,
-        mask_empty: MaskEmpty,
-        mut pad_empty: PadEmpty,
-        pack: Pack,
-    ) -> Result<BatchedOutputs<C, P>, BatchingError>
-    where
-        C: AssertionContext<Type = T>,
-        P: BatchingPolicy<C>,
-        V: Value<Type = ArrayType> + Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
-        Project: Fn(C::Value) -> Result<V, ProgramError>,
-        Lift: Fn(V) -> C::Value,
-        Indices: Fn(&ArrayType) -> Result<V, ProgramError>,
-        MaskEmpty: Fn(V) -> Result<V, ProgramError>,
-        PadEmpty: FnMut(C::Value) -> Result<C::Value, ProgramError>,
-        Pack: Fn(&[P::Batch]) -> Result<Vec<C::Value>, BatchingError>,
-        Driver: BatchingDriver<C, P>,
-    {
-        self.infer_output_types(
-            &inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>(),
-            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
-        )?;
-        // Empty batches pass even when the predicate is replicated and false. Check the extent before replaying.
-        if extent.value() == Some(0) {
-            return Ok(Vec::new().into());
-        }
-        if self.failure_limit.is_some() {
-            let arguments = pack(inputs)?;
-            context.parent().assert(self.clone(), &arguments)?;
-            return Ok(Vec::new().into());
-        }
-        let mapped = inputs.iter().any(|input| P::batch_axis(input).axis().is_some());
-        if !mapped {
-            let mut arguments = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
-            arguments[0] = lift(mask_empty(project(arguments[0].clone())?)?);
-            context.parent().assert(self.clone(), &arguments)?;
-            return Ok(Vec::new().into());
-        }
-        let (_, maximum) = extent.bounds().representable_extent_range().map_err(ProgramError::from)?;
-        if maximum > i32::MAX as usize {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "mapped assertion batch extent exceeds the supported `i32` index range".to_owned(),
-            });
-        }
-        // Backends also represent logical padded extents with signed indices; reserve the fallback item before staging.
-        if maximum == i32::MAX as usize
-            && extent.bounds().lower() == 0
-            && inputs[1..].iter().any(|input| P::batch_axis(input).axis().is_some())
-        {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "padded assertion batch extent exceeds the supported `i32` extent range".to_owned(),
-            });
-        }
-        let condition = project(P::value(&inputs[0]).clone())?;
-        let (condition, index) = if P::batch_axis(&inputs[0]).axis().is_some() {
-            let coordinates = indices(&condition.r#type().into_owned().with_data_type(DataType::I32))?;
-            // Passing items may tie the last coordinate: when any item fails, the minimum still identifies the
-            // first failure. Successful and empty batches are handled by the independent Boolean reduction.
-            let sentinel = coordinates.reduce(&[0], ReductionKind::Max)?;
-            let candidates = V::select(&condition, &sentinel, &coordinates)?;
-            let index = candidates.reduce(&[0], ReductionKind::Min)?;
-            let condition = condition.reduce(&[0], ReductionKind::All)?;
-            // Empty and successful batches use index zero. A padded observation makes this valid even at extent zero.
-            let index = V::select(&condition, &index.zero_like()?, &index)?;
-            (condition, index)
-        } else {
-            let condition = mask_empty(condition)?;
-            let index = condition.convert_element_type(DataType::I32)?.zero_like()?;
-            (condition, index)
-        };
-        let mut arguments = vec![lift(condition)];
-        for input in &inputs[1..] {
-            if P::batch_axis(input).axis().is_some() {
-                let input = project(pad_empty(P::value(input).clone())?)?;
-                // The selected batch index is never negative, so the clamp-only policy keeps this slice on the single
-                // gather path even when the mapped axis is dynamic.
-                let observation =
-                    input.dynamic_slice_with_negative_indices(std::slice::from_ref(&index), &[1], false)?;
-                arguments.push(lift(observation.reshape([])?));
-            } else {
-                arguments.push(P::value(input).clone());
-            }
-        }
-        arguments.push(lift(index));
-        let mut labels = self.labels.clone();
-        let mut label = "batch_index".to_owned();
-        let mut suffix = 1;
-        while labels.contains(&label) {
-            label = format!("batch_index_{suffix}");
-            suffix += 1;
-        }
-        labels.push(label);
-        context.parent().assert(self.clone().with_labels(labels), &arguments)?;
-        Ok(Vec::new().into())
-    }
-
-    /// Elides known successes at a staging boundary; transform contexts first apply their own rule.
-    fn fold_or_bind<C: Context<Type = T, Constant: AssertionValue, Operation: From<Self>>>(
+    /// Validates the inputs and skips binding if the condition resolves to a constant scalar `true`. Otherwise,
+    /// binds the assertion, preserving known failures for execution rather than raising them during tracing.
+    /// Used only at tracing boundaries so transform contexts can apply their own assertion rules first.
+    fn bind_unless_known_true<C: Context<Type = T, Constant: AssertionValue, Operation: From<Self>>>(
         &self,
         context: &C,
         inputs: &[C::Value],
@@ -406,8 +302,11 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         Ok(())
     }
 
-    /// Checks concrete logical elements without changing ordinary scalar assertion behavior.
-    fn check_elements<V: AssertionValue<Type = T>>(
+    /// Validates the inputs and checks every Boolean element of the concrete condition. Empty conditions pass.
+    /// On failure, reports up to the configured failure limit in row-major order, including each failing index and its
+    /// observations, plus the number of omitted failures. Scalar observations are reused at every index while array
+    /// observations are sampled at that index. Requires a configured failure limit.
+    fn assert_elements<V: AssertionValue<Type = T>>(
         &self,
         condition: &V,
         observations: &[(&str, V)],
@@ -467,8 +366,11 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         .into())
     }
 
-    /// Constructs a failure from validated observations, retaining dimension facts when values cannot be resolved.
-    fn failure<V: AssertionValue<Type = T>, I: IntoIterator<Item = (Option<V>, T)>>(
+    /// Constructs an [`AssertionError::Failed`] with this operation's message and labeled observations, without
+    /// checking the condition. Observations must match the previously validated signature and label order. Missing
+    /// or non-concretizable dimension values use their extent or dimension type. Other unavailable values appear as
+    /// `<unknown>` and other observation-rendering errors are propagated.
+    fn failure_from_observations<V: AssertionValue<Type = T>, I: IntoIterator<Item = (Option<V>, T)>>(
         &self,
         observations: I,
     ) -> Result<AssertionError, ProgramError> {
@@ -500,6 +402,7 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
 }
 
 impl<T: Type + Into<ArrayIrType>> Display for AssertOperation<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -508,6 +411,7 @@ impl<T: Type + Into<ArrayIrType>> Display for AssertOperation<T> {
 impl<T: Type + Into<ArrayIrType>> Operation for AssertOperation<T> {
     type Type = T;
 
+    #[inline]
     fn name(&self) -> &'static str {
         ASSERT_OPERATION_NAME
     }
@@ -519,6 +423,7 @@ impl<T: Type + Into<ArrayIrType>> Operation for AssertOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1 + self.labels.len(), TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
+
         let bounded = self.failure_limit.is_some();
         let condition = match input_types[0].clone().into() {
             ArrayIrType::Array(condition)
@@ -528,11 +433,13 @@ impl<T: Type + Into<ArrayIrType>> Operation for AssertOperation<T> {
             }
             condition => {
                 return Err(TypeError::invalid(format!(
-                    "assertion condition must have type `{}` but has type `{condition}`",
+                    "assertion condition must have type `{}` but has type `{}`",
                     if bounded { "bool[...]" } else { "bool[]" },
+                    condition,
                 )));
             }
         };
+
         for (label, input) in self.labels.iter().zip(&input_types[1..]) {
             let input: ArrayIrType = input.clone().into();
             let supported = match &input {
@@ -542,20 +449,23 @@ impl<T: Type + Into<ArrayIrType>> Operation for AssertOperation<T> {
                         && (array.data_type().is_integer()
                             || matches!(
                                 array.data_type(),
-                                DataType::Boolean | DataType::BF16 | DataType::F16 | DataType::F32 | DataType::F64
+                                DataType::Boolean | DataType::BF16 | DataType::F16 | DataType::F32 | DataType::F64,
                             ))
                 }
                 _ => false,
             };
+
             if !supported {
                 return Err(TypeError::invalid(format!(
-                    "assertion observation `{label}` has unsupported type `{input}`"
+                    "assertion observation `{label}` has unsupported type `{input}`",
                 )));
             }
         }
+
         Ok(Vec::new())
     }
 
+    #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
         Cow::Owned(Effects::explicit(EffectClasses::single(EffectClass::OrderedAssertion)))
     }
@@ -574,10 +484,7 @@ impl<T: Type + Into<ArrayIrType>> Operation for AssertOperation<T> {
 
 impl_reference_dischargeable_operation!(@reference_free <T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
 
-impl<C: Domain<Value: Assert>> InterpretableOperation<C> for AssertOperation<C::Type>
-where
-    C::Type: Into<ArrayIrType>,
-{
+impl<C: Domain<Type: Into<ArrayIrType>, Value: Assert>> InterpretableOperation<C> for AssertOperation<C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -603,10 +510,8 @@ where
     }
 }
 
-impl<C: Context<Constant: AssertionValue, Operation: From<AssertOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
-    for AssertOperation<C::Type>
-where
-    C::Type: Into<ArrayIrType>,
+impl<C: Context<Type: Into<ArrayIrType>, Constant: AssertionValue, Operation: From<AssertOperation<C::Type>>>>
+    PartiallyEvaluatableOperation<C> for AssertOperation<C::Type>
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -614,31 +519,47 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // Validate the complete signature before inspecting the condition so even a known success cannot hide
+        // invalid observations or attached regions.
         check_count!("input", inputs, 1 + self.labels.len(), ProgramError);
         self.infer_output_types(
             &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
+
+        // Elementwise assertions need the ordinary execution path to collect failing indices and observations.
+        // The default policy decides whether to bind them in the parent or retain them in the residual program.
         if self.failure_limit.is_some() {
             return context.fold_or_residualize(self.clone(), Vec::new(), inputs);
         }
+
+        // A known input can still be symbolic in the parent context. Inspect it only if it resolves to a constant.
         if let Some(condition) = inputs[0].as_known()
             && let ValueResolution::Constant(condition) = context.parent().resolve(condition)
         {
             match condition.concretize() {
-                Ok(true) => return Ok(Vec::new()),
+                Ok(true) => {
+                    // A successful assertion has no observable effect and needs none of its diagnostic observations.
+                    return Ok(Vec::new());
+                }
                 Ok(false) => {
+                    // Raise immediately only under eager execution when effect folding is allowed and no earlier
+                    // deferred ordered effect must run first. Otherwise, let the default policy place the assertion.
                     if !context.parent().is_eager() || !context.can_fold_effects(self.effects().classes()) {
                         return context.fold_or_residualize(self.clone(), Vec::new(), inputs);
                     }
                 }
                 Err(ProgramError::Concretization { .. }) => {
+                    // An unavailable concrete Boolean is not an assertion failure; defer to ordinary binding.
                     return context.fold_or_residualize(self.clone(), Vec::new(), inputs);
                 }
                 Err(error) => return Err(error),
             }
+
+            // The condition is false and may fail now. Render resolved observations, using type information or
+            // unknown placeholders for observations that are still symbolic rather than requiring their execution.
             return Err(self
-                .failure(inputs[1..].iter().map(|input| {
+                .failure_from_observations(inputs[1..].iter().map(|input| {
                     let value = input.as_known().and_then(|input| match context.parent().resolve(input) {
                         ValueResolution::Constant(input) => Some(input),
                         _ => None,
@@ -647,88 +568,267 @@ where
                 }))?
                 .into());
         }
+
+        // Without a concrete condition, preserve the assertion through the default partial evaluation policy.
         context.fold_or_residualize(self.clone(), Vec::new(), inputs)
     }
 }
 
-impl<C: AssertionContext<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatchingPolicy<P>> for AssertOperation<ArrayType>
-where
-    C::Operation: From<Self> + From<IotaOperation<ArrayType>> + From<BroadcastOperation>,
-    C::Value: Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
-{
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
+// TODO(eaplatanios): Review from here onwards.
+
+// Batching forwards the assertion to the parent context, either with its condition reduced to one scalar Boolean and
+// the observations of the first failing batch item selected at this transform level, or, with a failure limit, with
+// its inputs materialized along the batch axis. The policy supplies its array view of values and its extent handling.
+impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P> for AssertOperation<C::Type> {
+    fn batch<D: BatchingDriver<C, P>>(
         &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        context: &BatchingContext<C, P>,
         driver: &D,
-        inputs: &[<ArrayBatchingPolicy<P> as BatchingPolicy<C>>::Batch],
-    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
-        let extent = P::axis_dimension(context)?;
-        self.batch_inputs(
-            context,
-            driver,
-            inputs,
-            extent.clone(),
-            Ok,
-            |value| value,
-            |r#type| {
-                if extent.value().is_none() {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: "dynamic mapped assertions require the mixed array batching policy".to_owned(),
-                    });
-                }
-                let mut outputs = context.parent().bind(IotaOperation::new(r#type.clone(), 0)?, Vec::new(), &[])?;
-                check_count!("output", outputs, 1, ProgramError);
-                Ok(outputs.remove(0))
-            },
-            |condition| {
-                if extent.bounds().lower() == 0 {
-                    let condition = P::match_axis(context, &ArrayBatch::replicated(condition), Axis::from(0))?;
-                    return condition.value().reduce(&[0], ReductionKind::All);
-                }
-                Ok(condition)
-            },
-            Ok,
-            |inputs| {
-                let condition = P::match_axis(context, &inputs[0], Axis::from(0))?.value().clone();
-                let condition_type = condition.r#type().into_owned();
-                let mut arguments = vec![condition];
-                for input in &inputs[1..] {
-                    let value = if input.batch_axis().is_replicated() {
-                        input.value().clone()
-                    } else {
-                        P::match_axis(context, input, Axis::from(0))?.value().clone()
-                    };
-                    let input_type = value.r#type();
-                    if input_type.rank() == 0 {
-                        arguments.push(value);
-                        continue;
-                    }
-                    let output_axes = if input.batch_axis().is_replicated() {
-                        (1..=input_type.rank()).collect::<Vec<_>>()
-                    } else {
-                        (0..input_type.rank()).collect::<Vec<_>>()
-                    };
-                    let output_type = condition_type.clone().with_data_type(input_type.data_type());
-                    let mut outputs = context.parent().bind(
-                        BroadcastOperation::new(output_type, output_axes),
-                        Vec::new(),
-                        &[value],
-                    )?;
-                    check_count!("output", outputs, 1, ProgramError);
-                    arguments.push(outputs.remove(0));
-                }
-                Ok(arguments)
-            },
-        )
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        let extent = P::batch_extent(context)?;
+        self.infer_output_types(
+            &inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>(),
+            &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
+        )?;
+        // Empty batches pass even when the predicate is replicated and false. Check the extent before replaying.
+        if extent.value() == Some(0) {
+            return Ok(Vec::new().into());
+        }
+        if self.failure_limit.is_some() {
+            let arguments = P::materialize_inputs(context, inputs)?;
+            context.parent().assert(self.clone(), &arguments)?;
+            return Ok(Vec::new().into());
+        }
+        let mapped = inputs.iter().any(|input| P::batch_axis(input).axis().is_some());
+        if !mapped {
+            let mut arguments = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
+            arguments[0] = P::from_array_value(P::mask_empty_batch_condition(
+                context,
+                P::into_array_value(arguments[0].clone())?,
+            )?);
+            context.parent().assert(self.clone(), &arguments)?;
+            return Ok(Vec::new().into());
+        }
+        let (_, maximum) = extent.bounds().representable_extent_range().map_err(ProgramError::from)?;
+        if maximum > i32::MAX as usize {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "mapped assertion batch extent exceeds the supported `i32` index range".to_owned(),
+            });
+        }
+        // Backends also represent logical padded extents with signed indices; reserve the fallback item before staging.
+        if maximum == i32::MAX as usize
+            && extent.bounds().lower() == 0
+            && inputs[1..].iter().any(|input| P::batch_axis(input).axis().is_some())
+        {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "padded assertion batch extent exceeds the supported `i32` extent range".to_owned(),
+            });
+        }
+        let condition = P::into_array_value(P::value(&inputs[0]).clone())?;
+        let (condition, index) = if P::batch_axis(&inputs[0]).axis().is_some() {
+            let coordinates =
+                P::batch_item_indices(context, &condition.r#type().into_owned().with_data_type(DataType::I32))?;
+            // Passing items may tie the last coordinate: when any item fails, the minimum still identifies the
+            // first failure. Successful and empty batches are handled by the independent Boolean reduction.
+            let sentinel = coordinates.reduce(&[0], ReductionKind::Max)?;
+            let candidates = Select::select(&condition, &sentinel, &coordinates)?;
+            let index = candidates.reduce(&[0], ReductionKind::Min)?;
+            let condition = condition.reduce(&[0], ReductionKind::All)?;
+            // Empty and successful batches use index zero. A padded observation makes this valid even at extent zero.
+            let index = Select::select(&condition, &index.zero_like()?, &index)?;
+            (condition, index)
+        } else {
+            let condition = P::mask_empty_batch_condition(context, condition)?;
+            let index = condition.convert_element_type(DataType::I32)?.zero_like()?;
+            (condition, index)
+        };
+        let mut arguments = vec![P::from_array_value(condition)];
+        let mut padded_extent = None;
+        for input in &inputs[1..] {
+            if P::batch_axis(input).axis().is_some() {
+                let input = P::into_array_value(P::pad_empty_batch_observation(
+                    context,
+                    P::value(input).clone(),
+                    &mut padded_extent,
+                )?)?;
+                // The selected batch index is never negative, so the clamp-only policy keeps this slice on the single
+                // gather path even when the mapped axis is dynamic.
+                let observation =
+                    input.dynamic_slice_with_negative_indices(std::slice::from_ref(&index), &[1], false)?;
+                arguments.push(P::from_array_value(observation.reshape([])?));
+            } else {
+                arguments.push(P::value(input).clone());
+            }
+        }
+        arguments.push(P::from_array_value(index));
+        let mut labels = self.labels.clone();
+        let mut label = "batch_index".to_owned();
+        let mut suffix = 1;
+        while labels.contains(&label) {
+            label = format!("batch_index_{suffix}");
+            suffix += 1;
+        }
+        labels.push(label);
+        context.parent().assert(self.clone().with_labels(labels), &arguments)?;
+        Ok(Vec::new().into())
     }
 }
 
-impl<C: AssertionContext<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy>
-    for AssertOperation<ArrayIrType>
+impl_non_differentiable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
+impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
+
+/// Represents a [`BatchingPolicy`] that can batch [`AssertOperation`]s. Batching an assertion forwards it to the parent
+/// context. An assertion without a failure limit reduces its batched condition to one scalar Boolean and reports the
+/// observations of the first failing batch item, together with that item's index as an additional `batch_index`
+/// observation. An assertion with a failure limit instead receives its inputs with the batch axis materialized, and
+/// reports failing elements along that axis itself. That rule is the same for every policy. Policies differ only in how
+/// they view their values as arrays and in how they handle the batch extent, which a static-extent policy knows at
+/// trace time and a dynamic-extent policy only knows when the program runs, when it may also be zero. This trait
+/// captures exactly those differences, so that one [`BatchableOperation`] implementation serves every policy that
+/// implements it.
+pub(crate) trait AssertionBatchingPolicy<C: AssertionContext>: BatchingPolicy<C> {
+    /// Array value that the shared batching rule computes with, which is `C::Value` itself for array batching and its
+    /// array projection for array IR batching.
+    type ArrayValue: Value<Type = ArrayType> + Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike;
+
+    /// Returns the extent of the batch axis, which may be dynamic.
+    fn batch_extent(context: &BatchingContext<C, Self>) -> Result<Dimension, BatchingError>;
+
+    /// Returns `value` viewed as an [`ArrayValue`](Self::ArrayValue).
+    fn into_array_value(value: C::Value) -> Result<Self::ArrayValue, ProgramError>;
+
+    /// Returns `value` as a value of the context, reversing [`into_array_value`](Self::into_array_value).
+    fn from_array_value(value: Self::ArrayValue) -> C::Value;
+
+    /// Returns the index of every batch item along the leading batch axis of an array of type `r#type`.
+    fn batch_item_indices(
+        context: &BatchingContext<C, Self>,
+        r#type: &ArrayType,
+    ) -> Result<Self::ArrayValue, ProgramError>;
+
+    /// Returns `condition`, made to hold when the batch is empty, so that an empty batch passes even when the
+    /// condition itself is replicated and false.
+    fn mask_empty_batch_condition(
+        context: &BatchingContext<C, Self>,
+        condition: Self::ArrayValue,
+    ) -> Result<Self::ArrayValue, ProgramError>;
+
+    /// Returns a mapped `observation` padded by one batch item when the batch may be empty, so that selecting the
+    /// observation of batch item zero stays in bounds. `padded_extent` caches the padded batch extent across the
+    /// observations of one assertion, so that it is staged at most once and only when some observation needs it.
+    fn pad_empty_batch_observation(
+        context: &BatchingContext<C, Self>,
+        observation: C::Value,
+        padded_extent: &mut Option<C::Value>,
+    ) -> Result<C::Value, ProgramError>;
+
+    /// Returns `inputs` with their batch axes moved to the front and broadcast to the condition's shape, keeping scalar
+    /// observations scalar, as required by assertions with a failure limit, which report failing elements along the
+    /// batch axis themselves.
+    fn materialize_inputs(
+        context: &BatchingContext<C, Self>,
+        inputs: &[Self::Batch],
+    ) -> Result<Vec<C::Value>, BatchingError>;
+}
+
+impl<C: AssertionContext<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> AssertionBatchingPolicy<C>
+    for ArrayBatchingPolicy<P>
 where
-    C::Operation: From<Self>
-        + From<ConstantOperation<DimensionValue>>
+    C::Operation: From<IotaOperation<ArrayType>> + From<BroadcastOperation>,
+    C::Value: Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
+{
+    type ArrayValue = C::Value;
+
+    #[inline]
+    fn batch_extent(context: &BatchingContext<C, Self>) -> Result<Dimension, BatchingError> {
+        P::axis_dimension(context)
+    }
+
+    #[inline]
+    fn into_array_value(value: C::Value) -> Result<Self::ArrayValue, ProgramError> {
+        Ok(value)
+    }
+
+    #[inline]
+    fn from_array_value(value: Self::ArrayValue) -> C::Value {
+        value
+    }
+
+    fn batch_item_indices(
+        context: &BatchingContext<C, Self>,
+        r#type: &ArrayType,
+    ) -> Result<Self::ArrayValue, ProgramError> {
+        let extent = Self::batch_extent(context)?;
+        if extent.value().is_none() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "dynamic mapped assertions require the mixed array batching policy".to_owned(),
+            });
+        }
+        let mut outputs = context.parent().bind(IotaOperation::new(r#type.clone(), 0)?, Vec::new(), &[])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+
+    fn mask_empty_batch_condition(
+        context: &BatchingContext<C, Self>,
+        condition: Self::ArrayValue,
+    ) -> Result<Self::ArrayValue, ProgramError> {
+        let extent = Self::batch_extent(context)?;
+        if extent.bounds().lower() == 0 {
+            let condition = P::match_axis(context, &ArrayBatch::replicated(condition), Axis::from(0))?;
+            return condition.value().reduce(&[0], ReductionKind::All);
+        }
+        Ok(condition)
+    }
+
+    #[inline]
+    fn pad_empty_batch_observation(
+        _context: &BatchingContext<C, Self>,
+        observation: C::Value,
+        _padded_extent: &mut Option<C::Value>,
+    ) -> Result<C::Value, ProgramError> {
+        // Only array IR batching pads observations for possibly empty dynamic batches, and array batching slices them
+        // as they are.
+        Ok(observation)
+    }
+
+    fn materialize_inputs(
+        context: &BatchingContext<C, Self>,
+        inputs: &[Self::Batch],
+    ) -> Result<Vec<C::Value>, BatchingError> {
+        let condition = P::match_axis(context, &inputs[0], Axis::from(0))?.value().clone();
+        let condition_type = condition.r#type().into_owned();
+        let mut arguments = vec![condition];
+        for input in &inputs[1..] {
+            let value = if input.batch_axis().is_replicated() {
+                input.value().clone()
+            } else {
+                P::match_axis(context, input, Axis::from(0))?.value().clone()
+            };
+            let input_type = value.r#type();
+            if input_type.rank() == 0 {
+                arguments.push(value);
+                continue;
+            }
+            let output_axes = if input.batch_axis().is_replicated() {
+                (1..=input_type.rank()).collect::<Vec<_>>()
+            } else {
+                (0..input_type.rank()).collect::<Vec<_>>()
+            };
+            let output_type = condition_type.clone().with_data_type(input_type.data_type());
+            let mut outputs =
+                context.parent().bind(BroadcastOperation::new(output_type, output_axes), Vec::new(), &[value])?;
+            check_count!("output", outputs, 1, ProgramError);
+            arguments.push(outputs.remove(0));
+        }
+        Ok(arguments)
+    }
+}
+
+impl<C: AssertionContext<Type = ArrayIrType>> AssertionBatchingPolicy<C> for ArrayIrBatchingPolicy
+where
+    C::Operation: From<ConstantOperation<DimensionValue>>
         + From<IotaOperation<ArrayType>>
         + From<ZeroOperation<ArrayType>>
         + From<DimensionAddOperation>
@@ -748,140 +848,149 @@ where
                            + Transpose,
         >,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
-        &self,
-        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        driver: &D,
-        inputs: &[<ArrayIrBatchingPolicy as BatchingPolicy<C>>::Batch],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
-        let extent = match context.axis_extent().r#type().as_ref() {
-            ArrayIrType::Dimension(dimension) => dimension.to_dimension(),
-            _ => return Err(TypeError::invalid("assertion batch extent must be a dimension").into()),
-        };
-        let mut padded_extent: Option<C::Value> = None;
-        self.batch_inputs(
-            context,
-            driver,
-            inputs,
-            extent.clone(),
-            |value| Ok(value.into_projected()?),
-            C::Value::from_projected,
-            |r#type| {
-                let dimensions =
-                    if extent.value().is_some() { Vec::new() } else { vec![context.axis_extent().clone()] };
+    type ArrayValue = <C::Value as ValueProjection<ArrayType>>::Projected;
+
+    fn batch_extent(context: &BatchingContext<C, Self>) -> Result<Dimension, BatchingError> {
+        match context.axis_extent().r#type().as_ref() {
+            ArrayIrType::Dimension(dimension) => Ok(dimension.to_dimension()),
+            _ => Err(TypeError::invalid("assertion batch extent must be a dimension").into()),
+        }
+    }
+
+    #[inline]
+    fn into_array_value(value: C::Value) -> Result<Self::ArrayValue, ProgramError> {
+        Ok(value.into_projected()?)
+    }
+
+    #[inline]
+    fn from_array_value(value: Self::ArrayValue) -> C::Value {
+        C::Value::from_projected(value)
+    }
+
+    fn batch_item_indices(
+        context: &BatchingContext<C, Self>,
+        r#type: &ArrayType,
+    ) -> Result<Self::ArrayValue, ProgramError> {
+        let extent = Self::batch_extent(context)?;
+        let dimensions = if extent.value().is_some() { Vec::new() } else { vec![context.axis_extent().clone()] };
+        let mut outputs = context.parent().bind(IotaOperation::new(r#type.clone(), 0)?, Vec::new(), &dimensions)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0).into_projected()?)
+    }
+
+    fn mask_empty_batch_condition(
+        context: &BatchingContext<C, Self>,
+        condition: Self::ArrayValue,
+    ) -> Result<Self::ArrayValue, ProgramError> {
+        let extent = Self::batch_extent(context)?;
+        if extent.bounds().lower() > 0 {
+            return Ok(condition);
+        }
+        let mut zero = context.parent().bind(ConstantOperation::new(DimensionValue::constant(0)?), Vec::new(), &[])?;
+        check_count!("output", zero, 1, ProgramError);
+        let mut empty = context.parent().bind(
+            CompareOperation::new(ComparisonDirection::Equal),
+            Vec::new(),
+            &[context.axis_extent().clone(), zero.remove(0)],
+        )?;
+        check_count!("output", empty, 1, ProgramError);
+        let empty = empty.remove(0).into_projected()?;
+        Select::select(&empty, &empty, &condition)
+    }
+
+    fn pad_empty_batch_observation(
+        context: &BatchingContext<C, Self>,
+        observation: C::Value,
+        padded_extent: &mut Option<C::Value>,
+    ) -> Result<C::Value, ProgramError> {
+        let extent = Self::batch_extent(context)?;
+        if extent.bounds().lower() > 0 {
+            return Ok(observation);
+        }
+        let input_type = <&ArrayType>::try_from(observation.r#type().as_ref())?.clone();
+        let mut zero = context.parent().bind(
+            ZeroOperation::new(ArrayType::scalar(input_type.data_type()).with_memory(input_type.memory())),
+            Vec::new(),
+            &[],
+        )?;
+        check_count!("output", zero, 1, ProgramError);
+        let padded_extent = match padded_extent.clone() {
+            Some(value) => value,
+            None => {
+                let mut one =
+                    context.parent().bind(ConstantOperation::new(DimensionValue::constant(1)?), Vec::new(), &[])?;
+                check_count!("output", one, 1, ProgramError);
+                let one = one.remove(0);
+                let operation = DimensionAddOperation::new(
+                    <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?,
+                    <&DimensionType>::try_from(one.r#type().as_ref())?,
+                )?;
                 let mut outputs =
-                    context.parent().bind(IotaOperation::new(r#type.clone(), 0)?, Vec::new(), &dimensions)?;
+                    context.parent().bind(operation, Vec::new(), &[context.axis_extent().clone(), one])?;
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(outputs.remove(0).into_projected()?)
-            },
-            |condition| {
-                if extent.bounds().lower() > 0 {
-                    return Ok(condition);
+                let value = outputs.remove(0);
+                *padded_extent = Some(value.clone());
+                value
+            }
+        };
+        let arguments = vec![observation, zero.remove(0), padded_extent];
+        let operation = PadOperation::<ArrayIrType>::new(vec![0], vec![1], vec![0])?
+            .with_input_types(&arguments.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
+        let mut outputs = context.parent().bind(operation, Vec::new(), &arguments)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+
+    fn materialize_inputs(
+        context: &BatchingContext<C, Self>,
+        inputs: &[Self::Batch],
+    ) -> Result<Vec<C::Value>, BatchingError> {
+        let value = inputs[0].value().clone();
+        let condition_type = <&ArrayType>::try_from(value.r#type().as_ref())?.clone();
+        let mut dimensions = vec![context.axis_extent().clone()];
+        let mapped_axis = inputs[0].batch_axis_position();
+        for axis in (0..condition_type.rank()).filter(|axis| Some(*axis) != mapped_axis) {
+            let mut outputs = context.parent().bind(
+                DimensionSizeOperation::new(&condition_type, axis)?,
+                Vec::new(),
+                std::slice::from_ref(&value),
+            )?;
+            check_count!("output", outputs, 1, ProgramError);
+            dimensions.push(outputs.remove(0));
+        }
+        let mut arguments = Vec::new();
+        for input in inputs {
+            let mut value = input.value().clone();
+            let input_type = value.r#type();
+            let ArrayIrType::Array(input_type) = input_type.as_ref() else {
+                arguments.push(value);
+                continue;
+            };
+            let rank = input_type.rank();
+            if !arguments.is_empty() && rank == 0 {
+                arguments.push(value);
+                continue;
+            }
+            let output_axes = if let Some(mapped_axis) = input.batch_axis_position() {
+                if mapped_axis != 0 {
+                    let permutation = std::iter::once(mapped_axis)
+                        .chain((0..rank).filter(|axis| *axis != mapped_axis))
+                        .collect::<Vec<_>>();
+                    value = C::Value::from_projected(value.into_projected()?.transpose(permutation)?);
                 }
-                let mut zero =
-                    context.parent().bind(ConstantOperation::new(DimensionValue::constant(0)?), Vec::new(), &[])?;
-                check_count!("output", zero, 1, ProgramError);
-                let mut empty = context.parent().bind(
-                    CompareOperation::new(ComparisonDirection::Equal),
-                    Vec::new(),
-                    &[context.axis_extent().clone(), zero.remove(0)],
-                )?;
-                check_count!("output", empty, 1, ProgramError);
-                let empty = empty.remove(0).into_projected()?;
-                Select::select(&empty, &empty, &condition)
-            },
-            |input| {
-                if extent.bounds().lower() > 0 {
-                    return Ok(input);
-                }
-                let input_type = <&ArrayType>::try_from(input.r#type().as_ref())?.clone();
-                let mut zero = context.parent().bind(
-                    ZeroOperation::new(ArrayType::scalar(input_type.data_type()).with_memory(input_type.memory())),
-                    Vec::new(),
-                    &[],
-                )?;
-                check_count!("output", zero, 1, ProgramError);
-                let padded_extent = match &padded_extent {
-                    Some(value) => value.clone(),
-                    None => {
-                        let mut one = context.parent().bind(
-                            ConstantOperation::new(DimensionValue::constant(1)?),
-                            Vec::new(),
-                            &[],
-                        )?;
-                        check_count!("output", one, 1, ProgramError);
-                        let one = one.remove(0);
-                        let operation = DimensionAddOperation::new(
-                            <&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?,
-                            <&DimensionType>::try_from(one.r#type().as_ref())?,
-                        )?;
-                        let mut outputs =
-                            context.parent().bind(operation, Vec::new(), &[context.axis_extent().clone(), one])?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        let value = outputs.remove(0);
-                        padded_extent = Some(value.clone());
-                        value
-                    }
-                };
-                let arguments = vec![input, zero.remove(0), padded_extent];
-                let operation = PadOperation::<ArrayIrType>::new(vec![0], vec![1], vec![0])?
-                    .with_input_types(&arguments.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>())?;
-                let mut outputs = context.parent().bind(operation, Vec::new(), &arguments)?;
-                check_count!("output", outputs, 1, ProgramError);
-                Ok(outputs.remove(0))
-            },
-            |inputs| {
-                let value = inputs[0].value().clone();
-                let condition_type = <&ArrayType>::try_from(value.r#type().as_ref())?.clone();
-                let mut dimensions = vec![context.axis_extent().clone()];
-                let mapped_axis = inputs[0].batch_axis_position();
-                for axis in (0..condition_type.rank()).filter(|axis| Some(*axis) != mapped_axis) {
-                    let mut outputs = context.parent().bind(
-                        DimensionSizeOperation::new(&condition_type, axis)?,
-                        Vec::new(),
-                        std::slice::from_ref(&value),
-                    )?;
-                    check_count!("output", outputs, 1, ProgramError);
-                    dimensions.push(outputs.remove(0));
-                }
-                let mut arguments = Vec::new();
-                for input in inputs {
-                    let mut value = input.value().clone();
-                    let input_type = value.r#type();
-                    let ArrayIrType::Array(input_type) = input_type.as_ref() else {
-                        arguments.push(value);
-                        continue;
-                    };
-                    let rank = input_type.rank();
-                    if !arguments.is_empty() && rank == 0 {
-                        arguments.push(value);
-                        continue;
-                    }
-                    let output_axes = if let Some(mapped_axis) = input.batch_axis_position() {
-                        if mapped_axis != 0 {
-                            let permutation = std::iter::once(mapped_axis)
-                                .chain((0..rank).filter(|axis| *axis != mapped_axis))
-                                .collect::<Vec<_>>();
-                            value = C::Value::from_projected(value.into_projected()?.transpose(permutation)?);
-                        }
-                        (0..rank).collect::<Vec<_>>()
-                    } else {
-                        (1..=rank).collect::<Vec<_>>()
-                    };
-                    let inputs = std::iter::once(value).chain(dimensions.iter().cloned()).collect::<Vec<_>>();
-                    let mut outputs =
-                        context.parent().bind(DynamicBroadcastOperation::new(output_axes), Vec::new(), &inputs)?;
-                    check_count!("output", outputs, 1, ProgramError);
-                    arguments.push(outputs.remove(0));
-                }
-                Ok(arguments)
-            },
-        )
+                (0..rank).collect::<Vec<_>>()
+            } else {
+                (1..=rank).collect::<Vec<_>>()
+            };
+            let inputs = std::iter::once(value).chain(dimensions.iter().cloned()).collect::<Vec<_>>();
+            let mut outputs =
+                context.parent().bind(DynamicBroadcastOperation::new(output_axes), Vec::new(), &inputs)?;
+            check_count!("output", outputs, 1, ProgramError);
+            arguments.push(outputs.remove(0));
+        }
+        Ok(arguments)
     }
 }
-
-impl_non_differentiable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
-impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
 
 /// Checks Boolean conditions, reporting a message and named scalar observations when they fail.
 /// Eager execution reports failures immediately. Tracing elides known successes and retains failing or symbolic
@@ -913,7 +1022,9 @@ impl Assert for Array {
             return Ok(());
         }
         Err(operation
-            .failure(observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned())))?
+            .failure_from_observations(
+                observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned())),
+            )?
             .into())
     }
 
@@ -926,7 +1037,7 @@ impl Assert for Array {
         let operation = AssertOperation::new(message)
             .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect())
             .with_failure_limit(limit);
-        operation.check_elements(self, observations)
+        operation.assert_elements(self, observations)
     }
 }
 
@@ -942,7 +1053,9 @@ impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
             return Ok(());
         }
         Err(operation
-            .failure(observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned())))?
+            .failure_from_observations(
+                observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned())),
+            )?
             .into())
     }
 
@@ -955,7 +1068,7 @@ impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
         let operation = AssertOperation::new(message)
             .with_labels(observations.iter().map(|(label, _)| (*label).to_owned()).collect())
             .with_failure_limit(limit);
-        operation.check_elements(self, observations)
+        operation.assert_elements(self, observations)
     }
 }
 
@@ -1038,7 +1151,7 @@ where
     V::Type: Into<ArrayIrType>,
 {
     fn assert(&self, operation: AssertOperation<V::Type>, inputs: &[Self::Value]) -> Result<(), ProgramError> {
-        operation.fold_or_bind(self, inputs)
+        operation.bind_unless_known_true(self, inputs)
     }
 }
 
@@ -1049,7 +1162,7 @@ where
     C::Operation: From<AssertOperation<C::Type>>,
 {
     fn assert(&self, operation: AssertOperation<Self::Type>, inputs: &[Self::Value]) -> Result<(), ProgramError> {
-        operation.fold_or_bind(self, inputs)
+        operation.bind_unless_known_true(self, inputs)
     }
 }
 
