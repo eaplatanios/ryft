@@ -1483,7 +1483,7 @@ where
     /// Programs that use `shard_map` or `linear_shard_map` will surface
     /// [`BatchingError::UnsupportedOperation`](ryft_core::batching::BatchingError) at batch time — the batching rules
     /// for those XLA-specific extension variants are not yet implemented. Non-shard-map ops (including the
-    /// `reshard` and `sharding_constraint` sharding-control primitives) batch correctly through the per-op rules.
+    /// `reshard` and `constrain_sharding` sharding-control primitives) batch correctly through the per-op rules.
     #[track_caller]
     pub fn batch<'domain>(
         &'domain self,
@@ -5956,11 +5956,11 @@ mod tests {
         assert_eq!(engine.cache_size(), 0);
     }
 
-    /// Verifies that `sharding_constraint` works inside a `compile`-compiled function over an auto mesh axis: the
+    /// Verifies that `constrain_sharding` works inside a `compile`-compiled function over an auto mesh axis: the
     /// propagation hint is staged into the trace and lowers to `sdy.sharding_constraint`, and the output array carries
     /// the (input-derived) sharding on each device.
     #[test]
-    fn test_jit_with_sharding_constraint_constrains_output_sharding() {
+    fn test_jit_constrain_sharding_constrains_output_sharding() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -5973,11 +5973,11 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
         let target_sharding = sharded.clone();
 
-        // The user invokes `sharding_constraint` directly inside the staged closure — it's compiled into the
+        // The user invokes `constrain_sharding` directly inside the staged closure — it's compiled into the
         // same MLIR program as the rest of the function body.
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
-                let constrained = crate::experimental::shard_map::sharding_constraint(x, target_sharding.clone())
+                let constrained = crate::experimental::shard_map::constrain_sharding(x, target_sharding.clone())
                     .expect("staged sharding constraint should succeed");
                 constrained.sin().unwrap()
             },

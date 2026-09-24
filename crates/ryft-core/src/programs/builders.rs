@@ -956,13 +956,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation,
-        DimensionType, DimensionValue, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::captures::CaptureReference;
-    use crate::operations::{AddOperation, DimensionPowOperation, NegOperation};
+    use crate::operations::{
+        AddOperation, AssertOperation, AssertionError, CompareOperation, ComparisonDirection, DimensionPowOperation,
+        NegOperation,
+    };
     use crate::parameters::{Parameter, Placeholder};
-    use crate::programs::effects::{EffectClasses, Effects, ReferenceAlias, ReferenceEffect};
+    use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceAlias, ReferenceEffect};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::InstructionId;
     use crate::programs::operations::OperationFoldOutput;
@@ -1782,6 +1785,72 @@ mod tests {
         assert_eq!(constant.r#type().variable().name(), "value ^ 0");
         assert_eq!(constant.r#type().bounds(), DimensionBounds::new(1, Some(2)).unwrap());
         assert!(builder.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_program_builder_splice_program_preserves_assertions() {
+        let left = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
+        let right = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());
+        let mut source = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left_input = source.add_input(left.clone().into());
+        let right_input = source.add_input(right.clone().into());
+        let condition = source
+            .add_instruction(
+                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
+                Vec::new(),
+                vec![left_input, right_input],
+                None,
+            )
+            .unwrap()[0];
+        source
+            .add_instruction(
+                AssertOperation::new("left <= right").with_labels(vec!["left".to_owned(), "right".to_owned()]),
+                Vec::new(),
+                vec![condition, left_input, right_input],
+                None,
+            )
+            .unwrap();
+        let program = source
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder, Placeholder], vec![])
+            .unwrap();
+
+        // Relocation renames dimension identities while retaining the assertion even though it has no outputs.
+        let renamed_left = DimensionType::new("renamed_left", left.bounds());
+        let renamed_right = DimensionType::new("renamed_right", right.bounds());
+        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let inputs =
+            [destination.add_input(renamed_left.clone().into()), destination.add_input(renamed_right.clone().into())];
+        let outputs = destination.splice_program(&program, &inputs).unwrap();
+        let relocated = destination
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                outputs,
+                vec![Placeholder, Placeholder],
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(relocated.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        assert_eq!(
+            relocated.interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::new(renamed_left.clone(), 3).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(renamed_right.clone(), 7).unwrap()),
+            ]),
+            Ok(vec![]),
+        );
+
+        // Diagnostic labels remain source metadata, while their observations come from the relocated inputs.
+        let error = relocated
+            .interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::new(renamed_left, 7).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(renamed_right, 3).unwrap()),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<AssertionError>(),
+            Some(&AssertionError::Failed {
+                message: "left <= right".to_owned(),
+                observations: vec![("left".to_owned(), "7".to_owned()), ("right".to_owned(), "3".to_owned())],
+            }),
+        );
     }
 
     #[test]

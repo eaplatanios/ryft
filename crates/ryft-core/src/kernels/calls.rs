@@ -1101,7 +1101,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::ConvertElementType(_)
                 | ArrayOperation::TransferToMemory(_)
                 | ArrayOperation::Reshard(_)
-                | ArrayOperation::ShardingConstraint(_)
+                | ArrayOperation::ConstrainSharding(_)
                 | ArrayOperation::StopGradient(_)
                 | ArrayOperation::Tag(_)
                 | ArrayOperation::Rematerialize(_)

@@ -5127,7 +5127,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::ConvertElementType(_)
         | ArrayOperation::TransferToMemory(_)
         | ArrayOperation::Reshard(_)
-        | ArrayOperation::ShardingConstraint(_)
+        | ArrayOperation::ConstrainSharding(_)
         | ArrayOperation::StopGradient(_)
         | ArrayOperation::Tag(_)
         | ArrayOperation::Rematerialize(_)

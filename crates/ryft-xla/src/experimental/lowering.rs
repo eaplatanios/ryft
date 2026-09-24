@@ -5450,7 +5450,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 &mut lowerer.block,
                 lowerer.location,
             ),
-            ArrayOperation::ShardingConstraint(operation) => {
+            ArrayOperation::ConstrainSharding(operation) => {
                 // The constraint is untracked, so the output type is the input type, and the emitted constraint must
                 // carry the input's tracked placement alongside the constraint's own auto-axis placement.
                 check_count!("output", output_types, 1, ProgramError);
@@ -7534,7 +7534,7 @@ where
             let incoming = match instruction.operation() {
                 XlaOperation::ShardMap(operation) => Some(operation.shard_map().mesh().clone()),
                 XlaOperation::Array(ArrayOperation::Reshard(operation)) => Some(operation.sharding().mesh().clone()),
-                XlaOperation::Array(ArrayOperation::ShardingConstraint(operation)) => {
+                XlaOperation::Array(ArrayOperation::ConstrainSharding(operation)) => {
                     Some(operation.sharding().mesh().clone())
                 }
                 operation => {

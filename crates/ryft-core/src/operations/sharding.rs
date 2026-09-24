@@ -52,6 +52,13 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! Here, `reshard(&target)` partitions the array's only dimension over the two positions of the explicit mesh axis `x`
+//! and records that placement in the traced value's type. The following `constrain_sharding(&constraint)` requires the
+//! backend compiler to also partition that dimension over the two positions of the auto mesh axis `a`, while preserving
+//! the placement over `x`. The combined placement partitions the four elements across all four mesh positions, but the
+//! output type still records only `target` as placement over `a` is enforced during lowering rather than being tracked
+//! by the type system. Neither operation changes the array's logical shape or elements.
 
 use std::fmt::Display;
 
@@ -73,18 +80,16 @@ use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
 };
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`ReshardOperation`].
 pub const RESHARD_OPERATION_NAME: &str = "reshard";
 
-/// [`Operation`] that reshards its input to a target [`Sharding`], the analogue of JAX's
+/// [`Operation`] that reshards its input to a target [`Sharding`]. This operation is the Ryft analogue of JAX's
 /// [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html). The array's elements, shape, and data
 /// type are unchanged, and the output type carries the target sharding in place of the input's, extended with the
-/// manual variation and reduction facts of its input. The target may only name
-/// [`Explicit`](MeshAxisType::Explicit) mesh axes. Placement over [`Auto`](MeshAxisType::Auto) axes belongs to the
-/// compiler and is constrained with a [`ConstrainShardingOperation`]; transitions over manual axes require their
-/// corresponding collectives. Refer to the documentation of [`Reshard`] for more information.
+/// manual variation and reduction facts of its input. The target may only name [`MeshAxisType::Explicit`] mesh axes.
+/// Placement over [`MeshAxisType::Auto`] axes belongs to backend compilers and can be constrained using
+/// [`ConstrainShardingOperation`]s while transitions over [`MeshAxisType::Manual`] axes require their corresponding
+/// collectives. Refer to the documentation of [`Reshard`] for more information.
 ///
 /// Interpretation passes the value through and records the target on its type. Batching inserts the mapped axis's
 /// sharding into the target at the new batch axis. Differentiation reshards the tangent to the same target, and
@@ -92,7 +97,7 @@ pub const RESHARD_OPERATION_NAME: &str = "reshard";
 /// distributed like the input.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReshardOperation {
-    /// Refer to the documentation of [`sharding`](Self::sharding) for more information.
+    /// Target [`Sharding`] that the input is resharded to.
     sharding: Sharding,
 }
 
@@ -111,6 +116,7 @@ impl ReshardOperation {
 }
 
 impl Display for ReshardOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -134,13 +140,15 @@ impl Operation for ReshardOperation {
         let input = &input_types[0];
         if input.rank() != self.sharding.rank() {
             return Err(TypeError::invalid(format!(
-                "`{RESHARD_OPERATION_NAME}` target sharding rank ({}) does not match the input rank ({})",
+                "`{}` target sharding rank ({}) does not match the input rank ({})",
+                RESHARD_OPERATION_NAME,
                 self.sharding.rank(),
                 input.rank(),
             )));
         }
-        // Every mesh axis the target references, whether it shards a dimension or carries reduction state, must be
-        // one the type system governs.
+
+        // Every mesh axis the target references, whether it shards a dimension or carries reduction state,
+        // must be one the type system governs.
         let sharded_axes = self.sharding.dimensions().iter().flat_map(|dimension| match dimension {
             ShardingDimension::Sharded(axis_names) => axis_names.as_slice(),
             ShardingDimension::Replicated | ShardingDimension::Unconstrained => &[],
@@ -152,9 +160,10 @@ impl Operation for ReshardOperation {
         {
             return Err(TypeError::invalid(format!(
                 "`{RESHARD_OPERATION_NAME}` cannot target auto mesh axes; use `{CONSTRAIN_SHARDING_OPERATION_NAME}` \
-                 to constrain placement over them"
+                 to constrain placement over them",
             )));
         }
+
         if self
             .sharding
             .dimensions()
@@ -167,10 +176,12 @@ impl Operation for ReshardOperation {
             .chain(self.sharding.reduced_axes())
             .any(|axis| self.sharding.mesh().axis_type(axis) == Some(MeshAxisType::Manual))
         {
-            return Err(TypeError::invalid(
-                "`reshard` cannot target manual mesh axes; use manual collectives for transitions over them",
-            ));
+            return Err(TypeError::invalid(format!(
+                "`{RESHARD_OPERATION_NAME}` cannot target manual mesh axes; use manual collectives \
+                     for transitions over them",
+            )));
         }
+
         // Explicit redistribution preserves manual variation and reduction obligations. Their transitions belong
         // to manual collectives, including when a cotangent dual swaps reduced and unreduced state.
         let input_sharding = input.sharding();
@@ -205,9 +216,11 @@ impl Operation for ReshardOperation {
                 )
             })
             .map_err(|error| TypeError::invalid(error.to_string()))?;
+
         Ok(vec![input.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?])
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("sharding", &self.sharding))
@@ -221,14 +234,16 @@ impl<C: Domain<Type = ArrayType, Value: Reshard>> InterpretableOperation<C> for 
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // The resharding flows through the capability so interpretation over staging values (e.g., program batching,
+        // re-tracing, etc.) preserves it. Concrete values pass through unchanged.
         check_count!("input", inputs, 1, ProgramError);
-        // The resharding flows through the capability so interpretation over staging values (program batching,
-        // re-tracing) preserves it; concrete values pass through unchanged.
         Ok(vec![inputs[0].reshard(&self.sharding)?])
     }
 }
 
-impl<C: Context> PartiallyEvaluatableOperation<C> for ReshardOperation where C::Operation: From<ReshardOperation> {}
+impl<C: Context<Operation: From<ReshardOperation>>> PartiallyEvaluatableOperation<C> for ReshardOperation {}
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
 // (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension. Lifting needs

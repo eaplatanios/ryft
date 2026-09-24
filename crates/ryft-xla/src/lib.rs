@@ -22,7 +22,7 @@ pub use experimental::domains::{
     XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile, XlaInputBoundBucketing,
     XlaMemoryAnalysis, XlaOptimizedProgram, XlaOptions, XlaSession,
 };
-pub use experimental::shard_map::{reshard, sharding_constraint};
+pub use experimental::shard_map::{constrain_sharding, reshard};
 pub use jit::{
     CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, StatefulCompiledXlaFunction,
     StatefulJittedXlaFunction, XlaCompileTracer, XlaStatefulCompileTracer, XlaStatefulValue, compile,

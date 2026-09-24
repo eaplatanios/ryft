@@ -180,7 +180,7 @@ in `operations/collectives.rs`, with StableHLO lowerings emitting `all_reduce`, 
 
 | Primitive (JAX) | Used by | State | Notes |
 |---|---|---|---|
-| mesh sharding annotations | data + tensor parallel training | ✅ | `ReshardOperation` (`Reshard`) and `ShardingConstraintOperation` (`ConstrainSharding`), `Sharding`, `DeviceMesh` |
+| mesh sharding annotations | data + tensor parallel training | ✅ | `ReshardOperation` (`Reshard`) and `ConstrainShardingOperation` (`ConstrainSharding`), `Sharding`, `DeviceMesh` |
 | `shard_map` | MoE dispatch, custom collective regions | ✅ | `ShardMapOperation` (lowered via manual computations in `experimental/shard_map.rs`) |
 | `lax.psum` / `pmean` / `pmax` | gradient sync inside `shard_map` | ✅ | `ParallelReduceOperation` with `ParallelReductionKind::{Sum, Mean, Max}` (no `Min`; not needed) |
 | `lax.all_gather` | tensor-parallel gathers | ✅ | `AllGatherOperation`, tiled/untiled modes, `axis_index_groups` |

@@ -53,10 +53,10 @@ use std::fmt::Debug;
 #[cfg(test)]
 use ryft_core::StagingContext;
 use ryft_core::{
-    ArrayIrType, ArrayType, Atom, AtomId, Context, Dimension, Domain, DomainTracingContext, Instruction, LogicalMesh,
-    MeshAxisType, NamedAxis, Operation, ParallelVary, Parameter, ParameterError, Parameterized, ParameterizedFamily,
-    Placeholder, ProgramError, ProgramStatistics, ProjectedValue, ReshardOperation, Shape, Sharding,
-    ShardingConstraintOperation, ShardingDimension, ShardingError, Type, Typed, Value, ValueProjection,
+    ArrayIrType, ArrayType, Atom, AtomId, ConstrainShardingOperation, Context, Dimension, Domain, DomainTracingContext,
+    Instruction, LogicalMesh, MeshAxisType, NamedAxis, Operation, ParallelVary, Parameter, ParameterError,
+    Parameterized, ParameterizedFamily, Placeholder, ProgramError, ProgramStatistics, ProjectedValue, ReshardOperation,
+    Shape, Sharding, ShardingDimension, ShardingError, Type, Typed, Value, ValueProjection,
 };
 #[cfg(test)]
 use ryft_mlir::Block;
@@ -620,7 +620,7 @@ where
 
 /// Binds one sharding-control operation per leaf of an XLA value tree, pairing each leaf with the correspondingly
 /// structured [`Sharding`] and validating the requested rank before binding. Shared by [`reshard`] and
-/// [`sharding_constraint`], which differ only in the array operation they bind per leaf.
+/// [`constrain_sharding`], which differ only in the array operation they bind per leaf.
 fn bind_sharding_control_per_leaf<Input, Leaf, O>(
     input: Input,
     shardings: Input::To<Sharding>,
@@ -678,7 +678,7 @@ where
 /// [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html): it behaves like the identity at the
 /// value level while *replacing* each leaf's tracked [`Sharding`] with the requested one, and it differentiates as a
 /// resharding (its transpose reshards the cotangent to the input's cotangent dual). To constrain the compiler's
-/// placement over auto axes without tracking the result, use [`sharding_constraint`] instead.
+/// placement over auto axes without tracking the result, use [`constrain_sharding`] instead.
 ///
 /// Cross-mesh reshards are not representable inside a single staged program; for that case use the eager
 /// [`Array::to_placement`](crate::Array::to_placement) outside the trace.
@@ -702,7 +702,7 @@ where
 /// Constrains the placement of one traced XLA value tree over the mesh's
 /// [`Auto`](ryft_core::arrays::MeshAxisType::Auto) axes.
 ///
-/// This stages a [`ShardingConstraintOperation`] per leaf,
+/// This stages a [`ConstrainShardingOperation`] per leaf,
 /// mirroring [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):
 /// it is the identity at both the value and type levels (each leaf's tracked sharding is unchanged) and is enforced
 /// at lowering time, where it records a Shardy `sdy.sharding_constraint` on each traced leaf that merges the leaf's
@@ -714,7 +714,7 @@ where
 ///   - `input`: Structured traced XLA value whose leaves will be constrained.
 ///   - `shardings`: Structured sharding constraints with the same leaf layout as `input`.
 #[allow(private_bounds, private_interfaces)]
-pub fn sharding_constraint<Input, Leaf>(
+pub fn constrain_sharding<Input, Leaf>(
     input: Input,
     shardings: Input::To<Sharding>,
 ) -> Result<Input, ShardMapTraceError>
@@ -723,9 +723,9 @@ where
     Input::Family: ParameterizedFamily<Sharding>,
     Leaf: Value<Type = ArrayType>,
     Leaf::DispatchDomain: Context<Type = ArrayType>,
-    <Leaf::DispatchDomain as Domain>::Operation: From<ShardingConstraintOperation>,
+    <Leaf::DispatchDomain as Domain>::Operation: From<ConstrainShardingOperation>,
 {
-    bind_sharding_control_per_leaf(input, shardings, ShardingConstraintOperation::new)
+    bind_sharding_control_per_leaf(input, shardings, ConstrainShardingOperation::new)
 }
 
 /// Stages a traced shard-map body over the provided mesh and shardings.
@@ -3863,7 +3863,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_sharding_constraint_merges_tracked_placement_into_mlir() {
+    fn test_trace_constrain_sharding_merges_tracked_placement_into_mlir() {
         // The input is tracked as sharded over the explicit axis and the constraint places it over the auto axis, so
         // the emitted constraint must carry both placements rather than the constraint alone, which would contradict
         // the tracked type by marking the explicit axis replicated.
@@ -3882,7 +3882,7 @@ mod tests {
             {
                 let constraint = constraint.clone();
                 move |x: ShardMapTracer| {
-                    sharding_constraint(x, constraint.clone()).expect("constraint should stage on traced XLA values")
+                    constrain_sharding(x, constraint.clone()).expect("constraint should stage on traced XLA values")
                 }
             },
             global_input_type.clone(),

@@ -9554,7 +9554,7 @@ mod tests {
             ReshardOperation::new(normalized.sharding().unwrap().clone())
                 .infer_output_types(std::slice::from_ref(&input), &[]),
             Err(TypeError::invalid(
-                "`reshard` cannot target auto mesh axes; use `sharding_constraint` to constrain placement over them"
+                "`reshard` cannot target auto mesh axes; use `constrain_sharding` to constrain placement over them"
                     .to_string(),
             )),
         );

@@ -20,6 +20,6 @@ pub use domains::{
 };
 
 pub use shard_map::{
-    ShardMapTraceError, ShardMapTracer, TracedShardMap, TracedXlaProgram, reshard, shard_map, shard_map_with_options,
-    sharding_constraint, trace,
+    ShardMapTraceError, ShardMapTracer, TracedShardMap, TracedXlaProgram, constrain_sharding, reshard, shard_map,
+    shard_map_with_options, trace,
 };
