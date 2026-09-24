@@ -21,9 +21,9 @@ pub use or::{OR_OPERATION_NAME, Or, OrOperation};
 pub use xor::{XOR_OPERATION_NAME, Xor, XorOperation};
 
 impl Array {
-    /// Applies a binary logical or bitwise operation directly to validated Boolean or integer element bytes. Since
-    /// bitwise operations act independently on every bit, their result is independent of integer signedness and host
-    /// endianness. Logical Boolean encodings use the same `0` and `1` bitwise truth tables.
+    /// Applies a binary logical or bitwise operation specified by `function` directly to validated Boolean or integer
+    /// element bytes. Since bitwise operations act independently on every bit, their result is independent of integer
+    /// signedness and host endianness. Logical Boolean encodings use the same `0` and `1` bitwise truth tables.
     pub(crate) fn binary_logical(
         &self,
         rhs: &Self,
@@ -32,9 +32,6 @@ impl Array {
     ) -> Result<Self, ProgramError> {
         let left_data_type = self.r#type().data_type();
         let right_data_type = rhs.r#type().data_type();
-        ArrayType::check_matching_manual_variation(operation, &[self.r#type().as_ref(), rhs.r#type().as_ref()])?;
-        let output_type = Broadcastable::broadcast(self.r#type().as_ref(), rhs.r#type().as_ref())
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
         if left_data_type != right_data_type || !(left_data_type.is_boolean() || left_data_type.is_integer()) {
             return Err(TypeError::invalid(format!(
                 "cannot apply `{operation}` to arrays of element data types `{left_data_type}` and `{right_data_type}`",
@@ -42,6 +39,10 @@ impl Array {
             .into());
         }
 
+        ArrayType::check_matching_manual_variation(operation, &[self.r#type().as_ref(), rhs.r#type().as_ref()])?;
+
+        let output_type = Broadcastable::broadcast(self.r#type().as_ref(), rhs.r#type().as_ref())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
         let output_shape = output_type.static_shape().unwrap();
         let left_shape = self.r#type().static_shape().unwrap();
         let right_shape = rhs.r#type().static_shape().unwrap();
@@ -76,6 +77,7 @@ impl Array {
                     function(left_bytes[left_range.start + byte], right_bytes[right_range.start + byte]);
             }
         }
+
         // Valid inputs, bitwise closure outputs, and zero-initialized unoccupied storage preserve every `Array`
         // encoding invariant without a second validation traversal.
         Ok(Self::new_unchecked(output_type, Arc::new(output_bytes)))
