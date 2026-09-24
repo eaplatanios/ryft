@@ -1022,18 +1022,49 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Checks Boolean conditions, reporting a message and named scalar observations when they fail.
-/// Eager execution reports failures immediately. Tracing elides known successes and retains failing or symbolic
-/// conditions as ordered assertions. All input types are validated before folding or staging.
+/// Represents the ability to assert Boolean conditions in programs, reporting a message and named observations on
+/// failure. Concrete values are checked immediately; context-carrying values apply an [`AssertOperation`] through
+/// their context. Tracing omits known scalar successes and stages failing or symbolic conditions for execution.
+/// Assertions produce no outputs and remain enabled independently of debug builds. Staged assertions declare
+/// [`EffectClass::OrderedAssertion`] to preserve their failure order and survive dead-code elimination.
+///
+/// [`assert`](Self::assert) checks a scalar condition, while [`assert_with_limit`](Self::assert_with_limit) checks
+/// every element of an array condition and bounds the number of reported failures. Observations may be dimensions
+/// or Boolean, integer, `bf16`, `f16`, `f32`, and `f64` values. All input types are validated even when the condition
+/// is known to pass.
 pub trait Assert: Sized {
-    /// Requires this scalar Boolean value to be true, reporting `message` and `observations` on failure.
+    /// Requires this scalar Boolean value to be true. A failure reports the message and named scalar observations.
+    /// Under batching, reports the first failing item at each batching level and includes its batch index.
+    ///
+    /// # Parameters
+    ///
+    ///   - `message`: Literal description of the requirement, included in the failure diagnostic.
+    ///   - `observations`: Label-value pairs of supported scalar observations to report on failure, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if an input has an invalid type or the assertion cannot be applied in this value's
+    /// context. An executed false condition returns an [`AssertionError`] wrapped in a [`ProgramError`] while a staged
+    /// assertion reports that failure when the program executes.
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError>;
 
-    /// Requires every logical element to be true, reporting at most `limit` failed elements in row-major order.
-    /// Observations must be scalar values or arrays with the condition's shape. Empty conditions pass vacuously.
-    /// This bounds diagnostic output, not the amount of data inspected or transferred to the host.
+    /// Requires every logical element of this Boolean value to be true. Empty conditions pass. A failure reports
+    /// up to `limit` failing indices in row-major order, their observations, and the number of omitted failures.
+    /// Batching preserves individual elements for reporting instead of selecting only the first failing item.
+    ///
+    /// # Parameters
+    ///
+    ///   - `message`: Literal description of the requirement, included in the failure diagnostic.
+    ///   - `observations`: Label-value pairs of supported observations to report on failure, in order. Scalars are
+    ///     reused for every failed element; arrays must have the condition's shape and are sampled at each failing index.
+    ///   - `limit`: Maximum number of failed elements to report. Bounds diagnostic output, not the amount of data
+    ///     inspected or transferred to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if an input has an invalid type or shape, or the assertion cannot be applied in this
+    /// value's context. Executed failures return [`AssertionError::FailedElements`] wrapped in a [`ProgramError`] while
+    /// a staged assertion reports those failures when the program executes.
     fn assert_with_limit(
         &self,
         message: &str,
@@ -1050,14 +1081,13 @@ impl Assert for Array {
             .chain(observations.iter().map(|(_, input)| input.r#type().into_owned()))
             .collect::<Vec<_>>();
         operation.infer_output_types(&input_types, &[])?;
+
         if Concretizable::<bool>::concretize(self)? {
             return Ok(());
         }
-        Err(operation
-            .failure_from_observations(
-                observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned())),
-            )?
-            .into())
+
+        let observations = observations.iter().map(|(_, input)| (Some(input.clone()), input.r#type().into_owned()));
+        Err(operation.failure_from_observations(observations)?.into())
     }
 
     fn assert_with_limit(
@@ -1072,6 +1102,8 @@ impl Assert for Array {
         operation.assert_elements(self, observations)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<A: AssertionValue<Type = ArrayType>> Assert for ArrayIrValue<A> {
     fn assert(&self, message: &str, observations: &[(&str, Self)]) -> Result<(), ProgramError> {
