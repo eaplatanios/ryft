@@ -1243,15 +1243,20 @@ pub trait AssertionValue: Value + Concretizable<bool> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
+// Assertion partial evaluation requires `Constant: AssertionValue`, including in domains that store captures as
+// constants. A `CaptureReference` carries only an index and type, so inspection always fails with `Concretization`.
+// This implementation keeps captured programs eligible for partial evaluation. Unavailable observations use type
+// information or `<unknown>` in diagnostics. Removing it would reject those domains at compile time even when no
+// captured value needs to be inspected. Constant enums containing captures can also delegate their inspection here.
 impl<T: Type> AssertionValue for CaptureReference<T> {
+    #[inline]
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         Err(ProgramError::Concretization {
             message: "cannot inspect a captured assertion observation before execution".to_owned(),
         })
     }
 
+    #[inline]
     fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
         Err(ProgramError::Concretization {
             message: "cannot inspect a captured assertion array before execution".to_owned(),
@@ -1274,6 +1279,7 @@ impl AssertionValue for Array {
         }
     }
 
+    #[inline]
     fn assertion_array(&self) -> Result<Option<Array>, ProgramError> {
         Ok(Some(self.clone()))
     }
@@ -1380,6 +1386,7 @@ mod tests {
                 error = "assertion condition must have type `bool[]` but has type `bool[1]`",
             }],
         );
+
         check_operation_type_inference!(
             operation = AssertOperation::<ArrayType>::new("condition must hold").with_labels(vec!["value".to_owned()]),
             cases = [{
@@ -1397,6 +1404,8 @@ mod tests {
             }],
         );
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     #[test]
     fn test_assert_interpretation() {
