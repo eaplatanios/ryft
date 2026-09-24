@@ -76,7 +76,6 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::RematerializeOperation;
 
 mod collectives;
-mod complex;
 mod control_flow;
 mod cumulative;
 mod math;

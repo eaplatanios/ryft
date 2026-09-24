@@ -134,113 +134,31 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl Operation for CompareOperation<DataType> {
-    type Type = DataType;
+impl<T: ComparisonTypeSemantics> Operation for CompareOperation<T> {
+    type Type = T;
 
     #[inline]
     fn name(&self) -> &'static str {
         COMPARE_OPERATION_NAME
     }
 
+    #[inline]
     fn infer_output_types(
         &self,
-        input_types: &[DataType],
-        region_interfaces: &[RegionInterface<DataType>],
-    ) -> Result<Vec<DataType>, TypeError> {
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-
-        // Complex inputs are unordered, so only the equality comparison directions are defined for them.
-        if !matches!(self.direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual)
-            && input_types.iter().any(|input_type| input_type.is_complex())
-        {
-            return Err(TypeError::invalid(format!(
-                "cannot apply an ordered comparison to unordered complex inputs of types `{}` and `{}`",
-                input_types[0], input_types[1],
-            )));
-        }
-
-        let broadcasted = DataType::broadcasted(input_types)
-            .map_err(|_| TypeError::invalid("comparison input types are not broadcast-compatible"))?;
-        Ok(vec![broadcasted.with_element_type(DataType::Boolean)])
+        Ok(vec![input_types[0].infer_comparison_output_type(&input_types[1], self.direction)?])
     }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, COMPARE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("direction", self.direction))
-    }
-}
-
-// Array comparisons preserve broadcast geometry and matching manual variation while producing Boolean elements.
-impl Operation for CompareOperation<ArrayType> {
-    type Type = ArrayType;
 
     #[inline]
-    fn name(&self) -> &'static str {
-        COMPARE_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
-        check_count!("region", region_interfaces, 0, TypeError);
-
-        // Complex inputs are unordered, so only the equality comparison directions are defined for them.
-        if !matches!(self.direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual)
-            && input_types.iter().any(|input_type| input_type.is_complex())
-        {
-            return Err(TypeError::invalid(format!(
-                "cannot apply an ordered comparison to unordered complex inputs of types `{}` and `{}`",
-                input_types[0], input_types[1],
-            )));
-        }
-
-        ArrayType::check_matching_manual_variation(self.name(), &input_types.iter().collect::<Vec<_>>())?;
-        let broadcasted = ArrayType::broadcasted(input_types)
-            .map_err(|_| TypeError::invalid("comparison input types are not broadcast-compatible"))?;
-        Ok(vec![broadcasted.with_element_type(DataType::Boolean)])
-    }
-
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, COMPARE_OPERATION_NAME)?
+        OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("direction", self.direction))
     }
 }
-
-// Composite comparison contract: both inputs are first-class dimensions and the predicate is ordinary rank-zero
-// Boolean array data rather than another dimension value.
-impl Operation for CompareOperation<ArrayIrType> {
-    type Type = ArrayIrType;
-
-    #[inline]
-    fn name(&self) -> &'static str {
-        COMPARE_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<ArrayIrType>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
-        check_count!("region", region_interfaces, 0, TypeError);
-        input_types.iter().try_for_each(|r#type| <&DimensionType>::try_from(r#type).map(|_| ()))?;
-        // Comparing first-class dimensions produces ordinary predicate data rather than another dimension value.
-        Ok(vec![ArrayType::scalar(DataType::Boolean).into()])
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, COMPARE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("direction", self.direction))
-    }
-}
-
-impl_reference_dischargeable_operation!(@reference_free <T> CompareOperation<T> where T: Type);
 
 impl ElementwiseOperation for CompareOperation<ArrayType> {
     #[inline]
@@ -254,11 +172,12 @@ impl ElementwiseOperation for CompareOperation<ArrayType> {
     }
 }
 
-impl<D: Domain> InterpretableOperation<D> for CompareOperation<D::Type>
-where
-    CompareOperation<D::Type>: Operation<Type = D::Type>,
-    D::Value: Compare<D::Value>,
+impl_reference_dischargeable_operation!(@reference_free <T> CompareOperation<T> where T: Type);
+
+impl<D: Domain<Type: ComparisonTypeSemantics, Value: Compare<D::Value>>> InterpretableOperation<D>
+    for CompareOperation<D::Type>
 {
+    #[inline]
     fn interpret<I: InterpretationDriver<D>>(
         &self,
         _context: &D,
@@ -280,10 +199,13 @@ impl<C: Context<Type = ArrayType, Operation: From<CompareOperation<ArrayType>>>>
 {
 }
 
-impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for CompareOperation<ArrayIrType>
-where
-    C::Operation: From<Self>,
-    C::Constant: TryFrom<bool, Error = ProgramError> + ValueProjection<DimensionType, Projected = DimensionValue>,
+impl<
+    C: Context<
+            Type = ArrayIrType,
+            Constant: TryFrom<bool, Error = ProgramError> + ValueProjection<DimensionType, Projected = DimensionValue>,
+            Operation: From<Self>,
+        >,
+> PartiallyEvaluatableOperation<C> for CompareOperation<ArrayIrType>
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -307,19 +229,18 @@ where
                 *extent = Some(value.into_projected()?.extent());
             }
         }
-        // A proven predicate is a Boolean constant; unresolved predicates follow ordinary partial evaluation.
+
+        // A proven predicate is a Boolean constant. Unresolved predicates follow ordinary partial evaluation.
         if let Some(output) = prove_dimension_comparison(left, right, exact, self.direction)? {
             return Ok(vec![PartialEvaluationValue::known(context.parent().lift(C::Constant::try_from(output)?)?)]);
         }
+
         context.fold_or_residualize(*self, regions, inputs)
     }
 }
 
-// Batching rule for first-class dimension comparison. Dimension inputs describe one shared array shape and must
-// therefore remain replicated; their Boolean array output is replicated ordinary data.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for CompareOperation<ArrayIrType>
-where
-    C::Operation: From<CompareOperation<ArrayIrType>>,
+impl<C: Context<Type = ArrayIrType, Operation: From<CompareOperation<ArrayIrType>>>>
+    BatchableOperation<C, ArrayIrBatchingPolicy> for CompareOperation<ArrayIrType>
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -327,6 +248,8 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
+        // Dimension inputs describe one shared array shape and must therefore remain replicated;
+        // their Boolean array output is replicated ordinary data.
         check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];
         let right = &inputs[1];
@@ -344,6 +267,66 @@ where
 
 impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Type);
 impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
+
+/// Type-family comparison semantics for [`CompareOperation`].
+pub trait ComparisonTypeSemantics: Type {
+    /// Infers the Boolean output type for comparing this type with `other` in the given `direction`.
+    /// Returns an error if the inputs are incompatible or the direction is unsupported for their types.
+    ///
+    /// # Parameters
+    ///
+    ///   - `other`: Type of the second comparison input.
+    ///   - `direction`: Predicate applied to the two inputs.
+    fn infer_comparison_output_type(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, TypeError>;
+}
+
+impl ComparisonTypeSemantics for DataType {
+    fn infer_comparison_output_type(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, TypeError> {
+        // Complex inputs are unordered, so only the equality comparison directions are defined for them.
+        if !matches!(direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual)
+            && (self.is_complex() || other.is_complex())
+        {
+            return Err(TypeError::invalid(format!(
+                "cannot apply an ordered comparison to unordered complex inputs of types `{}` and `{}`",
+                self, other,
+            )));
+        }
+        let broadcasted = DataType::broadcasted(&[self, other])
+            .map_err(|_| TypeError::invalid("comparison input types are not broadcast-compatible"))?;
+        Ok(broadcasted.with_element_type(DataType::Boolean))
+    }
+}
+
+impl ComparisonTypeSemantics for ArrayType {
+    fn infer_comparison_output_type(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, TypeError> {
+        // Complex inputs are unordered, so only the equality comparison directions are defined for them.
+        if !matches!(direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual)
+            && (self.is_complex() || other.is_complex())
+        {
+            return Err(TypeError::invalid(format!(
+                "cannot apply an ordered comparison to unordered complex inputs of types `{}` and `{}`",
+                self, other,
+            )));
+        }
+        ArrayType::check_matching_manual_variation(COMPARE_OPERATION_NAME, &[self, other])?;
+        let broadcasted = ArrayType::broadcasted(&[self, other])
+            .map_err(|_| TypeError::invalid("comparison input types are not broadcast-compatible"))?;
+        Ok(broadcasted.with_element_type(DataType::Boolean))
+    }
+}
+
+impl ComparisonTypeSemantics for ArrayIrType {
+    fn infer_comparison_output_type(&self, other: &Self, _direction: ComparisonDirection) -> Result<Self, TypeError> {
+        // Validate that both inputs are dimensions. Array comparisons use the projected `ArrayType` operation instead.
+        <&DimensionType>::try_from(self)?;
+        <&DimensionType>::try_from(other)?;
+
+        // Comparing first-class dimensions produces ordinary predicate data rather than another dimension value.
+        Ok(ArrayType::scalar(DataType::Boolean).into())
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to compare two values and produce Boolean data. Array inputs are broadcast to a common
 /// shape and their element types are promoted before comparison. The output has that shape and
@@ -722,7 +705,7 @@ mod tests {
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
-        // Each independently implemented type universe rejects attached regions.
+        // The shared operation contract rejects attached regions for every type universe.
         assert_eq!(
             ordered_scalar.infer_output_types(
                 &[DataType::F32, DataType::F32],
