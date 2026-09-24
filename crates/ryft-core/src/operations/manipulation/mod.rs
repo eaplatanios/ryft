@@ -5,19 +5,19 @@
 //!
 //! The operations fall into four groups:
 //!
-//!   - **Reordering without changing the shape:** [`Transpose`] permutes axes and [`Reverse`] flips the order of the
+//!   - **Reordering without Changing the Shape:** [`Transpose`] permutes axes and [`Reverse`] flips the order of the
 //!     elements along selected axes.
 //!   - **Changing the shape:** [`Reshape`] reinterprets the element layout, [`Broadcast`] repeats an array along new
 //!     or size-one axes, [`Concatenate`] joins arrays along an axis, and [`Pad`] adds, removes, or interleaves edge
 //!     and interior padding.
-//!   - **Selecting and updating elements:** [`Slice`] and [`UpdateSlice`] take static windows, [`DynamicSlice`] and
+//!   - **Selecting and Updating Elements:** [`Slice`] and [`UpdateSlice`] take static windows, [`DynamicSlice`] and
 //!     [`DynamicUpdateSlice`] take runtime start indices, [`DynamicSliceWithDimensions`] takes dimension-valued
 //!     windows, [`Gather`] and [`Scatter`] read and write arbitrary coordinates, and [`Indexing`] composes all of
 //!     these behind an [`index!`](crate::index) selector list with
 //!     [NumPy-style](https://numpy.org/doc/stable/user/basics.indexing.html) integers, ranges, strides, new axes,
 //!     array indices, and masks. On array values the selection reads or returns updated copies, and on reference
 //!     values it derives a view that is read and written in place.
-//!   - **Changing representation and placement:** [`ConvertElementType`] changes the element data type and
+//!   - **Changing Representation and Placement:** [`ConvertElementType`] changes the element data type and
 //!     [`TransferToMemory`] moves an array between memory spaces.
 //!
 //! Negative host integers and negative runtime start indices count from the end of their axis once before clamping.
