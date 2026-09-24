@@ -21,6 +21,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, dispatch_on_array_element_type, impl_differentiable_operation, impl_reference_dischargeable_operation,
 };
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::compare::Compare;
 use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::iota::{Iota, IotaOperation};
@@ -1894,6 +1895,7 @@ impl Scatter for ArrayType {
             .into());
         }
 
+        ArrayType::check_matching_manual_variation(SCATTER_OPERATION_NAME, &[input, indices, updates])?;
         let mut varying_manual_axes = input.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
         for sharding in [indices.sharding(), updates.sharding()].into_iter().flatten() {
             varying_manual_axes.extend(sharding.varying_manual_axes().iter().cloned());
@@ -2086,7 +2088,7 @@ impl<A: Scatter + Value<Type = ArrayType>> Scatter for ArrayIrValue<A> {
     }
 }
 
-impl<V: Value<Type = ArrayType>> Scatter for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Scatter for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<ScatterOperation>>,
 {
@@ -2102,10 +2104,12 @@ where
         // `From<ScatterOperation>` bound makes this disjoint from the eager value types (whose context operation
         // is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
         // implementations.
+        let inputs = [self.clone(), indices.clone(), updates.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let mut outputs = self.dispatch_domain().bind(
             ScatterOperation::new(dimensions.clone(), kind).with_options(options.clone()),
             Vec::new(),
-            &[self.clone(), indices.clone(), updates.clone()],
+            &inputs,
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -2340,6 +2344,7 @@ mod tests {
         DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
         RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout, i4,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::batch;
     use crate::contexts::Context;
     use crate::differentiation::{Linearization, TransposableOperation, TranspositionContext, differentiate_at};
@@ -2356,7 +2361,7 @@ mod tests {
         EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceDischargeContext, ReferenceDischargeValue,
         ReferenceDischargeableOperation,
     };
-    use crate::tracing::Trace;
+    use crate::tracing::{DomainTracingContext, Trace};
 
     use super::*;
 
@@ -2672,6 +2677,37 @@ mod tests {
         let maximum = ScatterOperation::new(dimensions, ScatterReductionKind::Max);
         assert!(!maximum.is_linear());
         assert!(!maximum.with_unique_indices(true).with_indices_are_sorted(true).is_linear());
+    }
+
+    #[test]
+    fn test_scatter_manual_variation_alignment() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input = ArrayType::new_static(DataType::F32, [4]);
+        let indices = ArrayType::new_static(DataType::I32, [1, 1])
+            .with_sharding(Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let updates = ArrayType::new_static(DataType::F32, [1]);
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Add);
+        assert_eq!(
+            operation.infer_output_types(&[input.clone(), indices.clone(), updates.clone()], &[]),
+            Err(TypeError::invalid(
+                "`scatter` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that \
+                 lack an axis, as `align_manual_variation` does",
+            )),
+        );
+        let (_, program) = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
+            |(input, indices, updates)| {
+                input.scatter(&indices, &updates, operation.dimensions(), operation.kind(), operation.options())
+            },
+            (input, indices, updates),
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["broadcast", "parallel_vary", "broadcast", "parallel_vary", "scatter"],
+        );
     }
 
     #[test]
@@ -3190,7 +3226,11 @@ mod tests {
         .unwrap();
         let varying = Sharding::replicated(manual_mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
         let varying_updates = updates.clone().with_sharding(varying.clone()).unwrap();
-        let expected = ArrayType::new_static(DataType::F32, [4]).with_sharding(varying).unwrap();
+        let expected = Err(TypeError::invalid(
+            "`scatter` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack \
+             an axis, as `align_manual_variation` does",
+        )
+        .into());
         assert_eq!(
             ArrayType::new_static(DataType::F32, [4]).scatter(
                 &indices,
@@ -3199,7 +3239,7 @@ mod tests {
                 operation.kind(),
                 operation.options()
             ),
-            Ok(expected.clone()),
+            expected.clone(),
         );
         let manual_input = ArrayType::new_static(DataType::F32, [4])
             .with_sharding(Sharding::replicated(manual_mesh.clone(), 1))
@@ -3212,7 +3252,7 @@ mod tests {
                 operation.kind(),
                 operation.options()
             ),
-            Ok(expected)
+            expected,
         );
 
         // All sharded inputs must use one mesh, whichever input establishes it.
@@ -3220,7 +3260,7 @@ mod tests {
         assert_eq!(
             input.scatter(&other_mesh_indices, &updates, operation.dimensions(), operation.kind(), operation.options()),
             Err(TypeError::invalid(format!(
-                "`{SCATTER_OPERATION_NAME}` input, indices, and updates shardings must use one mesh"
+                "`{SCATTER_OPERATION_NAME}` input, indices, and updates shardings must use one mesh",
             ))
             .into()),
         );

@@ -1,11 +1,12 @@
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Dimension, DimensionType,
-    DimensionValue, Layout, LinearResiduals, RaggedAxis, Shape, Sharding, ShardingDimension, StridedLayout,
-    TiledLayout,
+    DimensionValue, Layout, LinearResiduals, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
+    StridedLayout, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -17,6 +18,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -32,8 +34,8 @@ use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
-    TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,
+    Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, Tracer};
 
@@ -298,7 +300,9 @@ impl_differentiable_operation! {
             + From<ReshapeOperation>
             + From<BroadcastOperation>
             + From<ReduceOperation>
-            + From<ReshardOperation>,
+            + From<ReshardOperation>
+            + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
+            + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // Transposition rule for `BroadcastOperation`. The pullback of a broadcast is a sum reduction over the
@@ -325,6 +329,19 @@ impl_differentiable_operation! {
             Ok(())
         }
     },
+}
+
+// Any operation family that contains `BroadcastOperation` can provide it on request. Families that cannot stage a
+// broadcast override this with an implementation that returns `ProgramError::UnsupportedOperation`. The `ParallelVary`
+// capability requests broadcasts this way to attach a mesh placement to unsharded inputs.
+impl<O: Operation<Type = ArrayType> + From<BroadcastOperation>> OperationProvider<ArrayType, BroadcastOperation> for O {
+    type Operation = Self;
+
+    #[inline]
+    fn provide(request: BroadcastOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        Ok(Self::from(request))
+    }
 }
 
 /// Replicates an array along new axes or expands axes of size one to a requested output shape. Input axis `i` maps to
@@ -529,6 +546,10 @@ impl Broadcast for ArrayType {
             ))
             .into());
         }
+
+        // Global dimension placement can introduce variation through physical ownership. A variation transition
+        // without a placement change requires its own operation so transposition sees its collective adjoint.
+        validate_broadcast_manual_state(self.sharding(), output_type.sharding())?;
 
         let input_rank = self.rank();
         let output_rank = output_type.rank();
@@ -1740,6 +1761,8 @@ fn infer_explicit_broadcast_output_type(
             .map_err(|error| TypeError::invalid(error.to_string()))?,
     };
 
+    validate_broadcast_manual_state(input.sharding(), output_sharding.as_ref())?;
+
     let mut output_type =
         if input.shape() == &output_shape && operation.output_axes().iter().copied().eq(0..input.rank()) {
             input.clone()
@@ -1755,6 +1778,58 @@ fn infer_explicit_broadcast_output_type(
 
     validate_broadcast_output_layout(&output_type)?;
     Ok(output_type)
+}
+
+/// Validates that broadcasting preserves manual state except variation introduced by global dimension placement.
+fn validate_broadcast_manual_state(input: Option<&Sharding>, output: Option<&Sharding>) -> Result<(), TypeError> {
+    let input_varying = input.map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
+    let output_varying = output.map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
+    let placed_manual_axes = |sharding: Option<&Sharding>| {
+        sharding
+            .into_iter()
+            .flat_map(|sharding| {
+                sharding
+                    .dimensions()
+                    .iter()
+                    .flat_map(|dimension| match dimension {
+                        ShardingDimension::Replicated | ShardingDimension::Unconstrained => [].iter(),
+                        ShardingDimension::Sharded(names) => names.iter(),
+                    })
+                    .filter(move |name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    };
+
+    let input_placement = placed_manual_axes(input);
+    let output_placement = placed_manual_axes(output);
+    let mut allowed_varying = input_varying.clone();
+    allowed_varying.extend(output_placement.difference(&input_placement).cloned());
+
+    if !input_varying.is_subset(&output_varying) || !output_varying.is_subset(&allowed_varying) {
+        return Err(TypeError::invalid("broadcasting cannot change varying manual axes"));
+    }
+
+    let reduction_state = |sharding: Option<&Sharding>| {
+        sharding
+            .into_iter()
+            .flat_map(|sharding| {
+                sharding
+                    .reduced_axes()
+                    .iter()
+                    .map(|axis| (axis, false))
+                    .chain(sharding.unreduced_axes().iter().map(|axis| (axis, true)))
+                    .filter(|(axis, _)| sharding.mesh().axis_type(axis) == Some(MeshAxisType::Manual))
+                    .map(|(axis, unreduced)| (axis.clone(), unreduced))
+            })
+            .collect::<BTreeSet<_>>()
+    };
+
+    if reduction_state(input) != reduction_state(output) {
+        return Err(TypeError::invalid("broadcasting cannot change manual reduction state"));
+    }
+
+    Ok(())
 }
 
 /// Validates that `output_axes` maps each of the `input_rank` input axes to a distinct output axis below `output_rank`,
@@ -2064,6 +2139,81 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_broadcast_type_inference_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
+            .unwrap();
+        assert_eq!(Broadcast::broadcast(&varying, varying.clone(), &[]), Ok(varying.clone()));
+        let materialized = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["devices"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["devices"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(Broadcast::broadcast(&invariant, materialized.clone(), &[]), Ok(materialized.clone()));
+        let materialize_operation =
+            DynamicBroadcastOperation::new(Vec::new()).with_output_sharding(materialized.sharding().cloned());
+        assert_eq!(
+            infer_explicit_broadcast_output_type(&invariant, materialized.shape().clone(), &materialize_operation),
+            Ok(materialized.clone()),
+        );
+        let replicated_vector = ArrayType::new(DataType::F32, materialized.shape().clone())
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        assert_eq!(Broadcast::broadcast(&replicated_vector, materialized.clone(), &[0]), Ok(materialized.clone()),);
+        let placed_invariant = materialized
+            .clone()
+            .with_sharding(
+                materialized.sharding().unwrap().clone().with_varying_manual_axes(Vec::<String>::new()).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            Broadcast::broadcast(&placed_invariant, materialized, &[0]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "broadcasting cannot change varying manual axes",
+        ));
+        assert!(matches!(
+            Broadcast::broadcast(&varying, invariant.clone(), &[]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "broadcasting cannot change varying manual axes",
+        ));
+        assert!(matches!(
+            Broadcast::broadcast(&invariant, varying.clone(), &[]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "broadcasting cannot change varying manual axes",
+        ));
+        let operation = DynamicBroadcastOperation::new(Vec::new()).with_output_sharding(invariant.sharding().cloned());
+        assert_eq!(
+            infer_explicit_broadcast_output_type(&varying, varying.shape().clone(), &operation),
+            Err(TypeError::invalid("broadcasting cannot change varying manual axes")),
+        );
+        let reduced = invariant
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["devices"]).unwrap())
+            .unwrap();
+        let unreduced = invariant
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["devices"]).unwrap())
+            .unwrap();
+        assert_eq!(Broadcast::broadcast(&reduced, reduced.clone(), &[]), Ok(reduced.clone()));
+        for input in [reduced, unreduced] {
+            assert_eq!(
+                infer_explicit_broadcast_output_type(&input, input.shape().clone(), &operation),
+                Err(TypeError::invalid("broadcasting cannot change manual reduction state")),
+            );
+            assert!(matches!(
+                Broadcast::broadcast(&input, invariant.clone(), &[]),
+                Err(ProgramError::Type(TypeError::Invalid { message }))
+                    if message == "broadcasting cannot change manual reduction state",
+            ));
+        }
     }
 
     #[test]

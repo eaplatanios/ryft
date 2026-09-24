@@ -21,6 +21,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -1097,7 +1098,7 @@ impl Concatenate for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType>> Concatenate for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Concatenate for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<ConcatenateOperation<ArrayType>>>,
 {
@@ -1124,6 +1125,7 @@ where
             return Ok(inputs.pop().unwrap());
         }
 
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let operation = ConcatenateOperation::<ArrayType>::new(axis, rank)?;
         let first = &inputs[0];
         let mut outputs = first.dispatch_domain().bind(operation, Vec::new(), inputs.as_slice())?;
@@ -1316,7 +1318,7 @@ impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>> DynamicCon
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> DynamicConcatenate for V
+impl<V: Value<Type = ArrayIrType> + ManualVariationAlignment<ArrayIrType>> DynamicConcatenate for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<ConcatenateOperation<ArrayIrType>>>,
 {
@@ -1328,7 +1330,8 @@ where
     where
         Self: 'i,
     {
-        let mut inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
+        let inputs = inputs.into_iter().cloned().collect::<Vec<_>>();
+        let mut inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         inputs.push(extent.clone());
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let mut outputs = inputs[0].dispatch_domain().bind(
@@ -1409,9 +1412,9 @@ fn validate_concatenation_inputs(inputs: &[&ArrayType], axis: usize) -> Result<O
     Ok(all_static.then_some(concatenated_static))
 }
 
-/// Infers the result [`Sharding`] for a concatenation operation by requiring identical spatial placement and merging
-/// varying-manual axes. Non-empty reduced and unreduced axis sets must agree independently; adding varying axes can
-/// consume a complete reduced set.
+/// Infers the output [`Sharding`] for a concatenation operation by requiring identical spatial placement and varying
+/// manual axes. Non-empty reduced and unreduced axis sets must agree independently. Reduction-state transitions require
+/// their own semantic operations and cannot be supplied by concatenation.
 fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding>, TypeError> {
     /// Merges one non-empty reduced or unreduced axis set into the corresponding concatenation result state.
     fn merge_concatenation_axis_set(
@@ -1432,31 +1435,18 @@ fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding
         }
     }
 
+    ArrayType::check_matching_manual_variation(CONCATENATE_OPERATION_NAME, inputs)?;
     let varying_manual_axes = inputs
-        .iter()
-        .filter_map(|input| input.sharding())
-        .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
-        .collect::<BTreeSet<_>>();
+        .first()
+        .and_then(|input| input.sharding())
+        .map(Sharding::varying_manual_axes)
+        .cloned()
+        .unwrap_or_default();
     let mut spatial_sharding: Option<&Sharding> = None;
     let mut unreduced_axes = None;
     let mut reduced_axes = None;
     for input in inputs {
-        let input_varying_manual_axes =
-            input.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
-        let added_varying_manual_axes =
-            varying_manual_axes.difference(&input_varying_manual_axes).cloned().collect::<BTreeSet<_>>();
-        let mut normalized_reduced_axes = input.reduced_axes().clone();
-        if normalized_reduced_axes == added_varying_manual_axes {
-            normalized_reduced_axes.clear();
-        } else if !input.unreduced_axes().is_disjoint(&added_varying_manual_axes)
-            || !normalized_reduced_axes.is_disjoint(&added_varying_manual_axes)
-        {
-            return Err(TypeError::invalid(format!(
-                "`{CONCATENATE_OPERATION_NAME}` cannot make input varying over axes \
-                 {added_varying_manual_axes:?} while it is reduced or unreduced over any of those axes",
-            )));
-        }
-
+        let normalized_reduced_axes = input.reduced_axes().clone();
         unreduced_axes = merge_concatenation_axis_set(unreduced_axes, input.unreduced_axes(), "unreduced")?;
         reduced_axes = merge_concatenation_axis_set(reduced_axes, &normalized_reduced_axes, "reduced")?;
 
@@ -1889,50 +1879,29 @@ mod tests {
             ))),
         );
 
-        // The public capability performs the standard varying normalization before applying the primitive rule.
+        // Raw inference requires the normalization performed by the public capability.
         let varying = replicated.clone().with_varying_manual_axes(["m"]).unwrap();
+        let varying_n = replicated.clone().with_varying_manual_axes(["n"]).unwrap();
         for inputs in [
             [row(Some(varying.clone())), row(Some(replicated.clone()))],
             [row(Some(replicated.clone())), row(Some(varying.clone()))],
             [row(Some(varying.clone())), row(None)],
-        ] {
-            let output = operation.infer_output_types(&inputs, &[]).unwrap();
-            assert_eq!(output[0].sharding().unwrap().varying_manual_axes(), varying.varying_manual_axes());
-        }
-        let varying_n = replicated.clone().with_varying_manual_axes(["n"]).unwrap();
-        let output = operation.infer_output_types(&[row(Some(varying.clone())), row(Some(varying_n))], &[]).unwrap();
-        assert_eq!(
-            output[0].sharding().unwrap().varying_manual_axes(),
-            &BTreeSet::from(["m".to_string(), "n".to_string()]),
-        );
-
-        // When standard normalization makes an input varying over its complete reduced set, that reduced state is
-        // consumed. A partial overlap is invalid because it cannot be represented by the standard cast, and an
-        // unreduced set is never consumed because casting a pending partial sum to varying would drop its reduction.
-        for inputs in [
+            [row(Some(varying.clone())), row(Some(varying_n))],
             [row(Some(replicated.clone().with_reduced_axes(["m"]).unwrap())), row(Some(varying.clone()))],
-            [row(Some(varying.clone())), row(Some(replicated.clone().with_reduced_axes(["m"]).unwrap()))],
+            [row(Some(replicated.with_unreduced_axes(["m"]).unwrap())), row(Some(varying.clone()))],
         ] {
-            let output = operation.infer_output_types(&inputs, &[]).unwrap();
-            let output_sharding = output[0].sharding().unwrap();
-            assert!(output_sharding.reduced_axes().is_empty());
-            assert_eq!(output_sharding.varying_manual_axes(), varying.varying_manual_axes());
-        }
-        let partially_reduced = replicated.clone().with_reduced_axes(["m", "n"]).unwrap();
-        let unreduced = replicated.with_unreduced_axes(["m"]).unwrap();
-        for inputs in [
-            [row(Some(partially_reduced)), row(Some(varying.clone()))],
-            [row(Some(unreduced.clone())), row(Some(varying.clone()))],
-            [row(Some(varying)), row(Some(unreduced))],
-        ] {
-            assert!(matches!(
+            assert_eq!(
                 operation.infer_output_types(&inputs, &[]),
-                Err(TypeError::Invalid { message }) if message == format!(
-                    "`{CONCATENATE_OPERATION_NAME}` cannot make input varying over axes {{\"m\"}} while it is reduced \
-                     or unreduced over any of those axes",
-                ),
-            ));
+                Err(TypeError::invalid(
+                    "`concatenate` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                     that lack an axis, as `align_manual_variation` does",
+                )),
+            );
         }
+        let output = operation
+            .infer_output_types(&[row(Some(varying.clone())), row(Some(varying.clone()))], &[])
+            .unwrap();
+        assert_eq!(output[0].sharding().unwrap().varying_manual_axes(), varying.varying_manual_axes());
     }
 
     #[test]

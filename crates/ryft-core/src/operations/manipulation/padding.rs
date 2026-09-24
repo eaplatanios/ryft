@@ -22,6 +22,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::assertions::Assert;
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::iota::DynamicIota;
@@ -1628,7 +1629,7 @@ impl Pad for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType>> Pad for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Pad for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<PadOperation<ArrayType>>>,
 {
@@ -1644,10 +1645,12 @@ where
         if is_effective_identity(self.r#type().as_ref(), edge_padding_low, edge_padding_high, interior_padding) {
             return Ok(self.clone());
         }
+        let inputs = [self.clone(), padding_value.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let mut outputs = self.dispatch_domain().bind(
             PadOperation::new(edge_padding_low.to_vec(), edge_padding_high.to_vec(), interior_padding.to_vec())?,
             Vec::new(),
-            &[self.clone(), padding_value.clone()],
+            &inputs,
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -3161,15 +3164,16 @@ mod tests {
             }],
         );
 
-        // A pure crop never reads the padding scalar, so its dependency metadata may differ from the input's. The
-        // inverse pad nevertheless introduces zeros for cropped input positions and must derive that internal zero's
-        // dependencies from the input cotangent rather than from the unused primal padding scalar.
+        // A pure crop never reads the padding scalar, but both inputs must still agree on their manual variation. The
+        // inverse pad introduces zeros for cropped input positions and derives that internal zero's metadata from the
+        // input cotangent, so the varying input cotangent is restored exactly.
         let crop_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let crop_input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
             .with_sharding(Sharding::replicated(crop_mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
             .unwrap();
-        let crop_padding_type =
-            ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(crop_mesh, 0)).unwrap();
+        let crop_padding_type = ArrayType::scalar(DataType::F64)
+            .with_sharding(Sharding::replicated(crop_mesh, 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
         let crop_output_type = crop_input_type.pad(&crop_padding_type, &[-1], &[0], &[0]).unwrap();
         check_operation_transposition!(
             @exact,

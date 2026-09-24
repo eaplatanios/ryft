@@ -21,6 +21,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, dispatch_on_array_element_type, impl_differentiable_operation, impl_reference_dischargeable_operation,
 };
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::zero::{DynamicZero, Zero, ZeroOperation};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
@@ -278,6 +279,17 @@ impl<V: Value<Type = ArrayType>> GatherOptions<V> {
                     "`{GATHER_OPERATION_NAME}` fill value must be a numeric or Boolean scalar",
                 )));
             }
+
+            if r#type.sharding().is_some_and(|sharding| {
+                !sharding.varying_manual_axes().is_empty()
+                    || !sharding.reduced_axes().is_empty()
+                    || !sharding.unreduced_axes().is_empty()
+            }) {
+                return Err(TypeError::invalid(format!(
+                    "`{GATHER_OPERATION_NAME}` stored fill value must be invariant without reduction state",
+                )));
+            }
+
             if r#type.data_type() != data_type {
                 return Err(TypeError::invalid(format!(
                     "`{}` fill data type `{}` does not match input data type `{}`",
@@ -1499,6 +1511,8 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             .into());
         }
 
+        ArrayType::check_matching_manual_variation(GATHER_OPERATION_NAME, &[input, indices])?;
+
         let sharding = if let Some(requested) = options.output_sharding() {
             if mesh.as_ref().is_some_and(|mesh| mesh != requested.mesh()) {
                 return Err(TypeError::invalid(format!(
@@ -1768,7 +1782,8 @@ impl<Stored: Value<Type = ArrayType>, A: Gather<Stored> + Value<Type = ArrayType
     }
 }
 
-impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayType>> Gather<Stored> for V
+impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Gather<Stored>
+    for V
 where
     V::DispatchDomain: Context<Type = ArrayType, Operation: From<GatherOperation<Stored>>>,
 {
@@ -1782,7 +1797,9 @@ where
         // Bind homogeneous array values through their context. Mixed tracers use the canonical array projection;
         // requiring a homogeneous type here keeps array-operation trait obligations from becoming recursive.
         let operation = GatherOperation::new(dimensions.clone(), slice_sizes.to_vec()).with_options(options.clone());
-        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), indices.clone()])?;
+        let inputs = [self.clone(), indices.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
+        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -1990,19 +2007,21 @@ mod tests {
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
         MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout, i1, i4, u4,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::batch;
     use crate::differentiation::{TransposableOperation, TranspositionContext, differentiate_at};
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
+    use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
-        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceDischargeContext, ReferenceDischargeValue,
-        ReferenceDischargeableOperation,
+        EffectClasses, EmptyRegionDriver, OperationProvider, Program, ProgramBuilder, ReferenceDischargeContext,
+        ReferenceDischargeValue, ReferenceDischargeableOperation,
     };
-    use crate::tracing::{Trace, Tracer, TracingContext};
+    use crate::tracing::{DomainTracingContext, Trace, Tracer, TracingContext};
 
     use super::*;
 
@@ -2324,6 +2343,44 @@ mod tests {
     }
 
     #[test]
+    fn test_gather_manual_variation_alignment() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input = ArrayType::new_static(DataType::F32, [4]);
+        let indices = ArrayType::new_static(DataType::I32, [1, 1])
+            .with_sharding(Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let operation = GatherOperation::<Array>::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
+        assert_eq!(
+            operation.infer_output_types(&[input.clone(), indices.clone()], &[]),
+            Err(TypeError::invalid(
+                "`gather` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that \
+                 lack an axis, as `align_manual_variation` does",
+            )),
+        );
+        let projected = ArrayIrOperation::<Array>::Array(ArrayOperation::Gather(operation.clone()));
+        assert_eq!(
+            projected
+                .infer_output_types(&[ArrayIrType::Array(input.clone()), ArrayIrType::Array(indices.clone())], &[]),
+            Err(TypeError::invalid(
+                "`gather` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that \
+                 lack an axis, as `align_manual_variation` does",
+            )),
+        );
+        let (_, program) = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
+            |(input, indices)| {
+                input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options())
+            },
+            (input, indices),
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["broadcast", "parallel_vary", "gather"],
+        );
+    }
+
+    #[test]
     fn test_gather_type_inference() {
         let operation =
             GatherOperation::<Array>::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
@@ -2439,6 +2496,23 @@ mod tests {
             operation.interpret(&EagerContext::<ArrayType>::new(), &EmptyRegionDriver, &input_types),
             Err(TypeError::invalid("non-literal fill cannot be stored as a constant").into()),
         );
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh, 0);
+        for sharding in [
+            replicated.clone().with_varying_manual_axes(["m"]).unwrap(),
+            replicated.clone().with_reduced_axes(["m"]).unwrap(),
+            replicated.with_unreduced_axes(["m"]).unwrap(),
+        ] {
+            let fill =
+                Array::from_elements(ArrayType::scalar(DataType::F32).with_sharding(sharding).unwrap(), &[1_f32])
+                    .unwrap();
+            let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
+                .with_mode(GatherMode::Fill { value: Some(Box::new(fill)) });
+            assert_eq!(
+                operation.infer_output_types(&input_types, &[]),
+                Err(TypeError::invalid("`gather` stored fill value must be invariant without reduction state")),
+            );
+        }
     }
 
     #[test]
@@ -3135,7 +3209,36 @@ mod tests {
             Ok(vec![ArrayType::new_static(DataType::F32, [2, 2])]),
         );
 
-        let context = TracingContext::<ArrayType, GatherOperation<ArrayType>>::new();
+        /// Narrow family for staging gathers with abstract stored values.
+        #[derive(Clone, Debug, ryft_macros::Operation)]
+        #[ryft(type = ArrayType, constant = ArrayType)]
+        enum AbstractGatherOperation {
+            Gather(GatherOperation<ArrayType>),
+        }
+
+        impl OperationProvider<ArrayType, ParallelVaryOperation> for AbstractGatherOperation {
+            type Operation = Self;
+
+            fn provide(_request: ParallelVaryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "abstract gather test family cannot align manual variation".to_string(),
+                })
+            }
+        }
+
+        impl OperationProvider<ArrayType, BroadcastOperation> for AbstractGatherOperation {
+            type Operation = Self;
+
+            fn provide(_request: BroadcastOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "abstract gather test family cannot align manual variation".to_string(),
+                })
+            }
+        }
+
+        let context = TracingContext::<ArrayType, AbstractGatherOperation>::new();
         let staged_input = context.input(input_types[0].clone());
         let staged_indices = context.input(input_types[1].clone());
         assert_eq!(

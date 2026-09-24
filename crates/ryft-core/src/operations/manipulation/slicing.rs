@@ -1,12 +1,12 @@
 use std::borrow::Cow;
-use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
     ArrayIrType, ArrayIrValue, ArraySliceAxis, ArrayType, ArrayTypeRefinements, DataType, Dimension, DimensionType,
-    DimensionValue, LinearResiduals, ReferenceSliceOperation, Shape, Sharding, ShardingDimension, StaticShape,
+    DimensionValue, LinearResiduals, MeshAxisType, ReferenceSliceOperation, Shape, Sharding, ShardingDimension,
+    StaticShape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -22,6 +22,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::compare::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::iota::DynamicIota;
@@ -1239,19 +1240,21 @@ impl<A: UpdateSlice + Value<Type = ArrayType>> UpdateSlice for ArrayIrValue<A> {
     }
 }
 
-impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<UpdateSliceOperation>>>>
-    UpdateSlice for V
+impl<
+    V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<UpdateSliceOperation>>>
+        + ManualVariationAlignment<ArrayType>,
+> UpdateSlice for V
 {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
         // Any context-carrying value updates a slice by binding an `UpdateSliceOperation` through its own context. The
         // `From<UpdateSliceOperation>` bound makes this disjoint from the eager value types (whose context operation is
         // `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
         // implementations.
-        let mut outputs = self.dispatch_domain().bind(
-            UpdateSliceOperation::new(start_indices.to_vec()),
-            Vec::new(),
-            &[self.clone(), update.clone()],
-        )?;
+        let inputs = [self.clone(), update.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
+        let mut outputs =
+            self.dispatch_domain()
+                .bind(UpdateSliceOperation::new(start_indices.to_vec()), Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -2763,16 +2766,18 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
 }
 
 impl<
+    T: Type,
     V: Value<
-        DispatchDomain: Context<
-            Operation: From<DynamicSliceOperation<V::Type>>
-                           + OperationProvider<
-                V::Type,
-                DynamicSliceOperation,
-                Operation = <V::DispatchDomain as Domain>::Operation,
+            Type = T,
+            DispatchDomain: Context<
+                Operation: From<DynamicSliceOperation<T>>
+                               + OperationProvider<
+                    T,
+                    DynamicSliceOperation,
+                    Operation = <V::DispatchDomain as Domain>::Operation,
+                >,
             >,
-        >,
-    >,
+        > + ManualVariationAlignment<T>,
 > DynamicSlice for V
 {
     fn dynamic_slice_with_negative_indices(
@@ -2784,6 +2789,7 @@ impl<
         let mut inputs = Vec::with_capacity(1 + start_indices.len());
         inputs.push(self.clone());
         inputs.extend_from_slice(start_indices);
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
         let operation = <V::DispatchDomain as Domain>::Operation::provide(
             DynamicSliceOperation::new(sizes.to_vec()).with_allow_negative_indices(allow_negative_indices),
@@ -3171,7 +3177,7 @@ impl<
                     Operation = <V::DispatchDomain as Domain>::Operation,
                 >,
             >,
-        >,
+        > + ManualVariationAlignment<ArrayIrType>,
 > DynamicSliceWithDimensions for V
 {
     fn dynamic_slice_with_bounds(
@@ -4067,7 +4073,8 @@ impl<A: DynamicUpdateSlice + Value<Type = ArrayType>> DynamicUpdateSlice for Arr
 }
 
 impl<
-    V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<DynamicUpdateSliceOperation>>>,
+    V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<DynamicUpdateSliceOperation>>>
+        + ManualVariationAlignment<ArrayType>,
 > DynamicUpdateSlice for V
 {
     fn dynamic_update_slice_with_negative_indices(
@@ -4082,6 +4089,7 @@ impl<
         // concrete implementations.
         let mut inputs = vec![self.clone(), update.clone()];
         inputs.extend(start_indices.iter().cloned());
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let operation = DynamicUpdateSliceOperation::new().with_allow_negative_indices(allow_negative_indices);
         let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
@@ -4159,11 +4167,9 @@ fn validate_update_slice_inputs(
 
 /// Computes the output [`Sharding`] for an in-place update (i.e., [`UpdateSlice`] or [`DynamicUpdateSlice`]).
 /// Because the update is written into the input without resharding, the two must agree on placement and reduction state
-/// wherever an [`Explicit`](crate::MeshAxisType::Explicit) mesh axis is involved. Differences confined to `Manual` and
-/// `Auto` axes are tolerated (i.e., left to the underlying backend). The output keeps the input's sharding, except that
-/// the update's [`varying_manual_axes`](Sharding::varying_manual_axes) are unioned in (the written region may vary over
-/// manual axes the input does not, so the result does too). An unsharded input acquires replicated placement on the
-/// update's mesh when that is needed to represent the update's manual-axis variation.
+/// wherever an [`MeshAxisType::Explicit`] mesh axis is involved. Differences confined to [`MeshAxisType::Manual`] and
+/// [`MeshAxisType::Auto`] axes are tolerated (i.e., are left to the underlying backend). Manual variation must already
+/// match after forward input alignment. The output keeps the input's sharding.
 fn infer_update_slice_output_sharding(
     operation_name: &'static str,
     input: &ArrayType,
@@ -4179,18 +4185,10 @@ fn infer_update_slice_output_sharding(
         )));
     }
 
+    ArrayType::check_matching_manual_variation(operation_name, &[input, update])?;
+
     let Some(input_sharding) = input.sharding() else {
-        return update
-            .sharding()
-            .filter(|sharding| !sharding.varying_manual_axes().is_empty())
-            .map(|sharding| {
-                Sharding::replicated(sharding.mesh().clone(), input.rank())
-                    .with_varying_manual_axes(sharding.varying_manual_axes().clone())
-                    .map_err(|error| {
-                        TypeError::invalid(format!("`{operation_name}` output sharding is invalid: {error}"))
-                    })
-            })
-            .transpose();
+        return Ok(None);
     };
 
     let Some(update_sharding) = update.sharding() else {
@@ -4208,21 +4206,7 @@ fn infer_update_slice_output_sharding(
         )));
     }
 
-    if update_sharding.varying_manual_axes().is_subset(input_sharding.varying_manual_axes()) {
-        return Ok(Some(input_sharding.clone()));
-    }
-
-    let varying_manual_axes = input_sharding
-        .varying_manual_axes()
-        .union(update_sharding.varying_manual_axes())
-        .cloned()
-        .collect::<Vec<_>>();
-
-    input_sharding
-        .clone()
-        .with_varying_manual_axes(varying_manual_axes)
-        .map(Some)
-        .map_err(|error| TypeError::invalid(format!("`{operation_name}` output sharding is invalid: {error}")))
+    Ok(Some(input_sharding.clone()))
 }
 
 /// Validates the scalar integer start-index input types of a dynamic slicing operation. Each index type must be a
@@ -4290,9 +4274,8 @@ fn validate_dynamic_slice_start_index_types(
     Ok(())
 }
 
-/// Carries the distribution of dynamic start indices into the result of a slicing operation. Index values are discrete
-/// control inputs and so their reduction state is invalid, while variation over manual mesh axes makes the selected or
-/// updated result vary over the same axes.
+/// Validates the mesh and manual variation of dynamic start indices against the slicing output.
+/// Forward input alignment makes their variation explicit before the operation is bound.
 fn infer_dynamic_slice_output_type(
     operation_name: &'static str,
     output_type: ArrayType,
@@ -4317,31 +4300,10 @@ fn infer_dynamic_slice_output_type(
         }
     }
 
-    // Only variation over manual axes changes the placement; a replicated index leaves an unsharded output unsharded.
-    let index_varying_manual_axes = indices
-        .iter()
-        .filter_map(|index_type| index_type.sharding())
-        .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
-        .collect::<BTreeSet<_>>();
-
-    if index_varying_manual_axes.is_empty() {
-        return Ok(output_type);
-    }
-
-    let output_sharding = match output_type.sharding() {
-        Some(sharding) => sharding.clone(),
-        None => Sharding::new(mesh.unwrap(), vec![ShardingDimension::Replicated; output_type.rank()])
-            .map_err(|error| TypeError::invalid(format!("`{operation_name}` output sharding is invalid: {error}")))?,
-    };
-
-    let varying_manual_axes =
-        output_sharding.varying_manual_axes().union(&index_varying_manual_axes).cloned().collect::<Vec<_>>();
-    let sharding = output_sharding
-        .with_varying_manual_axes(varying_manual_axes)
-        .map_err(|error| TypeError::invalid(format!("`{operation_name}` output sharding is invalid: {error}")))?;
-    output_type
-        .with_sharding(Some(sharding))
-        .map_err(|error| TypeError::invalid(format!("`{operation_name}` output type is invalid: {error}")).into())
+    let mut input_types = vec![&output_type];
+    input_types.extend(indices);
+    ArrayType::check_matching_manual_variation(operation_name, &input_types)?;
+    Ok(output_type)
 }
 
 /// Validates that a [`DynamicSlice`] call supplies one start index and one size per input axis,
@@ -4407,7 +4369,18 @@ fn batch_by_item_expansion<
         let mut limits = vec![0];
         limits.extend_from_slice(output_shape.as_slice());
         let output = input.value().slice(&vec![0; limits.len()], &limits, &vec![1; limits.len()])?;
-        let output_type = output_type.batched(0, Dimension::Static(0), context.axis_sharding().clone())?;
+        let batch_dimension = match (context.axis_sharding(), output_type.sharding()) {
+            (ShardingDimension::Sharded(axes), Some(sharding)) => {
+                let axes = axes
+                    .iter()
+                    .filter(|axis| sharding.mesh().axis_type(axis) != Some(MeshAxisType::Manual))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if axes.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(axes) }
+            }
+            (dimension, _) => dimension.clone(),
+        };
+        let output_type = output_type.batched(0, Dimension::Static(0), batch_dimension)?;
         let output = output.broadcast(output_type, &(0..limits.len()).collect::<Vec<_>>())?;
         return Ok(vec![ArrayBatch::new(output, BatchAxis::new(0))?]);
     }
@@ -4425,6 +4398,12 @@ fn batch_by_item_expansion<
                 return Ok(aligned);
             }
 
+            if !sharding.dimensions()[0].manual_axes(sharding.mesh()).is_empty() {
+                return Err(
+                    TypeError::invalid("slicing batch inputs must use local placement for manual mesh axes").into()
+                );
+            }
+
             // Slicing one global batch item cannot retain a nontrivial Explicit placement on its new extent-one
             // dimension. Replicate the packed input once, run the expansion over replicated slices, and restore
             // the mapped placement once on the completed output accumulator.
@@ -4433,7 +4412,7 @@ fn batch_by_item_expansion<
             let replicated = sharding
                 .with_dimensions(dimensions)
                 .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
-            let value = aligned.value().reshard(&replicated)?;
+            let value = aligned.value().reshard(&replicated.without_manual_reduction_axes())?;
             ArrayBatch::new(value, BatchAxis::new(0))
         })
         .collect::<Result<Vec<_>, BatchingError>>()?;
@@ -4473,11 +4452,30 @@ fn batch_by_item_expansion<
     let accumulator = match accumulator.r#type().sharding() {
         Some(sharding) if sharding.dimensions().first() != Some(batch_dimension) => {
             let mut dimensions = sharding.dimensions().to_vec();
-            dimensions[0] = batch_dimension.clone();
+
+            // A manual mesh dimension belongs to the enclosing boundary, not this local tensor's placement.
+            // The input's variation facts already describe ownership across those devices.
+            dimensions[0] = match batch_dimension {
+                ShardingDimension::Sharded(axes) => {
+                    let axes = axes
+                        .iter()
+                        .filter(|axis| sharding.mesh().axis_type(axis) != Some(MeshAxisType::Manual))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if axes.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(axes) }
+                }
+                dimension => dimension.clone(),
+            };
+
             let sharding = sharding
                 .with_dimensions(dimensions)
                 .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
-            accumulator.reshard(&sharding)?
+
+            if accumulator.r#type().sharding() == Some(&sharding) {
+                accumulator
+            } else {
+                accumulator.reshard(&sharding.without_manual_reduction_axes())?
+            }
         }
         _ => accumulator,
     };
@@ -4498,6 +4496,7 @@ mod tests {
         DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding,
         ShardingDimension, StridedLayout, f8e8m0fnu, i4,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
@@ -4520,7 +4519,7 @@ mod tests {
         EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeValue,
         ReferenceDischargeableOperation, Typed,
     };
-    use crate::tracing::Trace;
+    use crate::tracing::{DomainTracingContext, Trace};
 
     use super::*;
 
@@ -5547,8 +5546,10 @@ mod tests {
 
         // Applying output sharding metadata preserves the non-dense layout and the untouched input values.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let input_type =
-            ArrayType::new_static(DataType::I32, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-4])));
+        let input_type = ArrayType::new_static(DataType::I32, [3])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![-4])))
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
         let update_type = ArrayType::new_static(DataType::I32, [1])
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
             .unwrap();
@@ -5999,6 +6000,7 @@ mod tests {
         );
         // A varying manual update changes the dependency metadata while retaining explicit placement.
         let varying = matching.clone().with_sharding(sharding.with_varying_manual_axes(["m"]).unwrap()).unwrap();
+        let input = input.with_sharding(varying.sharding().cloned()).unwrap();
         assert_eq!(input.update_slice(&varying, &[0, 0]).unwrap().sharding(), varying.sharding());
     }
 
@@ -6067,21 +6069,25 @@ mod tests {
             &[40i32],
         )
         .unwrap();
-        let expected = Array::from_elements(
-            ArrayType::new_static(DataType::I32, [3]).with_sharding(varying.clone()).unwrap(),
-            &[10i32, 40, 30],
-        )
-        .unwrap();
-        assert_eq!(input.update_slice(&update, &[1]), Ok(expected));
+        assert_eq!(
+            input.update_slice(&update, &[1]),
+            Err(TypeError::invalid(
+                "`update_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                 that lack an axis, as `align_manual_variation` does",
+            )
+            .into())
+        );
 
-        // An unsharded base is invariant. A varying update still makes the written block vary over its mesh.
+        // An unsharded base also requires an explicit variation transition.
         let plain = Array::vector(vec![10i32, 20, 30]).unwrap();
-        let expected = Array::from_elements(
-            ArrayType::new_static(DataType::I32, [3]).with_sharding(varying).unwrap(),
-            &[10i32, 40, 30],
-        )
-        .unwrap();
-        assert_eq!(plain.update_slice(&update, &[1]), Ok(expected));
+        assert_eq!(
+            plain.update_slice(&update, &[1]),
+            Err(TypeError::invalid(
+                "`update_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                 that lack an axis, as `align_manual_variation` does",
+            )
+            .into())
+        );
     }
 
     #[test]
@@ -6131,6 +6137,33 @@ mod tests {
                 in (%3)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_slice_manual_variation_alignment() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input = ArrayType::new_static(DataType::F32, [4]);
+        let indices = ArrayType::scalar(DataType::I32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let operation = DynamicSliceOperation::new(vec![1]);
+        assert_eq!(
+            operation.infer_output_types(&[input.clone(), indices.clone()], &[]),
+            Err(TypeError::invalid(
+                "`dynamic_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                 that lack an axis, as `align_manual_variation` does",
+            )),
+        );
+        let (_, program) = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
+            |(input, indices)| input.dynamic_slice(&[indices], &[1]),
+            (input, indices),
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["broadcast", "parallel_vary", "dynamic_slice"],
         );
     }
 
@@ -7482,7 +7515,10 @@ mod tests {
             .with_sharding(Sharding::replicated(manual_mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
         assert_eq!(
-            ArrayType::new_static(DataType::F32, [4]).dynamic_slice(std::slice::from_ref(&varying_index), &[2]),
+            ArrayType::new_static(DataType::F32, [4])
+                .with_sharding(Sharding::replicated(manual_mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+                .unwrap()
+                .dynamic_slice(std::slice::from_ref(&varying_index), &[2]),
             Ok(ArrayType::new_static(DataType::F32, [2])
                 .with_sharding(Sharding::replicated(manual_mesh, 1).with_varying_manual_axes(["x"]).unwrap())
                 .unwrap()),
@@ -7535,6 +7571,11 @@ mod tests {
                 .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_varying_manual_axes(["m"]).unwrap())
                 .unwrap(),
             &[1i32],
+        )
+        .unwrap();
+        let input = Array::from_elements(
+            input.r#type().clone().into_owned().with_sharding(varying.clone()).unwrap(),
+            &input.elements::<i32>().unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -8829,14 +8870,23 @@ mod tests {
 
         // Applying output sharding metadata preserves the non-dense layout and the untouched input values.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let input_type =
-            ArrayType::new_static(DataType::I32, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-4])));
+        let input_type = ArrayType::new_static(DataType::I32, [3])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![-4])))
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
         let update_type = ArrayType::new_static(DataType::I32, [1])
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
             .unwrap();
         let input = Array::from_elements(input_type.clone(), &[1_i32, 2, 3]).unwrap();
         let update = Array::from_elements(update_type, &[9_i32]).unwrap();
-        let output = input.dynamic_update_slice(&update, &[Array::scalar(1_i32).unwrap()]).unwrap();
+        let index = Array::from_elements(
+            ArrayType::scalar(DataType::I32)
+                .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
+                .unwrap(),
+            &[1_i32],
+        )
+        .unwrap();
+        let output = input.dynamic_update_slice(&update, &[index]).unwrap();
         let expected_type = input_type
             .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
             .unwrap();
@@ -9056,7 +9106,7 @@ mod tests {
         .unwrap();
         let input_type = ArrayType::new_static(DataType::F64, [2, 4]).with_sharding(manual_sharding.clone()).unwrap();
         let update_type = ArrayType::new_static(DataType::F64, [2])
-            .with_sharding(Sharding::replicated(manual_mesh, 1))
+            .with_sharding(Sharding::replicated(manual_mesh.clone(), 1))
             .unwrap();
         let input = ArrayBatch::new(
             Array::from_elements::<f64>(input_type, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap(),
@@ -9064,6 +9114,15 @@ mod tests {
         )
         .unwrap();
         let update = ArrayBatch::replicated(Array::from_elements::<f64>(update_type, &[9.0, 9.0]).unwrap());
+        let start = ArrayBatch::replicated(
+            Array::from_elements(
+                ArrayType::scalar(DataType::I32)
+                    .with_sharding(Sharding::replicated(manual_mesh, 0).with_varying_manual_axes(["x"]).unwrap())
+                    .unwrap(),
+                &[1_i32],
+            )
+            .unwrap(),
+        );
         let outputs = DynamicUpdateSliceOperation::new()
             .batch(&context, &EmptyRegionDriver, &[input, update, start])
             .unwrap()
@@ -9496,8 +9555,9 @@ mod tests {
         let varying_index = ArrayType::scalar(DataType::I32)
             .with_sharding(Sharding::replicated(manual_mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
-        let vector = ArrayType::new_static(DataType::F32, [4]);
-        let update = ArrayType::new_static(DataType::F32, [2]);
+        let varying = Sharding::replicated(manual_mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
+        let vector = ArrayType::new_static(DataType::F32, [4]).with_sharding(varying.clone()).unwrap();
+        let update = ArrayType::new_static(DataType::F32, [2]).with_sharding(varying).unwrap();
         assert_eq!(
             vector.dynamic_update_slice(&update, std::slice::from_ref(&varying_index)),
             Ok(vector
@@ -9565,12 +9625,14 @@ mod tests {
             &[40i32],
         )
         .unwrap();
-        let expected = Array::from_elements(
-            ArrayType::new_static(DataType::I32, [3]).with_sharding(varying.clone()).unwrap(),
-            &[10i32, 40, 30],
-        )
-        .unwrap();
-        assert_eq!(input.dynamic_update_slice(&update, &[Array::scalar(1i32).unwrap()]), Ok(expected));
+        assert_eq!(
+            input.dynamic_update_slice(&update, &[Array::scalar(1i32).unwrap()]),
+            Err(TypeError::invalid(
+                "`dynamic_update_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the \
+                 inputs that lack an axis, as `align_manual_variation` does",
+            )
+            .into())
+        );
 
         // A discrete start can vary over a manual axis even when both array inputs are invariant.
         let index = Array::from_elements(
@@ -9581,23 +9643,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            input
-                .dynamic_update_slice(&Array::vector(vec![40i32]).unwrap(), &[index])
-                .unwrap()
-                .r#type()
-                .sharding(),
-            Some(&varying),
+            input.dynamic_update_slice(&Array::vector(vec![40i32]).unwrap(), &[index]),
+            Err(TypeError::invalid(
+                "`dynamic_update_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the \
+                 inputs that lack an axis, as `align_manual_variation` does",
+            )
+            .into()),
         );
-
-        // An unsharded base is invariant. A varying update still makes the written block vary over its mesh.
-        let plain = Array::vector(vec![10i32, 20, 30]).unwrap();
-        let expected = Array::from_elements(
-            ArrayType::new_static(DataType::I32, [3]).with_sharding(varying).unwrap(),
-            &[10i32, 40, 30],
-        )
-        .unwrap();
-        assert_eq!(plain.dynamic_update_slice(&update, &[Array::scalar(1i32).unwrap()]), Ok(expected));
     }
+
     #[test]
     fn test_array_ir_value_dynamic_update_slice() {
         let input = ArrayIrValue::Array(Array::vector(vec![10i32, 20, 30]).unwrap());
@@ -9891,8 +9945,7 @@ mod tests {
             .unwrap();
         let other_index = index.clone().with_sharding(Sharding::replicated(other_mesh, 0)).unwrap();
 
-        // Unsharded and replicated indices leave an unsharded output untouched; only variation over manual axes places
-        // it, as a replicated sharding on the indices' mesh carrying that variation.
+        // Invariant indices preserve the output; unequal variation requires forward input alignment.
         assert_eq!(
             infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output.clone(), &[index]),
             Ok(output.clone()),
@@ -9901,13 +9954,16 @@ mod tests {
             infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output.clone(), &[replicated_index.clone()]),
             Ok(output.clone()),
         );
-        let acquired = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
         assert_eq!(
             infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output.clone(), &[varying_index.clone()]),
-            Ok(output.clone().with_sharding(acquired).unwrap()),
+            Err(TypeError::invalid(
+                "`dynamic_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                 that lack an axis, as `align_manual_variation` does",
+            )
+            .into()),
         );
 
-        // A sharded output keeps its placement and reduction state and unions in the indices' variation.
+        // A sharded output preserves its placement and reduction state.
         let unreduced = Sharding::replicated(mesh, 1).with_unreduced_axes(["m"]).unwrap();
         let sharded_output = output.clone().with_sharding(unreduced.clone()).unwrap();
         assert_eq!(
@@ -9924,7 +9980,11 @@ mod tests {
                 sharded_output.clone(),
                 &[varying_index.clone()]
             ),
-            Ok(output.clone().with_sharding(unreduced.with_varying_manual_axes(["x"]).unwrap()).unwrap()),
+            Err(TypeError::invalid(
+                "`dynamic_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                 that lack an axis, as `align_manual_variation` does",
+            )
+            .into()),
         );
 
         // Every sharded index must use one mesh, shared with a sharded output, independent of index order and of
@@ -9972,8 +10032,7 @@ mod tests {
         let input = ArrayType::new_static(DataType::F32, [4, 4]);
         let update = ArrayType::new_static(DataType::F32, [2, 4]);
 
-        // Unsharded inputs stay unsharded unless the update varies over manual axes, in which case the output acquires
-        // a replicated placement on the update's mesh carrying that variation. Reduction state must agree first.
+        // Unsharded inputs stay unsharded. Reduction state and manual variation must agree.
         assert_eq!(infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &input, &update), Ok(None));
         let replicated_update = update.clone().with_sharding(Sharding::replicated(mesh.clone(), 2)).unwrap();
         assert_eq!(
@@ -9984,7 +10043,10 @@ mod tests {
         let varying_update = update.clone().with_sharding(varying.clone()).unwrap();
         assert_eq!(
             infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &input, &varying_update),
-            Ok(Some(varying.clone())),
+            Err(TypeError::invalid(
+                "`update_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                 that lack an axis, as `align_manual_variation` does",
+            )),
         );
         let unreduced_input = input
             .clone()
@@ -9997,8 +10059,7 @@ mod tests {
             ))),
         );
 
-        // A sharded input keeps its sharding for an unsharded update and for an update whose manual-axis variation it
-        // already covers; new variation is unioned in. Meshes must agree and explicit placements must not conflict.
+        // A sharded input keeps its sharding when manual variation agrees. Meshes and explicit placements must agree.
         let sharded =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                 .unwrap();
@@ -10020,7 +10081,10 @@ mod tests {
         );
         assert_eq!(
             infer_update_slice_output_sharding(UPDATE_SLICE_OPERATION_NAME, &sharded_input, &sharded_varying_update),
-            Ok(Some(sharded_varying)),
+            Err(TypeError::invalid(
+                "`update_slice` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                 that lack an axis, as `align_manual_variation` does",
+            )),
         );
         let other_update = update.clone().with_sharding(Sharding::replicated(other_mesh, 2)).unwrap();
         assert_eq!(
@@ -10106,6 +10170,44 @@ mod tests {
         .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::vector(vec![7.0]).unwrap());
+
+        // A manual mapped placement belongs to the enclosing boundary. Local slicing preserves per-device
+        // variation without creating a manual reshard of the concatenated accumulator.
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let manual_sharding = Sharding::replicated(manual_mesh, 2).with_varying_manual_axes(["m"]).unwrap();
+        let manual_input = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [2, 3]).with_sharding(manual_sharding.clone()).unwrap(),
+            &[1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+        .unwrap();
+        let manual_context =
+            BatchingContext::new(EagerContext::<Array>::new(), 2).with_axis_sharding(ShardingDimension::sharded(["m"]));
+        let manual_outputs = batch_by_item_expansion(
+            &manual_context,
+            &SliceOperation::new(vec![0], vec![2]),
+            &[ArrayBatch::new(manual_input, BatchAxis::new(0)).unwrap()],
+            2,
+        )
+        .unwrap();
+        assert_eq!(manual_outputs[0].value().to_f64s(), vec![1.0, 2.0, 4.0, 5.0]);
+        assert_eq!(manual_outputs[0].r#type().sharding(), Some(&manual_sharding));
+
+        let empty_manual_input = Array::from_elements::<f64>(
+            ArrayType::new_static(DataType::F64, [0, 3]).with_sharding(manual_sharding.clone()).unwrap(),
+            &[],
+        )
+        .unwrap();
+        let empty_manual_context =
+            BatchingContext::new(EagerContext::<Array>::new(), 0).with_axis_sharding(ShardingDimension::sharded(["m"]));
+        let empty_manual_outputs = batch_by_item_expansion(
+            &empty_manual_context,
+            &SliceOperation::new(vec![0], vec![2]),
+            &[ArrayBatch::new(empty_manual_input, BatchAxis::new(0)).unwrap()],
+            0,
+        )
+        .unwrap();
+        assert_eq!(empty_manual_outputs[0].r#type().static_shape(), Some(StaticShape::new(vec![0, 2])));
+        assert_eq!(empty_manual_outputs[0].r#type().sharding(), Some(&manual_sharding));
 
         // Explicitly sharded mapped inputs are replicated once before item extraction and the completed accumulator is
         // resharded once to the context's mapped placement.
