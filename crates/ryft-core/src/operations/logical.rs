@@ -149,8 +149,6 @@ impl std::ops::Not for Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`AndOperation`].
 pub const AND_OPERATION_NAME: &str = "and";
 
@@ -197,6 +195,7 @@ impl_capability_for_primitive!(@binary And, and, &, u128);
 impl_capability_for_primitive!(@binary And, and, &, usize);
 
 impl And for Array {
+    #[inline]
     fn and(&self, rhs: &Self) -> Result<Self, ProgramError> {
         self.binary_logical(rhs, AND_OPERATION_NAME, |left, right| left & right)
     }
@@ -205,6 +204,7 @@ impl And for Array {
 impl std::ops::BitAnd for Array {
     type Output = Self;
 
+    #[inline]
     fn bitand(self, rhs: Self) -> Self::Output {
         And::and(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
     }
@@ -256,6 +256,7 @@ impl_capability_for_primitive!(@binary Or, or, |, u128);
 impl_capability_for_primitive!(@binary Or, or, |, usize);
 
 impl Or for Array {
+    #[inline]
     fn or(&self, rhs: &Self) -> Result<Self, ProgramError> {
         self.binary_logical(rhs, OR_OPERATION_NAME, |left, right| left | right)
     }
@@ -264,6 +265,7 @@ impl Or for Array {
 impl std::ops::BitOr for Array {
     type Output = Self;
 
+    #[inline]
     fn bitor(self, rhs: Self) -> Self::Output {
         Or::or(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
     }
@@ -316,6 +318,7 @@ impl_capability_for_primitive!(@binary Xor, xor, ^, u128);
 impl_capability_for_primitive!(@binary Xor, xor, ^, usize);
 
 impl Xor for Array {
+    #[inline]
     fn xor(&self, rhs: &Self) -> Result<Self, ProgramError> {
         self.binary_logical(rhs, XOR_OPERATION_NAME, |left, right| left ^ right)
     }
@@ -324,6 +327,7 @@ impl Xor for Array {
 impl std::ops::BitXor for Array {
     type Output = Self;
 
+    #[inline]
     fn bitxor(self, rhs: Self) -> Self::Output {
         Xor::xor(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
     }
@@ -512,14 +516,14 @@ mod tests {
     fn test_not_for_primitives() {
         // The operator is logical for `bool` and bitwise for integer primitives.
         assert_eq!(Not::not(&true), Ok(false));
-        assert_eq!(Not::not(&0b1100_u8), Ok(0b1111_0011));
+        assert_eq!(Not::not(&0b1100u8), Ok(0b1111_0011));
     }
 
     #[test]
     fn test_not_for_array() {
         let left = Array::vector(vec![true, true, false, false]).unwrap();
         assert_eq!(left.not().unwrap(), Array::vector(vec![false, false, true, true]).unwrap());
-        assert_eq!(Array::vector(vec![0x00ff_i16, -1]).unwrap().not().unwrap().elements::<i16>(), Ok(vec![-256, 0]));
+        assert_eq!(Array::vector(vec![0x00ffi16, -1]).unwrap().not().unwrap().elements::<i16>(), Ok(vec![-256, 0]));
 
         // Sub-byte negation complements only the declared low bits, retaining a valid sign-extended encoding.
         let signed_sub_byte = Array::vector(vec![i2::MIN, i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::MAX]).unwrap();
@@ -660,7 +664,7 @@ mod tests {
     fn test_and_for_primitives() {
         // The operator is logical for `bool` and bitwise for integer primitives.
         assert_eq!(And::and(&true, &false), Ok(false));
-        assert_eq!(And::and(&0b1100_u8, &0b1010), Ok(0b1000));
+        assert_eq!(And::and(&0b1100u8, &0b1010), Ok(0b1000));
     }
 
     #[test]
@@ -669,7 +673,7 @@ mod tests {
         let left = Array::vector(vec![true, true, false, false]).unwrap();
         let right = Array::vector(vec![true, false, true, false]).unwrap();
         assert_eq!(left.and(&right), Array::vector(vec![true, false, false, false]));
-        assert_eq!(Array::scalar(0b1100_u8).unwrap().and(&Array::scalar(0b1010_u8).unwrap()), Array::scalar(0b1000_u8));
+        assert_eq!(Array::scalar(0b1100u8).unwrap().and(&Array::scalar(0b1010u8).unwrap()), Array::scalar(0b1000u8));
 
         // The `std::ops` sugar delegates to the fallible capability.
         assert_eq!(left.clone() & right.clone(), left.and(&right).unwrap());
@@ -779,7 +783,7 @@ mod tests {
     fn test_or_for_primitives() {
         // The operator is logical for `bool` and bitwise for integer primitives.
         assert_eq!(Or::or(&true, &false), Ok(true));
-        assert_eq!(Or::or(&0b1100_u8, &0b1010), Ok(0b1110));
+        assert_eq!(Or::or(&0b1100u8, &0b1010), Ok(0b1110));
     }
 
     #[test]
@@ -788,7 +792,7 @@ mod tests {
         let left = Array::vector(vec![true, true, false, false]).unwrap();
         let right = Array::vector(vec![true, false, true, false]).unwrap();
         assert_eq!(left.or(&right), Array::vector(vec![true, true, true, false]));
-        assert_eq!(Array::scalar(0b1100_u8).unwrap().or(&Array::scalar(0b1010_u8).unwrap()), Array::scalar(0b1110_u8));
+        assert_eq!(Array::scalar(0b1100u8).unwrap().or(&Array::scalar(0b1010u8).unwrap()), Array::scalar(0b1110u8));
 
         // The `std::ops` sugar delegates to the fallible capability.
         assert_eq!(left.clone() | right.clone(), left.or(&right).unwrap());
@@ -870,7 +874,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &Array::scalar(true).unwrap());
         assert!(
-            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
+            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero)),
         );
     }
 
@@ -898,7 +902,7 @@ mod tests {
     fn test_xor_for_primitives() {
         // The operator is logical for `bool` and bitwise for integer primitives.
         assert_eq!(Xor::xor(&true, &false), Ok(true));
-        assert_eq!(Xor::xor(&0b1100_u8, &0b1010), Ok(0b0110));
+        assert_eq!(Xor::xor(&0b1100u8, &0b1010), Ok(0b0110));
     }
 
     #[test]
@@ -907,7 +911,7 @@ mod tests {
         let left = Array::vector(vec![true, true, false, false]).unwrap();
         let right = Array::vector(vec![true, false, true, false]).unwrap();
         assert_eq!(left.xor(&right), Array::vector(vec![false, true, true, false]));
-        assert_eq!(Array::scalar(0b1100_u8).unwrap().xor(&Array::scalar(0b1010_u8).unwrap()), Array::scalar(0b0110_u8));
+        assert_eq!(Array::scalar(0b1100u8).unwrap().xor(&Array::scalar(0b1010u8).unwrap()), Array::scalar(0b0110u8));
 
         // The `std::ops` sugar delegates to the fallible capability.
         assert_eq!(left.clone() ^ right.clone(), left.xor(&right).unwrap());
@@ -950,7 +954,7 @@ mod tests {
         // Operands must share a Boolean or integer element type.
         for (left, right, data_types) in [
             (Array::scalar(1.0).unwrap(), Array::scalar(0.0).unwrap(), "`f64` and `f64`"),
-            (Array::scalar(true).unwrap(), Array::scalar(1_u8).unwrap(), "`bool` and `u8`"),
+            (Array::scalar(true).unwrap(), Array::scalar(1u8).unwrap(), "`bool` and `u8`"),
         ] {
             assert!(matches!(
                 left.binary_logical(&right, "xor", xor),
