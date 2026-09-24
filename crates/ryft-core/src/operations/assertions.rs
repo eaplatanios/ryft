@@ -1107,15 +1107,28 @@ impl<
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Represents concrete values that can be inspected to check assertions and render their observations.
-/// Implementations preserve unsigned integer ranges when rendering scalar observations and provide an array view
-/// for elementwise checks. [`check_assertion`](Self::check_assertion) supplies the shared concrete execution used by
-/// [`Assert`], without binding an [`AssertOperation`].
+/// Represents concrete values that can be inspected to check assertions and render their observations. Implementations
+/// preserve unsigned integer ranges when rendering scalar observations and provide an array view for elementwise
+/// checks. [`check_assertion`](Self::check_assertion) supplies the shared concrete execution used by [`Assert`],
+/// without binding an [`AssertOperation`].
 pub trait AssertionValue: Value + Concretizable<bool> {
-    /// Renders the concrete scalar observation, rejecting unsupported representations.
+    /// Returns this scalar value rendered as text for an assertion failure diagnostic, without its observation label or
+    /// type (e.g., `"42"` or `"false"`). Integer values retain their exact value, including unsigned integer ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if the value is not scalar, its representation is unsupported, or its concrete
+    /// value is unavailable (e.g., a captured value that cannot be inspected before execution).
     fn assertion_observation(&self) -> Result<String, ProgramError>;
 
-    /// Materializes an array for logical element inspection, or returns `None` for a non-array scalar value.
+    /// Returns this value as a concrete [`Array`] so assertion checks can inspect its logical elements. Array values,
+    /// including rank-zero arrays, return [`Some`]. Non-array scalar values such as dimensions return [`None`] and can
+    /// be rendered directly through [`assertion_observation`](Self::assertion_observation).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if the representation is unsupported or the array cannot be inspected.
+    /// An unavailable array is an error, not [`None`], which is reserved for non-array scalar observations.
     fn assertion_array(&self) -> Result<Option<Array>, ProgramError>;
 
     /// Validates and checks this concrete Boolean condition without binding an operation. Scalar assertions report
@@ -1125,9 +1138,9 @@ pub trait AssertionValue: Value + Concretizable<bool> {
     /// # Parameters
     ///
     ///   - `message`: Literal description of the requirement, included in the failure diagnostic.
-    ///   - `observations`: Label-value pairs to report on failure. Scalars are reused for each failing element;
-    ///     array observations must have the condition's shape and require a failure limit.
-    ///   - `failure_limit`: Maximum number of failing elements to report, or `None` to require a scalar condition
+    ///   - `observations`: Label-value pairs to report on failure. Scalars are reused for each failing element.
+    ///     Array observations must have the condition's shape and require a failure limit.
+    ///   - `failure_limit`: Maximum number of failing elements to report, or [`None`] to require a scalar condition
     ///     and scalar observations. Limits diagnostic output, not the amount of data inspected.
     ///
     /// # Errors
