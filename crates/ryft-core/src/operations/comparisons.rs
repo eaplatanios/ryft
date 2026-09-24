@@ -326,13 +326,11 @@ impl ComparisonTypeSemantics for ArrayIrType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the ability to compare two values and produce Boolean data. Array inputs are broadcast to a common
-/// shape and their element types are promoted before comparison. The output has that shape and
-/// [`DataType::Boolean`] elements. Equality and inequality support complex elements; ordered comparisons reject
-/// them. A comparison involving a floating-point NaN is false except for inequality. Empty eager arrays perform no
-/// element comparisons and return an empty Boolean array, including for payload-free element types.
+/// shape and their element types are promoted before comparison. The output has that shape and [`DataType::Boolean`]
+/// elements. Equality and inequality support complex elements while ordered comparisons reject them. A comparison
+/// involving a floating-point NaN value is false except for inequality. Empty eager arrays perform no element
+/// comparisons and return an empty Boolean array, including for payload-free element types.
 ///
 /// Concrete arrays compare immediately. Context-carrying values apply [`CompareOperation`] through their context,
 /// aligning manual variation first. First-class dimensions produce rank-zero Boolean arrays, and predicates proved
@@ -361,43 +359,37 @@ pub trait Compare<Output = Self>: Sized {
     ///   - `direction`: Predicate to apply to each pair of elements or to the two dimension extents.
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Output, ProgramError>;
 
-    /// Returns the Boolean output of `self == other`, with the broadcasting and type rules of
-    /// [`compare`](Self::compare).
+    /// Returns the Boolean output of `self == other`, with the broadcasting and type rules of [`Self::compare`].
     #[inline]
     fn equal(&self, other: &Self) -> Result<Output, ProgramError> {
         self.compare(other, ComparisonDirection::Equal)
     }
 
-    /// Returns the Boolean output of `self != other`, with the broadcasting and type rules of
-    /// [`compare`](Self::compare).
+    /// Returns the Boolean output of `self != other`, with the broadcasting and type rules of [`Self::compare`].
     #[inline]
     fn not_equal(&self, other: &Self) -> Result<Output, ProgramError> {
         self.compare(other, ComparisonDirection::NotEqual)
     }
 
-    /// Returns the Boolean output of `self < other`, with the broadcasting and type rules of
-    /// [`compare`](Self::compare).
+    /// Returns the Boolean output of `self < other`, with the broadcasting and type rules of [`Self::compare`].
     #[inline]
     fn less_than(&self, other: &Self) -> Result<Output, ProgramError> {
         self.compare(other, ComparisonDirection::LessThan)
     }
 
-    /// Returns the Boolean output of `self <= other`, with the broadcasting and type rules of
-    /// [`compare`](Self::compare).
+    /// Returns the Boolean output of `self <= other`, with the broadcasting and type rules of [`Self::compare`].
     #[inline]
     fn less_than_or_equal(&self, other: &Self) -> Result<Output, ProgramError> {
         self.compare(other, ComparisonDirection::LessThanOrEqual)
     }
 
-    /// Returns the Boolean output of `self > other`, with the broadcasting and type rules of
-    /// [`compare`](Self::compare).
+    /// Returns the Boolean output of `self > other`, with the broadcasting and type rules of [`Self::compare`].
     #[inline]
     fn greater_than(&self, other: &Self) -> Result<Output, ProgramError> {
         self.compare(other, ComparisonDirection::GreaterThan)
     }
 
-    /// Returns the Boolean output of `self >= other`, with the broadcasting and type rules of
-    /// [`compare`](Self::compare).
+    /// Returns the Boolean output of `self >= other`, with the broadcasting and type rules of [`Self::compare`].
     #[inline]
     fn greater_than_or_equal(&self, other: &Self) -> Result<Output, ProgramError> {
         self.compare(other, ComparisonDirection::GreaterThanOrEqual)
@@ -406,9 +398,9 @@ pub trait Compare<Output = Self>: Sized {
 
 impl Compare for Array {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
-        // Broadcast the input types together (including element-type promotion) so mixed-precision comparisons
-        // mirror the `CompareOperation` type-inference contract, then compare the promoted elements pairwise. The
-        // output type is the Boolean-typed counterpart of the broadcast type.
+        // Broadcast the input types together (including element-type promotion) so that mixed-precision comparisons
+        // mirror the `CompareOperation` type-inference contract, and then compare the promoted elements pairwise.
+        // The output type is the Boolean-typed counterpart of the broadcast type.
         ArrayType::check_matching_manual_variation(
             COMPARE_OPERATION_NAME,
             &[self.r#type().as_ref(), other.r#type().as_ref()],
@@ -416,23 +408,22 @@ impl Compare for Array {
         let (broadcast_type, inputs) = Self::broadcast_promoted(&[self, other])?;
         let data_type = broadcast_type.data_type();
         let output_type = broadcast_type.with_element_type(DataType::Boolean);
+
         // Empty comparisons inspect no elements, so they succeed vacuously even for payload-free data types.
         if Self::element_count(&output_type) == 0 {
             let addressing = ArrayAddressing::new(output_type.clone())?;
             return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
-        if data_type == DataType::Token {
-            return Err(TypeError::invalid("cannot compare `token` scalars").into());
-        }
-        if data_type == DataType::Zero {
-            return Err(TypeError::invalid("cannot compare scalars of data types `zero` and `zero`").into());
+
+        if data_type == DataType::Token || data_type == DataType::Zero {
+            return Err(TypeError::invalid(format!("cannot compare `{data_type}` scalars")).into());
         }
 
         // `broadcast_promoted` converts only mismatched inputs, so equal-typed inputs retain their exact physical
         // storage and are decoded one addressed element at a time by the shared binary loop.
         let [left, right] = <[_; 2]>::try_from(inputs).unwrap();
         if data_type.is_complex() {
-            // The unordered complex element types define only the equality comparison directions. The compare
+            // The unordered complex element types define only the equality comparison directions. The comparison
             // operation's type inference already rejects ordered complex comparisons, but the direct `Array`
             // comparison API reaches this kernel without it.
             if !matches!(direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual) {
@@ -441,6 +432,7 @@ impl Compare for Array {
                 ))
                 .into());
             }
+
             let equal = matches!(direction, ComparisonDirection::Equal);
             return dispatch_on_array_element_type!(@complex data_type, |Element| {
                 left.map_element_pairs::<Element, bool>(&right, output_type, |left, right| {
@@ -448,9 +440,10 @@ impl Compare for Array {
                 })
             });
         }
+
         dispatch_on_array_element_type!(@ordered data_type, |Element| {
             left.map_element_pairs::<Element, bool>(&right, output_type, |left, right| {
-                // An unordered pair (a comparison involving a floating-point NaN) satisfies only `NotEqual`.
+                // An unordered pair (e.g., a comparison involving a floating-point NaN) satisfies only `NotEqual`.
                 let ordering = left.partial_cmp(&right);
                 Ok(match direction {
                     ComparisonDirection::Equal => ordering == Some(Ordering::Equal),
@@ -467,6 +460,35 @@ impl Compare for Array {
     }
 }
 
+impl Compare<Array> for DimensionValue {
+    #[inline]
+    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Array, ProgramError> {
+        Array::scalar(match direction {
+            ComparisonDirection::Equal => self.extent() == other.extent(),
+            ComparisonDirection::NotEqual => self.extent() != other.extent(),
+            ComparisonDirection::LessThan => self.extent() < other.extent(),
+            ComparisonDirection::LessThanOrEqual => self.extent() <= other.extent(),
+            ComparisonDirection::GreaterThan => self.extent() > other.extent(),
+            ComparisonDirection::GreaterThanOrEqual => self.extent() >= other.extent(),
+        })
+    }
+}
+
+impl<A: Value<Type = ArrayType> + TryFrom<bool, Error = ProgramError>> Compare<ArrayIrValue<A>> for DimensionValue {
+    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<ArrayIrValue<A>, ProgramError> {
+        let output = prove_dimension_comparison(
+            self.r#type().as_ref(),
+            other.r#type().as_ref(),
+            [Some(self.extent()), Some(other.extent())],
+            direction,
+        )?;
+
+        // Both extents are known, so the comparison always resolves to a Boolean and so the `.unwrap()` is safe.
+        let output = output.unwrap();
+        Ok(ArrayIrValue::Array(A::try_from(output)?))
+    }
+}
+
 impl<A: Value<Type = ArrayType>> Compare for ArrayIrValue<A>
 where
     DimensionValue: Compare<A>,
@@ -478,23 +500,16 @@ where
     }
 }
 
-impl<T: Type, V: Value<Type = T> + ManualVariationAlignment<T>> Compare<V> for V
-where
-    V::DispatchDomain: Context<Operation: From<CompareOperation<T>>>,
-{
-    #[inline]
-    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
-        let inputs = [self.clone(), other.clone()];
-        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
-        Ok(self.dispatch_domain().bind(CompareOperation::new(direction), Vec::new(), &inputs)?.remove(0))
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> Compare<V> for ProjectedValue<DimensionType, V>
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<CompareOperation<V::Type>>,
-    <V::DispatchDomain as Domain>::Constant: TryFrom<bool, Error = ProgramError>,
+impl<
+    V: Value<
+            Type = ArrayIrType,
+            DispatchDomain: Context<
+                Type = ArrayIrType,
+                Constant: TryFrom<bool, Error = ProgramError>,
+                Operation: From<CompareOperation<V::Type>>,
+            >,
+        >,
+> Compare<V> for ProjectedValue<DimensionType, V>
 {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<V, ProgramError> {
         if let Some(output) =
@@ -510,32 +525,20 @@ where
     }
 }
 
-impl Compare<Array> for DimensionValue {
-    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Array, ProgramError> {
-        let output = match direction {
-            ComparisonDirection::Equal => self.extent() == other.extent(),
-            ComparisonDirection::NotEqual => self.extent() != other.extent(),
-            ComparisonDirection::LessThan => self.extent() < other.extent(),
-            ComparisonDirection::LessThanOrEqual => self.extent() <= other.extent(),
-            ComparisonDirection::GreaterThan => self.extent() > other.extent(),
-            ComparisonDirection::GreaterThanOrEqual => self.extent() >= other.extent(),
-        };
-        Array::scalar(output)
+impl<
+    T: Type,
+    V: Value<Type = T, DispatchDomain: Context<Operation: From<CompareOperation<T>>>> + ManualVariationAlignment<T>,
+> Compare<V> for V
+{
+    #[inline]
+    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
+        let inputs = [self.clone(), other.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
+        Ok(self.dispatch_domain().bind(CompareOperation::new(direction), Vec::new(), &inputs)?.remove(0))
     }
 }
 
-impl<A: Value<Type = ArrayType> + TryFrom<bool, Error = ProgramError>> Compare<ArrayIrValue<A>> for DimensionValue {
-    fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<ArrayIrValue<A>, ProgramError> {
-        let output = prove_dimension_comparison(
-            self.r#type().as_ref(),
-            other.r#type().as_ref(),
-            [Some(self.extent()), Some(other.extent())],
-            direction,
-        )?
-        .unwrap();
-        Ok(ArrayIrValue::Array(A::try_from(output)?))
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns a predicate proved by dimension identities and representable extent intervals, or `None` when it depends
 /// on runtime extents. An entry in `exact` narrows that input to a known extent; conflicting exact extents take
