@@ -1526,7 +1526,7 @@ mod tests {
         assert!(parent.builder().borrow().instructions().is_empty());
         assert_eq!(evaluation.program().instructions().len(), 1);
         assert_eq!(evaluation.program().input_count(), 1);
-        let error = evaluation.program().interpret(vec![Array::scalar(7_i32).unwrap()]).unwrap_err();
+        let error = evaluation.program().interpret(vec![Array::scalar(7i32).unwrap()]).unwrap_err();
         assert_eq!(
             error.downcast_custom::<AssertionError>(),
             Some(&AssertionError::Failed {
@@ -1762,7 +1762,7 @@ mod tests {
         // Mapped conditions select the first failure and its matching observation.
         let output: Result<(), BatchingError> = batch(
             |(condition, observation)| condition.assert("positive", &[("value", observation)]),
-            (Array::vector(vec![true, false, false]).unwrap(), Array::vector(vec![10_i32, 20, 30]).unwrap()),
+            (Array::vector(vec![true, false, false]).unwrap(), Array::vector(vec![10i32, 20, 30]).unwrap()),
             (BatchAxis::new(0), BatchAxis::new(0)),
             (),
             None,
@@ -1823,7 +1823,7 @@ mod tests {
             },
             (
                 Array::matrix(2, 3, vec![true, true, true, true, false, false]).unwrap(),
-                Array::matrix(2, 3, vec![10_i32, 20, 30, 40, 50, 60]).unwrap(),
+                Array::matrix(2, 3, vec![10i32, 20, 30, 40, 50, 60]).unwrap(),
             ),
             (BatchAxis::new(1), BatchAxis::new(1)),
             (),
@@ -1875,7 +1875,7 @@ mod tests {
             program.interpret((
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 0).unwrap()),
                 ArrayIrValue::Array(Array::vector(Vec::<bool>::new()).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![10_i32; 0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![10i32; 0]).unwrap()),
             )),
             Ok(()),
         );
@@ -1883,7 +1883,7 @@ mod tests {
             program.interpret((
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 1).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![true]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![10_i32; 1]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![10i32; 1]).unwrap()),
             )),
             Ok(()),
         );
@@ -1891,7 +1891,7 @@ mod tests {
             program.interpret((
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 4).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![true, true, true, true]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![10_i32; 4]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![10i32; 4]).unwrap()),
             )),
             Ok(()),
         );
@@ -1901,7 +1901,7 @@ mod tests {
             .interpret((
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type.clone(), 3).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![true, false, false]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![10i32, 20, 30]).unwrap()),
             ))
             .unwrap_err();
         assert_eq!(
@@ -1915,7 +1915,7 @@ mod tests {
             .interpret((
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type, 1).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![false]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![30_i32]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![30i32]).unwrap()),
             ))
             .unwrap_err();
         assert_eq!(
@@ -1972,7 +1972,7 @@ mod tests {
             .interpret((
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
                 ArrayIrValue::Array(Array::matrix(2, 3, vec![true, true, true, true, false, false]).unwrap()),
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![10_i32, 20, 30, 40, 50, 60]).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![10i32, 20, 30, 40, 50, 60]).unwrap()),
             ))
             .unwrap_err();
         assert_eq!(
@@ -2135,7 +2135,7 @@ mod tests {
             |(condition, observation)| {
                 condition.assert_with_limit("valid", &[("value", observation)], NonZeroUsize::new(2).unwrap())
             },
-            (Array::vector(vec![true, false, false]).unwrap(), Array::vector(vec![10_i32, 20, 30]).unwrap()),
+            (Array::vector(vec![true, false, false]).unwrap(), Array::vector(vec![10i32, 20, 30]).unwrap()),
             (BatchAxis::new(0), BatchAxis::new(0)),
             (),
             None,
@@ -2158,7 +2158,7 @@ mod tests {
             |(condition, observation)| {
                 condition.assert_with_limit("replicated", &[("value", observation)], NonZeroUsize::MIN)
             },
-            (Array::scalar(false).unwrap(), Array::vector(vec![10_i32, 20]).unwrap()),
+            (Array::scalar(false).unwrap(), Array::vector(vec![10i32, 20]).unwrap()),
             (BatchAxis::replicated(), BatchAxis::new(0)),
             (),
             None,
@@ -2206,7 +2206,7 @@ mod tests {
             },
             (
                 Array::matrix(2, 2, vec![true, false, false, false]).unwrap(),
-                Array::matrix(2, 2, vec![10_i32, 20, 30, 40]).unwrap(),
+                Array::matrix(2, 2, vec![10i32, 20, 30, 40]).unwrap(),
             ),
             (BatchAxis::new(1), BatchAxis::new(1)),
             (),
@@ -2265,7 +2265,7 @@ mod tests {
             .interpret((
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type, 4).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![true, false, false, false]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30, 40]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![10i32, 20, 30, 40]).unwrap()),
             ))
             .unwrap_err();
         assert_eq!(
@@ -2402,7 +2402,7 @@ mod tests {
         let condition = context.lift(Array::scalar(true).unwrap()).unwrap();
 
         // Validate observations before omitting a known success in either capability function.
-        let invalid = context.lift(Array::vector(vec![1_i32]).unwrap()).unwrap();
+        let invalid = context.lift(Array::vector(vec![1i32]).unwrap()).unwrap();
         assert_eq!(
             condition.assert("invalid observation", &[("value", invalid.clone())]),
             Err(TypeError::invalid("assertion observation `value` has unsupported type `i32[1]`").into()),
@@ -2451,7 +2451,7 @@ mod tests {
     fn test_assert_with_limit() {
         let error = Array::vector(vec![true, false])
             .unwrap()
-            .assert_with_limit("valid", &[("value", Array::vector(vec![10_i32, 20]).unwrap())], NonZeroUsize::MIN)
+            .assert_with_limit("valid", &[("value", Array::vector(vec![10i32, 20]).unwrap())], NonZeroUsize::MIN)
             .unwrap_err();
         assert_eq!(
             error.downcast_custom::<AssertionError>(),
@@ -2477,23 +2477,23 @@ mod tests {
         // Floating-point observations use the logical scalar value, including low-precision representations.
         assert_eq!(Array::scalar(bf16::from_f32(1.5)).unwrap().assertion_observation(), Ok("1.5".to_owned()));
         assert_eq!(Array::scalar(f16::from_f32(-2.5)).unwrap().assertion_observation(), Ok("-2.5".to_owned()));
-        assert_eq!(Array::scalar(3.25_f32).unwrap().assertion_observation(), Ok("3.25".to_owned()));
-        assert_eq!(Array::scalar(-4.75_f64).unwrap().assertion_observation(), Ok("-4.75".to_owned()));
+        assert_eq!(Array::scalar(3.25f32).unwrap().assertion_observation(), Ok("3.25".to_owned()));
+        assert_eq!(Array::scalar(-4.75f64).unwrap().assertion_observation(), Ok("-4.75".to_owned()));
 
         // Composite values preserve array formatting and render dimensions as scalar extents.
-        let array = ArrayIrValue::Array(Array::scalar(12_i32).unwrap());
+        let array = ArrayIrValue::Array(Array::scalar(12i32).unwrap());
         assert_eq!(array.assertion_observation(), Ok("12".to_owned()));
         let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(7).unwrap());
         assert_eq!(dimension.assertion_observation(), Ok("7".to_owned()));
 
         // Unsupported representations and unavailable captures have distinct concretization diagnostics.
         assert!(matches!(
-            Array::scalar(Complex::new(1.0_f32, 2.0)).unwrap().assertion_observation(),
+            Array::scalar(Complex::new(1.0f32, 2.0)).unwrap().assertion_observation(),
             Err(ProgramError::Concretization { message })
                 if message == "unsupported assertion observation type `c64[]`",
         ));
         assert!(matches!(
-            Array::vector(vec![1_i32]).unwrap().assertion_observation(),
+            Array::vector(vec![1i32]).unwrap().assertion_observation(),
             Err(ProgramError::Concretization { message })
                 if message == "cannot extract a concrete integer from `i32[1]`; expected a scalar integer",
         ));
@@ -2503,7 +2503,7 @@ mod tests {
             Err(ProgramError::Concretization { message })
                 if message == "cannot inspect a captured assertion observation before execution",
         ));
-        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1_i32).unwrap()));
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1i32).unwrap()));
         assert_eq!(
             reference.assertion_observation(),
             Err(ProgramError::Concretization { message: "assertion observations cannot be references".to_owned() }),
@@ -2516,7 +2516,7 @@ mod tests {
         let scalar = Array::scalar(true).unwrap();
         assert_eq!(scalar.assertion_array(), Ok(Some(scalar.clone())));
         assert_eq!(ArrayIrValue::Array(scalar.clone()).assertion_array(), Ok(Some(scalar)));
-        let array = Array::matrix(1, 2, vec![1_i32, 2]).unwrap();
+        let array = Array::matrix(1, 2, vec![1i32, 2]).unwrap();
         assert_eq!(array.assertion_array(), Ok(Some(array.clone())));
         assert_eq!(ArrayIrValue::Array(array.clone()).assertion_array(), Ok(Some(array)));
 
@@ -2529,7 +2529,7 @@ mod tests {
             Err(ProgramError::Concretization { message })
                 if message == "cannot inspect a captured assertion array before execution",
         ));
-        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1_i32).unwrap()));
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1i32).unwrap()));
         assert_eq!(
             reference.assertion_array(),
             Err(ProgramError::Concretization { message: "assertion observations cannot be references".to_owned() }),
@@ -2539,7 +2539,7 @@ mod tests {
     #[test]
     fn test_assertion_value_check_assertion() {
         // Scalar failures retain observation labels and values, while scalar successes have no diagnostic output.
-        let observations = [("value", Array::scalar(7_i32).unwrap())];
+        let observations = [("value", Array::scalar(7i32).unwrap())];
         assert_eq!(Array::scalar(true).unwrap().check_assertion("valid", &observations, None), Ok(()));
         let error = Array::scalar(false).unwrap().check_assertion("valid", &observations, None).unwrap_err();
         assert_eq!(
@@ -2554,7 +2554,7 @@ mod tests {
         assert_eq!(
             Array::scalar(true).unwrap().check_assertion(
                 "invalid",
-                &[("value", Array::vector(vec![1_i32]).unwrap())],
+                &[("value", Array::vector(vec![1i32]).unwrap())],
                 None,
             ),
             Err(TypeError::invalid("assertion observation `value` has unsupported type `i32[1]`").into()),
@@ -2562,7 +2562,7 @@ mod tests {
         assert_eq!(
             Array::vector(Vec::<bool>::new()).unwrap().check_assertion(
                 "invalid",
-                &[("value", Array::vector(vec![1_i32]).unwrap())],
+                &[("value", Array::vector(vec![1i32]).unwrap())],
                 Some(NonZeroUsize::MIN),
             ),
             Err(TypeError::invalid("assertion observation `value` has unsupported type `i32[1]`").into()),
@@ -2599,8 +2599,8 @@ mod tests {
             .check_assertion(
                 "elements",
                 &[
-                    ("value", ArrayIrValue::Array(Array::matrix(2, 2, vec![10_i32, 20, 30, 40]).unwrap())),
-                    ("scalar", ArrayIrValue::Array(Array::scalar(7_i32).unwrap())),
+                    ("value", ArrayIrValue::Array(Array::matrix(2, 2, vec![10i32, 20, 30, 40]).unwrap())),
+                    ("scalar", ArrayIrValue::Array(Array::scalar(7i32).unwrap())),
                     ("extent", ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap())),
                 ],
                 NonZeroUsize::new(2),
