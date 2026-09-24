@@ -298,6 +298,7 @@ mod tests {
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
@@ -904,7 +905,14 @@ mod tests {
         let (_, program) = TestContext::trace_with_named_axes(
             |input| input.all_gather_tiled("devices", 0),
             ArrayIrType::Array(input_type),
-            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2 })],
+            vec![(
+                "devices".to_string(),
+                NamedAxis::Mesh {
+                    mesh: LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    axis: 0,
+                    size: 2,
+                },
+            )],
         )
         .unwrap();
 
@@ -951,7 +959,14 @@ mod tests {
         let (_, program) = TestContext::trace_with_named_axes(
             |input| input.parallel_sum_scatter("devices", 0),
             ArrayIrType::Array(input_type),
-            vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2 })],
+            vec![(
+                "devices".to_string(),
+                NamedAxis::Mesh {
+                    mesh: LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    axis: 0,
+                    size: 2,
+                },
+            )],
         )
         .unwrap();
 

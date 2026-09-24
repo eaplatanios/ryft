@@ -136,6 +136,7 @@ impl Operation for ScaledDotOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         let (lhs, rhs, lhs_scale, rhs_scale) = self.inputs(input_types)?;
+        ArrayType::check_matching_manual_variation(self.name(), &input_types.iter().collect::<Vec<_>>())?;
         let rank = lhs.rank();
         if rank != rhs.rank()
             || lhs_scale.is_some_and(|scale| scale.rank() != rank)
@@ -375,7 +376,7 @@ impl ScaledDot for Array {
 // context. The `From<ScaledDotOperation>` bound makes this disjoint from the eager reference value types (whose
 // context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
 // transform tracers and backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType>> ScaledDot for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> ScaledDot for V
 where
     V::DispatchDomain: Context<Operation: From<ScaledDotOperation>>,
 {
@@ -395,6 +396,7 @@ where
         let mut inputs = vec![self.clone(), rhs.clone()];
         inputs.extend(lhs_scale.cloned());
         inputs.extend(rhs_scale.cloned());
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let mut outputs = self.dispatch_domain().bind(
             ScaledDotOperation::new(dimensions, preferred_element_type, lhs_scale.is_some(), rhs_scale.is_some()),
             Vec::new(),
@@ -564,7 +566,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionVariable, Shape,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::{EagerContext, StagingContext};
@@ -669,6 +671,31 @@ mod tests {
             Err(TypeError::invalid(
                 "`scaled_dot` left contracting axis 2 to scale ratio must be at least 2 but got 1".to_string(),
             )),
+        );
+    }
+
+    #[test]
+    fn test_scaled_dot_type_inference_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 2).with_varying_manual_axes(["x"]).unwrap();
+        let left = ArrayType::new_static(DataType::F32, [2, 4]);
+        let right = ArrayType::new_static(DataType::F32, [4, 2]);
+        let scale = ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding.clone()).unwrap();
+        let operation = ScaledDotOperation::new(DotDimensionNumbers::matmul(), DataType::F32, true, false);
+        assert_eq!(
+            operation.infer_output_types(&[left.clone(), right.clone(), scale.clone()], &[]),
+            Err(TypeError::invalid(
+                "`scaled_dot` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that \
+                 lack an axis, as `align_manual_variation` does"
+            )),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[
+                left.with_sharding(sharding.clone()).unwrap(),
+                right.with_sharding(sharding.clone()).unwrap(),
+                scale,
+            ], &[]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap()]),
         );
     }
 

@@ -470,6 +470,13 @@ macro_rules! impl_array_elementwise_operation {
                 );
                 $($crate::macros::check_types!(@$check, operation, [lhs_type.as_ref(), rhs_type.as_ref()]);)*
 
+                // Eager inputs have no enclosing binder to insert variation transitions. Treat unsharded inputs
+                // as invariant and validate before broadcasting can absorb their missing metadata.
+                $crate::arrays::ArrayType::check_matching_manual_variation(
+                    operation,
+                    &[lhs_type.as_ref(), rhs_type.as_ref()],
+                )?;
+
                 // Infer the common element type and broadcast result metadata without materializing broadcasts.
                 let output_type = lhs_type.as_ref().broadcast(rhs_type.as_ref())
                     .map_err(|error| $crate::programs::TypeError::invalid(error.to_string()))?;

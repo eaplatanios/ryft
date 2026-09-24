@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn test_trace_reshape_and_reshard_render_stablehlo_and_shardy() {
-        let mesh = manual_mesh(4);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 

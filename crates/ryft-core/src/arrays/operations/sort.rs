@@ -10,10 +10,10 @@ use crate::arrays::elements::{ArrayElement, i1, i2, i4, u1, u2, u4};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::operations::sort::{
-    ArgMax, ArgMin, SORT_OPERATION_NAME, Sort, SortDirection, TopK, extremal_index_from_index_passenger,
+    ArgMax, ArgMin, SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, TopK, extremal_index_from_index_passenger,
     sort_permutation, top_k_from_index_passenger, top_k_via_squeezed_view,
 };
-use crate::programs::{ProgramError, TypeError, Typed};
+use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
 
@@ -99,6 +99,9 @@ impl Sort for Array {
                 .into());
             }
         }
+        SortOperation::new(axis, direction)
+            .with_key_count(key_count)?
+            .infer_output_types(&operands.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
         let key_ranks = operands[..key_count]
             .iter()
             .map(|key| {
@@ -148,9 +151,10 @@ fn eager_index_passenger(value: &Array, axis: usize) -> Result<(Array, Vec<usize
     }
     let inner_stride: usize = dimensions[axis + 1..].iter().product();
     let axis_size = dimensions[axis];
-    let indices = Array::from_fn_elements(ArrayType::new(DataType::I32, value.r#type().shape().clone()), |index| {
-        Ok(((index / inner_stride) % axis_size) as i32)
-    })?;
+    let index_type = ArrayType::new(DataType::I32, value.r#type().shape().clone())
+        .with_sharding(value.r#type().sharding().cloned())
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let indices = Array::from_fn_elements(index_type, |index| Ok(((index / inner_stride) % axis_size) as i32))?;
     Ok((indices, dimensions))
 }
 
@@ -182,6 +186,8 @@ impl ArgMin for Array {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::sharding::shardings::Sharding;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
 
@@ -209,5 +215,45 @@ mod tests {
             Array::from_elements(key_type, &[i4::new(3).unwrap(), i4::new(-2).unwrap(), i4::new(1).unwrap()]).unwrap();
         let output = Array::sort_with_key_count(&[key], 0, SortDirection::Ascending, 1).unwrap().remove(0);
         assert_eq!(output.elements::<i4>(), Ok(vec![i4::new(-2).unwrap(), i4::new(1).unwrap(), i4::new(3).unwrap()]),);
+    }
+
+    #[test]
+    fn test_array_sort_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant = Array::vector(vec![1_i32, 2]).unwrap();
+        let varying_type = invariant
+            .r#type()
+            .into_owned()
+            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let varying = Array::from_elements(varying_type.clone(), &[2_i32, 1]).unwrap();
+        assert_eq!(
+            Array::sort(&[varying.clone(), invariant], 0, SortDirection::Ascending),
+            Err(TypeError::invalid(
+                "`sort` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack \
+                 an axis, as `align_manual_variation` does"
+            )
+            .into()),
+        );
+        assert_eq!(
+            varying.argmax(0),
+            Array::from_elements(
+                ArrayType::scalar(DataType::I32)
+                    .with_sharding(
+                        Sharding::replicated(varying_type.sharding().unwrap().mesh().clone(), 0)
+                            .with_varying_manual_axes(["m"])
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                &[0_i32],
+            ),
+        );
+        assert_eq!(
+            Array::sort(&[varying.clone(), varying], 0, SortDirection::Ascending),
+            Ok(vec![
+                Array::from_elements(varying_type.clone(), &[1_i32, 2]).unwrap(),
+                Array::from_elements(varying_type, &[1_i32, 2]).unwrap(),
+            ]),
+        );
     }
 }

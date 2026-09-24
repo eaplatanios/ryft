@@ -12,6 +12,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::impl_differentiable_operation;
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::iota::IotaOperation;
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::reshaping::Reshape;
@@ -57,6 +58,9 @@ pub const SORT_OPERATION_NAME: &str = "sort";
 /// [StableHLO's `TOTALORDER` comparison](https://openxla.org/stablehlo/spec#compare); complex keys are unordered
 /// and rejected. Operands must agree on shape (element types may differ), the sorted axis must not be sharded
 /// (sorting across shards would require communication), and operands that still carry partial sums are rejected.
+/// Inputs must have matching manual variation; [`Sort`] inserts the required transitions before binding. Reduced
+/// keys are unsupported because their zero-filled replicas can select different permutations. Reduced passengers
+/// retain their reduction state because permutations preserve their zero-filled replicas.
 ///
 /// There is no user-provided comparator: the fixed lexicographic key-ordering policy covers the ranking use cases
 /// ([`top_k`](TopK::top_k), [`argmax`](ArgMax::argmax), [`argmin`](ArgMin::argmin)) and multi-key sorts without
@@ -141,6 +145,11 @@ impl Operation for SortOperation {
             )));
         }
         for input_type in &input_types[..self.key_count] {
+            // A reduced key can select a different permutation on its zero-filled replicas, so invariant
+            // passengers would need additional variation tracking. Reduced passengers remain valid.
+            if !input_type.reduced_axes().is_empty() {
+                return Err(TypeError::invalid("`sort` does not support reduced keys"));
+            }
             let data_type = input_type.data_type();
             if data_type.is_token() || data_type.is_zero() || data_type.is_complex() {
                 return Err(TypeError::invalid(format!(
@@ -177,6 +186,7 @@ impl Operation for SortOperation {
                 }
             }
         }
+        ArrayType::check_matching_manual_variation(SORT_OPERATION_NAME, &input_types.iter().collect::<Vec<_>>())?;
         Ok(input_types.to_vec())
     }
 
@@ -292,7 +302,11 @@ impl_differentiable_operation! {
                 }
             }
             if shared && live_indices.is_empty() {
-                outputs = context.primal().bind(*operation, Vec::new(), &inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>())?;
+                outputs = context.primal().bind(
+                    *operation,
+                    Vec::new(),
+                    &inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>(),
+                )?;
             }
             outputs
                 .into_iter()
@@ -335,7 +349,7 @@ pub trait Sort: Sized {
 /// `From<SortOperation>` bound makes this disjoint from the eager reference value types (whose context operation is
 /// [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the transform tracers and
 /// backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType>> Sort for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Sort for V
 where
     V::DispatchDomain: Context<Operation: From<SortOperation>>,
 {
@@ -351,7 +365,8 @@ where
             });
         };
         let operation = SortOperation::new(axis, direction).with_key_count(key_count)?;
-        first.dispatch_domain().bind(operation, Vec::new(), operands)
+        let inputs = ManualVariationAlignment::align_manual_variation(operands)?;
+        first.dispatch_domain().bind(operation, Vec::new(), &inputs)
     }
 }
 
@@ -566,7 +581,12 @@ where
     let mut iota_type = ArrayType::new(DataType::I32, Shape::new(value_type.shape().dimensions().to_vec()));
     if let Some(sharding) = value_type.sharding() {
         iota_type = iota_type
-            .with_sharding(sharding.clone())
+            .with_sharding(
+                sharding
+                    .clone()
+                    .with_varying_manual_axes(Vec::<String>::new())
+                    .map_err(|error| TypeError::invalid(error.to_string()))?,
+            )
             .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?;
     }
     let indices = value.dispatch_domain().bind(IotaOperation::new(iota_type, axis)?, Vec::new(), &[])?.remove(0);
@@ -655,6 +675,46 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_sort_manual_variation() {
+        use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+        use crate::axes::NamedAxis;
+        use crate::tracing::DomainTracingContext;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant = vector_type(4).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
+        let varying = vector_type(4)
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let operation = SortOperation::new(0, SortDirection::Ascending);
+        assert!(matches!(
+            operation.infer_output_types(&[varying.clone(), invariant.clone()], &[]),
+            Err(TypeError::Invalid { message, .. }) if message == "`sort` inputs must have matching varying manual \
+                                                                   axes; insert `parallel_vary` on the inputs that \
+                                                                   lack an axis, as `align_manual_variation` does",
+        ));
+        let (outputs, program) =
+            DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
+                |inputs| Sort::sort(&inputs, 0, SortDirection::Ascending),
+                vec![varying.clone(), invariant],
+                vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            )
+            .unwrap();
+        assert_eq!(outputs, vec![varying.clone(), varying]);
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["parallel_vary", "sort"]
+        );
+
+        let key = vector_type(4).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
+        let reduced = vector_type(4)
+            .with_sharding(Sharding::replicated(mesh, 1).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(operation.infer_output_types(&[key.clone(), reduced.clone()], &[]), Ok(vec![key, reduced.clone()]));
+        assert!(matches!(operation.infer_output_types(&[reduced], &[]),
+            Err(TypeError::Invalid { message, .. }) if message == "`sort` does not support reduced keys"));
     }
 
     #[test]

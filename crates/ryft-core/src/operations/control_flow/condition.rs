@@ -157,7 +157,7 @@ where
         check_count!("input", input_types, true_interface.input_types().len() + 1, TypeError);
         if !input_types[0].is_condition_predicate() {
             return Err(TypeError::invalid(format!(
-                "{} predicate type must be a scalar boolean, but got {}",
+                "{} predicate type must be a scalar boolean invariant over manual axes, but got {}",
                 CONDITION_OPERATION_NAME, input_types[0],
             )));
         }
@@ -851,7 +851,8 @@ where
 //
 /// Type-family predicate semantics for [`ConditionOperation`].
 ///
-/// Conditions always branch on ordinary Boolean data. [`ArrayType`] accepts rank-zero Boolean predicates, while a
+/// Conditions require the predicate to be invariant over manual mesh axes, so all participants take the same branch.
+/// [`ArrayType`] accepts rank-zero Boolean predicates without varying manual axes, while a
 /// composite [`ArrayIrType`] accepts only its rank-zero Boolean array member. A first-class dimension describes an
 /// array extent rather than Boolean data, even though its runtime representation is scalar, and a reference is a
 /// mutable state handle rather than a predicate value.
@@ -863,7 +864,9 @@ pub trait ConditionTypeSemantics: Type {
 impl ConditionTypeSemantics for ArrayType {
     #[inline]
     fn is_condition_predicate(&self) -> bool {
-        self.is_scalar() && self.data_type().is_boolean()
+        self.is_scalar()
+            && self.data_type().is_boolean()
+            && self.sharding().is_none_or(|sharding| sharding.varying_manual_axes().is_empty())
     }
 }
 
@@ -1933,9 +1936,22 @@ mod tests {
                 ],
             ),
             Err(TypeError::invalid(
-                "condition predicate type must be a scalar boolean, but got dimension<extent ∈ [1, 8)>".to_string(),
+                "condition predicate type must be a scalar boolean invariant over manual axes, but got dimension<extent ∈ [1, 8)>".to_string(),
             )),
         );
+    }
+
+    #[test]
+    fn test_condition_type_semantics_manual_predicate() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant =
+            ArrayType::scalar(DataType::Boolean).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying = ArrayType::scalar(DataType::Boolean)
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap())
+            .unwrap();
+        assert!(invariant.is_condition_predicate());
+        assert!(!varying.is_condition_predicate());
+        assert!(!ArrayIrType::Array(varying).is_condition_predicate());
     }
 
     #[test]
@@ -1975,14 +1991,20 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[operand_type.clone(), operand_type.clone()], interfaces.as_slice()),
-            Err(TypeError::invalid("condition predicate type must be a scalar boolean, but got f64[]".to_string())),
+            Err(TypeError::invalid(
+                "condition predicate type must be a scalar boolean invariant over manual axes, but got f64[]"
+                    .to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(
                 &[ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])), operand_type.clone()],
                 interfaces.as_slice(),
             ),
-            Err(TypeError::invalid("condition predicate type must be a scalar boolean, but got bool[2]".to_string())),
+            Err(TypeError::invalid(
+                "condition predicate type must be a scalar boolean invariant over manual axes, but got bool[2]"
+                    .to_string()
+            )),
         );
         assert_eq!(
             operation.infer_output_types(

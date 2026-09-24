@@ -1859,10 +1859,10 @@ mod tests {
         CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
         DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
         DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
-        LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder,
-        ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceCompletion, ReferenceCompletionBackend, ReferenceDynamicIndexOperation, ReferenceError,
-        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation,
+        Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceDynamicIndexOperation,
+        ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin,
         StopGradient, StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection,
         WhileOperation, ZeroLike, differentiate_at,
@@ -2038,13 +2038,18 @@ mod tests {
             vec![reference_sharding.clone(), sharded.clone()],
             vec![sharded.clone()],
             vec!["x".to_string()],
-            true,
         );
         let mut body = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let reference =
             body.add_input(ReferenceType::new(shard_map.local_input_type(0, &reference_type).unwrap()).into());
         let value = body.add_input(shard_map.local_input_type(1, &value_type).unwrap().into());
         let state = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let state = if replicated_reference {
+            body.add_instruction(ParallelVaryOperation::new("x".to_string()), Vec::new(), vec![state], None)
+                .unwrap()[0]
+        } else {
+            state
+        };
         let output = body.add_instruction(MulOperation::new(), Vec::new(), vec![state, value], None).unwrap()[0];
         let body = body
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -2057,7 +2062,6 @@ mod tests {
             vec![reference_sharding, sharded.clone()],
             vec![sharded],
             vec!["x".to_string()],
-            true,
         )
         .unwrap();
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
@@ -3362,11 +3366,10 @@ mod tests {
         let operation = ShardMapOperation::from_program(
             &body,
             vec![reference_type.clone()],
-            logical_mesh,
+            logical_mesh.clone(),
             vec![sharding.clone()],
-            vec![sharding],
+            vec![sharding.clone()],
             vec!["x".to_string()],
-            true,
         )
         .unwrap();
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
@@ -3385,7 +3388,7 @@ mod tests {
                 let outputs = pullback.interpret_in_context(&context, inputs)?;
                 Ok(vec![context.bind(ReferenceReadOperation::new(), Vec::new(), &outputs)?.remove(0)])
             },
-            vec![ArrayIrType::Array(array_type.clone()), reference_type],
+            vec![ArrayIrType::Array(array_type.clone()), reference_type.clone()],
             &domain,
             XlaOptions::new(mesh.clone()),
         )
@@ -3427,7 +3430,6 @@ mod tests {
             vec![sharded.clone(), sharded.clone()],
             vec![sharded.clone()],
             vec!["x".to_string()],
-            true,
         );
         let body = {
             let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
@@ -3525,7 +3527,6 @@ mod tests {
             vec![replicated, sharded.clone()],
             vec![sharded.clone()],
             vec!["x".to_string()],
-            true,
         );
         let body = {
             let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
@@ -3534,6 +3535,9 @@ mod tests {
             let update = builder.add_input(ArrayIrType::Array(shard_map.local_input_type(1, &global_type).unwrap()));
             let state =
                 builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            let state = builder
+                .add_instruction(ParallelVaryOperation::new("x".to_string()), Vec::new(), vec![state], None)
+                .unwrap()[0];
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![state, update], None).unwrap()[0];
             builder

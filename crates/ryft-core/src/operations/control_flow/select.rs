@@ -8,6 +8,7 @@ use crate::differentiation::{DifferentiableType, DifferentiationDual, Elementwis
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::ElementwiseOperation;
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::partial::PartiallyEvaluatableOperation;
@@ -377,16 +378,15 @@ pub trait Select: Sized {
 // selects the primals and (linearly) the tangents by the same condition. The `From<SelectOperation<V::Type>>` bound
 // makes this blanket disjoint from the concrete eager value types (whose context operation is `ConstantOperation`),
 // which implement `Select` directly.
-impl<V: Value> Select for V
+impl<T: Type, V: Value<Type = T> + ManualVariationAlignment<T>> Select for V
 where
     V::DispatchDomain: Context<Operation: From<SelectOperation<V::Type>>>,
 {
     #[inline]
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        Ok(condition
-            .dispatch_domain()
-            .bind(SelectOperation::new(), Vec::new(), &[condition.clone(), on_true.clone(), on_false.clone()])?
-            .remove(0))
+        let inputs = [condition.clone(), on_true.clone(), on_false.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
+        Ok(condition.dispatch_domain().bind(SelectOperation::new(), Vec::new(), &inputs)?.remove(0))
     }
 }
 

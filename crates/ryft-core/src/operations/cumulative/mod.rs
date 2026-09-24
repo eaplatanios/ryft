@@ -41,7 +41,9 @@ use crate::differentiation::{
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
 };
 use crate::macros::check_count;
+use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
 use crate::operations::manipulation::padding::{Pad, PadOperation};
 use crate::operations::manipulation::slicing::{Slice, SliceOperation};
@@ -362,7 +364,9 @@ where
         + From<ConcatenateOperation<ArrayType>>
         + From<PadOperation<ArrayType>>
         + From<SliceOperation>
-        + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>,
+        + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>
+        + OperationProvider<ArrayType, ParallelVaryOperation, Operation = C::Operation>
+        + OperationProvider<ArrayType, BroadcastOperation, Operation = C::Operation>,
     F: Fn(&DecompositionTracer<C>, &DecompositionTracer<C>) -> Result<DecompositionTracer<C>, ProgramError>,
 {
     let (_, decomposition) = TracingContext::<C::Constant, C::Operation>::trace::<_, ArrayType, _>(
@@ -652,7 +656,9 @@ macro_rules! define_cumulative_operation {
                 + From<$operation>
                 + From<PadOperation<ArrayType>>
                 + From<SliceOperation>
-                + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>,
+                + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>
+                + OperationProvider<ArrayType, $crate::operations::ParallelVaryOperation, Operation = C::Operation>
+                + OperationProvider<ArrayType, $crate::operations::BroadcastOperation, Operation = C::Operation>,
             C::Value: $capability,
         {
             fn jvp<D: DifferentiationDriver<C>, P: $crate::DifferentiationPolicy<C>>(

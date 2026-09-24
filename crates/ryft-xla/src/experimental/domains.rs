@@ -1005,6 +1005,12 @@ impl<'c> Domain for XlaDomain<'c> {
 
 impl ryft_core::AssertionContext for XlaDomain<'_> {}
 
+impl ryft_core::NamedAxes for XlaDomain<'_> {
+    fn named_axis(&self, _name: &str) -> Option<ryft_core::NamedAxis> {
+        None
+    }
+}
+
 impl<'c> Context for XlaDomain<'c> {
     /// Immediate dimension extents materialize directly; Boolean literals upload a replicated scalar. A
     /// [`XlaConstant::Captured`] payload is a symbolic index into a compiled function's capture table carrying only a
@@ -5098,6 +5104,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Real(_)
         | ArrayOperation::Imaginary(_)
         | ArrayOperation::ParallelReduce(_)
+        | ArrayOperation::ParallelVary(_)
         | ArrayOperation::AllGather(_)
         | ArrayOperation::ParallelSumScatter(_)
         | ArrayOperation::ParallelPermute(_)
@@ -11642,7 +11649,7 @@ mod tests {
             .unwrap();
         let manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let shard_map =
-            ShardMap::new(manual_mesh, vec![manual_sharding.clone()], vec![manual_sharding], Vec::new(), true).unwrap();
+            ShardMap::new(manual_mesh, vec![manual_sharding.clone()], vec![manual_sharding], Vec::new()).unwrap();
 
         let mut builder = XlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
@@ -14475,8 +14482,10 @@ mod tests {
         // Manual shard-map body `local -> local + local` over `f32[4]` sharded across the 2-device mesh: each device
         // doubles its own 2-element shard inside the manual region.
         let sharding = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-        let local_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let global_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding.clone()).unwrap();
+        let local_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(sharding.local_sharding(&["x".to_string()]).unwrap())
+            .unwrap();
         let body_program = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(local_type.clone().into());
@@ -14491,7 +14500,6 @@ mod tests {
                 vec![sharding.clone()],
                 vec![sharding.clone()],
                 vec!["x".to_string()],
-                true,
             ),
             vec![global_type.clone()],
             vec![local_type.clone()],
@@ -14801,7 +14809,6 @@ mod tests {
                 vec![r#type.sharding().unwrap().clone()],
                 Vec::new(),
                 vec!["x".to_string()],
-                true,
             ),
             vec![r#type.clone()],
             vec![local_type],

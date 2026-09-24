@@ -2788,6 +2788,7 @@ mod tests {
         Array, ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, Dimension,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
     };
+    use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::batch;
     use crate::captures::ClosedProgram;
     use crate::contexts::{Domain, EagerContext, StagingContext, ValueResolution};
@@ -5547,6 +5548,12 @@ mod tests {
         type Value = Array;
         type Constant = Array;
         type Operation = TestDomainOperation;
+    }
+
+    impl NamedAxes for StagedDispatchTestDomain {
+        fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
+            None
+        }
     }
 
     impl Context for StagedDispatchTestDomain {

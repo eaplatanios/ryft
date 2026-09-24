@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use crate::arrays::{ArrayType, Broadcastable};
 use crate::macros::check_count;
 use crate::programs::{Operation, TypeError};
@@ -31,7 +29,10 @@ pub mod tagging;
 pub use assertions::{
     ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionContext, AssertionError, AssertionFailure, AssertionValue,
 };
-pub use collectives::{ParallelReduce, ParallelReduceOperation, ParallelReductionKind, forward_collective_to_parent};
+pub use collectives::{
+    ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelReduce, ParallelReduceOperation,
+    ParallelReductionKind, ParallelVary, ParallelVaryOperation, forward_collective_to_parent,
+};
 pub use compare::*;
 pub use constants::*;
 pub use control_flow::*;
@@ -75,8 +76,8 @@ pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
 /// [`ElementwiseOperation`] captures the shared type inference behavior of elementwise array operations.
 /// Implementations declare their fixed input count, while the default type inference implementation checks
-/// the input count, broadcasts all input [`ArrayType`]s while tolerating [`Sharding`](crate::Sharding)s that
-/// differ only by [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes).
+/// the input count and matching manual variation, then broadcasts all input [`ArrayType`]s. Binding must
+/// insert explicit variation transitions before inference when invariant and varying values are combined.
 pub trait ElementwiseOperation: Operation<Type = ArrayType> {
     /// Returns the number of input arrays consumed by this elementwise [`Operation`].
     fn input_count(&self) -> usize;
@@ -92,44 +93,17 @@ pub trait ElementwiseOperation: Operation<Type = ArrayType> {
         Ok(vec![self.infer_elementwise_broadcast_type(input_types)?])
     }
 
-    /// Broadcasts the elementwise operands into a single output [`ArrayType`], tolerating shardings that differ only by
-    /// their [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes). Ryft keeps generic [`ArrayType`]
-    /// broadcasting conservative, and so this function retries inference after erasing only the varying-manual-axis
-    /// (VMA) metadata and then restores the union of that metadata on the result, instead of weakening generic
-    /// [`ArrayType`] broadcasting everywhere.
-    ///
-    /// This is effectively a shared helper function for the default [`infer_output_types`](Self::infer_output_types)
-    /// implementation and for operations that override that default to layer extra sharding rules on top of the
-    /// broadcasted placement (e.g., [`MulOperation`]'s bilinear reduction-state rule).
+    /// Broadcasts input geometry and placement after validating matching manual variation. Operations with specialized
+    /// reduction-state rules may normalize those states before calling this function and restore their output state.
     fn infer_elementwise_broadcast_type(&self, input_types: &[ArrayType]) -> Result<ArrayType, TypeError> {
-        match ArrayType::broadcasted(input_types) {
-            Ok(output) => Ok(output),
-            Err(_) => {
-                let original_varying_manual_axes = input_types
-                    .iter()
-                    .filter_map(|input_type| input_type.sharding.as_ref())
-                    .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
-                    .collect::<BTreeSet<_>>();
-                let mut input_types = input_types.to_vec();
-                for sharding in input_types.iter_mut().filter_map(|input_type| input_type.sharding.as_mut()) {
-                    sharding.clear_varying_manual_axes();
-                }
-                let mut output = ArrayType::broadcasted(input_types.as_slice()).map_err(|_| {
-                    TypeError::invalid(format!("`{}` input types are not broadcast-compatible", self.name()))
-                })?;
-                if let Some(sharding) = &mut output.sharding {
-                    sharding.set_varying_manual_axes(original_varying_manual_axes).map_err(TypeError::custom)?;
-                }
-                Ok(output)
-            }
-        }
+        ArrayType::check_matching_manual_variation(self.name(), &input_types.iter().collect::<Vec<_>>())?;
+        ArrayType::broadcasted(input_types)
+            .map_err(|_| TypeError::invalid(format!("`{}` input types are not broadcast-compatible", self.name())))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -250,10 +224,27 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let output = Operation::infer_output_types(&operation, &[first, second, third], &[]).unwrap();
         assert_eq!(
-            output[0].sharding().unwrap().varying_manual_axes(),
-            &BTreeSet::from(["x".to_string(), "y".to_string(), "z".to_string()]),
+            Operation::infer_output_types(&operation, &[first.clone(), second, third], &[]),
+            Err(TypeError::invalid(
+                "`elementwise_test` inputs must have matching varying manual axes; insert `parallel_vary` on the \
+                 inputs that lack an axis, as `align_manual_variation` does",
+            )),
+        );
+        assert_eq!(
+            Operation::infer_output_types(
+                &operation,
+                &[first.clone(), first.clone(), ArrayType::scalar(DataType::F32)],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`elementwise_test` inputs must have matching varying manual axes; insert `parallel_vary` on the \
+                 inputs that lack an axis, as `align_manual_variation` does",
+            )),
+        );
+        assert_eq!(
+            Operation::infer_output_types(&operation, &[first.clone(), first.clone(), first.clone()], &[]),
+            Ok(vec![first]),
         );
 
         // Dynamic dimensions flow through elementwise congruence when they match exactly, while static-vs-dynamic

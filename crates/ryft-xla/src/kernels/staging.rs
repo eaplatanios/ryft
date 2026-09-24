@@ -2062,7 +2062,6 @@ pub(crate) mod tests {
             vec![sharding.clone()],
             vec![sharding],
             vec!["device".to_owned()],
-            true,
         )
         .unwrap();
         let mut builder = XlaProgramBuilder::new();

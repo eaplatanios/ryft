@@ -31,7 +31,6 @@ fn test_shard_map_operation_from_program() {
         vec![sharding.clone()],
         vec![sharding.clone(), sharding],
         vec!["x".to_string()],
-        true,
     )
     .unwrap();
     let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();

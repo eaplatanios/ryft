@@ -3,9 +3,11 @@
 //! Eager kernels combine validated encodings byte by byte. Their shared traversal handles broadcasting and physical
 //! layouts without requiring any particular logical operation.
 
+// TODO(eaplatanios): Review this module.
+
 use std::sync::Arc;
 
-use crate::arrays::{Array, ArrayAddressing, Broadcastable};
+use crate::arrays::{Array, ArrayAddressing, ArrayType, Broadcastable};
 use crate::programs::{ProgramError, TypeError, Typed};
 
 pub mod and;
@@ -17,8 +19,6 @@ pub use and::{AND_OPERATION_NAME, And, AndOperation};
 pub use not::{NOT_OPERATION_NAME, Not, NotOperation};
 pub use or::{OR_OPERATION_NAME, Or, OrOperation};
 pub use xor::{XOR_OPERATION_NAME, Xor, XorOperation};
-
-// TODO(eaplatanios): Review this.
 
 impl Array {
     /// Applies a binary logical or bitwise operation directly to validated Boolean or integer element bytes. Since
@@ -32,6 +32,7 @@ impl Array {
     ) -> Result<Self, ProgramError> {
         let left_data_type = self.r#type().data_type();
         let right_data_type = rhs.r#type().data_type();
+        ArrayType::check_matching_manual_variation(operation, &[self.r#type().as_ref(), rhs.r#type().as_ref()])?;
         let output_type = Broadcastable::broadcast(self.r#type().as_ref(), rhs.r#type().as_ref())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
         if left_data_type != right_data_type || !(left_data_type.is_boolean() || left_data_type.is_integer()) {

@@ -13,6 +13,7 @@ use crate::macros::{
     impl_reference_dischargeable_operation,
 };
 use crate::operations::ElementwiseOperation;
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::manipulation::conversions::ElementType;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -95,11 +96,8 @@ impl<T: Type> Display for CompareOperation<T> {
     }
 }
 
-// Homogeneous comparison contract: the two operands are broadcast together and the broadcasted element type is
-// replaced by [`DataType::Boolean`]. This covers every element-bearing type universe, including [`DataType`] and
-// [`ArrayType`].
-impl<T: Broadcastable + ElementType> Operation for CompareOperation<T> {
-    type Type = T;
+impl Operation for CompareOperation<DataType> {
+    type Type = DataType;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -108,9 +106,9 @@ impl<T: Broadcastable + ElementType> Operation for CompareOperation<T> {
 
     fn infer_output_types(
         &self,
-        input_types: &[T],
-        _region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError> {
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
 
         // Complex operands are unordered, so only the equality comparison directions are defined for them.
@@ -123,7 +121,45 @@ impl<T: Broadcastable + ElementType> Operation for CompareOperation<T> {
             )));
         }
 
-        let broadcasted = T::broadcasted(input_types)
+        let broadcasted = DataType::broadcasted(input_types)
+            .map_err(|_| TypeError::invalid("comparison input types are not broadcast-compatible".to_string()))?;
+        Ok(vec![broadcasted.with_element_type(DataType::Boolean)])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, COMPARE_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("direction", self.direction))
+    }
+}
+
+// Array comparisons preserve broadcast geometry and matching manual variation while producing Boolean elements.
+impl Operation for CompareOperation<ArrayType> {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        COMPARE_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+
+        // Complex operands are unordered, so only the equality comparison directions are defined for them.
+        if !matches!(self.direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual)
+            && input_types.iter().any(|input_type| input_type.is_complex())
+        {
+            return Err(TypeError::invalid(format!(
+                "cannot apply an ordered comparison to unordered complex operands of types {} and {}",
+                input_types[0], input_types[1],
+            )));
+        }
+
+        ArrayType::check_matching_manual_variation(self.name(), &input_types.iter().collect::<Vec<_>>())?;
+        let broadcasted = ArrayType::broadcasted(input_types)
             .map_err(|_| TypeError::invalid("comparison input types are not broadcast-compatible".to_string()))?;
         Ok(vec![broadcasted.with_element_type(DataType::Boolean)])
     }
@@ -333,13 +369,15 @@ pub trait Compare<Output = Self>: Sized {
     }
 }
 
-impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation<V::Type>>>>> Compare<V> for V {
+impl<T: Type, V: Value<Type = T> + ManualVariationAlignment<T>> Compare<V> for V
+where
+    V::DispatchDomain: Context<Operation: From<CompareOperation<T>>>,
+{
     #[inline]
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(CompareOperation::new(direction), Vec::new(), &[self.clone(), rhs.clone()])?
-            .remove(0))
+        let inputs = [self.clone(), rhs.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
+        Ok(self.dispatch_domain().bind(CompareOperation::new(direction), Vec::new(), &inputs)?.remove(0))
     }
 }
 
@@ -451,7 +489,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, Layout, Memory, Shape, StridedLayout,
+        DimensionBounds, DimensionType, DimensionValue, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape,
+        Sharding, StridedLayout,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -499,6 +538,37 @@ mod tests {
         let left = ArrayIrValue::<Array>::Dimension(left);
         let right = ArrayIrValue::<Array>::Dimension(right);
         assert_eq!(left.less_than(&right), Ok(ArrayIrValue::Array(Array::scalar(true).unwrap())));
+    }
+
+    #[test]
+    fn test_compare_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant_type = ArrayType::scalar(DataType::F32);
+        let varying_type = invariant_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let operation = CompareOperation::<ArrayType>::new(ComparisonDirection::Equal);
+        let error = TypeError::invalid(
+            "`compare` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack \
+             an axis, as `align_manual_variation` does",
+        );
+        assert_eq!(
+            Operation::infer_output_types(&operation, &[invariant_type.clone(), varying_type.clone()], &[]),
+            Err(error.clone()),
+        );
+        assert_eq!(
+            Operation::infer_output_types(&operation, &[varying_type.clone(), invariant_type.clone()], &[]),
+            Err(error.clone()),
+        );
+        let invariant = Array::from_elements(invariant_type, &[1_f32]).unwrap();
+        let varying = Array::from_elements(varying_type.clone(), &[1_f32]).unwrap();
+        assert_eq!(invariant.equal(&varying), Err(error.clone().into()));
+        assert_eq!(varying.equal(&invariant), Err(error.into()));
+        assert_eq!(
+            varying.equal(&varying),
+            Array::from_elements(varying_type.with_data_type(DataType::Boolean), &[true]),
+        );
     }
 
     #[test]

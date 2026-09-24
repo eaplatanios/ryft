@@ -18,7 +18,7 @@
 //!   element along an active manual axis that the spec shards.
 //! - **Replication is read-only.** Along an active manual axis that the input spec does not shard, every device sees
 //!   the whole referent and none owns it. Reading such a replicated reference is allowed; mutating it is rejected,
-//!   because the devices' writes would have to be proven identical (the `check_vma` argument for values) and the
+//!   because the devices' writes would have to be proven identical (the variation argument for values) and the
 //!   contract does not yet define that proof for state. Relaxing this to invariant writes is a later decision.
 //! - **Ordering is per device.** Accesses through one local reference follow the body's program order, exactly as on a
 //!   single device. Accesses on different devices touch disjoint owned shards and have no defined mutual order. A
@@ -37,10 +37,10 @@
 //!   ordinary residual values between the primal and tangent maps; varying residuals gain a leading dimension sharded
 //!   across their varying manual axes, preserving distinct per-device values. Replicated residuals keep their shape.
 //! - **Replicated gradients aggregate once.** Reverse mode uses fresh local accumulators for read-only replicated
-//!   reference inputs, sums their contributions across the replicated axes, and adds the resulting value into the
-//!   caller's cotangent reference once. Existing destination contents are retained once. Replicated output seeds are
-//!   divided across their copies before this summation, so returning one replicated global value does not multiply its
-//!   derivative by the device count. Fully sharded destinations accumulate into each device's owned shard.
+//!   reference inputs and adds the resulting value into the caller's cotangent reference once. Existing destination
+//!   contents are retained once. Checked bodies own cross-device sums through variation-operation adjoints. Unchecked
+//!   bodies instead normalize replicated output seeds and sum replicated input cotangents at the boundary. Fully
+//!   sharded destinations accumulate into each device's owned shard.
 //! - **Rules may assume** that distinct reference inputs are distinct allocations (the runtime alias validator checks
 //!   this at the boundary), that each device's lifecycle over its owned shards is independent of every other device's,
 //!   and that the reference analysis of the local body accounts for every access, since the body is an ordinary local
@@ -50,14 +50,14 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 
+#[cfg(test)]
+use ryft_core::StagingContext;
 use ryft_core::{
     ArrayIrType, ArrayType, Atom, AtomId, Context, Dimension, Domain, DomainTracingContext, Instruction, LogicalMesh,
-    MeshAxisType, NamedAxis, Operation, Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder,
-    ProgramError, ProgramStatistics, ProjectedValue, ReshardOperation, Shape, Sharding, ShardingConstraintOperation,
-    ShardingDimension, ShardingError, Type, Value, ValueProjection,
+    MeshAxisType, NamedAxis, Operation, ParallelVary, Parameter, ParameterError, Parameterized, ParameterizedFamily,
+    Placeholder, ProgramError, ProgramStatistics, ProjectedValue, ReshardOperation, Shape, Sharding,
+    ShardingConstraintOperation, ShardingDimension, ShardingError, Type, Typed, Value, ValueProjection,
 };
-#[cfg(test)]
-use ryft_core::{StagingContext, Typed};
 #[cfg(test)]
 use ryft_mlir::Block;
 use ryft_mlir::Context as MlirContext;
@@ -196,7 +196,7 @@ pub enum ShardMapTraceError {
     #[error("{value_kind} type #{value_index} dimension #{dimension} must be static for traced shard_map")]
     DynamicShapeNotSupported { value_kind: &'static str, value_index: usize, dimension: usize },
 
-    /// Error returned when `check_vma=true` and one output still varies along an omitted manual axis.
+    /// Error returned when one output still varies along an omitted manual axis.
     #[error(
         "output type #{output_index} still varies along manual axis `{axis_name}`, but out_specs does not mention it"
     )]
@@ -568,7 +568,6 @@ pub trait ShardMapInvocationLeaf: Parameter + Sized {
         in_specs: Input::To<Sharding>,
         out_specs: Output::To<Sharding>,
         manual_axes: Vec<String>,
-        check_vma: bool,
     ) -> Result<Self::Return<Input, Output>, ShardMapTraceError>
     where
         Input::Family: ParameterizedFamily<ArrayType>
@@ -615,7 +614,7 @@ where
         + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
-    let (global_output_types, program) = trace_xla_function(function, &global_input_types, Vec::new())?;
+    let (global_output_types, program) = trace_xla_function(function, &global_input_types, None, Vec::new())?;
     Ok(TracedXlaProgram { global_input_types, global_output_types, program })
 }
 
@@ -678,8 +677,8 @@ where
 /// This stages a [`ReshardOperation`] per leaf, the analogue of JAX's
 /// [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html): it behaves like the identity at the
 /// value level while *replacing* each leaf's tracked [`Sharding`] with the requested one, and it differentiates as a
-/// resharding (its transpose reshards the cotangent to the input's cotangent dual). To merely steer the compiler's
-/// propagation over auto axes without tracking the result, use [`sharding_constraint`] instead.
+/// resharding (its transpose reshards the cotangent to the input's cotangent dual). To constrain the compiler's
+/// placement over auto axes without tracking the result, use [`sharding_constraint`] instead.
 ///
 /// Cross-mesh reshards are not representable inside a single staged program; for that case use the eager
 /// [`Array::to_placement`](crate::Array::to_placement) outside the trace.
@@ -700,20 +699,20 @@ where
     bind_sharding_control_per_leaf(input, shardings, ReshardOperation::new)
 }
 
-/// Records sharding-propagation hints on one traced XLA value tree over the mesh's
+/// Constrains the placement of one traced XLA value tree over the mesh's
 /// [`Auto`](ryft_core::arrays::MeshAxisType::Auto) axes.
 ///
 /// This stages a [`ShardingConstraintOperation`] per leaf,
 /// mirroring [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):
-/// it is the identity at both the value and type levels (each leaf's tracked sharding is unchanged) and only steers
-/// the backend compiler's sharding propagation over auto mesh axes at lowering time, recording a concrete Shardy
-/// `sdy.sharding_constraint` on each traced leaf. It is self-adjoint under differentiation. To perform a tracked
-/// sharding transition over explicit or manual axes instead, use [`reshard`].
+/// it is the identity at both the value and type levels (each leaf's tracked sharding is unchanged) and is enforced
+/// at lowering time, where it records a Shardy `sdy.sharding_constraint` on each traced leaf that merges the leaf's
+/// tracked placement with the requested auto-axis placement, so that the compiler must honor both. It is self-adjoint
+/// under differentiation. To perform a tracked sharding transition over explicit axes instead, use [`reshard`].
 ///
 /// # Parameters
 ///
-///   - `input`: Structured traced XLA value whose leaves will be hinted.
-///   - `shardings`: Structured sharding hints with the same leaf layout as `input`.
+///   - `input`: Structured traced XLA value whose leaves will be constrained.
+///   - `shardings`: Structured sharding constraints with the same leaf layout as `input`.
 #[allow(private_bounds, private_interfaces)]
 pub fn sharding_constraint<Input, Leaf>(
     input: Input,
@@ -775,14 +774,15 @@ where
         + ParameterizedFamily<Leaf>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
-    shard_map_with_options(function, inputs, mesh, in_specs, out_specs, vec![], true)
+    shard_map_with_options(function, inputs, mesh, in_specs, out_specs, vec![])
 }
 
-/// Stages a traced shard-map body with one explicit manual-axis subset and `check_vma` mode.
+/// Stages a traced shard-map body with one explicit manual-axis subset.
 ///
 /// `manual_axes` mirrors JAX's `axis_names`: when the list is empty, all mesh axes whose type is
-/// [`Manual`](ryft_core::arrays::MeshAxisType::Manual) are active for this shard-map. `check_vma`
-/// mirrors JAX's default output-validity check for omitted manual axes.
+/// [`Manual`](ryft_core::arrays::MeshAxisType::Manual) are active for this shard-map. Manual variation is always
+/// tracked, as under JAX's default `check_vma=True`: an output that still varies along an active manual axis omitted
+/// from its output spec is rejected.
 ///
 /// # Parameters
 ///
@@ -793,8 +793,6 @@ where
 ///   - `out_specs`: Structured shardings for the global outputs.
 ///   - `manual_axes`: Active manual mesh axes for this shard-map. An empty list means "all manual
 ///     mesh axes".
-///   - `check_vma`: Whether to reject outputs that still vary along active manual axes omitted from
-///     `out_specs`.
 #[allow(private_bounds, private_interfaces)]
 pub fn shard_map_with_options<
     F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,
@@ -808,7 +806,6 @@ pub fn shard_map_with_options<
     in_specs: Input::To<Sharding>,
     out_specs: Output::To<Sharding>,
     manual_axes: Vec<String>,
-    check_vma: bool,
 ) -> Result<<Leaf as ShardMapInvocationLeaf>::Return<Input, Output>, ShardMapTraceError>
 where
     Input::Family: ParameterizedFamily<ArrayType>
@@ -824,7 +821,7 @@ where
         + ParameterizedFamily<Leaf>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
-    Leaf::invoke(function, inputs, mesh, in_specs, out_specs, manual_axes, check_vma)
+    Leaf::invoke(function, inputs, mesh, in_specs, out_specs, manual_axes)
 }
 
 /// Traced shard-map program backed by a staged `tracing_v2` program.
@@ -882,8 +879,8 @@ where
 
 /// Metadata describing one manual SPMD computation over a mesh.
 ///
-/// A `ShardMap` stores the mesh plus the validated per-input and per-output shardings, the active
-/// manual-axis subset, and whether JAX-style `check_vma` validation is enabled.
+/// A `ShardMap` stores the mesh plus the validated per-input and per-output shardings and the active
+/// manual-axis subset. Manual variation is always tracked, as under JAX's default `check_vma=True`.
 ///
 /// The public constructors accept [`Sharding`] values and project them into
 /// traced/type-level semantics, so `Auto` mesh axes remain hidden while `Manual` axes still
@@ -908,13 +905,10 @@ pub(crate) struct ShardMap {
 
     /// Active manual mesh axes for this shard-map invocation.
     manual_axes: Vec<String>,
-
-    /// Whether to enforce JAX-style omitted-manual-axis output validation.
-    check_vma: bool,
 }
 
 impl ShardMap {
-    /// Creates a `ShardMap` with one explicit manual-axis selection and `check_vma` mode.
+    /// Creates a `ShardMap` with one explicit manual-axis selection.
     ///
     /// When `manual_axes` is empty, every mesh axis with type
     /// [`Manual`](ryft_core::arrays::MeshAxisType::Manual) is treated as manual inside the body.
@@ -928,19 +922,16 @@ impl ShardMap {
     ///   - `out_specs`: Per-output shardings for the global outputs.
     ///   - `manual_axes`: Active manual mesh axes for this shard-map. An empty list means "all
     ///     manual mesh axes".
-    ///   - `check_vma`: Whether to reject outputs that still vary along active manual axes omitted
-    ///     from `out_specs`.
     pub(crate) fn new(
         mesh: LogicalMesh,
         in_specs: Vec<Sharding>,
         out_specs: Vec<Sharding>,
         manual_axes: Vec<String>,
-        check_vma: bool,
     ) -> Result<Self, ShardMapError> {
         let manual_axes = normalize_manual_axes(&mesh, manual_axes)?;
         let in_shardings = build_shardings(&mesh, manual_axes.as_slice(), in_specs, "input")?;
         let out_shardings = build_shardings(&mesh, manual_axes.as_slice(), out_specs, "output")?;
-        Ok(Self { mesh, in_shardings, out_shardings, manual_axes, check_vma })
+        Ok(Self { mesh, in_shardings, out_shardings, manual_axes })
     }
 
     /// Builds a shard map directly from already-validated shardings.
@@ -949,9 +940,8 @@ impl ShardMap {
         in_shardings: Vec<Sharding>,
         out_shardings: Vec<Sharding>,
         manual_axes: Vec<String>,
-        check_vma: bool,
     ) -> Self {
-        Self { mesh, in_shardings, out_shardings, manual_axes, check_vma }
+        Self { mesh, in_shardings, out_shardings, manual_axes }
     }
 
     /// Returns the logical mesh of this manual computation.
@@ -978,10 +968,6 @@ impl ShardMap {
         self.manual_axes.iter().map(String::as_str).collect()
     }
 
-    pub(crate) fn check_vma(&self) -> bool {
-        self.check_vma
-    }
-
     /// Returns the local body shape for input `input_index`.
     ///
     /// The returned shape is the tensor shape seen inside the manual computation body for the
@@ -1003,8 +989,8 @@ impl ShardMap {
     }
 
     /// Returns the local body type of input `input_index` for the provided global input type: the shard of the global
-    /// array that the input sharding assigns to the executing device, carrying the input sharding with the manual axes
-    /// it shards over (and any the global type already varies along) marked as varying.
+    /// array that the input sharding assigns to the executing device. Bound manual dimension placements become
+    /// variation facts; remaining placements and reduction state are preserved, including outer manual-axis facts.
     ///
     /// # Parameters
     ///
@@ -1017,9 +1003,11 @@ impl ShardMap {
     ) -> Result<ArrayType, ShardMapTraceError> {
         let global_shape = static_dimensions(global_input_type, "input", input_index)?;
         let local_shape = self.local_input_shape(input_index, &global_shape)?;
-        let local_sharding = &self.in_shardings[input_index];
+        let boundary_sharding = &self.in_shardings[input_index];
+        let manual_axes = self.manual_axis_names();
+        let local_sharding = boundary_sharding.local_sharding(self.manual_axes())?;
         let local_varying_axes = varying_axes(global_input_type.sharding())
-            .union(&spec_varying_axes(local_sharding, &self.manual_axis_names()))
+            .union(&spec_varying_axes(boundary_sharding, &manual_axes))
             .cloned()
             .collect();
         Ok(ArrayType::new(
@@ -1027,7 +1015,8 @@ impl ShardMap {
             Shape::new(local_shape.into_iter().map(Dimension::Static).collect()),
         )
         .with_layout(global_input_type.layout().cloned())
-        .with_sharding(sharding_with_varying_manual_axes(local_sharding, local_varying_axes)?)?)
+        .with_memory(global_input_type.memory())
+        .with_sharding(sharding_with_varying_manual_axes(&local_sharding, local_varying_axes)?)?)
     }
 
     /// Returns the active manual axes along which input `input_index` is replicated, in mesh order: the manual axes
@@ -1035,12 +1024,6 @@ impl ShardMap {
     /// reference input and none owns it, so a reference input replicated along some manual axis is read-only.
     pub(crate) fn input_replicated_manual_axes(&self, input_index: usize) -> Vec<String> {
         let varying_axes = spec_varying_axes(&self.in_shardings[input_index], &self.manual_axis_names());
-        self.manual_axes.iter().filter(|axis| !varying_axes.contains(axis.as_str())).cloned().collect()
-    }
-
-    /// Returns the active manual axes along which output `output_index` is replicated, in mesh order.
-    pub(crate) fn output_replicated_manual_axes(&self, output_index: usize) -> Vec<String> {
-        let varying_axes = spec_varying_axes(&self.out_shardings[output_index], &self.manual_axis_names());
         self.manual_axes.iter().filter(|axis| !varying_axes.contains(axis.as_str())).cloned().collect()
     }
 
@@ -1096,20 +1079,32 @@ impl ShardMap {
         )
     }
 
-    /// Builds the typed Shardy `in_shardings` attribute used by `sdy.manual_computation`.
+    /// Builds the typed Shardy `in_shardings` attribute, excluding axes already bound by enclosing manual regions.
     pub(crate) fn to_shardy_in_shardings<'c, 't>(
         &self,
+        enclosing_manual_axes: &[String],
         context: &'c MlirContext<'t>,
     ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
-        shardy_tensor_sharding_per_value(self.in_shardings.as_slice(), self.manual_axes(), context)
+        shardy_tensor_sharding_per_value(
+            self.in_shardings.as_slice(),
+            self.manual_axes(),
+            enclosing_manual_axes,
+            context,
+        )
     }
 
-    /// Builds the typed Shardy `out_shardings` attribute used by `sdy.manual_computation`.
+    /// Builds the typed Shardy `out_shardings` attribute, excluding axes already bound by enclosing manual regions.
     pub(crate) fn to_shardy_out_shardings<'c, 't>(
         &self,
+        enclosing_manual_axes: &[String],
         context: &'c MlirContext<'t>,
     ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
-        shardy_tensor_sharding_per_value(self.out_shardings.as_slice(), self.manual_axes(), context)
+        shardy_tensor_sharding_per_value(
+            self.out_shardings.as_slice(),
+            self.manual_axes(),
+            enclosing_manual_axes,
+            context,
+        )
     }
 
     /// Builds the typed Shardy `manual_axes` attribute used by `sdy.manual_computation`.
@@ -1127,6 +1122,7 @@ impl ShardMap {
     ///   - `function`: Body closure to trace over local shard-map values.
     ///   - `global_input_types`: Global input array types in the same leaf order as the shard-map
     ///     input shardings.
+    ///   - `outer_named_axes`: Active enclosing mesh bindings preserved while tracing the local body.
     pub(crate) fn trace<
         F: FnOnce(ShardMapLocalTraceInput<Input>) -> ShardMapLocalTraceOutput<Output>,
         Input: Parameterized<ArrayType>,
@@ -1135,6 +1131,7 @@ impl ShardMap {
         &self,
         function: F,
         global_input_types: Input,
+        mut outer_named_axes: Vec<(String, NamedAxis)>,
     ) -> Result<TracedShardMap<Input, Output>, ShardMapTraceError>
     where
         Input::Family: ParameterizedFamily<ArrayType>
@@ -1149,8 +1146,10 @@ impl ShardMap {
     {
         let global_input_types = derive_global_input_types(self, &global_input_types)?;
         let local_input_types = derive_local_input_types(self, &global_input_types)?;
+        outer_named_axes.retain(|(name, _)| !self.manual_axes().contains(name));
+        outer_named_axes.extend(shard_map_named_axes(self));
         let (local_output_types, program) =
-            trace_xla_function(function, &local_input_types, shard_map_named_axes(self))?;
+            trace_xla_function(function, &local_input_types, Some(self), outer_named_axes)?;
         let global_output_types = derive_global_output_types(self, &local_output_types)?;
 
         Ok(TracedShardMap {
@@ -1465,7 +1464,6 @@ impl FlatTracedShardMap {
             self.shard_map.in_shardings().to_vec(),
             live_out_shardings,
             self.shard_map.manual_axes().to_vec(),
-            self.shard_map.check_vma(),
         );
         Ok(Self::from_parts(
             shard_map,
@@ -1490,10 +1488,6 @@ fn sharding_with_varying_manual_axes(
     sharding: &Sharding,
     varying_axes: BTreeSet<String>,
 ) -> Result<Sharding, ShardMapTraceError> {
-    let varying_axes = varying_axes
-        .into_iter()
-        .filter(|axis_name| sharding.mesh().axis_type(axis_name) == Some(MeshAxisType::Manual))
-        .collect::<BTreeSet<_>>();
     Ok(sharding.clone().with_varying_manual_axes(varying_axes)?)
 }
 
@@ -1602,6 +1596,7 @@ fn trace_xla_function<
 >(
     function: F,
     input_types: &Input,
+    shard_map: Option<&ShardMap>,
     named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<(Output, XlaProgram<ShardMapCapturedInput<Input>, ShardMapCapturedOutput<Output>>), ShardMapTraceError>
 where
@@ -1627,7 +1622,26 @@ where
             let input = ShardMapLocalTraceInput::<Input>::from_parameters(input_structure.clone(), input)?;
             let output = function(input);
             output_structure.replace(Some(output.parameter_structure()));
-            Ok(output.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>())
+            output
+                .into_parameters()
+                .enumerate()
+                .map(|(index, mut value)| {
+                    if let Some(shard_map) = shard_map
+                        && let Some(sharding) = shard_map.out_shardings().get(index)
+                    {
+                        for axis in spec_varying_axes(sharding, &shard_map.manual_axis_names()) {
+                            if !value
+                                .r#type()
+                                .sharding()
+                                .is_some_and(|sharding| sharding.varying_manual_axes().contains(&axis))
+                            {
+                                value = value.parallel_vary(&axis)?;
+                            }
+                        }
+                    }
+                    Ok(value.into_value())
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()
         },
         flat_input_types,
         named_axes,
@@ -1657,7 +1671,7 @@ fn shard_map_named_axes(shard_map: &ShardMap) -> Vec<(String, NamedAxis)> {
         .map(|name| {
             let axis = mesh.axis_index(name).expect("manual axes are validated against the mesh at construction");
             let size = mesh.axis_size(name).expect("manual axes are validated against the mesh at construction");
-            (name.clone(), NamedAxis::Mesh { axis, size })
+            (name.clone(), NamedAxis::Mesh { mesh: mesh.clone(), axis, size })
         })
         .collect()
 }
@@ -1684,44 +1698,49 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
             let local_shape = static_dimensions(&local_output_type, "output", output_index)?;
             let output_sharding = &shard_map.out_shardings()[output_index];
             let expected_current_varying_axes = spec_varying_axes(output_sharding, &manual_axis_names);
-            let effective_local_varying_axes: BTreeSet<String> =
-                varying_axes(local_output_type.sharding()).union(&expected_current_varying_axes).cloned().collect();
-            if shard_map.check_vma() {
-                let local_unreduced_axes =
-                    local_output_type.sharding().map(|sharding| sharding.unreduced_axes().clone()).unwrap_or_default();
-                let effective_local_unreduced_axes =
-                    local_unreduced_axes.union(output_sharding.unreduced_axes()).cloned().collect();
-                if !axes_match(&effective_local_unreduced_axes, output_sharding.unreduced_axes()) {
-                    return Err(ShardMapTraceError::ShardingStateMismatch {
-                        value_kind: "output",
-                        value_index: output_index,
-                        state_kind: "unreduced axes",
-                        expected: axes_to_vec(output_sharding.unreduced_axes()),
-                        actual: axes_to_vec(&local_unreduced_axes),
-                    });
+            let effective_local_varying_axes = varying_axes(local_output_type.sharding());
+            if let Some(axis_name) = expected_current_varying_axes.difference(&effective_local_varying_axes).next() {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "`shard_map` body output {output_index} must vary along tiled manual axis `{axis_name}`; \
+                         insert `parallel_vary` before returning the output",
+                    ),
                 }
+                .into());
+            }
+            let local_unreduced_axes =
+                local_output_type.sharding().map(|sharding| sharding.unreduced_axes().clone()).unwrap_or_default();
+            let effective_local_unreduced_axes =
+                local_unreduced_axes.union(output_sharding.unreduced_axes()).cloned().collect();
+            if !axes_match(&effective_local_unreduced_axes, output_sharding.unreduced_axes()) {
+                return Err(ShardMapTraceError::ShardingStateMismatch {
+                    value_kind: "output",
+                    value_index: output_index,
+                    state_kind: "unreduced axes",
+                    expected: axes_to_vec(output_sharding.unreduced_axes()),
+                    actual: axes_to_vec(&local_unreduced_axes),
+                });
+            }
 
-                let local_reduced_axes =
-                    local_output_type.sharding().map(|sharding| sharding.reduced_axes().clone()).unwrap_or_default();
-                if !axes_match(&local_reduced_axes, output_sharding.reduced_axes()) {
-                    return Err(ShardMapTraceError::ShardingStateMismatch {
-                        value_kind: "output",
-                        value_index: output_index,
-                        state_kind: "reduced axes",
-                        expected: axes_to_vec(output_sharding.reduced_axes()),
-                        actual: axes_to_vec(&local_reduced_axes),
+            let local_reduced_axes =
+                local_output_type.sharding().map(|sharding| sharding.reduced_axes().clone()).unwrap_or_default();
+            if !axes_match(&local_reduced_axes, output_sharding.reduced_axes()) {
+                return Err(ShardMapTraceError::ShardingStateMismatch {
+                    value_kind: "output",
+                    value_index: output_index,
+                    state_kind: "reduced axes",
+                    expected: axes_to_vec(output_sharding.reduced_axes()),
+                    actual: axes_to_vec(&local_reduced_axes),
+                });
+            }
+
+            for axis_name in &effective_local_varying_axes {
+                if manual_axis_names.contains(axis_name.as_str()) && !expected_current_varying_axes.contains(axis_name)
+                {
+                    return Err(ShardMapTraceError::OutputVaryingManualAxisNotInOutSpecs {
+                        output_index,
+                        axis_name: axis_name.clone(),
                     });
-                }
-
-                for axis_name in &effective_local_varying_axes {
-                    if manual_axis_names.contains(axis_name.as_str())
-                        && !expected_current_varying_axes.contains(axis_name)
-                    {
-                        return Err(ShardMapTraceError::OutputVaryingManualAxisNotInOutSpecs {
-                            output_index,
-                            axis_name: axis_name.clone(),
-                        });
-                    }
                 }
             }
             let surviving_varying_axes = effective_local_varying_axes
@@ -1961,11 +1980,12 @@ fn render_shardy_sharding_list(shardings: &[Sharding], manual_axes: &[String]) -
 fn shardy_tensor_sharding_per_value<'c, 't>(
     shardings: &[Sharding],
     manual_axes: &[String],
+    enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
 ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, ryft_mlir::Error> {
     let shardings = shardings
         .iter()
-        .map(|sharding| manual_computation_tensor_sharding(sharding, manual_axes, context))
+        .map(|sharding| manual_computation_tensor_sharding(sharding, manual_axes, enclosing_manual_axes, context))
         .collect::<Result<Vec<_>, _>>()?;
     context.shardy_tensor_sharding_per_value(shardings.as_slice())
 }
@@ -1973,18 +1993,21 @@ fn shardy_tensor_sharding_per_value<'c, 't>(
 fn manual_computation_tensor_sharding<'c, 't>(
     sharding: &Sharding,
     manual_axes: &[String],
+    enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
 ) -> Result<TensorShardingAttributeRef<'c, 't>, ryft_mlir::Error> {
     let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
-    let dim_shardings = manual_computation_dimension_shardings(sharding, manual_axes, context)?;
+    let dim_shardings = manual_computation_dimension_shardings(sharding, manual_axes, enclosing_manual_axes, context)?;
     let replicated_axis_names = sharding.replicated_axes();
     let replicated_axes = replicated_axis_names
         .iter()
+        .filter(|axis_name| !enclosing_manual_axes.iter().any(|axis| axis.as_str() == **axis_name))
         .map(|axis_name| context.shardy_axis_ref(*axis_name, None))
         .collect::<Result<Vec<_>, _>>()?;
     let unreduced_axes = sharding
         .unreduced_axes()
         .iter()
+        .filter(|axis_name| !enclosing_manual_axes.contains(axis_name))
         .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
         .collect::<Result<Vec<_>, _>>()?;
     context.shardy_tensor_sharding(
@@ -1999,6 +2022,7 @@ fn manual_computation_tensor_sharding<'c, 't>(
 fn manual_computation_dimension_shardings<'c, 't>(
     sharding: &Sharding,
     manual_axes: &[String],
+    enclosing_manual_axes: &[String],
     context: &'c MlirContext<'t>,
 ) -> Result<Vec<DimensionShardingAttributeRef<'c, 't>>, ryft_mlir::Error> {
     let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
@@ -2006,7 +2030,10 @@ fn manual_computation_dimension_shardings<'c, 't>(
         .mesh()
         .axes()
         .iter()
-        .filter_map(|axis| (!manual_axis_names.contains(axis.name())).then_some(axis.name()))
+        .filter_map(|axis| {
+            (!manual_axis_names.contains(axis.name()) && !enclosing_manual_axes.iter().any(|name| name == axis.name()))
+                .then_some(axis.name())
+        })
         .collect::<HashSet<_>>();
     let mut used_axes = HashSet::new();
     for partition_dimension in sharding.dimensions() {
@@ -2026,6 +2053,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
             ShardingDimension::Sharded(axis_names) => {
                 let axes = axis_names
                     .iter()
+                    .filter(|axis_name| !enclosing_manual_axes.contains(axis_name))
                     .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
                     .collect::<Result<Vec<_>, _>>()?;
                 let contains_free_axis =
@@ -2255,7 +2283,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2272,7 +2299,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x", "y"])], vec![])],
             Vec::new(),
             vec!["x".into()],
-            true,
         )
         .unwrap();
 
@@ -2351,7 +2377,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["model", "data"])], vec![])],
             Vec::new(),
             vec![],
-            true,
         );
 
         assert_eq!(
@@ -2374,7 +2399,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x", "y"])], vec![])],
             Vec::new(),
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2389,7 +2413,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![])],
             Vec::new(),
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2408,7 +2431,6 @@ mod tests {
                 vec![],
             )],
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2423,7 +2445,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
             Vec::new(),
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2447,7 +2468,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
             Vec::new(),
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2465,7 +2485,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
             Vec::new(),
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2480,7 +2499,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![])],
             Vec::new(),
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2495,7 +2513,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data", "model"])], vec![])],
             Vec::new(),
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2514,7 +2531,6 @@ mod tests {
             Vec::new(),
             vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![])],
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2532,7 +2548,6 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2548,7 +2563,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data"])], vec![])],
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["data"])], vec![])],
             vec![],
-            true,
         )
         .unwrap();
 
@@ -2566,7 +2580,6 @@ mod tests {
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
             Vec::new(),
             vec!["x".into()],
-            true,
         )
         .unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
@@ -2582,6 +2595,7 @@ mod tests {
         let local_input_types = derive_local_input_types(&shard_map, &global_input_types).unwrap();
 
         assert_eq!(local_input_types[0].shape(), &Shape::new(vec![Dimension::Static(4)]));
+        assert_eq!(local_input_types[0].sharding().unwrap().dimensions(), &[ShardingDimension::Replicated]);
         assert_eq!(
             local_input_types[0]
                 .sharding()
@@ -2603,7 +2617,7 @@ mod tests {
             .with_reduced_axes(["x"])
             .unwrap();
         let shard_map =
-            ShardMap::new(mesh.clone(), vec![input_sharding], Vec::new(), vec!["x".into(), "y".into()], true).unwrap();
+            ShardMap::new(mesh.clone(), vec![input_sharding], Vec::new(), vec!["x".into(), "y".into()]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
             .with_sharding(
                 Sharding::new(mesh, vec![ShardingDimension::replicated()])
@@ -2644,7 +2658,6 @@ mod tests {
             vec![input_sharding.clone()],
             Vec::new(),
             vec!["x".into(), "y".into(), "z".into()],
-            true,
         )
         .unwrap();
         let global_input_types = derive_global_input_types(
@@ -2682,7 +2695,6 @@ mod tests {
             Vec::new(),
             vec![test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![])],
             vec!["x".into()],
-            true,
         )
         .unwrap();
         let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -2718,9 +2730,11 @@ mod tests {
             .with_unreduced_axes(["y"])
             .unwrap();
         let shard_map =
-            ShardMap::new(mesh.clone(), Vec::new(), vec![output_sharding.clone()], vec!["x".into(), "y".into()], true)
+            ShardMap::new(mesh.clone(), Vec::new(), vec![output_sharding.clone()], vec!["x".into(), "y".into()])
                 .unwrap();
-        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
         let global_output_types = derive_global_output_types(&shard_map, &vec![local_output_type]).unwrap();
 
         assert_eq!(
@@ -2733,7 +2747,7 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_global_output_types_rejects_extra_local_unreduced_axes_when_check_vma_is_enabled() {
+    fn test_derive_global_output_types_rejects_extra_local_unreduced_axes() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -2744,7 +2758,6 @@ mod tests {
             Vec::new(),
             vec![Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()]).unwrap()],
             vec!["x".into(), "y".into()],
-            true,
         )
         .unwrap();
         let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -2769,7 +2782,7 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_global_output_types_rejects_reduced_axis_mismatch_when_check_vma_is_enabled() {
+    fn test_derive_global_output_types_rejects_reduced_axis_mismatch() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -2780,7 +2793,7 @@ mod tests {
             .with_reduced_axes(["x"])
             .unwrap();
         let shard_map =
-            ShardMap::new(mesh.clone(), Vec::new(), vec![output_sharding], vec!["x".into(), "y".into()], true).unwrap();
+            ShardMap::new(mesh.clone(), Vec::new(), vec![output_sharding], vec!["x".into(), "y".into()]).unwrap();
         let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
         assert_eq!(
@@ -2796,14 +2809,13 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_global_output_types_rejects_omitted_varying_manual_axis_when_check_vma_is_enabled() {
+    fn test_derive_global_output_types_rejects_omitted_varying_manual_axis() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let shard_map = ShardMap::new(
             mesh.clone(),
             Vec::new(),
             vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![])],
             vec![],
-            true,
         )
         .unwrap();
         let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -2826,41 +2838,36 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_global_output_types_ignores_omitted_varying_manual_axis_when_check_vma_is_disabled() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let shard_map = ShardMap::new(
-            mesh.clone(),
-            Vec::new(),
-            vec![test_sharding(&mesh, vec![ShardingDimension::replicated()], vec![])],
-            vec![],
-            false,
-        )
-        .unwrap();
-        let local_output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
-            .with_sharding(test_sharding_with_varying(
-                &mesh,
-                vec![ShardingDimension::replicated()],
-                vec![],
-                vec![],
-                vec!["x".into()],
-            ))
-            .unwrap();
-        let global_output_types = derive_global_output_types(&shard_map, &vec![local_output_type]).unwrap();
-
-        assert_eq!(
-            global_output_types[0]
-                .sharding()
-                .expect("global shard_map output should keep sharding metadata")
-                .varying_manual_axes(),
-            &BTreeSet::<String>::new()
-        );
-    }
-
-    #[test]
     fn test_array_type_display_renders_type() {
         let array_type = ArrayType::scalar(DataType::F32);
 
         assert_eq!(array_type.to_string(), "f32[]");
+    }
+
+    #[test]
+    fn test_shard_map_trace_inserts_output_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedShardMap<ArrayType, ArrayType> =
+            shard_map(|input| input, ArrayType::new_static(DataType::F32, [1]), mesh, replicated.clone(), sharded)
+                .unwrap();
+        assert_eq!(
+            traced.local_output_types(),
+            &ArrayType::new_static(DataType::F32, [1])
+                .with_sharding(replicated.with_varying_manual_axes(["x"]).unwrap())
+                .unwrap(),
+        );
+        assert_eq!(
+            traced
+                .program
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec!["parallel_vary"],
+        );
+        assert_eq!(traced.global_output_types().shape(), &Shape::new(vec![Dimension::Static(2)]));
     }
 
     #[test]
@@ -2880,12 +2887,7 @@ mod tests {
             .with_sharding(input_sharding.clone())
             .unwrap();
         let expected_local_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
 
         assert_eq!(traced.global_input_types(), &expected_global_input_type);
@@ -2936,14 +2938,14 @@ mod tests {
             traced.program.to_string(),
             indoc! {"
                 lambda \
-                %0:f32[3][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], \
-                %1:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], \
-                %2:i32[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], \
-                %3:i32[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], \
-                %4:i32[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], \
-                %5:i32[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}] .
+                %0:f32[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                %2:i32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                %3:i32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                %4:i32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                %5:i32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
                 let \
-                %6:f32[4][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}] = \
+                %6:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                 ragged_all_to_all [axis_name=\"x\", axis_size=2] %0 %1 %2 %3 %4 %5
                 in (%6)
             "}
@@ -3469,12 +3471,7 @@ mod tests {
             .with_sharding(projected_sharding.clone())
             .unwrap();
         let expected_local_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["data"])
-                    .unwrap(),
-            )
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["data"]).unwrap())
             .unwrap();
 
         assert_eq!(traced.global_input_types(), &expected_global_input_type);
@@ -3501,29 +3498,27 @@ mod tests {
     fn test_shard_map_trace_can_render_nested_shard_maps() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let inner_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
+        let inner_mesh = mesh.clone();
         let outer_sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let inner_sharding = test_sharding(&inner_mesh, vec![ShardingDimension::sharded(["y"])], vec![]);
-        let traced: TracedShardMap<ArrayType, ArrayType> = shard_map(
+        let traced: TracedShardMap<ArrayType, ArrayType> = shard_map_with_options(
             {
                 let inner_mesh = inner_mesh.clone();
                 let inner_sharding = inner_sharding.clone();
                 move |x: ShardMapTracer| {
-                    let nested: ShardMapTracer = shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
-                        |y: ShardMapTracer| y.clone() + y,
-                        x.clone(),
-                        inner_mesh.clone(),
-                        inner_sharding.clone(),
-                        inner_sharding.clone(),
-                    )
-                    .expect("nested shard_map should trace");
+                    let nested: ShardMapTracer =
+                        shard_map_with_options::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
+                            |y: ShardMapTracer| y.clone() + y,
+                            x.clone(),
+                            inner_mesh.clone(),
+                            inner_sharding.clone(),
+                            inner_sharding.clone(),
+                            vec!["y".to_string()],
+                        )
+                        .expect("nested shard_map should trace");
                     nested + x
                 }
             },
@@ -3531,6 +3526,7 @@ mod tests {
             mesh,
             outer_sharding.clone(),
             outer_sharding,
+            vec!["x".to_string()],
         )
         .unwrap();
 
@@ -3539,9 +3535,9 @@ mod tests {
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2, "y"=2]>
-                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
-                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x", ?}]>] out_shardings=[<@mesh, [{"x", ?}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
-                      %1 = sdy.manual_computation(%arg1) in_shardings=[<@mesh, [{"y", ?}]>] out_shardings=[<@mesh, [{"y", ?}]>] manual_axes={"y"} (%arg2: tensor<2xf32>) {
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}], replicated={"y"}>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}], replicated={"y"}>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x", ?}], replicated={"y"}>] out_shardings=[<@mesh, [{"x", ?}], replicated={"y"}>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
+                      %1 = sdy.manual_computation(%arg1) in_shardings=[<@mesh, [{"y"}]>] out_shardings=[<@mesh, [{"y"}]>] manual_axes={"y"} (%arg2: tensor<2xf32>) {
                         %3 = stablehlo.add %arg2, %arg2 : tensor<2xf32>
                         sdy.return %3 : tensor<2xf32>
                       } : (tensor<4xf32>) -> tensor<4xf32>
@@ -3831,7 +3827,7 @@ mod tests {
 
     #[test]
     fn test_trace_reshard_renders_mlir() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
@@ -3867,6 +3863,48 @@ mod tests {
     }
 
     #[test]
+    fn test_trace_sharding_constraint_merges_tracked_placement_into_mlir() {
+        // The input is tracked as sharded over the explicit axis and the constraint places it over the auto axis, so
+        // the emitted constraint must carry both placements rather than the constraint alone, which would contradict
+        // the tracked type by marking the explicit axis replicated.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let tracked = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
+        let constraint = test_sharding(&mesh, vec![ShardingDimension::sharded(["a"])], vec![]);
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
+            .with_sharding(tracked.clone())
+            .unwrap();
+
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let constraint = constraint.clone();
+                move |x: ShardMapTracer| {
+                    sharding_constraint(x, constraint.clone()).expect("constraint should stage on traced XLA values")
+                }
+            },
+            global_input_type.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(traced.global_output_types(), &global_input_type);
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2, "a"=2]>
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{"x", "a"}]> : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
     fn test_shard_map_manual_computation_executes_end_to_end_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -3884,14 +3922,9 @@ mod tests {
 
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let shard_map = ShardMap::new(
-            device_mesh.logical_mesh().clone(),
-            vec![sharding.clone()],
-            vec![sharding.clone()],
-            vec![],
-            true,
-        )
-        .unwrap();
+        let shard_map =
+            ShardMap::new(device_mesh.logical_mesh().clone(), vec![sharding.clone()], vec![sharding.clone()], vec![])
+                .unwrap();
         assert_eq!(shard_map.local_input_shape(0, &[8]).unwrap(), vec![2]);
         assert_eq!(shard_map.local_output_shape(0, &[8]).unwrap(), vec![2]);
 
@@ -4089,6 +4122,1082 @@ mod tests {
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
             assert_eq!(values, [16.0, 20.0]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_checked_variation_gradients_execute_on_cpu() {
+        use ryft_core::{Fill, ParallelReduce, ParallelReductionKind};
+
+        for device_count in [1, 2] {
+            let plugin = load_cpu_plugin().unwrap();
+            let client = plugin
+                .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(device_count), ..Default::default() }))
+                .unwrap();
+            let client_devices = client.addressable_devices().unwrap();
+            assert_eq!(client_devices.len(), device_count);
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", device_count, MeshAxisType::Manual).unwrap()]).unwrap();
+            let device_mesh = DeviceMesh::new(
+                mesh.clone(),
+                client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+            )
+            .unwrap();
+            let replicated = Sharding::replicated(mesh.clone(), 0);
+            let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+                {
+                    let replicated = replicated.clone();
+                    let sharded = sharded.clone();
+                    move |inputs: Vec<ShardMapTracer>| {
+                        let (value, gradient) = inputs[0]
+                            .clone()
+                            .into_value()
+                            .dispatch_domain()
+                            .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
+                            .value_and_gradient(|(shared, weights)| {
+                                let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
+                                let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
+                                Ok(shard_map::<_, _, ArrayType, _>(
+                                    |(shared, weights): (ShardMapTracer, ShardMapTracer)| {
+                                        (shared.clone() * shared * weights)
+                                            .reduce(&[0], ReductionKind::Sum)
+                                            .unwrap()
+                                            .parallel_reduce("x", ParallelReductionKind::Sum)
+                                            .unwrap()
+                                    },
+                                    (shared, weights),
+                                    mesh.clone(),
+                                    (replicated.clone(), sharded.clone()),
+                                    replicated.clone(),
+                                )
+                                .unwrap()
+                                .into_value())
+                            })
+                            .unwrap();
+                        let varying_gradient = inputs[1]
+                            .clone()
+                            .into_value()
+                            .dispatch_domain()
+                            .differentiate_at(inputs[1].clone().into_value())
+                            .gradient(|varying| {
+                                let varying = ValueProjection::<ArrayType>::into_projected(varying)?;
+                                Ok(shard_map::<_, _, ArrayType, _>(
+                                    |varying: ShardMapTracer| {
+                                        (varying.clone() * varying)
+                                            .reduce(&[0], ReductionKind::Sum)
+                                            .unwrap()
+                                            .parallel_reduce("x", ParallelReductionKind::Sum)
+                                            .unwrap()
+                                    },
+                                    varying,
+                                    mesh.clone(),
+                                    sharded.clone(),
+                                    replicated.clone(),
+                                )
+                                .unwrap()
+                                .into_value())
+                            })
+                            .unwrap();
+                        let second_derivative = inputs[0]
+                            .clone()
+                            .into_value()
+                            .dispatch_domain()
+                            .differentiate_at(inputs[0].clone().into_value())
+                            .with_captures(inputs[1].clone().into_value())
+                            .gradient(|shared, weights| {
+                                Ok(shared
+                                    .dispatch_domain()
+                                    .differentiate_at(shared.clone())
+                                    .with_captures(weights)
+                                    .gradient(|shared, weights| {
+                                        let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
+                                        let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
+                                        Ok(shard_map::<_, _, ArrayType, _>(
+                                            |(shared, weights): (ShardMapTracer, ShardMapTracer)| {
+                                                (shared.clone() * shared * weights)
+                                                    .reduce(&[0], ReductionKind::Sum)
+                                                    .unwrap()
+                                                    .parallel_reduce("x", ParallelReductionKind::Sum)
+                                                    .unwrap()
+                                            },
+                                            (shared, weights),
+                                            mesh.clone(),
+                                            (replicated.clone(), sharded.clone()),
+                                            replicated.clone(),
+                                        )
+                                        .unwrap()
+                                        .into_value())
+                                    })
+                                    .unwrap())
+                            })
+                            .unwrap();
+                        let (_, pullback) = inputs[0]
+                            .clone()
+                            .into_value()
+                            .dispatch_domain()
+                            .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
+                            .vjp(|(shared, weights)| {
+                                let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
+                                let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
+                                Ok(shard_map::<_, _, ArrayType, _>(
+                                    |(shared, weights): (ShardMapTracer, ShardMapTracer)| {
+                                        shared.clone() * shared * weights
+                                    },
+                                    (shared, weights),
+                                    mesh.clone(),
+                                    (replicated.clone(), sharded.clone()),
+                                    sharded.clone(),
+                                )
+                                .unwrap()
+                                .into_value())
+                            })
+                            .unwrap();
+                        let seeded_gradients = pullback.apply(inputs[1].clone().into_value()).unwrap();
+                        let (_, directional_derivative) = inputs[0]
+                            .clone()
+                            .into_value()
+                            .dispatch_domain()
+                            .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
+                            .jvp(
+                                (inputs[0].clone().into_value(), inputs[1].clone().into_value()),
+                                |(shared, weights)| {
+                                    let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
+                                    let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
+                                    Ok(shard_map::<_, _, ArrayType, _>(
+                                        |(shared, weights): (ShardMapTracer, ShardMapTracer)| {
+                                            shared.clone() * shared * weights
+                                        },
+                                        (shared, weights),
+                                        mesh.clone(),
+                                        (replicated.clone(), sharded.clone()),
+                                        sharded.clone(),
+                                    )
+                                    .unwrap()
+                                    .into_value())
+                                },
+                            )
+                            .unwrap();
+                        let inner_gradient = shard_map::<_, _, ArrayType, _>(
+                            |(shared, weights): (ShardMapTracer, ShardMapTracer)| {
+                                let derivative = shared
+                                    .clone()
+                                    .into_value()
+                                    .dispatch_domain()
+                                    .differentiate_at(shared.into_value())
+                                    .with_captures(weights.into_value())
+                                    .gradient(|shared, weights| {
+                                        let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
+                                        let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
+                                        Ok((shared.clone() * shared * weights)
+                                            .reduce(&[0], ReductionKind::Sum)
+                                            .unwrap()
+                                            .into_value())
+                                    })
+                                    .unwrap();
+                                ValueProjection::<ArrayType>::into_projected(derivative).unwrap()
+                            },
+                            (inputs[0].clone(), inputs[1].clone()),
+                            mesh.clone(),
+                            (replicated.clone(), sharded.clone()),
+                            replicated.clone(),
+                        )
+                        .unwrap();
+                        let constant_sum = shard_map::<_, _, ArrayType, _>(
+                            |input: ShardMapTracer| {
+                                let constant: ShardMapTracer =
+                                    input.dispatch_domain().fill(&input.r#type(), 3.0_f32).unwrap();
+                                constant.parallel_reduce("x", ParallelReductionKind::Sum).unwrap()
+                            },
+                            inputs[0].clone(),
+                            mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                        )
+                        .unwrap();
+                        vec![
+                            ValueProjection::<ArrayType>::into_projected(value).unwrap(),
+                            ValueProjection::<ArrayType>::into_projected(gradient.0).unwrap(),
+                            ValueProjection::<ArrayType>::into_projected(gradient.1).unwrap(),
+                            constant_sum,
+                            ValueProjection::<ArrayType>::into_projected(varying_gradient).unwrap(),
+                            ValueProjection::<ArrayType>::into_projected(second_derivative).unwrap(),
+                            ValueProjection::<ArrayType>::into_projected(seeded_gradients.0).unwrap(),
+                            ValueProjection::<ArrayType>::into_projected(seeded_gradients.1).unwrap(),
+                            ValueProjection::<ArrayType>::into_projected(directional_derivative).unwrap(),
+                            inner_gradient,
+                        ]
+                    }
+                },
+                vec![
+                    ArrayType::scalar(DataType::F32),
+                    ArrayType::new_static(DataType::F32, [device_count]).with_sharding(sharded.clone()).unwrap(),
+                ],
+            )
+            .unwrap();
+            let program = traced
+                .to_mlir_module_with_signature_shardings(
+                    "main",
+                    Some(&[replicated.clone(), sharded.clone()]),
+                    Some(&[
+                        replicated.clone(),
+                        replicated.clone(),
+                        sharded.clone(),
+                        replicated.clone(),
+                        sharded.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        sharded.clone(),
+                        sharded.clone(),
+                        replicated.clone(),
+                    ]),
+                )
+                .unwrap();
+            let executable = client
+                .compile(
+                    &Program::Mlir { bytecode: program.into_bytes() },
+                    &test_spmd_compilation_options(device_count),
+                )
+                .unwrap();
+            let shared_buffers = client_devices
+                .iter()
+                .map(|device| {
+                    client.buffer(&3.0_f32.to_ne_bytes(), BufferType::F32, [], None, device.clone(), None).unwrap()
+                })
+                .collect();
+            let weight_buffers = client_devices
+                .iter()
+                .zip([2.0_f32, 5.0])
+                .map(|(device, weight)| {
+                    client.buffer(&weight.to_ne_bytes(), BufferType::F32, [1], None, device.clone(), None).unwrap()
+                })
+                .collect();
+            let inputs = vec![
+                Array::from_addressable_buffers(
+                    &client,
+                    static_sharded_array_type(DataType::F32, &[], replicated),
+                    device_mesh.clone(),
+                    shared_buffers,
+                )
+                .unwrap(),
+                Array::from_addressable_buffers(
+                    &client,
+                    static_sharded_array_type(DataType::F32, &[device_count], sharded),
+                    device_mesh,
+                    weight_buffers,
+                )
+                .unwrap(),
+            ];
+            let device_ids = executable
+                .addressable_devices()
+                .unwrap()
+                .iter()
+                .map(|device| device.id().unwrap())
+                .collect::<Vec<_>>();
+            let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+            let outputs = executable
+                .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+                .unwrap()
+                .block_until_ready()
+                .unwrap();
+            assert_eq!(outputs.len(), device_count);
+            let expected_varying_gradients = client_devices
+                .iter()
+                .zip([4.0, 10.0])
+                .map(|(device, gradient)| (device.id().unwrap(), gradient))
+                .collect::<HashMap<_, _>>();
+            let total_weight = if device_count == 1 { 2.0 } else { 7.0 };
+            let squared_weight_sum = if device_count == 1 { 4.0 } else { 29.0 };
+            let mut output_pairing = 0.0;
+            let mut input_pairing = 0.0;
+            for (device_index, (output, device_id)) in outputs.into_iter().zip(device_ids).enumerate() {
+                let expected_varying_gradient = expected_varying_gradients[&device_id];
+                assert_eq!(output.outputs.len(), 10);
+                let values = output
+                    .outputs
+                    .iter()
+                    .map(|buffer| values_from_bytes::<f32>(&buffer.copy_to_host(None).unwrap().r#await().unwrap()))
+                    .collect::<Vec<_>>();
+                let weight = expected_varying_gradient / 2.0;
+                output_pairing += weight * values[8][0];
+                input_pairing += weight * values[7][0];
+                if device_index == 0 {
+                    input_pairing += 3.0 * values[6][0];
+                }
+                // The shared derivative sums distinct contributions; each varying weight receives only its local one.
+                assert_eq!(
+                    values,
+                    vec![
+                        vec![9.0 * total_weight],
+                        vec![6.0 * total_weight],
+                        vec![9.0],
+                        vec![3.0 * device_count as f32],
+                        vec![expected_varying_gradient],
+                        vec![2.0 * total_weight],
+                        vec![6.0 * squared_weight_sum],
+                        vec![9.0 * weight],
+                        vec![27.0 * weight],
+                        vec![6.0 * total_weight],
+                    ]
+                );
+            }
+            // Count the invariant shared input once; pair varying inputs/outputs over their logical shards.
+            assert_eq!(input_pairing, output_pairing);
+            assert_eq!(output_pairing, 27.0 * squared_weight_sum);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_gather_varying_indices_gradient_executes_on_cpu() {
+        use ryft_core::{ConvertElementType, Gather, GatherMode, ParallelReduce, ParallelReductionKind};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let device_mesh =
+            DeviceMesh::new(mesh.clone(), devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
+                .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_types = vec![
+            ArrayType::new_static(DataType::F32, [3]),
+            ArrayType::new_static(DataType::I32, [4]).with_sharding(sharded.clone()).unwrap(),
+            ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap(),
+        ];
+        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+            {
+                let mesh = mesh.clone();
+                let replicated = replicated.clone();
+                let sharded = sharded.clone();
+                move |inputs: Vec<ShardMapTracer>| {
+                    let (output, pullback) = inputs[0]
+                        .clone()
+                        .into_value()
+                        .dispatch_domain()
+                        .differentiate_at(inputs[0].clone().into_value())
+                        .with_captures(inputs[1].clone().into_value())
+                        .vjp(|data, indices| {
+                            let data = ValueProjection::<ArrayType>::into_projected(data)?;
+                            let indices = ValueProjection::<ArrayType>::into_projected(indices)?;
+                            Ok(shard_map::<_, _, ArrayType, _>(
+                                |(data, indices): (ShardMapTracer, ShardMapTracer)| {
+                                    data.gather_axis(&indices, 0, GatherMode::Clip).unwrap()
+                                },
+                                (data, indices),
+                                mesh.clone(),
+                                (replicated.clone(), sharded.clone()),
+                                sharded.clone(),
+                            )
+                            .unwrap()
+                            .into_value())
+                        })
+                        .unwrap();
+                    let gradient = pullback.apply(inputs[2].clone().into_value()).unwrap();
+                    let maxima = shard_map::<_, _, (ArrayType, ArrayType), _>(
+                        |input: ShardMapTracer| {
+                            // The CPU backend recognizes integer maximum as an all-reduce reducer.
+                            let maximum = input
+                                .convert_element_type(DataType::I32)
+                                .unwrap()
+                                .parallel_reduce("x", ParallelReductionKind::Max)
+                                .unwrap()
+                                .convert_element_type(DataType::F32)
+                                .unwrap();
+                            let varying = maximum.parallel_vary("x").unwrap();
+                            (maximum, varying)
+                        },
+                        inputs[2].clone(),
+                        mesh.clone(),
+                        sharded.clone(),
+                        (replicated.clone(), sharded.clone()),
+                    )
+                    .unwrap();
+                    vec![
+                        ValueProjection::<ArrayType>::into_projected(output).unwrap(),
+                        ValueProjection::<ArrayType>::into_projected(gradient).unwrap(),
+                        maxima.0,
+                        maxima.1,
+                    ]
+                }
+            },
+            input_types,
+        )
+        .unwrap();
+        let program = traced
+            .to_mlir_module_with_signature_shardings(
+                "main",
+                Some(&[replicated.clone(), sharded.clone(), sharded.clone()]),
+                Some(&[sharded.clone(), replicated.clone(), replicated.clone(), sharded.clone()]),
+            )
+            .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
+            .unwrap();
+        let data_buffers = devices
+            .iter()
+            .map(|device| {
+                client
+                    .buffer(
+                        values_to_bytes(&[11.0_f32, 13.0, 17.0]).as_slice(),
+                        BufferType::F32,
+                        [3],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let index_buffers = devices
+            .iter()
+            .zip([[0_i32, 1], [0, 2]])
+            .map(|(device, indices)| {
+                client
+                    .buffer(values_to_bytes(&indices).as_slice(), BufferType::I32, [2], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let seed_buffers = devices
+            .iter()
+            .zip([[2.0_f32, 3.0], [5.0, 7.0]])
+            .map(|(device, seeds)| {
+                client
+                    .buffer(values_to_bytes(&seeds).as_slice(), BufferType::F32, [2], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let inputs = vec![
+            Array::from_addressable_buffers(
+                &client,
+                static_sharded_array_type(DataType::F32, &[3], replicated),
+                device_mesh.clone(),
+                data_buffers,
+            )
+            .unwrap(),
+            Array::from_addressable_buffers(
+                &client,
+                static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
+                device_mesh.clone(),
+                index_buffers,
+            )
+            .unwrap(),
+            Array::from_addressable_buffers(
+                &client,
+                static_sharded_array_type(DataType::F32, &[4], sharded),
+                device_mesh,
+                seed_buffers,
+            )
+            .unwrap(),
+        ];
+        let expected = devices
+            .iter()
+            .zip([[11.0_f32, 13.0], [11.0, 17.0]])
+            .map(|(device, values)| (device.id().unwrap(), values))
+            .collect::<HashMap<_, _>>();
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        assert_eq!(outputs.len(), 2);
+        for (output, device_id) in outputs.into_iter().zip(device_ids) {
+            let values = output
+                .outputs
+                .iter()
+                .map(|buffer| values_from_bytes::<f32>(&buffer.copy_to_host(None).unwrap().r#await().unwrap()))
+                .collect::<Vec<_>>();
+            // Index zero occurs on both devices; its unequal seed contributions must be added exactly once.
+            assert_eq!(
+                values,
+                vec![expected[&device_id].to_vec(), vec![7.0, 3.0, 7.0], vec![5.0, 7.0], vec![5.0, 7.0]]
+            );
+        }
+    }
+
+    #[test]
+    fn test_shard_map_sort_varying_keys_jvp_executes_on_cpu() {
+        use ryft_core::operations::sort::{Sort, SortDirection};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let device_mesh =
+            DeviceMesh::new(mesh.clone(), devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
+                .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_types = vec![
+            ArrayType::new_static(DataType::F32, [2]),
+            ArrayType::new_static(DataType::I32, [4]).with_sharding(sharded.clone()).unwrap(),
+            ArrayType::new_static(DataType::F32, [2]),
+        ];
+        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+            {
+                let mesh = mesh.clone();
+                let replicated = replicated.clone();
+                let sharded = sharded.clone();
+                move |inputs: Vec<ShardMapTracer>| {
+                    let (output, tangent) = inputs[0]
+                        .clone()
+                        .into_value()
+                        .dispatch_domain()
+                        .differentiate_at(inputs[0].clone().into_value())
+                        .with_captures(inputs[1].clone().into_value())
+                        .jvp(inputs[2].clone().into_value(), |data, indices| {
+                            let data = ValueProjection::<ArrayType>::into_projected(data)?;
+                            let indices = ValueProjection::<ArrayType>::into_projected(indices)?;
+                            Ok(shard_map::<_, _, ArrayType, _>(
+                                |(data, indices): (ShardMapTracer, ShardMapTracer)| {
+                                    Sort::sort(&[indices, data], 0, SortDirection::Ascending).unwrap().remove(1)
+                                },
+                                (data, indices),
+                                mesh.clone(),
+                                (replicated.clone(), sharded.clone()),
+                                sharded.clone(),
+                            )
+                            .unwrap()
+                            .into_value())
+                        })
+                        .unwrap();
+                    vec![
+                        ValueProjection::<ArrayType>::into_projected(output).unwrap(),
+                        ValueProjection::<ArrayType>::into_projected(tangent).unwrap(),
+                    ]
+                }
+            },
+            input_types,
+        )
+        .unwrap();
+        let program = traced
+            .to_mlir_module_with_signature_shardings(
+                "main",
+                Some(&[replicated.clone(), sharded.clone(), replicated.clone()]),
+                Some(&[sharded.clone(), sharded.clone()]),
+            )
+            .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
+            .unwrap();
+        let data_buffers = devices
+            .iter()
+            .map(|device| {
+                client
+                    .buffer(
+                        values_to_bytes(&[11.0_f32, 13.0]).as_slice(),
+                        BufferType::F32,
+                        [2],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let index_buffers = devices
+            .iter()
+            .zip([[2_i32, 1], [1, 2]])
+            .map(|(device, indices)| {
+                client
+                    .buffer(values_to_bytes(&indices).as_slice(), BufferType::I32, [2], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let seed_buffers = devices
+            .iter()
+            .zip([[2.0_f32, 3.0], [2.0, 3.0]])
+            .map(|(device, seeds)| {
+                client
+                    .buffer(values_to_bytes(&seeds).as_slice(), BufferType::F32, [2], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let inputs = vec![
+            Array::from_addressable_buffers(
+                &client,
+                static_sharded_array_type(DataType::F32, &[2], replicated.clone()),
+                device_mesh.clone(),
+                data_buffers,
+            )
+            .unwrap(),
+            Array::from_addressable_buffers(
+                &client,
+                static_sharded_array_type(DataType::I32, &[4], sharded.clone()),
+                device_mesh.clone(),
+                index_buffers,
+            )
+            .unwrap(),
+            Array::from_addressable_buffers(
+                &client,
+                static_sharded_array_type(DataType::F32, &[2], replicated),
+                device_mesh,
+                seed_buffers,
+            )
+            .unwrap(),
+        ];
+        let expected = devices
+            .iter()
+            .zip([[13.0_f32, 11.0], [11.0, 13.0]])
+            .map(|(device, values)| (device.id().unwrap(), values))
+            .collect::<HashMap<_, _>>();
+        let expected_tangents = devices
+            .iter()
+            .zip([[3.0_f32, 2.0], [2.0, 3.0]])
+            .map(|(device, values)| (device.id().unwrap(), values))
+            .collect::<HashMap<_, _>>();
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        assert_eq!(outputs.len(), 2);
+        for (output, device_id) in outputs.into_iter().zip(device_ids) {
+            let values = output
+                .outputs
+                .iter()
+                .map(|buffer| values_from_bytes::<f32>(&buffer.copy_to_host(None).unwrap().r#await().unwrap()))
+                .collect::<Vec<_>>();
+            // The invariant passenger and its tangent follow each device's distinct key permutation.
+            assert_eq!(values, vec![expected[&device_id].to_vec(), expected_tangents[&device_id].to_vec()]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_attention_varying_keys_gradient_executes_on_cpu() {
+        use ryft_core::operations::attention::{
+            AttentionConfiguration, AttentionImplementation, AttentionInputs, differentiable_dot_product_attention,
+        };
+        use ryft_core::{ArrayOperation, DomainTracer, EagerContext};
+
+        use crate::experimental::ops::XlaArrayConstant;
+
+        type AttentionDomain = EagerContext<XlaArrayConstant, ArrayOperation<XlaArrayConstant>>;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let devices = client.addressable_devices().unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let device_mesh =
+            DeviceMesh::new(mesh.clone(), devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
+                .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 4);
+        let sharded = Sharding::new(
+            mesh.clone(),
+            vec![
+                ShardingDimension::sharded(["x"]),
+                ShardingDimension::Replicated,
+                ShardingDimension::Replicated,
+                ShardingDimension::Replicated,
+            ],
+        )
+        .unwrap();
+        let query_type = ArrayType::new_static(DataType::F32, [1, 1, 1, 1]).with_sharding(replicated.clone()).unwrap();
+        let key_type = ArrayType::new_static(DataType::F32, [2, 2, 1, 1]).with_sharding(sharded.clone()).unwrap();
+        let value_type = ArrayType::new_static(DataType::F32, [1, 2, 1, 1]).with_sharding(replicated.clone()).unwrap();
+        let seed_type = ArrayType::new_static(DataType::F32, [2, 1, 1, 1]).with_sharding(sharded.clone()).unwrap();
+        let input_types = vec![query_type.clone(), key_type.clone(), value_type.clone(), seed_type.clone()];
+        let in_shardings = vec![replicated.clone(), sharded.clone(), replicated.clone(), sharded.clone()];
+        let out_shardings = vec![sharded.clone(), replicated.clone()];
+        let boundary = ShardMap::new(mesh.clone(), in_shardings.clone(), out_shardings.clone(), vec![]).unwrap();
+        let local_input_types = input_types
+            .iter()
+            .enumerate()
+            .map(|(index, input)| boundary.local_input_type(index, input).unwrap())
+            .collect::<Vec<_>>();
+        // Trace the region-carrying custom derivative in its homogeneous universe, then lift the complete program.
+        // A projected context intentionally cannot bind regions; whole-program promotion preserves those regions.
+        let (_, body) = DomainTracingContext::<AttentionDomain>::trace_with_named_axes(
+            |inputs: Vec<DomainTracer<AttentionDomain>>| {
+                let function = differentiable_dot_product_attention::<AttentionDomain>(
+                    AttentionConfiguration::new().with_implementation(AttentionImplementation::Portable),
+                );
+                let (output, pullback) = inputs[0]
+                    .dispatch_domain()
+                    .differentiate_at(AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone()))
+                    .vjp(|inputs| function.call(inputs))
+                    .unwrap();
+                let gradient = pullback.apply(inputs[3].clone()).unwrap();
+                // The query component of the full VJP is the partial derivative with respect to the query;
+                // making key/value cotangents available does not change this component.
+                Ok(vec![output, gradient.query])
+            },
+            local_input_types,
+            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+        )
+        .unwrap();
+        let body = body.into_flat_program().into_unprojected::<XlaConstant, XlaOperation>().unwrap();
+        let operation = ShardMapOperation::from_program(
+            &body,
+            input_types.iter().cloned().map(ArrayIrType::Array).collect(),
+            mesh.clone(),
+            in_shardings,
+            out_shardings,
+            vec![],
+        )
+        .unwrap();
+        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+            move |inputs: Vec<ShardMapTracer>| {
+                let inputs = inputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>();
+                inputs[0]
+                    .dispatch_domain()
+                    .bind(XlaOperation::ShardMap(Box::new(operation.clone())), vec![body.clone()], &inputs)
+                    .unwrap()
+                    .into_iter()
+                    .map(|output| ValueProjection::<ArrayType>::into_projected(output).unwrap())
+                    .collect()
+            },
+            input_types,
+        )
+        .unwrap();
+        let program = traced
+            .to_mlir_module_with_signature_shardings(
+                "main",
+                Some(&[replicated.clone(), sharded.clone(), replicated.clone(), sharded.clone()]),
+                Some(&[sharded, replicated]),
+            )
+            .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
+            .unwrap();
+        let inputs = vec![
+            Array::from_host_buffer(&client, query_type, device_mesh.clone(), &values_to_bytes(&[0.0_f32])).unwrap(),
+            Array::from_host_buffer(
+                &client,
+                key_type,
+                device_mesh.clone(),
+                &values_to_bytes(&[0.0_f32, 1.0, 0.0, 3.0]),
+            )
+            .unwrap(),
+            Array::from_host_buffer(&client, value_type, device_mesh.clone(), &values_to_bytes(&[2.0_f32, 6.0]))
+                .unwrap(),
+            Array::from_host_buffer(&client, seed_type, device_mesh, &values_to_bytes(&[2.0_f32, 5.0])).unwrap(),
+        ];
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        assert_eq!(outputs.len(), 2);
+        for output in outputs {
+            let values = output
+                .outputs
+                .iter()
+                .map(|buffer| values_from_bytes::<f32>(&buffer.copy_to_host(None).unwrap().r#await().unwrap()))
+                .collect::<Vec<_>>();
+            // At query zero the attention weights are equal. The query derivatives are 1 and 3, so the distinct
+            // output seeds give one shared cotangent of 2*1 + 5*3 = 17, rather than either local contribution.
+            assert_eq!(values, vec![vec![4.0], vec![17.0]]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_nested_variation_gradients_execute_on_cpu() {
+        use ryft_core::{ParallelReduce, ParallelReductionKind};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 4);
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let device_mesh = DeviceMesh::new(
+            mesh.clone(),
+            client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let outer = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let inner = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
+        let global = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+            {
+                let replicated = replicated.clone();
+                move |inputs: Vec<ShardMapTracer>| {
+                    let (value, gradient) = inputs[0]
+                        .clone()
+                        .into_value()
+                        .dispatch_domain()
+                        .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
+                        .value_and_gradient(|(shared, weights)| {
+                            let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
+                            let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
+                            Ok(shard_map_with_options::<_, _, ArrayType, _>(
+                                |inputs: (ShardMapTracer, ShardMapTracer)| {
+                                    shard_map_with_options::<_, _, ArrayType, _>(
+                                        |(shared, weights): (ShardMapTracer, ShardMapTracer)| {
+                                            (shared.clone() * shared * weights.clone() * weights)
+                                                .reduce(&[0], ReductionKind::Sum)
+                                                .unwrap()
+                                                .parallel_reduce("y", ParallelReductionKind::Sum)
+                                                .unwrap()
+                                        },
+                                        inputs,
+                                        mesh.clone(),
+                                        (replicated.clone(), inner.clone()),
+                                        replicated.clone(),
+                                        vec!["y".to_string()],
+                                    )
+                                    .unwrap()
+                                    .parallel_reduce("x", ParallelReductionKind::Sum)
+                                    .unwrap()
+                                },
+                                (shared, weights),
+                                mesh.clone(),
+                                (replicated.clone(), outer.clone()),
+                                replicated.clone(),
+                                vec!["x".to_string()],
+                            )
+                            .unwrap()
+                            .into_value())
+                        })
+                        .unwrap();
+                    vec![
+                        ValueProjection::<ArrayType>::into_projected(value).unwrap(),
+                        ValueProjection::<ArrayType>::into_projected(gradient.0).unwrap(),
+                        ValueProjection::<ArrayType>::into_projected(gradient.1).unwrap(),
+                    ]
+                }
+            },
+            vec![ArrayType::scalar(DataType::F32), ArrayType::new_static(DataType::F32, [4])],
+        )
+        .unwrap();
+        let program = traced
+            .to_mlir_module_with_signature_shardings(
+                "main",
+                Some(&[replicated.clone(), global.clone()]),
+                Some(&[replicated.clone(), replicated.clone(), global.clone()]),
+            )
+            .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .unwrap();
+        let shared_buffers = client_devices
+            .iter()
+            .map(|device| {
+                client.buffer(&3.0_f32.to_ne_bytes(), BufferType::F32, [], None, device.clone(), None).unwrap()
+            })
+            .collect();
+        let weight_buffers = client_devices
+            .iter()
+            .zip([1.0_f32, 2.0, 3.0, 4.0])
+            .map(|(device, weight)| {
+                client.buffer(&weight.to_ne_bytes(), BufferType::F32, [1], None, device.clone(), None).unwrap()
+            })
+            .collect();
+        let inputs = vec![
+            Array::from_addressable_buffers(
+                &client,
+                static_sharded_array_type(DataType::F32, &[], replicated),
+                device_mesh.clone(),
+                shared_buffers,
+            )
+            .unwrap(),
+            Array::from_addressable_buffers(
+                &client,
+                static_sharded_array_type(DataType::F32, &[4], global),
+                device_mesh,
+                weight_buffers,
+            )
+            .unwrap(),
+        ];
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        assert_eq!(outputs.len(), 4);
+        let expected_weight_gradients = client_devices
+            .iter()
+            .zip([18.0, 36.0, 54.0, 72.0])
+            .map(|(device, gradient)| (device.id().unwrap(), gradient))
+            .collect::<HashMap<_, _>>();
+        for (output, device_id) in outputs.into_iter().zip(device_ids) {
+            let values = output
+                .outputs
+                .iter()
+                .map(|buffer| values_from_bytes::<f32>(&buffer.copy_to_host(None).unwrap().r#await().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(values, vec![vec![270.0], vec![180.0], vec![expected_weight_gradients[&device_id]]]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_mixed_variation_gradients_execute_on_cpu() {
+        use ryft_core::{ParallelReduce, ParallelReductionKind};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 4);
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let device_mesh = DeviceMesh::new(
+            mesh.clone(),
+            client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let shared_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["z"])]).unwrap();
+        let global =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["z"])])
+                .unwrap();
+        let traced: TracedXlaProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+            {
+                let replicated = replicated.clone();
+                let shared_sharding = shared_sharding.clone();
+                let global = global.clone();
+                move |inputs: Vec<ShardMapTracer>| {
+                    let (value, gradient) = inputs[0]
+                        .clone()
+                        .into_value()
+                        .dispatch_domain()
+                        .differentiate_at((inputs[0].clone().into_value(), inputs[1].clone().into_value()))
+                        .value_and_gradient(|(shared, weights)| {
+                            let shared = ValueProjection::<ArrayType>::into_projected(shared)?;
+                            let weights = ValueProjection::<ArrayType>::into_projected(weights)?;
+                            Ok(shard_map_with_options::<_, _, ArrayType, _>(
+                                |(shared, weights): (ShardMapTracer, ShardMapTracer)| {
+                                    (shared.clone() * shared * weights)
+                                        .reduce(&[0, 1], ReductionKind::Sum)
+                                        .unwrap()
+                                        .parallel_reduce("x", ParallelReductionKind::Sum)
+                                        .unwrap()
+                                },
+                                (shared, weights),
+                                mesh.clone(),
+                                (shared_sharding.clone(), global.clone()),
+                                replicated.clone(),
+                                vec!["x".to_string()],
+                            )
+                            .unwrap()
+                            .into_value())
+                        })
+                        .unwrap();
+                    vec![
+                        ValueProjection::<ArrayType>::into_projected(value).unwrap(),
+                        ValueProjection::<ArrayType>::into_projected(gradient.0).unwrap(),
+                        ValueProjection::<ArrayType>::into_projected(gradient.1).unwrap(),
+                    ]
+                }
+            },
+            vec![
+                ArrayType::new_static(DataType::F32, [2]).with_sharding(shared_sharding.clone()).unwrap(),
+                ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(global.clone()).unwrap(),
+            ],
+        )
+        .unwrap();
+        let program = traced
+            .to_mlir_module_with_signature_shardings(
+                "main",
+                Some(&[shared_sharding.clone(), global.clone()]),
+                Some(&[replicated.clone(), shared_sharding.clone(), global.clone()]),
+            )
+            .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(4))
+            .unwrap();
+        let shared_buffers = client_devices
+            .iter()
+            .zip([3.0_f32, 4.0, 3.0, 4.0])
+            .map(|(device, shared)| {
+                client.buffer(&shared.to_ne_bytes(), BufferType::F32, [1], None, device.clone(), None).unwrap()
+            })
+            .collect();
+        let weight_buffers = client_devices
+            .iter()
+            .zip([2.0_f32, 3.0, 5.0, 7.0])
+            .map(|(device, weight)| {
+                client.buffer(&weight.to_ne_bytes(), BufferType::F32, [1, 1], None, device.clone(), None).unwrap()
+            })
+            .collect();
+        let inputs = vec![
+            Array::from_addressable_buffers(
+                &client,
+                static_sharded_array_type(DataType::F32, &[2], shared_sharding),
+                device_mesh.clone(),
+                shared_buffers,
+            )
+            .unwrap(),
+            Array::from_addressable_buffers(
+                &client,
+                static_sharded_array_type(DataType::F32, &[2, 2], global),
+                device_mesh,
+                weight_buffers,
+            )
+            .unwrap(),
+        ];
+        let device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let arguments = Array::into_execute_arguments(inputs, &device_ids).unwrap();
+        let outputs = executable
+            .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        assert_eq!(outputs.len(), 4);
+        let expected_gradients = client_devices
+            .iter()
+            .zip([(42.0, 9.0), (80.0, 16.0), (42.0, 9.0), (80.0, 16.0)])
+            .map(|(device, gradient)| (device.id().unwrap(), gradient))
+            .collect::<HashMap<_, _>>();
+        for (output, device_id) in outputs.into_iter().zip(device_ids) {
+            let values = output
+                .outputs
+                .iter()
+                .map(|buffer| values_from_bytes::<f32>(&buffer.copy_to_host(None).unwrap().r#await().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                values,
+                vec![vec![223.0], vec![expected_gradients[&device_id].0], vec![expected_gradients[&device_id].1]]
+            );
         }
     }
 
@@ -4364,10 +5473,7 @@ mod tests {
 
     #[test]
     fn test_parallel_reduce_inside_condition_inside_shard_map_lowers_to_all_reduce() {
-        use ryft_core::{
-            Compare, ComparisonDirection, ConditionOperation, ParallelReduceOperation, ParallelReductionKind, Reduce,
-            ReductionKind,
-        };
+        use ryft_core::{ConditionOperation, ParallelReduceOperation, ParallelReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -4402,17 +5508,13 @@ mod tests {
                                 let input = builder.add_input(ArrayIrType::Array(local_type));
                                 builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
                             };
-                            let predicate = local_x
-                                .compare(&local_x, ComparisonDirection::Equal)
-                                .unwrap()
-                                .reduce(&[0], ReductionKind::Any)
-                                .unwrap();
                             let context = local_x.value().context().clone();
+                            let predicate = context.lift(XlaConstant::Boolean(true)).unwrap();
                             let mut outputs = context
                                 .stage_operation(
                                     XlaOperation::Condition(ConditionOperation::new()),
                                     vec![parallel_sum_branch, identity_branch],
-                                    &[predicate.into_value(), local_x.into_value()],
+                                    &[predicate, local_x.into_value()],
                                 )
                                 .unwrap();
                             ValueProjection::<ArrayType>::into_projected(outputs.remove(0))
@@ -4437,20 +5539,18 @@ mod tests {
                   sdy.mesh @mesh = <["x"=4]>
                   func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
-                      %1 = stablehlo.compare EQ, %arg1, %arg1, FLOAT : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xi1>
-                      %c = stablehlo.constant dense<false> : tensor<i1>
-                      %2 = stablehlo.reduce(%1 init: %c) applies stablehlo.or across dimensions = [0] : (tensor<2xi1>, tensor<i1>) -> tensor<i1>
-                      %3 = "stablehlo.if"(%2) ({
-                        %4 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
+                      %c = stablehlo.constant dense<true> : tensor<i1>
+                      %1 = "stablehlo.if"(%c) ({
+                        %2 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
                         ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
-                          %5 = stablehlo.add %arg2, %arg3 : tensor<f32>
-                          stablehlo.return %5 : tensor<f32>
+                          %3 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                          stablehlo.return %3 : tensor<f32>
                         }) : (tensor<2xf32>) -> tensor<2xf32>
-                        stablehlo.return %4 : tensor<2xf32>
+                        stablehlo.return %2 : tensor<2xf32>
                       }, {
                         stablehlo.return %arg1 : tensor<2xf32>
                       }) : (tensor<i1>) -> tensor<2xf32>
-                      sdy.return %3 : tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
                     } : (tensor<8xf32>) -> tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
@@ -4559,7 +5659,14 @@ mod tests {
                             // shape-congruent operands (StableHLO has no implicit broadcasting).
                             let local_type = local_x.r#type().into_owned();
                             let index = local_x.dispatch_domain().axis_index("x").unwrap();
-                            let index = index.broadcast(local_type, &[]).unwrap();
+                            let index_sharding = index
+                                .r#type()
+                                .sharding()
+                                .unwrap()
+                                .with_broadcasted_dimensions(local_type.rank(), &[])
+                                .unwrap();
+                            let index_type = local_type.with_sharding(index_sharding).unwrap();
+                            let index = index.broadcast(index_type, &[]).unwrap();
                             local_x + index
                         },
                         x,
@@ -4663,7 +5770,14 @@ mod tests {
                         |local_x: ShardMapTracer| {
                             let local_type = local_x.r#type().into_owned();
                             let index = local_x.dispatch_domain().axis_index("x").unwrap();
-                            index.broadcast(local_type, &[]).unwrap()
+                            let index_sharding = index
+                                .r#type()
+                                .sharding()
+                                .unwrap()
+                                .with_broadcasted_dimensions(local_type.rank(), &[])
+                                .unwrap();
+                            let index_type = local_type.with_sharding(index_sharding).unwrap();
+                            index.broadcast(index_type, &[]).unwrap()
                         },
                         x,
                         mesh.clone(),

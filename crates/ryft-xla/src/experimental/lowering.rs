@@ -4494,15 +4494,31 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
         .collect())
 }
 
+/// Returns backend-local input types for a named decomposition after boundary validation and differentiation.
+///
+/// Private decomposition functions contain local array computations and have no manual-axis binders. Manual variation
+/// has already determined the enclosing program's explicit transitions and adjoints, so it must not trigger new
+/// transitions when expanding these functions. Retain mesh placement and reduction state, and keep the original types
+/// in the named-composition key so the external operation contract remains unchanged.
+fn named_composition_input_types(input_types: &[ArrayType]) -> Result<Vec<ArrayIrType>, LoweringError> {
+    input_types
+        .iter()
+        .map(|input| {
+            let sharding = input
+                .sharding()
+                .map(|sharding| sharding.clone().with_varying_manual_axes(Vec::<String>::new()))
+                .transpose()?;
+            Ok(ArrayIrType::from(input.clone().with_sharding(sharding)?))
+        })
+        .collect()
+}
+
 /// Traces the canonical scaled-dot decomposition for one validated operation boundary.
 fn trace_scaled_dot_composition(
     operation: &ScaledDotOperation,
     input_types: &[ArrayType],
 ) -> Result<FlatXlaProgram, LoweringError> {
-    let input_types = scaled_dot_composite_input_types(operation, input_types)?
-        .into_iter()
-        .map(ArrayIrType::from)
-        .collect::<Vec<_>>();
+    let input_types = named_composition_input_types(&scaled_dot_composite_input_types(operation, input_types)?)?;
     let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
         |inputs: Vec<XlaTracer<'static>>| {
             let [lhs, rhs, lhs_scale, rhs_scale] = inputs.as_slice() else {
@@ -4530,7 +4546,7 @@ fn trace_attention_composition(
     operation: &DotProductAttentionOperation,
     input_types: &[ArrayType],
 ) -> Result<FlatXlaProgram, LoweringError> {
-    let input_types = input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
+    let input_types = named_composition_input_types(input_types)?;
     let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
         |inputs: Vec<XlaTracer<'static>>| {
             let signature = operation.signature();
@@ -4551,7 +4567,7 @@ fn trace_attention_backward_composition(
     operation: &DotProductAttentionBackwardOperation,
     input_types: &[ArrayType],
 ) -> Result<FlatXlaProgram, LoweringError> {
-    let input_types = input_types.iter().cloned().map(ArrayIrType::from).collect::<Vec<_>>();
+    let input_types = named_composition_input_types(input_types)?;
     let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
         |inputs: Vec<XlaTracer<'static>>| {
             let signature = operation.signature();
@@ -5028,6 +5044,21 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
         mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        // Manual dimension ownership belongs to region boundaries. Local operations may change variation through
+        // collectives, but must not manufacture a global placement that lowering would silently strip away.
+        if output_types.iter().filter_map(ArrayType::sharding).any(|sharding| {
+            sharding.dimensions().iter().any(|dimension| match dimension {
+                ShardingDimension::Sharded(axes) => {
+                    axes.iter().any(|axis| lowerer.collective_state.bound_manual_axes.contains(axis))
+                }
+                _ => false,
+            })
+        }) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` cannot assign bound manual mesh axes to local output dimensions", self.name()),
+            }
+            .into());
+        }
         match self {
             ArrayOperation::Zero(_) => {
                 if !input_values.is_empty() {
@@ -5419,13 +5450,19 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 &mut lowerer.block,
                 lowerer.location,
             ),
-            ArrayOperation::ShardingConstraint(operation) => lower_sharding_constraint(
-                input_values,
-                operation.sharding(),
-                &lowerer.collective_state.bound_manual_axes,
-                &mut lowerer.block,
-                lowerer.location,
-            ),
+            ArrayOperation::ShardingConstraint(operation) => {
+                // The constraint is untracked, so the output type is the input type, and the emitted constraint must
+                // carry the input's tracked placement alongside the constraint's own auto-axis placement.
+                check_count!("output", output_types, 1, ProgramError);
+                let sharding = operation.lowered_sharding(&output_types[0]).map_err(ProgramError::from)?;
+                lower_sharding_constraint(
+                    input_values,
+                    &sharding,
+                    &lowerer.collective_state.bound_manual_axes,
+                    &mut lowerer.block,
+                    lowerer.location,
+                )
+            }
             ArrayOperation::Broadcast(operation) => <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -5632,6 +5669,13 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 let result = lowerer.block.append_operation(stable_hlo::xor(left, right, lowerer.location)?)?;
                 Ok(vec![result.result(0).expect("stablehlo.xor should return one result").as_ref()])
             }
+            ArrayOperation::ParallelVary(operation) => {
+                check_count!("input", input_values, 1, ProgramError);
+                check_count!("output", output_types, 1, ProgramError);
+                // The forward map only weakens invariance. Resolve its axis even though it emits no communication.
+                mesh_axis_replica_groups(&lowerer.collective_state, operation.axis_name())?;
+                Ok(vec![input_values[0]])
+            }
             ArrayOperation::ParallelReduce(operation) => {
                 // This plain dispatch serves nested programs (control-flow bodies, inlined custom-derivative and
                 // rematerialized primals), which can sit inside a shard_map manual region: the threaded
@@ -5709,6 +5753,12 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 check_count!("input", input_values, 0, ProgramError);
                 check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
+                if operation.mesh().is_none() && collective_state.manual_axis_region(operation.axis_name()).is_some() {
+                    return Err(ProgramError::MalformedProgram(
+                        "`axis_index` requires mesh metadata inside a manual region".to_string(),
+                    )
+                    .into());
+                }
                 let result = lower_axis_index_to_coordinate(
                     operation,
                     &collective_state,
@@ -6143,8 +6193,8 @@ pub(crate) struct CollectiveLoweringState {
     /// Module-scoped counter producing the next collective channel id.
     channel_ids: Rc<Cell<usize>>,
 
-    /// Innermost enclosing manual region's [`ShardMap`], or `None` outside manual regions.
-    manual_shard_map: Option<Rc<ShardMap>>,
+    /// Enclosing manual regions, ordered from outermost to innermost for named-axis resolution.
+    manual_regions: Vec<Rc<ShardMap>>,
 
     /// Axes bound by every enclosing manual region, excluded from shard-local placement constraints.
     bound_manual_axes: Vec<String>,
@@ -6175,7 +6225,7 @@ impl CollectiveLoweringState {
     pub(crate) fn new() -> Self {
         Self {
             channel_ids: Rc::new(Cell::new(1)),
-            manual_shard_map: None,
+            manual_regions: Vec::new(),
             bound_manual_axes: Vec::new(),
             target_platform: None,
             ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
@@ -6224,9 +6274,11 @@ impl CollectiveLoweringState {
                 bound_manual_axes.push(axis.clone());
             }
         }
+        let mut manual_regions = self.manual_regions.clone();
+        manual_regions.push(Rc::new(shard_map));
         Self {
             channel_ids: self.channel_ids.clone(),
-            manual_shard_map: Some(Rc::new(shard_map)),
+            manual_regions,
             bound_manual_axes,
             target_platform: self.target_platform.clone(),
             ragged_dot_lowering_strategy: self.ragged_dot_lowering_strategy,
@@ -6238,7 +6290,16 @@ impl CollectiveLoweringState {
 
     /// Returns the innermost enclosing manual region's [`ShardMap`], or `None` outside manual regions.
     pub(crate) fn manual_shard_map(&self) -> Option<&ShardMap> {
-        self.manual_shard_map.as_deref()
+        self.manual_regions.last().map(Rc::as_ref)
+    }
+
+    /// Returns the nearest enclosing region binding `axis_name`.
+    fn manual_axis_region(&self, axis_name: &str) -> Option<&ShardMap> {
+        self.manual_regions
+            .iter()
+            .rev()
+            .find(|region| region.manual_axes().iter().any(|axis| axis == axis_name))
+            .map(Rc::as_ref)
     }
 
     /// Returns a fresh module-unique channel id for one channeled collective.
@@ -9345,8 +9406,10 @@ where
         .map(|array_type| lower_tensor_type(array_type, context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut manual_inputs = outer_inputs.to_vec();
-    let mut input_shardings = shard_map.to_shardy_in_shardings(context)?.shardings();
-    let mut output_shardings = shard_map.to_shardy_out_shardings(context)?.shardings();
+    let mut input_shardings =
+        shard_map.to_shardy_in_shardings(&collective_state.bound_manual_axes, context)?.shardings();
+    let mut output_shardings =
+        shard_map.to_shardy_out_shardings(&collective_state.bound_manual_axes, context)?.shardings();
     if !threaded_effects.is_empty() {
         let token_type = context.stable_hlo_token_type()?.as_ref();
         // Tokens have rank zero and no replicated/unreduced axes. Each device carries its own token, without
@@ -9843,8 +9906,9 @@ fn mesh_axis_replica_groups(
         }
         .into());
     };
-    let mesh = shard_map.mesh();
-    if !shard_map.manual_axes().iter().any(|manual_axis| manual_axis == axis_name) {
+    let axis_region = collective_state.manual_axis_region(axis_name);
+    let mesh = axis_region.unwrap_or(shard_map).mesh();
+    if axis_region.is_none() {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "collective over axis `{axis_name}` cannot lower inside this shard_map manual region because the \
@@ -10423,6 +10487,17 @@ fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    if let Some(mesh) = operation.mesh()
+        && collective_state
+            .manual_axis_region(operation.axis_name())
+            .is_some_and(|region| region.mesh() != mesh)
+    {
+        return Err(ProgramError::MalformedProgram(format!(
+            "`{}` mesh does not match its active manual binding",
+            operation.name(),
+        ))
+        .into());
+    }
     let (replica_groups, effective_axis_size) = match operation.axis_index_groups() {
         Some(axis_index_groups) => collective_replica_groups(
             collective_state,
@@ -10507,8 +10582,9 @@ fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
         }
         .into());
     };
-    let mesh = shard_map.mesh();
-    if !shard_map.manual_axes().iter().any(|manual_axis| manual_axis == axis_name) {
+    let axis_region = collective_state.manual_axis_region(axis_name);
+    let mesh = axis_region.unwrap_or(shard_map).mesh();
+    if axis_region.is_none() {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "{AXIS_INDEX_OPERATION_NAME} for axis `{axis_name}` cannot lower inside this \
@@ -10516,6 +10592,12 @@ fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
                  axis",
             ),
         }
+        .into());
+    }
+    if operation.mesh().is_some_and(|declared| declared != mesh) {
+        return Err(ProgramError::MalformedProgram(
+            "`axis_index` mesh does not match its active manual binding".to_string(),
+        )
         .into());
     }
     let axis_index = mesh.axis_index(axis_name).unwrap();
@@ -14448,6 +14530,58 @@ mod tests {
     }
 
     #[test]
+    fn test_broadcast_rejects_bound_manual_output_placement() {
+        use ryft_core::Broadcast;
+
+        use crate::experimental::shard_map::ShardMapTraceError;
+
+        let mesh = test_manual_mesh("x", 2);
+        let boundary = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let local_output = test_vector_type(2)
+            .with_sharding(boundary.clone().with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
+            |input| input.broadcast(local_output.clone(), &[0]).unwrap(),
+            test_vector_type(4),
+            mesh,
+            boundary.clone(),
+            boundary,
+        )
+        .unwrap();
+        assert!(matches!(
+            lower_traced_module(&traced, "main"),
+            Err(ShardMapTraceError::LoweringFailure { message })
+                if message == "`broadcast` cannot assign bound manual mesh axes to local output dimensions",
+        ));
+    }
+
+    #[test]
+    fn test_axis_index_rejects_missing_checked_mesh_metadata() {
+        use crate::experimental::shard_map::ShardMapTraceError;
+
+        let mesh = test_manual_mesh("x", 2);
+        let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
+            |input| {
+                input
+                    .dispatch_domain()
+                    .bind(AxisIndexOperation::new("x".to_string()), Vec::new(), &[])
+                    .unwrap()
+                    .remove(0)
+            },
+            test_vector_type(4),
+            mesh.clone(),
+            Sharding::replicated(mesh.clone(), 1),
+            Sharding::replicated(mesh, 0),
+        )
+        .unwrap();
+        assert!(matches!(
+            lower_traced_module(&traced, "main"),
+            Err(ShardMapTraceError::LoweringFailure { message })
+                if message == "encountered malformed program: `axis_index` requires mesh metadata inside a manual region",
+        ));
+    }
+
+    #[test]
     fn test_broadcast_explicit_sharding_transition_lowers_to_constraint() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input_type = test_vector_type(4).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
@@ -15230,7 +15364,7 @@ mod tests {
         let mesh = test_manual_mesh("x", device_count);
         let sharding = Sharding::replicated(mesh.clone(), 1);
         let body = FlatTracedShardMap::from_parts(
-            ShardMap::from_shardings(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()], true),
+            ShardMap::from_shardings(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()]),
             vec![vector_type.clone()],
             vec![vector_type.clone()],
             vec![vector_type.clone()],
@@ -15405,7 +15539,12 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let device_index = builder
-            .add_instruction(AxisIndexOperation::new("x".to_string()), Vec::new(), Vec::new(), None)
+            .add_instruction(
+                AxisIndexOperation::new("x".to_string()).with_mesh(test_manual_mesh("x", 2)),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
             .unwrap()[0];
         let device_index = builder
             .add_instruction(
@@ -20345,6 +20484,31 @@ mod tests {
             .unwrap();
         let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
         (unproject_plain_program(program), input_types, vec![output_type])
+    }
+
+    #[test]
+    fn test_named_composition_input_types() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("varying", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("placed", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("reduced", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("unreduced", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["placed"])])
+            .unwrap()
+            .with_reduced_axes(["reduced"])
+            .unwrap()
+            .with_unreduced_axes(["unreduced"])
+            .unwrap();
+        let local = ArrayType::new(DataType::F32, Shape::new(vec![4.into()])).with_sharding(sharding.clone()).unwrap();
+        let boundary = local.clone().with_sharding(sharding.with_varying_manual_axes(["varying"]).unwrap()).unwrap();
+        let unsharded = ArrayType::scalar(DataType::F32);
+
+        assert_eq!(
+            named_composition_input_types(&[boundary, unsharded.clone()]).unwrap(),
+            vec![ArrayIrType::from(local), ArrayIrType::from(unsharded)],
+        );
     }
 
     #[test]

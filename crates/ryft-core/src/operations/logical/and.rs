@@ -5,6 +5,8 @@ use crate::macros::{
 };
 use crate::programs::ProgramError;
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`AndOperation`].
 pub const AND_OPERATION_NAME: &str = "and";
 
@@ -82,7 +84,7 @@ impl std::ops::BitAnd for Array {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
         DifferentiationError, DifferentiationTracer, TransposableOperation, TranspositionContext, differentiate_at,
@@ -241,5 +243,30 @@ mod tests {
         ));
         // The `std::ops` sugar delegates to the fallible capability.
         assert_eq!(left.clone() & right.clone(), Array::vector(vec![true, false, false, false]).unwrap());
+        // Eager inputs cannot implicitly acquire manual variation, including when no elements are traversed.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::scalar(DataType::Boolean)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let varying = Array::from_elements(varying_type.clone(), &[true]).unwrap();
+        let invariant = Array::scalar(false).unwrap();
+        let expected = Err(TypeError::invalid(
+            "`and` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack an \
+             axis, as `align_manual_variation` does",
+        )
+        .into());
+        assert_eq!(invariant.and(&varying), expected);
+        assert_eq!(varying.and(&invariant), expected);
+        assert_eq!(varying.and(&varying), Array::from_elements(varying_type, &[true]));
+        let empty_type = ArrayType::new_static(DataType::Boolean, [0]);
+        let empty = Array::from_elements::<bool>(empty_type.clone(), &[]).unwrap();
+        let varying_empty = Array::from_elements::<bool>(
+            empty_type
+                .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
+                .unwrap(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(empty.and(&varying_empty), expected);
     }
 }

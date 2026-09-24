@@ -4,6 +4,8 @@
 //! data, so the array universe answers the comparison contract at both the dimension member level and the composite
 //! level.
 
+// TODO(eaplatanios): Review this module.
+
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -15,7 +17,7 @@ use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::DimensionType;
-use crate::operations::{Compare, ComparisonDirection, ElementType};
+use crate::operations::{COMPARE_OPERATION_NAME, Compare, ComparisonDirection, ElementType};
 use crate::programs::{ProgramError, TypeError, Typed, Value, ValueProjection};
 
 impl<A: Value<Type = ArrayType>> Compare for ArrayIrValue<A>
@@ -81,6 +83,10 @@ impl Compare for Array {
         // Broadcast the operand types together (including element-type promotion) so mixed-precision comparisons
         // mirror the `CompareOperation` type-inference contract, then compare the promoted elements pairwise. The
         // output type is the Boolean-typed counterpart of the broadcast type.
+        ArrayType::check_matching_manual_variation(
+            COMPARE_OPERATION_NAME,
+            &[self.r#type().as_ref(), rhs.r#type().as_ref()],
+        )?;
         let (broadcast_type, operands) = Self::broadcast_promoted(&[self, rhs])?;
         let target = broadcast_type.data_type();
         let output_type = broadcast_type.with_element_type(DataType::Boolean);

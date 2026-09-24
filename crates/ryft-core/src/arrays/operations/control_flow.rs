@@ -26,8 +26,8 @@ use crate::operations::control_flow::scan::{
     write_scan_iteration,
 };
 use crate::operations::{
-    AddOperation, AndOperation, BroadcastOperation, DimensionFromScalarOperation, DimensionToScalarOperation,
-    DynamicUpdateSliceOperation, Fill, OneOperation, DIMENSION_DATA_TYPE, ReduceOperation, ReductionKind,
+    AddOperation, AndOperation, BroadcastOperation, DIMENSION_DATA_TYPE, DimensionFromScalarOperation,
+    DimensionToScalarOperation, DynamicUpdateSliceOperation, Fill, OneOperation, ReduceOperation, ReductionKind,
     Reshape, SelectOperation, Slice, TemporalResidualOperation, TemporalResidualType, UpdateSlice, WhilePredicate,
     WhileResidualStackOperation, WhileResidualStackType, Zero, ZeroOperation,
 };
@@ -353,6 +353,10 @@ impl crate::operations::control_flow::WhilePredicate for Array {
                 ),
             });
         }
+        ArrayType::check_matching_manual_variation(
+            "mask_select",
+            &[self.r#type().as_ref(), on_true.r#type().as_ref(), on_false.r#type().as_ref()],
+        )?;
         let block = true_addressing.element_count() / predicate_addressing.element_count();
         let mut output_bytes = vec![0; true_addressing.storage_byte_len()];
         for index in 0..true_addressing.element_count() {
@@ -380,6 +384,8 @@ mod tests {
     use crate::arrays::operations::references::ReferenceDynamicIndexOperation;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::references::{ArrayReference, ArrayReferenceView, ArrayReferenceViewIndex};
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::sharding::shardings::Sharding;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
@@ -395,7 +401,7 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{Program, ProgramBuilder, ProgramError, ReferenceType, Typed};
+    use crate::programs::{Program, ProgramBuilder, ProgramError, ReferenceType, TypeError, Typed};
     use crate::tracing::TracingContext;
 
     type TestValue = ArrayIrValue<Array>;
@@ -426,6 +432,26 @@ mod tests {
             )
             .unwrap()[0];
         builder.build(vec![extent, output], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
+    }
+
+    #[test]
+    fn test_array_mask_select_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::scalar(DataType::Boolean)
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let predicate = Array::from_elements(varying_type.clone(), &[true]).unwrap();
+        let invariant = Array::scalar(false).unwrap();
+        assert_eq!(
+            predicate.mask_select(&invariant, &invariant),
+            Err(TypeError::invalid(
+                "`mask_select` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                 that lack an axis, as `align_manual_variation` does"
+            )
+            .into()),
+        );
+        let varying = Array::from_elements(varying_type, &[false]).unwrap();
+        assert_eq!(predicate.mask_select(&varying, &varying), Ok(varying));
     }
 
     #[test]

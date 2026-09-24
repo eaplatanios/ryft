@@ -23,6 +23,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
+use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
@@ -36,8 +37,8 @@ use crate::operations::math::div::DivOperation;
 use crate::operations::math::mul::MulOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
-    Value, ValueProjection,
+    MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,
+    TypeError, Typed, Value, ValueProjection,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -357,7 +358,9 @@ impl_differentiable_operation! {
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
-        O: From<BroadcastOperation> + From<ConstantOperation<Array>> + From<MulOperation<ArrayType>>,
+        O: From<BroadcastOperation> + From<ConstantOperation<Array>> + From<MulOperation<ArrayType>>
+            + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
+            + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             check_count!("input", inputs, 1, ProgramError);

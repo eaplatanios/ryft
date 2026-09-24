@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt::Display;
 
 // TODO(eaplatanios): Review this module.
@@ -6,7 +7,7 @@ use std::fmt::Display;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
     ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis,
-    ShardingDimension, TiledLayout,
+    Sharding, ShardingDimension, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1379,7 +1380,29 @@ impl Operation for CustomCallOperation {
                 )));
             }
         }
-        Ok(self.output_types.clone())
+        // Opaque code cannot be assumed to produce the same result on every device, so an output whose declared type
+        // says nothing about placement inherits the manual variation of the inputs, placed replicated on their mesh.
+        // A declared sharding is the author's statement and is kept as is.
+        let Some(input_sharding) = input_types.iter().find_map(ArrayType::sharding) else {
+            return Ok(self.output_types.clone());
+        };
+        let varying_manual_axes = input_types
+            .iter()
+            .filter_map(ArrayType::sharding)
+            .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
+            .collect::<BTreeSet<_>>();
+        self.output_types
+            .iter()
+            .map(|output_type| {
+                if output_type.sharding().is_some() || varying_manual_axes.is_empty() {
+                    return Ok(output_type.clone());
+                }
+                let sharding = Sharding::replicated(input_sharding.mesh().clone(), output_type.rank())
+                    .with_varying_manual_axes(varying_manual_axes.clone())
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                output_type.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
+            })
+            .collect()
     }
 
     #[inline]
@@ -2025,7 +2048,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue,
         ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
-        RaggedAxis, Shape, ShardingDimension, StridedLayout,
+        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, ShardingDimension, StridedLayout,
     };
     use crate::batching::{
         BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingError, BatchingTracer,
@@ -2291,6 +2314,28 @@ mod tests {
                 "`custom_call` expects 2 trailing output-extent dimensions but only 1 inputs were provided",
             )),
         );
+    }
+
+    #[test]
+    fn test_custom_call_type_inference_manual_variation() {
+        // Opaque code cannot be assumed to agree across devices, so an output declared without a sharding inherits
+        // the inputs' manual variation, placed replicated on their mesh, whereas a declared sharding is kept as is.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
+        let varying_input = vector_type().with_sharding(varying.clone()).unwrap();
+        let declared = vector_type().with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type(), declared.clone()]);
+        assert_eq!(
+            operation.infer_output_types(&[varying_input], &[]),
+            Ok(vec![vector_type().with_sharding(varying).unwrap(), declared]),
+        );
+
+        // Invariant and unsharded inputs leave undeclared outputs unsharded.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let invariant_input = vector_type().with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
+        assert_eq!(operation.infer_output_types(&[invariant_input], &[]), Ok(vec![vector_type()]));
+        assert_eq!(operation.infer_output_types(&[vector_type()], &[]), Ok(vec![vector_type()]));
     }
 
     #[test]

@@ -119,7 +119,7 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::programs::{EmptyRegionDriver, Typed};
+    use crate::programs::{EmptyRegionDriver, TypeError, Typed};
 
     use super::*;
 
@@ -350,6 +350,35 @@ mod tests {
         // Integer arithmetic wraps deterministically, matching the scalar reference backend.
         let wrapped = Array::vector(vec![255u8]).unwrap().add(&Array::vector(vec![1u8]).unwrap()).unwrap();
         assert_eq!(wrapped.elements::<u8>(), Ok(vec![0]));
+    }
+
+    #[test]
+    fn test_add_for_array_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let varying = Array::from_elements(varying_type.clone(), &[2_f32]).unwrap();
+        let invariant = Array::scalar(1_f32).unwrap();
+        let expected = Err(TypeError::invalid(
+            "`add` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack an \
+             axis, as `align_manual_variation` does",
+        )
+        .into());
+        assert_eq!(invariant.add(&varying), expected);
+        assert_eq!(varying.add(&invariant), expected);
+        assert_eq!(varying.add(&varying), Array::from_elements(varying_type, &[4_f32]));
+
+        let empty_type = ArrayType::new_static(DataType::F32, [0]);
+        let empty = Array::from_elements::<f32>(empty_type.clone(), &[]).unwrap();
+        let varying_empty = Array::from_elements::<f32>(
+            empty_type
+                .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap())
+                .unwrap(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(empty.add(&varying_empty), expected);
     }
 
     #[test]
