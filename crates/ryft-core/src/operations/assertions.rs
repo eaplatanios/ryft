@@ -611,10 +611,8 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
             // Every item has the same condition and observations, so one assertion suffices. A dynamic extent
             // may still be zero at execution time; mask the condition so that case passes vacuously.
             let mut arguments = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
-            arguments[0] = P::from_array_value(P::mask_empty_batch_condition(
-                context,
-                P::into_array_value(arguments[0].clone())?,
-            )?);
+            arguments[0] =
+                P::from_array_value(P::mask_empty_batch_condition(context, P::array_value(arguments[0].clone())?)?);
             context.parent().assert(self.clone(), &arguments)?;
             return Ok(Vec::new().into());
         }
@@ -637,7 +635,7 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
             });
         }
 
-        let condition = P::into_array_value(P::value(&inputs[0]).clone())?;
+        let condition = P::array_value(P::value(&inputs[0]).clone())?;
         let (condition, index) = if P::batch_axis(&inputs[0]).axis().is_some() {
             let coordinates_type = condition.r#type().into_owned().with_data_type(DataType::I32);
             let coordinates = P::batch_item_indices(context, &coordinates_type)?;
@@ -666,7 +664,7 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
         let mut padded_extent = None;
         for input in &inputs[1..] {
             if P::batch_axis(input).axis().is_some() {
-                let input = P::into_array_value(P::pad_empty_batch_observation(
+                let input = P::array_value(P::pad_empty_batch_observation(
                     context,
                     P::value(input).clone(),
                     &mut padded_extent,
@@ -703,8 +701,6 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
 impl_non_differentiable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
 impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents a [`BatchingPolicy`] that can batch [`AssertOperation`]s. Batching an assertion forwards it to the parent
 /// context. An assertion without a failure limit reduces its batched condition to one scalar Boolean and reports the
 /// observations of the first failing batch item, together with that item's index as an additional `batch_index`
@@ -715,20 +711,20 @@ impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<Arr
 /// captures exactly those differences, so that one [`BatchableOperation`] implementation serves every policy that
 /// implements it.
 pub(crate) trait AssertionBatchingPolicy<C: AssertionContext>: BatchingPolicy<C> {
-    /// Array value that the shared batching rule computes with, which is `C::Value` itself for array batching and its
-    /// array projection for array IR batching.
+    /// [`ArrayType`]d value that the shared batching rule computes with, which is `C::Value` itself for array batching
+    /// and its array projection for array IR batching.
     type ArrayValue: Value<Type = ArrayType> + Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike;
 
     /// Returns the extent of the batch axis, which may be dynamic.
     fn batch_extent(context: &BatchingContext<C, Self>) -> Result<Dimension, BatchingError>;
 
     /// Returns `value` viewed as an [`ArrayValue`](Self::ArrayValue).
-    fn into_array_value(value: C::Value) -> Result<Self::ArrayValue, ProgramError>;
+    fn array_value(value: C::Value) -> Result<Self::ArrayValue, ProgramError>;
 
-    /// Returns `value` as a value of the context, reversing [`into_array_value`](Self::into_array_value).
+    /// Returns `value` as a value of the context, reversing [`array_value`](Self::array_value).
     fn from_array_value(value: Self::ArrayValue) -> C::Value;
 
-    /// Returns the index of every batch item along the leading batch axis of an array of type `r#type`.
+    /// Returns an array with the index of every batch item along the leading batch axis of an array of type `r#type`.
     fn batch_item_indices(
         context: &BatchingContext<C, Self>,
         r#type: &ArrayType,
@@ -759,11 +755,14 @@ pub(crate) trait AssertionBatchingPolicy<C: AssertionContext>: BatchingPolicy<C>
     ) -> Result<Vec<C::Value>, BatchingError>;
 }
 
-impl<C: AssertionContext<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> AssertionBatchingPolicy<C>
-    for ArrayBatchingPolicy<P>
-where
-    C::Operation: From<IotaOperation<ArrayType>> + From<BroadcastOperation>,
-    C::Value: Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
+impl<
+    C: AssertionContext<
+            Type = ArrayType,
+            Value: Reduce + Select + DynamicSlice + Reshape + ConvertElementType + ZeroLike,
+            Operation: From<IotaOperation<ArrayType>> + From<BroadcastOperation>,
+        >,
+    P: ArrayExtentBatchingPolicy<C>,
+> AssertionBatchingPolicy<C> for ArrayBatchingPolicy<P>
 {
     type ArrayValue = C::Value;
 
@@ -773,7 +772,7 @@ where
     }
 
     #[inline]
-    fn into_array_value(value: C::Value) -> Result<Self::ArrayValue, ProgramError> {
+    fn array_value(value: C::Value) -> Result<Self::ArrayValue, ProgramError> {
         Ok(value)
     }
 
@@ -815,8 +814,8 @@ where
         observation: C::Value,
         _padded_extent: &mut Option<C::Value>,
     ) -> Result<C::Value, ProgramError> {
-        // Only array IR batching pads observations for possibly empty dynamic batches, and array batching slices them
-        // as they are.
+        // Only array IR batching pads observations for possibly empty dynamic batches,
+        // and array batching slices them as they are.
         Ok(observation)
     }
 
@@ -853,30 +852,34 @@ where
     }
 }
 
-impl<C: AssertionContext<Type = ArrayIrType>> AssertionBatchingPolicy<C> for ArrayIrBatchingPolicy
-where
-    C::Operation: From<ConstantOperation<DimensionValue>>
-        + From<IotaOperation<ArrayType>>
-        + From<ZeroOperation<ArrayType>>
-        + From<DimensionAddOperation>
-        + From<CompareOperation<ArrayIrType>>
-        + From<PadOperation<ArrayIrType>>
-        + From<DynamicBroadcastOperation>
-        + From<DimensionSizeOperation>,
-    C::Value: ValueProjection<
-            ArrayType,
-            Projected: Value<Type = ArrayType>
-                           + Reduce
-                           + Select
-                           + DynamicSlice
-                           + Reshape
-                           + ConvertElementType
-                           + ZeroLike
-                           + Transpose,
+impl<
+    C: AssertionContext<
+            Type = ArrayIrType,
+            Value: ValueProjection<
+                ArrayType,
+                Projected: Value<Type = ArrayType>
+                               + Reduce
+                               + Select
+                               + DynamicSlice
+                               + Reshape
+                               + ConvertElementType
+                               + ZeroLike
+                               + Transpose,
+            >,
+            Operation: From<ConstantOperation<DimensionValue>>
+                           + From<IotaOperation<ArrayType>>
+                           + From<ZeroOperation<ArrayType>>
+                           + From<DimensionAddOperation>
+                           + From<CompareOperation<ArrayIrType>>
+                           + From<PadOperation<ArrayIrType>>
+                           + From<DynamicBroadcastOperation>
+                           + From<DimensionSizeOperation>,
         >,
+> AssertionBatchingPolicy<C> for ArrayIrBatchingPolicy
 {
     type ArrayValue = <C::Value as ValueProjection<ArrayType>>::Projected;
 
+    #[inline]
     fn batch_extent(context: &BatchingContext<C, Self>) -> Result<Dimension, BatchingError> {
         match context.axis_extent().r#type().as_ref() {
             ArrayIrType::Dimension(dimension) => Ok(dimension.to_dimension()),
@@ -885,7 +888,7 @@ where
     }
 
     #[inline]
-    fn into_array_value(value: C::Value) -> Result<Self::ArrayValue, ProgramError> {
+    fn array_value(value: C::Value) -> Result<Self::ArrayValue, ProgramError> {
         Ok(value.into_projected()?)
     }
 
@@ -1018,6 +1021,8 @@ where
         Ok(arguments)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Checks Boolean conditions, reporting a message and named scalar observations when they fail.
 /// Eager execution reports failures immediately. Tracing elides known successes and retains failing or symbolic
