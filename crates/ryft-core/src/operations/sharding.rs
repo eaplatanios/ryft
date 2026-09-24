@@ -319,29 +319,26 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the ability to reshard a value to a target [`Sharding`]. [`Reshard`] stages a [`ReshardOperation`],
 /// which is an identity function on the array's elements whose output type carries the target sharding. Concrete
 /// single-device values record the target on their type and leave their payload untouched, and context-carrying values
-/// stage the operation instead, so that transforms that apply operations through interpretation (e.g., program
-/// batching and re-tracing) preserve the resharding. Every implementation validates the target exactly like
-/// [`ReshardOperation`] type inference does, so that eager and staged evaluation accept the same programs.
+/// stage the operation instead, so that transforms that apply operations through interpretation (e.g., program batching
+/// and re-tracing) preserve the resharding. Every implementation validates the target exactly like [`ReshardOperation`]
+/// type inference does, so that eager and staged evaluation accept the same programs.
 pub trait Reshard: Clone {
     /// Reshards `self` to `sharding`, and returns a [`ProgramError`] if `sharding` is not a valid target for `self` or
     /// the resharding cannot be recorded in the value's context.
     fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError>;
 }
 
-// Any context-carrying value reshards by binding a [`ReshardOperation`] through its own context. The
-// `From<ReshardOperation>` bound makes this disjoint from the eager value types (whose context operation is
-// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType>> Reshard for V
-where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReshardOperation>,
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReshardOperation>>>> Reshard
+    for V
 {
     fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
+        // Any context-carrying value reshards by binding a `ReshardOperation` through its own context. The
+        // `From<ReshardOperation>` bound makes this disjoint from the eager value types (whose context operation
+        // is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
+        // implementations.
         let mut outputs = self.dispatch_domain().bind(
             ReshardOperation::new(sharding.clone()),
             Vec::new(),
@@ -352,11 +349,12 @@ where
     }
 }
 
-// An `Array` is a concrete single-device value, so resharding is a no-op on its payload. Its type still records the
-// target, and the output type comes from the `ReshardOperation` type-inference rule itself, so that eager evaluation
-// validates the target and carries the input's varying manual axes over exactly like staged programs do.
 impl Reshard for Array {
     fn reshard(&self, sharding: &Sharding) -> Result<Self, ProgramError> {
+        // An `Array` is a concrete single-device value, so resharding is a no-op on its payload. Its type still records
+        // the target, and the output type comes from the `ReshardOperation` type inference rule itself, so that eager
+        // evaluation validates the target and carries the input's varying manual axes over exactly like staged programs
+        // do.
         let input_type = self.r#type().into_owned();
         let mut output_types = ReshardOperation::new(sharding.clone()).infer_output_types(&[input_type], &[])?;
         check_count!("output", output_types, 1, ProgramError);
@@ -367,15 +365,15 @@ impl Reshard for Array {
 /// Canonical operation name for [`ConstrainShardingOperation`].
 pub const CONSTRAIN_SHARDING_OPERATION_NAME: &str = "constrain_sharding";
 
-/// [`Operation`] that constrains the placement of its input over [`Auto`](MeshAxisType::Auto) mesh axes, the analogue
-/// of JAX's
-/// [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html).
-/// Type inference is the identity, so the output type, sharding included, equals the input type and the constraint
-/// never becomes type-level state. The constraint is nevertheless binding: when the program is lowered, the backend
-/// compiler must place the value as requested over the auto axes and only remains free where the constraint is
-/// unconstrained. A constraint that shards a dimension over a non-auto axis is rejected, because such placements are
-/// tracked transitions that belong to a [`ReshardOperation`], and a constraint on a different mesh than the input's
-/// tracked sharding is rejected as well. Refer to the documentation of [`ConstrainSharding`] for more information.
+/// [`Operation`] that constrains the placement of its input over [`MeshAxisType::Auto`] mesh axes.
+/// This operation is the Ryft analogue of JAX's [`jax.lax.with_sharding_constraint`](
+/// https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html). Type inference is the identity,
+/// so the output type, sharding included, equals the input type and the constraint never becomes type-level state.
+/// The constraint is nevertheless binding. When the program is lowered, the backend compiler must place the value as
+/// requested over the auto axes and only remains free where the constraint is unconstrained. A constraint that shards
+/// a dimension over a non-auto axis is rejected, because such placements are tracked transitions that belong to a
+/// [`ReshardOperation`], and a constraint on a different mesh than the input's tracked sharding is rejected as well.
+/// Refer to the documentation of [`ConstrainSharding`] for more information.
 ///
 /// Interpretation passes the value through unchanged. Batching leaves the new batch axis unconstrained in the lifted
 /// constraint, so that the compiler remains free to place it. Differentiation applies the same constraint to the
@@ -384,7 +382,7 @@ pub const CONSTRAIN_SHARDING_OPERATION_NAME: &str = "constrain_sharding";
 /// emitted constraint also carries the input's tracked placement.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ConstrainShardingOperation {
-    /// Refer to the documentation of [`sharding`](Self::sharding) for more information.
+    /// Underlying [`Sharding`] constraint over [`MeshAxisType::Auto`] mesh axes.
     sharding: Sharding,
 }
 
@@ -395,19 +393,19 @@ impl ConstrainShardingOperation {
         Self { sharding }
     }
 
-    /// Returns the [`Sharding`] constraint over auto mesh axes.
+    /// Returns the underlying [`Sharding`] constraint over [`MeshAxisType::Auto`] mesh axes.
     #[inline]
     pub fn sharding(&self) -> &Sharding {
         &self.sharding
     }
 
-    /// Returns the [`Sharding`] a backend must constrain an input of type `input_type` to. An input without a tracked
-    /// sharding is constrained to [`sharding`](Self::sharding) as is. Otherwise, the tracked placement is merged into
-    /// the constraint dimension by dimension, so that the emitted constraint never contradicts the type the program
-    /// was checked against: a tracked sharded dimension keeps its axes and gains the constraint's auto axes after them
-    /// (mirroring JAX's `with_sharding_constraint` lowering), or stays as is where the constraint is replicated or
+    /// Returns the [`Sharding`] a backend must constrain an input of type `input_type` to for this
+    /// [`ConstrainShardingOperation`]. An input without a tracked sharding is constrained to [`Self::sharding`] as is.
+    /// Otherwise, the tracked placement is merged into the constraint dimension by dimension, so that the emitted
+    /// constraint never contradicts the type the program was checked against (i.e., a tracked sharded dimension keeps
+    /// its axes and gains the constraint's auto axes after them, or stays as is where the constraint is replicated or
     /// unconstrained, whereas a tracked replicated dimension takes the constraint's entry, since a tracked type is
-    /// only replicated over the axes the type system governs and leaves the auto axes to the compiler. The tracked
+    /// only replicated over the axes the type system governs and leaves the auto axes to the compiler). The tracked
     /// unreduced, reduced, and varying manual axes are carried over as well.
     ///
     /// # Parameters
@@ -418,23 +416,27 @@ impl ConstrainShardingOperation {
         let Some(tracked) = input_type.sharding() else {
             return Ok(self.sharding.clone());
         };
+
         // A tracked type may still name auto axes (e.g., the actual placement of a concrete input), but placement
         // over those axes is the compiler's to decide and exactly what this constraint overrides, so only the
         // placement the type system governs is carried over.
         let tracked = tracked.without_auto_axes();
         if tracked.rank() != self.sharding.rank() {
             return Err(TypeError::invalid(format!(
-                "`{CONSTRAIN_SHARDING_OPERATION_NAME}` rank ({}) does not match the input rank ({})",
+                "`{}` rank ({}) does not match the input rank ({})",
+                CONSTRAIN_SHARDING_OPERATION_NAME,
                 self.sharding.rank(),
                 tracked.rank(),
             )));
         }
+
         if tracked.mesh() != self.sharding.mesh() {
             return Err(TypeError::invalid(format!(
-                "`{CONSTRAIN_SHARDING_OPERATION_NAME}` sharding {} is on a different mesh than the input sharding {}",
-                self.sharding, tracked,
+                "`{}` sharding {} is on a different mesh than the input sharding {}",
+                CONSTRAIN_SHARDING_OPERATION_NAME, self.sharding, tracked,
             )));
         }
+
         let dimensions = tracked
             .dimensions()
             .iter()
@@ -449,6 +451,7 @@ impl ConstrainShardingOperation {
                 (ShardingDimension::Replicated | ShardingDimension::Unconstrained, constrained) => constrained.clone(),
             })
             .collect();
+
         self.sharding
             .with_dimensions(dimensions)
             .and_then(|sharding| {
@@ -467,6 +470,7 @@ impl ConstrainShardingOperation {
 }
 
 impl Display for ConstrainShardingOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -490,40 +494,46 @@ impl Operation for ConstrainShardingOperation {
         let input = &input_types[0];
         if input.rank() != self.sharding.rank() {
             return Err(TypeError::invalid(format!(
-                "`{CONSTRAIN_SHARDING_OPERATION_NAME}` rank ({}) does not match the input rank ({})",
+                "`{}` rank ({}) does not match the input rank ({})",
+                CONSTRAIN_SHARDING_OPERATION_NAME,
                 self.sharding.rank(),
                 input.rank(),
             )));
         }
+
         if let Some(tracked) = input.sharding()
             && tracked.mesh() != self.sharding.mesh()
         {
             return Err(TypeError::invalid(format!(
-                "`{CONSTRAIN_SHARDING_OPERATION_NAME}` sharding {} is on a different mesh than the input sharding {}",
-                self.sharding, tracked,
+                "`{}` sharding {} is on a different mesh than the input sharding {}",
+                CONSTRAIN_SHARDING_OPERATION_NAME, self.sharding, tracked,
             )));
         }
-        // The constraint may only place dimensions over auto axes, which are the axes the compiler propagates; naming
-        // an explicit or manual axis is the mirror image of the auto-axis rejection of `reshard`.
+
+        // The constraint may only place dimensions over auto axes, which are the axes the compiler propagates.
+        // Naming an explicit or manual axis is the mirror image of the auto-axis rejection of `reshard`.
         for dimension in self.sharding.dimensions() {
             let ShardingDimension::Sharded(axis_names) = dimension else {
                 continue;
             };
+
             if let Some(axis_name) = axis_names
                 .iter()
                 .find(|axis_name| self.sharding.mesh().axis_type(axis_name) != Some(MeshAxisType::Auto))
             {
                 return Err(TypeError::invalid(format!(
                     "`{CONSTRAIN_SHARDING_OPERATION_NAME}` can only constrain placement over auto mesh axes but \
-                     `{axis_name}` is not one; use `{RESHARD_OPERATION_NAME}` for explicit axes"
+                     `{axis_name}` is not one; use `{RESHARD_OPERATION_NAME}` for explicit axes",
                 )));
             }
         }
-        // The constraint is untracked: the output type, sharding included, is identical to the input, and the
+
+        // The constraint is untracked. The output type, sharding included, is identical to the input, and the
         // constraint is enforced only when the backend lowers the operation.
         Ok(vec![input.clone()])
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("sharding", &self.sharding))
@@ -537,27 +547,20 @@ impl<C: Domain<Type = ArrayType, Value: ConstrainSharding>> InterpretableOperati
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // The constraint flows through the capability so interpretation over staging values preserves it.
+        // Concrete values pass through unchanged.
         check_count!("input", inputs, 1, ProgramError);
-        // The constraint flows through the capability so interpretation over staging values preserves it; concrete
-        // values pass through unchanged.
         Ok(vec![inputs[0].constrain_sharding(&self.sharding)?])
     }
 }
 
-impl<C: Context> PartiallyEvaluatableOperation<C> for ConstrainShardingOperation where
-    C::Operation: From<ConstrainShardingOperation>
+impl<C: Context<Operation: From<ConstrainShardingOperation>>> PartiallyEvaluatableOperation<C>
+    for ConstrainShardingOperation
 {
 }
 
-// Batching rule for [`ConstrainShardingOperation`]. The lifted constraint gains a
-// [`ShardingDimension::Unconstrained`] entry at the new batch dimension: the constraint governs only the
-// compiler-propagated auto axes, so the new dimension is left open for the backend to fill rather than pinned to a
-// derived or replicated entry (matching JAX's `with_sharding_constraint` batcher, which inserts
-// `PartitionSpec.UNCONSTRAINED`). Like the reshard rule, lifting never needs the batch axis's extent.
-impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
-    for ConstrainShardingOperation
-where
-    ConstrainShardingOperation: InterpretableOperation<C>,
+impl<C: Context<Type = ArrayType, Value: ConstrainSharding>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for ConstrainShardingOperation
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -565,6 +568,10 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // The lifted constraint gains a `ShardingDimension::Unconstrained` entry at the new batch dimension as the
+        // constraint governs only the compiler-propagated auto axes, and so the new dimension is left open for the
+        // backend to fill rather than pinned to a derived or replicated entry. Like the `reshard` rule, lifting never
+        // needs the batch axis's extent.
         check_count!("input", inputs, 1, ProgramError);
         let lifted_sharding = match inputs[0].batch_axis_position() {
             Some(batch_axis) => self.sharding().batched(batch_axis, ShardingDimension::Unconstrained)?,
@@ -579,8 +586,8 @@ impl_differentiable_operation! {
     jvp<C>
     where
         C: Context<Type = ArrayType>,
-        C::Operation: From<ConstrainShardingOperation>,
         C::Value: ConstrainSharding,
+        C::Operation: From<ConstrainShardingOperation>,
     {
         |operation, _context, _driver, inputs| {
             // The constraint is linear, so the same constraint applies to the tangent as to the primal.
@@ -600,22 +607,24 @@ impl_differentiable_operation! {
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // The operation is self-adjoint, so the output cotangent is constrained by the same constraint (mirroring
-            // JAX registering `with_sharding_constraint` with `ad.deflinear2`). Unlike [`ReshardOperation`], the
-            // input's sharding is not consulted, because the constraint is the operation's own.
+            // JAX registering `with_sharding_constraint` with `ad.deflinear2`). Unlike the `reshard` rule, the input's
+            // sharding is not consulted, because the constraint is the operation's own.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
             match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(()),
                 MaybeZero::Value(cotangent) => {
                     let contribution = MaybeZero::Value(cotangent.constrain_sharding(operation.sharding())?);
                     accumulators[0].accumulate(context, contribution)?;
                     Ok(())
                 }
-                MaybeZero::Zero(_) => Ok(()),
             }
         }
     },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to constrain the placement of a value over auto mesh axes. [`ConstrainSharding`] stages a
 /// [`ConstrainShardingOperation`], which is an identity function whose constraint is enforced when a backend lowers
