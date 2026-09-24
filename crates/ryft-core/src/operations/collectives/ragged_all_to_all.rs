@@ -25,6 +25,7 @@ use crate::interpretation::{
     InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
 };
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::iota::IotaOperation;
@@ -48,9 +49,9 @@ use crate::operations::math::mul::{Mul, MulOperation};
 use crate::operations::math::neg::{Neg, NegOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EmptyRegionDriver, MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError,
-    ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
-    infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    EmptyRegionDriver, MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection,
+    OperationProvider, ProgramError, ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value,
+    ValueProjection, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -748,7 +749,9 @@ impl_differentiable_operation! {
             + From<SelectOperation<ArrayType>>
             + From<SliceOperation>
             + From<TransferToMemoryOperation>
-            + From<ZeroOperation<ArrayType>>,
+            + From<ZeroOperation<ArrayType>>
+            + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
+            + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             let provenance_context = context.clone();
@@ -957,7 +960,11 @@ fn transpose_physical_offsets<V, O>(
 ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
 where
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<ConcatenateOperation<ArrayType>> + From<SliceOperation>,
+    O: Operation<Type = ArrayType>
+        + From<ConcatenateOperation<ArrayType>>
+        + From<SliceOperation>
+        + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
+        + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
 {
     let offset_type = offsets.r#type();
     let metadata_length = offset_type.shape().dimensions()[1].value().unwrap();
@@ -995,7 +1002,9 @@ where
     O: Operation<Type = ArrayType>
         + From<AllToAllOperation>
         + From<ConcatenateOperation<ArrayType>>
-        + From<SliceOperation>,
+        + From<SliceOperation>
+        + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
+        + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
 {
     if operation.is_physical() {
         transpose_physical_offsets(operation, offsets)
@@ -1027,7 +1036,9 @@ where
         + From<SelectOperation<ArrayType>>
         + From<SliceOperation>
         + From<TransferToMemoryOperation>
-        + From<ZeroOperation<ArrayType>>,
+        + From<ZeroOperation<ArrayType>>
+        + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
+        + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
 {
     let output_type = cotangent.r#type().into_owned();
     let leading_axis = usize::from(physical);
@@ -1044,7 +1055,13 @@ where
     })?;
     let mut marker_dimensions = output_type.shape().dimensions()[..=leading_axis].to_vec();
     marker_dimensions[leading_axis] = Dimension::Static(marker_extent);
-    let marker_type = ArrayType::new(DataType::I64, Shape::new(marker_dimensions)).with_memory(output_type.memory());
+
+    // Marker constants participate in the metadata computation on each shard. Give them the metadata's placement
+    // and variation from creation; they are not differentiated inputs requiring a variation transition.
+    let marker_type = ArrayType::new(DataType::I64, Shape::new(marker_dimensions))
+        .with_memory(output_type.memory())
+        .with_sharding(output_offsets.r#type().sharding().cloned())
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
 
     // Metadata may use any integer width and memory placement. Widen index arithmetic to `u64` before adding and
     // move it beside the cotangent so scatter's three operands share one memory space.
@@ -1076,6 +1093,7 @@ where
     } else {
         ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0])
     };
+
     // Both boundaries are additive. A zero-length region contributes `+1` and `-1` at the same position, while
     // adjacent regions combine deterministically at their shared boundary.
     let options = ScatterOptions::new();
@@ -1096,8 +1114,13 @@ where
     let markers = markers.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())?;
     let marker_zero = context.zero(markers.r#type().as_ref())?;
     let received = markers.not_equal(&marker_zero)?;
-    let condition_type =
-        ArrayType::new(DataType::Boolean, output_type.shape().clone()).with_memory(output_type.memory());
+
+    // The receive mask varies with its offset metadata. Expanding it over payload dimensions changes only
+    // geometry; retain those variation facts instead of replacing them with an unsharded Boolean type.
+    let mut condition_type = received.r#type().into_owned();
+    for (axis, dimension) in output_type.shape().dimensions().iter().enumerate().skip(leading_axis + 1) {
+        condition_type = condition_type.with_inserted_dimension(axis, dimension.clone())?;
+    }
     let received = received.broadcast(condition_type, &(0..=leading_axis).collect::<Vec<_>>())?;
     let zero = context.zero(&output_type)?;
     Ok(Tracer::select(&received, &zero, cotangent)?)
@@ -1254,7 +1277,14 @@ mod tests {
                 inputs[0].ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
             },
             input_types,
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh {
+                    mesh: LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    axis: 0,
+                    size: 2,
+                },
+            )],
         )
         .unwrap();
         assert_eq!(program.instructions().len(), 1);

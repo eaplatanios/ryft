@@ -565,17 +565,21 @@ mod tests {
     fn test_data_type_broadcast() {
         assert_eq!(Boolean.broadcast(&U16), Ok(U16));
         assert_eq!(U16.broadcast(&Boolean), Ok(U16));
-        assert!(
-            matches!(F8E3M4.broadcast(&F32), Err(BroadcastingError::IncompatibleDataTypes(DataTypeError::InvalidPromotion { message, .. })) if message == "cannot promote types `f8e3m4` and `f32` to a common type"),
-        );
+        assert!(matches!(
+            F8E3M4.broadcast(&F32),
+            Err(BroadcastingError::IncompatibleDataTypes(DataTypeError::InvalidPromotion { message, .. }))
+                if message == "cannot promote types `f8e3m4` and `f32` to a common type",
+        ),);
     }
 
     #[test]
     fn test_data_type_broadcast_to() {
         assert_eq!(Boolean.broadcast_to(&U16), Ok(U16));
-        assert!(
-            matches!(F64.broadcast_to(&I32), Err(BroadcastingError::IncompatibleDataTypes(DataTypeError::InvalidPromotion { message, .. })) if message == "cannot promote type `f64` to type `i32`"),
-        );
+        assert!(matches!(
+            F64.broadcast_to(&I32),
+            Err(BroadcastingError::IncompatibleDataTypes(DataTypeError::InvalidPromotion { message, .. }))
+                if message == "cannot promote type `f64` to type `i32`",
+        ),);
     }
 
     #[test]
@@ -583,9 +587,11 @@ mod tests {
         assert_eq!(DataType::broadcasted(&[&Boolean]), Ok(Boolean));
         assert_eq!(DataType::broadcasted(&[&Boolean, &U16]), Ok(U16));
         assert!(matches!(DataType::broadcasted::<DataType>(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
-        assert!(
-            matches!(DataType::broadcasted(&[&F8E3M4, &F32]), Err(BroadcastingError::IncompatibleDataTypes(DataTypeError::InvalidPromotion { message, .. })) if message == "cannot promote types `f8e3m4` and `f32` to a common type"),
-        );
+        assert!(matches!(
+            DataType::broadcasted(&[&F8E3M4, &F32]),
+            Err(BroadcastingError::IncompatibleDataTypes(DataTypeError::InvalidPromotion { message, .. }))
+                if message == "cannot promote types `f8e3m4` and `f32` to a common type",
+        ),);
     }
 
     #[test]

@@ -211,17 +211,15 @@ pub trait Dot<Rhs = Self>: Sized {
 
 // Context-carrying values stage a dot through their context. The `From<DotOperation>` bound keeps this implementation
 // disjoint from eager values, whose context operation is `ConstantOperation`.
-impl<V: Value<Type = ArrayType>> Dot for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Dot for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<DotOperation>,
 {
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError> {
-        let mut outputs = self.dispatch_domain().bind(
-            DotOperation::new(dimensions.clone()),
-            Vec::new(),
-            &[self.clone(), rhs.clone()],
-        )?;
+        let inputs = [self.clone(), rhs.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
+        let mut outputs = self.dispatch_domain().bind(DotOperation::new(dimensions.clone()), Vec::new(), &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -232,10 +230,12 @@ where
         dimensions: &DotDimensionNumbers,
         accumulation_type: DataType,
     ) -> Result<Self, ProgramError> {
+        let inputs = [self.clone(), rhs.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let mut outputs = self.dispatch_domain().bind(
             DotOperation::new(dimensions.clone()).with_accumulation_type(accumulation_type),
             Vec::new(),
-            &[self.clone(), rhs.clone()],
+            &inputs,
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -247,10 +247,12 @@ where
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
     ) -> Result<Self, ProgramError> {
+        let inputs = [self.clone(), rhs.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let mut outputs = self.dispatch_domain().bind(
             DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()),
             Vec::new(),
-            &[self.clone(), rhs.clone()],
+            &inputs,
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -383,7 +385,7 @@ pub trait RaggedDot: Sized {
     }
 }
 
-impl<V: Value<Type = ArrayType>> RaggedDot for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> RaggedDot for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
     <V::DispatchDomain as Domain>::Operation: From<RaggedDotOperation>,
@@ -394,13 +396,11 @@ where
         group_sizes: &Self,
         dimensions: &RaggedDotDimensionNumbers,
     ) -> Result<Self, ProgramError> {
+        let inputs = [self.clone(), rhs.clone(), group_sizes.clone()];
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         Ok(self
             .dispatch_domain()
-            .bind(
-                RaggedDotOperation::new(dimensions.clone()),
-                Vec::new(),
-                &[self.clone(), rhs.clone(), group_sizes.clone()],
-            )?
+            .bind(RaggedDotOperation::new(dimensions.clone()), Vec::new(), &inputs)?
             .remove(0))
     }
 }

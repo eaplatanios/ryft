@@ -23,6 +23,7 @@ pub(crate) fn ragged_dot_abstract(
     group_sizes: &ArrayType,
     dimensions: &RaggedDotDimensionNumbers,
 ) -> Result<ArrayType, TypeError> {
+    ArrayType::check_matching_manual_variation(RAGGED_DOT_OPERATION_NAME, &[lhs, rhs, group_sizes])?;
     if !group_sizes.data_type().is_integer() {
         return Err(TypeError::invalid(format!(
             "`{RAGGED_DOT_OPERATION_NAME}` group sizes must have an integer data type",
@@ -187,6 +188,7 @@ pub(crate) fn dot_abstract(
     accumulation_type: Option<DataType>,
     output_sharding: Option<&Sharding>,
 ) -> Result<ArrayType, TypeError> {
+    ArrayType::check_matching_manual_variation(DOT_OPERATION_NAME, &[lhs, rhs])?;
     if lhs.data_type() != rhs.data_type() {
         return Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` input element types are incompatible")));
     }
@@ -351,7 +353,19 @@ pub(crate) fn dot_abstract(
                 )));
             }
         }
-        Some(output_sharding.clone())
+        // Requested placement does not override logical dependence on manual shards. Variation is determined by
+        // the input values; changing it requires an explicit variation operation or collective.
+        let varying = [lhs_sharding, rhs_sharding]
+            .into_iter()
+            .flatten()
+            .flat_map(|sharding| sharding.varying_manual_axes().iter().cloned())
+            .collect::<BTreeSet<_>>();
+        Some(
+            output_sharding
+                .clone()
+                .with_varying_manual_axes(varying)
+                .map_err(|error| TypeError::invalid(error.to_string()))?,
+        )
     } else if let Some(mesh) = mesh {
         for (lhs_axis, rhs_axis) in
             dimensions.lhs_contracting_dimensions().iter().zip(dimensions.rhs_contracting_dimensions())

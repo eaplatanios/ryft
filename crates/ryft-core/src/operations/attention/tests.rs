@@ -71,6 +71,135 @@ fn test_dot_product_attention() {
 }
 
 #[test]
+fn test_dot_product_attention_manual_variation() {
+    use crate::arrays::{ArrayOperation, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+    use crate::axes::NamedAxis;
+    use crate::contexts::EagerContext;
+    use crate::tracing::DomainTracingContext;
+
+    let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+    let invariant = ArrayType::new_static(DataType::F32, [1, 1, 1, 1])
+        .with_sharding(Sharding::replicated(mesh.clone(), 4))
+        .unwrap();
+    let varying = invariant
+        .clone()
+        .with_sharding(Sharding::replicated(mesh.clone(), 4).with_varying_manual_axes(["x"]).unwrap())
+        .unwrap();
+    let lengths = ArrayType::new_static(DataType::I32, [1])
+        .with_sharding(Sharding::replicated(mesh.clone(), 1))
+        .unwrap();
+    let mask = ArrayType::new_static(DataType::Boolean, [1, 1, 1, 1])
+        .with_sharding(Sharding::replicated(mesh.clone(), 4))
+        .unwrap();
+    let signature = AttentionOperandSignature::new(true, true, true, true);
+    let configuration = AttentionConfiguration::new().with_residual(true);
+    let inputs = vec![
+        varying.clone(),
+        invariant.clone(),
+        invariant.clone(),
+        invariant.clone(),
+        mask.clone(),
+        lengths.clone(),
+        lengths.clone(),
+    ];
+    let operation = DotProductAttentionOperation::new(configuration, signature);
+    assert!(matches!(operation.infer_output_types(&inputs, &[]),
+        Err(TypeError::Invalid { message, .. }) if message == "`dot_product_attention` inputs must have matching \
+                                                               varying manual axes; insert `parallel_vary` on the \
+                                                               inputs that lack an axis, as `align_manual_variation` \
+                                                               does"));
+    let (outputs, program) = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
+        |inputs| {
+            let (output, residual) = DotProductAttention::dot_product_attention(
+                AttentionInputs::from_values(signature, &inputs)?,
+                configuration,
+            )?;
+            Ok(vec![output, residual.unwrap()])
+        },
+        inputs,
+        vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+    )
+    .unwrap();
+    let residual = ArrayType::new_static(DataType::F32, [1, 1, 1])
+        .with_sharding(Sharding::replicated(mesh.clone(), 3).with_varying_manual_axes(["x"]).unwrap())
+        .unwrap();
+    assert_eq!(outputs, vec![varying.clone(), residual.clone()]);
+    assert_eq!(
+        program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+        vec![
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "dot_product_attention"
+        ]
+    );
+
+    let invariant_residual = ArrayType::new_static(DataType::F32, [1, 1, 1])
+        .with_sharding(Sharding::replicated(mesh.clone(), 3))
+        .unwrap();
+    let backward_inputs = vec![
+        invariant.clone(),
+        invariant.clone(),
+        invariant.clone(),
+        invariant.clone(),
+        mask,
+        lengths.clone(),
+        lengths,
+        invariant.clone(),
+        invariant_residual,
+        varying.clone(),
+    ];
+    let backward = DotProductAttentionBackwardOperation::new(configuration, signature);
+    assert!(matches!(backward.infer_output_types(&backward_inputs, &[]),
+        Err(TypeError::Invalid { message, .. }) if message == "`dot_product_attention_backward` inputs must have \
+                                                               matching varying manual axes; insert `parallel_vary` on \
+                                                               the inputs that lack an axis, as \
+                                                               `align_manual_variation` does"));
+    let (outputs, program) = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
+        |inputs: Vec<_>| {
+            DotProductAttentionBackward::dot_product_attention_backward(
+                AttentionInputs::from_values(signature, &inputs[..7])?,
+                inputs[7].clone(),
+                inputs[8].clone(),
+                inputs[9].clone(),
+                configuration,
+            )
+        },
+        backward_inputs,
+        vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+    )
+    .unwrap();
+    assert_eq!(outputs, vec![varying.clone(), varying.clone(), varying.clone(), varying]);
+    assert_eq!(
+        program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+        vec![
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "parallel_vary",
+            "dot_product_attention_backward"
+        ]
+    );
+
+    let reduced = invariant
+        .clone()
+        .with_sharding(Sharding::replicated(mesh, 4).with_reduced_axes(["x"]).unwrap())
+        .unwrap();
+    let operation =
+        DotProductAttentionOperation::new(configuration, AttentionOperandSignature::new(false, false, false, false));
+    assert!(matches!(operation.infer_output_types(&[reduced, invariant.clone(), invariant], &[]),
+        Err(TypeError::Invalid { message, .. }) if message == "`dot_product_attention` does not support reduced inputs"));
+}
+
+#[test]
 fn test_dot_product_attention_type_inference() {
     let query = ArrayType::new_static(DataType::F32, [2, 2, 2]);
     let key_value = ArrayType::new_static(DataType::F32, [3, 1, 2]);

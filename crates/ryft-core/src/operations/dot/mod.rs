@@ -14,6 +14,7 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::manipulation::conversions::{ConvertElementType, ConvertElementTypeOperation};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;

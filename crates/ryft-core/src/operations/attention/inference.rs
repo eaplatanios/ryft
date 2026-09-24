@@ -350,9 +350,9 @@ pub(super) fn attention_activation_type(
     let Some(query_sharding) = query_type.sharding() else {
         return Ok(activation_type);
     };
-    let sharding =
-        Sharding::new(query_sharding.mesh().clone(), query_sharding.dimensions()[..query_type.rank() - 1].to_vec())
-            .and_then(|sharding| activation_type.with_sharding(sharding))
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let sharding = query_sharding
+        .with_dimensions(query_sharding.dimensions()[..query_type.rank() - 1].to_vec())
+        .and_then(|sharding| activation_type.with_sharding(sharding))
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
     Ok(sharding)
 }

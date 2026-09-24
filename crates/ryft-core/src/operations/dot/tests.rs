@@ -382,6 +382,19 @@ fn test_dot_inference_output_sharding_bypass_and_validation() {
 }
 
 #[test]
+fn test_dot_inference_output_sharding_preserves_manual_variation() {
+    let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+    let varying = Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["devices"]).unwrap();
+    let left = plain_array(&[2, 3]).with_sharding(varying.clone()).unwrap();
+    let right = plain_array(&[3, 4]).with_sharding(varying.clone()).unwrap();
+    let operation = DotOperation::matmul().with_output_sharding(Sharding::replicated(mesh, 2));
+    assert_eq!(
+        operation.infer_output_types(&[left, right], &[]),
+        Ok(vec![plain_array(&[2, 4]).with_sharding(varying).unwrap()]),
+    );
+}
+
+#[test]
 fn test_dot_inference_unreduced_output_sharding() {
     let mesh = test_mesh();
     let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::replicated(), ShardingDimension::sharded(["k"])]);

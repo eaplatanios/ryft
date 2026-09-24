@@ -1142,22 +1142,29 @@ macro_rules! define_elementwise_capability {
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError>;
         }
 
-        impl<__V: $crate::Value> $capability for __V
-        where
-            $operation<__V::Type>: $crate::OperationProvider<__V::Type>,
-            __V::DispatchDomain: $crate::Context<
-                    Type = __V::Type,
+        impl<
+            __T: $crate::Type,
+            __V: $crate::Value<
+                Type = __T,
+                DispatchDomain: $crate::Context<
+                    Type = __T,
                     Value = __V,
                     Operation: ::std::convert::From<
-                        <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::Operation,
+                        <$operation<__T> as $crate::OperationProvider<__T>>::Operation,
                     >,
                 >,
+            > + $crate::ManualVariationAlignment<__T>,
+        > $capability for __V
+        where
+            $operation<__T>: $crate::OperationProvider<__T>,
         {
             #[inline]
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError> {
-                let left_type = $crate::Typed::r#type(self);
-                let right_type = $crate::Typed::r#type($argument);
-                let operation = <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::provide(
+                let inputs = [self.clone(), $argument.clone()];
+                let inputs = <__V as $crate::ManualVariationAlignment<__T>>::align_manual_variation(&inputs)?;
+                let left_type = $crate::Typed::r#type(&inputs[0]);
+                let right_type = $crate::Typed::r#type(&inputs[1]);
+                let operation = <$operation<__T> as $crate::OperationProvider<__T>>::provide(
                     (),
                     &[left_type.as_ref(), right_type.as_ref()],
                 )?;
@@ -1165,7 +1172,7 @@ macro_rules! define_elementwise_capability {
                     &$crate::Value::dispatch_domain(self),
                     operation,
                     Vec::new(),
-                    &[self.clone(), $argument.clone()],
+                    &inputs,
                 )?
                 .remove(0))
             }
@@ -5039,8 +5046,8 @@ mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
         Abs, AbsOperation, Add, AddOperation, ArithmeticDimensionOperation, BroadcastOperation, DivOperation,
-        ElementwiseOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation, Sub,
-        SubOperation, TransposeOperation, ZeroOperation,
+        ElementwiseOperation, ExpOperation, MulOperation, Neg, NegOperation, ParallelVaryOperation, Reduce,
+        ReductionKind, SinOperation, Sub, SubOperation, TransposeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{
@@ -5077,6 +5084,28 @@ mod tests {
     );
 
     impl_reference_dischargeable_operation!(@local_reference <T> TestBinaryOperation<T> where T: Type);
+
+    impl OperationProvider<ArrayType, ParallelVaryOperation> for TestUnaryOperation<ArrayType> {
+        type Operation = Self;
+
+        fn provide(_request: ParallelVaryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+            check_count!("input", input_types, 1, ProgramError);
+            Err(ProgramError::UnsupportedOperation {
+                message: "test operation family cannot align manual variation".to_string(),
+            })
+        }
+    }
+
+    impl OperationProvider<ArrayType, ParallelVaryOperation> for TestBinaryOperation<ArrayType> {
+        type Operation = Self;
+
+        fn provide(_request: ParallelVaryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+            check_count!("input", input_types, 1, ProgramError);
+            Err(ProgramError::UnsupportedOperation {
+                message: "test operation family cannot align manual variation".to_string(),
+            })
+        }
+    }
 
     const TEST_MAGNITUDE_OPERATION_NAME: &str = "test_magnitude";
     const TEST_STRICT_ADD_OPERATION_NAME: &str = "test_strict_add";

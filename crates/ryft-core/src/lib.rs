@@ -112,15 +112,16 @@ pub use operations::{
     LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOG_SUM_EXP_OPERATION_NAME, LOG1P_OPERATION_NAME,
     LOGISTIC_OPERATION_NAME, LinearCallOperation, Log, Log1p, Log1pOperation, LogAddExp, LogAddExpOperation,
     LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME,
-    MUL_OPERATION_NAME, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME,
-    NOT_OPERATION_NAME, Neg, NegOperation, Not, NotOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME,
-    OR_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, PAD_OPERATION_NAME,
-    POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation, ParallelReduce, ParallelReduceOperation,
-    ParallelReductionKind, Permutation, Pow, PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME,
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
-    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME,
-    RESHAPE_OPERATION_NAME, RESHARD_OPERATION_NAME, REVERSE_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME,
-    RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReduceOperation, ReductionKind,
+    MUL_OPERATION_NAME, ManualVariationAlignment, Max, MaxOperation, Min, MinOperation, Mul, MulOperation,
+    NEG_OPERATION_NAME, NOT_OPERATION_NAME, Neg, NegOperation, Not, NotOperation, ONE_LIKE_OPERATION_NAME,
+    ONE_OPERATION_NAME, OR_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation,
+    PAD_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation,
+    ParallelReduce, ParallelReduceOperation, ParallelReductionKind, ParallelVary, ParallelVaryOperation, Permutation,
+    Pow, PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME, REFERENCE_ADD_UPDATE_OPERATION_NAME,
+    REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME,
+    REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME, RESHAPE_OPERATION_NAME,
+    RESHARD_OPERATION_NAME, REVERSE_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, RaggedDot,
+    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReduceOperation, ReductionKind,
     ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
     ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem,
@@ -212,17 +213,17 @@ pub(crate) mod tests {
     use crate::macros::check_count;
     use crate::operations::{
         AddOperation, BroadcastOperation, CompareOperation, ConstantOperation, ConvertElementTypeOperation,
-        DivOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation, ReduceOperation,
-        ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation, ReshardOperation, TransposeOperation,
-        ZeroLikeOperation, ZeroOperation,
+        DivOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation, ParallelVaryOperation,
+        ReduceOperation, ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation, ReshardOperation,
+        TransposeOperation, ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
     use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
     use crate::programs::{
-        EffectClass, EffectClasses, Effects, MaybeZero, NoIdentity, Operation, OperationProjection, Program,
-        ProgramError, Region, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, Type, TypeError,
-        Typed, Value, ValueProjection,
+        EffectClass, EffectClasses, Effects, MaybeZero, NoIdentity, Operation, OperationProjection, OperationProvider,
+        Program, ProgramError, Region, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, Type,
+        TypeError, Typed, Value, ValueProjection,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tracing::{Tracer, TracingContext};
@@ -253,6 +254,17 @@ pub(crate) mod tests {
         Reduce(ReduceOperation),
         Reshard(ReshardOperation),
         Compare(CompareOperation<ArrayType>),
+    }
+
+    impl OperationProvider<ArrayType, ParallelVaryOperation> for TestArrayOperation {
+        type Operation = Self;
+
+        fn provide(_request: ParallelVaryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+            check_count!("input", input_types, 1, ProgramError);
+            Err(ProgramError::UnsupportedOperation {
+                message: "test array operation family cannot align manual variation".to_string(),
+            })
+        }
     }
 
     /// Eager array context with only the operations required by ordinary core protocol tests.

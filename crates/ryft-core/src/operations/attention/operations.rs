@@ -12,7 +12,9 @@ pub const DOT_PRODUCT_ATTENTION_OPERATION_NAME: &str = "dot_product_attention";
 /// Query accepts `TNH` or `BTNH`; key and value accept `SKH` or `BSKH`. `T` and `S` are the query and key/value
 /// sequence lengths, `N` is the query-head count, `K` is the key/value-head count, and `H` is the head dimension.
 /// `K` must divide `N`; `K == N` is multi-head attention, `K == 1` is multi-query attention, and the remaining cases
-/// are grouped-query attention. The attended output has the query type and shape.
+/// are grouped-query attention. The attended output has the query type and shape. Every input must have matching
+/// manual variation; the capability aligns inputs before binding. Reduced and unreduced inputs are unsupported:
+/// softmax and the log-sum-exp residual do not preserve partial-sum or zero-filled-replica representations.
 ///
 /// [`AttentionInputs`] defines the complete operand boundary: query, key, value, then an optional broadcastable
 /// additive bias, Boolean visibility mask, per-batch query lengths, and per-batch key/value lengths. Dot products,
@@ -89,6 +91,10 @@ impl Operation for DotProductAttentionOperation {
                 input_types.len(),
             )));
         }
+        ArrayType::check_matching_manual_variation(
+            DOT_PRODUCT_ATTENTION_OPERATION_NAME,
+            &input_types.iter().collect::<Vec<_>>(),
+        )?;
         let operands = AttentionOperandTypes::forward(signature, input_types)?;
         let dimensions = validated_attention_operands(
             DOT_PRODUCT_ATTENTION_OPERATION_NAME,
@@ -113,6 +119,12 @@ impl Operation for DotProductAttentionOperation {
             )));
         }
         for input_type in input_types {
+            // Softmax and log-sum-exp do not preserve the zero-filled replicas of a reduced input.
+            if !input_type.reduced_axes().is_empty() {
+                return Err(TypeError::invalid(format!(
+                    "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` does not support reduced inputs"
+                )));
+            }
             if !input_type.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
                     "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` does not support unreduced operands"
@@ -258,6 +270,10 @@ impl Operation for DotProductAttentionBackwardOperation {
                 input_types.len(),
             )));
         }
+        ArrayType::check_matching_manual_variation(
+            DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
+            &input_types.iter().collect::<Vec<_>>(),
+        )?;
         let operands = AttentionOperandTypes::backward(signature, input_types)?;
         let dimensions = validated_attention_operands(
             DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
@@ -311,6 +327,12 @@ impl Operation for DotProductAttentionBackwardOperation {
             )));
         }
         for input_type in input_types {
+            // Softmax and log-sum-exp do not preserve the zero-filled replicas of a reduced input.
+            if !input_type.reduced_axes().is_empty() {
+                return Err(TypeError::invalid(format!(
+                    "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` does not support reduced inputs"
+                )));
+            }
             if !input_type.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
                     "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` does not support unreduced operands"

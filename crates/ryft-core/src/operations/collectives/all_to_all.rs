@@ -770,7 +770,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, RaggedAxis, Shape,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType,
+        RaggedAxis, Shape,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
@@ -789,7 +790,14 @@ mod tests {
         let (_, program) = TestContext::trace_with_named_axes(
             |input| input.parallel_swap_axes("x", 0),
             ArrayIrType::Array(input_type),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh {
+                    mesh: LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    axis: 0,
+                    size: 2,
+                },
+            )],
         )
         .unwrap();
 

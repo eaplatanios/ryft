@@ -98,7 +98,7 @@ impl DotProductAttentionBackward for Array {
 /// context. The `From<DotProductAttentionOperation>` bound makes this disjoint from the eager reference value types
 /// (whose context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers
 /// the transform tracers and backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType>> DotProductAttention for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> DotProductAttention for V
 where
     V::DispatchDomain: Context<Operation: From<DotProductAttentionOperation>>,
 {
@@ -109,6 +109,7 @@ where
         let signature = inputs.signature();
         let context = inputs.query.dispatch_domain();
         let operands = inputs.into_values();
+        let operands = ManualVariationAlignment::align_manual_variation(&operands)?;
         let mut outputs = context.bind(
             DotProductAttentionOperation::new(configuration, signature),
             Vec::new(),
@@ -124,7 +125,7 @@ where
 /// Any context-carrying value computes the attention backward pass by binding a
 /// [`DotProductAttentionBackwardOperation`] through its own context; refer to the [`DotProductAttention`] blanket
 /// implementation for the disjointness argument.
-impl<V: Value<Type = ArrayType>> DotProductAttentionBackward for V
+impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> DotProductAttentionBackward for V
 where
     V::DispatchDomain: Context<Operation: From<DotProductAttentionBackwardOperation>>,
 {
@@ -139,6 +140,7 @@ where
         let context = inputs.query.dispatch_domain();
         let mut operands = inputs.into_values();
         operands.extend([output, residual, output_cotangent]);
+        let operands = ManualVariationAlignment::align_manual_variation(&operands)?;
         context.bind(
             DotProductAttentionBackwardOperation::new(configuration, signature),
             Vec::new(),

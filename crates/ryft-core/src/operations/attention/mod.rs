@@ -5,7 +5,7 @@ use ryft_macros::Parameterized;
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType,
-    Dimension, DimensionType, DimensionValue, Shape, Sharding, StaticArrayExtentBatchingPolicy,
+    Dimension, DimensionType, DimensionValue, Shape, StaticArrayExtentBatchingPolicy,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -15,6 +15,7 @@ use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::fill::Fill;
@@ -56,7 +57,7 @@ pub use capabilities::DotProductAttention;
 pub(crate) use capabilities::DotProductAttentionBackward;
 pub use composition::{dot_product_attention_backward_ir_composition, dot_product_attention_ir_composition};
 pub use configuration::{AttentionConfiguration, AttentionImplementation, AttentionInputs, AttentionOperandSignature};
-pub use differentiation::differentiable_dot_product_attention;
+pub use differentiation::{DifferentiableDotProductAttention, differentiable_dot_product_attention};
 pub use operations::{
     DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME, DOT_PRODUCT_ATTENTION_OPERATION_NAME,
     DotProductAttentionBackwardOperation, DotProductAttentionOperation,
