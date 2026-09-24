@@ -603,19 +603,25 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
-        StridedLayout, f8e5m2, i2,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionError, DimensionType, DimensionValue, Layout, LogicalMesh, MAX_DIMENSION_EXTENT,
+        Memory, MeshAxis, MeshAxisType, Shape, Sharding, StridedLayout, f8e5m2, i2,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::BatchAxis;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext, differentiate_at};
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
+        TransposableOperation, TranspositionContext, differentiate_at,
+    };
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::constants::zero_like::ZeroLike;
     use crate::operations::control_flow::select::Select;
-    use crate::parameters::Placeholder;
-    use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramError, RegionInterface, Typed, ValueProjection};
-    use crate::tracing::TracingContext;
+    use crate::partial::PartialValue;
+    use crate::programs::{
+        EffectClasses, EmptyRegionDriver, MaybeZero, ProgramError, RegionInterface, Typed, ValueProjection,
+    };
+    use crate::tracing::{DomainTracingContext, TracingContext};
 
     use super::*;
 
@@ -682,10 +688,13 @@ mod tests {
             }
         }
 
-        // Shared identities prove reflexive predicates even without finite bounds; exact values take precedence.
+        // Shared identities prove reflexive predicates even without finite bounds, including when only one side has a
+        // known extent. Conflicting exact extents take precedence over the shared identity.
         let dimension = DimensionType::new("dimension", DimensionBounds::new(0, None).unwrap());
-        for (direction, expected) in directions.into_iter().zip([true, false, false, true, false, true]) {
-            assert_eq!(direction.prove_for_dimensions(&dimension, &dimension, [None, None]).unwrap(), Some(expected));
+        for exact in [[None, None], [Some(4), None]] {
+            for (direction, expected) in directions.into_iter().zip([true, false, false, true, false, true]) {
+                assert_eq!(direction.prove_for_dimensions(&dimension, &dimension, exact).unwrap(), Some(expected));
+            }
         }
         for (direction, expected) in directions.into_iter().zip([false, true, true, true, false, false]) {
             assert_eq!(
@@ -693,6 +702,13 @@ mod tests {
                 Some(expected),
             );
         }
+
+        // Lower bounds beyond the portable backend width have no representable extent interval.
+        let oversized = DimensionType::new("oversized", DimensionBounds::new(usize::MAX, None).unwrap());
+        assert_eq!(
+            ComparisonDirection::Equal.prove_for_dimensions(&oversized, &dimension, [None, None]),
+            Err(DimensionError::ExtentExceedsBackendWidth { value: usize::MAX, maximum: MAX_DIMENSION_EXTENT }.into()),
+        );
     }
 
     #[test]
@@ -705,6 +721,7 @@ mod tests {
 
     #[test]
     fn test_compare_type_inference() {
+        // Scalar element types promote to a common type, and only equality comparisons accept complex inputs.
         let ordered_scalar = CompareOperation::<DataType>::new(ComparisonDirection::LessThan);
         check_operation_type_inference!(
             operation = ordered_scalar,
@@ -720,7 +737,16 @@ mod tests {
             }],
         );
 
-        // Comparison preserves shape and placement but clears byte strides when the element storage width changes.
+        check_operation_type_inference!(
+            operation = CompareOperation::<DataType>::new(ComparisonDirection::Equal),
+            cases = [{
+                input_types = [DataType::C64, DataType::C64],
+                output_types = [DataType::Boolean],
+            }],
+        );
+
+        // Array comparisons preserve shape and placement but clear byte strides because Boolean elements change the
+        // storage width. Only equality comparisons accept complex arrays.
         let left = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
             .with_memory(Memory::Host { pinned: true });
@@ -730,28 +756,33 @@ mod tests {
             Operation::infer_output_types(&ordered_array, &[left.clone(), right], &[]),
             Ok(vec![left.clone().with_data_type(DataType::Boolean).with_layout(None)]),
         );
-
-        let equality_scalar = CompareOperation::<DataType>::new(ComparisonDirection::Equal);
-        check_operation_type_inference!(
-            operation = equality_scalar,
-            cases = [{
-                input_types = [DataType::C64, DataType::C64],
-                output_types = [DataType::Boolean],
-            }],
-        );
-        let equality_array = CompareOperation::<ArrayType>::new(ComparisonDirection::Equal);
         let complex = left.with_data_type(DataType::C64);
         assert_eq!(
-            Operation::infer_output_types(&equality_array, &[complex.clone(), complex.clone()], &[]),
-            Ok(vec![complex.with_data_type(DataType::Boolean).with_layout(None)]),
+            Operation::infer_output_types(
+                &CompareOperation::<ArrayType>::new(ComparisonDirection::Equal),
+                &[complex.clone(), complex.clone()],
+                &[],
+            ),
+            Ok(vec![complex.clone().with_data_type(DataType::Boolean).with_layout(None)]),
+        );
+        assert_eq!(
+            Operation::infer_output_types(
+                &ordered_array,
+                &[ArrayType::scalar(DataType::C64), ArrayType::scalar(DataType::C64)],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "cannot apply an ordered comparison to unordered complex inputs of types `c64[]` and `c64[]`",
+            )),
         );
 
+        // Dimension comparisons accept only dimension inputs and produce a rank-zero Boolean array.
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
         let left = DimensionType::new("left", bounds);
         let right = DimensionType::new("right", bounds);
-        let operation = CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThan);
+        let dimension_operation = CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThan);
         check_operation_type_inference!(
-            operation = operation,
+            operation = dimension_operation,
             cases = [{
                 input_types = [left.clone().into(), right.clone().into()],
                 output_types = [ArrayType::scalar(DataType::Boolean).into()],
@@ -763,19 +794,12 @@ mod tests {
                 error = "expected 2 inputs but got 1",
             }],
         );
-        assert_eq!(
-            operation.infer_output_types(
-                &[left.into(), right.into()],
-                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
-            ),
-            Err(TypeError::invalid("expected 0 regions but got 1")),
-        );
 
         // The shared operation contract rejects attached regions for every type universe.
         assert_eq!(
             ordered_scalar.infer_output_types(
                 &[DataType::F32, DataType::F32],
-                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)]
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
@@ -784,6 +808,13 @@ mod tests {
                 &ordered_array,
                 &[ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F32)],
                 &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
+            ),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+        assert_eq!(
+            dimension_operation.infer_output_types(
+                &[left.into(), right.into()],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)]
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
@@ -798,6 +829,10 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
             .unwrap();
         let operation = CompareOperation::<ArrayType>::new(ComparisonDirection::Equal);
+        assert_eq!(
+            Operation::infer_output_types(&operation, &[varying_type.clone(), varying_type.clone()], &[]),
+            Ok(vec![varying_type.clone().with_data_type(DataType::Boolean)]),
+        );
         let error = TypeError::invalid(
             "`compare` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack \
              an axis, as `align_manual_variation` does",
@@ -806,14 +841,12 @@ mod tests {
             Operation::infer_output_types(&operation, &[invariant_type.clone(), varying_type.clone()], &[]),
             Err(error.clone()),
         );
-        assert_eq!(
-            Operation::infer_output_types(&operation, &[varying_type.clone(), invariant_type.clone()], &[]),
-            Err(error.clone()),
-        );
+        assert_eq!(Operation::infer_output_types(&operation, &[varying_type, invariant_type], &[]), Err(error));
     }
 
     #[test]
     fn test_compare_interpretation() {
+        // Array inputs broadcast before comparing, whereas dimension inputs compare their extents.
         assert_eq!(
             CompareOperation::new(ComparisonDirection::GreaterThan).interpret(
                 &EagerContext::<Array>::new(),
@@ -822,10 +855,22 @@ mod tests {
             ),
             Ok(vec![Array::vector(vec![true, false]).unwrap()]),
         );
+        assert_eq!(
+            CompareOperation::new(ComparisonDirection::LessThan).interpret(
+                &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+                &EmptyRegionDriver,
+                &[
+                    ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::constant(5).unwrap()),
+                ],
+            ),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(true).unwrap())]),
+        );
     }
 
     #[test]
     fn test_compare_partial_evaluation() {
+        // Known array inputs fold to a Boolean constant.
         check_operation_partial_evaluation!(
             operation = CompareOperation::new(ComparisonDirection::GreaterThan),
             inputs = [Array::scalar(1.0).unwrap(), Array::scalar(0.0).unwrap()],
@@ -900,6 +945,7 @@ mod tests {
 
     #[test]
     fn test_compare_batching() {
+        // Array comparisons map elementwise over the batch axis, whichever input carries it.
         check_operation_batching!(
             @exact,
             operation = CompareOperation::new(ComparisonDirection::GreaterThan),
@@ -938,10 +984,10 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &ArrayIrValue::Array(Array::scalar(true).unwrap()));
 
-        // Per-lane dimensions cannot stand in for one shared shape extent.
+        // A mapped dimension carries one extent per batch item, so it cannot stand in for one shared shape extent.
         let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(8)).unwrap());
         let mapped = ArrayIrBatch::mapped_dimension(
-            ArrayIrValue::Array(Array::vector(vec![1_i32, 3]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1i32, 3]).unwrap()),
             BatchAxis::new(0),
             dimension_type.clone(),
         )
@@ -954,136 +1000,183 @@ mod tests {
 
     #[test]
     fn test_compare_differentiation() {
-        // `f(x) = select(x > 0, 2x, 3x)`: the comparison output is Boolean, so its tangent is symbolically zero and
-        // the derivative comes entirely from the selected branch (2 for x > 0 and 3 for x <= 0).
-        let (primal, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
-            .jvp(Array::scalar(1.0).unwrap(), |input| {
-                let condition = input.greater_than(&input.zero_like()?)?;
-                Select::select(&condition, &(input.clone() + input.clone()), &(input.clone() + input.clone() + input))
-            })
+        // Comparisons are non-differentiable, so their Boolean output has a structural zero tangent even when the
+        // input tangents are nonzero.
+        let outputs = CompareOperation::<ArrayType>::new(ComparisonDirection::GreaterThan)
+            .jvp(
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new(Array::scalar(2.0).unwrap(), Array::scalar(1.0).unwrap()).unwrap(),
+                    DifferentiationDual::new(Array::scalar(0.0).unwrap(), Array::scalar(1.0).unwrap()).unwrap(),
+                ],
+            )
             .unwrap();
-        assert_eq!(primal, Array::scalar(4.0).unwrap());
-        assert_eq!(tangent, Array::scalar(2.0).unwrap());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(true).unwrap());
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
+        );
 
-        let (primal, tangent) = differentiate_at(Array::scalar(-2.0).unwrap())
-            .jvp(Array::scalar(1.0).unwrap(), |input| {
-                let condition = input.greater_than(&input.zero_like()?)?;
-                Select::select(&condition, &(input.clone() + input.clone()), &(input.clone() + input.clone() + input))
-            })
-            .unwrap();
-        assert_eq!(primal, Array::scalar(-6.0).unwrap());
-        assert_eq!(tangent, Array::scalar(3.0).unwrap());
+        // A comparison that selects between differentiable branches contributes nothing to the derivative, so
+        // `select(x > 0, 2x, 3x)` differentiates to the slope of the selected branch.
+        for (input, primal, tangent) in [(2.0, 4.0, 2.0), (-2.0, -6.0, 3.0)] {
+            assert_eq!(
+                differentiate_at(Array::scalar(input).unwrap()).jvp(Array::scalar(1.0).unwrap(), |input| {
+                    let condition = input.greater_than(&input.zero_like()?)?;
+                    Select::select(
+                        &condition,
+                        &(input.clone() + input.clone()),
+                        &(input.clone() + input.clone() + input),
+                    )
+                }),
+                Ok((Array::scalar(primal).unwrap(), Array::scalar(tangent).unwrap())),
+            );
+        }
     }
 
     #[test]
     fn test_compare_differentiation_dimensions() {
-        // Dimension inputs and Boolean outputs have no tangent slots in the differentiated program.
-        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        // Dimension inputs and Boolean outputs have no tangent slots, so the differentiated program only replays the
+        // primal comparison.
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
-        let left = context.input(DimensionType::new("left", bounds).into());
-        let right = context.input(DimensionType::new("right", bounds).into());
-        let output = left.less_than(&right).unwrap();
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output.atom_id().unwrap()],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let differentiated = program.jvp().unwrap();
-        assert_eq!(differentiated.input_ids().len(), 2);
-        assert_eq!(differentiated.output_ids().len(), 1);
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<_>| Ok(vec![inputs[0].less_than(&inputs[1])?]),
+            vec![
+                ArrayIrType::from(DimensionType::new("left", bounds)),
+                ArrayIrType::from(DimensionType::new("right", bounds)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [0, 9)>, %1:dimension<right ∈ [0, 9)> .
+                let %2:bool[] = compare [direction=LessThan] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
     fn test_compare_transposition() {
-        let operation = ArrayIrOperation::<Array>::from(CompareOperation::new(ComparisonDirection::LessThan));
-        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        // Program transposition elides the zero-space cotangents of Boolean outputs, so check the primitive's
+        // rejection directly.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         assert!(matches!(
-            operation.transpose(&mut TranspositionContext::new(context), &EmptyRegionDriver, &[], &[], &[]),
+            CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan).transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::F64)),
+                    PartialValue::Unknown(ArrayType::scalar(DataType::F64)),
+                ],
+                &[MaybeZero::Zero(ArrayType::scalar(DataType::Zero))],
+                &[],
+            ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `compare` is not transposable",
         ));
     }
 
     #[test]
-    fn test_array_compare() {
+    fn test_compare_for_array() {
         let left = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         let right = Array::vector(vec![2.0, 2.0, 2.0]).unwrap();
-        assert_eq!(left.equal(&right).unwrap().elements::<bool>(), Ok(vec![false, true, false]));
-        assert_eq!(left.not_equal(&right).unwrap().elements::<bool>(), Ok(vec![true, false, true]));
-        assert_eq!(left.less_than(&right).unwrap().elements::<bool>(), Ok(vec![true, false, false]));
-        assert_eq!(left.less_than_or_equal(&right).unwrap().elements::<bool>(), Ok(vec![true, true, false]));
-        assert_eq!(left.greater_than(&right).unwrap().elements::<bool>(), Ok(vec![false, false, true]));
-        assert_eq!(left.greater_than_or_equal(&right).unwrap().elements::<bool>(), Ok(vec![false, true, true]));
+        assert_eq!(
+            left.compare(&right, ComparisonDirection::LessThan),
+            Ok(Array::vector(vec![true, false, false]).unwrap()),
+        );
+        assert_eq!(left.equal(&right), Ok(Array::vector(vec![false, true, false]).unwrap()));
+        assert_eq!(left.not_equal(&right), Ok(Array::vector(vec![true, false, true]).unwrap()));
+        assert_eq!(left.less_than(&right), Ok(Array::vector(vec![true, false, false]).unwrap()));
+        assert_eq!(left.less_than_or_equal(&right), Ok(Array::vector(vec![true, true, false]).unwrap()));
+        assert_eq!(left.greater_than(&right), Ok(Array::vector(vec![false, false, true]).unwrap()));
+        assert_eq!(left.greater_than_or_equal(&right), Ok(Array::vector(vec![false, true, true]).unwrap()));
     }
 
     #[test]
-    fn test_array_compare_manual_variation() {
+    fn test_compare_for_array_manual_variation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant_type = ArrayType::scalar(DataType::F32);
         let varying_type = invariant_type
             .clone()
             .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
             .unwrap();
-        let error = TypeError::invalid(
-            "`compare` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack \
-             an axis, as `align_manual_variation` does",
-        );
-        let invariant = Array::from_elements(invariant_type, &[1_f32]).unwrap();
-        let varying = Array::from_elements(varying_type.clone(), &[1_f32]).unwrap();
-        assert_eq!(invariant.equal(&varying), Err(error.clone().into()));
-        assert_eq!(varying.equal(&invariant), Err(error.into()));
+        let invariant = Array::from_elements(invariant_type, &[1f32]).unwrap();
+        let varying = Array::from_elements(varying_type.clone(), &[1f32]).unwrap();
         assert_eq!(
             varying.equal(&varying),
             Array::from_elements(varying_type.with_data_type(DataType::Boolean), &[true]),
         );
+
+        // Eager arrays have no context in which to insert `parallel_vary`, so mismatched variation is rejected.
+        let error = TypeError::invalid(
+            "`compare` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack \
+             an axis, as `align_manual_variation` does",
+        );
+        assert_eq!(invariant.equal(&varying), Err(error.clone().into()));
+        assert_eq!(varying.equal(&invariant), Err(error.into()));
     }
 
     #[test]
-    fn test_array_compare_broadcasting() {
-        // Inputs broadcast and promote before comparing.
-        let mixed = Array::vector(vec![1.0f32, 3.0])
-            .unwrap()
-            .compare(&Array::scalar(2.0f64).unwrap(), ComparisonDirection::GreaterThan);
-        assert_eq!(mixed, Ok(Array::vector(vec![false, true]).unwrap()));
+    fn test_compare_for_array_broadcasting() {
+        // Inputs broadcast and promote to a common element type before comparing.
+        assert_eq!(
+            Array::vector(vec![1.0f32, 3.0]).unwrap().greater_than(&Array::scalar(2.0f64).unwrap()),
+            Ok(Array::vector(vec![false, true]).unwrap()),
+        );
 
-        // Sealed sub-byte elements use their signed value ordering and participate in full NumPy-style broadcasting.
+        // Sub-byte integers compare by their signed values and broadcast along every size-one axis.
         let left = Array::matrix(2, 1, vec![i2::new(-1).unwrap(), i2::new(1).unwrap()]).unwrap();
         let right = Array::matrix(1, 3, vec![i2::new(-2).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]).unwrap();
         assert_eq!(
-            left.compare(&right, ComparisonDirection::LessThan).unwrap().elements::<bool>(),
-            Ok(vec![false, true, true, false, false, false]),
+            left.less_than(&right),
+            Ok(Array::matrix(2, 3, vec![false, true, true, false, false, false]).unwrap()),
         );
     }
 
     #[test]
-    fn test_array_compare_layout() {
-        // Addressed inputs retain their physical layout; changing to narrower Boolean elements clears byte strides.
+    fn test_compare_for_array_layout() {
+        // Addressed inputs retain their physical layout, whereas the narrower Boolean output clears byte strides.
         let strided_type =
             ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let left = Array::from_elements(strided_type.clone(), &[1u16, 3]).unwrap();
         let right = Array::from_elements(strided_type, &[2u16, 2]).unwrap();
-        let compared = left.compare(&right, ComparisonDirection::LessThan).unwrap();
+        let compared = left.less_than(&right).unwrap();
         assert_eq!(compared.elements::<bool>(), Ok(vec![true, false]));
         assert_eq!(compared.r#type().layout(), None);
         assert_eq!(compared.storage_bytes(), [1, 0]);
     }
 
     #[test]
-    fn test_array_compare_unordered() {
-        // Floating-point NaNs are unordered, while complex arrays expose only equality comparisons.
-        let nan = Array::vector(vec![f8e5m2::NAN]).unwrap();
-        assert_eq!(nan.compare(&nan, ComparisonDirection::NotEqual).unwrap().elements::<bool>(), Ok(vec![true]));
-        assert_eq!(nan.equal(&nan), Ok(Array::vector(vec![false]).unwrap()));
-        assert_eq!(nan.less_than(&nan), Ok(Array::vector(vec![false]).unwrap()));
-        let complex = Array::vector(vec![ComplexNumber::new(1.0f32, 2.0)]).unwrap();
-        assert_eq!(complex.compare(&complex, ComparisonDirection::Equal).unwrap().elements::<bool>(), Ok(vec![true]));
+    fn test_compare_for_array_nan() {
+        // Floating-point NaNs are unordered, so a comparison involving one is false for every direction except
+        // `NotEqual`, whether the other element is a NaN or an ordinary value.
+        let left = Array::vector(vec![f8e5m2::NAN, f8e5m2::NAN]).unwrap();
+        let right = Array::vector(vec![f8e5m2::NAN, f8e5m2::from_f64(1.0).unwrap()]).unwrap();
+        for (direction, expected) in [
+            (ComparisonDirection::Equal, false),
+            (ComparisonDirection::NotEqual, true),
+            (ComparisonDirection::LessThan, false),
+            (ComparisonDirection::LessThanOrEqual, false),
+            (ComparisonDirection::GreaterThan, false),
+            (ComparisonDirection::GreaterThanOrEqual, false),
+        ] {
+            assert_eq!(left.compare(&right, direction), Ok(Array::vector(vec![expected, expected]).unwrap()));
+        }
+    }
+
+    #[test]
+    fn test_compare_for_array_complex() {
+        // Complex elements are unordered, so they support only equality and inequality.
+        let left = Array::vector(vec![ComplexNumber::new(1.0f32, 2.0), ComplexNumber::new(1.0f32, -2.0)]).unwrap();
+        let right = Array::vector(vec![ComplexNumber::new(1.0f32, 2.0), ComplexNumber::new(1.0f32, 2.0)]).unwrap();
+        assert_eq!(left.equal(&right), Ok(Array::vector(vec![true, false]).unwrap()));
+        assert_eq!(left.not_equal(&right), Ok(Array::vector(vec![false, true]).unwrap()));
         assert_eq!(
-            complex.compare(&complex, ComparisonDirection::LessThan),
+            left.less_than(&right),
             Err(TypeError::invalid(
                 "cannot apply an ordered comparison to unordered complex scalars of data type `c64`",
             )
@@ -1092,78 +1185,94 @@ mod tests {
     }
 
     #[test]
-    fn test_array_compare_payload_free() {
-        // Empty payload-free comparisons are vacuous because they evaluate no unsupported element comparison; a
-        // nonempty token array retains the established scalar-backend error.
+    fn test_compare_for_array_payload_free() {
+        // Empty payload-free comparisons inspect no elements, so they succeed vacuously, whereas nonempty
+        // payload-free arrays have no elements to compare.
         let empty_token = Array::from_logical_bytes(ArrayType::new_static(DataType::Token, [0]), &[]).unwrap();
-        assert_eq!(
-            empty_token.compare(&empty_token, ComparisonDirection::Equal).unwrap().elements::<bool>(),
-            Ok(vec![]),
-        );
+        assert_eq!(empty_token.equal(&empty_token), Ok(Array::vector(Vec::<bool>::new()).unwrap()));
         let token = Array::from_logical_bytes(ArrayType::new_static(DataType::Token, [1]), &[]).unwrap();
-        assert_eq!(
-            token.compare(&token, ComparisonDirection::Equal),
-            Err(TypeError::invalid("cannot compare `token` scalars").into()),
-        );
+        assert_eq!(token.equal(&token), Err(TypeError::invalid("cannot compare `token` scalars").into()));
+        let zero = Array::from_logical_bytes(ArrayType::new_static(DataType::Zero, [1]), &[]).unwrap();
+        assert_eq!(zero.equal(&zero), Err(TypeError::invalid("cannot compare `zero` scalars").into()));
     }
 
     #[test]
-    fn test_array_ir_value_compare() {
+    fn test_compare_for_dimension_value() {
         let left = DimensionValue::constant(3).unwrap();
         let right = DimensionValue::constant(5).unwrap();
-        let left = ArrayIrValue::<Array>::Dimension(left);
-        let right = ArrayIrValue::<Array>::Dimension(right);
-        assert_eq!(left.less_than(&right), Ok(ArrayIrValue::Array(Array::scalar(true).unwrap())));
+        assert_eq!(left.equal(&right), Ok(Array::scalar(false).unwrap()));
+        assert_eq!(left.not_equal(&right), Ok(Array::scalar(true).unwrap()));
+        assert_eq!(left.less_than(&right), Ok(Array::scalar(true).unwrap()));
+        assert_eq!(left.less_than_or_equal(&right), Ok(Array::scalar(true).unwrap()));
+        assert_eq!(left.greater_than(&right), Ok(Array::scalar(false).unwrap()));
+        assert_eq!(left.greater_than_or_equal(&right), Ok(Array::scalar(false).unwrap()));
+
+        // Mixed-family outputs are resolved by the dimension proof, in which concrete extents take precedence over a
+        // shared dimension identity.
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let three = DimensionValue::new(dimension_type.clone(), 3).unwrap();
+        let five = DimensionValue::new(dimension_type, 5).unwrap();
+        assert_eq!(
+            Compare::<ArrayIrValue<Array>>::less_than(&three, &five),
+            Ok(ArrayIrValue::Array(Array::scalar(true).unwrap())),
+        );
+        assert_eq!(
+            Compare::<ArrayIrValue<Array>>::equal(&three, &three),
+            Ok(ArrayIrValue::Array(Array::scalar(true).unwrap())),
+        );
     }
 
     #[test]
-    fn test_compare_staging() {
+    fn test_compare_for_array_ir_value() {
+        // Dimension members compare their extents, whereas array members are rejected because array comparisons
+        // use the projected `ArrayType` operation.
+        let left = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
+        let right = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(5).unwrap());
+        assert_eq!(left.less_than(&right), Ok(ArrayIrValue::Array(Array::scalar(true).unwrap())));
+        let array = ArrayIrValue::Array(Array::scalar(1.0).unwrap());
+        assert_eq!(
+            array.less_than(&array),
+            Err(TypeError::invalid("expected dimension type but got array type").into())
+        );
+    }
+
+    #[test]
+    fn test_compare_for_projected_value() {
+        // An unproven dimension predicate stages one comparison that produces a rank-zero Boolean array.
         let bounds = DimensionBounds::new(0, Some(9)).unwrap();
         let left_type = DimensionType::new("left", bounds);
         let right_type = DimensionType::new("right", bounds);
-        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let left = context.input(left_type.clone().into());
-        let right = context.input(right_type.clone().into());
-        let left_id = left.atom_id().unwrap();
-        let right_id = right.atom_id().unwrap();
-        let left = ValueProjection::<DimensionType>::into_projected(left).unwrap();
-        let right = ValueProjection::<DimensionType>::into_projected(right).unwrap();
-        let output = left.less_than(&right).unwrap();
-        let output_id = output.atom_id().unwrap();
-        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
-
-        let builder = context.builder().borrow();
-        let [instruction] = builder.instructions() else {
-            panic!("expected one comparison instruction");
-        };
-        assert_eq!(instruction.inputs(), &[left_id, right_id]);
-        assert_eq!(instruction.outputs(), &[output_id]);
-        assert!(instruction.regions().is_empty());
-        let ArrayIrOperation::Compare(operation) = instruction.operation() else {
-            panic!("expected a dimension comparison instruction");
-        };
-        assert_eq!(operation.direction(), ComparisonDirection::LessThan);
-        let program = builder
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output_id],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        drop(builder);
-
+        let (output_type, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |(left, right): (_, _)| {
+                let left = ValueProjection::<DimensionType>::into_projected(left)?;
+                let right = ValueProjection::<DimensionType>::into_projected(right)?;
+                left.less_than(&right)
+            },
+            (ArrayIrType::from(left_type.clone()), ArrayIrType::from(right_type.clone())),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Dimension(DimensionValue::new(left_type.clone(), 3).unwrap()),
-                ArrayIrValue::Dimension(DimensionValue::new(right_type.clone(), 5).unwrap()),
-            ]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(true).unwrap())]),
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [0, 9)>, %1:dimension<right ∈ [0, 9)> .
+                let %2:bool[] = compare [direction=LessThan] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Dimension(DimensionValue::new(left_type, 3).unwrap()),
+                ArrayIrValue::Dimension(DimensionValue::new(right_type, 5).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::scalar(true).unwrap())),
         );
     }
 
     #[test]
-    fn test_compare_staging_dimension_proof() {
+    fn test_compare_for_projected_value_dimension_proof() {
+        // A predicate proved by a shared dimension identity is lifted as a constant without staging an instruction.
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let dimension = context.input(DimensionType::new("extent", DimensionBounds::new(0, None).unwrap()).into());
         let dimension = ValueProjection::<DimensionType>::into_projected(dimension).unwrap();
@@ -1176,14 +1285,50 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_value_compare() {
-        let left = DimensionValue::constant(3).unwrap();
-        let right = DimensionValue::constant(5).unwrap();
-        assert_eq!(left.equal(&right), Ok(Array::scalar(false).unwrap()));
-        assert_eq!(left.not_equal(&right), Ok(Array::scalar(true).unwrap()));
-        assert_eq!(left.less_than(&right), Ok(Array::scalar(true).unwrap()));
-        assert_eq!(left.less_than_or_equal(&right), Ok(Array::scalar(true).unwrap()));
-        assert_eq!(left.greater_than(&right), Ok(Array::scalar(false).unwrap()));
-        assert_eq!(left.greater_than_or_equal(&right), Ok(Array::scalar(false).unwrap()));
+    fn test_compare_for_tracer() {
+        // Traced arrays stage the comparison through their context.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(left, right): (_, _)| left.less_than(&right),
+            (ArrayType::new_static(DataType::F32, [2]), ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f64[] .
+                let %2:bool[2] = compare [direction=LessThan] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_compare_for_tracer_manual_variation() {
+        // Traced comparisons align manual variation before staging by inserting `parallel_vary` on the invariant input.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let (_, program) = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
+            |(invariant, varying): (_, _)| invariant.less_than(&varying),
+            (ArrayType::scalar(DataType::F32), varying_type),
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] .
+                let %2:f32[][sharding={mesh<['m'=2:manual]>, []}] = broadcast \
+                        [output_type=f32[][sharding={mesh<['m'=2:manual]>, []}], output_axes=[]] %0
+                    %3:f32[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary \
+                        [axis_name=\"m\"] %2
+                    %4:bool[][sharding={mesh<['m'=2:manual]>, [], varying_manual={'m'}}] = compare \
+                        [direction=LessThan] %3 %1
+                in (%4)
+            "}
+            .trim_end(),
+        );
     }
 }

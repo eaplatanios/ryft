@@ -4118,7 +4118,7 @@ macro_rules! check_operation_partial_evaluation {
     }};
 
     // This internal branch converts one unknown input declaration and retains its concrete replay value.
-    (@partial_input $value:ty, (@unknown(type = $r#type:expr, replay = $input:expr))) => {{
+    (@partial_input $value:ty, (@unknown(type = $r#type:expr, replay = $input:expr $(,)?))) => {{
         let input: $value = ::core::convert::Into::into($input);
         ($crate::partial::PartialValue::Unknown($r#type), Some(input))
     }};
