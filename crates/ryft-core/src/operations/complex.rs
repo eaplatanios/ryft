@@ -580,8 +580,6 @@ impl Imaginary for Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -742,7 +740,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &Array::scalar(ComplexNumber::new(1.5f64, -2.0)).unwrap());
         assert!(
-            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::C128))
+            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::C128)),
         );
     }
 
