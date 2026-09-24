@@ -205,20 +205,17 @@ pub struct AssertionFailure {
     pub observations: Vec<(String, String)>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`AssertOperation`].
 pub const ASSERT_OPERATION_NAME: &str = "assert";
 
-/// [`Operation`] that checks a Boolean condition and produces no outputs. Refer to the documentation of [`Assert`]
-/// for more information.
+/// [`Operation`] that checks a Boolean condition and produces no outputs.
 ///
-/// The first input is the condition and the remaining inputs are the observations named by
-/// [`labels`](Self::labels), which are reported together with the message when the check fails. By default, the
-/// condition and the observations are scalars; [`with_failure_limit`](Self::with_failure_limit) enables array
-/// conditions and bounded element diagnostics, in which case array observations may instead have the condition's shape.
-/// Supported observations are dimensions and Boolean, integer, `bf16`, `f16`, `f32`, and `f64` arrays. Labels and
-/// messages are literal descriptions and do not refer to type identities.
+/// The first input is the condition and the remaining inputs are the observations named by [`labels`](Self::labels),
+/// which are reported together with the message when the check fails. By default, the condition and the observations
+/// are scalars. [`with_failure_limit`](Self::with_failure_limit) enables array conditions and bounded element
+/// diagnostics, in which case array observations may instead have the condition's shape. Supported observations
+/// are dimensions and Boolean, integer, `bf16`, `f16`, `f32`, and `f64` arrays. Labels and messages are literal
+/// descriptions and do not refer to type identities.
 ///
 /// Assertions remain enabled independently of debug builds. Every residual instruction declares
 /// [`EffectClass::OrderedAssertion`], so separate assertions preserve separate ordered failures, while known
@@ -227,6 +224,8 @@ pub const ASSERT_OPERATION_NAME: &str = "assert";
 /// reporting preserves all logical elements and reports a row-major sample. Mixed array programs support dynamic
 /// extents, including empty batches, which pass vacuously. Observations with a potentially empty mapped axis receive
 /// one unused padding item so that diagnostic selection remains valid; the padded extent must also fit `i32`.
+///
+/// Refer to the documentation of [`Assert`] for more information.
 #[derive(Clone, Debug)]
 pub struct AssertOperation<T: Type> {
     /// Refer to the documentation of [`message`](Self::message) for more information.
@@ -244,38 +243,46 @@ pub struct AssertOperation<T: Type> {
 
 impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
     /// Creates a new [`AssertOperation`] with the provided message and no diagnostic observations.
+    #[inline]
     pub fn new<M: Into<String>>(message: M) -> Self {
         Self { message: message.into(), labels: Vec::new(), failure_limit: None, marker: PhantomData }
     }
 
     /// Returns a copy of this [`AssertOperation`] with its diagnostic labels set to the provided `labels`.
+    #[inline]
     pub fn with_labels(mut self, labels: Vec<String>) -> Self {
         self.labels = labels;
         self
     }
 
     /// Returns a copy of this [`AssertOperation`] with bounded element reporting enabled with the provided `limit`.
-    /// Conditions may then be Boolean arrays; observations must be scalars or have the condition's shape.
-    /// At most `limit` failed elements are reported in logical row-major order, along with the number omitted.
+    /// Conditions may then be Boolean arrays; observations must be scalars or have the condition's shape. At most
+    /// `limit` failed elements are reported in logical row-major order, along with the number omitted.
+    #[inline]
     pub fn with_failure_limit(mut self, limit: NonZeroUsize) -> Self {
         self.failure_limit = Some(limit);
         self
     }
 
     /// Returns the literal message reported when the condition is false.
+    #[inline]
     pub fn message(&self) -> &str {
         &self.message
     }
 
     /// Returns the labels for the diagnostic inputs following the condition, in input order.
+    #[inline]
     pub fn labels(&self) -> &[String] {
         &self.labels
     }
 
     /// Returns the maximum number of reported failed elements, or `None` for the default scalar assertion behavior.
+    #[inline]
     pub fn failure_limit(&self) -> Option<NonZeroUsize> {
         self.failure_limit
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Batches logical scalar inputs, selecting one observed failing batch item at the current transform level.
     fn batch_inputs<C, P, V, Project, Lift, Indices, MaskEmpty, PadEmpty, Pack, Driver>(
