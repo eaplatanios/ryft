@@ -159,8 +159,8 @@ impl Operation for ReshardOperation {
             .any(|axis| self.sharding.mesh().axis_type(axis) == Some(MeshAxisType::Auto))
         {
             return Err(TypeError::invalid(format!(
-                "`{RESHARD_OPERATION_NAME}` cannot target auto mesh axes; use `{CONSTRAIN_SHARDING_OPERATION_NAME}` \
-                 to constrain placement over them",
+                "`{RESHARD_OPERATION_NAME}` cannot target auto mesh axes; use \
+                 `{CONSTRAIN_SHARDING_OPERATION_NAME}` to constrain placement over them",
             )));
         }
 
@@ -177,8 +177,8 @@ impl Operation for ReshardOperation {
             .any(|axis| self.sharding.mesh().axis_type(axis) == Some(MeshAxisType::Manual))
         {
             return Err(TypeError::invalid(format!(
-                "`{RESHARD_OPERATION_NAME}` cannot target manual mesh axes; use manual collectives \
-                     for transitions over them",
+                "`{RESHARD_OPERATION_NAME}` cannot target manual mesh axes; use manual collectives for \
+                 transitions over them",
             )));
         }
 
@@ -719,7 +719,7 @@ mod tests {
         // Operation identity, accessors, and rendering.
         assert_eq!(operation.name(), RESHARD_OPERATION_NAME);
         assert_eq!(operation.sharding(), &target);
-        assert_eq!(operation.to_string(), format!("reshard [sharding={target}]"));
+        assert_eq!(operation.to_string(), format!("{RESHARD_OPERATION_NAME} [sharding={target}]"));
     }
 
     #[test]
@@ -747,7 +747,9 @@ mod tests {
                     .unwrap()],
             }, {
                 input_types = [ArrayType::new_static(DataType::F32, [8, 2])],
-                error = "`reshard` target sharding rank (1) does not match the input rank (2)",
+                error = format!(
+                    "`{RESHARD_OPERATION_NAME}` target sharding rank (1) does not match the input rank (2)",
+                ),
             }, {
                 input_types = [],
                 error = "expected 1 input but got 0",
@@ -758,8 +760,8 @@ mod tests {
         // or carries reduction state.
         let auto_target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         let auto_error = format!(
-            "`{RESHARD_OPERATION_NAME}` cannot target auto mesh axes; use `{CONSTRAIN_SHARDING_OPERATION_NAME}` to \
-             constrain placement over them",
+            "`{RESHARD_OPERATION_NAME}` cannot target auto mesh axes; use \
+             `{CONSTRAIN_SHARDING_OPERATION_NAME}` to constrain placement over them",
         );
         check_operation_type_inference!(
             operation = ReshardOperation::new(auto_target),
@@ -793,14 +795,20 @@ mod tests {
             operation = ReshardOperation::new(Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["m"]).unwrap()),
             cases = [{
                 input_types = [input_type.clone()],
-                error = "`reshard` cannot target manual mesh axes; use manual collectives for transitions over them",
+                error = format!(
+                    "`{RESHARD_OPERATION_NAME}` cannot target manual mesh axes; use manual collectives for \
+                     transitions over them",
+                ),
             }],
         );
         check_operation_type_inference!(
             operation = ReshardOperation::new(Sharding::new(mesh, vec![ShardingDimension::sharded(["m"])]).unwrap()),
             cases = [{
                 input_types = [input_type.clone()],
-                error = "`reshard` cannot target manual mesh axes; use manual collectives for transitions over them",
+                error = format!(
+                    "`{RESHARD_OPERATION_NAME}` cannot target manual mesh axes; use manual collectives for \
+                     transitions over them",
+                ),
             }],
         );
 
@@ -818,7 +826,7 @@ mod tests {
     fn test_reshard_interpretation() {
         let target = Sharding::new(mesh(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let operation = ReshardOperation::new(target.clone());
-        let input = Array::vector(vec![1.0_f32, 2.0]).unwrap();
+        let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
 
         // Interpretation passes the elements through and records the target on the output type.
         assert_eq!(
@@ -826,7 +834,7 @@ mod tests {
             Ok(vec![
                 Array::from_elements(
                     ArrayType::new_static(DataType::F32, [2]).with_sharding(target).unwrap(),
-                    &[1.0_f32, 2.0],
+                    &[1.0f32, 2.0],
                 )
                 .unwrap(),
             ]),
@@ -842,10 +850,10 @@ mod tests {
         let target = Sharding::new(mesh(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         check_operation_partial_evaluation!(
             operation = ReshardOperation::new(target.clone()),
-            inputs = [Array::vector(vec![1.0_f32, 2.0]).unwrap()],
+            inputs = [Array::vector(vec![1.0f32, 2.0]).unwrap()],
             expected = Array::from_elements(
                 ArrayType::new_static(DataType::F32, [2]).with_sharding(target).unwrap(),
-                &[1.0_f32, 2.0],
+                &[1.0f32, 2.0],
             )
             .unwrap(),
         );
@@ -883,9 +891,9 @@ mod tests {
         let expected_lifted = target.with_inserted_dimension(0, ShardingDimension::Replicated).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
         let array =
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1_f32, 2., 3., 4., 5., 6.]).unwrap();
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 2., 3., 4., 5., 6.]).unwrap();
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 3]).unwrap();
+        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 3]).unwrap();
         let input = ArrayBatch::new(array, BatchAxis::new(0))
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(1, extents, variable, vec![0])])
@@ -930,7 +938,7 @@ mod tests {
         // An unmapped input keeps its original rank and remains replicated across the batch.
         let target = Sharding::new(mesh(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
-        let array = Array::vector(vec![1.0_f32, 2.0]).unwrap();
+        let array = Array::vector(vec![1.0f32, 2.0]).unwrap();
         let input = ArrayBatch::new(array.clone(), BatchAxis::replicated()).unwrap();
         let (outputs, _) = ReshardOperation::new(target.clone())
             .batch(&context, &EmptyRegionDriver, &[input])
@@ -943,7 +951,7 @@ mod tests {
             outputs[0].value(),
             &Array::from_elements(
                 ArrayType::new_static(DataType::F32, [2]).with_sharding(target).unwrap(),
-                &[1.0_f32, 2.0],
+                &[1.0f32, 2.0],
             )
             .unwrap(),
         );
@@ -953,12 +961,12 @@ mod tests {
     fn test_reshard_differentiation() {
         // Resharding is linear, so the tangent is resharded to the same target as the primal.
         let target = Sharding::new(mesh(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let (primal, tangent) = differentiate_at(Array::vector(vec![1.0_f32, 2.0]).unwrap())
-            .jvp(Array::vector(vec![3.0_f32, 4.0]).unwrap(), |x| x.reshard(&target))
+        let (primal, tangent) = differentiate_at(Array::vector(vec![1.0f32, 2.0]).unwrap())
+            .jvp(Array::vector(vec![3.0f32, 4.0]).unwrap(), |x| x.reshard(&target))
             .unwrap();
         let expected_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(target).unwrap();
-        assert_eq!(primal, Array::from_elements(expected_type.clone(), &[1.0_f32, 2.0]).unwrap());
-        assert_eq!(tangent, Array::from_elements(expected_type, &[3.0_f32, 4.0]).unwrap());
+        assert_eq!(primal, Array::from_elements(expected_type.clone(), &[1.0f32, 2.0]).unwrap());
+        assert_eq!(tangent, Array::from_elements(expected_type, &[3.0f32, 4.0]).unwrap());
     }
 
     #[test]
@@ -1047,9 +1055,9 @@ mod tests {
         );
         assert_eq!(
             input.reshard(&Sharding::replicated(mesh, 2)),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`reshard` target sharding rank (2) does not match the input rank (1)",
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{RESHARD_OPERATION_NAME}` target sharding rank (2) does not match the input rank (1)",
+            )))),
         );
     }
 
@@ -1061,7 +1069,7 @@ mod tests {
         // Operation identity, accessors, and rendering.
         assert_eq!(operation.name(), CONSTRAIN_SHARDING_OPERATION_NAME);
         assert_eq!(operation.sharding(), &constraint);
-        assert_eq!(operation.to_string(), format!("constrain_sharding [sharding={constraint}]"));
+        assert_eq!(operation.to_string(), format!("{CONSTRAIN_SHARDING_OPERATION_NAME} [sharding={constraint}]"));
     }
 
     #[test]
@@ -1173,16 +1181,19 @@ mod tests {
         let other_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         assert_eq!(
             operation.lowered_sharding(&input_type.clone().with_sharding(Sharding::replicated(other_mesh, 3)).unwrap()),
-            Err(TypeError::invalid(
-                "`constrain_sharding` sharding {mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'a'}, {}, {?}]} \
-                 is on a different mesh than the input sharding {mesh<['y'=2:explicit]>, [{}, {}, {}]}",
-            )),
+            Err(TypeError::invalid(format!(
+                "`{CONSTRAIN_SHARDING_OPERATION_NAME}` sharding {{mesh<['x'=2:explicit, 'm'=2:manual, \
+                 'a'=2:auto]>, [{{'a'}}, {{}}, {{?}}]}} is on a different mesh than the input sharding \
+                 {{mesh<['y'=2:explicit]>, [{{}}, {{}}, {{}}]}}",
+            ))),
         );
         assert_eq!(
             operation.lowered_sharding(
                 &ArrayType::new_static(DataType::F32, [8]).with_sharding(Sharding::replicated(mesh, 1)).unwrap(),
             ),
-            Err(TypeError::invalid("`constrain_sharding` rank (3) does not match the input rank (1)")),
+            Err(TypeError::invalid(format!(
+                "`{CONSTRAIN_SHARDING_OPERATION_NAME}` rank (3) does not match the input rank (1)",
+            ))),
         );
     }
 
@@ -1208,7 +1219,9 @@ mod tests {
                 output_types = [sharded_input_type],
             }, {
                 input_types = [ArrayType::new_static(DataType::F32, [8, 2])],
-                error = "`constrain_sharding` rank (1) does not match the input rank (2)",
+                error = format!(
+                    "`{CONSTRAIN_SHARDING_OPERATION_NAME}` rank (1) does not match the input rank (2)",
+                ),
             }, {
                 input_types = [],
                 error = "expected 1 input but got 0",
@@ -1223,8 +1236,11 @@ mod tests {
             operation = ConstrainShardingOperation::new(constraint.clone()),
             cases = [{
                 input_types = [other_input_type],
-                error = "`constrain_sharding` sharding {mesh<['x'=2:explicit, 'm'=2:manual, 'a'=2:auto]>, [{'a'}]} \
-                         is on a different mesh than the input sharding {mesh<['y'=2:explicit]>, [{}]}",
+                error = format!(
+                    "`{CONSTRAIN_SHARDING_OPERATION_NAME}` sharding {{mesh<['x'=2:explicit, 'm'=2:manual, \
+                     'a'=2:auto]>, [{{'a'}}]}} is on a different mesh than the input sharding \
+                     {{mesh<['y'=2:explicit]>, [{{}}]}}",
+                ),
             }],
         );
         let explicit_constraint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1288,8 +1304,8 @@ mod tests {
         let constraint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         check_operation_partial_evaluation!(
             operation = ConstrainShardingOperation::new(constraint),
-            inputs = [Array::vector(vec![1.0_f32, 2.0]).unwrap()],
-            expected = Array::vector(vec![1.0_f32, 2.0]).unwrap(),
+            inputs = [Array::vector(vec![1.0f32, 2.0]).unwrap()],
+            expected = Array::vector(vec![1.0f32, 2.0]).unwrap(),
         );
     }
 
@@ -1331,9 +1347,9 @@ mod tests {
         let constraint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
         let array =
-            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1_f32, 2., 3., 4., 5., 6.]).unwrap();
+            Array::from_elements(ArrayType::new_static(DataType::F32, [2, 3]), &[1f32, 2., 3., 4., 5., 6.]).unwrap();
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1_i32, 3]).unwrap();
+        let extents = Array::from_elements(ArrayType::new_static(DataType::I32, [2]), &[1i32, 3]).unwrap();
         let input = ArrayBatch::new(array.clone(), BatchAxis::new(0))
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(1, extents, variable, vec![0])])
@@ -1379,7 +1395,7 @@ mod tests {
         // An unmapped input keeps its original rank and remains replicated across the batch.
         let constraint = Sharding::new(mesh(), vec![ShardingDimension::sharded(["a"])]).unwrap();
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array>::new(), 2);
-        let array = Array::vector(vec![1.0_f32, 2.0]).unwrap();
+        let array = Array::vector(vec![1.0f32, 2.0]).unwrap();
         let input = ArrayBatch::new(array.clone(), BatchAxis::replicated()).unwrap();
         let (outputs, _) = ConstrainShardingOperation::new(constraint.clone())
             .batch(&context, &EmptyRegionDriver, &[input])
@@ -1437,7 +1453,7 @@ mod tests {
         // The constraint is metadata for lowering only, so a concrete array is returned unchanged.
         let mesh = mesh();
         let constraint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
-        let input = Array::vector(vec![1.0_f32, 2.0]).unwrap();
+        let input = Array::vector(vec![1.0f32, 2.0]).unwrap();
         assert_eq!(input.constrain_sharding(&constraint), Ok(input.clone()));
 
         // Eager evaluation validates the constraint exactly like staged programs do.
@@ -1450,9 +1466,9 @@ mod tests {
         );
         assert_eq!(
             input.constrain_sharding(&Sharding::replicated(mesh, 2)),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`constrain_sharding` rank (2) does not match the input rank (1)",
-            ))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{CONSTRAIN_SHARDING_OPERATION_NAME}` rank (2) does not match the input rank (1)",
+            )))),
         );
     }
 }
