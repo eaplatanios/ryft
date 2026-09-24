@@ -574,11 +574,6 @@ impl<C: Context<Type: Into<ArrayIrType>, Constant: AssertionValue, Operation: Fr
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Batching forwards the assertion to the parent context, either with its condition reduced to one scalar Boolean and
-// the observations of the first failing batch item selected at this transform level, or, with a failure limit, with
-// its inputs materialized along the batch axis. The policy supplies its array view of values and its extent handling.
 impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P> for AssertOperation<C::Type> {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
@@ -586,22 +581,35 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // Batching forwards the assertion to the parent context, either with its condition reduced to one scalar
+        // Boolean and the observations of the first failing batch item selected at this transform level, or, with
+        // a failure limit, with its inputs materialized along the batch axis. The policy supplies its array view
+        // of values and its extent handling.
+
+        // Validate the per-item signature before eliminating an empty batch or changing the input shapes.
         let extent = P::batch_extent(context)?;
         self.infer_output_types(
             &inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect::<Vec<_>>(),
             &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
         )?;
+
         // Empty batches pass even when the predicate is replicated and false. Check the extent before replaying.
         if extent.value() == Some(0) {
             return Ok(Vec::new().into());
         }
+
+        // Preserve individual conditions and observations so the parent can report multiple failing elements.
+        // Materialization broadcasts replicated inputs and arranges mapped inputs along the batch axis.
         if self.failure_limit.is_some() {
             let arguments = P::materialize_inputs(context, inputs)?;
             context.parent().assert(self.clone(), &arguments)?;
             return Ok(Vec::new().into());
         }
+
         let mapped = inputs.iter().any(|input| P::batch_axis(input).axis().is_some());
         if !mapped {
+            // Every item has the same condition and observations, so one assertion suffices. A dynamic extent
+            // may still be zero at execution time; mask the condition so that case passes vacuously.
             let mut arguments = inputs.iter().map(|input| P::value(input).clone()).collect::<Vec<_>>();
             arguments[0] = P::from_array_value(P::mask_empty_batch_condition(
                 context,
@@ -610,12 +618,15 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
             context.parent().assert(self.clone(), &arguments)?;
             return Ok(Vec::new().into());
         }
+
+        // Failure selection uses signed 32-bit indices. Check the extent's upper bound before staging that work.
         let (_, maximum) = extent.bounds().representable_extent_range().map_err(ProgramError::from)?;
         if maximum > i32::MAX as usize {
             return Err(BatchingError::UnsupportedOperation {
                 message: "mapped assertion batch extent exceeds the supported `i32` index range".to_owned(),
             });
         }
+
         // Backends also represent logical padded extents with signed indices; reserve the fallback item before staging.
         if maximum == i32::MAX as usize
             && extent.bounds().lower() == 0
@@ -625,24 +636,32 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
                 message: "padded assertion batch extent exceeds the supported `i32` extent range".to_owned(),
             });
         }
+
         let condition = P::into_array_value(P::value(&inputs[0]).clone())?;
         let (condition, index) = if P::batch_axis(&inputs[0]).axis().is_some() {
-            let coordinates =
-                P::batch_item_indices(context, &condition.r#type().into_owned().with_data_type(DataType::I32))?;
+            let coordinates_type = condition.r#type().into_owned().with_data_type(DataType::I32);
+            let coordinates = P::batch_item_indices(context, &coordinates_type)?;
+
             // Passing items may tie the last coordinate: when any item fails, the minimum still identifies the
             // first failure. Successful and empty batches are handled by the independent Boolean reduction.
             let sentinel = coordinates.reduce(&[0], ReductionKind::Max)?;
             let candidates = Select::select(&condition, &sentinel, &coordinates)?;
             let index = candidates.reduce(&[0], ReductionKind::Min)?;
             let condition = condition.reduce(&[0], ReductionKind::All)?;
+
             // Empty and successful batches use index zero. A padded observation makes this valid even at extent zero.
             let index = Select::select(&condition, &index.zero_like()?, &index)?;
             (condition, index)
         } else {
+            // Only observations vary across items. A replicated false condition fails first at index zero,
+            // while a dynamically empty batch must still pass.
             let condition = P::mask_empty_batch_condition(context, condition)?;
             let index = condition.convert_element_type(DataType::I32)?.zero_like()?;
             (condition, index)
         };
+
+        // Select each mapped observation at the first failing index and keep replicated observations unchanged.
+        // Padding supplies a valid fallback element when the dynamic batch is empty, even though it passes.
         let mut arguments = vec![P::from_array_value(condition)];
         let mut padded_extent = None;
         for input in &inputs[1..] {
@@ -652,6 +671,7 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
                     P::value(input).clone(),
                     &mut padded_extent,
                 )?)?;
+
                 // The selected batch index is never negative, so the clamp-only policy keeps this slice on the single
                 // gather path even when the mapped axis is dynamic.
                 let observation =
@@ -662,6 +682,9 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
             }
         }
         arguments.push(P::from_array_value(index));
+
+        // Include the selected index in the diagnostic without colliding with user labels or indices already
+        // introduced by another batching level.
         let mut labels = self.labels.clone();
         let mut label = "batch_index".to_owned();
         let mut suffix = 1;
@@ -670,6 +693,8 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
             suffix += 1;
         }
         labels.push(label);
+
+        // Delegate the scalar assertion to the parent so any enclosing transforms apply their own rules.
         context.parent().assert(self.clone().with_labels(labels), &arguments)?;
         Ok(Vec::new().into())
     }
@@ -677,6 +702,8 @@ impl<C: AssertionContext, P: AssertionBatchingPolicy<C>> BatchableOperation<C, P
 
 impl_non_differentiable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
 impl_non_transposable_operation!(<T> AssertOperation<T> where T: Type + Into<ArrayIrType>);
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents a [`BatchingPolicy`] that can batch [`AssertOperation`]s. Batching an assertion forwards it to the parent
 /// context. An assertion without a failure limit reduces its batched condition to one scalar Boolean and reports the
