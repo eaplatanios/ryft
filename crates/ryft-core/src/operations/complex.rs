@@ -76,7 +76,18 @@ define_elementwise_operation!(
                 input_types[1],
             )));
         }
-        Ok(vec![part_to_complex_data_type(input_types[0], COMPLEX_OPERATION_NAME)?])
+        let data_type = match input_types[0] {
+            DataType::F32 => DataType::C64,
+            DataType::F64 => DataType::C128,
+            other => {
+                return Err(TypeError::invalid(format!(
+                    "`{}` requires `f32` or `f64` parts but got `{}`",
+                    COMPLEX_OPERATION_NAME,
+                    other,
+                )));
+            }
+        };
+        Ok(vec![data_type])
     },
     infer_array_types = |input_types: &[ArrayType]| {
         if input_types[0] != input_types[1] {
@@ -87,7 +98,17 @@ define_elementwise_operation!(
                 input_types[1],
             )));
         }
-        let data_type = part_to_complex_data_type(input_types[0].data_type(), COMPLEX_OPERATION_NAME)?;
+        let data_type = match input_types[0].data_type() {
+            DataType::F32 => DataType::C64,
+            DataType::F64 => DataType::C128,
+            other => {
+                return Err(TypeError::invalid(format!(
+                    "`{}` requires `f32` or `f64` parts but got `{}`",
+                    COMPLEX_OPERATION_NAME,
+                    other,
+                )));
+            }
+        };
         Ok(vec![input_types[0].with_element_type(data_type)])
     },
 );
@@ -219,8 +240,14 @@ define_elementwise_operation!(
     ConjugateOperation, CONJUGATE_OPERATION_NAME,
     Conjugate, conjugate,
     infer_data_types = |input_types: &[DataType]| {
-        complex_to_part_data_type(input_types[0], CONJUGATE_OPERATION_NAME)?;
-        Ok(vec![input_types[0]])
+        match input_types[0] {
+            DataType::C64 | DataType::C128 => Ok(vec![input_types[0]]),
+            other => Err(TypeError::invalid(format!(
+                "`{}` requires a complex input but got `{}`",
+                CONJUGATE_OPERATION_NAME,
+                other,
+            ))),
+        }
     },
 );
 
@@ -313,10 +340,31 @@ define_elementwise_operation!(
     RealOperation, REAL_OPERATION_NAME,
     Real, real,
     infer_data_types = |input_types: &[DataType]| {
-        Ok(vec![complex_to_part_data_type(input_types[0], REAL_OPERATION_NAME)?])
+        let data_type = match input_types[0] {
+            DataType::C64 => DataType::F32,
+            DataType::C128 => DataType::F64,
+            other => {
+                return Err(TypeError::invalid(format!(
+                    "`{}` requires a complex input but got `{}`",
+                    REAL_OPERATION_NAME,
+                    other,
+                )));
+            }
+        };
+        Ok(vec![data_type])
     },
     infer_array_types = |input_types: &[ArrayType]| {
-        let data_type = complex_to_part_data_type(input_types[0].data_type(), REAL_OPERATION_NAME)?;
+        let data_type = match input_types[0].data_type() {
+            DataType::C64 => DataType::F32,
+            DataType::C128 => DataType::F64,
+            other => {
+                return Err(TypeError::invalid(format!(
+                    "`{}` requires a complex input but got `{}`",
+                    REAL_OPERATION_NAME,
+                    other,
+                )));
+            }
+        };
         Ok(vec![input_types[0].with_element_type(data_type)])
     },
 );
@@ -415,10 +463,31 @@ define_elementwise_operation!(
     ImaginaryOperation, IMAGINARY_OPERATION_NAME,
     Imaginary, imaginary,
     infer_data_types = |input_types: &[DataType]| {
-        Ok(vec![complex_to_part_data_type(input_types[0], IMAGINARY_OPERATION_NAME)?])
+        let data_type = match input_types[0] {
+            DataType::C64 => DataType::F32,
+            DataType::C128 => DataType::F64,
+            other => {
+                return Err(TypeError::invalid(format!(
+                    "`{}` requires a complex input but got `{}`",
+                    IMAGINARY_OPERATION_NAME,
+                    other,
+                )));
+            }
+        };
+        Ok(vec![data_type])
     },
     infer_array_types = |input_types: &[ArrayType]| {
-        let data_type = complex_to_part_data_type(input_types[0].data_type(), IMAGINARY_OPERATION_NAME)?;
+        let data_type = match input_types[0].data_type() {
+            DataType::C64 => DataType::F32,
+            DataType::C128 => DataType::F64,
+            other => {
+                return Err(TypeError::invalid(format!(
+                    "`{}` requires a complex input but got `{}`",
+                    IMAGINARY_OPERATION_NAME,
+                    other,
+                )));
+            }
+        };
         Ok(vec![input_types[0].with_element_type(data_type)])
     },
 );
@@ -501,26 +570,6 @@ impl Imaginary for Array {
                     .into())
             }
         }
-    }
-}
-
-/// Maps a real part element [`DataType`] to the complex [`DataType`] it constructs (i.e., `f32 → c64` and
-/// `f64 → c128`), reporting a [`TypeError`] under `operation_name`'s name for any other part data type.
-fn part_to_complex_data_type(part: DataType, operation_name: &'static str) -> Result<DataType, TypeError> {
-    match part {
-        DataType::F32 => Ok(DataType::C64),
-        DataType::F64 => Ok(DataType::C128),
-        other => Err(TypeError::invalid(format!("`{operation_name}` requires `f32` or `f64` parts but got `{other}`"))),
-    }
-}
-
-/// Maps a complex element [`DataType`] to the [`DataType`] of its real and imaginary parts (i.e., `c64 → f32` and
-/// `c128 → f64`), reporting a [`TypeError`] under `operation_name`'s name for non-complex input data types.
-fn complex_to_part_data_type(complex: DataType, operation_name: &'static str) -> Result<DataType, TypeError> {
-    match complex {
-        DataType::C64 => Ok(DataType::F32),
-        DataType::C128 => Ok(DataType::F64),
-        other => Err(TypeError::invalid(format!("`{operation_name}` requires a complex input but got `{other}`"))),
     }
 }
 
