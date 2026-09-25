@@ -1,11 +1,11 @@
-//! Operations that compute elementwise arithmetic on numeric values. Each operation is defined by an [`Operation`]
-//! type (e.g., [`AddOperation`]) together with a value capability trait (e.g., [`Add`]) whose functions apply it to
-//! eager [`Array`]s and traced values alike, so the same code executes immediately or records into a program depending
-//! on the value it runs on. The operations fall into three groups:
+//! Operations that compute elementwise arithmetic on numeric values. Each operation is defined by an [`Operation`] type
+//! (e.g., [`AddOperation`]) together with a value capability trait (e.g., [`Add`]) whose functions apply it to eager
+//! [`Array`]s and traced values alike, so the same code executes immediately or records into a program depending on the
+//! value it runs on. The operations fall into three groups:
 //!
 //!   - **Binary Arithmetic:** [`Add`], [`Sub`], [`Mul`], and [`Div`] compute sums, differences, products, and
-//!     quotients, and [`Rem`] computes remainders that take the sign of the dividend (i.e., truncated division, like
-//!     Rust's `%`).
+//!     quotients, and [`Rem`] computes remainders that take the sign of the dividend (i.e., truncated division,
+//!     like [`std::ops::Rem`]).
 //!   - **Sign and Magnitude:** [`Neg`] negates a value, [`Abs`] computes its absolute value (i.e., the real magnitude
 //!     `|z|` for a complex value), and [`Sign`] maps it to `-1`, `0`, or `1` (i.e., `z / |z|` for a nonzero complex
 //!     value).
@@ -13,18 +13,17 @@
 //!     `exp(y · log(x))` for complex values), and [`Sqrt`] and [`Rsqrt`] compute square roots and reciprocal square
 //!     roots.
 //!
-//! Binary operations promote their element types and broadcast their shapes, as for StableHLO's
+//! Binary operations promote their element types and broadcast their shapes, same as StableHLO's
 //! [`add`](https://openxla.org/stablehlo/spec#add), [`subtract`](https://openxla.org/stablehlo/spec#subtract),
 //! [`multiply`](https://openxla.org/stablehlo/spec#multiply), [`divide`](https://openxla.org/stablehlo/spec#divide),
-//! [`remainder`](https://openxla.org/stablehlo/spec#remainder), and
-//! [`power`](https://openxla.org/stablehlo/spec#power).
-//! Array operands that carry partial sums over unreduced mesh axes are accepted only where the result remains a valid
-//! partial sum: negation preserves them, sums and differences require both operands to be unreduced over the same
-//! axes, and products permit one unreduced operand when the other is reduced over those same axes. Every other
-//! operation rejects such operands. Refer to the documentation of each operation for the element types it supports.
-//! [`Add`], [`Sub`], [`Mul`], [`Div`], [`Rem`], and [`Neg`] are the fallible counterparts of the corresponding
-//! [`std::ops`] operators, which values additionally implement as panicking sugar. Eager integer arrays wrap at their
-//! element width, whereas the host integer primitives report overflow as an error.
+//! [`remainder`](https://openxla.org/stablehlo/spec#remainder), and [`power`](https://openxla.org/stablehlo/spec#power)
+//! operations do. Array operands that carry partial sums over unreduced mesh axes are accepted only where the result
+//! remains a valid partial sum: negation preserves them, sums and differences require both operands to be unreduced
+//! over the same axes, and products permit one unreduced operand when the other is reduced over those same axes.
+//! Every other operation rejects such operands. Refer to the documentation of each operation for the element types
+//! it supports. [`Add`], [`Sub`], [`Mul`], [`Div`], [`Rem`], and [`Neg`] are the fallible counterparts of the
+//! corresponding [`std::ops`] operators, which values additionally implement as panicking sugar. Eager integer
+//! arrays wrap at their element width, whereas the host integer primitives report overflow as an error.
 //!
 //! Negation, addition, and subtraction are linear. Multiplication is linear in either operand when the other one is
 //! known, and division is linear in its numerator when its denominator is known, so all of them can be transposed.
@@ -44,7 +43,6 @@
 //! ```
 
 use std::collections::BTreeSet;
-use std::ops;
 use std::sync::Arc;
 
 use crate::arrays::{
@@ -67,8 +65,6 @@ use crate::operations::control_flow::select::Select;
 use crate::operations::exponential::Log;
 use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed};
 use crate::tracing::{Tracer, TracingContext};
-
-// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`AddOperation`].
 pub const ADD_OPERATION_NAME: &str = "add";
@@ -95,11 +91,8 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @binary
-    /// Value capability for elementwise addition.
-    ///
-    /// Eager values compute directly; contextual values bind [`AddOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Value capability for elementwise addition. Eager values compute directly while contextual values bind
+    /// [`AddOperation`]. Failures are returned as [`ProgramError`]s.
     Add,
     /// Adds `rhs` to this value.
     add(rhs),
@@ -122,6 +115,7 @@ impl std::ops::Add for Array {
         Add::add(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
     }
 }
+
 define_tracer_operator!(@binary std::ops::Add, add, capability = Add, method = add);
 
 /// Implements [`Add`] for one host primitive type.
@@ -163,20 +157,20 @@ impl_add_for_primitive!(@integer usize);
 impl_add_for_primitive!(@float f32);
 impl_add_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`SubOperation`].
 pub const SUB_OPERATION_NAME: &str = "sub";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that subtracts two numeric values elementwise, promoting their element types and
-    /// broadcasting their shapes. Array operands that carry partial sums must both be unreduced over exactly the same
-    /// mesh axes (subtraction is linear, so the difference of two partial sums over the same axes is another valid
-    /// partial sum); mixing an unreduced operand with an already reduced operand would duplicate the reduced
-    /// contribution when the result is subsequently reduced. Their reduced-axis markers must likewise agree.
-    SubOperation, SUB_OPERATION_NAME,
-    Sub, sub,
+    /// [`Operation`] that subtracts two numeric values elementwise, promoting their element types and broadcasting
+    /// their shapes. Array operands that carry partial sums must both be unreduced over exactly the same mesh axes
+    /// (subtraction is linear, so the difference of two partial sums over the same axes is another valid partial sum).
+    /// Mixing an unreduced operand with an already reduced operand would duplicate the reduced contribution when the
+    /// result is subsequently reduced. Their reduced-axis markers must likewise agree.
+    SubOperation,
+    SUB_OPERATION_NAME,
+    Sub,
+    sub,
     check_data_types = [@numeric],
     check_array_types = [@same_unreduced_axes, @same_reduced_axes],
 );
@@ -189,11 +183,8 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @binary
-    /// Value capability for elementwise subtraction.
-    ///
-    /// Eager values compute directly; contextual values bind [`SubOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Value capability for elementwise subtraction. Eager values compute directly while contextual values bind
+    /// [`SubOperation`]. Failures are returned as [`ProgramError`]s.
     Sub,
     /// Subtracts `right` from this value.
     sub(right),
@@ -216,6 +207,7 @@ impl std::ops::Sub for Array {
         Sub::sub(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
     }
 }
+
 define_tracer_operator!(@binary std::ops::Sub, sub, capability = Sub, method = sub);
 
 /// Implements [`Sub`] for one host primitive type.
@@ -257,7 +249,7 @@ impl_sub_for_primitive!(@integer usize);
 impl_sub_for_primitive!(@float f32);
 impl_sub_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`MulOperation`].
 pub const MUL_OPERATION_NAME: &str = "mul";
@@ -267,8 +259,10 @@ define_elementwise_operation!(
     /// [`Operation`] that multiplies two numeric values elementwise, promoting their element types and broadcasting
     /// their shapes. Its bilinear reduction-state rule permits one unreduced operand only when the other operand is
     /// reduced over exactly the same mesh axes.
-    MulOperation, MUL_OPERATION_NAME,
-    Mul, mul,
+    MulOperation,
+    MUL_OPERATION_NAME,
+    Mul,
+    mul,
     infer_array_types = infer_mul_output_array_types,
     check_data_types = [@numeric],
 );
@@ -279,7 +273,7 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @binary
     MulOperation,
-    jvp<C> where C::Value: ops::Mul<Output = C::Value> {
+    jvp<C> where C::Value: std::ops::Mul<Output = C::Value> {
         |(_, left_tangent), (right, _)| right * left_tangent;
         |(left, _), (_, right_tangent)| left * right_tangent;
     },
@@ -527,9 +521,9 @@ impl_differentiable_elementwise_operation! {
     DivOperation,
     jvp<C>
     where
-        C::Value: ops::Neg<Output = C::Value>
-            + ops::Mul<Output = C::Value>
-            + ops::Div<Output = C::Value>,
+        C::Value: std::ops::Neg<Output = C::Value>
+            + std::ops::Mul<Output = C::Value>
+            + std::ops::Div<Output = C::Value>,
     {
         |(_, left_tangent), (right, _)| left_tangent / right;
         |(left, _), (right, right_tangent)| {
@@ -647,10 +641,10 @@ impl_differentiable_elementwise_operation! {
     jvp<C>
     where
         C::Value: Rem
-            + ops::Div<Output = C::Value>
-            + ops::Mul<Output = C::Value>
-            + ops::Neg<Output = C::Value>
-            + ops::Sub<Output = C::Value>,
+            + std::ops::Div<Output = C::Value>
+            + std::ops::Mul<Output = C::Value>
+            + std::ops::Neg<Output = C::Value>
+            + std::ops::Sub<Output = C::Value>,
     {
         // d(rem(x, y)) = dx - trunc(x / y) · dy away from the discontinuities, with the truncated quotient
         // recovered exactly as (x - rem(x, y)) / y.
@@ -1189,8 +1183,8 @@ impl_differentiable_elementwise_operation! {
             + Select
             + OneLike
             + ZeroLike
-            + ops::Mul<Output = C::Value>
-            + ops::Sub<Output = C::Value>,
+            + std::ops::Mul<Output = C::Value>
+            + std::ops::Sub<Output = C::Value>,
     {
         // d(x^y) = y · x^{y-1} · dx + x^y · log(x) · dy, with log(x) evaluated at a base of one when x = 0 so
         // that the exponent contribution vanishes instead of producing log(0) = -∞.
@@ -1265,7 +1259,7 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @unary
     SqrtOperation,
-    jvp<C> where C::Value: ops::Add<Output = C::Value> + ops::Div<Output = C::Value> {
+    jvp<C> where C::Value: std::ops::Add<Output = C::Value> + std::ops::Div<Output = C::Value> {
         |(_, input_tangent) -> output| input_tangent / (output.clone() + output)
     },
     transpose = @nonlinear,
@@ -1329,10 +1323,10 @@ impl_differentiable_elementwise_operation! {
     RsqrtOperation,
     jvp<C>
     where
-        C::Value: ops::Add<Output = C::Value>
-            + ops::Div<Output = C::Value>
-            + ops::Mul<Output = C::Value>
-            + ops::Neg<Output = C::Value>,
+        C::Value: std::ops::Add<Output = C::Value>
+            + std::ops::Div<Output = C::Value>
+            + std::ops::Mul<Output = C::Value>
+            + std::ops::Neg<Output = C::Value>,
     {
         // d(rsqrt(x)) = -x^{-3/2} / 2 · dx = -(rsqrt(x) / (x + x)) · dx, reusing the primal output evaluated at
         // the tangent type.
