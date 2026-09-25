@@ -3,12 +3,12 @@
 //! [`Array`]s and traced values alike, so the same code executes immediately or records into a program depending on the
 //! value it runs on. The operations fall into three groups:
 //!
-//!   - **Binary Arithmetic:** [`Add`], [`Sub`], [`Mul`], and [`Div`] compute sums, differences, products, and
-//!     quotients, and [`Rem`] computes remainders that take the sign of the dividend (i.e., truncated division,
-//!     like [`std::ops::Rem`]).
 //!   - **Sign and Magnitude:** [`Neg`] negates a value, [`Abs`] computes its absolute value (i.e., the real magnitude
 //!     `|z|` for a complex value), and [`Sign`] maps it to `-1`, `0`, or `1` (i.e., `z / |z|` for a nonzero complex
 //!     value).
+//!   - **Binary Arithmetic:** [`Add`], [`Sub`], [`Mul`], and [`Div`] compute sums, differences, products, and
+//!     quotients, and [`Rem`] computes remainders that take the sign of the dividend (i.e., truncated division,
+//!     like [`std::ops::Rem`]).
 //!   - **Powers and Roots:** [`Pow`] raises one value to the power of another (i.e., the principal value
 //!     `exp(y · log(x))` for complex values), and [`Sqrt`] and [`Rsqrt`] compute square roots and reciprocal square
 //!     roots.
@@ -20,7 +20,7 @@
 //! and differences require both inputs to be unreduced over the same axes, products permit one unreduced input when the
 //! other is reduced over those same axes, and division permits an unreduced numerator with a denominator reduced over
 //! those axes. Every other operation rejects such inputs. Refer to the documentation of each operation for the element
-//! types it supports. [`Neg`] [`Add`], [`Sub`], [`Mul`], [`Div`], and [`Rem`] are the fallible counterparts of the
+//! types it supports. [`Neg`], [`Add`], [`Sub`], [`Mul`], [`Div`], and [`Rem`] are the fallible counterparts of the
 //! corresponding [`std::ops`] operators, which values additionally implement as panicking sugar. Eager integer arrays
 //! wrap at their element width, whereas the host integer primitives report overflow as an error.
 //!
@@ -64,6 +64,109 @@ use crate::operations::exponential::Log;
 use crate::operations::rounding::Floor;
 use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed};
 use crate::tracing::{Tracer, TracingContext};
+
+/// Canonical operation name for [`NegOperation`].
+pub const NEG_OPERATION_NAME: &str = "neg";
+
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`] that negates one integer, floating-point, or complex value while preserving its array metadata
+    /// and reduction state. Unsigned integers wrap at their element width. Boolean, token, structural-zero, and the
+    /// unsigned floating-point type [`DataType::F8E8M0FNU`] are rejected.
+    NegOperation,
+    NEG_OPERATION_NAME,
+    Neg,
+    neg,
+    infer_data_types = |input_types: &[DataType]| {
+        check_types!(@numeric, NEG_OPERATION_NAME, input_types);
+        let input_type = input_types[0];
+        if input_type == DataType::F8E8M0FNU {
+            return Err(TypeError::invalid(format!(
+                "`{NEG_OPERATION_NAME}` does not support input data type `{input_type}`",
+            )));
+        }
+        Ok(vec![input_type])
+    },
+);
+
+impl_differentiable_elementwise_operation! {
+    @linear
+    NegOperation,
+    rule = [@negative],
+}
+
+define_elementwise_capability!(
+    @unary
+    /// Value capability for elementwise negation. Eager values compute directly while contextual values bind
+    /// [`NegOperation`]. Failures are returned as [`ProgramError`]s.
+    Neg,
+    /// Negates `self`.
+    neg,
+    NegOperation,
+);
+
+impl Neg for Array {
+    fn neg(&self) -> Result<Self, ProgramError> {
+        NegOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?;
+        if Self::element_count(self.r#type().as_ref()) == 0 {
+            let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+            return Ok(Self::new_unchecked(
+                self.r#type().into_owned(),
+                Arc::new(vec![0; addressing.storage_byte_len()]),
+            ));
+        }
+        let data_type = self.r#type().data_type();
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            self.map_elements::<Element, Element>(self.r#type().into_owned(), <Element as ArrayElement>::neg)
+        })
+    }
+}
+
+impl std::ops::Neg for Array {
+    type Output = Self;
+
+    #[inline]
+    fn neg(self) -> Self::Output {
+        Neg::neg(&self).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+define_tracer_operator!(@unary std::ops::Neg, neg, NegOperation, "`neg` operation failed");
+
+/// Implements [`Neg`] for one host primitive type.
+macro_rules! impl_neg_for_primitive {
+    // Signed integer primitives use checked negation so that the `MIN` overflow reports an error instead of
+    // wrapping like the XLA-mirroring reference backends do on devices.
+    (@signed $type:ty) => {
+        impl Neg for $type {
+            #[inline]
+            fn neg(&self) -> Result<Self, ProgramError> {
+                self.checked_neg().ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("`{}` output does not fit in `{}`", NEG_OPERATION_NAME, stringify!($type)),
+                })
+            }
+        }
+    };
+
+    // Floating-point primitives use ordinary IEEE 754 negation, which cannot fail.
+    (@float $type:ty) => {
+        impl Neg for $type {
+            #[inline]
+            fn neg(&self) -> Result<Self, ProgramError> {
+                Ok(-*self)
+            }
+        }
+    };
+}
+
+impl_neg_for_primitive!(@signed i8);
+impl_neg_for_primitive!(@signed i16);
+impl_neg_for_primitive!(@signed i32);
+impl_neg_for_primitive!(@signed i64);
+impl_neg_for_primitive!(@signed i128);
+impl_neg_for_primitive!(@signed isize);
+impl_neg_for_primitive!(@float f32);
+impl_neg_for_primitive!(@float f64);
 
 /// Canonical operation name for [`AddOperation`].
 pub const ADD_OPERATION_NAME: &str = "add";
@@ -794,111 +897,6 @@ impl_rem_for_primitive!(@integer usize);
 impl_rem_for_primitive!(@float f32);
 impl_rem_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Move this operation, its capability trait and its implementations to before `AddOperation` and
-//  also move its corresponding tests accordingly.
-/// Canonical operation name for [`NegOperation`].
-pub const NEG_OPERATION_NAME: &str = "neg";
-
-define_elementwise_operation!(
-    @unary
-    /// [`Operation`] that negates one integer, floating-point, or complex value while preserving its array metadata
-    /// and reduction state. Unsigned integers wrap at their element width. Boolean, token, structural-zero, and the
-    /// unsigned floating-point type [`DataType::F8E8M0FNU`] are rejected.
-    NegOperation,
-    NEG_OPERATION_NAME,
-    Neg,
-    neg,
-    infer_data_types = |input_types: &[DataType]| {
-        check_types!(@numeric, NEG_OPERATION_NAME, input_types);
-        let input_type = input_types[0];
-        if input_type == DataType::F8E8M0FNU {
-            return Err(TypeError::invalid(format!(
-                "`{NEG_OPERATION_NAME}` does not support input data type `{input_type}`",
-            )));
-        }
-        Ok(vec![input_type])
-    },
-);
-
-impl_differentiable_elementwise_operation! {
-    @linear
-    NegOperation,
-    rule = [@negative],
-}
-
-define_elementwise_capability!(
-    @unary
-    /// Value capability for elementwise negation. Eager values compute directly while contextual values bind
-    /// [`NegOperation`]. Failures are returned as [`ProgramError`]s.
-    Neg,
-    /// Negates `self`.
-    neg,
-    NegOperation,
-);
-
-impl Neg for Array {
-    fn neg(&self) -> Result<Self, ProgramError> {
-        NegOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?;
-        if Self::element_count(self.r#type().as_ref()) == 0 {
-            let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-            return Ok(Self::new_unchecked(
-                self.r#type().into_owned(),
-                Arc::new(vec![0; addressing.storage_byte_len()]),
-            ));
-        }
-        let data_type = self.r#type().data_type();
-        dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            self.map_elements::<Element, Element>(self.r#type().into_owned(), <Element as ArrayElement>::neg)
-        })
-    }
-}
-
-impl std::ops::Neg for Array {
-    type Output = Self;
-
-    #[inline]
-    fn neg(self) -> Self::Output {
-        Neg::neg(&self).unwrap_or_else(|error| panic!("{error}"))
-    }
-}
-
-define_tracer_operator!(@unary std::ops::Neg, neg, NegOperation, "`neg` operation failed");
-
-/// Implements [`Neg`] for one host primitive type.
-macro_rules! impl_neg_for_primitive {
-    // Signed integer primitives use checked negation so that the `MIN` overflow reports an error instead of
-    // wrapping like the XLA-mirroring reference backends do on devices.
-    (@signed $type:ty) => {
-        impl Neg for $type {
-            #[inline]
-            fn neg(&self) -> Result<Self, ProgramError> {
-                self.checked_neg().ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("`{}` output does not fit in `{}`", NEG_OPERATION_NAME, stringify!($type)),
-                })
-            }
-        }
-    };
-
-    // Floating-point primitives use ordinary IEEE 754 negation, which cannot fail.
-    (@float $type:ty) => {
-        impl Neg for $type {
-            #[inline]
-            fn neg(&self) -> Result<Self, ProgramError> {
-                Ok(-*self)
-            }
-        }
-    };
-}
-
-impl_neg_for_primitive!(@signed i8);
-impl_neg_for_primitive!(@signed i16);
-impl_neg_for_primitive!(@signed i32);
-impl_neg_for_primitive!(@signed i64);
-impl_neg_for_primitive!(@signed i128);
-impl_neg_for_primitive!(@signed isize);
-impl_neg_for_primitive!(@float f32);
-impl_neg_for_primitive!(@float f64);
-
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &str = "abs";
 
@@ -1442,6 +1440,219 @@ mod tests {
     use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, TypeError, Typed};
 
     use super::*;
+
+    #[test]
+    fn test_neg_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = NegOperation,
+            cases = [{
+                input_data_types = [DataType::F64],
+                output_data_types = [DataType::F64],
+            }],
+        );
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = NegOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::Token],
+                    error = format!("`neg` does not support input data type `{}`", DataType::Token),
+                },
+                {
+                    input_data_types = [DataType::Zero],
+                    error = format!("`neg` does not support input data type `{}`", DataType::Zero),
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = format!("`neg` does not support input data type `{}`", DataType::Boolean),
+                },
+                {
+                    input_data_types = [DataType::F8E8M0FNU],
+                    error = format!("`neg` does not support input data type `{}`", DataType::F8E8M0FNU),
+                },
+            ],
+        );
+
+        // Negation is linear, so partial-sum and reduced markers pass through unchanged.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unreduced = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        check_operation_type_inference!(
+            operation = NegOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [unreduced.clone()],
+                output_types = [unreduced],
+            }],
+        );
+
+        let reduced = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_reduced_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        check_operation_type_inference!(
+            operation = NegOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [reduced.clone()],
+                output_types = [reduced],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_neg_interpretation() {
+        let operation = NegOperation::<ArrayType>::new();
+        assert_eq!(
+            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(2.0).unwrap()]),
+            Ok(vec![Array::scalar(-2.0).unwrap()]),
+        );
+        assert_eq!(
+            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(1u8).unwrap()]),
+            Ok(vec![Array::scalar(u8::MAX).unwrap()]),
+        );
+        assert_eq!(
+            operation.interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(ComplexNumber::new(1.0f64, -2.0)).unwrap()],
+            ),
+            Ok(vec![Array::scalar(ComplexNumber::new(-1.0f64, 2.0)).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_neg_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = NegOperation::new(),
+            inputs = [Array::scalar(2.0).unwrap()],
+            expected = Array::scalar(-2.0).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_neg_batching() {
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = NegOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![-1.0, 2.0]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_neg_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = NegOperation::new(),
+            cases = [{
+                primals = [Array::scalar(2.0).unwrap()],
+                tangents = [Array::scalar(3.0).unwrap()],
+                primal_outputs = [Array::scalar(-2.0).unwrap()],
+                tangent_outputs = [Array::scalar(-3.0).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = neg %0
+                        %3:f64[] = neg %1
+                    in (%2, %3)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_neg_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = NegOperation::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(3.0).unwrap()],
+                input_cotangents = [Array::scalar(-3.0).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f64[] .
+                    let %1:f64[] = neg %0
+                    in (%1)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_array_neg() {
+        let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(vector.neg().unwrap(), Array::vector(vec![-1.0, -2.0, -3.0]).unwrap());
+
+        // The `std::ops` sugar delegates to the fallible capability.
+        assert_eq!(-vector.clone(), Array::vector(vec![-1.0, -2.0, -3.0]).unwrap());
+    }
+
+    #[test]
+    fn test_array_neg_empty() {
+        // Empty arrays still obey the operation's element-type contract.
+        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
+        assert_eq!(invalid.neg(), Err(TypeError::invalid("`neg` does not support input data type `bool`").into()));
+        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
+        assert_eq!(valid.neg(), Ok(valid));
+    }
+
+    #[test]
+    fn test_array_neg_low_precision() {
+        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
+        let left = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            left.neg(),
+            Array::vector(vec![f8e4m3fn::from_f64(-1.0).unwrap(), f8e4m3fn::from_f64(-2.0).unwrap()])
+        );
+    }
+
+    #[test]
+    fn test_array_neg_complex() {
+        // Elementwise complex math decodes and encodes the complex element types directly.
+        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
+        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        assert_eq!(left.neg().unwrap(), Array::vector(vec![-left_values[0], -left_values[1]]).unwrap());
+    }
+
+    #[test]
+    fn test_array_neg_integers() {
+        // Negation wraps deterministically for unsigned and two's-complement signed elements, matching the scalar
+        // reference backend (and StableHLO's integer semantics), rather than panicking or saturating.
+        let unsigned = Array::vector(vec![0u8, 1, 255]).unwrap();
+        assert_eq!(unsigned.neg().unwrap().elements::<u8>(), Ok(vec![0, 255, 1]));
+        let minimum = Array::vector(vec![i8::MIN, -5]).unwrap();
+        assert_eq!(minimum.neg().unwrap().elements::<i8>(), Ok(vec![i8::MIN, 5]));
+        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
+        assert_eq!(narrow.neg().unwrap().elements::<i4>(), Ok(vec![i4::new(-7).unwrap(), i4::MIN]));
+    }
+
+    #[test]
+    fn test_neg_primitives() {
+        assert_eq!(Neg::neg(&5i32), Ok(-5));
+        assert_eq!(
+            Neg::neg(&i8::MIN),
+            Err(ProgramError::InvalidArgument {
+                message: format!("`{NEG_OPERATION_NAME}` output does not fit in `i8`"),
+            }),
+        );
+        assert_eq!(Neg::neg(&2.5f64), Ok(-2.5));
+    }
 
     #[test]
     fn test_add_type_inference() {
@@ -2828,217 +3039,6 @@ mod tests {
             }),
         );
         assert!(Rem::rem(&1.0f64, &0.0).unwrap().is_nan());
-    }
-
-    #[test]
-    fn test_neg_type_inference() {
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = NegOperation,
-            cases = [{
-                input_data_types = [DataType::F64],
-                output_data_types = [DataType::F64],
-            }],
-        );
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = NegOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::Token],
-                    error = format!("`neg` does not support input data type `{}`", DataType::Token),
-                },
-                {
-                    input_data_types = [DataType::Zero],
-                    error = format!("`neg` does not support input data type `{}`", DataType::Zero),
-                },
-                {
-                    input_data_types = [DataType::Boolean],
-                    error = format!("`neg` does not support input data type `{}`", DataType::Boolean),
-                },
-                {
-                    input_data_types = [DataType::F8E8M0FNU],
-                    error = format!("`neg` does not support input data type `{}`", DataType::F8E8M0FNU),
-                },
-            ],
-        );
-
-        // Negation is linear, so partial-sum and reduced markers pass through unchanged.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let unreduced = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
-                    .unwrap()
-                    .with_unreduced_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        check_operation_type_inference!(
-            operation = NegOperation::<ArrayType>::new(),
-            cases = [{
-                input_types = [unreduced.clone()],
-                output_types = [unreduced],
-            }],
-        );
-        let reduced = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::replicated()])
-                    .unwrap()
-                    .with_reduced_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        check_operation_type_inference!(
-            operation = NegOperation::<ArrayType>::new(),
-            cases = [{
-                input_types = [reduced.clone()],
-                output_types = [reduced],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_neg_interpretation() {
-        let operation = NegOperation::<ArrayType>::new();
-
-        assert_eq!(
-            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(2.0).unwrap()]),
-            Ok(vec![Array::scalar(-2.0).unwrap()]),
-        );
-        assert_eq!(
-            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(1u8).unwrap()]),
-            Ok(vec![Array::scalar(u8::MAX).unwrap()]),
-        );
-        assert_eq!(
-            operation.interpret(
-                &EagerContext::<Array>::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(ComplexNumber::new(1.0f64, -2.0)).unwrap()],
-            ),
-            Ok(vec![Array::scalar(ComplexNumber::new(-1.0f64, 2.0)).unwrap()]),
-        );
-    }
-
-    #[test]
-    fn test_neg_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = NegOperation::new(),
-            inputs = [Array::scalar(2.0).unwrap()],
-            expected = Array::scalar(-2.0).unwrap(),
-        );
-    }
-
-    #[test]
-    fn test_neg_batching() {
-        check_operation_batching!(
-            @approx(epsilon = 1e-9),
-            operation = NegOperation::new(),
-            axis_size = 2,
-            cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]).unwrap())],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![-1.0, 2.0]).unwrap())],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_neg_differentiation() {
-        check_operation_differentiation!(
-            @approx(step = 1e-6, epsilon = 1e-6),
-            operation = NegOperation::new(),
-            cases = [{
-                primals = [Array::scalar(2.0).unwrap()],
-                tangents = [Array::scalar(3.0).unwrap()],
-                primal_outputs = [Array::scalar(-2.0).unwrap()],
-                tangent_outputs = [Array::scalar(-3.0).unwrap()],
-                jvp = indoc! {"
-                    lambda %0:f64[], %1:f64[] .
-                    let %2:f64[] = neg %0
-                        %3:f64[] = neg %1
-                    in (%2, %3)
-                "},
-            }],
-        );
-    }
-
-    #[test]
-    fn test_neg_transposition() {
-        check_operation_transposition!(
-            @exact,
-            operation = NegOperation::new(),
-            cases = [{
-                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                output_cotangents = [Array::scalar(3.0).unwrap()],
-                input_cotangents = [Array::scalar(-3.0).unwrap()],
-                pullback = indoc! {"
-                    lambda %0:f64[] .
-                    let %1:f64[] = neg %0
-                    in (%1)
-                "},
-            }],
-        );
-    }
-
-    #[test]
-    fn test_array_neg() {
-        let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
-        assert_eq!(vector.neg().unwrap(), Array::vector(vec![-1.0, -2.0, -3.0]).unwrap());
-
-        // The `std::ops` sugar delegates to the fallible capability.
-        assert_eq!(-vector.clone(), Array::vector(vec![-1.0, -2.0, -3.0]).unwrap());
-    }
-
-    #[test]
-    fn test_array_neg_empty() {
-        // Empty arrays still obey the operation's element-type contract.
-        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
-        assert_eq!(invalid.neg(), Err(TypeError::invalid("`neg` does not support input data type `bool`").into()));
-        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
-        assert_eq!(valid.neg(), Ok(valid));
-    }
-
-    #[test]
-    fn test_array_neg_low_precision() {
-        // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
-        let left = Array::from_elements::<f8e4m3fn>(
-            ArrayType::new_static(DataType::F8E4M3FN, [2]),
-            &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        assert_eq!(
-            left.neg(),
-            Array::vector(vec![f8e4m3fn::from_f64(-1.0).unwrap(), f8e4m3fn::from_f64(-2.0).unwrap()])
-        );
-    }
-
-    #[test]
-    fn test_array_neg_complex() {
-        // Elementwise complex math decodes and encodes the complex element types directly.
-        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
-        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
-        assert_eq!(left.neg().unwrap(), Array::vector(vec![-left_values[0], -left_values[1]]).unwrap());
-    }
-
-    #[test]
-    fn test_array_neg_integers() {
-        // Negation wraps deterministically for unsigned and two's-complement signed elements, matching the scalar
-        // reference backend (and StableHLO's integer semantics), rather than panicking or saturating.
-        let unsigned = Array::vector(vec![0u8, 1, 255]).unwrap();
-        assert_eq!(unsigned.neg().unwrap().elements::<u8>(), Ok(vec![0, 255, 1]));
-        let minimum = Array::vector(vec![i8::MIN, -5]).unwrap();
-        assert_eq!(minimum.neg().unwrap().elements::<i8>(), Ok(vec![i8::MIN, 5]));
-        let narrow = Array::vector(vec![i4::new(7).unwrap(), i4::new(-8).unwrap()]).unwrap();
-        assert_eq!(narrow.neg().unwrap().elements::<i4>(), Ok(vec![i4::new(-7).unwrap(), i4::MIN]));
-    }
-
-    #[test]
-    fn test_neg_primitives() {
-        assert_eq!(Neg::neg(&5i32), Ok(-5));
-        assert_eq!(
-            Neg::neg(&i8::MIN),
-            Err(ProgramError::InvalidArgument { message: "`neg` output does not fit in `i8`".to_string() }),
-        );
-        assert_eq!(Neg::neg(&2.5f64), Ok(-2.5));
     }
 
     #[test]
