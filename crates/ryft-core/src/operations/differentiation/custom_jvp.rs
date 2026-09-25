@@ -689,6 +689,7 @@ mod tests {
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{Differentiate, DifferentiationTracer, ForwardModeDifferentiate, LinearizationTracer};
+    use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::assertions::{AssertOperation, AssertionError};
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::control_flow::condition::ConditionOperation;
@@ -698,15 +699,12 @@ mod tests {
         nested_custom_derivative_state_program,
     };
     use crate::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::operations::math::add::AddOperation;
-    use crate::operations::math::cos::{Cos, CosOperation};
-    use crate::operations::math::mul::MulOperation;
-    use crate::operations::math::reduce::{Reduce, ReduceOperation, ReductionKind};
-    use crate::operations::math::sin::{Sin, SinOperation};
+    use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
     use crate::operations::references::{
         ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
         ReferenceReadOperation,
     };
+    use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{

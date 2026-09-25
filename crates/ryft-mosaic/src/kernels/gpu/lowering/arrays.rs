@@ -703,6 +703,12 @@ mod tests {
             Err(Error::Unsupported { operation: "reduce_mean", reason })
                 if reason == "operation or its metadata has no baseline scalar implementation",
         ));
+        let operation = ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::LogSumExp));
+        assert!(matches!(
+            validate(&operation, &[ArrayType::new_static(DataType::F32, [2])], &ArrayType::scalar(DataType::F32)),
+            Err(Error::Unsupported { operation: "reduce_log_sum_exp", reason })
+                if reason == "operation or its metadata has no baseline scalar implementation",
+        ));
     }
 
     #[test]

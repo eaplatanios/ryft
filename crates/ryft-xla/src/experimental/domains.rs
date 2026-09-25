@@ -4967,6 +4967,12 @@ fn reduction_data_dependent_padding_discipline(kind: ReductionKind) -> DataDepen
         ReductionKind::Sum | ReductionKind::Max | ReductionKind::Min | ReductionKind::Any | ReductionKind::All => {
             XlaMasked
         }
+        // `reduce_log_sum_exp` expands into maximum and summation reductions over the same axes, so it inherits
+        // the masking contract of exactly those two reduction kinds: XLA masks each reduction's
+        // operand with that reduction's own identity, which wipes the padding lanes of the shifted exponentials
+        // before they are summed. The rank-2 arm of `data_derived_padding_fixture` executes that expansion with the
+        // data-derived extent on the kept axis, which is the admission's execution evidence.
+        ReductionKind::LogSumExp => XlaMasked,
         ReductionKind::Mean => {
             Unsupported { reason: "mean over a dynamically sized reduction axis is not supported by the XLA lowering" }
         }
@@ -5018,12 +5024,6 @@ fn array_data_dependent_padding_discipline(
 
     match operation {
         ArrayOperation::Reduce(operation) => reduction_data_dependent_padding_discipline(operation.kind()),
-        // The lowering expands `log_sum_exp` into a maximum reduction and a summation reduction over the same axes,
-        // so it inherits the masking contract of exactly those two reduction kinds: XLA masks each reduction's
-        // operand with that reduction's own identity, which wipes the padding lanes of the shifted exponentials
-        // before they are summed. The rank-2 arm of `data_derived_padding_fixture` executes that expansion with the
-        // data-derived extent on the kept axis, which is the admission's execution evidence.
-        ArrayOperation::LogSumExp(_) => XlaMasked,
         ArrayOperation::Sort(operation) => sort_data_dependent_padding_discipline(operation.direction()),
         // Runtime-sized slice pullbacks use unique, in-bounds point updates. XLA masks inactive update lanes;
         // the compiled slice pullback fixture checks non-maximum and empty logical extents on CPU and CUDA.
@@ -6269,14 +6269,14 @@ mod tests {
         DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
         DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather,
         GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization,
-        LogSumExpOperation, MulOperation, NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers,
-        RaggedDotOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation,
-        ReferenceRead, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType,
-        ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter,
-        ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding,
-        ShardingDimension, SliceOperation, StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation,
-        ZeroOperation, batch, try_jit_with_options,
+        MulOperation, NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation,
+        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
+        ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers,
+        ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding, ShardingDimension, SliceOperation,
+        StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation, batch,
+        try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -6697,9 +6697,9 @@ mod tests {
             .unwrap()[0];
 
         // The rank-2 `i + j` matrix carries the data-derived extent on an axis that neither the reduction nor the scan
-        // touches, which is the configuration those two disciplines actually admit: `log_sum_exp` consumes the static
-        // axis and still has to produce a dynamically shaped result, and the prefix scan consumes the static axis
-        // while every row it emits keeps the dynamic extent.
+        // touches, which is the configuration those two disciplines actually admit: `reduce_log_sum_exp` consumes
+        // the static axis and still produces a dynamically shaped output, and the prefix scan consumes the static
+        // axis while every row it emits keeps the dynamic extent.
         let rows = builder
             .add_instruction(IotaOperation::new(matrix_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
             .unwrap()[0];
@@ -6707,8 +6707,9 @@ mod tests {
             .add_instruction(IotaOperation::new(matrix_type, 1).unwrap(), Vec::new(), vec![dimension], None)
             .unwrap()[0];
         let matrix = builder.add_instruction(AddOperation::new(), Vec::new(), vec![rows, columns], None).unwrap()[0];
-        let log_sum_exp =
-            builder.add_instruction(LogSumExpOperation::new(vec![1]), Vec::new(), vec![matrix], None).unwrap()[0];
+        let log_sum_exp = builder
+            .add_instruction(ReduceOperation::new(vec![1], ReductionKind::LogSumExp), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
         let cumulative_sum =
             builder.add_instruction(CumulativeSumOperation::new(1), Vec::new(), vec![matrix], None).unwrap()[0];
         builder
@@ -10524,8 +10525,14 @@ mod tests {
             Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" },
         );
 
-        for kind in [ReductionKind::Sum, ReductionKind::Max, ReductionKind::Min, ReductionKind::Any, ReductionKind::All]
-        {
+        for kind in [
+            ReductionKind::Sum,
+            ReductionKind::LogSumExp,
+            ReductionKind::Max,
+            ReductionKind::Min,
+            ReductionKind::Any,
+            ReductionKind::All,
+        ] {
             assert_eq!(reduction_data_dependent_padding_discipline(kind), XlaMasked);
         }
         assert_eq!(
@@ -10575,10 +10582,13 @@ mod tests {
             assert_eq!(array_data_dependent_padding_discipline(&operation), RyftMasked);
         }
 
-        // `log_sum_exp` expands into a maximum reduction and a summation reduction, so it carries the same masking
-        // contract that those two reduction kinds carry.
+        // `reduce_log_sum_exp` expands into maximum and summation reductions, so it carries the same masking
+        // contract as those two reduction kinds.
         assert_eq!(
-            array_data_dependent_padding_discipline(&ArrayOperation::LogSumExp(LogSumExpOperation::new(vec![0]))),
+            array_data_dependent_padding_discipline(&ArrayOperation::Reduce(ReduceOperation::new(
+                vec![0],
+                ReductionKind::LogSumExp,
+            ))),
             XlaMasked,
         );
 

@@ -370,7 +370,7 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
-    use crate::operations::math::add::AddOperation;
+    use crate::operations::arithmetic::AddOperation;
     use crate::operations::references::reference_add_update::ReferenceAddUpdate;
     use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
     use crate::operations::references::reference_read::ReferenceRead;

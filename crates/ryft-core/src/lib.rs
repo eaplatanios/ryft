@@ -109,35 +109,35 @@ pub use operations::{
     EXP_OPERATION_NAME, ElementType, ElementwiseOperation, Erf, ErfOperation, Exp, ExpOperation, FLOOR_OPERATION_NAME,
     Fill, Floor, FloorOperation, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode, GatherOperation,
     GatherOptions, IOTA_OPERATION_NAME, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed, Indexing, Iota,
-    IotaOperation, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOG_SUM_EXP_OPERATION_NAME, LOG1P_OPERATION_NAME,
-    LOGISTIC_OPERATION_NAME, LinearCallOperation, Log, Log1p, Log1pOperation, LogAddExp, LogAddExpOperation,
-    LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME,
-    MUL_OPERATION_NAME, ManualVariationAlignment, Max, MaxOperation, Min, MinOperation, Mul, MulOperation,
-    NEG_OPERATION_NAME, NOT_OPERATION_NAME, Neg, NegOperation, Not, NotOperation, ONE_LIKE_OPERATION_NAME,
-    ONE_OPERATION_NAME, OR_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation,
-    PAD_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation,
-    ParallelReduce, ParallelReduceOperation, ParallelReductionKind, ParallelVary, ParallelVaryOperation, Permutation,
-    Pow, PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME, REFERENCE_ADD_UPDATE_OPERATION_NAME,
-    REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME,
-    REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME, RESHAPE_OPERATION_NAME,
-    RESHARD_OPERATION_NAME, REVERSE_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, RaggedDot,
-    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReduceOperation, ReductionKind,
-    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
-    ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem,
-    RemOperation, Reshape, ReshapeOperation, Reshard, ReshardOperation, Reverse, ReverseOperation, Round,
-    RoundOperation, Rsqrt, RsqrtOperation, SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME,
-    SELECT_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME, SQRT_OPERATION_NAME,
-    STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, ScaledDot, ScaledDotOperation, ScanOperation,
-    ScanReferenceDischarge, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
-    ScatterReductionKind, Select, SelectOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt,
-    SqrtOperation, StopGradient, StopGradientOperation, StopGradients, Sub, SubOperation, TAG_OPERATION_NAME,
-    TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tanh,
-    TanhOperation, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
-    UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WhileOperation,
-    WhilePredicate, WhileTypeSemantics, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME,
-    ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, custom_jvp, custom_vjp,
-    forward_collective_to_parent, transpose_primal_condition, transpose_primal_scan,
+    IotaOperation, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOG1P_OPERATION_NAME, LOGISTIC_OPERATION_NAME,
+    LinearCallOperation, Log, Log1p, Log1pOperation, LogAddExp, LogAddExpOperation, LogOperation, LogSumExp, Logistic,
+    LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME, ManualVariationAlignment, Max,
+    MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME, NOT_OPERATION_NAME, Neg, NegOperation, Not,
+    NotOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, OR_OPERATION_NAME, One, OneLike, OneLikeOperation,
+    OneOperation, Or, OrOperation, PAD_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, POW_OPERATION_NAME,
+    PRINT_OPERATION_NAME, Pad, PadOperation, ParallelReduce, ParallelReduceOperation, ParallelReductionKind,
+    ParallelVary, ParallelVaryOperation, Permutation, Pow, PowOperation, Print, PrintOperation,
+    RAGGED_DOT_OPERATION_NAME, REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
+    REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
+    REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME, RESHAPE_OPERATION_NAME, RESHARD_OPERATION_NAME,
+    REVERSE_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, RaggedDot, RaggedDotDimensionNumbers,
+    RaggedDotMode, RaggedDotOperation, Reduce, ReduceOperation, ReductionKind, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze,
+    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape,
+    ReshapeOperation, Reshard, ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt,
+    RsqrtOperation, SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, SELECT_OPERATION_NAME,
+    SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME, SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME,
+    SUB_OPERATION_NAME, ScaledDot, ScaledDotOperation, ScanOperation, ScanReferenceDischarge, Scatter,
+    ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Select,
+    SelectOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient,
+    StopGradientOperation, StopGradients, Sub, SubOperation, TAG_OPERATION_NAME, TANH_OPERATION_NAME,
+    TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tanh, TanhOperation,
+    TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME,
+    UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics,
+    XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation, custom_jvp, custom_vjp, forward_collective_to_parent, transpose_primal_condition,
+    transpose_primal_scan,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -213,9 +213,9 @@ pub(crate) mod tests {
     use crate::macros::check_count;
     use crate::operations::{
         AddOperation, BroadcastOperation, CompareOperation, ConstantOperation, ConvertElementTypeOperation,
-        DivOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation, ParallelVaryOperation,
+        DivOperation, ExpOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation, ParallelVaryOperation,
         ReduceOperation, ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation, ReshardOperation,
-        TransposeOperation, ZeroLikeOperation, ZeroOperation,
+        SubOperation, TransposeOperation, ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -232,9 +232,10 @@ pub(crate) mod tests {
     /// and arbitrary region interfaces remain explicit, separate protocol fixtures. Captures and interpretation need
     /// constant and arithmetic operations, and tracing's static constructors additionally need the zero and one
     /// operation types. Broadcast and transpose support staged batching alignment. Differentiation's shared alignment
-    /// rules also require conversion, reduction, reshape, and reshard. Reduction derivatives require compare and
-    /// divide. These dependencies apply to the operation family even when a particular scalar test emits none of
-    /// those operations. This family has no region-bearing payloads and therefore needs no value type parameter.
+    /// rules also require conversion, reduction, reshape, and reshard. Reduction derivatives require comparison,
+    /// division, subtraction, and exponentiation. These dependencies apply to the operation family even when a
+    /// particular scalar test emits none of those operations. This family has no region-bearing payloads and
+    /// therefore needs no value type parameter.
     #[derive(Clone, Debug, Operation)]
     #[ryft(type = ArrayType, constant = Array, dispatch(batching, differentiation, transposition))]
     pub(crate) enum TestArrayOperation {
@@ -245,8 +246,10 @@ pub(crate) mod tests {
         OneLike(OneLikeOperation<ArrayType>),
         Neg(NegOperation<ArrayType>),
         Add(AddOperation<ArrayType>),
+        Sub(SubOperation<ArrayType>),
         Mul(MulOperation<ArrayType>),
         Div(DivOperation<ArrayType>),
+        Exp(ExpOperation<ArrayType>),
         ConvertElementType(ConvertElementTypeOperation<ArrayType>),
         Broadcast(BroadcastOperation),
         Transpose(TransposeOperation),

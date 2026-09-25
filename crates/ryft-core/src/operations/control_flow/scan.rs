@@ -28,6 +28,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::assertions::{AssertOperation, AssertionError};
 use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -39,7 +40,6 @@ use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperatio
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::slicing::{Slice, SliceOperation, UpdateSlice, UpdateSliceOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
-use crate::operations::math::add::AddOperation;
 use crate::operations::references::ReferenceNewOperation;
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -3896,20 +3896,18 @@ mod tests {
         CotangentDestination, CotangentSeed, Differentiate, LinearizationTracer, ReverseModeDifferentiate,
         differentiate_at,
     };
+    use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation};
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::tests::CountingBatchingDriver;
     use crate::operations::manipulation::memory::TransferToMemoryOperation;
     use crate::operations::manipulation::slicing::DynamicSliceOperation;
-    use crate::operations::math::add::AddOperation;
-    use crate::operations::math::div::DivOperation;
-    use crate::operations::math::mul::MulOperation;
-    use crate::operations::math::sin::SinOperation;
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceWriteOperation,
     };
+    use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceAliasKind, ReferenceSource, ReferenceType,

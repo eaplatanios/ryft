@@ -868,15 +868,14 @@ mod tests {
         CotangentDestination, CotangentSeed, Differentiate, ForwardModeDifferentiate, LinearizationTracer,
         ReverseModeDifferentiate, differentiate_at,
     };
+    use crate::operations::arithmetic::MulOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::differentiation::tests::{
         ReferenceRuleDifferentiationDriver, array_ir_identity_program, nested_custom_derivative_state_program,
     };
-    use crate::operations::math::cos::{Cos, CosOperation};
-    use crate::operations::math::mul::MulOperation;
-    use crate::operations::math::reduce::{Reduce, ReductionKind};
-    use crate::operations::math::sin::{Sin, SinOperation};
+    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::operations::references::{ReferenceNew, ReferenceRead, ReferenceWrite};
+    use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{

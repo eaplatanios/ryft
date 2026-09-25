@@ -114,7 +114,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
-    use crate::operations::math::div::Div;
+    use crate::operations::arithmetic::Div;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{EffectClass, EffectClasses, ProgramBuilder};

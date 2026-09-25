@@ -32,6 +32,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::one::OneOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -44,8 +45,7 @@ use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::DynamicUpdateSliceOperation;
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
-use crate::operations::math::add::AddOperation;
-use crate::operations::math::reduce::{ReduceOperation, ReductionKind};
+use crate::operations::reductions::{ReduceOperation, ReductionKind};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
@@ -2795,6 +2795,7 @@ mod tests {
     use crate::differentiation::{
         Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
+    use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, SUB_OPERATION_NAME, SubOperation};
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::constant::Constant;
     use crate::operations::constants::fill::Fill;
@@ -2805,10 +2806,6 @@ mod tests {
     use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
     use crate::operations::control_flow::tests::CountingBatchingDriver;
     use crate::operations::debugging::PrintOperation;
-    use crate::operations::math::add::AddOperation;
-    use crate::operations::math::div::DivOperation;
-    use crate::operations::math::mul::MulOperation;
-    use crate::operations::math::sub::{SUB_OPERATION_NAME, SubOperation};
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceWriteOperation,
@@ -6909,7 +6906,7 @@ mod tests {
         // `while (sum(x) < 20, iteration_bound = 4) { x = x * x }` at `x = [1.5, 2]` squares twice (sums visit 3.5
         // and 6.25 before reaching 21.0625), so `f(x) = sum(x⁴)` locally: value `1.5⁴ + 2⁴ = 21.0625` and gradient
         // `4 x³ = [13.5, 32]`, with trip count 2 strictly below the bound 4.
-        use crate::operations::math::reduce::ReductionKind;
+        use crate::operations::reductions::ReductionKind;
 
         let vector_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();

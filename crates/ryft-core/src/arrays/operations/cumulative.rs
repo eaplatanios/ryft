@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(
             Array::vector(vec![1_i32, 2]).unwrap().cumulative_log_sum_exp(0),
             Err(ProgramError::Type(TypeError::invalid(
-                "`cumulative_log_sum_exp` requires real floating-point inputs but got i32".to_string(),
+                "`cumulative_log_sum_exp` requires real floating-point inputs but got `i32`".to_string(),
             ))),
         );
     }

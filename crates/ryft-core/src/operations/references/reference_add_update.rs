@@ -11,9 +11,9 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::arithmetic::{Add, AddOperation};
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
-use crate::operations::math::add::{Add, AddOperation};
 use crate::operations::references::reference_read::ReferenceReadOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{

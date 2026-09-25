@@ -12,11 +12,11 @@ use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, Shape};
+use crate::operations::Add;
 use crate::operations::collectives::ragged_all_to_all::{RaggedAllToAllEvaluation, RaggedAllToAllUpdateKind};
 use crate::operations::collectives::{
     ParallelPermuteOperation, RAGGED_ALL_TO_ALL_OPERATION_NAME, RaggedAllToAllOperation,
 };
-use crate::operations::math::add::Add;
 use crate::programs::{ProgramError, Typed, Value};
 
 // TODO(eaplatanios): Review this.

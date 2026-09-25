@@ -24,6 +24,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::assertions::Assert;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
@@ -34,7 +35,6 @@ use crate::operations::manipulation::broadcasting::{
     Broadcast, BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
 };
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
-use crate::operations::math::add::AddOperation;
 use crate::operations::references::ReferenceNewOperation;
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -1700,18 +1700,16 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
+    use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation};
     use crate::operations::assertions::AssertionError;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::tests::CountingBatchingDriver;
-    use crate::operations::math::add::AddOperation;
-    use crate::operations::math::div::DivOperation;
-    use crate::operations::math::mul::MulOperation;
-    use crate::operations::math::sin::SinOperation;
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSwapOperation, ReferenceWriteOperation,
     };
+    use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, ProgramBuilder, ReferenceDischargeResult,

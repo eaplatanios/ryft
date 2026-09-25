@@ -2940,7 +2940,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let next = builder
-                .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![carry, dot], None)
+                .add_instruction(crate::operations::MulOperation::new(), Vec::new(), vec![carry, dot], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 3], vec![Placeholder; 1])
@@ -4208,7 +4208,7 @@ mod tests {
                 )
                 .unwrap()[0];
             let next = builder
-                .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![carry, dot], None)
+                .add_instruction(crate::operations::MulOperation::new(), Vec::new(), vec![carry, dot], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![next, dot], vec![Placeholder; 3], vec![Placeholder; 2])

@@ -422,6 +422,6 @@ amax tracker) are tracked in the Gemma plan §4.2 and apply here identically.
 - [crates/ryft-core/src/operations/attention.rs](src/operations/attention.rs) — the fused
   `DotProductAttentionOperation` whose GQA + sliding-window support makes the Muse attention
   core a single call.
-- [crates/ryft-core/src/operations/math/logistic.rs](src/operations/math/logistic.rs) — the
+- [crates/ryft-core/src/operations/exponential.rs](src/operations/exponential.rs) — the
   `Logistic` primitive underlying both SwiGLU and the attention output gate.
 - [crates/ryft/examples/mlp.rs](../ryft/examples/mlp.rs) — the training-loop idiom §3 follows.

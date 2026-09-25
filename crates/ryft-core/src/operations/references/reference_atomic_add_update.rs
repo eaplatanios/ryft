@@ -11,9 +11,9 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::arithmetic::{Add, AddOperation};
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
-use crate::operations::math::add::{Add, AddOperation};
 use crate::operations::references::reference_read::ReferenceReadOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -405,7 +405,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
-    use crate::operations::math::add::AddOperation;
+    use crate::operations::arithmetic::AddOperation;
     use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
     use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
     use crate::operations::references::reference_read::ReferenceRead;

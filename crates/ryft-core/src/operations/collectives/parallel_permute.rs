@@ -16,11 +16,11 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::add::AddOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,

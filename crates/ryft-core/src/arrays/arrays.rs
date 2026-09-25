@@ -21,8 +21,7 @@ use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::contexts::EagerContext;
-use crate::macros::impl_array_elementwise_operation;
-use crate::operations::{ElementType, Max, Min};
+use crate::operations::ElementType;
 use crate::parameters::Parameter;
 use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 
@@ -63,7 +62,7 @@ use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 ///
 /// ```rust
 /// # use ryft_core::arrays::Array;
-/// # use ryft_core::operations::math::Add;
+/// # use ryft_core::operations::arithmetic::Add;
 /// let left = Array::vector(vec![1.0, 2.0]).unwrap();
 /// let right = Array::vector(vec![3.0, 4.0]).unwrap();
 /// assert_eq!(left.add(&right).unwrap(), Array::vector(vec![4.0, 6.0]).unwrap());
@@ -965,24 +964,6 @@ impl_array_scalar_concretization!(@exact f64);
 impl_array_scalar_concretization!(@exact Complex<f32>);
 impl_array_scalar_concretization!(@exact Complex<f64>);
 
-impl_array_elementwise_operation!(
-    @binary
-    Min, min,
-    operation = "min",
-    inputs = @numeric,
-    checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| Ok(ArrayElement::min(&lhs, &rhs)),
-);
-
-impl_array_elementwise_operation!(
-    @binary
-    Max, max,
-    operation = "max",
-    inputs = @numeric,
-    checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| Ok(ArrayElement::max(&lhs, &rhs)),
-);
-
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -1807,41 +1788,5 @@ mod tests {
             Err(ProgramError::Concretization { message })
                 if message == "cannot extract a concrete `Complex<f32>` from `f32[]`; expected `c64[]`",
         ));
-    }
-
-    #[test]
-    fn test_array_min() {
-        // Minimum preserves the selected operand's IEEE signed-zero encoding.
-        assert_eq!(
-            Array::scalar(-0.0f32)
-                .unwrap()
-                .min(&Array::scalar(0.0f32).unwrap())
-                .unwrap()
-                .elements::<f32>()
-                .unwrap()[0]
-                .to_bits(),
-            (-0.0f32).to_bits(),
-        );
-    }
-
-    #[test]
-    fn test_array_max() {
-        // Elementwise extrema retain the selected operand's NaN payload and IEEE signed-zero encoding.
-        let nan = f32::from_bits(0x7fc0_1234);
-        assert_eq!(
-            Array::scalar(nan).unwrap().max(&Array::scalar(1.0f32).unwrap()).unwrap().elements::<f32>().unwrap()[0]
-                .to_bits(),
-            nan.to_bits(),
-        );
-        assert_eq!(
-            Array::scalar(-0.0f32)
-                .unwrap()
-                .max(&Array::scalar(0.0f32).unwrap())
-                .unwrap()
-                .elements::<f32>()
-                .unwrap()[0]
-                .to_bits(),
-            0.0f32.to_bits(),
-        );
     }
 }

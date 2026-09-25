@@ -1,11 +1,13 @@
 use approx::assert_abs_diff_eq;
+use half::f16;
 use indoc::indoc;
+use num_complex::Complex as ComplexNumber;
 use pretty_assertions::assert_eq;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
-    DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, f8e4m3fn,
-    f8e8m0fnu,
+    DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
+    StridedLayout, f8e4m3fn, f8e8m0fnu, i4,
 };
 use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
 use crate::contexts::{Context, EagerContext};
@@ -1135,6 +1137,68 @@ fn test_dot_transposition_omits_unrequested_cotangent() {
         vec!["dot"]
     );
     assert!(!context.take_cotangents(&accumulators).unwrap()[0].is_zero());
+}
+
+#[test]
+fn test_array_dot() {
+    // Ordinary matrix multiplication uses the generalized contraction order.
+    let lhs = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let rhs = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
+    let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
+    let product = lhs.dot(&rhs, &dimensions).unwrap();
+    assert_eq!(product.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 2]));
+    assert_eq!(product.to_f64s(), vec![58.0, 64.0, 139.0, 154.0]);
+
+    // Both operands are decoded through their physical layouts rather than through dense logical payload copies.
+    let lhs_type =
+        ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
+    let rhs_type =
+        ArrayType::new_static(DataType::U16, [3, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![4, -2])));
+    let lhs = Array::from_elements(lhs_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
+    let rhs = Array::from_elements(rhs_type, &[7u16, 8, 9, 10, 11, 12]).unwrap();
+    assert_eq!(lhs.dot(&rhs, &dimensions).unwrap().elements::<u16>(), Ok(vec![58, 64, 139, 154]));
+
+    // Batched generalized contraction places batch axes before both operands' non-contracting axes.
+    let lhs =
+        Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 2]), &[1i32, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+    let rhs = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[2i32, 3, 4, 5]).unwrap();
+    let batched = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
+    let product = lhs.dot(&rhs, &batched).unwrap();
+    assert_eq!(product.r#type().into_owned(), ArrayType::new_static(DataType::I32, [2, 2, 1]));
+    assert_eq!(product.elements::<i32>(), Ok(vec![8, 18, 50, 68]));
+
+    // Narrow integer products and sums wrap at the declared element width, and complex accumulation retains both
+    // components.
+    let lhs =
+        Array::from_elements(ArrayType::new_static(DataType::I4, [1, 2]), &[i4::new(7).unwrap(), i4::new(7).unwrap()])
+            .unwrap();
+    let rhs =
+        Array::from_elements(ArrayType::new_static(DataType::I4, [2, 1]), &[i4::new(2).unwrap(), i4::new(2).unwrap()])
+            .unwrap();
+    assert_eq!(lhs.dot(&rhs, &dimensions).unwrap().elements::<i4>(), Ok(vec![i4::new(-4).unwrap()]));
+    let lhs = Array::matrix(1, 2, vec![ComplexNumber::new(1.0f32, 2.0), ComplexNumber::new(3.0, -1.0)]).unwrap();
+    let rhs = Array::matrix(2, 1, vec![ComplexNumber::new(2.0f32, -1.0), ComplexNumber::new(0.5, 4.0)]).unwrap();
+    assert_eq!(
+        lhs.dot(&rhs, &dimensions).unwrap().elements::<ComplexNumber<f32>>(),
+        Ok(vec![ComplexNumber::new(9.5, 14.5)]),
+    );
+
+    // An empty contracting dimension materializes one additive identity for every result coordinate.
+    let lhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 0]), &[]).unwrap();
+    let rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, 3]), &[]).unwrap();
+    assert_eq!(lhs.dot(&rhs, &dimensions).unwrap().elements::<f32>(), Ok(vec![0.0; 6]));
+}
+
+#[test]
+fn test_array_dot_with_accumulation_type() {
+    let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
+    // Preferred accumulation first promotes both inputs and then runs the same typed contraction at the wider
+    // element data type.
+    let lhs = Array::matrix(1, 2, vec![f16::from_f32(1.5), f16::from_f32(2.0)]).unwrap();
+    let rhs = Array::matrix(2, 1, vec![f16::from_f32(2.0), f16::from_f32(3.0)]).unwrap();
+    let product = lhs.dot_with_accumulation_type(&rhs, &dimensions, DataType::F32).unwrap();
+    assert_eq!(product.r#type().data_type(), DataType::F32);
+    assert_eq!(product.elements::<f32>(), Ok(vec![9.0]));
 }
 
 #[test]

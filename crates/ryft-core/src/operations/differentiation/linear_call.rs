@@ -13,8 +13,8 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero::Zero;
-use crate::operations::math::add::AddOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramError, RegionInterface, RegionSlot,
@@ -855,14 +855,13 @@ mod tests {
         CotangentDestinationKind, DifferentiationError, TransposableOperation, TranspositionContext,
         TranspositionDriver,
     };
+    use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::dimensions::dimension_from_scalar::{DimensionFromScalar, DimensionFromScalarOperation};
     use crate::operations::manipulation::broadcasting::DynamicBroadcast;
     use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
-    use crate::operations::math::add::AddOperation;
-    use crate::operations::math::mul::MulOperation;
-    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};

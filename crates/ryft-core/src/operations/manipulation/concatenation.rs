@@ -21,6 +21,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::arithmetic::Add;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -31,7 +32,6 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::{DynamicSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::add::Add;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,

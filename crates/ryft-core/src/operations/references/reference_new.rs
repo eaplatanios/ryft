@@ -353,7 +353,7 @@ mod tests {
         TransposableOperation, TranspositionContext,
     };
     use crate::macros::check_operation_type_inference;
-    use crate::operations::math::add::AddOperation;
+    use crate::operations::arithmetic::AddOperation;
     use crate::operations::references::reference_read::{ReferenceRead, ReferenceReadOperation};
     use crate::operations::references::reference_write::ReferenceWrite;
     use crate::operations::references::tests::*;

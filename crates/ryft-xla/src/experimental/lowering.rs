@@ -5483,18 +5483,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 )?;
                 Ok(vec![value])
             }
-            ArrayOperation::LogSumExp(operation) => {
-                check_count!("output", output_types, 1, ProgramError);
-                let value = lower_log_sum_exp_to_mlir(
-                    operation.axes(),
-                    input_values[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                Ok(vec![value])
-            }
             ArrayOperation::CumulativeSum(operation) => {
                 check_count!("output", output_types, 1, ProgramError);
                 let value = lower_cumulative_to_mlir(
@@ -10793,6 +10781,12 @@ fn build_reduce_body_region<'c, 't>(
     let lhs = block_ref.argument(0)?.as_ref();
     let rhs = block_ref.argument(1)?.as_ref();
     let body_value = match kind {
+        ReductionKind::LogSumExp => {
+            return Err(LoweringError::UnsupportedOp {
+                op: "`reduce_log_sum_exp` requires a maximum-shifted expansion instead of a scalar combiner"
+                    .to_string(),
+            });
+        }
         ReductionKind::Sum | ReductionKind::Mean => block_ref
             .append_operation(stable_hlo::add(lhs, rhs, location)?)?
             .result(0)
@@ -10816,9 +10810,9 @@ fn build_reduce_body_region<'c, 't>(
     Ok(region)
 }
 
-/// Lowers an [`ArrayOperation::Reduce`] dispatch to `stablehlo.reduce` with the appropriate
-/// scalar body region and an initial-value constant matching the reduction's identity element.
-/// A [`ReductionKind::Mean`] reduction lowers as the sum divided by the number of reduced elements.
+/// Lowers an [`ArrayOperation::Reduce`] dispatch using the reduction kind's scalar combiner and identity.
+/// [`ReductionKind::Mean`] divides a sum by the reduced element count, while [`ReductionKind::LogSumExp`] uses
+/// the guarded maximum-shifted expansion in [`lower_log_sum_exp_to_mlir`].
 fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     kind: ReductionKind,
     axes: &[usize],
@@ -10828,6 +10822,9 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    if kind == ReductionKind::LogSumExp {
+        return lower_log_sum_exp_to_mlir(axes, input_value, output_array_type, block, context, location);
+    }
     let element_type = output_array_type.data_type();
     let initial_value = build_reduction_identity_constant(kind, element_type, block, context, location)?;
     let body_region = build_reduce_body_region(kind, element_type, context, location)?;
@@ -10863,9 +10860,8 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(mean.result(0).expect("stablehlo.divide should return one result").as_ref())
 }
 
-/// Lowers an [`ArrayOperation::LogSumExp`] dispatch by expanding the guarded max-shifted construction that
-/// `ryft-core`'s [`LogSumExpOperation`](ryft_core::LogSumExpOperation) pins, since StableHLO has no `logsumexp`
-/// primitive:
+/// Lowers [`ReductionKind::LogSumExp`] using a guarded maximum-shifted construction, since StableHLO has no
+/// `logsumexp` primitive:
 ///
 /// ```text
 /// m      = reduce_max(x)                      // with a -∞ initial value
@@ -10890,7 +10886,7 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     let element_type = output_array_type.data_type();
     let input_type = input_value.r#type()?;
     let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| LoweringError::UnsupportedOp {
-        op: format!("`log_sum_exp` operand has non-tensor MLIR type `{input_type}`"),
+        op: format!("`reduce_log_sum_exp` input has non-tensor MLIR type `{input_type}`"),
     })?;
     let maximum_initial_value =
         build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)?;
@@ -11740,7 +11736,7 @@ fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
             ReductionKind::Sum | ReductionKind::Mean => 0.0,
             ReductionKind::Max => f64::NEG_INFINITY,
             ReductionKind::Min => f64::INFINITY,
-            ReductionKind::Any | ReductionKind::All => {
+            ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
                 return Err(LoweringError::UnsupportedDataType { data_type: element_type });
             }
         };
@@ -11776,7 +11772,7 @@ fn build_reduction_identity_attribute<'c, 't>(
             ReductionKind::Sum | ReductionKind::Mean => {
                 return Err(LoweringError::UnsupportedDataType { data_type: element_type });
             }
-            ReductionKind::Any | ReductionKind::All => {
+            ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
                 return Err(LoweringError::UnsupportedDataType { data_type: element_type });
             }
         };
@@ -11787,7 +11783,7 @@ fn build_reduction_identity_attribute<'c, 't>(
             ReductionKind::Sum | ReductionKind::Mean => 0,
             ReductionKind::Max => minimum,
             ReductionKind::Min => maximum,
-            ReductionKind::Any | ReductionKind::All => {
+            ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
                 return Err(LoweringError::UnsupportedDataType { data_type: element_type });
             }
         };
@@ -12119,9 +12115,9 @@ mod tests {
         DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers,
         DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation,
         DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation,
-        LogSumExpOperation, LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation,
-        PadOperation, Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance, ProvenanceScope,
-        RaggedDot, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, ScanOperation, ScatterDimensionNumbers,
+        LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation,
+        Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance, ProvenanceScope, RaggedDot,
+        ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, ScanOperation, ScatterDimensionNumbers,
         SelectOperation, Shape, Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile,
         TileDimension, TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation,
         XorOperation, ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
@@ -17168,7 +17164,7 @@ mod tests {
         // maximum back over the reduced axis, and adds it to the logarithm of the shifted exponential sum.
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::LogSumExp(LogSumExpOperation::new(vec![1])),
+                ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::LogSumExp)),
                 DataType::F32,
                 vec![2, 3],
             )
@@ -22490,14 +22486,14 @@ mod tests {
 
     fn scalar_bilinear_sin<T>(inputs: (T, T)) -> T
     where
-        T: Clone + ryft_core::operations::math::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+        T: Clone + ryft_core::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
         inputs.0.clone() * inputs.1 + inputs.0.sin().unwrap()
     }
 
     fn scalar_quartic_plus_sin<T>(x: T) -> T
     where
-        T: Clone + ryft_core::operations::math::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+        T: Clone + ryft_core::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
         x.clone() * x.clone() * x.clone() * x.clone() + x.sin().unwrap()
     }

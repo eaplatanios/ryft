@@ -7,6 +7,7 @@ use crate::arrays::{
 };
 use crate::contexts::Context;
 use crate::macros::check_count;
+use crate::operations::arithmetic::Add;
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::control_flow::select::Select;
@@ -25,7 +26,6 @@ use crate::operations::manipulation::scattering::{
     DynamicScatter, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOptions, ScatterReductionKind,
 };
 use crate::operations::manipulation::slicing::Slice;
-use crate::operations::math::add::Add;
 use crate::operations::references::{ReferenceAddUpdate, ReferenceRead, ReferenceSwap, ReferenceWrite};
 use crate::programs::{ProgramError, ReferenceType, Type, TypeError, Typed, Value, ValueProjection};
 

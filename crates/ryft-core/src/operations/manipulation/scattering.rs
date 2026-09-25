@@ -21,6 +21,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, dispatch_on_array_element_type, impl_differentiable_operation, impl_reference_dischargeable_operation,
 };
+use crate::operations::arithmetic::{Add, Div, Mul};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::DimensionConstant;
@@ -37,9 +38,6 @@ use crate::operations::manipulation::gathering::{
 };
 use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::add::Add;
-use crate::operations::math::div::Div;
-use crate::operations::math::mul::Mul;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
@@ -2354,7 +2352,7 @@ mod tests {
     };
     use crate::operations::constants::one::OneOperation;
     use crate::operations::manipulation::reshaping::DynamicReshapeOperation;
-    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{

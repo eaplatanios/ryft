@@ -115,7 +115,7 @@ mod tests {
 
     use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
     use crate::contexts::StagingContext;
-    use crate::operations::math::mul::Mul;
+    use crate::operations::arithmetic::Mul;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{EffectClass, EffectClasses, ProgramBuilder};

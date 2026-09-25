@@ -30,6 +30,7 @@ use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
 };
 use crate::macros::check_count;
+use crate::operations::arithmetic::{Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -39,9 +40,6 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::div::Div;
-use crate::operations::math::mul::Mul;
-use crate::operations::math::rem::Rem;
 use crate::partial::PartialValue;
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, TypeError, Typed, Value, ValueProjection,

@@ -19,6 +19,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::operations::arithmetic::{AddOperation, Mul, MulOperation};
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::cumulative::{
     cumulative_abstract, define_cumulative_operation, jvp_through_associative_scan, lift_cumulative_axis,
@@ -26,8 +27,6 @@ use crate::operations::cumulative::{
 use crate::operations::manipulation::concatenation::ConcatenateOperation;
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::slicing::SliceOperation;
-use crate::operations::math::add::AddOperation;
-use crate::operations::math::mul::{Mul, MulOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, TypeError, Typed, Value,

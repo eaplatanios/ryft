@@ -25,6 +25,7 @@ use crate::interpretation::{
     InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
 };
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::arithmetic::{Add, AddOperation, Mul, MulOperation, Neg, NegOperation};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::comparisons::{Compare, CompareOperation};
 use crate::operations::constants::constant::ConstantOperation;
@@ -44,9 +45,6 @@ use crate::operations::manipulation::scattering::{
 };
 use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::add::{Add, AddOperation};
-use crate::operations::math::mul::{Mul, MulOperation};
-use crate::operations::math::neg::{Neg, NegOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     EmptyRegionDriver, MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection,
@@ -1239,7 +1237,7 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::differentiate_at;
     use crate::macros::{check_gradient, check_operation_transposition, check_operation_type_inference};
-    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialTracer};
     use crate::programs::{ProgramBuilder, Provenance};

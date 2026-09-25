@@ -308,7 +308,7 @@ mod tests {
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_transposition,
     };
-    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ValueProjection};
 

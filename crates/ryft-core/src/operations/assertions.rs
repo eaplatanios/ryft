@@ -106,7 +106,7 @@ use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::DynamicSlice;
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::reduce::{Reduce, ReductionKind};
+use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };

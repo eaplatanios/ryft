@@ -13,25 +13,20 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
+use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sqrt, Sub};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::exponential::Log;
 use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
-use crate::operations::math::add::Add;
-use crate::operations::math::cos::Cos;
-use crate::operations::math::div::Div;
-use crate::operations::math::log::Log;
-use crate::operations::math::mul::Mul;
-use crate::operations::math::neg::Neg;
-use crate::operations::math::sqrt::Sqrt;
-use crate::operations::math::sub::Sub;
 use crate::operations::sort::ArgMax;
+use crate::operations::trigonometric::Cos;
 use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{

@@ -42,10 +42,10 @@ use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_differentiable_operation,
 };
+use crate::operations::arithmetic::NegOperation;
 use crate::operations::constants::zero::Zero;
 use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::manipulation::conversions::ElementType;
-use crate::operations::math::neg::NegOperation;
 use crate::programs::{MaybeZero, ProgramError, Type, TypeError, Typed};
 
 /// Canonical operation name for [`ComplexOperation`].

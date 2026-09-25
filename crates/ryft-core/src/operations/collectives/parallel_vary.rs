@@ -558,7 +558,7 @@ mod tests {
     use crate::batching::BatchAxis;
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::macros::check_operation_type_inference;
-    use crate::operations::math::add::Add;
+    use crate::operations::arithmetic::Add;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed, ValueProjection};

@@ -22,6 +22,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::operations::arithmetic::{Add, AddOperation, Mul};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -48,9 +49,7 @@ use crate::operations::manipulation::scattering::{
     Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOptions, ScatterReductionKind,
 };
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::add::{Add, AddOperation};
-use crate::operations::math::mul::Mul;
-use crate::operations::math::reduce::{Reduce, ReductionKind};
+use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -4506,13 +4505,13 @@ mod tests {
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
+    use crate::operations::arithmetic::MulOperation;
     use crate::operations::constants::constant::Constant;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::manipulation::concatenation::Concatenate;
     use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
     use crate::operations::manipulation::padding::Pad;
-    use crate::operations::math::mul::MulOperation;
-    use crate::operations::math::reduce::{Reduce, ReduceOperation, ReductionKind};
+    use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
     use crate::operations::references::{ReferenceNew, ReferenceRead};
     use crate::parameters::Placeholder;
     use crate::programs::{

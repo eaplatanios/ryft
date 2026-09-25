@@ -17,17 +17,17 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::cumulative::{
     cumulative_abstract, define_cumulative_operation, jvp_through_associative_scan, lift_cumulative_axis,
 };
+use crate::operations::exponential::{
+    LogAddExp, LogAddExpOperation, is_log_add_exp_identity_data_type, log_add_exp_identity_data_type_error,
+};
 use crate::operations::manipulation::concatenation::ConcatenateOperation;
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::slicing::SliceOperation;
-use crate::operations::math::add::AddOperation;
-use crate::operations::math::log_add_exp::{
-    LogAddExp, LogAddExpOperation, is_log_add_exp_identity_data_type, log_add_exp_identity_data_type_error,
-};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, TypeError, Typed, Value,
@@ -57,7 +57,7 @@ define_cumulative_operation! {
     /// [`DataType::F8E4M3B11FNUZ`](crate::arrays::DataType::F8E4M3B11FNUZ), and
     /// [`DataType::F6E3M2FN`](crate::arrays::DataType::F6E3M2FN), whose lowest values hold across one, two, two, and
     /// seven copies respectively. Those five are rejected outright rather than silently corrupting prefixes, and they
-    /// are exactly the formats that [`LogSumExpOperation`](crate::operations::math::log_sum_exp::LogSumExpOperation)
+    /// are exactly the formats that [`ReductionKind::LogSumExp`](crate::operations::reductions::ReductionKind::LogSumExp)
     /// rejects for the same reason, so the two operations share one element-domain predicate,
     /// `is_log_add_exp_identity_data_type`, whose documentation tabulates every format's reach. Every other
     /// floating-point format either has a true `-inf` or, like
@@ -66,7 +66,7 @@ define_cumulative_operation! {
     ///
     /// Each prefix is accumulated by folding the pairwise [`LogAddExp`] primitive, which is stable over the whole
     /// real range but is a different expression from the max-shifted reduction that
-    /// [`LogSumExpOperation`](crate::operations::math::log_sum_exp::LogSumExpOperation) evaluates, so the two can
+    /// [`ReductionKind::LogSumExp`](crate::operations::reductions::ReductionKind::LogSumExp) evaluates, so the two can
     /// round differently in their last bits.
     operation = CumulativeLogSumExpOperation,
     name = CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME = "cumulative_log_sum_exp",
@@ -137,7 +137,7 @@ mod tests {
             assert_eq!(
                 operation.infer_output_types(&[ArrayType::new_static(data_type, [3, 2])], &[]),
                 Err(TypeError::invalid(format!(
-                    "`cumulative_log_sum_exp` requires real floating-point inputs but got {data_type}"
+                    "`cumulative_log_sum_exp` requires real floating-point inputs but got `{data_type}`"
                 ))),
             );
         }
@@ -149,7 +149,7 @@ mod tests {
             operation.infer_output_types(&[ArrayType::new_static(DataType::F8E8M0FNU, [3, 2])], &[]),
             Err(TypeError::invalid(
                 "`cumulative_log_sum_exp` requires a floating-point format that represents zero and negative \
-                 infinity but got f8e8m0fnu"
+                 infinity but got `f8e8m0fnu`"
                     .to_string(),
             )),
         );
@@ -164,7 +164,7 @@ mod tests {
                 operation.infer_output_types(&[ArrayType::new_static(data_type, [3, 2])], &[]),
                 Err(TypeError::invalid(format!(
                     "`cumulative_log_sum_exp` requires a floating-point format whose lowest value is a \
-                     `log_add_exp` identity but got {data_type}"
+                     `log_add_exp` identity but got `{data_type}`"
                 ))),
             );
         }
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(
             Array::vector(vec![1_i32, 2]).unwrap().cumulative_log_sum_exp(0),
             Err(ProgramError::Type(TypeError::invalid(
-                "`cumulative_log_sum_exp` requires real floating-point inputs but got i32".to_string(),
+                "`cumulative_log_sum_exp` requires real floating-point inputs but got `i32`".to_string(),
             ))),
         );
     }

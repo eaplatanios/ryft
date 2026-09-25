@@ -1263,16 +1263,12 @@ pub trait RaggedArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayEx
         contracted_axes: &[usize],
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
 
-    /// Replaces padding along the ragged axes in `masked_axes` with `identity`. This is the identity-masking
-    /// discipline, owned by consumers whose combining operator is not one that [`ReductionKind`] names. Unlike
-    /// [`Self::mask_reduction_input`], this hook is defined by the value it writes rather than by what becomes of the
-    /// masked axis: the caller names the identity of whatever it goes on to combine those positions with, and both
-    /// kinds of caller are ordinary. A prefix scan keeps every axis it touches, so the operand's ragged axes ride
-    /// through onto the result. For example, a `log_sum_exp` operation masks with [`RaggedMaskIdentity::Lowest`] and
-    /// then collapses those very axes, retiring them. Whether the ragged axes survive is therefore the calling rule's
-    /// own business, as is reporting the consumption evidence that goes with retiring one. All this hook guarantees is
-    /// that padding cannot influence the live elements of the result, which holds exactly when `identity` is neutral
-    /// under the caller's combination.
+    /// Replaces padding along the ragged axes in `masked_axes` with `identity`. Unlike [`Self::mask_reduction_input`],
+    /// this hook specifies the padding value directly. It supports both prefix scans, which retain the masked axes, and
+    /// reductions such as [`ReductionKind::LogSumExp`], which mask with [`RaggedMaskIdentity::Lowest`] before removing
+    /// those axes. The caller determines which ragged axes survive and reports consumption evidence for any that are
+    /// removed. The chosen identity must prevent padding from affecting the live output elements under the caller's
+    /// combination.
     ///
     /// # Parameters
     ///

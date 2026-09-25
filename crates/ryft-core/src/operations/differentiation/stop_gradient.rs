@@ -178,7 +178,7 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
-    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
 

@@ -19,12 +19,12 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::arithmetic::DivOperation;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::memory::TransferToMemory;
-use crate::operations::math::div::DivOperation;
-use crate::operations::math::reduce::{Reduce, ReductionKind};
+use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,

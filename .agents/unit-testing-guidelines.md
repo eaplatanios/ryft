@@ -96,7 +96,7 @@ Use this file as the single detailed reference for `ryft` testing conventions.
   - For simple operations, order primary tests as `test_<operation>`, `test_<operation>_type_inference`,
     `test_<operation>_interpretation` using `Array` values, `test_<operation>_partial_evaluation`,
     `test_<operation>_batching`, `test_<operation>_differentiation`, and `test_<operation>_transposition`, where those
-    behaviors apply. Use `operations/math/add.rs` as the reference layout. Keep substantial edge cases beside the
+    behaviors apply. Use `operations/arithmetic.rs` as the reference layout. Keep substantial edge cases beside the
     corresponding primary test, including specialized sharding behavior, dynamic-index transforms, backend kernels,
     and nested transformation composition, and test independently useful public helper types separately.
   - Use default or unknown locations for ordinary operation tests. Use specific file locations only when location

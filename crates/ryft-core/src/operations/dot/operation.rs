@@ -1,3 +1,12 @@
+use std::sync::Arc;
+
+use crate::arrays::operations::decode_nonnegative_integer_metadata;
+use crate::arrays::{Array, ArrayAddressing, ArrayElement, NumericArrayElement, StaticShape};
+use crate::macros::dispatch_on_array_element_type;
+use crate::operations::arithmetic::Add;
+use crate::operations::manipulation::reshaping::Reshape;
+use crate::operations::manipulation::slicing::Slice;
+
 use super::*;
 
 /// Canonical operation name for [`DotOperation`].
@@ -209,6 +218,27 @@ pub trait Dot<Rhs = Self>: Sized {
     ) -> Result<Self, ProgramError>;
 }
 
+impl Dot for Array {
+    fn dot_with_accumulation_type(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+        accumulation_type: DataType,
+    ) -> Result<Self, ProgramError> {
+        let lhs = self.convert_element_type(accumulation_type)?;
+        let rhs = rhs.convert_element_type(accumulation_type)?;
+        lhs.dot(&rhs, dimensions)
+    }
+
+    fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError> {
+        // TODO(eaplatanios): What about the accumulation type?
+        let data_type = self.r#type().data_type();
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            self.dot_elements::<Element>(rhs, dimensions)
+        })
+    }
+}
+
 // Context-carrying values stage a dot through their context. The `From<DotOperation>` bound keeps this implementation
 // disjoint from eager values, whose context operation is `ConstantOperation`.
 impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Dot for V
@@ -385,6 +415,20 @@ pub trait RaggedDot: Sized {
     }
 }
 
+impl RaggedDot for Array {
+    fn ragged_dot_general(
+        &self,
+        rhs: &Self,
+        group_sizes: &Self,
+        dimensions: &RaggedDotDimensionNumbers,
+    ) -> Result<Self, ProgramError> {
+        let data_type = self.r#type().data_type();
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            self.ragged_dot_elements::<Element>(rhs, group_sizes, dimensions)
+        })
+    }
+}
+
 impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> RaggedDot for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
@@ -412,3 +456,296 @@ where
 pub trait DotOps: Dot + Transpose {}
 
 impl<T: Dot + Transpose> DotOps for T {}
+
+impl Array {
+    /// Allocates an array whose logical elements are initialized to the additive identity.
+    fn zeroed<T: ArrayElement>(output_type: ArrayType) -> Result<Self, ProgramError> {
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        let zero = T::zero()?;
+        for element in 0..output_addressing.element_count() {
+            zero.encode(&mut bytes[output_addressing.byte_range_for_flat_index(element)]);
+        }
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
+    }
+
+    /// Evaluates grouped generalized dot extent-exactly. Each concrete group's raw cumulative interval is clipped to
+    /// the physical ragged extent, the resulting pair of operand slices is contracted by the ordinary generalized-dot
+    /// kernel, and the result is written into its output window. This keeps temporary storage proportional to one
+    /// group rather than the whole operand times the group count.
+    fn ragged_dot_elements<T: NumericArrayElement>(
+        &self,
+        rhs: &Self,
+        group_sizes: &Self,
+        dimensions: &RaggedDotDimensionNumbers,
+    ) -> Result<Self, ProgramError> {
+        let mut output_types = RaggedDotOperation::new(dimensions.clone()).infer_output_types(
+            &[self.r#type().into_owned(), rhs.r#type().into_owned(), group_sizes.r#type().into_owned()],
+            &[],
+        )?;
+        let output_type = output_types.remove(0);
+        let dot_dimensions = dimensions.dot_dimensions();
+        let ragged_axis = dimensions.lhs_ragged_dimensions()[0];
+        let mode = dimensions.mode(self.r#type().rank())?;
+        if mode == RaggedDotMode::Batch {
+            return self.dot_elements::<T>(rhs, dot_dimensions);
+        }
+        let prefix_axes = dimensions.group_sizes_prefix_dimensions(self.r#type().rank())?;
+        let prefix_shape = prefix_axes
+            .iter()
+            .map(|axis| self.r#type().shape().dimensions()[*axis].value().unwrap())
+            .collect::<Vec<_>>();
+        let prefix_count = prefix_shape.iter().product::<usize>();
+        let group_count = group_sizes.r#type().shape().dimensions().last().unwrap().value().ok_or_else(|| {
+            ProgramError::InvalidArgument {
+                message: format!("`{RAGGED_DOT_OPERATION_NAME}` requires a static group count for eager evaluation"),
+            }
+        })?;
+        let sizes = decode_nonnegative_integer_metadata(group_sizes, RAGGED_DOT_OPERATION_NAME, "group_sizes")?;
+        let expected_size_count = if group_sizes.r#type().rank() == 1 {
+            group_count
+        } else {
+            prefix_count.checked_mul(group_count).ok_or_else(|| ProgramError::InvalidArgument {
+                message: format!("`{RAGGED_DOT_OPERATION_NAME}` group sizes element count does not fit in `usize`"),
+            })?
+        };
+        if sizes.len() != expected_size_count {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("`{RAGGED_DOT_OPERATION_NAME}` group sizes storage does not match its shape"),
+            });
+        }
+        let ragged_extent = self.r#type().shape().dimensions()[ragged_axis].value().unwrap();
+        let lhs_shape = self.r#type().static_shape().unwrap();
+        let rhs_shape = rhs.r#type().static_shape().unwrap();
+        let lhs_strides = vec![1; lhs_shape.rank()];
+        let rhs_strides = vec![1; rhs_shape.rank()];
+        let output_strides = vec![1; output_type.rank()];
+        let lhs_result = crate::operations::dot::lhs_result_axes(dot_dimensions, self.r#type().rank());
+        let non_contracting_metadata = (mode == RaggedDotMode::NonContracting).then(|| {
+            let rhs_group_axis = dimensions.rhs_group_dimensions()[0];
+            let rhs_slice_shape = Shape::new(
+                rhs_shape
+                    .dimensions()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(axis, dimension)| {
+                        (axis != rhs_group_axis).then(|| {
+                            let is_prefix_axis = dot_dimensions
+                                .lhs_batching_dimensions()
+                                .iter()
+                                .zip(dot_dimensions.rhs_batching_dimensions())
+                                .any(|(lhs_axis, rhs_axis)| *rhs_axis == axis && prefix_axes.contains(lhs_axis));
+                            Dimension::Static(if is_prefix_axis { 1 } else { *dimension })
+                        })
+                    })
+                    .collect(),
+            );
+            let remap_rhs_axis = |axis: usize| if axis < rhs_group_axis { axis } else { axis - 1 };
+            let dense_dimensions = DotDimensionNumbers::new(
+                dot_dimensions.lhs_contracting_dimensions().to_vec(),
+                dot_dimensions.rhs_contracting_dimensions().iter().map(|axis| remap_rhs_axis(*axis)).collect(),
+                dot_dimensions.lhs_batching_dimensions().to_vec(),
+                dot_dimensions.rhs_batching_dimensions().iter().map(|axis| remap_rhs_axis(*axis)).collect(),
+            );
+            let ragged_position = lhs_result.iter().position(|axis| *axis == ragged_axis).unwrap();
+            let ragged_output_axis = dot_dimensions.lhs_batching_dimensions().len() + ragged_position;
+            (rhs_group_axis, rhs_slice_shape, dense_dimensions, ragged_output_axis)
+        });
+        let contracting_rhs_ragged_axis = (mode == RaggedDotMode::Contracting).then(|| {
+            let contracting_position =
+                dot_dimensions.lhs_contracting_dimensions().iter().position(|axis| *axis == ragged_axis).unwrap();
+            dot_dimensions.rhs_contracting_dimensions()[contracting_position]
+        });
+        let mut output = Self::zeroed::<T>(output_type)?;
+        for prefix in 0..prefix_count {
+            let mut remainder = prefix;
+            let mut prefix_coordinates = vec![0; prefix_axes.len()];
+            for (coordinate, extent) in prefix_coordinates.iter_mut().zip(prefix_shape.iter()).rev() {
+                *coordinate = remainder % extent;
+                remainder /= extent;
+            }
+            let metadata_prefix = if group_sizes.r#type().rank() == 1 { 0 } else { prefix };
+            let group_range = metadata_prefix * group_count..(metadata_prefix + 1) * group_count;
+            let mut lhs_starts = vec![0; lhs_shape.rank()];
+            let mut lhs_limits = lhs_shape.dimensions().to_vec();
+            for (&axis, &coordinate) in prefix_axes.iter().zip(prefix_coordinates.iter()) {
+                lhs_starts[axis] = coordinate;
+                lhs_limits[axis] = coordinate + 1;
+            }
+            let mut rhs_starts = vec![0; rhs_shape.rank()];
+            let mut rhs_limits = rhs_shape.dimensions().to_vec();
+            for (&lhs_axis, &rhs_axis) in
+                dot_dimensions.lhs_batching_dimensions().iter().zip(dot_dimensions.rhs_batching_dimensions())
+            {
+                if let Some(prefix_position) = prefix_axes.iter().position(|axis| *axis == lhs_axis) {
+                    let coordinate = prefix_coordinates[prefix_position];
+                    rhs_starts[rhs_axis] = coordinate;
+                    rhs_limits[rhs_axis] = coordinate + 1;
+                }
+            }
+            if mode == RaggedDotMode::Contracting {
+                for (&lhs_axis, &rhs_axis) in
+                    dot_dimensions.lhs_contracting_dimensions().iter().zip(dot_dimensions.rhs_contracting_dimensions())
+                {
+                    if let Some(prefix_position) = prefix_axes.iter().position(|axis| *axis == lhs_axis) {
+                        let coordinate = prefix_coordinates[prefix_position];
+                        rhs_starts[rhs_axis] = coordinate;
+                        rhs_limits[rhs_axis] = coordinate + 1;
+                    }
+                }
+            }
+            let mut output_starts = vec![0; output.r#type().rank()];
+            let mut output_limits = output.r#type().static_shape().unwrap().dimensions().to_vec();
+            match mode {
+                RaggedDotMode::NonContracting => {
+                    for (&axis, &coordinate) in prefix_axes.iter().zip(prefix_coordinates.iter()) {
+                        if let Some(position) =
+                            dot_dimensions.lhs_batching_dimensions().iter().position(|candidate| *candidate == axis)
+                        {
+                            output_starts[position] = coordinate;
+                        } else {
+                            let position = lhs_result.iter().position(|candidate| *candidate == axis).unwrap();
+                            let position = dot_dimensions.lhs_batching_dimensions().len() + position;
+                            output_starts[position] = coordinate;
+                        }
+                    }
+                }
+                RaggedDotMode::Contracting => {
+                    for (position, lhs_axis) in dot_dimensions.lhs_batching_dimensions().iter().enumerate() {
+                        if let Some(prefix_position) = prefix_axes.iter().position(|axis| axis == lhs_axis) {
+                            output_starts[position + 1] = prefix_coordinates[prefix_position];
+                            output_limits[position + 1] = prefix_coordinates[prefix_position] + 1;
+                        }
+                    }
+                }
+                RaggedDotMode::Batch => unreachable!(),
+            }
+            let mut raw_ragged_start = 0usize;
+            for (group, &group_size) in sizes[group_range].iter().enumerate() {
+                if raw_ragged_start >= ragged_extent {
+                    break;
+                }
+                let ragged_start = raw_ragged_start;
+                let ragged_limit = raw_ragged_start.saturating_add(group_size).min(ragged_extent);
+                raw_ragged_start = ragged_limit;
+                if ragged_start == ragged_limit {
+                    continue;
+                }
+                lhs_starts[ragged_axis] = ragged_start;
+                lhs_limits[ragged_axis] = ragged_limit;
+                let lhs_slice = self.slice(&lhs_starts, &lhs_limits, &lhs_strides)?;
+                let dot = match mode {
+                    RaggedDotMode::NonContracting => {
+                        let (rhs_group_axis, rhs_slice_shape, dense_dimensions, ragged_output_axis) =
+                            non_contracting_metadata.as_ref().unwrap();
+                        rhs_starts[*rhs_group_axis] = group;
+                        rhs_limits[*rhs_group_axis] = group + 1;
+                        let rhs_slice = rhs.slice(&rhs_starts, &rhs_limits, &rhs_strides)?;
+                        let rhs_slice = rhs_slice.reshape(rhs_slice_shape.clone())?;
+                        output_starts[*ragged_output_axis] = ragged_start;
+                        lhs_slice.dot_elements::<T>(&rhs_slice, dense_dimensions)?
+                    }
+                    RaggedDotMode::Contracting => {
+                        let rhs_ragged_axis = contracting_rhs_ragged_axis.unwrap();
+                        rhs_starts[rhs_ragged_axis] = ragged_start;
+                        rhs_limits[rhs_ragged_axis] = ragged_limit;
+                        let rhs_slice = rhs.slice(&rhs_starts, &rhs_limits, &rhs_strides)?;
+                        output_starts[0] = group;
+                        output_limits[0] = group + 1;
+                        let dot = lhs_slice.dot_elements::<T>(&rhs_slice, dot_dimensions)?;
+                        let mut dimensions = vec![Dimension::Static(1)];
+                        dimensions.extend_from_slice(dot.r#type().shape().dimensions());
+                        let dot = dot.reshape(Shape::new(dimensions))?;
+                        let current = output.slice(&output_starts, &output_limits, &output_strides)?;
+                        Add::add(&current, &dot)?
+                    }
+                    RaggedDotMode::Batch => unreachable!(),
+                };
+                output = output.replace_block(&dot, &output_starts);
+            }
+        }
+        Ok(output)
+    }
+
+    /// Contracts typed elements using each input's physical layout and the declared contraction dimensions.
+    fn dot_elements<T: NumericArrayElement>(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+    ) -> Result<Self, ProgramError> {
+        debug_assert_eq!(self.r#type().data_type(), T::data_type());
+        debug_assert_eq!(rhs.r#type().data_type(), T::data_type());
+        let mut output_types = DotOperation::new(dimensions.clone())
+            .infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?;
+        let output_type = output_types.remove(0);
+        let lhs_shape = self.r#type().static_shape().unwrap();
+        let rhs_shape = rhs.r#type().static_shape().unwrap();
+        let output_shape = output_type.static_shape().unwrap();
+        let output_strides = output_shape.row_major_strides();
+        let lhs_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let rhs_addressing = ArrayAddressing::new(rhs.r#type().into_owned())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+
+        let lhs_batching = dimensions.lhs_batching_dimensions();
+        let rhs_batching = dimensions.rhs_batching_dimensions();
+        let lhs_contracting = dimensions.lhs_contracting_dimensions();
+        let rhs_contracting = dimensions.rhs_contracting_dimensions();
+        let lhs_result = (0..lhs_shape.rank())
+            .filter(|axis| !lhs_batching.contains(axis) && !lhs_contracting.contains(axis))
+            .collect::<Vec<_>>();
+        let rhs_result = (0..rhs_shape.rank())
+            .filter(|axis| !rhs_batching.contains(axis) && !rhs_contracting.contains(axis))
+            .collect::<Vec<_>>();
+        let contracting_shape =
+            StaticShape::new(lhs_contracting.iter().map(|axis| lhs_shape[*axis]).collect::<Vec<_>>());
+        let contracting_strides = contracting_shape.row_major_strides();
+        let contracting_count = contracting_shape.dimensions().iter().product();
+
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        let mut lhs_index = vec![0usize; lhs_shape.rank()];
+        let mut rhs_index = vec![0usize; rhs_shape.rank()];
+        for output_flat in 0..output_addressing.element_count() {
+            // Decode the result coordinate directly into the corresponding batch and non-contracting operand axes.
+            let mut output_axis = 0usize;
+            for (&lhs_axis, &rhs_axis) in lhs_batching.iter().zip(rhs_batching) {
+                let coordinate = (output_flat / output_strides[output_axis]) % output_shape[output_axis];
+                lhs_index[lhs_axis] = coordinate;
+                rhs_index[rhs_axis] = coordinate;
+                output_axis += 1;
+            }
+            for &lhs_axis in &lhs_result {
+                lhs_index[lhs_axis] = (output_flat / output_strides[output_axis]) % output_shape[output_axis];
+                output_axis += 1;
+            }
+            for &rhs_axis in &rhs_result {
+                rhs_index[rhs_axis] = (output_flat / output_strides[output_axis]) % output_shape[output_axis];
+                output_axis += 1;
+            }
+
+            let mut accumulator = if T::data_type() == DataType::F8E8M0FNU { None } else { Some(T::zero()?) };
+            for contracting_flat in 0..contracting_count {
+                for (contracting_axis, (&lhs_axis, &rhs_axis)) in
+                    lhs_contracting.iter().zip(rhs_contracting).enumerate()
+                {
+                    let coordinate = (contracting_flat / contracting_strides[contracting_axis])
+                        % contracting_shape[contracting_axis];
+                    lhs_index[lhs_axis] = coordinate;
+                    rhs_index[rhs_axis] = coordinate;
+                }
+                let lhs_value = T::decode(&self.storage_bytes()[lhs_addressing.byte_range_unchecked(&lhs_index)]);
+                let rhs_value = T::decode(&rhs.storage_bytes()[rhs_addressing.byte_range_unchecked(&rhs_index)]);
+                let product = lhs_value.mul(rhs_value)?;
+                accumulator = Some(match accumulator {
+                    Some(accumulator) => accumulator.add(product)?,
+                    None => product,
+                });
+            }
+            let accumulator = match accumulator {
+                Some(accumulator) => accumulator,
+                None => T::zero()?,
+            };
+            accumulator.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output_flat)]);
+        }
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
+    }
+}

@@ -17,6 +17,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::arithmetic::{Div, Mul, Rem};
 use crate::operations::assertions::{Assert, AssertionValue};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
@@ -27,9 +28,6 @@ use crate::operations::dot::{Dot, DotDimensionNumbers, dot_abstract, lift_dot_di
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast};
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};
-use crate::operations::math::div::Div;
-use crate::operations::math::mul::Mul;
-use crate::operations::math::rem::Rem;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,

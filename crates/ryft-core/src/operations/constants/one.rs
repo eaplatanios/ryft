@@ -342,9 +342,9 @@ mod tests {
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
+    use crate::operations::arithmetic::Mul;
     use crate::operations::constants::constant::ConstantOperation;
-    use crate::operations::math::mul::Mul;
-    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, ReferenceType};

@@ -1,18 +1,13 @@
 use crate::arrays::{ArrayType, DataType, Dimension, Shape};
+use crate::operations::arithmetic::{Abs, Div, Mul, Sub};
 use crate::operations::constants::fill::Fill;
+use crate::operations::exponential::{Exp, Log};
+use crate::operations::extrema::{Clamp, Max};
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::Reshape;
-use crate::operations::math::abs::Abs;
-use crate::operations::math::clamp::Clamp;
-use crate::operations::math::div::Div;
-use crate::operations::math::exp::Exp;
-use crate::operations::math::floor::Floor;
-use crate::operations::math::log::Log;
-use crate::operations::math::max::Max;
-use crate::operations::math::mul::Mul;
-use crate::operations::math::reduce::{Reduce, ReductionKind};
-use crate::operations::math::sub::Sub;
+use crate::operations::reductions::{Reduce, ReductionKind};
+use crate::operations::rounding::Floor;
 use crate::programs::{ProgramError, TypeError, Value};
 
 /// Value-level block-quantization capability: splits a full-precision (`f32` or `f64`) tensor of rank 1 through 3

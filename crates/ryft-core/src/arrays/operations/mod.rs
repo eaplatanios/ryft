@@ -53,19 +53,18 @@ use crate::operations::{
     DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation, DynamicSlice,
     DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf, ErfOperation, Exp, ExpOperation,
     Floor, FloorOperation, Gather, GatherOperation, IotaOperation, LinearCallOperation, Log, Log1p, Log1pOperation,
-    LogAddExp, LogAddExpOperation, LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, Max,
-    MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation, OneLike,
-    OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation, ParallelVaryOperation,
-    Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze,
-    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape,
-    ReshapeOperation, ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation,
-    ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign,
-    SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
-    Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation,
-    UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation,
-    ZeroOperation,
+    LogAddExp, LogAddExpOperation, LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation,
+    Mul, MulOperation, Neg, NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation,
+    Pad, PadOperation, ParallelReduceOperation, ParallelVaryOperation, Pow, PowOperation, PrintOperation, RaggedDot,
+    RaggedDotOperation, Reduce, ReduceOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+    ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
+    ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Reverse,
+    ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation,
+    Scatter, ScatterOperation, Select, SelectOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation,
+    Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
+    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -78,10 +77,11 @@ use crate::tracing_v2::RematerializeOperation;
 mod collectives;
 mod control_flow;
 mod cumulative;
-mod math;
 mod random;
 mod references;
 mod sort;
+
+pub(crate) use collectives::decode_nonnegative_integer_metadata;
 
 // The element-level extrema of the reference kernels are the canonical least and greatest values of each element data
 // type, so the ragged identity masking of `arrays::batching` reads them through this facade instead of restating them.
@@ -152,7 +152,6 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     DotProductAttention(DotProductAttentionOperation),
     DotProductAttentionBackward(DotProductAttentionBackwardOperation),
     Reduce(ReduceOperation),
-    LogSumExp(LogSumExpOperation),
     CumulativeSum(CumulativeSumOperation),
     CumulativeProduct(CumulativeProductOperation),
     CumulativeMax(CumulativeMaxOperation),
@@ -272,7 +271,7 @@ pub trait ArrayOperations:
     + Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice
     + DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort
     // Linear algebra and reduction.
-    + Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp
+    + Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce
     + CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp
     // Constants and differentiation barriers.
     + ZeroLike + OneLike + StopGradient + Assert
@@ -291,7 +290,7 @@ where
     V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
     V: Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
     V: DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort,
-    V: Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp,
+    V: Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce,
     V: CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp,
     V: ZeroLike + OneLike + StopGradient + Assert,
 {

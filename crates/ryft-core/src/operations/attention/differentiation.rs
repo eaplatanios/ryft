@@ -230,7 +230,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::Differentiate;
     use crate::operations::attention::dot_product_attention_ir_composition;
-    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::tracing::Trace;
 
     use super::*;

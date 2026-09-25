@@ -1,12 +1,33 @@
+//! Elementwise special mathematical functions.
+//!
+//! This module provides:
+//!
+//!   - [`ErfOperation`] and [`Erf`] for the Gauss error function on real floating-point values.
+//!
+//! The operation preserves array metadata and rejects inputs with pending partial sums. It supports partial evaluation,
+//! batching, and differentiation. Reverse differentiation transposes its linearized program; the nonlinear primitive
+//! cannot be transposed directly.
+//!
+//! # Example
+//!
+//! ```
+//! use ryft_core::{Array, Erf, ProgramError};
+//!
+//! assert_eq!(Array::scalar(0.0f64)?.erf()?, Array::scalar(0.0)?);
+//! # Ok::<(), ProgramError>(())
+//! ```
+
 use std::f64::consts::FRAC_2_SQRT_PI;
 use std::ops::{Mul as StandardMul, Neg as StandardNeg};
 
+use crate::arrays::RealFloatingPointArrayElement;
 use crate::macros::{
-    define_elementwise_capability, define_elementwise_operation, impl_differentiable_elementwise_operation,
+    define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
+    impl_differentiable_elementwise_operation,
 };
 use crate::operations::constants::fill::Fill;
+use crate::operations::exponential::Exp;
 use crate::operations::manipulation::conversions::ElementType;
-use crate::operations::math::exp::Exp;
 use crate::programs::{Typed, Value};
 
 // TODO(eaplatanios): Review this module.
@@ -17,8 +38,8 @@ pub const ERF_OPERATION_NAME: &str = "erf";
 define_elementwise_operation!(
     @unary
     /// [`Operation`] that computes the elementwise Gauss error function of one value (i.e.,
-    /// `x ↦ erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt`) while preserving its array metadata. Only real floating-point operands
-    /// are supported, and operands that still carry partial sums are rejected.
+    /// `x ↦ erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt`) while preserving its array metadata. Only real floating-point inputs
+    /// are supported, and inputs that still carry partial sums are rejected.
     ErfOperation, ERF_OPERATION_NAME,
     Erf, erf,
     check_data_types = [@float @real],
@@ -47,12 +68,23 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @unary
-    /// Value-level elementwise error-function capability. [`Erf`] fills the same role for
-    /// [`ErfOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
+    /// Represents the ability to compute the elementwise Gauss error function. Concrete arrays compute immediately
+    /// while context-carrying values apply [`ErfOperation`] through their context. Refer to that operation for
+    /// supported types and exceptional-value behavior.
     Erf,
-    /// Computes [`ErfOperation`] elementwise for this value.
+    /// Computes the Gauss error function for each real floating-point element. Returns an error if the input types or
+    /// metadata are unsupported.
     erf,
     ErfOperation,
+);
+
+impl_array_elementwise_operation!(
+    @unary
+    Erf, erf,
+    operation = "erf",
+    inputs = @float @real,
+    checks = [@no_unreduced],
+    |input| RealFloatingPointArrayElement::erf(input),
 );
 
 #[cfg(test)]
@@ -63,11 +95,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayType, DataType};
+    use crate::contexts::EagerContext;
+    use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::reductions::{Reduce, ReductionKind};
+    use crate::programs::EmptyRegionDriver;
 
     use super::*;
 
@@ -76,11 +111,6 @@ mod tests {
     const ERF_ONE: f64 = 0.8427007929497149;
     const ERF_TWO: f64 = 0.9953222650189527;
     const ERF_THREE: f64 = 0.9999779095030014;
-
-    #[test]
-    fn test_erf() {
-        assert_eq!(ErfOperation::<ArrayType>::new().to_string(), "erf");
-    }
 
     #[test]
     fn test_erf_type_inference() {
@@ -111,40 +141,14 @@ mod tests {
 
     #[test]
     fn test_erf_interpretation() {
-        // Exact fixed points and symmetry.
-        assert_eq!(Array::scalar(0.0f64).unwrap().erf().unwrap(), Array::scalar(0.0f64).unwrap());
-        assert_eq!(Array::scalar(f64::INFINITY).unwrap().erf().unwrap(), Array::scalar(1.0f64).unwrap());
-        assert_eq!(Array::scalar(f64::NEG_INFINITY).unwrap().erf().unwrap(), Array::scalar(-1.0f64).unwrap());
-        assert_eq!(Array::scalar(1.5f64).unwrap().erf().unwrap(), -Array::scalar(-1.5f64).unwrap().erf().unwrap());
-        assert!(Array::scalar(f64::NAN).unwrap().erf().unwrap().to_f64s()[0].is_nan());
-
-        // Known values covering every rational-approximation regime of the reference implementation: the small
-        // series (|x| < 2⁻²⁸), the primary interval (|x| < 0.84375), the [0.84375, 1.25) interval, both tail
-        // intervals of the complementary-function path, and the saturated |x| ≥ 6 regime.
-        assert_abs_diff_eq!(
-            Array::scalar(1e-12f64).unwrap().erf().unwrap(),
-            Array::scalar(FRAC_2_SQRT_PI * 1e-12).unwrap()
-        );
-        assert_eq!(Array::scalar(0.5f64).unwrap().erf().unwrap(), Array::scalar(ERF_HALF).unwrap());
-        assert_eq!(Array::scalar(1.0f64).unwrap().erf().unwrap(), Array::scalar(ERF_ONE).unwrap());
-        assert_eq!(Array::scalar(2.0f64).unwrap().erf().unwrap(), Array::scalar(ERF_TWO).unwrap());
-        assert_eq!(Array::scalar(3.0f64).unwrap().erf().unwrap(), Array::scalar(ERF_THREE).unwrap());
-        assert_eq!(Array::scalar(4.0f64).unwrap().erf().unwrap(), Array::scalar(0.9999999845827421).unwrap());
-        assert_eq!(Array::scalar(6.5f64).unwrap().erf().unwrap(), Array::scalar(1.0f64).unwrap());
-        assert_eq!(Array::scalar(-6.5f64).unwrap().erf().unwrap(), Array::scalar(-1.0f64).unwrap());
-
-        // The narrower variants round the double-precision evaluation to their own precision.
-        assert_eq!(Array::scalar(0.5f32).unwrap().erf().unwrap(), Array::scalar(ERF_HALF as f32).unwrap());
         assert_eq!(
-            Array::scalar(bf16::from_f32(0.5)).unwrap().erf().unwrap(),
-            Array::scalar(bf16::from_f64(ERF_HALF)).unwrap(),
+            ErfOperation::<ArrayType>::new().interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(0.0f64).unwrap()],
+            ),
+            Ok(vec![Array::scalar(0.0f64).unwrap()]),
         );
-        assert_eq!(
-            Array::scalar(f16::from_f32(0.5)).unwrap().erf().unwrap(),
-            Array::scalar(f16::from_f64(ERF_HALF)).unwrap()
-        );
-
-        assert_eq!(Array::scalar(0.5).unwrap().erf().unwrap(), Array::scalar(ERF_HALF).unwrap());
     }
 
     #[test]
@@ -207,6 +211,50 @@ mod tests {
             @rejected,
             operation = ErfOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_array_erf() {
+        // Exact fixed points and symmetry.
+        assert_eq!(Array::scalar(0.0f64).unwrap().erf().unwrap(), Array::scalar(0.0f64).unwrap());
+        assert_eq!(Array::scalar(f64::INFINITY).unwrap().erf().unwrap(), Array::scalar(1.0f64).unwrap());
+        assert_eq!(Array::scalar(f64::NEG_INFINITY).unwrap().erf().unwrap(), Array::scalar(-1.0f64).unwrap());
+        assert_eq!(Array::scalar(1.5f64).unwrap().erf().unwrap(), -Array::scalar(-1.5f64).unwrap().erf().unwrap());
+        assert!(Array::scalar(f64::NAN).unwrap().erf().unwrap().to_f64s()[0].is_nan());
+
+        // Known values covering every rational-approximation regime of the reference implementation: the small
+        // series (|x| < 2⁻²⁸), the primary interval (|x| < 0.84375), the [0.84375, 1.25) interval, both tail
+        // intervals of the complementary-function path, and the saturated |x| ≥ 6 regime.
+        assert_abs_diff_eq!(
+            Array::scalar(1e-12f64).unwrap().erf().unwrap(),
+            Array::scalar(FRAC_2_SQRT_PI * 1e-12).unwrap(),
+        );
+        assert_eq!(Array::scalar(0.5f64).unwrap().erf().unwrap(), Array::scalar(ERF_HALF).unwrap());
+        assert_eq!(Array::scalar(1.0f64).unwrap().erf().unwrap(), Array::scalar(ERF_ONE).unwrap());
+        assert_eq!(Array::scalar(2.0f64).unwrap().erf().unwrap(), Array::scalar(ERF_TWO).unwrap());
+        assert_eq!(Array::scalar(3.0f64).unwrap().erf().unwrap(), Array::scalar(ERF_THREE).unwrap());
+        assert_eq!(Array::scalar(4.0f64).unwrap().erf().unwrap(), Array::scalar(0.9999999845827421).unwrap());
+        assert_eq!(Array::scalar(6.5f64).unwrap().erf().unwrap(), Array::scalar(1.0f64).unwrap());
+        assert_eq!(Array::scalar(-6.5f64).unwrap().erf().unwrap(), Array::scalar(-1.0f64).unwrap());
+
+        // The narrower variants round the double-precision evaluation to their own precision.
+        assert_eq!(Array::scalar(0.5f32).unwrap().erf().unwrap(), Array::scalar(ERF_HALF as f32).unwrap());
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).unwrap().erf().unwrap(),
+            Array::scalar(bf16::from_f64(ERF_HALF)).unwrap(),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).unwrap().erf().unwrap(),
+            Array::scalar(f16::from_f64(ERF_HALF)).unwrap(),
+        );
+
+        assert_eq!(Array::scalar(0.5).unwrap().erf().unwrap(), Array::scalar(ERF_HALF).unwrap());
+
+        assert_abs_diff_eq!(
+            Array::vector(vec![-1.0f64, 0.0, 1.0]).unwrap().erf().unwrap(),
+            Array::vector(vec![-0.8427007929497149, 0.0, 0.8427007929497149]).unwrap(),
+            epsilon = 1e-12,
         );
     }
 }

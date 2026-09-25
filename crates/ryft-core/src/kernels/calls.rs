@@ -1065,7 +1065,6 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::RaggedDot(_)
                 | ArrayOperation::ScaledDot(_)
                 | ArrayOperation::Reduce(_)
-                | ArrayOperation::LogSumExp(_)
                 | ArrayOperation::CumulativeSum(_)
                 | ArrayOperation::CumulativeProduct(_)
                 | ArrayOperation::CumulativeMax(_)

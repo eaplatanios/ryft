@@ -2,6 +2,7 @@ use crate::arrays::{ArrayType, Broadcastable};
 use crate::macros::check_count;
 use crate::programs::{Operation, TypeError};
 
+pub mod arithmetic;
 pub mod assertions;
 pub mod attention;
 pub mod collectives;
@@ -15,17 +16,29 @@ pub mod debugging;
 pub mod differentiation;
 pub mod dimensions;
 pub mod dot;
+pub mod exponential;
+pub mod extrema;
 pub mod logical;
 pub mod manipulation;
-pub mod math;
 pub mod quantization;
 pub mod random;
+pub mod reductions;
 pub mod references;
+pub mod rounding;
 pub mod sharding;
 pub mod sort;
+pub mod special;
 pub mod tagging;
+pub mod trigonometric;
 
 // TODO(eaplatanios): We should be importing specific symbols here wherever possible / relevant.
+pub use arithmetic::{
+    ABS_OPERATION_NAME, ADD_OPERATION_NAME, Abs, AbsOperation, Add, AddOperation, DIV_OPERATION_NAME, Div,
+    DivOperation, MUL_OPERATION_NAME, Mul, MulOperation, NEG_OPERATION_NAME, Neg, NegOperation, POW_OPERATION_NAME,
+    Pow, PowOperation, REM_OPERATION_NAME, RSQRT_OPERATION_NAME, Rem, RemOperation, Rsqrt, RsqrtOperation,
+    SIGN_OPERATION_NAME, SQRT_OPERATION_NAME, SUB_OPERATION_NAME, Sign, SignOperation, Sqrt, SqrtOperation, Sub,
+    SubOperation,
+};
 pub use assertions::{
     ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionError, AssertionFailure, AssertionValue,
 };
@@ -58,10 +71,16 @@ pub use dot::{
     DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps, RAGGED_DOT_OPERATION_NAME, RaggedDot,
     RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
 };
+pub use exponential::{
+    EXP_OPERATION_NAME, Exp, ExpOperation, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOG1P_OPERATION_NAME,
+    LOGISTIC_OPERATION_NAME, Log, Log1p, Log1pOperation, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
+    LogisticOperation,
+};
+pub use extrema::{Clamp, MAX_OPERATION_NAME, MIN_OPERATION_NAME, Max, MaxOperation, Min, MinOperation};
 pub use logical::*;
 pub use manipulation::*;
-pub use math::*;
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
+pub use reductions::{LogSumExp, Reduce, ReduceOperation, ReductionKind};
 pub use references::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
     REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
@@ -70,8 +89,17 @@ pub use references::{
     ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
     ReferenceWriteOperation,
 };
+pub use rounding::{
+    CEIL_OPERATION_NAME, Ceil, CeilOperation, FLOOR_OPERATION_NAME, Floor, FloorOperation, ROUND_OPERATION_NAME, Round,
+    RoundOperation,
+};
 pub use sharding::*;
+pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};
 pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};
+pub use trigonometric::{
+    ATAN2_OPERATION_NAME, Atan2, Atan2Operation, COS_OPERATION_NAME, Cos, CosOperation, SIN_OPERATION_NAME, Sin,
+    SinOperation, TANH_OPERATION_NAME, Tanh, TanhOperation,
+};
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
 /// [`ElementwiseOperation`] captures the shared type inference behavior of elementwise array operations.
