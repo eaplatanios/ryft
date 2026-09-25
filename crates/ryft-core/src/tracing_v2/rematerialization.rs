@@ -100,13 +100,13 @@ pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
 /// around rematerialized tangent/pullback outputs so compiler common-subexpression elimination does not undo the
 /// requested memory/computation tradeoff.
 ///
-/// The leading [`non_differentiated_count`](Self::non_differentiated_count) operands parameterize the call without being
-/// differentiated: the primal and forward regions receive them in their own leading positions, the backward and
+/// The leading [`non_differentiated_count`](Self::non_differentiated_count) operands parameterize the call without
+/// being differentiated: the primal and forward regions receive them in their own leading positions, the backward and
 /// tangent regions receive them ahead of the forward tail, and they receive neither a tangent nor a cotangent. This is
-/// the same operand split [`LinearCallOperation`](crate::LinearCallOperation) draws with its residual count, and the
-/// direct analogue of JAX's `nondiff_argnums`. Batching is its canonical producer: a policy that threads batching
-/// state through a structurally batched region's boundary (e.g., a composite universe's first-class mapped extent)
-/// reintroduces that state as additional leading non-differentiated operands of the batched call.
+/// the same operand split [`LinearCallOperation`] draws with its residual count, and the direct analogue of JAX's
+/// `nondiff_argnums`. Batching is its canonical producer: a policy that threads batching state through a structurally
+/// batched region's boundary (e.g., a composite universe's first-class mapped extent) reintroduces that state as
+/// additional leading non-differentiated operands of the batched call.
 ///
 /// The forward region maps the operands to the primal outputs followed by the *forward tail*: the region inputs and
 /// then the saved residuals. The tangent region maps `(non_differentiated..., forward_tail..., tangents...)`, with one

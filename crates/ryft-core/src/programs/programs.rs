@@ -193,7 +193,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         self.entry_region_ref().input_ids()
     }
 
-    /// Returns the [`Type`](crate::Type)s of the inputs of this [`Program`], in order.
+    /// Returns the [`Type`]s of the inputs of this [`Program`], in order.
     #[inline]
     pub fn input_types(&self) -> Vec<V::Type> {
         self.entry_region_ref().input_types()
@@ -228,7 +228,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         self.entry_region_ref().output_ids()
     }
 
-    /// Returns the [`Type`](crate::Type)s of the outputs of this [`Program`], in order.
+    /// Returns the [`Type`]s of the outputs of this [`Program`], in order.
     #[inline]
     pub fn output_types(&self) -> Vec<V::Type> {
         self.entry_region_ref().output_types()

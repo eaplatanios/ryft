@@ -237,15 +237,16 @@ impl<V> RaggedAxis<V> {
 /// ragged axis. It names the value rather than the combining operator, so one masking hook serves every consumer
 /// whose operator has one of these identities.
 ///
-/// [`Lowest`](Self::Lowest) and [`Highest`](Self::Highest) are the operand data type's lowest and highest values
-/// under the ordering that Ryft's extrema use (i.e., negative and positive infinity for the floating-point formats that
-/// have infinities and the largest-magnitude finite values for the ones that do not, those same extremes in the real
+/// [`Lowest`](Self::Lowest) and [`Highest`](Self::Highest) are the operand data type's lowest and highest values under
+/// the ordering that Ryft's extrema use (i.e., negative and positive infinity for the floating-point formats that have
+/// infinities and the largest-magnitude finite values for the ones that do not, those same extremes in the real
 /// component, paired with a zero imaginary one, for the complex types, `MIN` and `MAX` for the integers, and `false`
 /// and `true` for Booleans). [`One`](Self::One) is the multiplicative identity converted into the operand data type,
 /// and the conversion is verified rather than assumed: an element type that cannot represent the constant exactly (such
-/// as the two-valued [`DataType::I1`], whose range is `{-1, 0}`) is rejected instead of masked with a different value.
-/// Those three identities also require an element type with a payload, so the payload-free [`DataType::Token`] and
-/// [`DataType::Zero`] element types are rejected.
+/// as the two-valued [`DataType::I1`](crate::DataType::I1), whose range is `{-1, 0}`) is rejected instead of masked
+/// with a different value. Those three identities also require an element type with a payload, so the payload-free
+/// [`DataType::Token`](crate::DataType::Token) and [`DataType::Zero`](crate::DataType::Zero) element types are
+/// rejected.
 ///
 /// [`Zero`](Self::Zero), the additive identity, never reaches that guard in practice. Instead, a masking implementation
 /// takes the operand's own [`ZeroLikeOperation`] for it, which needs no data type reasoning and imposes its own

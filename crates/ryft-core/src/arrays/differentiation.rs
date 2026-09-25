@@ -173,13 +173,13 @@ pub struct ExactShape(Vec<ExactShapeDimension>);
 impl ExactShape {
     /// Builds the canonical [`ExactShape`] plan for constructing a zero of [`Shape`] `shape` without any surrounding
     /// [`LinearResiduals`] list, and returns it together with the source axes a caller must read to populate those
-    /// residuals. This is the planning half of the disconnected-cotangent protocol shared by
-    /// [`ResidualZeroProvider`](crate::ResidualZeroProvider) and the dynamic-zero constructors: when a pullback input
-    /// receives no cotangent, its zero must still be materialized with the primal input's exact runtime extents.
-    /// Residual slots are assigned by first axis occurrence, and repeated uses of one dimension identity reuse the same
-    /// slot, preserving equality between axes without retaining duplicate scalar values. The returned list contains one
-    /// `(axis, variable)` entry per distinct dynamic identity, in slot order, telling the caller which source axis to
-    /// read (e.g., with [`DimensionSizeOperation`]) to obtain each residual value.
+    /// residuals. This is the planning half of the disconnected-cotangent protocol shared by [`ResidualZeroProvider`]
+    /// and the dynamic-zero constructors: when a pullback input receives no cotangent, its zero must still be
+    /// materialized with the primal input's exact runtime extents. Residual slots are assigned by first axis
+    /// occurrence, and repeated uses of one dimension identity reuse the same slot, preserving equality between axes
+    /// without retaining duplicate scalar values. The returned list contains one `(axis, variable)` entry per distinct
+    /// dynamic identity, in slot order, telling the caller which source axis to read (e.g., with
+    /// [`DimensionSizeOperation`]) to obtain each residual value.
     pub fn for_residual_zero(shape: &Shape) -> (Self, Vec<(usize, DimensionVariable)>) {
         // Residual slots are assigned by first axis occurrence. Repeated uses of one dimension identity reuse
         // that slot, preserving equality between axes without retaining duplicate scalar values.
@@ -291,14 +291,14 @@ pub enum ExactShapeDimension {
 /// rebuild an exact shape from the retained residuals.
 ///
 /// Dynamic dimension definitions are deduplicated by identity. Retaining a dimension-typed value whose
-/// [`DimensionType`](crate::DimensionType) carries no concrete extent reuses the slot of any previously retained
-/// residual with the same [`DimensionVariable`], because a variable that appears several times (across axes, or as both
-/// an axis and an explicit dimension operand) denotes one runtime extent. This keeps operand lists minimal and, more
-/// importantly, preserves the type-level equality between axes when shapes are reconstructed inside the attached
-/// regions. All other valid differential residuals (i.e., ordinary arrays and dimensions whose types already pin a
-/// concrete extent) are purely positional: every retention appends a new slot, and the values themselves are never
-/// inspected. References have no differential representation and are rejected by the fallible differentiation type
-/// boundary (i.e., via [`DifferentiableType`](crate::DifferentiableType)) before a valid linearization can retain them.
+/// [`DimensionType`] carries no concrete extent reuses the slot of any previously retained residual with the same
+/// [`DimensionVariable`], because a variable that appears several times (across axes, or as both an axis and an
+/// explicit dimension operand) denotes one runtime extent. This keeps operand lists minimal and, more importantly,
+/// preserves the type-level equality between axes when shapes are reconstructed inside the attached regions. All other
+/// valid differential residuals (i.e., ordinary arrays and dimensions whose types already pin a concrete extent) are
+/// purely positional: every retention appends a new slot, and the values themselves are never inspected. References
+/// have no differential representation and are rejected by the fallible differentiation type boundary (i.e., via
+/// [`DifferentiableType`](crate::DifferentiableType)) before a valid linearization can retain them.
 #[derive(Clone, Debug)]
 pub struct LinearResiduals<V: Value<Type = ArrayIrType>> {
     /// Retained residual [`Value`]s, in the trailing-operand order of the staged linear call. Indices returned by the
@@ -328,11 +328,11 @@ impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
 
     /// Retains `value` and returns the residual slot index that will address it inside the attached
     /// [`Region`](crate::Region)s. When `value` is a dynamic dimension definition (i.e., its type is
-    /// [`ArrayIrType::Dimension`] and that [`DimensionType`](crate::DimensionType) has no concrete extent), retention
-    /// deduplicates by identity: if a residual with the same [`DimensionVariable`] was already retained, its existing
-    /// slot index is returned and `value` is dropped, since both values denote the same runtime extent. Every other
-    /// valid differential value (i.e., ordinary arrays, and dimensions whose types pin a concrete extent and therefore
-    /// carry no identity worth sharing) is appended to a fresh slot unconditionally, even when it compares equal to an
+    /// [`ArrayIrType::Dimension`] and that [`DimensionType`] has no concrete extent), retention deduplicates by
+    /// identity: if a residual with the same [`DimensionVariable`] was already retained, its existing slot index is
+    /// returned and `value` is dropped, since both values denote the same runtime extent. Every other valid
+    /// differential value (i.e., ordinary arrays, and dimensions whose types pin a concrete extent and therefore carry
+    /// no identity worth sharing) is appended to a fresh slot unconditionally, even when it compares equal to an
     /// already-retained value. Unresolved references must never reach this method through a valid differentiation
     /// pipeline.
     pub fn retain(&mut self, value: V) -> usize {
@@ -371,7 +371,7 @@ impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
     ///   - `context`: [`Context`] that owns the primal trace being linearized, in which any required
     ///     [`DimensionSizeOperation`] reads are bound.
     ///   - `array`: [`ArrayType`]-typed value owned by `context` whose exact runtime shape must become available inside
-    ///     the attached regions. Passing a non-array value fails with a kind-mismatch [`TypeError`](crate::TypeError).
+    ///     the attached regions. Passing a non-array value fails with a kind-mismatch [`TypeError`].
     pub fn retain_shape<C: Context<Type = ArrayIrType, Value = V, Operation: From<DimensionSizeOperation>>>(
         &mut self,
         context: &C,
@@ -471,9 +471,8 @@ fn sum_mapped_array_cotangents<V: Typed<Type = ArrayType> + Reduce>(
 /// geometry the tangent type omits from the operand's primal. A mixed array rule that has to hand a concrete tangent to
 /// a staged operation cannot always materialize a structural zero from its type (an [`ArrayType`] with symbolic extents
 /// names its dynamic extents by [`DimensionVariable`] rather than pinning them, so the type-only nullary
-/// [`ZeroOperation`](crate::ZeroOperation) is unconstructible for it). The primal names every one of those extents,
-/// because the tangent type derivation preserves geometry exactly and rewrites only element representation, layout,
-/// and sharding.
+/// [`ZeroOperation`] is unconstructible for it). The primal names every one of those extents, because the tangent type
+/// derivation preserves geometry exactly and rewrites only element representation, layout, and sharding.
 ///
 /// The zero is therefore staged through the *mixed* parent family's residual protocol rather than the projected array
 /// view, and the result is projected back. That is deliberate: the mixed family owns the dynamic zero constructor that

@@ -13,10 +13,10 @@ pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 /// dimension divides the corresponding operand dimension with an integer ratio of at least two. Ratios are inferred
 /// independently for every side and contracting dimension.
 ///
-/// Semantically this operation expands each present scale to its operand shape, converts elements and scales to
-/// `bf16`, multiplies them, and applies [`DotOperation`] with [`Self::dimensions`] and
-/// [`Self::preferred_element_type`]. That definition is implemented once by [`scaled_dot_composition`] and is also
-/// the decomposition of the XLA `xla.scaled_dot` composite. Like the corresponding JAX primitive, scaled dot is not
+/// Semantically this operation expands each present scale to its operand shape, converts elements and scales to `bf16`,
+/// multiplies them, and applies [`DotOperation`](crate::DotOperation) with [`Self::dimensions`] and
+/// [`Self::preferred_element_type`]. That definition is implemented once by [`scaled_dot_composition`] and is also the
+/// decomposition of the XLA `xla.scaled_dot` composite. Like the corresponding JAX primitive, scaled dot is not
 /// differentiable. Batching inserts one leading batch pair and shifts the existing dimension numbers, without a rank
 /// ceiling.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
