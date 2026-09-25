@@ -846,8 +846,6 @@ impl_neg_for_primitive!(@signed isize);
 impl_neg_for_primitive!(@float f32);
 impl_neg_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &str = "abs";
 
@@ -855,12 +853,12 @@ define_elementwise_operation!(
     @unary
     /// [`Operation`] that computes the elementwise absolute value of a value (i.e., `x ↦ |x|` and the magnitude `|z|`
     /// for complex operands with a real result) while preserving all other type metadata. Inputs that still represent
-    /// partial sums over unreduced mesh axes are rejected because taking an absolute value does not preserve
-    /// partial-sum semantics. Matching the operand constraints of
-    /// [StableHLO's `abs`](https://openxla.org/stablehlo/spec#abs), signed-integer (including the sub-byte
-    /// [`DataType::I2`] and [`DataType::I4`] types, with the minimum value wrapping to itself), floating-point,
-    /// and complex inputs are supported, while unsigned-integer, Boolean, token, structural-zero, and single-bit
-    /// [`DataType::I1`] inputs (whose only negative value `-1` has no representable absolute value) are rejected.
+    /// partial sums over unreduced mesh axes are rejected because taking an absolute value does not preserve partial
+    /// sum semantics. Matching the operand constraints of StableHLO's [`abs`](https://openxla.org/stablehlo/spec#abs),
+    /// signed-integer (including the sub-byte [`DataType::I2`] and [`DataType::I4`] types, with the minimum value
+    /// wrapping to itself), floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token,
+    /// structural-zero, and single-bit [`DataType::I1`] inputs (whose only negative value `-1` has no representable
+    /// absolute value) are rejected.
     AbsOperation,
     ABS_OPERATION_NAME,
     Abs,
@@ -889,15 +887,15 @@ impl_differentiable_operation! {
     where
         T: Type,
         C::Type: DifferentiableType,
-        C::Value: Abs
-            + Compare<C::Value>
+        C::Value: ZeroLike
+            + OneLike
+            + Abs
             + Complex
             + Conjugate
             + Imaginary
             + Real
+            + Compare<C::Value>
             + Select
-            + ZeroLike
-            + OneLike
             + std::ops::Neg<Output = C::Value>
             + std::ops::Mul<Output = C::Value>
             + std::ops::Div<Output = C::Value>
@@ -907,8 +905,8 @@ impl_differentiable_operation! {
             // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a ℂ → ℝ map
             // with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return `dx`. At the
             // complex origin, replace the zero denominator with one so the zero numerator yields zero. These
-            // conventions keep the rule finite and stable under higher-order transforms. A structural zero tangent
-            // stays symbolic, retyped to the real output's tangent type.
+            // conventions keep the rule finite and stable under higher-order transforms. A structural zero
+            // tangent stays symbolic, retyped to the real output's tangent type.
             check_count!("input", inputs, 1, ProgramError);
             let input = &inputs[0];
             let primal = input.primal().abs()?;
@@ -934,6 +932,7 @@ impl_differentiable_operation! {
                         let one = denominator.one_like()?;
                         let denominator_is_zero = denominator.compare(&zero, ComparisonDirection::Equal)?;
                         let denominator = C::Value::select(&denominator_is_zero, &one, &denominator)?;
+
                         // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
                         // algebraically equivalent but can overflow even when the final directional derivative is
                         // finite.
@@ -959,18 +958,13 @@ impl_differentiable_operation! {
     transpose = @nonlinear,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 define_elementwise_capability!(
     @unary
-    /// Value capability for elementwise absolute values, returning real magnitudes for complex inputs.
-    ///
-    /// Eager values compute directly; contextual values bind [`AbsOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Value capability for elementwise absolute values, returning real magnitudes for complex inputs. Eager values
+    /// compute directly while contextual values bind [`AbsOperation`]. Failures are returned as [`ProgramError`]s.
     Abs,
-    /// Computes elementwise absolute values, returning real magnitudes for complex inputs. Unsupported input
-    /// types, such as Boolean arrays, return a [`ProgramError`].
+    /// Computes elementwise absolute values, returning real magnitudes for complex inputs.
+    /// Unsupported input types, such as Boolean arrays, return a [`ProgramError`].
     abs,
     AbsOperation,
 );
@@ -1013,6 +1007,7 @@ macro_rules! impl_abs_for_primitive {
     // wrapping like the XLA-mirroring reference backends do on devices.
     (@signed $type:ty) => {
         impl Abs for $type {
+            #[inline]
             fn abs(&self) -> Result<Self, ProgramError> {
                 self.checked_abs().ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!("`{}` output does not fit in `{}`", ABS_OPERATION_NAME, stringify!($type)),
@@ -1024,6 +1019,7 @@ macro_rules! impl_abs_for_primitive {
     // Unsigned integer primitives are their own absolute values.
     (@unsigned $type:ty) => {
         impl Abs for $type {
+            #[inline]
             fn abs(&self) -> Result<Self, ProgramError> {
                 Ok(*self)
             }
@@ -1033,6 +1029,7 @@ macro_rules! impl_abs_for_primitive {
     // Floating-point primitives use ordinary IEEE 754 absolute values, which cannot fail.
     (@float $type:ty) => {
         impl Abs for $type {
+            #[inline]
             fn abs(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::abs(*self))
             }
@@ -1055,22 +1052,22 @@ impl_abs_for_primitive!(@unsigned usize);
 impl_abs_for_primitive!(@float f32);
 impl_abs_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`SignOperation`].
 pub const SIGN_OPERATION_NAME: &str = "sign";
 
 define_elementwise_operation!(
     @unary
     /// [`Operation`] that computes the elementwise sign of one value while preserving its array metadata. Matching
-    /// the operand constraints of [StableHLO's `sign`](https://openxla.org/stablehlo/spec#sign), signed-integer,
-    /// floating-point, and complex operands are supported, while unsigned-integer, Boolean, token, and
-    /// structural-zero operands are rejected (unsigned magnitudes carry no sign to extract). Signed integers map to
-    /// `-1`, `0`, or `1`; floating-point values map to `-1.0` or `1.0` away from zero while signed zeros and NaNs
-    /// pass through unchanged; and complex values map to `z / |z|`, with `0` mapping to `0`. Operands that still
-    /// carry partial sums are rejected because the sign of a partial sum is not the sign of the total.
-    SignOperation, SIGN_OPERATION_NAME,
-    Sign, sign,
+    /// the operand constraints of StableHLO's [`sign`](https://openxla.org/stablehlo/spec#sign), signed-integer,
+    /// floating-point, and complex operands are supported, while unsigned-integer, Boolean, token, and structural-zero
+    /// operands are rejected (unsigned magnitudes carry no sign to extract). Signed integers map to `-1`, `0`, or `1`,
+    /// floating-point values map to `-1.0` or `1.0` away from zero while signed zeros and NaNs pass through unchanged,
+    /// and complex values map to `z / |z|`, with `0` mapping to `0`. Operands that still carry partial sums are
+    /// rejected because the sign of a partial sum is not the sign of the total.
+    SignOperation,
+    SIGN_OPERATION_NAME,
+    Sign,
+    sign,
     infer_data_types = |input_types: &[DataType]| {
         let input_type = input_types[0];
         if input_type.is_signed() || input_type.is_floating_point() || input_type.is_complex() {
@@ -1086,11 +1083,8 @@ impl_differentiable_elementwise_operation!(@constant SignOperation);
 
 define_elementwise_capability!(
     @unary
-    /// Value capability for elementwise signs, preserving floating-point signed zeros and NaNs.
-    ///
-    /// Eager values compute directly; contextual values bind [`SignOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Value capability for elementwise signs, preserving floating-point signed zeros and NaNs. Eager values compute
+    /// directly while contextual values bind [`SignOperation`]. Failures are returned as [`ProgramError`]s.
     Sign,
     /// Computes [`SignOperation`] elementwise for this value.
     sign,
@@ -1108,10 +1102,9 @@ impl Sign for Array {
         }
         let data_type = self.r#type().data_type();
         if !data_type.is_signed() && !data_type.is_floating_point() && !data_type.is_complex() {
-            return Err(TypeError::invalid(
-                format!("cannot compute the sign of a value of data type `{}`", data_type,),
-            )
-            .into());
+            return Err(
+                TypeError::invalid(format!("cannot compute the sign of a value of data type `{data_type}`")).into()
+            );
         }
         if data_type.is_signed() {
             dispatch_on_array_element_type!(@signed data_type, |Element| {
@@ -1140,16 +1133,18 @@ macro_rules! impl_sign_for_primitive {
     // Signed integer primitives use the ordinary integer signum, which cannot fail.
     (@signed $type:ty) => {
         impl Sign for $type {
+            #[inline]
             fn sign(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::signum(*self))
             }
         }
     };
 
-    // Floating-point primitives mirror the reference backends. Signed zeros and NaNs are preserved, and every other
-    // value maps to `1.0` or `-1.0`.
+    // Floating-point primitives mirror the reference backends. Signed zeros and NaNs are preserved,
+    // and every other value maps to `1.0` or `-1.0`.
     (@float $type:ty) => {
         impl Sign for $type {
+            #[inline]
             fn sign(&self) -> Result<Self, ProgramError> {
                 Ok(if self.is_nan() || *self == 0.0 { *self } else { <$type>::signum(*self) })
             }
@@ -1166,21 +1161,21 @@ impl_sign_for_primitive!(@signed isize);
 impl_sign_for_primitive!(@float f32);
 impl_sign_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`PowOperation`].
 pub const POW_OPERATION_NAME: &str = "pow";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that raises one value to the power of another elementwise (i.e., `(x, y) ↦ x^y`, with the
-    /// complex power defined as the principal value `exp(y · log(x))`), promoting their element types and
-    /// broadcasting their shapes. Matching the operand constraints of
-    /// [StableHLO's `power`](https://openxla.org/stablehlo/spec#power) for those types, only floating-point and
+    /// [`Operation`] that raises one value to the power of another elementwise (i.e., `(x, y) ↦ x^y`,
+    /// with the complex power defined as the principal value `exp(y · log(x))`), promoting their element
+    /// types and broadcasting their shapes. Matching the operand constraints of StableHLO's
+    /// [`power`](https://openxla.org/stablehlo/spec#power) for those types, only floating-point and
     /// complex operands are supported (Ryft restricts the integer forms to keep the operation differentiable).
     /// Array operands that still carry partial sums are rejected, and their reduced-axis markers must agree.
-    PowOperation, POW_OPERATION_NAME,
-    Pow, pow,
+    PowOperation,
+    POW_OPERATION_NAME,
+    Pow,
+    pow,
     check_data_types = [@float],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
@@ -1190,17 +1185,17 @@ impl_differentiable_elementwise_operation! {
     PowOperation,
     jvp<C>
     where
-        C::Value: Pow
+        C::Value: ZeroLike
+            + OneLike
+            + Pow
             + Log
             + Compare<C::Value>
             + Select
-            + OneLike
-            + ZeroLike
-            + std::ops::Mul<Output = C::Value>
-            + std::ops::Sub<Output = C::Value>,
+            + std::ops::Sub<Output = C::Value>
+            + std::ops::Mul<Output = C::Value>,
     {
-        // d(x^y) = y · x^{y-1} · dx + x^y · log(x) · dy, with log(x) evaluated at a base of one when x = 0 so
-        // that the exponent contribution vanishes instead of producing log(0) = -∞.
+        // d(x^y) = y · x^{y-1} · dx + x^y · log(x) · dy, with log(x) evaluated at a base of one when x = 0
+        // so that the exponent contribution vanishes instead of producing log(0) = -∞.
         |(left, left_tangent), (right, _)| {
             let exponent = right.clone() - right.one_like()?;
             right * left.pow(&exponent)? * left_tangent
@@ -1216,14 +1211,11 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @binary
-    /// Value capability for elementwise powers on floating-point and complex inputs.
-    ///
-    /// Eager values compute directly; contextual values bind [`PowOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Value capability for elementwise powers on floating-point and complex inputs. Eager values compute directly
+    /// while contextual values bind [`PowOperation`]. Failures are returned as [`ProgramError`]s.
     Pow,
-    /// Raises this value to the power `exponent` elementwise, promoting both operands to a common floating-point or
-    /// complex element type.
+    /// Raises this value to the power `exponent` elementwise, promoting both operands to a common floating-point
+    /// or complex element type.
     pow(exponent),
     PowOperation,
 );
@@ -1244,6 +1236,7 @@ macro_rules! impl_pow_for_primitive {
     // Implements the capability using the corresponding floating-point primitive function.
     ($type:ty) => {
         impl Pow for $type {
+            #[inline]
             fn pow(&self, exponent: &Self) -> Result<Self, ProgramError> {
                 Ok(<$type>::powf(*self, *exponent))
             }
@@ -1254,18 +1247,18 @@ macro_rules! impl_pow_for_primitive {
 impl_pow_for_primitive!(f32);
 impl_pow_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`SqrtOperation`].
 pub const SQRT_OPERATION_NAME: &str = "sqrt";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise square root of one value (i.e., `x ↦ √x`, the
-    /// principal branch `√z` on complex operands) while preserving its array metadata. Only floating-point and
-    /// complex operands are supported, and operands that still carry partial sums are rejected.
-    SqrtOperation, SQRT_OPERATION_NAME,
-    Sqrt, sqrt,
+    /// [`Operation`] that computes the elementwise square root of one value (i.e., `x ↦ √x`, the principal branch
+    /// `√z` on complex operands) while preserving its array metadata. Only floating-point and complex operands are
+    /// supported, and operands that still carry partial sums are rejected.
+    SqrtOperation,
+    SQRT_OPERATION_NAME,
+    Sqrt,
+    sqrt,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -1281,11 +1274,8 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @unary
-    /// Value capability for elementwise principal square roots on floating-point and complex inputs.
-    ///
-    /// Eager values compute directly; contextual values bind [`SqrtOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Value capability for elementwise principal square roots on floating-point and complex inputs. Eager values
+    /// compute directly while contextual values bind [`SqrtOperation`]. Failures are returned as [`ProgramError`]s.
     Sqrt,
     /// Computes [`SqrtOperation`] elementwise for this value.
     sqrt,
@@ -1307,6 +1297,7 @@ macro_rules! impl_sqrt_for_primitive {
     // Implements the capability using the corresponding floating-point primitive function.
     ($type:ty) => {
         impl Sqrt for $type {
+            #[inline]
             fn sqrt(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::sqrt(*self))
             }
@@ -1317,8 +1308,6 @@ macro_rules! impl_sqrt_for_primitive {
 impl_sqrt_for_primitive!(f32);
 impl_sqrt_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`RsqrtOperation`].
 pub const RSQRT_OPERATION_NAME: &str = "rsqrt";
 
@@ -1327,8 +1316,10 @@ define_elementwise_operation!(
     /// [`Operation`] that computes the elementwise reciprocal square root of one value (i.e., `x ↦ 1/√x`, the
     /// principal branch `1/√z` on complex operands) while preserving its array metadata. Only floating-point and
     /// complex operands are supported, and operands that still carry partial sums are rejected.
-    RsqrtOperation, RSQRT_OPERATION_NAME,
-    Rsqrt, rsqrt,
+    RsqrtOperation,
+    RSQRT_OPERATION_NAME,
+    Rsqrt,
+    rsqrt,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -1338,13 +1329,13 @@ impl_differentiable_elementwise_operation! {
     RsqrtOperation,
     jvp<C>
     where
-        C::Value: std::ops::Add<Output = C::Value>
-            + std::ops::Div<Output = C::Value>
+        C::Value: std::ops::Neg<Output = C::Value>
+            + std::ops::Add<Output = C::Value>
             + std::ops::Mul<Output = C::Value>
-            + std::ops::Neg<Output = C::Value>,
+            + std::ops::Div<Output = C::Value>,
     {
-        // d(rsqrt(x)) = -x^{-3/2} / 2 · dx = -(rsqrt(x) / (x + x)) · dx, reusing the primal output evaluated at
-        // the tangent type.
+        // d(rsqrt(x)) = -x^{-3/2} / 2 · dx = -(rsqrt(x) / (x + x)) · dx, reusing the primal output evaluated
+        // at the tangent type.
         |(input, input_tangent) -> output| -(output / (input.clone() + input)) * input_tangent
     },
     transpose = @nonlinear,
@@ -1353,10 +1344,8 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @unary
     /// Value capability for elementwise reciprocal principal square roots on floating-point and complex inputs.
-    ///
-    /// Eager values compute directly; contextual values bind [`RsqrtOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Eager values compute directly while contextual values bind [`RsqrtOperation`]. Failures are returned as
+    /// [`ProgramError`]s.
     Rsqrt,
     /// Computes [`RsqrtOperation`] elementwise for this value.
     rsqrt,
@@ -1378,6 +1367,7 @@ macro_rules! impl_rsqrt_for_primitive {
     // Implements the capability using the corresponding floating-point primitive function.
     ($type:ty) => {
         impl Rsqrt for $type {
+            #[inline]
             fn rsqrt(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::sqrt(*self).recip())
             }
@@ -1607,12 +1597,14 @@ mod tests {
     fn test_array_add() {
         let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(vector.add(&Array::scalar(1.0).unwrap()).unwrap(), Array::vector(vec![2.0, 3.0, 4.0]).unwrap());
+
         // Mixed-precision operands promote to the common element data type.
         let promoted =
             Array::vector(vec![1.0f32, 2.0]).unwrap().add(&Array::vector(vec![0.5f64, 0.5]).unwrap()).unwrap();
         assert_eq!(promoted, Array::vector(vec![1.5f64, 2.5]).unwrap());
-        // General broadcasting traverses arbitrary input layouts while mixed element types normalize through the
-        // canonical conversion kernel.
+
+        // General broadcasting traverses arbitrary input layouts while mixed element types normalize
+        // through the canonical conversion kernel.
         let left_type =
             ArrayType::new_static(DataType::F32, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
         let left = Array::from_elements(left_type, &[1.0f32, 2.0]).unwrap();
@@ -1622,8 +1614,10 @@ mod tests {
         let sum = left.add(&right).unwrap();
         assert_eq!(sum.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3]));
         assert_eq!(sum.elements::<f64>(), Ok(vec![1.5, 2.0, 2.5, 2.5, 3.0, 3.5]));
+
         // The `std::ops` sugar delegates to the fallible capability.
         assert_eq!(vector.clone() + Array::scalar(1.0).unwrap(), Array::vector(vec![2.0, 3.0, 4.0]).unwrap());
+
         // Integer arithmetic wraps deterministically, matching the scalar reference backend.
         let wrapped = Array::vector(vec![255u8]).unwrap().add(&Array::vector(vec![1u8]).unwrap()).unwrap();
         assert_eq!(wrapped.elements::<u8>(), Ok(vec![0]));
@@ -2551,6 +2545,7 @@ mod tests {
             Array::vector(vec![left_values[0] / right_values[0], left_values[1] / right_values[1]]).unwrap(),
             epsilon = 1e-12,
         );
+
         // Ratio-based division can still overflow when both denominator components are near the largest value.
         let large = Array::scalar(ComplexNumber::new(1e308f64, 1e308)).unwrap();
         let quotient = Div::div(&large, &large).unwrap().elements::<ComplexNumber<f64>>().unwrap()[0];
@@ -2684,28 +2679,29 @@ mod tests {
     fn test_array_rem() {
         assert_eq!(
             Array::scalar(7i32).unwrap().rem(&Array::scalar(3i32).unwrap()).unwrap(),
-            Array::scalar(1i32).unwrap()
+            Array::scalar(1i32).unwrap(),
         );
+
         // The result takes the sign of the dividend.
         assert_eq!(
             Array::scalar(-7i32).unwrap().rem(&Array::scalar(3i32).unwrap()).unwrap(),
-            Array::scalar(-1i32).unwrap()
+            Array::scalar(-1i32).unwrap(),
         );
         assert_eq!(
             Array::scalar(7i64).unwrap().rem(&Array::scalar(-3i64).unwrap()).unwrap(),
-            Array::scalar(1i64).unwrap()
+            Array::scalar(1i64).unwrap(),
         );
         assert_eq!(
             Array::scalar(7u32).unwrap().rem(&Array::scalar(3u32).unwrap()).unwrap(),
-            Array::scalar(1u32).unwrap()
+            Array::scalar(1u32).unwrap(),
         );
         assert_eq!(
             Array::scalar(7.5f64).unwrap().rem(&Array::scalar(2.0f64).unwrap()).unwrap(),
-            Array::scalar(1.5f64).unwrap()
+            Array::scalar(1.5f64).unwrap(),
         );
         assert_eq!(
             Array::scalar(-7.5f32).unwrap().rem(&Array::scalar(2.0f32).unwrap()).unwrap(),
-            Array::scalar(-1.5f32).unwrap()
+            Array::scalar(-1.5f32).unwrap(),
         );
         assert_eq!(
             Array::scalar(bf16::from_f32(7.5))
@@ -2718,6 +2714,7 @@ mod tests {
             Array::scalar(f16::from_f32(7.5)).unwrap().rem(&Array::scalar(f16::from_f32(2.0)).unwrap()).unwrap(),
             Array::scalar(f16::from_f32(7.5f32 % 2.0f32)).unwrap(),
         );
+
         // Division by an integer zero reports an error instead of panicking.
         assert_eq!(
             Array::scalar(7i32).unwrap().rem(&Array::scalar(0i32).unwrap()),
@@ -2755,8 +2752,7 @@ mod tests {
         assert!(matches!(
             Array::vector(vec![1u8]).unwrap().rem(&Array::vector(vec![0u8]).unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message
-                    == "cannot compute the remainder of an integer scalar of data type `u8` with a zero divisor",
+                if message == "cannot compute the remainder of an integer scalar of data type `u8` with a zero divisor",
         ));
     }
 
@@ -2833,11 +2829,11 @@ mod tests {
         let operation = NegOperation::<ArrayType>::new();
 
         assert_eq!(
-            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(2.0).unwrap()],),
+            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(2.0).unwrap()]),
             Ok(vec![Array::scalar(-2.0).unwrap()]),
         );
         assert_eq!(
-            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(1u8).unwrap()],),
+            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(1u8).unwrap()]),
             Ok(vec![Array::scalar(u8::MAX).unwrap()]),
         );
         assert_eq!(
@@ -2914,6 +2910,7 @@ mod tests {
     fn test_array_neg() {
         let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(vector.neg().unwrap(), Array::vector(vec![-1.0, -2.0, -3.0]).unwrap());
+
         // The `std::ops` sugar delegates to the fallible capability.
         assert_eq!(-vector.clone(), Array::vector(vec![-1.0, -2.0, -3.0]).unwrap());
     }
@@ -3012,7 +3009,7 @@ mod tests {
         let operation = AbsOperation::new();
 
         assert_eq!(
-            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(-2.0).unwrap()],),
+            operation.interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(-2.0).unwrap()]),
             Ok(vec![Array::scalar(2.0).unwrap()]),
         );
         assert_eq!(
@@ -3166,6 +3163,7 @@ mod tests {
     #[test]
     fn test_array_abs() {
         assert_eq!(Array::vector(vec![-1.5, 2.5]).unwrap().abs().unwrap(), Array::vector(vec![1.5, 2.5]).unwrap());
+
         // The absolute value of a complex array is its elementwise magnitude with a real element data type.
         let complex = Array::vector(vec![3.0]).unwrap().complex(&Array::vector(vec![4.0]).unwrap()).unwrap();
         let magnitude = complex.abs().unwrap();
@@ -3192,6 +3190,7 @@ mod tests {
     fn test_array_abs_complex() {
         let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
         let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+
         // The absolute value is the elementwise magnitude with a real element data type.
         let magnitude = left.abs().unwrap();
         assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2]));
@@ -3327,10 +3326,12 @@ mod tests {
             Array::scalar(f16::from_f32(4.0)).unwrap().sign().unwrap(),
             Array::scalar(f16::from_f32(1.0)).unwrap(),
         );
+
         // Signed zeros and NaNs pass through unchanged.
         assert_eq!(Array::scalar(0.0f64).unwrap().sign().unwrap(), Array::scalar(0.0f64).unwrap());
         assert!(Array::scalar(-0.0f64).unwrap().sign().unwrap().to_f64s()[0].is_sign_negative());
         assert!(Array::scalar(f64::NAN).unwrap().sign().unwrap().to_f64s()[0].is_nan());
+
         // Complex signs normalize to `z / |z|` and map the origin to itself.
         let input = ComplexNumber::new(3.0f64, -4.0f64);
         assert_abs_diff_eq!(
@@ -3404,6 +3405,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             @reject @unreduced,
             operation = PowOperation::<ArrayType>::new(),
@@ -3469,7 +3471,7 @@ mod tests {
     fn test_pow_differentiation_at_zero_base() {
         // A zero base exercises the guarded log factor: the exponent contribution is exactly zero instead of
         // `log(0) = -∞` turning the tangent into a NaN. The finite-difference oracle cannot check this boundary
-        // point (perturbing the base below zero is undefined), so the guard is asserted on the staged jvp program
+        // point (perturbing the base below zero is undefined), so the guard is asserted on the staged JVP program
         // directly.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let base = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -3538,6 +3540,7 @@ mod tests {
             Array::scalar(f16::from_f32(2.0)).unwrap().pow(&Array::scalar(f16::from_f32(3.0)).unwrap()).unwrap(),
             Array::scalar(f16::from_f32(2.0f32.powf(3.0))).unwrap(),
         );
+
         // The complex power is the principal value `exp(y · log(x))`.
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         let exponent = ComplexNumber::new(2.0f64, 0.0f64);
@@ -3554,7 +3557,7 @@ mod tests {
         // Both inputs promote before broadcasting their independent axes.
         let bases = Array::matrix(2, 1, vec![2.0f32, 3.0]).unwrap();
         let exponents = Array::matrix(1, 3, vec![1.0f64, 2.0, 3.0]).unwrap();
-        assert_eq!(bases.pow(&exponents), Array::matrix(2, 3, vec![2.0f64, 4.0, 8.0, 3.0, 9.0, 27.0]),);
+        assert_eq!(bases.pow(&exponents), Array::matrix(2, 3, vec![2.0f64, 4.0, 8.0, 3.0, 9.0, 27.0]));
         assert_eq!(
             Array::scalar(2.0f64).unwrap().pow(&Array::scalar(3i32).unwrap()),
             Err(TypeError::invalid("`pow` does not support input data type `i32`").into()),
@@ -3665,6 +3668,7 @@ mod tests {
         let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.sqrt()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
         assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 / (2.0 * 2.0f64.sqrt()), epsilon = 1e-6);
 
@@ -3720,6 +3724,7 @@ mod tests {
             Array::scalar(input.sqrt()).unwrap(),
             epsilon = 1e-12
         );
+
         // The principal branch maps the negative real axis to the positive imaginary axis.
         assert_abs_diff_eq!(
             Array::scalar(ComplexNumber::new(-4.0f64, 0.0)).unwrap().sqrt().unwrap(),
@@ -3727,12 +3732,13 @@ mod tests {
             epsilon = 1e-12,
         );
 
-        assert_eq!(Array::scalar(4.0).unwrap().sqrt().unwrap(), Array::scalar(2.0).unwrap(),);
+        assert_eq!(Array::scalar(4.0).unwrap().sqrt().unwrap(), Array::scalar(2.0).unwrap());
     }
 
     #[test]
     fn test_array_sqrt_typed_storage() {
-        assert_eq!(Array::vector(vec![1.0f64, 4.0]).unwrap().sqrt(), Array::vector(vec![1.0f64, 2.0]),);
+        assert_eq!(Array::vector(vec![1.0f64, 4.0]).unwrap().sqrt(), Array::vector(vec![1.0f64, 2.0]));
+
         // Complex square roots use the principal branch for each typed element.
         let values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
         let input = Array::vector(values.to_vec()).unwrap();
@@ -3823,6 +3829,7 @@ mod tests {
     #[test]
     fn test_rsqrt_differentiation_complex() {
         let input = ComplexNumber::new(0.7f64, -0.3f64);
+
         // d(1/√z)/dz = -z^{-3/2} / 2 on the principal branch.
         let expected = input.powc(ComplexNumber::new(-1.5, 0.0)) * ComplexNumber::new(-0.5, 0.0);
         assert_abs_diff_eq!(
@@ -3863,13 +3870,12 @@ mod tests {
             Array::scalar(expected).unwrap(),
             epsilon = 1e-12
         );
-
-        assert_eq!(Array::scalar(4.0).unwrap().rsqrt().unwrap(), Array::scalar(0.5).unwrap(),);
+        assert_eq!(Array::scalar(4.0).unwrap().rsqrt().unwrap(), Array::scalar(0.5).unwrap());
     }
 
     #[test]
     fn test_array_rsqrt_typed_storage() {
-        assert_eq!(Array::vector(vec![1.0f64, 4.0]).unwrap().rsqrt(), Array::vector(vec![1.0f64, 0.5]),);
+        assert_eq!(Array::vector(vec![1.0f64, 4.0]).unwrap().rsqrt(), Array::vector(vec![1.0f64, 0.5]));
     }
 
     #[test]
