@@ -17898,6 +17898,57 @@ mod tests {
         assert_eq!(stablehlo.matches("stablehlo.complex").count(), 4, "{stablehlo}");
     }
 
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_result_accuracies() {
+        // The default accuracy keeps the default StableHLO result accuracy, while other accuracies request theirs.
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Sin(SinOperation::new()), DataType::F32, vec![2]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.sine %arg0 : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#}
+        );
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::Tanh(ryft_core::TanhOperation::new().with_accuracy(ryft_core::Accuracy::Highest)),
+                DataType::F32,
+                vec![2],
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.tanh %arg0 {result_accuracy = #stablehlo.result_accuracy<mode = #stablehlo.result_accuracy_mode<HIGHEST>>} : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#}
+        );
+        let tolerance = ryft_core::Tolerance::new(1e-6, 0.0, 2).unwrap();
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::Exp(
+                    ryft_core::ExpOperation::new().with_accuracy(ryft_core::Accuracy::Tolerance(tolerance))
+                ),
+                DataType::F32,
+                vec![2],
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.exponential %arg0 {result_accuracy = #stablehlo.result_accuracy<atol = 9.9999999999999995E-7, ulps = 2, mode = #stablehlo.result_accuracy_mode<TOLERANCE>>} : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
     /// Builds a one-instruction program reducing an input of the given data type and dimensions, and returns the
     /// result of lowering it to a rendered StableHLO module.
     fn lowered_reduce_module(

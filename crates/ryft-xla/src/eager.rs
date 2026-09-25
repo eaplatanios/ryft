@@ -746,6 +746,41 @@ mod tests {
     }
 
     #[test]
+    fn test_eager_result_accuracies() {
+        // Requested accuracies reach the XLA compiler, which selects its implementations while preserving the results.
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let values = [0.5f32, -1.0, 2.0];
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F32, &[values.len()]),
+            mesh.clone(),
+            values_to_bytes(&values),
+        )
+        .unwrap();
+        let reference = CpuArray::vector(values.to_vec()).unwrap();
+        let tolerance = ryft_core::Accuracy::Tolerance(ryft_core::Tolerance::new(1e-6, 0.0, 0).unwrap());
+        for accuracy in [ryft_core::Accuracy::Highest, tolerance] {
+            let output = values_from_bytes::<f32>(
+                &shard_host_bytes(input.sin_with_accuracy(accuracy).unwrap().addressable_shards().next().unwrap())
+                    .unwrap(),
+            );
+            let expected = reference.sin().unwrap().elements::<f32>().unwrap();
+            for (output, expected) in output.iter().zip(expected) {
+                assert!((output - expected).abs() <= 1e-6, "{output} vs {expected}");
+            }
+            let output = values_from_bytes::<f32>(
+                &shard_host_bytes(input.tanh_with_accuracy(accuracy).unwrap().addressable_shards().next().unwrap())
+                    .unwrap(),
+            );
+            let expected = reference.tanh().unwrap().elements::<f32>().unwrap();
+            for (output, expected) in output.iter().zip(expected) {
+                assert!((output - expected).abs() <= 1e-6, "{output} vs {expected}");
+            }
+        }
+    }
+
+    #[test]
     fn test_eager_tanh_complex_large_real() {
         let client = execution_client();
         let mesh = cpu_mesh(&client);

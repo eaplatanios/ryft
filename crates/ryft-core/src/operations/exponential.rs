@@ -517,6 +517,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_exp() {
+        // The default accuracy renders as the bare operation name, and every other accuracy as a bracketed field.
+        let operation = ExpOperation::<ArrayType>::new();
+        assert_eq!(operation.accuracy(), Accuracy::Default);
+        assert_eq!(operation.to_string(), "exp");
+        assert_eq!(operation.with_accuracy(Accuracy::Highest).to_string(), "exp [accuracy=highest]");
+    }
+
+    #[test]
     fn test_exp_type_inference() {
         check_operation_type_inference!(
             @elementwise @unary,
@@ -708,6 +717,15 @@ mod tests {
     fn test_exp_primitives() {
         assert_eq!(Exp::exp(&0.0f32), Ok(1.0));
         assert_eq!(Exp::exp(&0.0f64), Ok(1.0));
+    }
+
+    #[test]
+    fn test_log() {
+        // The default accuracy renders as the bare operation name, and every other accuracy as a bracketed field.
+        let operation = LogOperation::<ArrayType>::new();
+        assert_eq!(operation.accuracy(), Accuracy::Default);
+        assert_eq!(operation.to_string(), "log");
+        assert_eq!(operation.with_accuracy(Accuracy::Highest).to_string(), "log [accuracy=highest]");
     }
 
     #[test]
@@ -904,6 +922,15 @@ mod tests {
     fn test_log_primitives() {
         assert_eq!(Log::log(&1.0f32), Ok(0.0));
         assert_eq!(Log::log(&1.0f64), Ok(0.0));
+    }
+
+    #[test]
+    fn test_ln_1p() {
+        // The default accuracy renders as the bare operation name, and every other accuracy as a bracketed field.
+        let operation = Ln1pOperation::<ArrayType>::new();
+        assert_eq!(operation.accuracy(), Accuracy::Default);
+        assert_eq!(operation.to_string(), "ln_1p");
+        assert_eq!(operation.with_accuracy(Accuracy::Highest).to_string(), "ln_1p [accuracy=highest]");
     }
 
     #[test]
@@ -1438,6 +1465,15 @@ mod tests {
     fn test_log_add_exp_primitives() {
         assert_eq!(LogAddExp::log_add_exp(&0.0f64, &0.0), Ok(std::f64::consts::LN_2));
         assert_eq!(LogAddExp::log_add_exp(&0.0f32, &0.0), Ok(std::f32::consts::LN_2));
+    }
+
+    #[test]
+    fn test_logistic() {
+        // The default accuracy renders as the bare operation name, and every other accuracy as a bracketed field.
+        let operation = LogisticOperation::<ArrayType>::new();
+        assert_eq!(operation.accuracy(), Accuracy::Default);
+        assert_eq!(operation.to_string(), "logistic");
+        assert_eq!(operation.with_accuracy(Accuracy::Highest).to_string(), "logistic [accuracy=highest]");
     }
 
     #[test]

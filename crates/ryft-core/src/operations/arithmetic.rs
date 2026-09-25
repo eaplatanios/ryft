@@ -3715,6 +3715,15 @@ mod tests {
     }
 
     #[test]
+    fn test_sqrt() {
+        // The default accuracy renders as the bare operation name, and every other accuracy as a bracketed field.
+        let operation = SqrtOperation::<ArrayType>::new();
+        assert_eq!(operation.accuracy(), Accuracy::Default);
+        assert_eq!(operation.to_string(), "sqrt");
+        assert_eq!(operation.with_accuracy(Accuracy::Highest).to_string(), "sqrt [accuracy=highest]");
+    }
+
+    #[test]
     fn test_sqrt_type_inference() {
         check_operation_type_inference!(
             @elementwise @unary,
@@ -3908,6 +3917,15 @@ mod tests {
     #[test]
     fn test_sqrt_primitives() {
         assert_eq!(Sqrt::sqrt(&4.0f64), Ok(2.0));
+    }
+
+    #[test]
+    fn test_rsqrt() {
+        // The default accuracy renders as the bare operation name, and every other accuracy as a bracketed field.
+        let operation = RsqrtOperation::<ArrayType>::new();
+        assert_eq!(operation.accuracy(), Accuracy::Default);
+        assert_eq!(operation.to_string(), "rsqrt");
+        assert_eq!(operation.with_accuracy(Accuracy::Highest).to_string(), "rsqrt [accuracy=highest]");
     }
 
     #[test]

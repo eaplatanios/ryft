@@ -1372,8 +1372,8 @@ mod tests {
     #[test]
     fn test_tanh_differentiation_near_zero() {
         // The second derivative `-2 · tanh(x) · (1 - tanh(x)²)` is about `-2e-20` at `x = 1e-20`. The direct
-        // `1 - output²` form retains it, whereas a factored `(1 + output) · (1 - output)` loses it by subtracting nearly
-        // equal terms.
+        // `1 - output²` form retains it, whereas a factored `(1 + output) · (1 - output)` loses it by subtracting
+        // nearly equal terms.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TanhOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
