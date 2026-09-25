@@ -1,7 +1,7 @@
 //! Operations that compute special mathematical functions elementwise. Each operation is defined by an
-//! [`Operation`](crate::Operation) type (e.g., [`ErfOperation`]) together with a value capability trait (e.g., [`Erf`])
-//! whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code executes
-//! immediately or records into a program depending on the value it runs on:
+//! [`Operation`](crate::Operation) type (e.g., [`ErfOperation`]) together with a value capability trait (e.g.,
+//! [`Erf`]) whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code
+//! executes immediately or records into a program depending on the value it runs on:
 //!
 //!   - [`Erf`] computes the Gauss error function (i.e., `x ↦ erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt`).
 //!
@@ -31,8 +31,6 @@ use crate::operations::constants::fill::Fill;
 use crate::operations::exponential::Exp;
 use crate::operations::manipulation::conversions::ElementType;
 use crate::programs::{Typed, Value};
-
-// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`ErfOperation`].
 pub const ERF_OPERATION_NAME: &str = "erf";
@@ -228,8 +226,8 @@ mod tests {
         assert!(Array::scalar(f64::NAN).unwrap().erf().unwrap().to_f64s()[0].is_nan());
 
         // Known values covering every rational-approximation regime of the reference implementation: the small
-        // series (|x| < 2⁻²⁸), the primary interval (|x| < 0.84375), the [0.84375, 1.25) interval, both tail
-        // intervals of the complementary-function path, and the saturated |x| ≥ 6 regime.
+        // series (i.e., `|x| < 2⁻²⁸`), the primary interval (i.e., `|x| < 0.84375`), the `[0.84375, 1.25)` interval,
+        // both tail intervals of the complementary-function path, and the saturated `|x| ≥ 6` regime.
         assert_abs_diff_eq!(
             Array::scalar(1e-12f64).unwrap().erf().unwrap(),
             Array::scalar(FRAC_2_SQRT_PI * 1e-12).unwrap(),
