@@ -1,7 +1,7 @@
 //! Operations that select elementwise minima and maxima of numeric values. Each operation is defined by an
-//! [`Operation`](crate::Operation) type (e.g., [`MinOperation`]) together with a value capability trait (e.g., [`Min`])
-//! whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code executes
-//! immediately or records into a program depending on the value it runs on:
+//! [`Operation`](crate::Operation) type (e.g., [`MinOperation`]) together with a value capability trait (e.g.,
+//! [`Min`]) whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code
+//! executes immediately or records into a program depending on the value it runs on:
 //!
 //!   - [`Min`] and [`Max`] select the smaller and the larger of two values (i.e., `(a, b) ↦ min(a, b)` and
 //!     `(a, b) ↦ max(a, b)`).
@@ -9,7 +9,7 @@
 //!     is how StableHLO defines [`clamp`](https://openxla.org/stablehlo/spec#clamp). It is implemented for every value
 //!     that supports [`Min`] and [`Max`] and stages no operation of its own.
 //!
-//! Inputs promote to a common numeric element type and broadcast, as for StableHLO's
+//! Inputs promote to a common numeric element type and broadcast, same as for StableHLO's
 //! [`minimum`](https://openxla.org/stablehlo/spec#minimum) and [`maximum`](https://openxla.org/stablehlo/spec#maximum),
 //! and Boolean inputs are rejected. Real floating-point extrema propagate NaNs and order negative zero below positive
 //! zero. Complex extrema compare real parts first and imaginary parts second, selecting one whole input, and ties and
@@ -43,8 +43,6 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::programs::{ProgramError, Type, Typed};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`MinOperation`].
 pub const MIN_OPERATION_NAME: &str = "min";
 
@@ -56,8 +54,10 @@ define_elementwise_operation!(
     /// components are equal, selecting one whole input. Ties and unordered deciding comparisons select the right
     /// complex input. Boolean inputs are not supported. Array inputs that still carry partial sums are rejected, and
     /// their reduced-axis markers must agree.
-    MinOperation, MIN_OPERATION_NAME,
-    Min, min,
+    MinOperation,
+    MIN_OPERATION_NAME,
+    Min,
+    min,
     check_data_types = [@numeric],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
@@ -67,7 +67,7 @@ impl_differentiable_elementwise_operation! {
     MinOperation,
     jvp<C>
     where
-        C::Value: Compare<C::Value> + Imaginary + Real + Select + ZeroLike,
+        C::Value: ZeroLike + Imaginary + Real + Compare<C::Value> + Select,
     {
         // Real ties retain the existing left-tangent convention. Complex selection uses strict lexicographic
         // comparisons, routing ties and unordered deciding comparisons to the right tangent like the primal.
@@ -108,8 +108,7 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @binary
     /// Represents the ability to select elementwise minima. Concrete arrays compute immediately while context-carrying
-    /// values apply [`MinOperation`] through their context. Refer to that operation for supported types and
-    /// exceptional-value behavior.
+    /// values apply [`MinOperation`] through their context.
     Min,
     /// Returns the elementwise minimum of this value and `right`, promoting and broadcasting the inputs. Returns an
     /// error if the input types or metadata are unsupported.
@@ -119,7 +118,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @binary
-    Min, min,
+    Min,
+    min,
     operation = "min",
     inputs = @numeric,
     checks = [@no_unreduced, @same_reduced_axes],
@@ -131,6 +131,7 @@ macro_rules! impl_min_for_primitive {
     // Integer primitives use ordinary total-order comparison, which cannot fail.
     (@integer $type:ty) => {
         impl Min for $type {
+            #[inline]
             fn min(&self, right: &Self) -> Result<Self, ProgramError> {
                 Ok(::std::cmp::Ord::min(*self, *right))
             }
@@ -171,8 +172,6 @@ impl_min_for_primitive!(@integer usize);
 impl_min_for_primitive!(@float f32);
 impl_min_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`MaxOperation`].
 pub const MAX_OPERATION_NAME: &str = "max";
 
@@ -184,8 +183,10 @@ define_elementwise_operation!(
     /// components are equal, selecting one whole input. Ties and unordered deciding comparisons select the right
     /// complex input. Boolean inputs are not supported. Array inputs that still carry partial sums are rejected, and
     /// their reduced-axis markers must agree.
-    MaxOperation, MAX_OPERATION_NAME,
-    Max, max,
+    MaxOperation,
+    MAX_OPERATION_NAME,
+    Max,
+    max,
     check_data_types = [@numeric],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
@@ -195,7 +196,7 @@ impl_differentiable_elementwise_operation! {
     MaxOperation,
     jvp<C>
     where
-        C::Value: Compare<C::Value> + Imaginary + Real + Select + ZeroLike,
+        C::Value: ZeroLike + Imaginary + Real + Compare<C::Value> + Select,
     {
         // Real ties retain the existing left-tangent convention. Complex selection uses strict lexicographic
         // comparisons, routing ties and unordered deciding comparisons to the right tangent like the primal.
@@ -236,8 +237,7 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @binary
     /// Represents the ability to select elementwise maxima. Concrete arrays compute immediately while context-carrying
-    /// values apply [`MaxOperation`] through their context. Refer to that operation for supported types and
-    /// exceptional-value behavior.
+    /// values apply [`MaxOperation`] through their context.
     Max,
     /// Returns the elementwise maximum of this value and `right`, promoting and broadcasting the inputs. Returns an
     /// error if the input types or metadata are unsupported.
@@ -247,7 +247,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @binary
-    Max, max,
+    Max,
+    max,
     operation = "max",
     inputs = @numeric,
     checks = [@no_unreduced, @same_reduced_axes],
@@ -259,6 +260,7 @@ macro_rules! impl_max_for_primitive {
     // Integer primitives use ordinary total-order comparison, which cannot fail.
     (@integer $type:ty) => {
         impl Max for $type {
+            #[inline]
             fn max(&self, right: &Self) -> Result<Self, ProgramError> {
                 Ok(::std::cmp::Ord::max(*self, *right))
             }
@@ -299,14 +301,12 @@ impl_max_for_primitive!(@integer usize);
 impl_max_for_primitive!(@float f32);
 impl_max_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review this module.
-
-/// Represents the ability to restrict values elementwise between `lower` and `upper`. [`Clamp`] is provided for
-/// every value that supports [`Max`] and [`Min`] as the composition `max(lower, min(input, upper))`, which is how
-/// [StableHLO defines `clamp`](https://openxla.org/stablehlo/spec#clamp). Inputs promote to a common numeric element
-/// type and broadcast. Real inputs are clipped to the inclusive interval; complex inputs use the extrema operations'
-/// lexicographic ordering. The composition inherits their NaN and tie behavior. For real inputs strictly inside the
-/// interval, the tangent follows the input; outside the interval it follows the selected bound.
+/// Represents the ability to restrict values elementwise between `lower` and `upper`. [`Clamp`] is provided for every
+/// value that supports [`Min`] and [`Max`] as the composition `max(lower, min(input, upper))`, which is how StableHLO
+/// defines [`clamp`](https://openxla.org/stablehlo/spec#clamp). Inputs promote to a common numeric element type and
+/// broadcast. Real inputs are clipped to the inclusive interval while complex inputs use the extrema operations'
+/// lexicographic ordering. The composition inherits their NaN and tie behavior. For real inputs strictly inside
+/// the interval, the tangent follows the input. Outside the interval it follows the selected bound.
 pub trait Clamp: Sized {
     /// Clamps this value elementwise to the inclusive `[lower, upper]` interval, promoting and broadcasting its inputs
     /// as needed. Returns an error if the input types or metadata are unsupported.
@@ -318,7 +318,7 @@ pub trait Clamp: Sized {
     fn clamp(&self, lower: &Self, upper: &Self) -> Result<Self, ProgramError>;
 }
 
-impl<V: Max + Min> Clamp for V {
+impl<V: Min + Max> Clamp for V {
     #[inline]
     fn clamp(&self, lower: &Self, upper: &Self) -> Result<Self, ProgramError> {
         self.min(upper)?.max(lower)
@@ -540,6 +540,7 @@ mod tests {
             Array::scalar(2.5f32).unwrap().min(&Array::scalar(1.5f32).unwrap()).unwrap(),
             Array::scalar(1.5f32).unwrap()
         );
+
         // Mixed-precision operands promote before comparing.
         assert_eq!(
             Array::scalar(2.5f32).unwrap().min(&Array::scalar(3.5f64).unwrap()).unwrap(),
@@ -556,6 +557,7 @@ mod tests {
             Array::scalar(f16::from_f32(2.0)).unwrap().min(&Array::scalar(f16::from_f32(3.0)).unwrap()).unwrap(),
             Array::scalar(f16::from_f32(2.0)).unwrap(),
         );
+
         // NaNs propagate and `-0.0` orders below `+0.0`.
         assert!(Array::scalar(f64::NAN).unwrap().min(&Array::scalar(1.0f64).unwrap()).unwrap().to_f64s()[0].is_nan());
         assert!(Array::scalar(1.0f64).unwrap().min(&Array::scalar(f64::NAN).unwrap()).unwrap().to_f64s()[0].is_nan());
@@ -772,6 +774,7 @@ mod tests {
                 .unwrap(),
             vec![Array::scalar(Complex::new(1.0, 2.0)).unwrap(), right_tangent.clone()],
         );
+
         // Complex ties follow the right operand, unlike the existing real tie convention.
         assert_eq!(
             jvp_program
@@ -799,24 +802,25 @@ mod tests {
     fn test_array_max() {
         assert_eq!(
             Array::scalar(2i32).unwrap().max(&Array::scalar(5i32).unwrap()).unwrap(),
-            Array::scalar(5i32).unwrap()
+            Array::scalar(5i32).unwrap(),
         );
         assert_eq!(
             Array::scalar(-2i64).unwrap().max(&Array::scalar(-5i64).unwrap()).unwrap(),
-            Array::scalar(-2i64).unwrap()
+            Array::scalar(-2i64).unwrap(),
         );
         assert_eq!(
             Array::scalar(3u32).unwrap().max(&Array::scalar(7u32).unwrap()).unwrap(),
-            Array::scalar(7u32).unwrap()
+            Array::scalar(7u32).unwrap(),
         );
         assert_eq!(
             Array::scalar(2.5f32).unwrap().max(&Array::scalar(1.5f32).unwrap()).unwrap(),
-            Array::scalar(2.5f32).unwrap()
+            Array::scalar(2.5f32).unwrap(),
         );
+
         // Mixed-precision operands promote before comparing.
         assert_eq!(
             Array::scalar(2.5f32).unwrap().max(&Array::scalar(3.5f64).unwrap()).unwrap(),
-            Array::scalar(3.5f64).unwrap()
+            Array::scalar(3.5f64).unwrap(),
         );
         assert_eq!(
             Array::scalar(bf16::from_f32(2.0))
