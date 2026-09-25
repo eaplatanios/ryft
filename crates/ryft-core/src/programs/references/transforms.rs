@@ -1,0 +1,1231 @@
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
+use std::ops::Range;
+
+use ryft_macros::Parameter;
+
+use crate::batching::{BatchAxis, BatchingError};
+use crate::parameters::Parameter;
+use crate::programs::ProgramError;
+use crate::programs::atoms::AtomId;
+use crate::programs::effects::ReferenceAccessMode;
+use crate::programs::instructions::Instruction;
+use crate::programs::operations::Operation;
+use crate::programs::references::types::ReferenceType;
+use crate::programs::types::{Type, TypeError};
+use crate::programs::values::ValueId;
+
+/// Uninhabited binding of [`ReferenceTransformPath`]s that only ever carry static [`BoundReferenceTransform`]s, such
+/// as the path of an eager array reference handle. Every transform in such paths has empty bindings; consumers must
+/// reject transforms that require dynamic bindings because no binding value can be supplied for them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub enum NoReferenceTransformBinding {}
+
+/// Represents whether two views of the same reference allocation cover separate parts, exactly the same part, or
+/// potentially overlapping parts, as determined by [`ReferenceTransform::overlap`]. Both paths apply transforms
+/// starting from the complete allocation. For example, `root[0]` and `root[1]` address different elements and are
+/// disjoint, while `root[i]` and `root[j]` may overlap when the values of `i` and `j` are unknown. Each symbolic index
+/// in a path has a binding identifying the program value that supplies it; that binding does not imply that the index's
+/// runtime value is known.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReferenceViewOverlap {
+    /// The two paths _provably_ address disjoint parts of the root.
+    Disjoint,
+
+    /// The two paths _provably_ address exactly the same part of the root.
+    Same,
+
+    /// The two paths may overlap: they address intersecting parts, or a transform depends on a symbol whose binding
+    /// cannot prove the paths identical or disjoint.
+    MayOverlap,
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+/// Metadata describing one selection applied to a reference allocation, carried by each access operation that applies
+/// it. A transform stores information such as an array axis and a static index, or indicates that a dynamic binding
+/// supplies an index. It stores neither the allocation nor the dynamic value or its instruction input position.
+/// [`BoundReferenceTransform`] pairs the transform with its binding values or program identities and
+/// [`ReferenceAccessDescriptor`] identifies the corresponding range of instruction inputs.
+///
+/// The `'static`, [`Send`], and [`Sync`] bounds allow [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis) to be
+/// retained as type-erased metadata in the region's transform cache (refer to
+/// [`RegionRef::transform`](crate::RegionRef::transform) for more information on that). In particular, `'static`
+/// prevents transforms from borrowing temporary data; it does not require their instances to live forever. Owned
+/// transform metadata satisfies this bound. Equality supports revalidation against a fresh analysis, and hashing lets
+/// paths serve as part of eager reference handles' identities.
+pub trait ReferenceTransform: 'static + Clone + Debug + Display + PartialEq + Eq + Hash + Send + Sync {
+    /// Input type universe in which this [`ReferenceTransform`] binds its dynamic inputs.
+    type Type: Type;
+
+    /// Referent type family consumed and produced by this transform.
+    type Referent: Type;
+
+    /// Returns the number of dynamic inputs consumed by this transform.
+    fn binding_count(&self) -> usize;
+
+    /// Validates this transform's dynamic input types against the input referent. Implementations check the binding
+    /// count as well as family-specific requirements, such as scalar integer array indices in the referent's memory
+    /// space. Bindings belong to the input universe and need not themselves have referent types.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input`: Referent type before this transform is applied.
+    ///   - `bindings`: Types of this transform's dynamic inputs in the transform family's binding order.
+    fn validate_bindings(&self, input: &Self::Referent, bindings: &[&Self::Type]) -> Result<(), TypeError>;
+
+    /// Returns the referent type after applying this transform to `input`. Rejects transforms that cannot apply to that
+    /// referent, including transforms through which an update could not be written back to `input`.
+    fn output_type(&self, input: &Self::Referent) -> Result<Self::Referent, TypeError>;
+
+    /// Returns the referent type that a read-only access selects by applying this transform to `input`. Unlike
+    /// [`output_type`](Self::output_type), this function need not prove that an update through the transform could be
+    /// written back to `input`, because a read-only access never writes back. Families whose write-back validation
+    /// is expensive override this function to skip it; the default delegates to [`output_type`](Self::output_type).
+    fn read_type(&self, input: &Self::Referent) -> Result<Self::Referent, TypeError> {
+        self.output_type(input)
+    }
+
+    /// Returns whether `lhs` and `rhs` address separate parts, exactly the same part, or potentially overlapping parts
+    /// of the same reference allocation, without executing the program. Both paths are assumed to start from the
+    /// complete allocation. For example, views of `reference[0]` and `reference[1]` are disjoint, while views of
+    /// `reference[i]` and `reference[j]` may overlap when their indices are unknown. Equal symbol bindings identify the
+    /// same program value. Different bindings do not prove that the runtime values differ. Comparing symbolic views
+    /// must also account for the transforms themselves, including any clamping.
+    ///
+    /// Note that an empty path covers the complete allocation, two empty paths are considered
+    /// [`Same`](ReferenceViewOverlap::Same), and an empty path may overlap with a path covering only part of the
+    /// allocation. Paths are validated when they are derived, and implementations may conservatively return
+    /// [`MayOverlap`](ReferenceViewOverlap::MayOverlap) for a malformed path instead of failing.
+    ///
+    /// # Parameters
+    ///
+    ///   - `type`: [`Type`] of the complete reference from which both paths start.
+    ///   - `lhs`: [`BoundReferenceTransform`]s describing the first view to compare, starting from the complete
+    ///     reference.
+    ///   - `rhs`: [`BoundReferenceTransform`]s describing the second view to compare, starting from the complete
+    ///     reference.
+    fn overlap(
+        r#type: &Self::Type,
+        lhs: &[BoundReferenceTransform<Self>],
+        rhs: &[BoundReferenceTransform<Self>],
+    ) -> ReferenceViewOverlap;
+}
+
+/// Uninhabited transform type for a referent family `T` in an input universe `U` that supports only whole-root
+/// accesses. Paths containing this type are necessarily empty; the function-pointer marker imposes no thread-safety or
+/// equality requirements on the type descriptors.
+pub enum NoReferenceTransform<T: Type, U: Type> {
+    #[doc(hidden)]
+    Never(Infallible, PhantomData<fn() -> (T, U)>),
+}
+
+impl<T: Type, U: Type> Copy for NoReferenceTransform<T, U> {}
+
+impl<T: Type, U: Type> Clone for NoReferenceTransform<T, U> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: Type, U: Type> Debug for NoReferenceTransform<T, U> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Never(never, _) => Debug::fmt(never, formatter),
+        }
+    }
+}
+
+impl<T: Type, U: Type> Display for NoReferenceTransform<T, U> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Never(never, _) => Display::fmt(never, formatter),
+        }
+    }
+}
+
+impl<T: Type, U: Type> PartialEq for NoReferenceTransform<T, U> {
+    fn eq(&self, _other: &Self) -> bool {
+        match self {
+            Self::Never(never, _) => match *never {},
+        }
+    }
+}
+
+impl<T: Type, U: Type> Eq for NoReferenceTransform<T, U> {}
+
+impl<T: Type, U: Type> Hash for NoReferenceTransform<T, U> {
+    fn hash<H: Hasher>(&self, _state: &mut H) {
+        match self {
+            Self::Never(never, _) => match *never {},
+        }
+    }
+}
+
+impl<T: 'static + Type, U: 'static + Type> ReferenceTransform for NoReferenceTransform<T, U> {
+    type Type = U;
+    type Referent = T;
+
+    fn binding_count(&self) -> usize {
+        match self {
+            Self::Never(never, _) => match *never {},
+        }
+    }
+
+    fn validate_bindings(&self, _input: &T, _bindings: &[&U]) -> Result<(), TypeError> {
+        match self {
+            Self::Never(never, _) => match *never {},
+        }
+    }
+
+    fn output_type(&self, _input: &T) -> Result<T, TypeError> {
+        match self {
+            Self::Never(never, _) => match *never {},
+        }
+    }
+
+    fn overlap(
+        _type: &U,
+        _lhs: &[BoundReferenceTransform<Self>],
+        _rhs: &[BoundReferenceTransform<Self>],
+    ) -> ReferenceViewOverlap {
+        ReferenceViewOverlap::Same
+    }
+}
+
+impl<T: 'static + Type, U: 'static + Type> BatchableReferenceTransform for NoReferenceTransform<T, U> {
+    fn batch(&self, _type: &U, _batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
+        match self {
+            Self::Never(never, _) => match *never {},
+        }
+    }
+}
+
+/// Transforms and dynamic-input positions applied by an access to one reference input. Binding positions follow the
+/// access's base inputs, grouped by reference input in increasing input-index order and then in path order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceAccessDescriptor<'o, Transform: ReferenceTransform> {
+    /// Ordered transforms, empty for an access to the complete root.
+    transforms: &'o [Transform],
+
+    /// Consecutive input positions supplying this path's dynamic inputs.
+    bindings: Range<usize>,
+}
+
+impl<'o, Transform: ReferenceTransform> ReferenceAccessDescriptor<'o, Transform> {
+    /// Describes the transforms and binding range of one reference input. The owning operation derives `bindings`
+    /// from its base input count and the paths on preceding reference inputs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `transforms`: Transforms applied in order from the reference input.
+    ///   - `bindings`: Consecutive instruction input positions supplying those transforms' dynamic inputs.
+    pub fn new(transforms: &'o [Transform], bindings: Range<usize>) -> Self {
+        Self { transforms, bindings }
+    }
+
+    /// Returns the ordered transforms applied by this access.
+    pub fn transforms(&self) -> &'o [Transform] {
+        self.transforms
+    }
+
+    /// Returns the consecutive input positions supplying this path's dynamic inputs.
+    pub fn bindings(&self) -> Range<usize> {
+        self.bindings.clone()
+    }
+}
+
+/// Operation family whose reference accesses expose the transform paths applied to their root inputs. Every input
+/// declared by a [`ReferenceEffect::Access`](crate::ReferenceEffect::Access) must have a descriptor, including
+/// whole-root accesses with empty paths. Other inputs have no descriptor. Binding inputs trail the base inputs, grouped
+/// by reference input position and then by transform; operation payloads store paths rather than positions. Consumers
+/// read descriptors through [`validated_reference_access_descriptors`], which enforces this layout.
+pub trait ReferenceAccessOperation: Operation {
+    /// Transform metadata understood by the family, with dynamic bindings in its input universe.
+    type Transform: ReferenceTransform<Type = Self::Type>;
+
+    /// Returns the number of inputs before the trailing dynamic transform bindings. This count is used only for
+    /// operations with declared reference accesses; pure operations have no binding groups and may return zero.
+    fn base_input_count(&self) -> usize;
+
+    /// Returns the path and binding range for the reference access at `input_index`, or [`None`] for a non-access.
+    fn reference_access_descriptor(&self, input_index: usize)
+    -> Option<ReferenceAccessDescriptor<'_, Self::Transform>>;
+
+    /// Returns a copy with the path of the access at `input_index` replaced. Rejects a non-access position or a path
+    /// unsupported by that access. The instruction's bindings must be replaced separately in the canonical layout.
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<Self::Transform>,
+    ) -> Result<Self, ProgramError>;
+}
+
+/// Returns the validated access descriptor of each input of an instruction that applies `operation` to `input_count`
+/// inputs, indexed by input position. Accesses map to their [`ReferenceAccessDescriptor`]; ordinary inputs, including
+/// the trailing transform bindings, map to [`None`].
+///
+/// Validation enforces the [`ReferenceAccessOperation`] layout contract: every declared
+/// [`ReferenceEffect::Access`](crate::ReferenceEffect::Access) is a base input with a descriptor, no other input has
+/// one, the binding groups follow the base inputs in increasing access order and exactly cover the remaining inputs,
+/// and consuming accesses apply no transforms. The base-input count applies only when reference accesses exist; pure
+/// operations have no binding groups and retain their ordinary input layout.
+///
+/// [`ProgramBuilder`](crate::ProgramBuilder) is generic over every [`Operation`] family and therefore cannot check this
+/// layout when instructions are added. [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis) and
+/// [`rewrite_reference_access_transforms`] validate it before using any descriptor, and every other consumer must read
+/// descriptors through this function instead of calling [`ReferenceAccessOperation::reference_access_descriptor`]
+/// directly, so that malformed downstream families are rejected instead of producing out-of-range bindings.
+///
+/// # Parameters
+///
+///   - `operation`: Operation whose descriptors are validated.
+///   - `input_count`: Number of inputs of the instruction that applies `operation`, including transform bindings.
+pub fn validated_reference_access_descriptors<O: ReferenceAccessOperation>(
+    operation: &O,
+    input_count: usize,
+) -> Result<Vec<Option<ReferenceAccessDescriptor<'_, O::Transform>>>, ProgramError> {
+    reference_access_layout(operation, input_count).map_err(|(_, message)| ProgramError::MalformedProgram(message))
+}
+
+/// Validates the layout described by [`validated_reference_access_descriptors`], reporting a failure as the index of
+/// the failing input together with a message that names the operation. Failures of the trailing binding count are
+/// attributed to the last access, whose binding group ends the canonical layout.
+pub(super) fn reference_access_layout<O: ReferenceAccessOperation>(
+    operation: &O,
+    input_count: usize,
+) -> Result<Vec<Option<ReferenceAccessDescriptor<'_, O::Transform>>>, (usize, String)> {
+    let accesses = operation.effects().accesses().collect::<BTreeMap<_, _>>();
+    let malformed = |input: usize, message: String| (input, format!("operation `{}` {message}", operation.name()));
+    if let Some((&input, _)) = accesses.range(input_count..).next() {
+        return Err(malformed(
+            input,
+            format!("declares reference access at input {input} but has only {input_count} inputs"),
+        ));
+    }
+    let base_count = operation.base_input_count();
+    let mut next_binding = base_count;
+    let mut last_access = None;
+    let mut descriptors = Vec::with_capacity(input_count);
+    for input in 0..input_count {
+        let descriptor = operation.reference_access_descriptor(input);
+        match (accesses.get(&input), &descriptor) {
+            (Some(_), None) => {
+                return Err(malformed(input, format!("does not describe reference access at input {input}")));
+            }
+            (None, Some(_)) => {
+                return Err(malformed(input, format!("describes reference transforms at non-access input {input}")));
+            }
+            (None, None) => {}
+            (Some(mode), Some(descriptor)) => {
+                if input >= base_count {
+                    return Err(malformed(
+                        input,
+                        format!("reference access at input {input} is outside its {base_count} base inputs"),
+                    ));
+                }
+                let start = next_binding;
+                for transform in descriptor.transforms() {
+                    next_binding = next_binding.checked_add(transform.binding_count()).ok_or_else(|| {
+                        malformed(input, "reference transform binding count overflows `usize`".to_string())
+                    })?;
+                }
+                if descriptor.bindings() != (start..next_binding) {
+                    return Err(malformed(
+                        input,
+                        format!(
+                            "reference access at input {input} has binding range {:?}, expected \
+                             {start}..{next_binding}",
+                            descriptor.bindings(),
+                        ),
+                    ));
+                }
+                if !descriptor.transforms().is_empty() && mode.is_consuming() {
+                    return Err(malformed(input, format!("consumes input {input} through a reference view")));
+                }
+                last_access = Some(input);
+            }
+        }
+        descriptors.push(descriptor);
+    }
+    if let Some(input) = last_access
+        && next_binding != input_count
+    {
+        return Err(malformed(
+            input,
+            format!("reference transforms require {next_binding} inputs but the instruction has {input_count}"),
+        ));
+    }
+    Ok(descriptors)
+}
+
+/// Replaces one reference input's path and consecutive dynamic bindings while preserving instruction outputs,
+/// attached regions, and provenance. Later binding groups shift automatically because their ranges are derived from
+/// the updated operation. Binding atom identifiers stay in the instruction's region namespace. The caller validates
+/// the resulting input and output types when adding the returned instruction to its destination builder.
+pub fn rewrite_reference_access_transforms<O: ReferenceAccessOperation>(
+    instruction: &Instruction<O>,
+    input_index: usize,
+    transforms: Vec<O::Transform>,
+    bindings: Vec<AtomId>,
+) -> Result<Instruction<O>, ProgramError> {
+    let operation = instruction.operation();
+    let range = validated_reference_access_descriptors(operation, instruction.inputs().len())?
+        .into_iter()
+        .nth(input_index)
+        .flatten()
+        .ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "operation `{}` has no reference access at input {input_index}",
+                operation.name(),
+            ))
+        })?
+        .bindings();
+    ReferenceTransformPath::from_transforms(&transforms, &bindings)?;
+    let operation = operation.with_reference_access_transforms(input_index, transforms)?;
+    let mut inputs = Vec::with_capacity(instruction.inputs().len() - range.len() + bindings.len());
+    inputs.extend_from_slice(&instruction.inputs()[..range.start]);
+    inputs.extend(bindings);
+    inputs.extend_from_slice(&instruction.inputs()[range.end..]);
+    validated_reference_access_descriptors(&operation, inputs.len())?;
+    Ok(Instruction::new(operation, inputs, instruction.outputs().to_vec(), instruction.regions().to_vec())
+        .with_provenance(instruction.provenance().clone()))
+}
+
+/// Validates dynamic bindings and derives the referent of the view produced by an ordered path, applying its
+/// transforms in order. Every transform consumes its own consecutive group of [`ReferenceTransform::binding_count`]
+/// ordinary (non-reference) inputs, whose types are validated against the referent produced by the preceding transform
+/// before the transform computes the next one. A [`Read`](ReferenceAccessMode::Read) access derives each referent
+/// through [`ReferenceTransform::read_type`], and every other access mode also validates that updates can be written
+/// back through [`ReferenceTransform::output_type`].
+///
+/// # Parameters
+///
+///   - `input`: Referent type of the root reference.
+///   - `transforms`: Transforms applied in order from the root.
+///   - `bindings`: Types of the transforms' dynamic inputs, in path order.
+///   - `mode`: Access mode of the operation applying the path.
+pub fn infer_reference_view_type<Transform: ReferenceTransform>(
+    input: &Transform::Referent,
+    transforms: &[Transform],
+    bindings: &[&Transform::Type],
+    mode: ReferenceAccessMode,
+) -> Result<Transform::Referent, TypeError> {
+    let mut output = input.clone();
+    let mut remaining = bindings;
+    for transform in transforms {
+        let count = transform.binding_count();
+        if count > remaining.len() {
+            return Err(TypeError::invalid(format!(
+                "reference transform requires {count} bindings but only {} remain",
+                remaining.len(),
+            )));
+        }
+        let (current, rest) = remaining.split_at(count);
+        transform.validate_bindings(&output, current)?;
+        output = match mode {
+            ReferenceAccessMode::Read => transform.read_type(&output)?,
+            _ => transform.output_type(&output)?,
+        };
+        remaining = rest;
+    }
+    if !remaining.is_empty() {
+        return Err(TypeError::invalid(format!("reference transform path has {} extra bindings", remaining.len())));
+    }
+    Ok(output)
+}
+
+/// Moves a packed reference's batch axis through an ordered transform path, one transform at a time in the same order
+/// in which [`infer_reference_view_type`] applies them. Dynamic bindings must be replicated. The resulting batch axis
+/// belongs to the referent of the final view, which may have fewer dimensions than the root.
+pub fn batch_reference_transforms<Transform: BatchableReferenceTransform>(
+    root_type: &Transform::Type,
+    root_axis: BatchAxis,
+    transforms: &[Transform],
+    binding_axes: &[BatchAxis],
+) -> Result<(Vec<Transform>, BatchAxis), BatchingError>
+where
+    Transform::Type: From<ReferenceType<Transform::Referent>>,
+    for<'t> &'t ReferenceType<Transform::Referent>: TryFrom<&'t Transform::Type, Error = TypeError>,
+{
+    let mut current_type = root_type.clone();
+    let mut current_axis = root_axis;
+    let mut remaining = binding_axes;
+    let mut batched = Vec::with_capacity(transforms.len());
+    for transform in transforms {
+        let count = transform.binding_count();
+        if count > remaining.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference transform requires {count} bindings but only {} remain",
+                remaining.len(),
+            ))
+            .into());
+        }
+        let (current, rest) = remaining.split_at(count);
+        if current.iter().any(|axis| !axis.is_replicated()) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "batching a reference transform with a mapped index input is not supported".to_string(),
+            });
+        }
+        let (transform, axis) = transform.batch(&current_type, current_axis)?;
+        let reference = <&ReferenceType<Transform::Referent>>::try_from(&current_type)?;
+        current_type = ReferenceType::new(transform.output_type(reference.referent())?).into();
+        current_axis = axis;
+        remaining = rest;
+        batched.push(transform);
+    }
+    if !remaining.is_empty() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "reference transform path has {} extra bindings",
+            remaining.len(),
+        ))
+        .into());
+    }
+    Ok((batched, current_axis))
+}
+
+/// Optional batching capability for a [`ReferenceTransform`]. Implementations adjust a transform when its source
+/// reference gains a batch axis. Reference families that support analysis and discharge without batching need only
+/// implement [`ReferenceTransform`] but batching rules additionally require this trait.
+pub trait BatchableReferenceTransform: ReferenceTransform {
+    /// Moves the batch axis of a source reference through this [`ReferenceTransform`] mapping. The batch axis of a
+    /// reference is an axis of its packed referent that the per-item transform never sees. The batched transform
+    /// therefore addresses the same part of each packed item as the original transform addresses in the unbatched
+    /// input, and the resulting view has its own batch axis. This is pure axis arithmetic: the transform's dynamic
+    /// binding requirements are unchanged, and a replicated `batch_axis` returns the transform unchanged and
+    /// replicated.
+    ///
+    /// # Parameters
+    ///
+    ///   - `type`: Packed reference [`Type`] of the batched source, with the batch axis inserted.
+    ///   - `batch_axis`: Batch axis positioned in the packed referent of `type`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] when this family cannot carry `batch_axis` through the transform (e.g., a family
+    /// without axes rejects every mapped axis, and a static array slice cannot span a dynamically sized batch axis).
+    fn batch(&self, r#type: &Self::Type, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError>;
+}
+
+/// One transform together with its dynamic bindings. [`ReferenceTransformPath`] applies bound transforms in order from
+/// the complete root. `Transform` owns transform metadata, such as an array axis or static slice; `Binding` supplies
+/// the ordinary values required by [`ReferenceTransform::binding_count`]. Static transforms carry no bindings.
+///
+/// During analysis, bindings are [`ValueId`]s in the access instruction's region. During discharge, they are values
+/// in the reconstruction context. For example, an array `Index { axis: 0, index: Dynamic }` consumes one binding;
+/// that binding identifies the runtime index value, independently of its position among the instruction's inputs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct BoundReferenceTransform<Transform: ReferenceTransform, Binding = ValueId> {
+    /// [`ReferenceTransform`] of this [`BoundReferenceTransform`].
+    transform: Transform,
+
+    /// Dynamic bindings consumed by this transform, in the order defined by the transform family.
+    bindings: Vec<Binding>,
+}
+
+impl<Transform: ReferenceTransform, Binding> BoundReferenceTransform<Transform, Binding> {
+    /// Returns the [`ReferenceTransform`] of this [`BoundReferenceTransform`].
+    #[inline]
+    pub fn transform(&self) -> &Transform {
+        &self.transform
+    }
+
+    /// Returns the binding of each symbol of the [`ReferenceTransform`], in the order returned
+    /// by [`ReferenceTransform::binding_count`].
+    #[inline]
+    pub fn bindings(&self) -> &[Binding] {
+        self.bindings.as_slice()
+    }
+}
+
+/// Sequence of [`BoundReferenceTransform`]s from a reference root to one derived reference (i.e., a view), in the order
+/// they are applied. `Transform` is the type of each transform, such as
+/// [`ArrayReferenceTransform`](crate::ArrayReferenceTransform), and `Binding` represents the inputs needed by a
+/// symbolic transform. Each [`BoundReferenceTransform`] pairs a `Transform` with a vector of `Binding`s. The path
+/// stores these bound transforms, but neither the root allocation nor its identity;
+/// [`ReferenceAnalysis`](crate::ReferenceAnalysis) identifies the root when analyzing a [`Program`](crate::Program).
+///
+/// For example, `root[row][column]` produces two transforms: the first addresses a row in the root, and the second
+/// addresses an element in that row. With `Transform = ArrayReferenceTransform` and `Binding = ValueId`, the bound
+/// transforms describe the two indexing operations and store the program identities of `row` and `column`. During
+/// discharge, `Binding = C::Value` stores their values in the reconstruction context instead, so the same path
+/// traversal can reapply the transforms without looking up source program identities.
+///
+/// Eager reference handles resolve indices immediately into static transforms and use
+/// [`NoReferenceTransformBinding`]. Their transforms have empty binding vectors. Dynamic paths instead bind each
+/// transform to the consecutive inputs declared by the access descriptor, consuming exactly
+/// [`ReferenceTransform::binding_count`] bindings per transform.
+///
+/// The empty path denotes the complete root. Complete root handles, capture constants, and forwarded complete
+/// references carry it. A path belongs to one access instruction and therefore stays inside that instruction's region:
+/// references that cross region boundaries always denote complete roots, and accesses in the receiving region carry
+/// their own paths. Equality and hashing compare transforms and bindings, not the identities of the reference handles
+/// or the array elements addressed by different transform sequences.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct ReferenceTransformPath<Transform: ReferenceTransform, Binding = ValueId> {
+    /// [`BoundReferenceTransform`]s in this [`ReferenceTransformPath`] in the order they are applied,
+    /// starting from the complete reference.
+    bound_transforms: Vec<BoundReferenceTransform<Transform, Binding>>,
+}
+
+impl<Transform: ReferenceTransform, Binding> ReferenceTransformPath<Transform, Binding> {
+    /// Returns the empty [`ReferenceTransformPath`] denoting the complete root.
+    pub const fn root() -> Self {
+        Self { bound_transforms: Vec::new() }
+    }
+
+    /// Resolves an access's ordered transforms against consecutive dynamic bindings. The bindings must contain exactly
+    /// the sum of [`ReferenceTransform::binding_count`] across all transforms. This function checks only the binding
+    /// layout; [`infer_reference_view_type`] validates binding types and transform semantics.
+    ///
+    /// # Parameters
+    ///
+    ///   - `transforms`: Transforms applied in order from the complete root.
+    ///   - `bindings`: Dynamic bindings grouped in transform order, with each transform consuming its declared binding
+    ///     count.
+    pub fn from_transforms(transforms: &[Transform], bindings: &[Binding]) -> Result<Self, ProgramError>
+    where
+        Binding: Clone,
+    {
+        let mut remaining = bindings;
+        let mut bound_transforms = Vec::with_capacity(transforms.len());
+        for transform in transforms {
+            let count = transform.binding_count();
+            if count > remaining.len() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference transform requires {count} bindings but only {} remain",
+                    remaining.len(),
+                )));
+            }
+            let (current, rest) = remaining.split_at(count);
+            bound_transforms.push(BoundReferenceTransform { transform: transform.clone(), bindings: current.to_vec() });
+            remaining = rest;
+        }
+        if !remaining.is_empty() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference transform path has {} extra bindings",
+                remaining.len(),
+            )));
+        }
+        Ok(Self { bound_transforms })
+    }
+
+    /// Returns whether this [`ReferenceTransformPath`] denotes the complete root (i.e., whether it is empty).
+    #[inline]
+    pub fn is_root(&self) -> bool {
+        self.bound_transforms.is_empty()
+    }
+
+    /// Returns the [`BoundReferenceTransform`]s in this [`ReferenceTransformPath`] in the order they are applied,
+    /// starting from the complete reference.
+    #[inline]
+    pub fn bound_transforms(&self) -> &[BoundReferenceTransform<Transform, Binding>] {
+        self.bound_transforms.as_slice()
+    }
+
+    /// Returns the ordered [`ReferenceTransform`]s applied from the root outward, without their bindings.
+    #[inline]
+    pub fn transforms(&self) -> impl ExactSizeIterator<Item = &Transform> + DoubleEndedIterator {
+        self.bound_transforms.iter().map(BoundReferenceTransform::transform)
+    }
+
+    /// Returns a copy of this [`ReferenceTransformPath`] extended by one more [`BoundReferenceTransform`] applied to
+    /// its current end, associating `transform` with `bindings`. The caller must supply the number of bindings declared
+    /// by [`ReferenceTransform::binding_count`], in the transform family's order. This generic container does not
+    /// validate the transform or its bindings.
+    pub fn with_bound_transform(&self, transform: Transform, bindings: Vec<Binding>) -> Self
+    where
+        Binding: Clone,
+    {
+        let mut bound_transforms = Vec::with_capacity(self.bound_transforms.len() + 1);
+        bound_transforms.extend(self.bound_transforms.iter().cloned());
+        bound_transforms.push(BoundReferenceTransform { transform, bindings });
+        Self { bound_transforms }
+    }
+
+    /// Returns a copy of this [`ReferenceTransformPath`] extended by one more static [`ReferenceTransform`] applied to
+    /// its current end. This is the shorthand of [`with_bound_transform`](Self::with_bound_transform) with no bindings.
+    /// The caller must ensure that `transform` requires no dynamic bindings.
+    #[inline]
+    pub fn with_transform(&self, transform: Transform) -> Self
+    where
+        Binding: Clone,
+    {
+        self.with_bound_transform(transform, Vec::new())
+    }
+
+    /// Extends this [`ReferenceTransformPath`] in place by the bound transforms of `suffix`, applied in order after its
+    /// current end. Unlike [`with_bound_transform`](Self::with_bound_transform), which copies the existing bound
+    /// transforms into a new path, this moves the bound transforms of `suffix` without cloning either path, so
+    /// extending a path by `k` transforms costs `O(k)` amortized time regardless of its current length. Like
+    /// [`with_bound_transform`](Self::with_bound_transform), it does not validate the transforms or their bindings.
+    pub fn append(&mut self, suffix: Self) {
+        self.bound_transforms.extend(suffix.bound_transforms);
+    }
+}
+
+impl<Transform: ReferenceTransform> ReferenceTransformPath<Transform, ValueId> {
+    /// Returns the [`ReferenceViewOverlap`] between the parts this [`ReferenceTransformPath`] and `other` address
+    /// within one root of type `root`, through [`ReferenceTransform::overlap`]. Both paths must start from the same
+    /// complete reference. Callers resolve allocation roots through [`ReferenceAnalysis`](crate::ReferenceAnalysis)
+    /// before comparing access paths.
+    #[inline]
+    pub fn overlap(&self, other: &Self, root: &Transform::Type) -> ReferenceViewOverlap {
+        Transform::overlap(root, self.bound_transforms(), other.bound_transforms())
+    }
+}
+
+impl<Transform: ReferenceTransform, Binding> Default for ReferenceTransformPath<Transform, Binding> {
+    #[inline]
+    fn default() -> Self {
+        Self::root()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::collections::HashMap;
+
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{ArrayIrType, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, DataType};
+    use crate::kernels::AsyncCopyOperation;
+    use crate::programs::effects::{EffectClasses, Effects, ReferenceAccessMode, ReferenceEffect};
+    use crate::programs::regions::{RegionId, RegionInterface};
+
+    use super::*;
+
+    /// Paths with instruction-local program identity bindings.
+    type TestPath = ReferenceTransformPath<ArrayReferenceTransform>;
+
+    /// Creates a static reference type for a test root.
+    fn reference_type(dimensions: impl Into<Vec<usize>>) -> ArrayIrType {
+        ReferenceType::new(ArrayType::new_static(DataType::F32, dimensions.into())).into()
+    }
+
+    /// Creates a static index transform.
+    fn index(axis: usize, index: usize) -> ArrayReferenceTransform {
+        ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) }
+    }
+
+    /// Creates a dynamic index transform.
+    fn dynamic() -> ArrayReferenceTransform {
+        ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }
+    }
+
+    /// Downstream-style access family that stores its descriptors directly instead of deriving them from a canonical
+    /// layout, so that tests can describe layouts violating the [`ReferenceAccessOperation`] contract.
+    #[derive(Clone, Debug)]
+    pub(crate) struct DescribedAccess {
+        /// Declared reference access, as its input index and mode, or [`None`] for a pure operation.
+        pub(crate) access: Option<(usize, ReferenceAccessMode)>,
+
+        /// Number of inputs before the trailing transform bindings.
+        pub(crate) base_input_count: usize,
+
+        /// Transforms and binding range described at each input position, with missing positions describing no access.
+        pub(crate) descriptors: Vec<Option<(Vec<ArrayReferenceTransform>, Range<usize>)>>,
+    }
+
+    impl Operation for DescribedAccess {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            "described_access"
+        }
+
+        fn infer_output_types(
+            &self,
+            _inputs: &[ArrayIrType],
+            _regions: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            Ok(Vec::new())
+        }
+
+        fn effects(&self) -> std::borrow::Cow<'_, Effects> {
+            let access = self.access.map(|(input_index, mode)| ReferenceEffect::Access { input_index, mode });
+            std::borrow::Cow::Owned(Effects::new(EffectClasses::NONE, access.into_iter().collect()).unwrap())
+        }
+    }
+
+    impl ReferenceAccessOperation for DescribedAccess {
+        type Transform = ArrayReferenceTransform;
+
+        fn base_input_count(&self) -> usize {
+            self.base_input_count
+        }
+
+        fn reference_access_descriptor(
+            &self,
+            input_index: usize,
+        ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+            let (transforms, bindings) = self.descriptors.get(input_index)?.as_ref()?;
+            Some(ReferenceAccessDescriptor::new(transforms, bindings.clone()))
+        }
+
+        fn with_reference_access_transforms(
+            &self,
+            input_index: usize,
+            transforms: Vec<Self::Transform>,
+        ) -> Result<Self, ProgramError> {
+            // The fixture replaces only the transforms and keeps its stored binding range.
+            let mut operation = self.clone();
+            let Some(Some(descriptor)) = operation.descriptors.get_mut(input_index) else {
+                return Err(ProgramError::MalformedProgram(format!("no reference access at input {input_index}")));
+            };
+            descriptor.0 = transforms;
+            Ok(operation)
+        }
+    }
+
+    #[test]
+    fn test_no_reference_transform() {
+        let root = ReferenceTransformPath::<NoReferenceTransform<ArrayType, ArrayIrType>>::root();
+        assert_eq!(root.overlap(&root, &reference_type([2])), ReferenceViewOverlap::Same);
+        assert_eq!(
+            batch_reference_transforms::<NoReferenceTransform<ArrayType, ArrayIrType>>(
+                &reference_type([2]),
+                BatchAxis::new(0),
+                &[],
+                &[],
+            ),
+            Ok((Vec::new(), BatchAxis::new(0))),
+        );
+    }
+
+    #[test]
+    fn test_reference_access_descriptor() {
+        let transforms = [dynamic()];
+        let descriptor = ReferenceAccessDescriptor::new(&transforms, 2..3);
+        assert_eq!(descriptor.transforms(), &transforms);
+        assert_eq!(descriptor.bindings(), 2..3);
+        assert_eq!(descriptor.clone(), descriptor);
+    }
+
+    #[test]
+    fn test_validated_reference_access_descriptors() {
+        let operation = AsyncCopyOperation::new()
+            .with_source_transforms(vec![dynamic()])
+            .with_destination_transforms(vec![dynamic()]);
+        assert_eq!(
+            validated_reference_access_descriptors(&operation, 4),
+            Ok(vec![
+                Some(ReferenceAccessDescriptor::new(&[dynamic()], 2..3)),
+                Some(ReferenceAccessDescriptor::new(&[dynamic()], 3..4)),
+                None,
+                None,
+            ]),
+        );
+
+        // Downstream families follow the same contract, and pure operations keep their ordinary input layout.
+        let read = DescribedAccess {
+            access: Some((0, ReferenceAccessMode::Read)),
+            base_input_count: 1,
+            descriptors: vec![Some((vec![dynamic()], 1..2))],
+        };
+        assert_eq!(
+            validated_reference_access_descriptors(&read, 2),
+            Ok(vec![Some(ReferenceAccessDescriptor::new(&[dynamic()], 1..2)), None]),
+        );
+        let pure = DescribedAccess { access: None, base_input_count: 0, descriptors: Vec::new() };
+        assert_eq!(validated_reference_access_descriptors(&pure, 2), Ok(vec![None, None]));
+    }
+
+    #[test]
+    fn test_validated_reference_access_descriptors_rejects_malformed_layouts() {
+        let malformed =
+            |message: &str| Err(ProgramError::MalformedProgram(format!("operation `described_access` {message}")));
+
+        // A declared access needs a descriptor, and only declared accesses may have one.
+        let missing = DescribedAccess {
+            access: Some((1, ReferenceAccessMode::Read)),
+            base_input_count: 2,
+            descriptors: Vec::new(),
+        };
+        assert_eq!(
+            validated_reference_access_descriptors(&missing, 2),
+            malformed("does not describe reference access at input 1"),
+        );
+        let extraneous = DescribedAccess {
+            access: Some((0, ReferenceAccessMode::Read)),
+            base_input_count: 2,
+            descriptors: vec![Some((Vec::new(), 2..2)), Some((Vec::new(), 2..2))],
+        };
+        assert_eq!(
+            validated_reference_access_descriptors(&extraneous, 2),
+            malformed("describes reference transforms at non-access input 1"),
+        );
+
+        // Accesses must be base inputs within the instruction.
+        assert_eq!(
+            validated_reference_access_descriptors(&missing, 1),
+            malformed("declares reference access at input 1 but has only 1 inputs"),
+        );
+        let outside_base = DescribedAccess {
+            access: Some((1, ReferenceAccessMode::Read)),
+            base_input_count: 1,
+            descriptors: vec![None, Some((Vec::new(), 1..1))],
+        };
+        assert_eq!(
+            validated_reference_access_descriptors(&outside_base, 2),
+            malformed("reference access at input 1 is outside its 1 base inputs"),
+        );
+
+        // Binding groups start right after the base inputs and exactly cover the remaining inputs.
+        let shifted = DescribedAccess {
+            access: Some((0, ReferenceAccessMode::Read)),
+            base_input_count: 1,
+            descriptors: vec![Some((vec![dynamic()], 2..3))],
+        };
+        assert_eq!(
+            validated_reference_access_descriptors(&shifted, 3),
+            malformed("reference access at input 0 has binding range 2..3, expected 1..2"),
+        );
+        let whole_root = DescribedAccess {
+            access: Some((0, ReferenceAccessMode::Read)),
+            base_input_count: 1,
+            descriptors: vec![Some((Vec::new(), 1..1))],
+        };
+        assert_eq!(
+            validated_reference_access_descriptors(&whole_root, 2),
+            malformed("reference transforms require 1 inputs but the instruction has 2"),
+        );
+
+        // Consumption is a complete-root lifetime event and cannot go through a view.
+        let consuming = DescribedAccess {
+            access: Some((0, ReferenceAccessMode::Consume)),
+            base_input_count: 1,
+            descriptors: vec![Some((vec![index(0, 0)], 1..1))],
+        };
+        assert_eq!(
+            validated_reference_access_descriptors(&consuming, 1),
+            malformed("consumes input 0 through a reference view"),
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_access_transforms() {
+        let operation = AsyncCopyOperation::new()
+            .with_source_transforms(vec![dynamic()])
+            .with_destination_transforms(vec![dynamic()]);
+        let source = AtomId::new(0);
+        let destination = AtomId::new(1);
+        let source_index = AtomId::new(2);
+        let destination_index = AtomId::new(3);
+        let instruction = Instruction::new(
+            operation,
+            vec![source, destination, source_index, destination_index],
+            Vec::new(),
+            Vec::new(),
+        );
+        let rewritten = rewrite_reference_access_transforms(&instruction, 0, Vec::new(), Vec::new()).unwrap();
+        assert_eq!(rewritten.inputs(), &[source, destination, destination_index]);
+        assert_eq!(rewritten.operation().reference_access_descriptor(0).unwrap().bindings(), 2..2);
+        assert_eq!(rewritten.operation().reference_access_descriptor(1).unwrap().bindings(), 2..3);
+        assert_eq!(rewritten.provenance(), instruction.provenance());
+        assert_eq!(rewritten.outputs(), instruction.outputs());
+        assert_eq!(rewritten.regions(), instruction.regions());
+        assert_eq!(
+            rewrite_reference_access_transforms(&instruction, 0, Vec::new(), vec![source_index])
+                .unwrap_err()
+                .to_string(),
+            "encountered malformed program: reference transform path has 1 extra bindings",
+        );
+        let malformed = Instruction::new(instruction.operation().clone(), vec![source], Vec::new(), Vec::new());
+        assert_eq!(
+            rewrite_reference_access_transforms(&malformed, 0, Vec::new(), Vec::new()).unwrap_err().to_string(),
+            "encountered malformed program: operation `async_copy` declares reference access at input 1 \
+             but has only 1 inputs",
+        );
+
+        // Rewrites validate downstream layouts before reading any descriptor.
+        let consuming = Instruction::new(
+            DescribedAccess {
+                access: Some((0, ReferenceAccessMode::Consume)),
+                base_input_count: 1,
+                descriptors: vec![Some((vec![index(0, 0)], 1..1))],
+            },
+            vec![source],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            rewrite_reference_access_transforms(&consuming, 0, Vec::new(), Vec::new()).unwrap_err().to_string(),
+            "encountered malformed program: operation `described_access` consumes input 0 through a reference view",
+        );
+    }
+
+    #[test]
+    fn test_infer_reference_view_type() {
+        let input = ArrayType::new_static(DataType::F32, [3, 4]);
+        let transforms = [index(0, 1), dynamic()];
+        let binding = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
+        assert_eq!(
+            infer_reference_view_type(&input, &transforms, &[&binding], ReferenceAccessMode::Read),
+            Ok(ArrayType::scalar(DataType::F32))
+        );
+        assert_eq!(
+            infer_reference_view_type(&input, &transforms, &[], ReferenceAccessMode::Read),
+            Err(TypeError::invalid("reference transform requires 1 bindings but only 0 remain")),
+        );
+        assert_eq!(
+            infer_reference_view_type::<ArrayReferenceTransform>(&input, &[], &[&binding], ReferenceAccessMode::Read),
+            Err(TypeError::invalid("reference transform path has 1 extra bindings")),
+        );
+        assert_eq!(
+            infer_reference_view_type(&input, &[index(0, 1), index(1, 0)], &[], ReferenceAccessMode::Read),
+            Err(TypeError::invalid("reference index axis 1 is out of bounds for rank 1")),
+        );
+    }
+
+    #[test]
+    fn test_infer_reference_view_type_validates_write_back_only_for_mutating_accesses() {
+        /// Transform that selects its input unchanged but whose selection can never be written back.
+        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        struct ReadOnlyTransform;
+
+        impl std::fmt::Display for ReadOnlyTransform {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("read_only")
+            }
+        }
+
+        impl ReferenceTransform for ReadOnlyTransform {
+            type Type = ArrayIrType;
+            type Referent = ArrayType;
+
+            fn binding_count(&self) -> usize {
+                0
+            }
+
+            fn validate_bindings(&self, _input: &ArrayType, _bindings: &[&ArrayIrType]) -> Result<(), TypeError> {
+                Ok(())
+            }
+
+            fn output_type(&self, _input: &ArrayType) -> Result<ArrayType, TypeError> {
+                Err(TypeError::invalid("`read_only` transforms cannot be written back"))
+            }
+
+            fn read_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
+                Ok(input.clone())
+            }
+
+            fn overlap(
+                _type: &ArrayIrType,
+                _lhs: &[BoundReferenceTransform<Self>],
+                _rhs: &[BoundReferenceTransform<Self>],
+            ) -> ReferenceViewOverlap {
+                ReferenceViewOverlap::MayOverlap
+            }
+        }
+
+        // Only read-only accesses skip the write-back validation of `output_type`.
+        let input = ArrayType::new_static(DataType::F32, [3]);
+        assert_eq!(
+            infer_reference_view_type(&input, &[ReadOnlyTransform], &[], ReferenceAccessMode::Read),
+            Ok(input.clone())
+        );
+        for mode in [
+            ReferenceAccessMode::Write,
+            ReferenceAccessMode::ReadWrite,
+            ReferenceAccessMode::Accumulate,
+            ReferenceAccessMode::AtomicAccumulate,
+        ] {
+            assert_eq!(
+                infer_reference_view_type(&input, &[ReadOnlyTransform], &[], mode),
+                Err(TypeError::invalid("`read_only` transforms cannot be written back")),
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_reference_transforms() {
+        // Removing the first axis moves the packed batch axis before the dynamic transform is adjusted.
+        let transforms = [index(0, 1), dynamic()];
+        assert_eq!(
+            batch_reference_transforms(
+                &reference_type([3, 5, 4]),
+                BatchAxis::new(1),
+                &transforms,
+                &[BatchAxis::replicated()]
+            ),
+            Ok((
+                vec![
+                    index(0, 1),
+                    ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Dynamic }
+                ],
+                BatchAxis::new(0),
+            )),
+        );
+        assert_eq!(
+            batch_reference_transforms(
+                &reference_type([3, 5, 4]),
+                BatchAxis::new(1),
+                &transforms,
+                &[BatchAxis::new(0)]
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "batching a reference transform with a mapped index input is not supported".to_string(),
+            }),
+        );
+        assert_eq!(
+            batch_reference_transforms(&reference_type([3, 5, 4]), BatchAxis::new(1), &transforms, &[]),
+            Err(ProgramError::MalformedProgram(
+                "reference transform requires 1 bindings but only 0 remain".to_string()
+            )
+            .into()),
+        );
+    }
+
+    #[test]
+    fn test_bound_reference_transform_transform() {
+        let transform = index(0, 1);
+        let path = TestPath::root().with_transform(transform.clone());
+        assert_eq!(path.bound_transforms()[0].transform(), &transform);
+    }
+
+    #[test]
+    fn test_bound_reference_transform_bindings() {
+        let static_path = TestPath::root().with_transform(index(0, 1));
+        assert_eq!(static_path.bound_transforms()[0].bindings(), &[]);
+
+        // The binding identifies the value supplying the dynamic index; it is not the index's runtime value.
+        let path =
+            TestPath::root().with_bound_transform(dynamic(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))]);
+        assert_eq!(path.bound_transforms()[0].bindings(), &[ValueId::new(RegionId::new(0), AtomId::new(3))]);
+    }
+
+    #[test]
+    fn test_reference_transform_path_root() {
+        let root = TestPath::root();
+        assert!(root.is_root());
+        assert_eq!(root.bound_transforms(), &[]);
+        assert_eq!(root.transforms().count(), 0);
+        assert_eq!(root, TestPath::default());
+
+        assert_eq!(format!("{root:?}"), "ReferenceTransformPath { bound_transforms: [] }");
+    }
+
+    #[test]
+    fn test_reference_transform_path_from_transforms() {
+        let first = ValueId::new(RegionId::new(0), AtomId::new(2));
+        let second = ValueId::new(RegionId::new(0), AtomId::new(3));
+        let transforms = [index(0, 1), dynamic(), dynamic()];
+        assert_eq!(
+            TestPath::from_transforms(&transforms, &[first, second]),
+            Ok(TestPath::root()
+                .with_transform(index(0, 1))
+                .with_bound_transform(dynamic(), vec![first])
+                .with_bound_transform(dynamic(), vec![second])),
+        );
+        assert_eq!(TestPath::from_transforms(&[], &[]), Ok(TestPath::root()));
+        assert_eq!(
+            TestPath::from_transforms(&transforms, &[first]),
+            Err(ProgramError::MalformedProgram(
+                "reference transform requires 1 bindings but only 0 remain".to_string()
+            )),
+        );
+        assert_eq!(
+            TestPath::from_transforms(&[], &[first]),
+            Err(ProgramError::MalformedProgram("reference transform path has 1 extra bindings".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_reference_transform_path_is_root() {
+        assert!(TestPath::root().is_root());
+        assert!(!TestPath::root().with_transform(index(0, 1)).is_root());
+    }
+
+    #[test]
+    fn test_reference_transform_path_bound_transforms() {
+        let path = TestPath::root().with_transform(index(0, 1)).with_transform(index(0, 2));
+        assert_eq!(
+            path.bound_transforms(),
+            &[
+                BoundReferenceTransform { transform: index(0, 1), bindings: Vec::new() },
+                BoundReferenceTransform { transform: index(0, 2), bindings: Vec::new() },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_reference_transform_path_transforms() {
+        let path = TestPath::root().with_transform(index(0, 1)).with_transform(index(0, 2));
+        assert_eq!(path.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &index(0, 2)]);
+        assert_eq!(path.transforms().rev().collect::<Vec<_>>(), vec![&index(0, 2), &index(0, 1)]);
+    }
+
+    #[test]
+    fn test_reference_transform_path_with_bound_transform() {
+        let row = TestPath::root().with_transform(index(0, 1));
+        let symbolic = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let bound = row.with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))]);
+        assert_eq!(bound.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &symbolic]);
+        assert_eq!(bound.bound_transforms()[1].bindings(), &[ValueId::new(RegionId::new(0), AtomId::new(3))]);
+        assert_eq!(row.transforms().collect::<Vec<_>>(), vec![&index(0, 1)]);
+
+        // Equal transforms can select different indices when their source bindings differ.
+        assert_eq!(
+            bound,
+            row.with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))])
+        );
+        assert_ne!(
+            bound,
+            row.with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(4))])
+        );
+        assert_ne!(bound, row.with_bound_transform(symbolic, vec![ValueId::new(RegionId::new(1), AtomId::new(0))]));
+
+        // Paths used as map keys distinguish bindings as well as transforms.
+        let paths = HashMap::from([(bound.clone(), "bound")]);
+        assert_eq!(paths.get(&bound), Some(&"bound"));
+        assert_eq!(paths.get(&row), None);
+    }
+
+    #[test]
+    fn test_reference_transform_path_with_transform() {
+        let root = TestPath::root();
+        let row = root.with_transform(index(0, 1));
+        let element = row.with_transform(index(0, 2));
+
+        // Appending preserves root-to-value order without modifying either source path.
+        assert!(root.is_root());
+        assert_eq!(row.transforms().collect::<Vec<_>>(), vec![&index(0, 1)]);
+        assert_eq!(element.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &index(0, 2)]);
+        assert_eq!(row, TestPath::root().with_transform(index(0, 1)));
+        assert_ne!(row, element);
+        assert_ne!(row, TestPath::root().with_transform(index(1, 1)));
+        assert_eq!(
+            format!("{row:?}"),
+            "ReferenceTransformPath { bound_transforms: [BoundReferenceTransform { transform: Index { axis: 0, index: \
+             Static(1) }, bindings: [] }] }",
+        );
+    }
+
+    #[test]
+    fn test_reference_transform_path_overlap() {
+        // The path query delegates to the family's rule against the caller-supplied root type: two different rows are
+        // disjoint, a row is the same as itself, and the complete root may overlap with any row but is the same as
+        // itself.
+        let root = reference_type([2, 3]);
+        let row_0 = TestPath::root().with_transform(index(0, 0));
+        let row_1 = TestPath::root().with_transform(index(0, 1));
+        assert_eq!(row_0.overlap(&row_1, &root), ReferenceViewOverlap::Disjoint);
+        assert_eq!(row_0.overlap(&TestPath::root().with_transform(index(0, 0)), &root), ReferenceViewOverlap::Same);
+        assert_eq!(TestPath::root().overlap(&row_0, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(TestPath::root().overlap(&TestPath::root(), &root), ReferenceViewOverlap::Same);
+
+        // Symbolic transforms agree when their input bindings agree. Different bindings may still select the same row.
+        let symbolic =
+            TestPath::root().with_bound_transform(dynamic(), vec![ValueId::new(RegionId::new(0), AtomId::new(0))]);
+        let other =
+            TestPath::root().with_bound_transform(dynamic(), vec![ValueId::new(RegionId::new(1), AtomId::new(0))]);
+        assert_eq!(symbolic.overlap(&symbolic, &root), ReferenceViewOverlap::Same);
+        assert_eq!(symbolic.overlap(&TestPath::root(), &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(symbolic.overlap(&row_1, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(symbolic.overlap(&other, &root), ReferenceViewOverlap::MayOverlap);
+    }
+}

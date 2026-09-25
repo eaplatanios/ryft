@@ -12,8 +12,8 @@ use crate::programs::types::{Type, TypeError, TypeRefinements};
 /// therefore does not affect structural equality, hashing, or retained-program specialization. Reference compatibility
 /// is exact in that a reference cannot implicitly broadcast or promote its storage, while refinement and identity
 /// handling delegate to the referenced type. For [`ArrayType`](crate::ArrayType)s, exactness deliberately spans the
-/// referenced value's optional layout, sharding, and memory metadata as well: the external-state mutation contract requires
-/// exact physical referent compatibility, so a metadata-tolerant relation would overpromise.
+/// referenced value's optional layout, sharding, and memory metadata as well: the external-state mutation contract
+/// requires exact physical referent compatibility, so a metadata-tolerant relation would overpromise.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceType<T: Type> {
     /// [`Type`] of the referenced value.
