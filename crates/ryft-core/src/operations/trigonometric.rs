@@ -1,23 +1,23 @@
 //! Operations that compute trigonometric and hyperbolic functions elementwise. Each operation is defined by an
-//! [`Operation`](crate::Operation) type (e.g., [`SinOperation`]) together with a value capability trait (e.g., [`Sin`])
-//! whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code executes
-//! immediately or records into a program depending on the value it runs on:
+//! [`Operation`](crate::Operation) type (e.g., [`SinOperation`]) together with a value capability trait (e.g.,
+//! [`Sin`]) whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code
+//! executes immediately or records into a program depending on the value it runs on:
 //!
 //!   - [`Sin`] and [`Cos`] compute the sine and cosine of angles measured in radians.
 //!   - [`Atan2`] computes the two-argument arc tangent (i.e., `(y, x) ↦ atan2(y, x)`, the angle of the point `(x, y)`
 //!     in its correct quadrant), with the principal value `-i · log((x + i · y) / sqrt(x² + y²))` for complex values.
 //!   - [`Tanh`] computes the hyperbolic tangent (i.e., `x ↦ tanh(x)`).
 //!
-//! Floating-point and complex inputs are supported, as for StableHLO's
+//! Floating-point and complex inputs are supported, same as for StableHLO's
 //! [`sine`](https://openxla.org/stablehlo/spec#sine), [`cosine`](https://openxla.org/stablehlo/spec#cosine),
-//! [`atan2`](https://openxla.org/stablehlo/spec#atan2), and [`tanh`](https://openxla.org/stablehlo/spec#tanh). Unary
-//! operations preserve the metadata of their input, and [`Atan2`] promotes the element types and broadcasts the
+//! [`atan2`](https://openxla.org/stablehlo/spec#atan2), and [`tanh`](https://openxla.org/stablehlo/spec#tanh).
+//! Unary operations preserve the metadata of their input, and [`Atan2`] promotes the element types and broadcasts the
 //! shapes of its inputs. Inputs that carry partial sums over unreduced mesh axes are rejected. The derivatives of sine,
 //! cosine, and the hyperbolic tangent are the cosine, the negated sine, and `1 - tanh(x)²`, and the derivative of
 //! `atan2(y, x)` is `(x · dy - y · dx) / (x² + y²)`. Every operation is nonlinear, so reverse-mode differentiation
 //! transposes its linearization instead.
 //!
-//! # Example
+//! # Examples
 //!
 //! ```rust
 //! # use ryft_core::{Array, Cos, ProgramError, Sin};
@@ -41,8 +41,6 @@ use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::constants::one_like::OneLike;
 use crate::programs::{MaybeZero, ProgramError, Type, Typed};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`SinOperation`].
 pub const SIN_OPERATION_NAME: &str = "sin";
 
@@ -50,8 +48,10 @@ define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise sine of a floating-point or complex value while
     /// preserving its array metadata. Array inputs that still carry partial sums are rejected.
-    SinOperation, SIN_OPERATION_NAME,
-    Sin, sin,
+    SinOperation,
+    SIN_OPERATION_NAME,
+    Sin,
+    sin,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -68,18 +68,18 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @unary
     /// Represents the ability to compute elementwise sines. Concrete arrays compute immediately while context-carrying
-    /// values apply [`SinOperation`] through their context. Refer to that operation for supported types and
-    /// exceptional-value behavior.
+    /// values apply [`SinOperation`] through their context.
     Sin,
-    /// Computes the sine of each floating-point or complex element; real angles are measured in radians. Returns an
-    /// error if the input types or metadata are unsupported.
+    /// Computes the sine of each floating-point or complex element; real angles are measured in radians.
+    /// Returns an error if the input types or metadata are unsupported.
     sin,
     SinOperation,
 );
 
 impl_array_elementwise_operation!(
     @unary
-    Sin, sin,
+    Sin,
+    sin,
     operation = "sin",
     inputs = @float,
     checks = [@no_unreduced],
@@ -88,9 +88,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Sin`] for one host primitive type.
 macro_rules! impl_sin_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Sin for $type {
+            #[inline]
             fn sin(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::sin(*self))
             }
@@ -101,8 +101,6 @@ macro_rules! impl_sin_for_primitive {
 impl_sin_for_primitive!(f32);
 impl_sin_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`CosOperation`].
 pub const COS_OPERATION_NAME: &str = "cos";
 
@@ -110,8 +108,10 @@ define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise cosine of a floating-point or complex value while
     /// preserving its array metadata. Array inputs that still carry partial sums are rejected.
-    CosOperation, COS_OPERATION_NAME,
-    Cos, cos,
+    CosOperation,
+    COS_OPERATION_NAME,
+    Cos,
+    cos,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -127,19 +127,19 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @unary
-    /// Represents the ability to compute elementwise cosines. Concrete arrays compute immediately while context-
-    /// carrying values apply [`CosOperation`] through their context. Refer to that operation for supported types and
-    /// exceptional-value behavior.
+    /// Represents the ability to compute elementwise cosines. Concrete arrays compute immediately while
+    /// context-carrying values apply [`CosOperation`] through their context.
     Cos,
-    /// Computes the cosine of each floating-point or complex element; real angles are measured in radians. Returns an
-    /// error if the input types or metadata are unsupported.
+    /// Computes the cosine of each floating-point or complex element; real angles are measured in radians.
+    /// Returns an error if the input types or metadata are unsupported.
     cos,
     CosOperation,
 );
 
 impl_array_elementwise_operation!(
     @unary
-    Cos, cos,
+    Cos,
+    cos,
     operation = "cos",
     inputs = @float,
     checks = [@no_unreduced],
@@ -148,9 +148,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Cos`] for one host primitive type.
 macro_rules! impl_cos_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Cos for $type {
+            #[inline]
             fn cos(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::cos(*self))
             }
@@ -161,7 +161,7 @@ macro_rules! impl_cos_for_primitive {
 impl_cos_for_primitive!(f32);
 impl_cos_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`Atan2Operation`].
 pub const ATAN2_OPERATION_NAME: &str = "atan2";
