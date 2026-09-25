@@ -2023,6 +2023,10 @@ macro_rules! impl_differentiable_operation {
 ///   - `$operation_binding`: Optional name, written before a unary rule's input pattern (e.g.,
 ///     `|operation, (input, input_tangent)| ...`), bound to the operation whose JVP is being evaluated, so that
 ///     the rule can read its configuration (e.g., the result accuracy that a JVP forwards to its coefficient).
+///   - `$operands_binding`: Name used by the alternative unary form `|operation, operands| ...`, bound to the
+///     lazy [`UnaryElementwiseJvpOperands`](crate::UnaryElementwiseJvpOperands) accessor whose `input_primal`,
+///     `input_tangent`, and `output_primal_at_tangent_type` functions align only the values that the chosen
+///     formula reads.
 ///   - `$output_primal`: Optional name following `->`, bound to the primal output evaluated at its tangent type.
 ///   - `$left_primal`, `$right_primal`: Names bound to aligned binary input primals. `_` omits a primal without
 ///     evaluating it.
@@ -2384,10 +2388,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     // transposition, unlike binary rules with structured knownness cases.
     (
         @jvp_ready [unary] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
-        {
-            |$($operation_binding:ident,)? ($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?|
-            $term:expr
-        }
+        { $($rule:tt)* }
         transpose = @nonlinear $(,)?
     ) => {
         $crate::impl_differentiable_operation! {
@@ -2417,15 +2418,9 @@ macro_rules! impl_differentiable_elementwise_operation {
                         Ok(outputs.remove(0))
                     },
                     |operands| {
-                        $(let $operation_binding = operation;)?
                         $crate::impl_differentiable_elementwise_operation! {
-                            @bind_unary_input_primal operands, $input_primal
+                            @unary_rule operation, operands, $($rule)*
                         }
-                        $($crate::impl_differentiable_elementwise_operation! {
-                            @bind_unary_output_primal operands, $output_primal
-                        })?
-                        let $input_tangent = operands.input_tangent()?;
-                        Ok($term)
                     },
                 )
             }
@@ -3143,6 +3138,36 @@ macro_rules! impl_differentiable_elementwise_operation {
             }
         }
     };
+
+    // This internal helper branch evaluates the ordinary unary rule form, which names the input primal, the live input
+    // tangent, and optionally the operation and the output primal. Named primals are bound eagerly when the rule runs.
+    (
+        @unary_rule $operation:ident, $operands:ident,
+        |$($operation_binding:ident,)? ($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?|
+        $term:expr
+    ) => {{
+        $(let $operation_binding = $operation;)?
+        $crate::impl_differentiable_elementwise_operation! {
+            @bind_unary_input_primal $operands, $input_primal
+        }
+        $($crate::impl_differentiable_elementwise_operation! {
+            @bind_unary_output_primal $operands, $output_primal
+        })?
+        let $input_tangent = $operands.input_tangent()?;
+        Ok($term)
+    }};
+
+    // This internal helper branch evaluates the unary rule form that receives the operation and the lazy operand
+    // accessor, so that rules whose formula depends on the operation's configuration only align the primals they use.
+    (
+        @unary_rule $operation:ident, $operands:ident,
+        |$operation_binding:ident, $operands_binding:ident|
+        $term:expr
+    ) => {{
+        let $operation_binding = $operation;
+        let $operands_binding = $operands;
+        Ok($term)
+    }};
 
     // This internal helper branch handles `_` for a unary input primal by emitting no binding and, importantly,
     // no accessor call. Avoiding the call preserves the DSL's promise that omitted primals are not evaluated

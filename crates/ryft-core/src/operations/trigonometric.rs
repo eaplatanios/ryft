@@ -498,7 +498,9 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                PLACEHOLDER
+                lambda %0:f32[] .
+                let %1:f32[] = sin [accuracy=highest] %0
+                in (%1)
             "}
             .trim_end(),
         );
@@ -601,7 +603,11 @@ mod tests {
                 primal_outputs = [Array::scalar(2.0f64.sin()).unwrap()],
                 tangent_outputs = [Array::scalar(3.0 * 2.0f64.cos()).unwrap()],
                 jvp = indoc! {"
-                    PLACEHOLDER
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = sin [accuracy=highest] %0
+                        %3:f64[] = cos [accuracy=highest] %0
+                        %4:f64[] = mul %3 %1
+                    in (%2, %4)
                 "},
             }],
         );
@@ -818,7 +824,12 @@ mod tests {
                 primal_outputs = [Array::scalar(2.0f64.cos()).unwrap()],
                 tangent_outputs = [Array::scalar(-3.0 * 2.0f64.sin()).unwrap()],
                 jvp = indoc! {"
-                    PLACEHOLDER
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = cos [accuracy=highest] %0
+                        %3:f64[] = sin [accuracy=highest] %0
+                        %4:f64[] = mul %3 %1
+                        %5:f64[] = neg %4
+                    in (%2, %5)
                 "},
             }],
         );
@@ -1329,7 +1340,19 @@ mod tests {
                 primal_outputs = [Array::scalar(0.7f64.tanh()).unwrap()],
                 tangent_outputs = [Array::scalar(expected_tangent).unwrap()],
                 jvp = indoc! {"
-                    PLACEHOLDER
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = tanh [accuracy=highest] %0
+                        %3:f64[] = constant [value=2.0]
+                        %4:f64[] = mul %3 %0
+                        %5:f64[] = logistic [accuracy=highest] %4
+                        %6:f64[] = constant [value=-2.0]
+                        %7:f64[] = mul %6 %0
+                        %8:f64[] = logistic [accuracy=highest] %7
+                        %9:f64[] = constant [value=4.0]
+                        %10:f64[] = mul %5 %8
+                        %11:f64[] = mul %9 %10
+                        %12:f64[] = mul %1 %11
+                    in (%2, %12)
                 "},
             }],
         );
@@ -1422,7 +1445,15 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                PLACEHOLDER
+                lambda %0:f8e8m0fnu[], %1:f32[] .
+                let %2:f8e8m0fnu[] = tanh %0
+                    %3:f32[] = convert_element_type [data_type=f32] %0
+                    %4:f32[] = tanh %3
+                    %5:f32[] = one_like %4
+                    %6:f32[] = mul %4 %4
+                    %7:f32[] = sub %5 %6
+                    %8:f32[] = mul %7 %1
+                in (%2, %8)
             "}
             .trim_end(),
         );
