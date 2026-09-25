@@ -1333,6 +1333,26 @@ mod tests {
         assert_eq!(comparisons.r#type().as_ref(), &ArrayType::new_static(DataType::Boolean, [2, 3]));
         assert_eq!(comparisons.elements::<bool>(), Ok(vec![false, true, true, false, false, true]));
 
+        // Broadcasting reads negative-stride inputs in logical order.
+        let strided_left = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-16, 8]))),
+            &[0.0f64, 1.0],
+        )
+        .unwrap();
+        let strided_right = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![24, -8]))),
+            &[1.0f64, 1.0, -1.0],
+        )
+        .unwrap();
+        assert_eq!(
+            strided_left.map_element_pairs::<f64, f64>(
+                &strided_right,
+                ArrayType::new_static(DataType::F64, [2, 3]),
+                |left, right| Ok(left + right),
+            ),
+            Ok(Array::matrix(2, 3, vec![1.0f64, 1.0, -1.0, 2.0, 2.0, 0.0]).unwrap()),
+        );
+
         // Callers must supply the actual input codec, output codec, and broadcast shape.
         assert!(matches!(
             left.map_element_pairs::<i64, bool>(

@@ -353,13 +353,30 @@ macro_rules! dispatch_on_array_element_type {
 ///     [`check_types!`](crate::check_types). `@numeric` accepts all numeric types, `@float` excludes integers, and
 ///     `@real` excludes complex values. For example, `@float @real` accepts only real floating-point values and
 ///     `@numeric @real` also accepts integers. Order and repetition do not change the accepted types. This macro's
-///     numeric base universe always excludes Booleans and payload-free types, including for empty arrays.
+///     numeric base universe excludes Booleans and payload-free types, including for empty arrays, unless the sole
+///     selector is `@boolean_or_numeric`, which extends it with Booleans.
 ///   - `checks = $checks`: Ordered list of array metadata checks from [`check_types!`](crate::check_types), typically
 ///     `@no_unreduced`, `@same_unreduced_axes`, or `@same_reduced_axes`. An empty list applies no additional checks.
 ///   - `|input| body` or `|lhs, rhs| body`: Names for decoded scalar operands, followed by an expression returning
 ///     their element type wrapped in `Result<_, ProgramError>`. The body must compile for every type in `inputs`.
 #[macro_export]
 macro_rules! impl_array_elementwise_operation {
+    // Validate the Boolean-extended universe on its own, since intersecting it with the numeric base would drop
+    // Booleans again.
+    (@check [@boolean_or_numeric] $operation:expr, $data_types:expr $(,)?) => {
+        $crate::macros::check_types!(@boolean_or_numeric, $operation, $data_types);
+    };
+
+    // Validate every other selector list within the numeric base universe.
+    (@check [$(@$selector:ident)+] $operation:expr, $data_types:expr $(,)?) => {
+        $crate::macros::check_types!(@numeric $(@$selector)+, $operation, $data_types);
+    };
+
+    // Booleans extend the numeric base universe, so their kernels dispatch over every element type.
+    (@dispatch [@boolean_or_numeric] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::dispatch_on_array_element_type!($data_type, |$element| $body)
+    };
+
     // Intersect selectors for dispatch. Numeric is the base universe; float and real each narrow it independently.
     (@dispatch [$(@$selector:ident)+] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::impl_array_elementwise_operation!(
@@ -430,7 +447,12 @@ macro_rules! impl_array_elementwise_operation {
                 let data_type = input_type.data_type();
 
                 // Validate before traversal so empty arrays satisfy the same contract as non-empty arrays.
-                $crate::macros::check_types!(@numeric $(@$selector)+, operation, [data_type]);
+                $crate::arrays::macros::impl_array_elementwise_operation!(
+                    @check [$(@$selector)+]
+                    operation,
+                    [data_type],
+                );
+
                 $($crate::macros::check_types!(@$check, operation, [input_type.as_ref()]);)*
 
                 // The mapped output retains the input layout. Empty traversal allocates storage without evaluating
@@ -465,9 +487,12 @@ macro_rules! impl_array_elementwise_operation {
 
                 // Validate the original inputs before promotion or the empty result shortcut, so neither can
                 // hide an unsupported input type or invalid reduction metadata.
-                $crate::macros::check_types!(
-                    @numeric $(@$selector)+, operation, [lhs_type.data_type(), rhs_type.data_type()],
+                $crate::arrays::macros::impl_array_elementwise_operation!(
+                    @check [$(@$selector)+]
+                    operation,
+                    [lhs_type.data_type(), rhs_type.data_type()],
                 );
+
                 $($crate::macros::check_types!(@$check, operation, [lhs_type.as_ref(), rhs_type.as_ref()]);)*
 
                 // Eager inputs have no enclosing binder to insert variation transitions. Treat unsharded inputs

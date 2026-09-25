@@ -2068,6 +2068,27 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
             }
 
             fn sin(self) -> Result<Self, ProgramError> {
+                // Scale each component before forming the growing exponential: the hyperbolic factor
+                // alone can overflow even when multiplication by the trigonometric factor remains finite.
+                if self.im.abs() > 20.0 {
+                    let half_exponential = (self.im.abs() / 2.0).exp();
+                    let component = |factor: $component| {
+                        if factor == 0.0 {
+                            factor
+                        } else if half_exponential.is_infinite() {
+                            (self.im.abs() + factor.abs().ln() - std::f64::consts::LN_2 as $component)
+                                .exp()
+                                .copysign(factor)
+                        } else {
+                            ((factor * half_exponential) * 0.5) * half_exponential
+                        }
+                    };
+                    return Ok(Complex::new(
+                        if self.re == 0.0 { 0.0 } else { component(self.re.sin()) },
+                        component(self.re.cos() * self.im.signum()),
+                    ));
+                }
+
                 let expm1_imaginary = self.im.exp_m1();
                 let expm1_negative_imaginary = (-self.im).exp_m1();
                 let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
@@ -2077,6 +2098,27 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
             }
 
             fn cos(self) -> Result<Self, ProgramError> {
+                // Scale each component before forming the growing exponential: the hyperbolic factor
+                // alone can overflow even when multiplication by the trigonometric factor remains finite.
+                if self.im.abs() > 20.0 {
+                    let half_exponential = (self.im.abs() / 2.0).exp();
+                    let component = |factor: $component| {
+                        if factor == 0.0 {
+                            factor
+                        } else if half_exponential.is_infinite() {
+                            (self.im.abs() + factor.abs().ln() - std::f64::consts::LN_2 as $component)
+                                .exp()
+                                .copysign(factor)
+                        } else {
+                            ((factor * half_exponential) * 0.5) * half_exponential
+                        }
+                    };
+                    return Ok(Complex::new(
+                        component(self.re.cos()),
+                        if self.re == 0.0 { 0.0 } else { component(-self.re.sin() * self.im.signum()) },
+                    ));
+                }
+
                 let expm1_imaginary = self.im.exp_m1();
                 let expm1_negative_imaginary = (-self.im).exp_m1();
                 let sinh_imaginary = (expm1_imaginary - expm1_negative_imaginary) / 2.0;
@@ -2094,7 +2136,26 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
 
             #[inline]
             fn tanh(self) -> Result<Self, ProgramError> {
-                Ok(Complex::tanh(self))
+                // Normalize by the growing exponential away from the imaginary axis. Its reciprocal decays to zero
+                // without overflowing. Near the imaginary axis, retain the small real component and avoid doubling
+                // the imaginary argument, which can itself overflow.
+                if self.re.is_infinite() {
+                    return Ok(Complex::new(self.re.signum(), (0.0 as $component).copysign(self.im)));
+                }
+                if self.re.abs() > 1.0 {
+                    let exponential = (-2.0 * self.re.abs()).exp();
+                    let (sine, cosine) = self.im.sin_cos();
+                    let denominator =
+                        1.0 + 2.0 * exponential * (cosine * cosine - sine * sine) + exponential * exponential;
+                    return Ok(Complex::new(
+                        ((1.0 - exponential * exponential) / denominator).copysign(self.re),
+                        (2.0 * exponential) * (2.0 * sine * cosine) / denominator,
+                    ));
+                }
+                let sinh_real = self.re.sinh();
+                let (sine, cosine) = self.im.sin_cos();
+                let denominator = sinh_real * sinh_real + cosine * cosine;
+                Ok(Complex::new(sinh_real * self.re.cosh() / denominator, sine * cosine / denominator))
             }
 
             fn atan2(self, x: Self) -> Result<Self, ProgramError> {
@@ -3535,6 +3596,25 @@ mod tests {
     }
 
     #[test]
+    fn test_floating_point_array_element_sin_complex_large_imaginary() {
+        // These independently rounded values remain finite beyond the range of the unscaled exponential.
+        let output = FloatingPointArrayElement::sin(Complex::new(-0f64, 710.0)).unwrap();
+        assert_eq!(output.re.to_bits(), 0f64.to_bits());
+        assert_relative_eq!(output.im, 1.1169973830808555e308, epsilon = 0.0, max_relative = 2e-15);
+        let output = FloatingPointArrayElement::sin(Complex::new(0f32, -89.0)).unwrap();
+        assert_eq!(output.re, 0.0);
+        assert_relative_eq!(output.im, -2.2448064e38, epsilon = 0.0, max_relative = 2e-7);
+
+        // A tiny real component can keep one output finite even when the hyperbolic factor overflows.
+        let output = FloatingPointArrayElement::sin(Complex::new(1e-300f64, 1400.0)).unwrap();
+        assert_relative_eq!(output.re, 5.143333304259946e307, epsilon = 0.0, max_relative = 2e-15);
+        assert_eq!(output.im, f64::INFINITY);
+        let output = FloatingPointArrayElement::sin(Complex::new(f64::from_bits(1), 1430.0)).unwrap();
+        assert_relative_eq!(output.re, 2.7155873871042953e297, epsilon = 0.0, max_relative = 2e-13);
+        assert_eq!(output.im, f64::INFINITY);
+    }
+
+    #[test]
     fn test_floating_point_array_element_cos() {
         assert_eq!(FloatingPointArrayElement::cos(0.0f32), Ok(1.0));
         assert_eq!(FloatingPointArrayElement::cos(std::f64::consts::PI), Ok(-1.0));
@@ -3542,6 +3622,19 @@ mod tests {
         assert_eq!(FloatingPointArrayElement::cos(f4e2m1fn::zero().unwrap()), f4e2m1fn::one());
         assert!(FloatingPointArrayElement::cos(f64::NAN).unwrap().is_nan());
         assert_eq!(FloatingPointArrayElement::cos(Complex::new(0.0f32, 1000.0)), Ok(Complex::new(f32::INFINITY, 0.0)),);
+    }
+
+    #[test]
+    fn test_floating_point_array_element_cos_complex_large_imaginary() {
+        let output = FloatingPointArrayElement::cos(Complex::new(-0f64, 710.0)).unwrap();
+        assert_relative_eq!(output.re, 1.1169973830808555e308, epsilon = 0.0, max_relative = 2e-15);
+        assert_eq!(output.im.to_bits(), 0f64.to_bits());
+        let output = FloatingPointArrayElement::cos(Complex::new(0f32, 89.0)).unwrap();
+        assert_relative_eq!(output.re, 2.2448064e38, epsilon = 0.0, max_relative = 2e-7);
+        assert_eq!(output.im, 0.0);
+        let output = FloatingPointArrayElement::cos(Complex::new(1e-300f64, 1400.0)).unwrap();
+        assert_eq!(output.re, f64::INFINITY);
+        assert_relative_eq!(output.im, -5.143333304259946e307, epsilon = 0.0, max_relative = 2e-15);
     }
 
     #[test]
@@ -3569,6 +3662,36 @@ mod tests {
         assert_eq!(FloatingPointArrayElement::tanh(f32::NEG_INFINITY), Ok(-1.0));
         assert!(FloatingPointArrayElement::tanh(f64::NAN).unwrap().is_nan());
         assert_eq!(FloatingPointArrayElement::tanh(Complex::new(0.0f32, 0.0)), Ok(Complex::new(0.0, 0.0)));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_tanh_complex() {
+        assert_eq!(FloatingPointArrayElement::tanh(Complex::new(400f64, 1.0)), Ok(Complex::new(1.0, 0.0)));
+        assert_eq!(FloatingPointArrayElement::tanh(Complex::new(-100f32, 1.0)), Ok(Complex::new(-1.0, 0.0)));
+        assert_eq!(FloatingPointArrayElement::tanh(Complex::new(f64::INFINITY, 1.0)), Ok(Complex::new(1.0, 0.0)),);
+        assert_eq!(
+            FloatingPointArrayElement::tanh(Complex::new(f32::NEG_INFINITY, f32::NAN)),
+            Ok(Complex::new(-1.0, 0.0)),
+        );
+
+        // The unscaled branch retains inputs whose cubic correction is too small to represent.
+        assert_eq!(
+            FloatingPointArrayElement::tanh(Complex::new(1e-200f64, -1e-200)),
+            Ok(Complex::new(1e-200, -1e-200)),
+        );
+        let output = FloatingPointArrayElement::tanh(Complex::new(2f64, 1.0)).unwrap();
+        assert_relative_eq!(output.re, 1.0147936161466335, epsilon = 0.0, max_relative = 2e-15);
+        assert_relative_eq!(output.im, 0.03381282607989669, epsilon = 0.0, max_relative = 2e-15);
+        // Finite imaginary arguments must not overflow merely because a double-angle identity is used.
+        let output = FloatingPointArrayElement::tanh(Complex::new(0.5f64, 1e308)).unwrap();
+        assert_relative_eq!(output.re, 0.5512345821481115, epsilon = 0.0, max_relative = 2e-15);
+        assert_relative_eq!(output.im, -0.3791059869481058, epsilon = 0.0, max_relative = 2e-15);
+        let output = FloatingPointArrayElement::tanh(Complex::new(2f64, f64::INFINITY)).unwrap();
+        assert!(output.re.is_nan());
+        assert!(output.im.is_nan());
+        let output = FloatingPointArrayElement::tanh(Complex::new(f64::NAN, 1.0)).unwrap();
+        assert!(output.re.is_nan());
+        assert!(output.im.is_nan());
     }
 
     #[test]

@@ -49,6 +49,8 @@ macro_rules! check_count {
 ///
 ///   - `@same`: Requires the provided expected and actual flat type signatures to be identical.
 ///   - `@numeric`: Accepts integer, floating-point, and complex [`DataType`](crate::DataType)s.
+///   - `@boolean_or_numeric`: Accepts [`DataType::Boolean`](crate::DataType::Boolean) together with every type that
+///     `@numeric` accepts.
 ///   - `@float`: Accepts floating-point and complex [`DataType`](crate::DataType)s.
 ///   - `@real`: Excludes complex [`DataType`](crate::DataType)s and is intended to refine `@numeric` or `@float`.
 ///   - `@no_unreduced`: Rejects [`ArrayType`](crate::ArrayType)s carrying any unreduced mesh axes.
@@ -147,6 +149,14 @@ macro_rules! check_types {
     // and complex values. It recurses so later selectors can refine that universe without duplicating its variant list.
     (@matches_data_type $input_type:ident; @numeric $($selectors:tt)*) => {
         $input_type.is_numeric() && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
+    };
+
+    // This internal helper accepts the numeric universe extended with Booleans, which is the element domain of
+    // operations such as the extrema that order Booleans as `false < true`. It recurses so that later selectors
+    // can refine that universe.
+    (@matches_data_type $input_type:ident; @boolean_or_numeric $($selectors:tt)*) => {
+        ($input_type.is_boolean() || $input_type.is_numeric())
+            && $crate::check_types!(@matches_data_type $input_type; $($selectors)*)
     };
 
     // This internal helper accepts real floating-point and complex types as one float-capable universe. Keeping this
