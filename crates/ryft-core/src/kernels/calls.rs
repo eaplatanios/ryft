@@ -23,7 +23,7 @@ use crate::kernels::validation::{
 };
 use crate::operations::attention::AttentionConfiguration;
 use crate::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
-use crate::operations::{DimensionFromScalar, DimensionFromScalarOperation, PadOperation};
+use crate::operations::{DimensionFromScalar, DimensionFromScalarOperation, LINEAR_CALL_OPERATION_NAME, PadOperation};
 use crate::parameters::Placeholder;
 use crate::programs::{
     Atom, FlatProgram, InputRegionProvenance, Operation, OperationFormatter, ProgramBuilder, ProgramError,
@@ -1018,9 +1018,10 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                     Self::attention_semantic_fields(key, operation.configuration())
                 }
                 ArrayOperation::LinearCall(operation) if operation.is_transpose_only() => {
-                    return Err(TypeError::invalid(
-                        "transpose-only linear calls have no kernel semantic descriptor encoding",
-                    ));
+                    return Err(TypeError::invalid(format!(
+                        "transpose-only `{LINEAR_CALL_OPERATION_NAME}` operations have no kernel semantic descriptor \
+                         encoding",
+                    )));
                 }
                 ArrayOperation::Zero(_)
                 | ArrayOperation::ZeroLike(_)
@@ -1113,9 +1114,9 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             },
             ArrayIrOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
             ArrayIrOperation::LinearCall(operation) if operation.is_transpose_only() => {
-                return Err(TypeError::invalid(
-                    "transpose-only linear calls have no kernel semantic descriptor encoding",
-                ));
+                return Err(TypeError::invalid(format!(
+                    "transpose-only `{LINEAR_CALL_OPERATION_NAME}` operations have no kernel semantic descriptor encoding",
+                )));
             }
             ArrayIrOperation::Zero(_)
             | ArrayIrOperation::One(_)

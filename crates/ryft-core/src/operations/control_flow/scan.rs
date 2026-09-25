@@ -3923,7 +3923,7 @@ mod tests {
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceSource, ReferenceType, ViewedReference,
+        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceSource, ReferenceType, ReferenceView,
     };
     use crate::tracing::{DomainTracingContext, NestedTracingContext, Trace, Tracer, TracingContext};
 
@@ -5687,7 +5687,7 @@ mod tests {
                 let body = inputs[0].context().clone();
                 let root = StagingContext::constant(&body, body.capture(stack.clone())?);
                 let index = StagingContext::constant(&body, body.capture(index.clone())?);
-                ViewedReference::new(root)?.dynamic_index(0, &index)?.read()
+                ReferenceView::new(root)?.dynamic_index(0, &index)?.read()
             },
             vec![ArrayType::scalar(DataType::I64).into()],
         )

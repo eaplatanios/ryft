@@ -26,7 +26,7 @@ use crate::operations::manipulation::scattering::{
 };
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::references::{ReferenceAddUpdate, ReferenceRead, ReferenceSwap, ReferenceWrite};
-use crate::programs::{ProgramError, ReferenceType, Type, TypeError, Typed, Value, ValueProjection, ViewedReference};
+use crate::programs::{ProgramError, ReferenceType, ReferenceView, Type, TypeError, Typed, Value, ValueProjection};
 
 /// A host integer that can be represented exactly as an indexing coordinate, slice endpoint, or stride. The [`index!`]
 /// macro and range conversions into [`IndexSelector`] use this trait to accept integer types such as `usize` without
@@ -1369,7 +1369,7 @@ impl<V: Value<Type = ArrayIrType>> Indexed<'_, '_, '_, V, ArrayIrType> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn view(&self) -> Result<ViewedReference<V, V, ArrayReferenceTransform>, ProgramError> {
+    pub fn view(&self) -> Result<ReferenceView<V, V, ArrayReferenceTransform>, ProgramError> {
         let input_type = self.input.r#type();
         let referent = <&ReferenceType<ArrayType>>::try_from(input_type.as_ref())?.referent();
         let rank = referent.rank();
@@ -1482,7 +1482,7 @@ impl<V: Value<Type = ArrayIrType>> Indexed<'_, '_, '_, V, ArrayIrType> {
 
         // Windows are applied first through one rank-preserving slice over every axis, and then the indexed axes
         // are removed from the sliced view in ascending order, adjusting for the axes removed before them.
-        let mut view = ViewedReference::new(self.input.clone())?;
+        let mut view = ReferenceView::new(self.input.clone())?;
         if selections.iter().any(|selection| matches!(selection, ReferenceAxisSelection::Window(_))) {
             let axes = selections
                 .iter()

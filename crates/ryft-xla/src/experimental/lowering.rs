@@ -29,15 +29,15 @@ use ryft_core::{
     ConvertElementTypeOperation, CosOperation, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation,
     DimensionType, DimensionValue, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass,
     EffectClasses, ErfOperation, ExpOperation, ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation,
-    Instruction, IotaOperation, Layout, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalMesh,
-    LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
-    PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError,
-    ProjectedValue, Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReductionKind,
-    RegionId, RegionRef, RemOperation, ReshapeOperation, ReverseOperation, RoundOperation, RsqrtOperation,
-    SCAN_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, Shape,
-    Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation,
-    SubOperation, TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME,
-    WhileOperation,
+    Instruction, IotaOperation, LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation, LogAddExpOperation, LogOperation,
+    LogicalMesh, LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation,
+    Operation, PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program,
+    ProgramError, ProjectedValue, Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation,
+    ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation, ReverseOperation, RoundOperation,
+    RsqrtOperation, SCAN_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation,
+    ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation,
+    SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed,
+    Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -10002,13 +10002,13 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::LinearCall(operation) => {
             if operation.is_transpose_only() {
                 return Err(ProgramError::UnsupportedOperation {
-                    message: format!("operation `{}` cannot be lowered to StableHLO", operation.name()),
+                    message: format!("a transpose-only `{LINEAR_CALL_OPERATION_NAME}` cannot be lowered to StableHLO"),
                 }
                 .into());
             }
             let [forward, _transpose] = regions else {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("linear_call expected 2 attached regions but got {}", regions.len()),
+                    op: format!("`{LINEAR_CALL_OPERATION_NAME}` expected 2 attached regions but got {}", regions.len()),
                 });
             };
             lower_nested_program_inline(
@@ -16607,7 +16607,7 @@ mod tests {
         assert!(matches!(
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
             Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == "operation `transpose_only_linear_call` cannot be lowered to StableHLO",
+                if message == "a transpose-only `linear_call` cannot be lowered to StableHLO",
         ));
     }
 

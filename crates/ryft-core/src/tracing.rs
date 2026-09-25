@@ -1073,8 +1073,8 @@ mod tests {
     use crate::operations::{AddOperation, NegOperation, OneLike, OneOperation, ZeroLike, ZeroOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{
-        AtomId, Operation, ProgramError, ReferenceBoundary, ReferenceType, RegionInterface, TypeError, Typed,
-        ViewedReference,
+        AtomId, Operation, ProgramError, ReferenceBoundary, ReferenceType, ReferenceView, RegionInterface, TypeError,
+        Typed,
     };
     use crate::tests::{TestArrayContext, TestArrayOperation};
 
@@ -1513,7 +1513,7 @@ mod tests {
     fn test_tracing_context_reference_identity() {
         let context = DomainTracingContext::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::new();
         let root = context.input(ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))));
-        let view = ViewedReference::<_, _, ArrayReferenceTransform>::new(root.clone())
+        let view = ReferenceView::<_, _, ArrayReferenceTransform>::new(root.clone())
             .unwrap()
             .dynamic_index(0, &context.constant(ArrayIrValue::Array(Array::scalar(0i32).unwrap())))
             .unwrap();

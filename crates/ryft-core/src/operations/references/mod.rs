@@ -12,11 +12,10 @@
 //!   - [`ReferenceAddUpdate`], which adds an update into the referent, and [`ReferenceAtomicAddUpdate`],
 //!     its variant for updates that may race (e.g., within a kernel implementation).
 //!
-//! Array references additionally support _views_, which derive a narrower reference to the same allocation without
-//! accessing its state: [`ReferenceIndex`] and [`ReferenceDynamicIndex`] select one element on an axis (at a static
-//! index and at an index supplied as a value, respectively) and remove that axis, and [`ReferenceSlice`] selects one
-//! static range on every axis. Each array view is described by an [`ArrayReferenceView`](crate::ArrayReferenceView),
-//! and reads and updates through a view touch only the elements it selects.
+//! Array references support lazy views through [`ReferenceView`](crate::ReferenceView). Constructing a view records
+//! static indices, slices, and dynamic index values without emitting an instruction. Each read or update carries the
+//! complete path as [`ArrayReferenceTransform`](crate::ArrayReferenceTransform) metadata and supplies the root
+//! reference and any dynamic indices as inputs. The access touches only the elements covered by that path.
 //!
 //! Every function is a value capability on the reference handle, so the same code updates eager state immediately
 //! and records reference instructions when the handle is a tracer.
@@ -66,12 +65,9 @@
 
 mod reference_add_update;
 mod reference_atomic_add_update;
-mod reference_dynamic_index;
 mod reference_freeze;
-mod reference_index;
 mod reference_new;
 mod reference_read;
-mod reference_slice;
 mod reference_swap;
 mod reference_write;
 
@@ -79,14 +75,9 @@ pub use reference_add_update::{REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAdd
 pub use reference_atomic_add_update::{
     REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
 };
-pub use reference_dynamic_index::{
-    REFERENCE_DYNAMIC_INDEX_OPERATION_NAME, ReferenceDynamicIndex, ReferenceDynamicIndexOperation,
-};
 pub use reference_freeze::{REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation};
-pub use reference_index::{REFERENCE_INDEX_OPERATION_NAME, ReferenceIndex, ReferenceIndexOperation};
 pub use reference_new::{REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation};
 pub use reference_read::{REFERENCE_READ_OPERATION_NAME, ReferenceRead, ReferenceReadOperation};
-pub use reference_slice::{REFERENCE_SLICE_OPERATION_NAME, ReferenceSlice, ReferenceSliceOperation};
 pub use reference_swap::{REFERENCE_SWAP_OPERATION_NAME, ReferenceSwap, ReferenceSwapOperation};
 pub use reference_write::{REFERENCE_WRITE_OPERATION_NAME, ReferenceWrite, ReferenceWriteOperation};
 
@@ -103,10 +94,11 @@ pub(crate) mod tests {
     use crate::operations::{Add, AddOperation};
     use crate::parameters::Parameter;
     use crate::programs::{
-        Effects, EmptyRegionDriver, Operation, ProgramError, ReferenceAccumulationPolicy, ReferenceDischargeContext,
-        ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeValue,
-        ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType, RegionInterface, Type, TypeError,
-        TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, discharge_reference_free_operation,
+        Effects, EmptyRegionDriver, NoReferenceTransform, Operation, ProgramError, ReferenceAccumulationPolicy,
+        ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
+        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType,
+        RegionInterface, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
+        discharge_reference_free_operation,
     };
 
     use super::*;
@@ -476,8 +468,8 @@ pub(crate) mod tests {
     pub(crate) type AddUpdate = ReferenceAddUpdateOperation<TestReferent, TestType>;
     pub(crate) type Freeze = ReferenceFreezeOperation<TestReferent, TestType>;
 
-    // These fixtures exercise discharge without array or view behavior. Addition executes eagerly; program-level
-    // tests stage preserved reference operations.
+    // These fixtures exercise discharge without array or transform behavior.
+    // Addition executes eagerly while program-level tests stage preserved reference operations.
 
     /// Destination universe of the discharge-rule tests.
     pub(crate) type TestDestination = EagerContext<TestValue, TestOperation>;
@@ -489,7 +481,7 @@ pub(crate) mod tests {
     pub(crate) type TestDischargeValue = ReferenceDischargeValue<TestDestination, TestReferenceDischarge>;
 
     /// Operation family required by the discharge rules; only addition executes in the eager destination.
-    #[derive(Copy, Clone, Debug)]
+    #[derive(Clone, Debug)]
     pub(crate) enum TestOperation {
         Add,
         New(New),
@@ -563,7 +555,11 @@ pub(crate) mod tests {
     impl<C, P> ReferenceDischargeableOperation<C, P> for TestOperation
     where
         C: Context<Type = TestType, Operation = TestOperation>,
-        P: ReferenceAccumulationPolicy<C, Referent = TestReferent>,
+        P: ReferenceAccumulationPolicy<
+                C,
+                Referent = TestReferent,
+                Transform = NoReferenceTransform<TestReferent, TestType>,
+            >,
     {
         fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
             &self,
@@ -678,7 +674,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// View chain of the discharge-rule test universe, which has no interior structure to select.
+    /// Transform chain of the discharge-rule test universe, which has no interior structure to select.
     #[derive(Copy, Clone, Debug, PartialEq)]
     pub(crate) struct TestAlias;
 
@@ -695,6 +691,7 @@ pub(crate) mod tests {
         for TestReferenceDischarge
     {
         type Referent = TestReferent;
+        type Transform = NoReferenceTransform<TestReferent, TestType>;
         type Alias = TestAlias;
 
         fn storage_alias(_referent: &TestReferent) -> TestAlias {

@@ -17,7 +17,7 @@
 //! exercise disjoint-path analysis; bit accesses carry their index as an ordinary trailing input. Discharge closes
 //! paths over destination values and binds the family's bit extraction/insertion operations. Forward and reverse mode
 //! retain the same paths and primal index bindings on tangent and cotangent accesses. Lazy eager views keep the root
-//! and bindings in [`ViewedReference`], without creating another value or reference identity.
+//! and bindings in [`ReferenceView`], without creating another value or reference identity.
 //!
 //! The transform legs are reached through the public entry points ([`differentiate_at`] for `jvp`, `vjp`, and
 //! `value_and_gradient`, and [`batch`]) over a live register reference. The generic reference primitives
@@ -62,10 +62,10 @@ use ryft_core::{
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceMemberType, ReferenceNew, ReferenceNewOperation,
     ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceTransform,
-    ReferenceTransformPath, ReferenceType, ReferenceViewOverlap, ReferenceWrite, ReferenceWriteOperation, RegionId,
-    RegionInterface, RegionRef, RegionSlot, ReshapeOperation, ReshardOperation, ResidualZeroProvider, SubOperation,
-    Trace, Tracer, TracingContext, TransposableOperation, TransposeOperation, TranspositionContext,
-    TranspositionDriver, Type, TypeError, Typed, Value, ValueId, ValueProjection, ViewedReference, Zero,
+    ReferenceTransformPath, ReferenceType, ReferenceView, ReferenceViewOverlap, ReferenceWrite,
+    ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot, ReshapeOperation, ReshardOperation,
+    ResidualZeroProvider, SubOperation, Trace, Tracer, TracingContext, TransposableOperation, TransposeOperation,
+    TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId, ValueProjection, Zero,
     ZeroLikeOperation, ZeroOperation, batch, check_count, differentiate_at, discharge_reference_free_operation,
     infer_reference_view_type, jvp_projected_operation, transpose_projected_operation, validate_reference_boundary,
 };
@@ -2753,7 +2753,7 @@ fn test_downstream_reference_boundary_accepts_owned_positions() {
 fn test_downstream_lazy_bit_view_accesses_one_bit_of_its_root() {
     let root = Reference::new(RegisterValue::Register(5)).unwrap();
     let viewed =
-        ViewedReference::<_, RegisterValue, RegisterTransform>::new(RegisterValue::Reference(root.clone())).unwrap();
+        ReferenceView::<_, RegisterValue, RegisterTransform>::new(RegisterValue::Reference(root.clone())).unwrap();
     let bit = viewed.clone().with_transform(RegisterTransform::Bit, vec![RegisterValue::Register(1)]).unwrap();
     assert_eq!(bit.root().reference_id(), Some(root.id()));
     assert_eq!(bit.read(), Ok(RegisterValue::Register(0)));

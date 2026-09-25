@@ -13,7 +13,6 @@ use crate::arrays::{
 use crate::contexts::{Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::references::render_reference_access;
 use crate::programs::{
     EffectClasses, Effects, Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor,
     ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect, ReferenceTransform, ReferenceType, RegionInterface,
@@ -175,7 +174,12 @@ impl Operation for MaskedLoadOperation {
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        render_reference_access(formatter, indentation, self.name(), &self.transforms)
+        // An empty transform path accesses the complete referent, so it renders as just the operation name.
+        let operation = OperationFormatter::new(formatter, indentation, self.name())?;
+        if self.transforms.is_empty() {
+            return Ok(());
+        }
+        operation.bracketed(|operation| operation.list("transforms", &self.transforms))
     }
 
     fn effects(&self) -> Cow<'_, Effects> {
@@ -299,7 +303,12 @@ impl Operation for MaskedStoreOperation {
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        render_reference_access(formatter, indentation, self.name(), &self.transforms)
+        // An empty transform path accesses the complete referent, so it renders as just the operation name.
+        let operation = OperationFormatter::new(formatter, indentation, self.name())?;
+        if self.transforms.is_empty() {
+            return Ok(());
+        }
+        operation.bracketed(|operation| operation.list("transforms", &self.transforms))
     }
 
     fn effects(&self) -> Cow<'_, Effects> {
@@ -430,7 +439,12 @@ impl Operation for MaskedSwapOperation {
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        render_reference_access(formatter, indentation, self.name(), &self.transforms)
+        // An empty transform path accesses the complete referent, so it renders as just the operation name.
+        let operation = OperationFormatter::new(formatter, indentation, self.name())?;
+        if self.transforms.is_empty() {
+            return Ok(());
+        }
+        operation.bracketed(|operation| operation.list("transforms", &self.transforms))
     }
 
     fn effects(&self) -> Cow<'_, Effects> {

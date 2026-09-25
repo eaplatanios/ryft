@@ -1714,7 +1714,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{
         EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, ProgramBuilder, ReferenceAccessOperation,
-        ReferenceDischargeResult, ReferenceSource, ReferenceType, TypeError, ViewedReference,
+        ReferenceDischargeResult, ReferenceSource, ReferenceType, ReferenceView, TypeError,
     };
     use crate::tracing::{DomainTracingContext, NestedTracingContext, Trace, Tracer, TracingContext};
 
@@ -3421,7 +3421,7 @@ mod tests {
                 let branch = inputs[0].context().clone();
                 let root = StagingContext::constant(&branch, branch.capture(root.clone())?);
                 let index = StagingContext::constant(&branch, branch.capture(index.clone())?);
-                let element = ViewedReference::new(root)?.dynamic_index(0, &index)?.read()?;
+                let element = ReferenceView::new(root)?.dynamic_index(0, &index)?.read()?;
                 Ok(branch
                     .bind(AddOperation::<ArrayIrType>::new(), Vec::new(), &[element, inputs[0].clone()])?
                     .remove(0))

@@ -22,6 +22,9 @@ use crate::programs::{
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
+/// Canonical operation name for [`LinearCallOperation`].
+pub const LINEAR_CALL_OPERATION_NAME: &str = "linear_call";
+
 /// Interface form implemented by a [`LinearCallOperation`].
 #[derive(Clone, Debug, PartialEq)]
 enum LinearCallInterface<T: DifferentiableType> {
@@ -163,7 +166,8 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     fn split_inputs<'a>(&self, input_types: &'a [T]) -> Result<(&'a [T], &'a [T]), TypeError> {
         if self.residual_count > input_types.len() {
             return Err(TypeError::invalid(format!(
-                "linear call residual count {} exceeds input count {}",
+                "`{}` residual count {} exceeds input count {}",
+                LINEAR_CALL_OPERATION_NAME,
                 self.residual_count,
                 input_types.len(),
             )));
@@ -284,7 +288,8 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ) -> Result<Vec<P::Batch>, BatchingError> {
         if self.residual_count > inputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "linear call residual count {} exceeds input count {}",
+                "`{}` residual count {} exceeds input count {}",
+                LINEAR_CALL_OPERATION_NAME,
                 self.residual_count,
                 inputs.len(),
             ))
@@ -316,10 +321,11 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
             LinearCallInterface::ForwardAndTranspose => {}
             LinearCallInterface::TransposeOnly { .. } => {
                 return Err(BatchingError::UnsupportedOperation {
-                    message: "a transpose-only linear call cannot be batched structurally because its unavailable \
-                              forward program does not determine output batch axes; it is preserved unchanged only \
-                              when every operand is replicated at an unnamed batching level"
-                        .to_string(),
+                    message: format!(
+                        "a transpose-only `{LINEAR_CALL_OPERATION_NAME}` cannot be batched structurally because its \
+                         unavailable forward program does not determine output batch axes; it is preserved unchanged \
+                         only when every input is replicated at an unnamed batching level",
+                    ),
                 });
             }
         }
@@ -415,9 +421,7 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
 
     #[inline]
     fn name(&self) -> &'static str {
-        // The two forms render under distinct names so rendered programs and the diagnostics built from this name
-        // distinguish a reverse-only call from an executable one without inspecting region counts.
-        if self.is_transpose_only() { "transpose_only_linear_call" } else { "linear_call" }
+        LINEAR_CALL_OPERATION_NAME
     }
 
     #[inline]
@@ -469,14 +473,18 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
         let (residual_types, linear_types, output_types, descriptor) = match &self.interface {
             LinearCallInterface::ForwardAndTranspose => {
                 let forward = &region_interfaces[0];
-                check_types!(@same, "linear call forward input", [input_types, forward.input_types()]);
+                check_types!(@same, format!("`{LINEAR_CALL_OPERATION_NAME}` forward input"), [
+                    input_types,
+                    forward.input_types(),
+                ]);
                 let (residual_types, linear_types) = self.split_inputs(input_types)?;
-                (residual_types, linear_types, forward.output_types(), "linear call")
+                (residual_types, linear_types, forward.output_types(), format!("`{LINEAR_CALL_OPERATION_NAME}`"))
             }
             LinearCallInterface::TransposeOnly { input_types: linear_types, output_types } => {
                 let (residual_types, actual_linear_types) = self.split_inputs(input_types)?;
-                check_types!(@same, "transpose-only linear call input", [linear_types, actual_linear_types]);
-                (residual_types, linear_types.as_slice(), output_types.as_slice(), "transpose-only linear call")
+                let descriptor = format!("transpose-only `{LINEAR_CALL_OPERATION_NAME}`");
+                check_types!(@same, format!("{descriptor} input"), [linear_types, actual_linear_types]);
+                (residual_types, linear_types.as_slice(), output_types.as_slice(), descriptor)
             }
         };
         let transpose = region_interfaces.last().unwrap();
@@ -542,8 +550,16 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("residual_count", self.residual_count))
+        // The transpose-only form is rendered as a flag so that it remains visible where the operation renders without
+        // its attached regions (e.g., in its `Display` rendering). Its stored forward input and output types are not
+        // rendered because they coincide with the types of the call's linear inputs and outputs.
+        OperationFormatter::new(formatter, indentation, LINEAR_CALL_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("residual_count", self.residual_count)?;
+            if self.is_transpose_only() {
+                operation.field("transpose_only", true)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -559,9 +575,10 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCa
     ) -> Result<Vec<C::Value>, ProgramError> {
         if self.is_transpose_only() {
             return Err(ProgramError::UnsupportedOperation {
-                message: "a transpose-only linear call has no forward program to execute; it supports only \
-                          reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)"
-                    .to_string(),
+                message: format!(
+                    "a transpose-only `{LINEAR_CALL_OPERATION_NAME}` has no forward program to execute; it supports \
+                     only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
+                ),
             });
         }
         driver.interpret_region(context, 0, inputs.to_vec())
@@ -605,16 +622,18 @@ impl<
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         if self.is_transpose_only() {
             return Err(ProgramError::UnsupportedOperation {
-                message: "a transpose-only linear call has no forward-mode (JVP) rule; it supports only \
-                          reverse-mode differentiation"
-                    .to_string(),
+                message: format!(
+                    "a transpose-only `{LINEAR_CALL_OPERATION_NAME}` has no forward-mode (i.e., JVP) rule; \
+                     it supports only reverse-mode differentiation",
+                ),
             }
             .into());
         }
 
         inputs.len().checked_sub(self.residual_count).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
-                "linear call residual count {} exceeds input count {}",
+                "`{}` residual count {} exceeds input count {}",
+                LINEAR_CALL_OPERATION_NAME,
                 self.residual_count,
                 inputs.len(),
             ))
@@ -724,7 +743,8 @@ impl<
     ) -> Result<(), DifferentiationError> {
         if self.residual_count > inputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "linear call residual count {} exceeds input count {}",
+                "`{}` residual count {} exceeds input count {}",
+                LINEAR_CALL_OPERATION_NAME,
                 self.residual_count,
                 inputs.len(),
             ))
@@ -743,7 +763,7 @@ impl<
             .map(|(index, input)| {
                 input.as_known().cloned().ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
-                        "linear call residual operand {index} is not known during transposition",
+                        "`{LINEAR_CALL_OPERATION_NAME}` residual input {index} is not known during transposition",
                     ))
                 })
             })
@@ -939,6 +959,7 @@ mod tests {
 
         // The forward-and-transpose form derives its interface from two attached regions.
         let operation = LinearCallOperation::<ArrayType>::new(1);
+        assert_eq!(operation.name(), LINEAR_CALL_OPERATION_NAME);
         assert_eq!(operation.residual_count(), 1);
         assert!(!operation.is_transpose_only());
         assert_eq!(operation.to_string(), "linear_call [residual_count=1]");
@@ -948,11 +969,13 @@ mod tests {
             "LinearCallOperation { residual_count: 1, interface: ForwardAndTranspose }",
         );
 
-        // The transpose-only form stores the unavailable forward interface and renders under its distinct name.
+        // The transpose-only form stores the unavailable forward interface, shares the operation name, and renders
+        // with a `transpose_only` flag.
         let operation = LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type]);
+        assert_eq!(operation.name(), LINEAR_CALL_OPERATION_NAME);
         assert_eq!(operation.residual_count(), 1);
         assert!(operation.is_transpose_only());
-        assert_eq!(operation.to_string(), "transpose_only_linear_call [residual_count=1]");
+        assert_eq!(operation.to_string(), "linear_call [residual_count=1, transpose_only=true]");
         assert_eq!(operation.region_slots(), &[RegionSlot::rule("transpose")]);
 
         // Mapping changes only the type universe: the executable form retains its marker-only interface, while the
@@ -1022,7 +1045,7 @@ mod tests {
                 )],
             ),
             Err(TypeError::invalid(
-                "transpose-only linear call transpose output type signature mismatch: \
+                "transpose-only `linear_call` transpose output type signature mismatch: \
                  expected [f32[2]] but got [f32[broad]]",
             )),
         );
@@ -1036,7 +1059,7 @@ mod tests {
                 )],
             ),
             Err(TypeError::invalid(
-                "transpose-only linear call transpose output type signature mismatch: \
+                "transpose-only `linear_call` transpose output type signature mismatch: \
                  expected [f32[2]] but got [f32[3]]",
             )),
         );
@@ -1050,7 +1073,7 @@ mod tests {
                 )],
             ),
             Err(TypeError::invalid(
-                "transpose-only linear call transpose output type signature mismatch: \
+                "transpose-only `linear_call` transpose output type signature mismatch: \
                  expected [f32[2]] but got [f64[2]]",
             )),
         );
@@ -1068,7 +1091,7 @@ mod tests {
                 )],
             ),
             Err(TypeError::invalid(
-                "transpose-only linear call transpose output type signature mismatch: \
+                "transpose-only `linear_call` transpose output type signature mismatch: \
                  expected [f32[broad, broad]] but got [f32[other, other]]",
             )),
         );
@@ -1082,7 +1105,7 @@ mod tests {
                 )],
             ),
             Err(TypeError::invalid(
-                "transpose-only linear call transpose output type signature mismatch: \
+                "transpose-only `linear_call` transpose output type signature mismatch: \
                  expected [f32[broad, broad]] but got [f32[broad, other]]",
             )),
         );
@@ -1150,7 +1173,7 @@ mod tests {
         assert!(matches!(
             LinearCallOperation::transpose_only(2, Vec::new(), Vec::new())
                 .infer_output_types(&[], std::slice::from_ref(&transpose_interface)),
-            Err(TypeError::Invalid { message }) if message == "linear call residual count 2 exceeds input count 0",
+            Err(TypeError::Invalid { message }) if message == "`linear_call` residual count 2 exceeds input count 0",
         ));
 
         // Transposition enforces the same split independently, because a pullback may be built from an imported call
@@ -1167,7 +1190,7 @@ mod tests {
                 &[],
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
-                if message == "linear call residual count 3 exceeds input count 0",
+                if message == "`linear_call` residual count 3 exceeds input count 0",
         ));
 
         // Every residual must be known during transposition, because the replayed transpose region consumes the
@@ -1185,7 +1208,7 @@ mod tests {
                 &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
-                if message == "linear call residual operand 0 is not known during transposition",
+                if message == "`linear_call` residual input 0 is not known during transposition",
         ));
     }
 
@@ -1271,8 +1294,8 @@ mod tests {
         assert!(matches!(
             program.interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]),
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "a transpose-only linear call has no forward program to execute; it supports only \
-                               reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
+                if message == "a transpose-only `linear_call` has no forward program to execute; it supports \
+                               only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
                                `jacobian_reverse`)",
         ));
         assert!(matches!(
@@ -1283,9 +1306,9 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             ),
             Err(BatchingError::UnsupportedOperation { message })
-                if message == "a transpose-only linear call cannot be batched structurally because its unavailable \
-                               forward program does not determine output batch axes; it is preserved unchanged only \
-                               when every operand is replicated at an unnamed batching level",
+                if message == "a transpose-only `linear_call` cannot be batched structurally because its \
+                               unavailable forward program does not determine output batch axes; it is preserved \
+                               unchanged only when every input is replicated at an unnamed batching level",
         ));
     }
 
@@ -1441,7 +1464,7 @@ mod tests {
             .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::replicated()]);
         let instruction = &batched.instructions()[0];
-        assert_eq!(instruction.operation().name(), "transpose_only_linear_call");
+        assert_eq!(instruction.operation().to_string(), "linear_call [residual_count=1, transpose_only=true]");
         assert_eq!(instruction.regions().len(), 1);
     }
 
