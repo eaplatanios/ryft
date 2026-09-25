@@ -5078,7 +5078,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Atan2(_)
         | ArrayOperation::Exp(_)
         | ArrayOperation::Log(_)
-        | ArrayOperation::Log1p(_)
+        | ArrayOperation::Ln1p(_)
         | ArrayOperation::LogAddExp(_)
         | ArrayOperation::Sqrt(_)
         | ArrayOperation::Rsqrt(_)

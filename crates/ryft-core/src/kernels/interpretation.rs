@@ -891,8 +891,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, Layout, Memory,
-        ReferenceIndexOperation, StridedLayout,
+        ArrayIrOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, Layout, Memory, StridedLayout,
     };
     use crate::contexts::Context;
     use crate::kernels::authoring::whole_array_parameter;
@@ -908,7 +907,7 @@ mod tests {
     };
     use crate::operations::{
         AddOperation, ConditionOperation, DimensionMulOperation, DimensionToScalarOperation, ReduceOperation,
-        ReductionKind, ReferenceRead, ReferenceWrite, ScaledDotOperation, WhileOperation,
+        ReductionKind, ReferenceIndexOperation, ReferenceRead, ReferenceWrite, ScaledDotOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;

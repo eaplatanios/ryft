@@ -447,14 +447,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayReferenceViewIndex, ArraySliceAxis, DataType,
-        ReferenceIndexOperation, ReferenceSliceOperation,
-    };
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayReferenceViewIndex, ArraySliceAxis, DataType};
     use crate::captures::CaptureReference;
     use crate::operations::{
-        ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
+        ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
+        ReferenceWriteOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder, ReferenceAnalysisError, ReferenceSource, ReferenceType};

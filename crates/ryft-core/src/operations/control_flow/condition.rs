@@ -1693,7 +1693,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
         ArrayReference, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, ReferenceIndexOperation, Shape, Sharding, ShardingDimension,
+        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::{CaptureReference, ClosedProgram};
@@ -1706,8 +1706,8 @@ mod tests {
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::tests::CountingBatchingDriver;
     use crate::operations::references::{
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSwapOperation, ReferenceWriteOperation,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
     };
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;

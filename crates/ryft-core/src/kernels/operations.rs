@@ -10,8 +10,7 @@ use std::fmt::{Display, Formatter};
 
 use crate::arrays::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceView, ArrayType,
-    DimensionOperation, DimensionType, DimensionValue, ReferenceDynamicIndexOperation, ReferenceIndexOperation,
-    ReferenceSliceOperation, reapply_array_reference_view, validate_array_reference_view,
+    DimensionOperation, DimensionType, DimensionValue,
 };
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -23,7 +22,8 @@ use crate::kernels::memory::{
 use crate::kernels::validation::KernelReferenceOperation;
 use crate::operations::{
     ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation,
+    ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation,
     ReferenceSwapOperation, ReferenceWriteOperation,
 };
 use crate::partial::{
@@ -147,7 +147,7 @@ impl ReferenceViewOperation for NoKernelExtension {
         source: &ArrayIrType,
         target: &ArrayIrType,
     ) -> Result<(), ReferenceViewValidationError> {
-        validate_array_reference_view(view, source, target)
+        view.validate(source, target)
     }
 
     fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
@@ -538,7 +538,7 @@ where
         source: &ArrayIrType,
         target: &ArrayIrType,
     ) -> Result<(), ReferenceViewValidationError> {
-        validate_array_reference_view(view, source, target)
+        view.validate(source, target)
     }
 
     fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
@@ -547,7 +547,7 @@ where
         source: C::Value,
         symbols: &[C::Value],
     ) -> Result<C::Value, ProgramError> {
-        reapply_array_reference_view(context, view, source, symbols)
+        view.reapply(context, source, symbols)
     }
 }
 
@@ -840,7 +840,7 @@ mod tests {
                 source: &ArrayIrType,
                 target: &ArrayIrType,
             ) -> Result<(), ReferenceViewValidationError> {
-                validate_array_reference_view(view, source, target)
+                view.validate(source, target)
             }
 
             fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(

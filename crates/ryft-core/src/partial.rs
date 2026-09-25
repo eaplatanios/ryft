@@ -2888,15 +2888,14 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
-        ReferenceIndexOperation,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, StagingContext};
     use crate::interpretation::InterpretationDriver;
     use crate::operations::{
         AddOperation, ConditionOperation, LinearCallOperation, MulOperation, NegOperation, PrintOperation,
-        ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
-        ReferenceWriteOperation, SubOperation, Zero,
+        ReferenceAddUpdateOperation, ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSwapOperation, ReferenceWriteOperation, SubOperation, Zero,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{

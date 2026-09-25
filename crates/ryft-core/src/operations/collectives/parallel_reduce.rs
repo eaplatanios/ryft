@@ -7,7 +7,6 @@
 // TODO(eaplatanios): Review this module.
 
 use std::fmt::Display;
-use std::ops::Mul as StdMul;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayType, DataType, LogicalMesh, MeshAxisType,
@@ -351,7 +350,7 @@ impl<C, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchi
 where
     C: Context<Type = ArrayType> + Fill<f64, C::Value>,
     C::Operation: From<ParallelReduceOperation>,
-    <C as Domain>::Value: Reduce + StdMul<Output = <C as Domain>::Value>,
+    <C as Domain>::Value: Reduce + std::ops::Mul<Output = <C as Domain>::Value>,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -491,7 +490,7 @@ fn collective_reduce_batch<C, P, MakeParallelMeanFactor>(
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
-    C::Value: Reduce + StdMul<Output = C::Value>,
+    C::Value: Reduce + std::ops::Mul<Output = C::Value>,
     P: RaggedArrayExtentBatchingPolicy<C>,
     MakeParallelMeanFactor: FnOnce(ArrayType, f64) -> Result<C::Value, ProgramError>,
 {

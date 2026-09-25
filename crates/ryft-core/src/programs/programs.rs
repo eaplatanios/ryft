@@ -2049,14 +2049,14 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
+        DimensionBounds, DimensionVariable, Shape,
     };
     use crate::contexts::EagerContext;
     use crate::macros::check_count;
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, MulOperation, NegOperation,
-        PrintOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, ScanOperation,
-        WhileOperation,
+        PrintOperation, ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceWriteOperation, ScanOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;

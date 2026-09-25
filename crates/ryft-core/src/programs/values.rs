@@ -144,10 +144,9 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// corresponding [`DimensionValue`](crate::DimensionValue) is fully determined by the type. Folding rules that
     /// return [`OperationFoldOutput::Singleton`](crate::OperationFoldOutput::Singleton) rely on this function to
     /// replace an instruction whose inferred output type is a singleton with a program constant of that exact type, so
-    /// implementations must return a value whose [`Typed::r#type`](Typed::type) equals `r#type`, including its
-    /// identity. Only value families that store concrete payloads can materialize singletons; staged values such as
-    /// tracers keep the default, which returns [`None`], because their payload lives in a context rather than in the
-    /// value.
+    /// implementations must return a value whose type exactly matches the requested type, including its identity. Only
+    /// value families that store concrete payloads can materialize singletons; staged values such as tracers keep the
+    /// default, which returns [`None`], because their payload lives in a context rather than in the value.
     #[inline]
     fn singleton(r#type: &Self::Type) -> Option<Self> {
         let _ = r#type;

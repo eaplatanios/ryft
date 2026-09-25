@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayReferenceView, ArrayReferenceViewIndex, ArrayReferenceViewOperation, ArraySliceAxis, ArrayType, DataType,
-    Dimension, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT, ReferenceSliceOperation, Shape,
+    Dimension, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT, Shape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -40,7 +40,7 @@ use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperatio
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::slicing::{Slice, SliceOperation, UpdateSlice, UpdateSliceOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
-use crate::operations::references::ReferenceNewOperation;
+use crate::operations::references::{ReferenceNewOperation, ReferenceSliceOperation};
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput,
@@ -85,7 +85,7 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// matching first-class dimension value as a trailing runtime operand.
 ///
 /// A composite body receiving `ref<[length, t]>` selects its current slice by applying
-/// [`ReferenceDynamicIndexOperation`](crate::arrays::ReferenceDynamicIndexOperation) to that root and its index input
+/// [`ReferenceDynamicIndexOperation`](crate::operations::ReferenceDynamicIndexOperation) to that root and its index input
 /// in the body itself. Reference operations and their transforms then handle this view just like any explicitly
 /// created view. The root parameter must not be consumed or frozen inside the body. Stacked reference outputs remain
 /// unsupported: a scan cannot assemble a reference value from per-iteration handles. Discharge can replace accesses
@@ -3885,8 +3885,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        ReferenceDynamicIndexOperation, ReferenceIndexOperation, Sharding, ShardingDimension,
+        DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension,
     };
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::{CaptureReference, ClosedProgram};
@@ -3904,8 +3904,8 @@ mod tests {
     use crate::operations::manipulation::memory::TransferToMemoryOperation;
     use crate::operations::manipulation::slicing::DynamicSliceOperation;
     use crate::operations::references::{
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceWriteOperation,
+        ReferenceAddUpdateOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation,
     };
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;

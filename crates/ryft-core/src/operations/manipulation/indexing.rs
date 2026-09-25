@@ -1,10 +1,7 @@
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
-use crate::arrays::{
-    Array, ArrayIrType, ArraySliceAxis, ArrayType, Broadcastable, DataType, Dimension, ReferenceDynamicIndex,
-    ReferenceIndex, ReferenceSlice, Shape,
-};
+use crate::arrays::{Array, ArrayIrType, ArraySliceAxis, ArrayType, Broadcastable, DataType, Dimension, Shape};
 use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::operations::arithmetic::Add;
@@ -26,7 +23,10 @@ use crate::operations::manipulation::scattering::{
     DynamicScatter, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOptions, ScatterReductionKind,
 };
 use crate::operations::manipulation::slicing::Slice;
-use crate::operations::references::{ReferenceAddUpdate, ReferenceRead, ReferenceSwap, ReferenceWrite};
+use crate::operations::references::{
+    ReferenceAddUpdate, ReferenceDynamicIndex, ReferenceIndex, ReferenceRead, ReferenceSlice, ReferenceSwap,
+    ReferenceWrite,
+};
 use crate::programs::{ProgramError, ReferenceType, Type, TypeError, Typed, Value, ValueProjection};
 
 /// A host integer that can be represented exactly as an indexing coordinate, slice endpoint, or stride. The [`index!`]

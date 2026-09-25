@@ -38,7 +38,6 @@
 //! ```
 
 use std::fmt::Display;
-use std::ops::{Div, Mul, Sub};
 use std::sync::Arc;
 
 use half::{bf16, f16};
@@ -346,12 +345,12 @@ impl_differentiable_operation! {
             + From<MulOperation<ArrayType>>,
         C::Value: Reduce
             + Exp
-            + Sub<Output = C::Value>
+            + std::ops::Sub<Output = C::Value>
             + Broadcast
             + Compare<C::Value>
-            + Div<Output = C::Value>
+            + std::ops::Div<Output = C::Value>
             + ElementwiseDerivativeAlignment<ArrayType>
-            + Mul<Output = C::Value>,
+            + std::ops::Mul<Output = C::Value>,
     {
         |operation, context, _driver, inputs| {
             check_count!("input", inputs, 1, ProgramError);

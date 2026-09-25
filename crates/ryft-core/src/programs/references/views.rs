@@ -935,13 +935,12 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceView,
         ArrayReferenceViewIndex, ArraySliceAxis, ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue,
-        REFERENCE_INDEX_OPERATION_NAME, ReferenceDynamicIndexOperation, ReferenceIndexOperation,
-        ReferenceSliceOperation, reapply_array_reference_view,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{
-        ConditionOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceWriteOperation, WhileOperation,
+        ConditionOperation, REFERENCE_INDEX_OPERATION_NAME, ReferenceDynamicIndexOperation, ReferenceFreezeOperation,
+        ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceSliceOperation, ReferenceWriteOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::atoms::AtomId;
@@ -1149,7 +1148,7 @@ mod tests {
             source: C::Value,
             symbols: &[C::Value],
         ) -> Result<C::Value, ProgramError> {
-            reapply_array_reference_view(context, view, source, symbols)
+            view.reapply(context, source, symbols)
         }
     }
 

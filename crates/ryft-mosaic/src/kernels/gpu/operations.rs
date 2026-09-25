@@ -7,7 +7,7 @@ use ryft_core::kernels::{KernelExtension, KernelExtensionMemory, NoKernelExtensi
 use ryft_core::{
     ArrayIrType, ArrayReferenceView, ArrayType, Context, DataType, DotOperation, EffectClass, EffectClasses, Effects,
     Operation, OperationFormatter, ProgramError, ReferenceViewOperation, ReferenceViewValidationError, RegionInterface,
-    TypeError, validate_array_reference_view,
+    TypeError,
 };
 
 use crate::kernels::gpu::tmem::TmemOperation;
@@ -222,7 +222,7 @@ impl ReferenceViewOperation for GpuOperation {
         source: &ArrayIrType,
         target: &ArrayIrType,
     ) -> Result<(), ReferenceViewValidationError> {
-        validate_array_reference_view(view, source, target)
+        view.validate(source, target)
     }
 
     fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(

@@ -1050,7 +1050,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Floor(_)
                 | ArrayOperation::Ceil(_)
                 | ArrayOperation::Round(_)
-                | ArrayOperation::Log1p(_)
+                | ArrayOperation::Ln1p(_)
                 | ArrayOperation::LogAddExp(_)
                 | ArrayOperation::Erf(_)
                 | ArrayOperation::Not(_)
@@ -2210,7 +2210,7 @@ mod tests {
             source: &ArrayIrType,
             target: &ArrayIrType,
         ) -> Result<(), crate::programs::ReferenceViewValidationError> {
-            crate::arrays::validate_array_reference_view(view, source, target)
+            view.validate(source, target)
         }
         fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
             _context: &C,

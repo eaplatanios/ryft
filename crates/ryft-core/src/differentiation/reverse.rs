@@ -3773,7 +3773,7 @@ pub(crate) mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
-        Dimension, DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
+        Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -3782,9 +3782,9 @@ pub(crate) mod tests {
     use crate::macros::{check_count, check_types};
     use crate::operations::{
         AddOperation, ConditionOperation, Constant, MulOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-        ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
-        ReferenceWriteOperation, Sin, ZeroOperation,
+        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
+        ReferenceWrite, ReferenceWriteOperation, Sin, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;

@@ -96,7 +96,7 @@ impl ReferenceViewOperation for XlaKernelExtension {
         source: &ArrayIrType,
         target: &ArrayIrType,
     ) -> Result<(), ReferenceViewValidationError> {
-        ryft_core::validate_array_reference_view(view, source, target)
+        view.validate(source, target)
     }
 
     fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(

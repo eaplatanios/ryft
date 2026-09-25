@@ -4408,16 +4408,16 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceView,
-        ArrayReferenceViewOperation, ArrayType, DataType, ReferenceDynamicIndexOperation, ReferenceIndexOperation,
-        ReferenceSliceOperation, reapply_array_reference_view,
+        ArrayReferenceViewOperation, ArrayType, DataType,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
         Add, AddOperation, ConditionOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSwapOperation, ReferenceWriteOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation,
+        ReferenceAddUpdateOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
+        ReferenceWriteOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation,
     };
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
@@ -9335,7 +9335,7 @@ mod tests {
                 source: C::Value,
                 symbols: &[C::Value],
             ) -> Result<C::Value, ProgramError> {
-                reapply_array_reference_view(context, view, source, symbols)
+                view.reapply(context, source, symbols)
             }
         }
 

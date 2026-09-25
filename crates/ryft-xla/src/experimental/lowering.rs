@@ -29,7 +29,7 @@ use ryft_core::{
     ConvertElementTypeOperation, CosOperation, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation,
     DimensionType, DimensionValue, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass,
     EffectClasses, ErfOperation, ExpOperation, ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation,
-    Instruction, IotaOperation, Layout, Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh,
+    Instruction, IotaOperation, Layout, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalMesh,
     LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
     PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError,
     ProjectedValue, Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReductionKind,
@@ -2039,7 +2039,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogOperation<ArrayType>
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Log1pOperation<ArrayType> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Ln1pOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -5216,7 +5216,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Log1p(operation) => <Log1pOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Ln1p(operation) => <Ln1pOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
@@ -10784,7 +10784,7 @@ fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// [`LogAddExpOperation`] pins, since StableHLO has no `logaddexp` primitive:
 ///
 /// ```text
-/// log_add_exp(a, b) = select(isnan(a - b), a + b, max(a, b) + log1p(exp(-|a - b|)))
+/// log_add_exp(a, b) = select(isnan(a - b), a + b, max(a, b) + ln_1p(exp(-|a - b|)))
 /// ```
 ///
 /// Factoring the larger operand out of the sum keeps `exp` from overflowing anywhere on the real line, and the
@@ -17257,10 +17257,10 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_log1p_and_log_add_exp() {
-        // `log1p` has a StableHLO primitive of its own, so it lowers to exactly one operation.
+    fn test_to_mlir_module_for_plain_program_lowers_ln_1p_and_log_add_exp() {
+        // `ln_1p` has a StableHLO primitive of its own, so it lowers to exactly one operation.
         assert_eq!(
-            lowered_unary_module(ArrayOperation::Log1p(Log1pOperation::new()), DataType::F32, vec![4]).unwrap(),
+            lowered_unary_module(ArrayOperation::Ln1p(Ln1pOperation::new()), DataType::F32, vec![4]).unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {

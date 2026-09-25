@@ -32,15 +32,12 @@ pub use elements::{
 pub use ir::ArrayIrValue;
 pub use macros::dispatch_on_array_element_type;
 pub use operations::{
-    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayReferenceViewOperation,
-    ArrayTracingContext, DimensionOperation, DimensionOperations, DimensionTracingContext,
-    REFERENCE_DYNAMIC_INDEX_OPERATION_NAME, REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME,
-    ReferenceDynamicIndex, ReferenceDynamicIndexOperation, ReferenceIndex, ReferenceIndexOperation, ReferenceSlice,
-    ReferenceSliceOperation, reapply_array_reference_view, validate_array_reference_view,
+    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayTracingContext, DimensionOperation,
+    DimensionOperations, DimensionTracingContext,
 };
 pub use references::{
     ArrayReference, ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceView, ArrayReferenceViewError,
-    ArrayReferenceViewIndex, ArrayReferenceViewPath,
+    ArrayReferenceViewIndex, ArrayReferenceViewOperation, ArrayReferenceViewPath,
 };
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,

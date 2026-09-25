@@ -1688,11 +1688,11 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
+        DimensionBounds, DimensionVariable, Shape,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::Add;
+    use crate::operations::{Add, ReferenceIndexOperation};
     use crate::tracing::{Tracer, TracerState, TracingContext};
 
     use super::*;

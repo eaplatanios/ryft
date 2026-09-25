@@ -319,7 +319,7 @@ mod tests {
         ConvertElementType, ConvertElementTypeOperation, Cos, CumulativeLogSumExp, CumulativeMax, CumulativeMin,
         CumulativeProduct, CumulativeSum, DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension,
         DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather, GatherDimensionNumbers, GatherMode,
-        GatherOptions, Log, Log1p, LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min,
+        GatherOptions, Ln1p, Log, LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min,
         OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round,
         Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind, Shape, Sharding,
         ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError,
@@ -730,7 +730,7 @@ mod tests {
 
         // The logarithmic operations that XLA has no primitive for lower as expansions, so their agreement with the
         // reference kernels is what pins those expansions to the semantics `ryft-core` documents.
-        assert_parity(&left.log1p().unwrap(), &reference_left.log1p().unwrap());
+        assert_parity(&left.ln_1p().unwrap(), &reference_left.ln_1p().unwrap());
         assert_parity(&left.log_add_exp(&right).unwrap(), &reference_left.log_add_exp(&reference_right).unwrap());
         assert_parity(&left.log_sum_exp(&[0]).unwrap(), &reference_left.log_sum_exp(&[0]).unwrap());
 

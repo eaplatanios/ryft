@@ -5,13 +5,13 @@
 //!
 //!   - [`Exp`] and [`Log`] compute the natural exponential and logarithm (i.e., `x ↦ eˣ` and `x ↦ ln(x)`, with the
 //!     principal branch of the logarithm for complex values).
-//!   - [`Log1p`] computes `log(1 + x)` as a single operation, which keeps full relative accuracy for inputs near zero.
+//!   - [`Ln1p`] computes `log(1 + x)` as a single operation, which keeps full relative accuracy for inputs near zero.
 //!   - [`LogAddExp`] computes `log(exp(a) + exp(b))` without forming either exponential, so that it cannot overflow.
 //!   - [`Logistic`] computes the logistic sigmoid (i.e., `x ↦ 1 / (1 + e^{-x})`).
 //!
 //! [`Exp`], [`Log`], and [`Logistic`] support floating-point and complex values, same as StableHLO's
 //! [`exponential`](https://openxla.org/stablehlo/spec#exponential), [`log`](https://openxla.org/stablehlo/spec#log),
-//! and [`logistic`](https://openxla.org/stablehlo/spec#logistic), whereas [`Log1p`] and [`LogAddExp`] support only
+//! and [`logistic`](https://openxla.org/stablehlo/spec#logistic), whereas [`Ln1p`] and [`LogAddExp`] support only
 //! real floating-point values. Unary operations preserve the metadata of their input, and [`LogAddExp`] promotes the
 //! element types and broadcasts the shapes of its inputs. Inputs that carry partial sums over unreduced mesh axes are
 //! rejected. Every operation is nonlinear, so reverse-mode differentiation transposes its linearization instead.
@@ -164,9 +164,8 @@ macro_rules! impl_log_for_primitive {
 impl_log_for_primitive!(f32);
 impl_log_for_primitive!(f64);
 
-// TODO(eaplatanios): Rename `Log1p` to `Ln1p` and `log1p` to `ln_1p` to match Rust's conventions.
-/// Canonical operation name for [`Log1pOperation`].
-pub const LOG1P_OPERATION_NAME: &str = "log1p";
+/// Canonical operation name for [`Ln1pOperation`].
+pub const LN_1P_OPERATION_NAME: &str = "ln_1p";
 
 define_elementwise_operation!(
     @unary
@@ -177,27 +176,27 @@ define_elementwise_operation!(
     /// The point of the primitive is accuracy near zero. Evaluating `log(1 + x)` by first forming `1 + x` loses every
     /// bit of `x` below the precision of one, so a small `x` returns a result whose relative error grows without bound
     /// as `x` shrinks. Computing the composition as a single operation keeps full relative accuracy there, which is why
-    /// `log1p` is the form used by log-likelihood and log-probability code.
+    /// `ln_1p` is the form used by log-likelihood and log-probability code.
     ///
     /// Only real floating-point inputs are supported, and inputs that still carry partial sums are rejected. The
     /// complex logarithm needs a different construction (i.e., a principal branch and a separate accurate magnitude
     /// near `-1`), and that is construction is not currently supported here.
-    Log1pOperation,
-    LOG1P_OPERATION_NAME,
-    Log1p,
-    log1p,
+    Ln1pOperation,
+    LN_1P_OPERATION_NAME,
+    Ln1p,
+    ln_1p,
     check_data_types = [@float @real],
     check_array_types = [@no_unreduced],
 );
 
 impl_differentiable_elementwise_operation! {
     @unary
-    Log1pOperation,
+    Ln1pOperation,
     jvp<C>
     where
         C::Value: OneLike + std::ops::Add<Output = C::Value> + std::ops::Div<Output = C::Value>,
     {
-        // d(log1p(x)) = dx / (1 + x). The denominator is formed from the aligned input primal so that it carries the
+        // `d(ln_1p(x)) = dx / (1 + x)`. The denominator is formed from the aligned input primal so that it carries the
         // tangent's element data type, and `one_like` supplies the one at exactly that type.
         |(input, input_tangent)| input_tangent / (input.one_like()? + input)
     },
@@ -207,38 +206,38 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @unary
     /// Represents the ability to compute elementwise `log(1 + input)` accurately near zero. Concrete arrays compute
-    /// immediately while context-carrying values apply [`Log1pOperation`] through their context.
-    Log1p,
+    /// immediately while context-carrying values apply [`Ln1pOperation`] through their context.
+    Ln1p,
     /// Computes `log(1 + input)` for each real floating-point element, retaining accuracy near zero. Returns an error
     /// if the input types or metadata are unsupported.
-    log1p,
-    Log1pOperation,
+    ln_1p,
+    Ln1pOperation,
 );
 
 impl_array_elementwise_operation!(
     @unary
-    Log1p,
-    log1p,
-    operation = "log1p",
+    Ln1p,
+    ln_1p,
+    operation = "ln_1p",
     inputs = @float @real,
     checks = [@no_unreduced],
-    |input| RealFloatingPointArrayElement::log1p(input),
+    |input| RealFloatingPointArrayElement::ln_1p(input),
 );
 
-/// Implements [`Log1p`] for one host primitive type.
-macro_rules! impl_log1p_for_primitive {
+/// Implements [`Ln1p`] for one host primitive type.
+macro_rules! impl_ln_1p_for_primitive {
     ($type:ty) => {
-        impl Log1p for $type {
+        impl Ln1p for $type {
             #[inline]
-            fn log1p(&self) -> Result<Self, ProgramError> {
-                Ok(self.ln_1p())
+            fn ln_1p(&self) -> Result<Self, ProgramError> {
+                Ok(<$type>::ln_1p(*self))
             }
         }
     };
 }
 
-impl_log1p_for_primitive!(f32);
-impl_log1p_for_primitive!(f64);
+impl_ln_1p_for_primitive!(f32);
+impl_ln_1p_for_primitive!(f64);
 
 /// Canonical operation name for [`LogAddExpOperation`].
 pub const LOG_ADD_EXP_OPERATION_NAME: &str = "log_add_exp";
@@ -251,7 +250,7 @@ define_elementwise_operation!(
     /// The semantics are:
     ///
     /// ```text
-    /// log_add_exp(a, b) = select(is_nan(a - b), a + b, max(a, b) + log1p(exp(-|a - b|)))
+    /// log_add_exp(a, b) = select(is_nan(a - b), a + b, max(a, b) + ln_1p(exp(-|a - b|)))
     /// ```
     ///
     /// and are borrowed from JAX's [`logaddexp`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.logaddexp.html).
@@ -265,8 +264,8 @@ define_elementwise_operation!(
     ///
     ///   - `(+∞, +∞) ↦ +∞` and `(-∞, -∞) ↦ -∞`, through the `a + b` branch,
     ///   - any NaN input propagates NaN, also through the `a + b` branch,
-    ///   - mixed infinities return the larger input, through the ordinary branch: `-|a - b|` is `-∞`, so
-    ///     `log1p(exp(-∞)) = log1p(0) = 0` and the result is `max(a, b)`.
+    ///   - mixed infinities return the larger input, through the ordinary branch: `-|a - b|` is `-∞`,
+    ///     so `ln_1p(exp(-∞)) = ln_1p(0) = 0` and the result is `max(a, b)`.
     ///
     /// Only real floating-point inputs are supported, and array inputs that still carry partial sums are rejected,
     /// with their reduced-axis markers required to agree.
@@ -968,10 +967,10 @@ mod tests {
     }
 
     #[test]
-    fn test_log1p_type_inference() {
+    fn test_ln_1p_type_inference() {
         check_operation_type_inference!(
             @elementwise @unary,
-            operation = Log1pOperation,
+            operation = Ln1pOperation,
             cases = [
                 {
                     input_data_types = [DataType::F64],
@@ -979,25 +978,25 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64],
-                    error = "`log1p` does not support input data type `c64`",
+                    error = "`ln_1p` does not support input data type `c64`",
                 },
                 {
                     input_data_types = [DataType::I32],
-                    error = "`log1p` does not support input data type `i32`",
+                    error = "`ln_1p` does not support input data type `i32`",
                 },
             ],
         );
         check_operation_type_inference!(
             @reject @unreduced,
-            operation = Log1pOperation::<ArrayType>::new(),
+            operation = Ln1pOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
 
     #[test]
-    fn test_log1p_interpretation() {
+    fn test_ln_1p_interpretation() {
         assert_eq!(
-            Log1pOperation::<ArrayType>::new().interpret(
+            Ln1pOperation::<ArrayType>::new().interpret(
                 &EagerContext::<Array>::new(),
                 &EmptyRegionDriver,
                 &[Array::scalar(0.0f64).unwrap()],
@@ -1007,19 +1006,19 @@ mod tests {
     }
 
     #[test]
-    fn test_log1p_partial_evaluation() {
+    fn test_ln_1p_partial_evaluation() {
         check_operation_partial_evaluation!(
-            operation = Log1pOperation::new(),
+            operation = Ln1pOperation::new(),
             inputs = [Array::scalar(0.7).unwrap()],
             expected = Array::scalar(0.7f64.ln_1p()).unwrap(),
         );
     }
 
     #[test]
-    fn test_log1p_batching() {
+    fn test_ln_1p_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
-            operation = Log1pOperation::new(),
+            operation = Ln1pOperation::new(),
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -0.5]).unwrap())],
@@ -1029,10 +1028,10 @@ mod tests {
     }
 
     #[test]
-    fn test_log1p_differentiation() {
+    fn test_ln_1p_differentiation() {
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
-            operation = Log1pOperation::new(),
+            operation = Ln1pOperation::new(),
             cases = [{
                 primals = [Array::scalar(0.7).unwrap()],
                 tangents = [Array::scalar(3.0).unwrap()],
@@ -1040,7 +1039,7 @@ mod tests {
                 tangent_outputs = [Array::scalar(3.0 / 1.7).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[] .
-                    let %2:f64[] = log1p %0
+                    let %2:f64[] = ln_1p %0
                         %3:f64[] = one_like %0
                         %4:f64[] = add %3 %0
                         %5:f64[] = div %1 %4
@@ -1051,46 +1050,46 @@ mod tests {
     }
 
     #[test]
-    fn test_log1p_transposition() {
+    fn test_ln_1p_transposition() {
         check_operation_transposition!(
             @rejected,
-            operation = Log1pOperation::<ArrayType>::new(),
+            operation = Ln1pOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
     }
 
     #[test]
-    fn test_array_log1p() {
+    fn test_array_ln_1p() {
         // Ordinary values in every supported floating-point width, each evaluated in its own precision.
-        assert_eq!(Array::scalar(0.5f32).unwrap().log1p().unwrap(), Array::scalar(0.5f32.ln_1p()).unwrap());
-        assert_eq!(Array::scalar(0.5f64).unwrap().log1p().unwrap(), Array::scalar(0.5f64.ln_1p()).unwrap());
+        assert_eq!(Array::scalar(0.5f32).unwrap().ln_1p().unwrap(), Array::scalar(0.5f32.ln_1p()).unwrap());
+        assert_eq!(Array::scalar(0.5f64).unwrap().ln_1p().unwrap(), Array::scalar(0.5f64.ln_1p()).unwrap());
         assert_eq!(
-            Array::scalar(bf16::from_f32(0.5)).unwrap().log1p().unwrap(),
+            Array::scalar(bf16::from_f32(0.5)).unwrap().ln_1p().unwrap(),
             Array::scalar(bf16::from_f32(0.5f32.ln_1p())).unwrap(),
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(0.5)).unwrap().log1p().unwrap(),
+            Array::scalar(f16::from_f32(0.5)).unwrap().ln_1p().unwrap(),
             Array::scalar(f16::from_f32(0.5f32.ln_1p())).unwrap()
         );
 
         // The fixed point and the boundary values of the real domain.
-        assert_eq!(Array::scalar(0.0f64).unwrap().log1p().unwrap(), Array::scalar(0.0f64).unwrap());
-        assert_eq!(Array::scalar(-1.0f64).unwrap().log1p().unwrap(), Array::scalar(f64::NEG_INFINITY).unwrap());
-        assert!(Array::scalar(-2.0f64).unwrap().log1p().unwrap().to_f64s()[0].is_nan());
+        assert_eq!(Array::scalar(0.0f64).unwrap().ln_1p().unwrap(), Array::scalar(0.0f64).unwrap());
+        assert_eq!(Array::scalar(-1.0f64).unwrap().ln_1p().unwrap(), Array::scalar(f64::NEG_INFINITY).unwrap());
+        assert!(Array::scalar(-2.0f64).unwrap().ln_1p().unwrap().to_f64s()[0].is_nan());
 
-        // The accuracy the primitive exists for: near zero, `log1p` keeps full relative precision while the naive
+        // The accuracy the primitive exists for: near zero, `ln_1p` keeps full relative precision while the naive
         // composition through `1 + x` has already lost most of it.
-        assert_eq!(Array::scalar(1e-10f64).unwrap().log1p().unwrap(), Array::scalar(1e-10f64.ln_1p()).unwrap());
+        assert_eq!(Array::scalar(1e-10f64).unwrap().ln_1p().unwrap(), Array::scalar(1e-10f64.ln_1p()).unwrap());
         assert_ne!(1e-10f64.ln_1p(), (1.0f64 + 1e-10).ln());
         assert!((1e-10f64.ln_1p() - 1e-10).abs() < 1e-20);
 
-        assert_eq!(Array::scalar(0.5).unwrap().log1p().unwrap(), Array::scalar(0.5f64.ln_1p()).unwrap());
+        assert_eq!(Array::scalar(0.5).unwrap().ln_1p().unwrap(), Array::scalar(0.5f64.ln_1p()).unwrap());
     }
 
     #[test]
-    fn test_log1p_for_primitives() {
-        assert_eq!(Log1p::log1p(&0.0f64), Ok(0.0));
-        assert_eq!(Log1p::log1p(&0.0f32), Ok(0.0));
+    fn test_ln_1p_for_primitives() {
+        assert_eq!(Ln1p::ln_1p(&0.0f64), Ok(0.0));
+        assert_eq!(Ln1p::ln_1p(&0.0f32), Ok(0.0));
     }
 
     #[test]

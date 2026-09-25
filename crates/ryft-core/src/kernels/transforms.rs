@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::arrays::{
     Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, Dimension,
-    DimensionBounds, DimensionType, ReferenceIndexOperation,
+    DimensionBounds, DimensionType,
 };
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::Context;
@@ -19,6 +19,7 @@ use crate::kernels::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRA
 use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
 use crate::kernels::operations::{KernelExtension, KernelOperation};
 use crate::kernels::validation::KernelParameterAccess;
+use crate::operations::ReferenceIndexOperation;
 use crate::parameters::Placeholder;
 use crate::programs::{Operation, ProgramBuilder, ProgramError, Typed, Value};
 

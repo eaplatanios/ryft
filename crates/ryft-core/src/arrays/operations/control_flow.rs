@@ -381,7 +381,6 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::references::ReferenceDynamicIndexOperation;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::references::{ArrayReference, ArrayReferenceView, ArrayReferenceViewIndex};
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
@@ -396,8 +395,8 @@ mod tests {
     use crate::operations::{
         Add, AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
-        ReferenceAddUpdateOperation, ReferenceReadOperation, ScanOperation, StopGradientOperation, WhileOperation,
-        WhilePredicate, ZeroOperation,
+        ReferenceAddUpdateOperation, ReferenceDynamicIndexOperation, ReferenceReadOperation, ScanOperation,
+        StopGradientOperation, WhileOperation, WhilePredicate, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};

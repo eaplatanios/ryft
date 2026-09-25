@@ -1064,13 +1064,15 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
+        DimensionBounds, DimensionVariable, Shape,
     };
     use crate::axes::NamedAxes;
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::{AddOperation, NegOperation, OneLike, OneOperation, ZeroLike, ZeroOperation};
+    use crate::operations::{
+        AddOperation, NegOperation, OneLike, OneOperation, ReferenceIndexOperation, ZeroLike, ZeroOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::{
         AtomId, Operation, ProgramError, ReferenceBoundary, ReferenceType, RegionInterface, TypeError, Typed,

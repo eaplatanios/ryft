@@ -893,9 +893,7 @@ fn intersect_states(
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{
-        ArrayOperation, DataType, DimensionBounds, DimensionType, ReferenceIndexOperation, ReferenceSliceOperation,
-    };
+    use crate::arrays::{ArrayOperation, DataType, DimensionBounds, DimensionType};
     use crate::contexts::EagerContext;
     use crate::kernels::calls::KernelParameter;
     use crate::kernels::grids::{Grid, GridDimension, GridExecution};
@@ -908,8 +906,9 @@ mod tests {
     use crate::kernels::validation::KernelValidationError;
     use crate::operations::{
         ConditionOperation, DimensionAddOperation, DimensionMulOperation, NotOperation, ReferenceAddUpdateOperation,
-        ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSwapOperation, ReferenceWriteOperation, WhileOperation,
+        ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceWriteOperation,
+        WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{FlatProgram, ProgramBuilder, ReferenceAnalysisError, ReferenceViewAnalysisError};
@@ -992,7 +991,7 @@ mod tests {
             source: &ArrayIrType,
             target: &ArrayIrType,
         ) -> Result<(), crate::programs::ReferenceViewValidationError> {
-            crate::arrays::validate_array_reference_view(view, source, target)
+            view.validate(source, target)
         }
 
         fn reapply_reference_view<C: crate::contexts::Context<Type = ArrayIrType, Operation = Self>>(

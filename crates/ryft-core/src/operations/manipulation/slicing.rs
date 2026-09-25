@@ -5,8 +5,7 @@ use std::marker::PhantomData;
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
     ArrayIrType, ArrayIrValue, ArraySliceAxis, ArrayType, ArrayTypeRefinements, DataType, Dimension, DimensionType,
-    DimensionValue, LinearResiduals, MeshAxisType, ReferenceSliceOperation, Shape, Sharding, ShardingDimension,
-    StaticShape,
+    DimensionValue, LinearResiduals, MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -50,7 +49,9 @@ use crate::operations::manipulation::scattering::{
 };
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
-use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation};
+use crate::operations::references::{
+    ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceWriteOperation,
+};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{

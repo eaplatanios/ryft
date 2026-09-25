@@ -3294,7 +3294,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArraySliceAxis, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionVariable, ReferenceSliceOperation, Shape,
+        DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
@@ -3302,7 +3302,8 @@ mod tests {
     use crate::operations::{
         ConditionOperation, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceWriteOperation, StopGradient, StopGradientOperation, ZeroOperation,
+        ReferenceReadOperation, ReferenceSliceOperation, ReferenceWriteOperation, StopGradient, StopGradientOperation,
+        ZeroOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{

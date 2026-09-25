@@ -306,7 +306,7 @@ pub trait RealFloatingPointArrayElement: FloatingPointArrayElement + RealArrayEl
 
     /// Computes `log(1 + self)` without first rounding `1 + self`, preserving accuracy near zero. Inputs below
     /// `-1` produce NaN and `-1` produces negative infinity before conversion to the destination format.
-    fn log1p(self) -> Result<Self, ProgramError>;
+    fn ln_1p(self) -> Result<Self, ProgramError>;
 
     /// Computes `log(exp(self) + exp(other))` without forming the potentially overflowing exponentials. Equal-sign
     /// infinities return that infinity, opposite-sign infinities return positive infinity, and NaNs propagate,
@@ -1805,12 +1805,12 @@ macro_rules! impl_floating_point_array_element_for_real_floating_point_types {
             }
 
             #[inline]
-            fn log1p(self) -> Result<Self, ProgramError> {
+            fn ln_1p(self) -> Result<Self, ProgramError> {
                 ($encode)(<$work>::ln_1p(($decode)(self)))
             }
 
             fn log_add_exp(self, other: Self) -> Result<Self, ProgramError> {
-                // The pinned `select(isnan(a - b), a + b, max(a, b) + log1p(exp(-|a - b|)))` construction. The
+                // The pinned `select(isnan(a - b), a + b, max(a, b) + ln_1p(exp(-|a - b|)))` construction. The
                 // difference is NaN exactly when it is undefined (same-sign infinities) or when an operand is NaN,
                 // which is what routes those cases through the saturating sum.
                 let left = ($decode)(self);
@@ -3604,13 +3604,13 @@ mod tests {
     }
 
     #[test]
-    fn test_real_floating_point_array_element_log1p() {
+    fn test_real_floating_point_array_element_ln_1p() {
         // Small arguments retain information that forming 1 + x would lose.
-        assert_eq!(RealFloatingPointArrayElement::log1p(1e-20f64), Ok(1e-20));
-        assert_eq!(RealFloatingPointArrayElement::log1p(-0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
-        assert_eq!(RealFloatingPointArrayElement::log1p(-1.0f64), Ok(f64::NEG_INFINITY));
-        assert!(RealFloatingPointArrayElement::log1p(-2.0f64).unwrap().is_nan());
-        assert_eq!(RealFloatingPointArrayElement::log1p(f64::INFINITY), Ok(f64::INFINITY));
+        assert_eq!(RealFloatingPointArrayElement::ln_1p(1e-20f64), Ok(1e-20));
+        assert_eq!(RealFloatingPointArrayElement::ln_1p(-0.0f32).unwrap().to_bits(), (-0.0f32).to_bits());
+        assert_eq!(RealFloatingPointArrayElement::ln_1p(-1.0f64), Ok(f64::NEG_INFINITY));
+        assert!(RealFloatingPointArrayElement::ln_1p(-2.0f64).unwrap().is_nan());
+        assert_eq!(RealFloatingPointArrayElement::ln_1p(f64::INFINITY), Ok(f64::INFINITY));
     }
 
     #[test]

@@ -1889,13 +1889,14 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArraySliceAxis, ArrayType,
-        DataType, ReferenceIndexOperation, ReferenceSliceOperation,
+        DataType,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, ReferenceAddUpdateOperation,
-        ReferenceReadOperation, ReferenceWriteOperation, WhileOperation,
+        ReferenceIndexOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceWriteOperation,
+        WhileOperation,
     };
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;

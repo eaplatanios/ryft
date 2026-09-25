@@ -72,8 +72,8 @@ pub use dot::{
     RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
 };
 pub use exponential::{
-    EXP_OPERATION_NAME, Exp, ExpOperation, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOG1P_OPERATION_NAME,
-    LOGISTIC_OPERATION_NAME, Log, Log1p, Log1pOperation, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
+    EXP_OPERATION_NAME, Exp, ExpOperation, LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME,
+    LOGISTIC_OPERATION_NAME, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
     LogisticOperation,
 };
 pub use extrema::{Clamp, MAX_OPERATION_NAME, MIN_OPERATION_NAME, Max, MaxOperation, Min, MinOperation};
@@ -82,12 +82,14 @@ pub use manipulation::*;
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use reductions::{LogSumExp, Reduce, ReduceOperation, ReductionKind};
 pub use references::{
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
-    REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
-    REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
-    ReferenceWriteOperation,
+    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME,
+    REFERENCE_DYNAMIC_INDEX_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_INDEX_OPERATION_NAME,
+    REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME,
+    REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceDynamicIndex, ReferenceDynamicIndexOperation,
+    ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndex, ReferenceIndexOperation, ReferenceNew,
+    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSlice, ReferenceSliceOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
 };
 pub use rounding::{
     CEIL_OPERATION_NAME, Ceil, CeilOperation, FLOOR_OPERATION_NAME, Floor, FloorOperation, ROUND_OPERATION_NAME, Round,

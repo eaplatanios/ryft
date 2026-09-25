@@ -50,19 +50,21 @@ use crate::operations::{
     DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, Dot, DotOperation,
     DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation, DynamicSlice,
     DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf, ErfOperation, Exp, ExpOperation,
-    Floor, FloorOperation, Gather, GatherOperation, IotaOperation, LinearCallOperation, Log, Log1p, Log1pOperation,
+    Floor, FloorOperation, Gather, GatherOperation, IotaOperation, LinearCallOperation, Ln1p, Ln1pOperation, Log,
     LogAddExp, LogAddExpOperation, LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation,
     Mul, MulOperation, Neg, NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation,
     Pad, PadOperation, ParallelReduceOperation, ParallelVaryOperation, Pow, PowOperation, PrintOperation, RaggedDot,
     RaggedDotOperation, Reduce, ReduceOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-    ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
-    ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Reverse,
-    ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation,
-    Scatter, ScatterOperation, Select, SelectOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation,
-    Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
-    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceDynamicIndex, ReferenceDynamicIndexOperation,
+    ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndex, ReferenceIndexOperation, ReferenceNew,
+    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSlice, ReferenceSliceOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape,
+    ReshapeOperation, ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation,
+    ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign,
+    SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
+    Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation,
+    UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation,
+    ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -76,21 +78,12 @@ mod collectives;
 mod control_flow;
 mod cumulative;
 mod random;
-mod references;
 mod sort;
 
 pub(crate) use collectives::decode_nonnegative_integer_metadata;
 
 // The element-level extrema of the reference kernels are the canonical least and greatest values of each element data
 // type, so the ragged identity masking of `arrays::batching` reads them through this facade instead of restating them.
-
-// TODO(eaplatanios): This seems a bit weirdly placed.
-pub use references::{
-    ArrayReferenceViewOperation, REFERENCE_DYNAMIC_INDEX_OPERATION_NAME, REFERENCE_INDEX_OPERATION_NAME,
-    REFERENCE_SLICE_OPERATION_NAME, ReferenceDynamicIndex, ReferenceDynamicIndexOperation, ReferenceIndex,
-    ReferenceIndexOperation, ReferenceSlice, ReferenceSliceOperation, reapply_array_reference_view,
-    validate_array_reference_view,
-};
 
 /// Reusable [`Operation`] enum for ordinary staged programs over arrays.
 ///
@@ -133,7 +126,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Floor(FloorOperation<ArrayType>),
     Ceil(CeilOperation<ArrayType>),
     Round(RoundOperation<ArrayType>),
-    Log1p(Log1pOperation<ArrayType>),
+    Ln1p(Ln1pOperation<ArrayType>),
     LogAddExp(LogAddExpOperation<ArrayType>),
     Erf(ErfOperation<ArrayType>),
     Not(NotOperation<ArrayType>),
@@ -258,7 +251,7 @@ pub trait ArrayOperations:
     + std::ops::Mul<Output = Self> + std::ops::Div<Output = Self>
     + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Abs + Sign
     // Elementwise math and logic.
-    + Sin + Cos + Atan2 + Exp + Log + Log1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil
+    + Sin + Cos + Atan2 + Exp + Log + Ln1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil
     + Round
     + Not + And + Or + Xor
     // Complex numbers.
@@ -283,7 +276,7 @@ where
     V: Value<Type = ArrayType>,
     V: std::ops::Neg<Output = V> + std::ops::Add<Output = V> + std::ops::Sub<Output = V> + std::ops::Mul<Output = V>,
     V: std::ops::Div<Output = V> + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Abs + Sign,
-    V: Sin + Cos + Atan2 + Exp + Log + Log1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf,
+    V: Sin + Cos + Atan2 + Exp + Log + Ln1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf,
     V: Floor + Ceil + Round,
     V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
     V: Transpose + Reverse + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
@@ -1801,6 +1794,42 @@ mod tests {
                     .into()
             ]),
         );
+    }
+
+    #[test]
+    fn test_array_ir_operation_reference_conversions() {
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceNew(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceReadOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceRead(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceWriteOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceWrite(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceSwapOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceSwap(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceAddUpdateOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceAddUpdate(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceFreeze(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceIndexOperation::new(0, 0)),
+            ArrayIrOperation::ReferenceIndex(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)])),
+            ArrayIrOperation::ReferenceSlice(_),
+        ));
     }
 
     #[test]

@@ -680,8 +680,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayReference, ArrayReferenceDischarge, ArrayType, DataType, Dimension, ReferenceDynamicIndexOperation, Shape,
-        ShardingDimension,
+        ArrayReference, ArrayReferenceDischarge, ArrayType, DataType, Dimension, Shape, ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{
@@ -701,8 +700,8 @@ mod tests {
     use crate::operations::dot::{Dot, DotDimensionNumbers};
     use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
     use crate::operations::references::{
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation,
     };
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;

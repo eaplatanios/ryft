@@ -32,7 +32,7 @@ use ryft_core::{
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
     DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation,
     DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation, GatherOperation,
-    InputRegionProvenance, IotaOperation, LinearCallOperation, Log1pOperation, LogAddExpOperation, LogOperation,
+    InputRegionProvenance, IotaOperation, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation,
     LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation,
     OneLikeOperation, OneOperation, Operation, OperationFormatter, OperationProvider, OrOperation,
     OutputRegionProvenance, PadOperation, ParallelReduceOperation, ParallelVaryOperation, Parameter,
@@ -49,7 +49,6 @@ use ryft_core::{
     TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext,
     TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
     WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
-    reapply_array_reference_view, validate_array_reference_view,
 };
 use ryft_macros::Parameter;
 
@@ -563,7 +562,7 @@ where
         source: &ArrayIrType,
         target: &ArrayIrType,
     ) -> Result<(), ReferenceViewValidationError> {
-        validate_array_reference_view(view, source, target)
+        view.validate(source, target)
     }
 
     fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
@@ -572,7 +571,7 @@ where
         source: C::Value,
         symbols: &[C::Value],
     ) -> Result<C::Value, ProgramError> {
-        reapply_array_reference_view(context, view, source, symbols)
+        view.reapply(context, source, symbols)
     }
 }
 
@@ -786,7 +785,7 @@ impl_array_operation_conversion!(
     Atan2Operation<ArrayType>,
     ExpOperation<ArrayType>,
     LogOperation<ArrayType>,
-    Log1pOperation<ArrayType>,
+    Ln1pOperation<ArrayType>,
     LogAddExpOperation<ArrayType>,
     SqrtOperation<ArrayType>,
     RsqrtOperation<ArrayType>,

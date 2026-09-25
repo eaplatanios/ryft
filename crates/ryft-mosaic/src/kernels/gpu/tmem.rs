@@ -7,7 +7,7 @@ use ryft_core::kernels::{KernelExtension, KernelExtensionMemory};
 use ryft_core::{
     ArrayIrType, ArrayReferenceView, ArrayType, Context, DataType, EffectClasses, Effects, Operation,
     OperationFormatter, ProgramError, ReferenceAccessMode, ReferenceEffect, ReferenceType, ReferenceViewOperation,
-    ReferenceViewValidationError, RegionInterface, TypeError, validate_array_reference_view,
+    ReferenceViewValidationError, RegionInterface, TypeError,
 };
 
 /// A datacenter Blackwell tensor-memory allocation and its ordered asynchronous operations.
@@ -343,7 +343,7 @@ impl ReferenceViewOperation for TmemOperation {
         source: &ArrayIrType,
         target: &ArrayIrType,
     ) -> Result<(), ReferenceViewValidationError> {
-        validate_array_reference_view(view, source, target)
+        view.validate(source, target)
     }
 
     fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
