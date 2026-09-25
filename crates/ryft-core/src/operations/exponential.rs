@@ -26,7 +26,7 @@
 //! # }
 //! ```
 
-use crate::arrays::{DataType, FloatingPointArrayElement};
+use crate::arrays::FloatingPointArrayElement;
 use crate::differentiation::{
     DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
 };
@@ -478,25 +478,6 @@ impl_logistic_for_primitive!(f32);
 impl_logistic_for_primitive!(f64);
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Returns whether the lowest value of `data_type` is an identity of the rounded pairwise [`LogAddExp`].
-/// A binary fold rounds after every pair: once combining two sentinel values returns the sentinel, an all-sentinel
-/// subtree of any size does too. There is therefore no scan-length bound. This contract does not apply to a
-/// max-shifted sum, whose padding must remain neutral after subtraction of an arbitrary maximum.
-pub(crate) fn is_log_add_exp_identity_data_type(data_type: DataType) -> bool {
-    data_type.is_floating_point() && !matches!(data_type, DataType::F8E8M0FNU | DataType::F6E2M3FN)
-}
-
-/// Returns the diagnostic for a type whose lowest value cannot seed a rounded pairwise [`LogAddExp`] fold.
-pub(crate) fn log_add_exp_identity_data_type_error(operation_name: &str, data_type: DataType) -> String {
-    match data_type {
-        _ if data_type.is_floating_point() => format!(
-            "`{operation_name}` requires a floating-point format whose lowest value is a `log_add_exp` identity but \
-             got `{data_type}`"
-        ),
-        _ => format!("`{operation_name}` requires real floating-point inputs but got `{data_type}`"),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1484,36 +1465,5 @@ mod tests {
     fn test_logistic_primitives() {
         assert_eq!(Logistic::logistic(&0.0f32), Ok(0.5));
         assert_eq!(Logistic::logistic(&0.0f64), Ok(0.5));
-    }
-
-    #[test]
-    fn test_is_log_add_exp_identity_data_type() {
-        assert!(is_log_add_exp_identity_data_type(DataType::F32));
-        assert!(is_log_add_exp_identity_data_type(DataType::F8E4M3FN));
-        assert!(!is_log_add_exp_identity_data_type(DataType::F8E8M0FNU));
-        assert!(is_log_add_exp_identity_data_type(DataType::F4E2M1FN));
-        assert!(is_log_add_exp_identity_data_type(DataType::F6E3M2FN));
-        assert!(is_log_add_exp_identity_data_type(DataType::F8E4M3B11FNUZ));
-        assert!(!is_log_add_exp_identity_data_type(DataType::F6E2M3FN));
-        assert!(!is_log_add_exp_identity_data_type(DataType::I32));
-        assert!(!is_log_add_exp_identity_data_type(DataType::C64));
-    }
-
-    #[test]
-    fn test_log_add_exp_identity_data_type_error() {
-        assert_eq!(
-            log_add_exp_identity_data_type_error("reduce_log_sum_exp", DataType::F8E8M0FNU),
-            "`reduce_log_sum_exp` requires a floating-point format whose lowest value is a `log_add_exp` identity but got \
-             `f8e8m0fnu`",
-        );
-        assert_eq!(
-            log_add_exp_identity_data_type_error("reduce_log_sum_exp", DataType::F6E2M3FN),
-            "`reduce_log_sum_exp` requires a floating-point format whose lowest value is a `log_add_exp` identity but got \
-             `f6e2m3fn`",
-        );
-        assert_eq!(
-            log_add_exp_identity_data_type_error("reduce_log_sum_exp", DataType::I32),
-            "`reduce_log_sum_exp` requires real floating-point inputs but got `i32`",
-        );
     }
 }

@@ -6,7 +6,9 @@
 
 use std::fmt::Display;
 
-use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayType, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity};
+use crate::arrays::{
+    ArrayBatch, ArrayBatchingPolicy, ArrayType, DataType, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity,
+};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -22,9 +24,7 @@ use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::cumulative::{
     cumulative_abstract, define_cumulative_operation, jvp_through_associative_scan, lift_cumulative_axis,
 };
-use crate::operations::exponential::{
-    LogAddExp, LogAddExpOperation, is_log_add_exp_identity_data_type, log_add_exp_identity_data_type_error,
-};
+use crate::operations::exponential::{LOG_ADD_EXP_OPERATION_NAME, LogAddExp, LogAddExpOperation};
 use crate::operations::manipulation::concatenation::ConcatenateOperation;
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::slicing::SliceOperation;
@@ -43,9 +43,8 @@ define_cumulative_operation! {
     /// Padding is filled with the element type's lowest value, which must be an identity of the rounded pairwise
     /// [`LogAddExp`] operation. True negative infinity satisfies this contract, as do finite sentinels that round
     /// back to the other input after each pairwise combination. Such sentinels remain neutral for any prefix length.
-    /// [`DataType::F8E8M0FNU`](crate::arrays::DataType::F8E8M0FNU) and
-    /// [`DataType::F6E2M3FN`](crate::arrays::DataType::F6E2M3FN) have no suitable identity and are rejected.
-    /// The scanned dimension must be static and unsharded, as documented on [`cumulative_abstract`].
+    /// [`DataType::F8E8M0FNU`] and [`DataType::F6E2M3FN`] have no suitable identity and are rejected. The scanned
+    /// dimension must be static and unsharded, as documented on [`cumulative_abstract`].
     ///
     /// Each prefix is accumulated by folding the pairwise [`LogAddExp`] primitive, which is stable over the whole
     /// real range but is a different expression from the max-shifted reduction that
@@ -54,8 +53,21 @@ define_cumulative_operation! {
     operation = CumulativeLogSumExpOperation,
     name = CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME = "cumulative_log_sum_exp",
     abstract_rule = cumulative_log_sum_exp_abstract,
-    element_domain = |data_type| is_log_add_exp_identity_data_type(data_type),
-    element_domain_error = log_add_exp_identity_data_type_error(CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, data_type),
+    // The lowest value of an accepted format must be an identity of the rounded pairwise `LogAddExp`. A binary fold
+    // rounds after every pair, so once combining two sentinel values returns the sentinel, an all-sentinel subtree of
+    // any size does too, and there is therefore no scan-length bound. This contract does not apply to a max-shifted
+    // sum, whose padding must remain neutral after subtracting an arbitrary maximum.
+    element_domain = |data_type| {
+        data_type.is_floating_point() && !matches!(data_type, DataType::F8E8M0FNU | DataType::F6E2M3FN)
+    },
+    element_domain_error = if data_type.is_floating_point() {
+        format!(
+            "`{CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME}` requires a floating-point format whose lowest value is a \
+             `{LOG_ADD_EXP_OPERATION_NAME}` identity but got `{data_type}`"
+        )
+    } else {
+        format!("`{CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME}` requires real floating-point inputs but got `{data_type}`")
+    },
     ragged_identity = RaggedMaskIdentity::Lowest,
     combine_operation = LogAddExpOperation<ArrayType>,
     combine = |left, right| left.log_add_exp(right),
