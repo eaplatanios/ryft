@@ -20,9 +20,9 @@ use crate::operations::references::reference_new::ReferenceNewOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     EffectClasses, Effects, MaybeZero, NoReferent, Operation, OperationProvider, ProgramError, ProjectedValue,
-    ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType,
-    ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect,
+    ReferenceMemberType, ReferenceType, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -85,7 +85,6 @@ where
             Effects::new(
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }],
-                Vec::new(),
             )
             .unwrap()
         });
@@ -193,13 +192,13 @@ impl<
     T: Type,
     U: DifferentiableType + ReferenceMemberType,
     V: Value<Type = U>,
-    O: ReferenceViewOperation<Type = U>
+    O: ReferenceAccessOperation<Type = U>
         + ResidualZeroProvider<U, Operation = O>
         + OperationProvider<U, ReferenceNewOperation<<U as ReferenceMemberType>::Referent, U>, Operation = O>,
 > TransposableOperation<V, O> for ReferenceFreezeOperation<T, U>
 where
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
-    Tracer<TracingContext<V, O>>: ReferenceAddUpdate,
+    Tracer<TracingContext<V, O>>: ReferenceAddUpdate<<O as ReferenceAccessOperation>::Transform>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -400,7 +399,6 @@ mod tests {
             operation.effects().reference_effects(),
             &[ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }],
         );
-        assert_eq!(operation.effects().reference_aliases(), &[]);
     }
 
     #[test]

@@ -84,7 +84,7 @@ where
     fn effects(&self) -> Cow<'_, Effects> {
         // Share one descriptor across all type instantiations to avoid allocating and validating it on every query.
         static EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
-            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new()).unwrap()
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap()
         });
         Cow::Borrowed(&EFFECTS)
     }
@@ -344,7 +344,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
+        ArrayReferenceTransform, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, Shape,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
@@ -382,7 +383,6 @@ mod tests {
         );
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(operation.effects().reference_effects(), &[ReferenceEffect::Allocate { output_index: 0 }]);
-        assert_eq!(operation.effects().reference_aliases(), &[]);
     }
 
     #[test]
@@ -776,7 +776,12 @@ mod tests {
             .add_instruction(TestIrReferenceNewOperation::new(), Vec::new(), vec![initial], None)
             .unwrap()[0];
         let output = builder
-            .add_instruction(ReferenceReadOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), vec![reference], None)
+            .add_instruction(
+                ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
+                Vec::new(),
+                vec![reference],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
