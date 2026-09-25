@@ -347,7 +347,9 @@ macro_rules! dispatch_on_array_element_type {
 ///
 ///   - `@unary` or `@binary`: Number of operands accepted by the generated function.
 ///   - `$capability`: Capability trait path.
-///   - `$method`: Name of its function to implement.
+///   - `$method`: Name of its function to implement. A unary capability whose operation carries a result
+///     [`Accuracy`](crate::Accuracy) names that function's accuracy parameter in parentheses (e.g.,
+///     `sin_with_accuracy(_accuracy)`). The reference kernels provide one implementation, so they ignore it.
 ///   - `operation = $operation`: Name used in diagnostics, such as `"min"`.
 ///   - `inputs = $(@selector)+`: Composable predicates over numeric elements, using the same intersection rules as
 ///     [`check_types!`](crate::check_types). `@numeric` accepts all numeric types, `@float` excludes integers, and
@@ -433,14 +435,19 @@ macro_rules! impl_array_elementwise_operation {
     // Generates a unary capability preserving the input element type, shape, and layout.
     (
         @unary
-        $capability:path, $method:ident,
+        $capability:path,
+        $method:ident
+        $(($accuracy:ident))?,
         operation = $operation:expr,
         inputs = $(@$selector:ident)+,
         checks = [$(@$check:ident),* $(,)?],
         |$input_element:ident| $body:expr $(,)?
     ) => {
         impl $capability for $crate::arrays::Array {
-            fn $method(&self) -> Result<Self, $crate::programs::ProgramError> {
+            fn $method(
+                &self
+                $(, $accuracy: $crate::operations::Accuracy)?
+            ) -> Result<Self, $crate::programs::ProgramError> {
                 use $crate::programs::Typed as _;
                 let operation = $operation;
                 let input_type = self.r#type();

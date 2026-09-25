@@ -705,12 +705,17 @@ macro_rules! define_arithmetic_dimension_capability {
 /// # Parameters
 ///
 ///   - `@unary` / `@binary`: Selects the operation arity.
+///   - `@accuracy`: Optional flag after `@unary` that gives the operation a result [`Accuracy`](crate::Accuracy) field,
+///     with `new` (default accuracy), `with_accuracy`, and `accuracy` functions. The default accuracy renders as the
+///     bare operation name, while every other accuracy renders as a bracketed `accuracy` field
+///     (e.g., `sin [accuracy=highest]`).
 ///   - `$(#[$documentation])*`: Documentation attributes attached to the generated operation struct.
 ///   - `$operation`: Identifier of the generated type-parameterized operation marker (e.g., `SinOperation`).
 ///   - `$name`: Identifier of an existing operation-name constant (e.g., `SIN_OPERATION_NAME`).
 ///   - `$capability`: Identifier of the value-level capability trait bound by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Sin`).
-///   - `$method`: Identifier of the capability trait method used for interpretation (e.g., `sin`).
+///   - `$method`: Identifier of the capability trait method used for interpretation (e.g., `sin`). With `@accuracy`,
+///     it names the capability function that receives the operation's accuracy (e.g., `sin_with_accuracy`).
 ///   - `infer_data_types`: Optional callable expression with signature `Fn(&[DataType]) -> Result<Vec<DataType>,
 ///     TypeError>`. It receives the operation's validated input data types and returns its single output data type.
 ///     Both closures and function paths are accepted. When omitted, unary operations preserve their input data type
@@ -727,8 +732,10 @@ macro_rules! define_arithmetic_dimension_capability {
 #[macro_export]
 macro_rules! define_elementwise_operation {
     // This public branch defines a unary elementwise operation and its shared interpretation and inference machinery.
+    // The optional `@accuracy` flag gives the operation a result `Accuracy` field, in which case `$method` names the
+    // capability function that receives that accuracy.
     (
-        @unary
+        @unary $(@$flag:ident)?
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
         $capability:ident, $method:ident
@@ -737,7 +744,7 @@ macro_rules! define_elementwise_operation {
         $(, check_data_types = [$($(@$data_type_check:ident)+),* $(,)?])?
         $(, check_array_types = [$(@$array_type_check:ident),* $(,)?])? $(,)?
     ) => {
-        $crate::define_elementwise_operation!(@marker [$(#[$documentation])*] $operation, $name);
+        $crate::define_elementwise_operation!(@unary_marker [$($flag)?] [$(#[$documentation])*] $operation, $name);
 
         impl $crate::Operation for $operation<$crate::arrays::DataType> {
             type Type = $crate::arrays::DataType;
@@ -761,6 +768,8 @@ macro_rules! define_elementwise_operation {
                 $crate::check_count!("output", output_types, 1, TypeError);
                 Ok(output_types)
             }
+
+            $crate::define_elementwise_operation!(@unary_render [$($flag)?] $name);
         }
 
         impl $crate::Operation for $operation<$crate::arrays::ArrayType> {
@@ -779,6 +788,8 @@ macro_rules! define_elementwise_operation {
             ) -> Result<Vec<$crate::arrays::ArrayType>, $crate::TypeError> {
                 $crate::ElementwiseOperation::infer_output_types(self, input_types)
             }
+
+            $crate::define_elementwise_operation!(@unary_render [$($flag)?] $name);
         }
 
         impl $crate::ElementwiseOperation for $operation<$crate::arrays::ArrayType> {
@@ -819,7 +830,7 @@ macro_rules! define_elementwise_operation {
                 inputs: &[__C::Value],
             ) -> Result<Vec<__C::Value>, $crate::ProgramError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].$method()?])
+                Ok(vec![$crate::define_elementwise_operation!(@unary_interpret [$($flag)?] self, inputs[0], $method)?])
             }
         }
 
@@ -942,6 +953,105 @@ macro_rules! define_elementwise_operation {
             __C::Operation: ::std::convert::From<$operation<__C::Type>>,
         {
         }
+    };
+
+    // This internal branch selects the zero-sized marker for a unary operation without an accuracy attribute.
+    (@unary_marker [] [$($documentation:tt)*] $operation:ident, $name:ident) => {
+        $crate::define_elementwise_operation!(@marker [$($documentation)*] $operation, $name);
+    };
+
+    // This internal branch defines a type-indexed unary operation that carries a result accuracy. The default accuracy
+    // renders as the bare operation name, so existing programs keep their renderings, while every other accuracy is
+    // rendered as a bracketed field because program renderings also key compilation caches.
+    (@unary_marker [accuracy] [$($documentation:tt)*] $operation:ident, $name:ident) => {
+        $($documentation)*
+        #[derive(Clone)]
+        pub struct $operation<__T: $crate::Type> {
+            /// [`Accuracy`](crate::Accuracy) requested from the backend implementation of this operation.
+            accuracy: $crate::Accuracy,
+
+            /// [`PhantomData`](::std::marker::PhantomData) marker tying this operation to its type universe.
+            marker: ::std::marker::PhantomData<fn() -> __T>,
+        }
+
+        impl<__T: $crate::Type> $operation<__T> {
+            #[doc = ::std::concat!(
+                "Creates a new [`", ::std::stringify!($operation), "`] with the default ",
+                "[`Accuracy`](crate::Accuracy).",
+            )]
+            pub const fn new() -> Self {
+                Self { accuracy: $crate::operations::Accuracy::Default, marker: ::std::marker::PhantomData }
+            }
+
+            #[doc = ::std::concat!(
+                "Returns this [`", ::std::stringify!($operation), "`] with the provided result ",
+                "[`Accuracy`](crate::Accuracy).",
+            )]
+            pub const fn with_accuracy(self, accuracy: $crate::operations::Accuracy) -> Self {
+                Self { accuracy, marker: ::std::marker::PhantomData }
+            }
+
+            #[doc = ::std::concat!(
+                "Returns the result [`Accuracy`](crate::Accuracy) of this [`",
+                ::std::stringify!($operation), "`].",
+            )]
+            #[inline]
+            pub fn accuracy(&self) -> $crate::operations::Accuracy {
+                self.accuracy
+            }
+        }
+
+        impl<__T: $crate::Type> ::std::default::Default for $operation<__T> {
+            #[inline]
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl<__T: $crate::Type> ::std::fmt::Debug for $operation<__T> {
+            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                if self.accuracy == $crate::operations::Accuracy::Default {
+                    formatter.write_str(::std::stringify!($operation))
+                } else {
+                    formatter.debug_struct(::std::stringify!($operation)).field("accuracy", &self.accuracy).finish()
+                }
+            }
+        }
+
+        impl<__T: $crate::Type> ::std::fmt::Display for $operation<__T> {
+            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                formatter.write_str($name)?;
+                if self.accuracy != $crate::operations::Accuracy::Default {
+                    ::std::write!(formatter, " [accuracy={}]", self.accuracy)?;
+                }
+                Ok(())
+            }
+        }
+    };
+
+    // This internal branch keeps the default rendering for a unary operation without an accuracy attribute.
+    (@unary_render [] $name:ident) => {};
+
+    // This internal branch renders a non-default accuracy as the only bracketed field of a unary operation.
+    (@unary_render [accuracy] $name:ident) => {
+        fn render(&self, formatter: &mut ::std::fmt::Formatter<'_>, indentation: usize) -> ::std::fmt::Result {
+            let operation = $crate::programs::operations::OperationFormatter::new(formatter, indentation, $name)?;
+            if self.accuracy == $crate::operations::Accuracy::Default {
+                return Ok(());
+            }
+            operation.bracketed(|operation| operation.field("accuracy", self.accuracy))
+        }
+    };
+
+    // This internal branch interprets a unary operation without an accuracy attribute through its capability.
+    (@unary_interpret [] $operation:ident, $input:expr, $method:ident) => {
+        $input.$method()
+    };
+
+    // This internal branch interprets a unary operation with an accuracy attribute, forwarding that accuracy to the
+    // capability so that backend domains with several implementations honor it.
+    (@unary_interpret [accuracy] $operation:ident, $input:expr, $method:ident) => {
+        $input.$method($operation.accuracy())
     };
 
     // This internal branch defines the zero-sized, type-indexed marker shared by both public operation arities.
@@ -1079,10 +1189,17 @@ macro_rules! define_elementwise_operation {
 /// # Parameters
 ///
 ///   - `@unary` / `@binary`: Selects whether the capability consumes only `self` or also one named argument.
+///   - `@accuracy`: Optional flag after `@unary` for operations defined with the matching `@accuracy` flag of
+///     [`define_elementwise_operation!`]. The capability then declares a required function that receives a result
+///     [`Accuracy`](crate::Accuracy), and `$method` becomes a provided function that requests the default accuracy.
+///     Context-carrying values bind the operation with the requested accuracy directly rather than through an
+///     [`OperationProvider`](crate::OperationProvider).
 ///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
 ///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `Sin`).
 ///   - `$(#[$method_documentation])*`: Documentation attributes attached to the generated capability method.
 ///   - `$method`: Identifier of the generated capability method (e.g., `sin`).
+///   - `$(#[$accuracy_method_documentation])*` and `$accuracy_method`: With `@accuracy`, the documentation and name
+///     of the capability function that receives the result accuracy (e.g., `sin_with_accuracy`).
 ///   - `$argument`: Required name for the binary capability's non-receiver argument (e.g., `x` in `atan2(x)`).
 ///   - `$operation`: Stateless operation marker (e.g., `SinOperation`) whose
 ///     [`OperationProvider`](crate::OperationProvider) implementation selects and constructs the concrete operation
@@ -1092,6 +1209,52 @@ macro_rules! define_elementwise_operation {
 ///     marker.
 #[macro_export]
 macro_rules! define_elementwise_capability {
+    // This branch defines a unary capability whose operation carries a result accuracy. The accuracy-free function
+    // requests the default accuracy, and context-carrying values bind the operation with the requested accuracy.
+    (
+        @unary @accuracy
+        $(#[$capability_documentation:meta])*
+        $capability:ident,
+        $(#[$method_documentation:meta])+
+        $method:ident,
+        $(#[$accuracy_method_documentation:meta])+
+        $accuracy_method:ident,
+        $operation:ident $(,)?
+    ) => {
+        $(#[$capability_documentation])*
+        pub trait $capability: Sized {
+            $(#[$method_documentation])+
+            #[inline]
+            fn $method(&self) -> Result<Self, $crate::ProgramError> {
+                self.$accuracy_method($crate::operations::Accuracy::Default)
+            }
+
+            $(#[$accuracy_method_documentation])+
+            fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Result<Self, $crate::ProgramError>;
+        }
+
+        impl<__V: $crate::Value> $capability for __V
+        where
+            $operation<__V::Type>: $crate::Operation<Type = __V::Type>,
+            __V::DispatchDomain: $crate::Context<
+                    Type = __V::Type,
+                    Value = __V,
+                    Operation: ::std::convert::From<$operation<__V::Type>>,
+                >,
+        {
+            #[inline]
+            fn $accuracy_method(&self, accuracy: $crate::operations::Accuracy) -> Result<Self, $crate::ProgramError> {
+                Ok($crate::Context::bind(
+                    &$crate::Value::dispatch_domain(self),
+                    $operation::<__V::Type>::new().with_accuracy(accuracy),
+                    Vec::new(),
+                    ::std::slice::from_ref(self),
+                )?
+                .remove(0))
+            }
+        }
+    };
+
     // This branch defines a receiver capability whose unary operation is provided by the value type family.
     (
         @unary
@@ -1857,6 +2020,9 @@ macro_rules! impl_differentiable_operation {
 ///     `where` using ordinary Rust `where`-predicate syntax without an additional delimiter.
 ///   - `$input_primal`: Name bound to an aligned input primal. `_` omits that value without evaluating it.
 ///   - `$input_tangent`: Name bound to the live, aligned tangent whose contribution is being evaluated.
+///   - `$operation_binding`: Optional name, written before a unary rule's input pattern (e.g.,
+///     `|operation, (input, input_tangent)| ...`), bound to the operation whose JVP is being evaluated, so that
+///     the rule can read its configuration (e.g., the result accuracy that a JVP forwards to its coefficient).
 ///   - `$output_primal`: Optional name following `->`, bound to the primal output evaluated at its tangent type.
 ///   - `$left_primal`, `$right_primal`: Names bound to aligned binary input primals. `_` omits a primal without
 ///     evaluating it.
@@ -2218,7 +2384,10 @@ macro_rules! impl_differentiable_elementwise_operation {
     // transposition, unlike binary rules with structured knownness cases.
     (
         @jvp_ready [unary] [$($generic:ident),*] [$context:ident] [$operation:ty] [$($bounds:tt)*]
-        { |($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?| $term:expr }
+        {
+            |$($operation_binding:ident,)? ($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?|
+            $term:expr
+        }
         transpose = @nonlinear $(,)?
     ) => {
         $crate::impl_differentiable_operation! {
@@ -2248,6 +2417,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                         Ok(outputs.remove(0))
                     },
                     |operands| {
+                        $(let $operation_binding = operation;)?
                         $crate::impl_differentiable_elementwise_operation! {
                             @bind_unary_input_primal operands, $input_primal
                         }

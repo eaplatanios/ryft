@@ -34,6 +34,7 @@ use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
     impl_differentiable_elementwise_operation, impl_differentiable_operation,
 };
+use crate::operations::Accuracy;
 use crate::operations::arithmetic::{Add, Div, Mul, Sub};
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::complex::Real;
@@ -48,14 +49,14 @@ use crate::programs::{MaybeZero, ProgramError, Type, Typed, Value};
 pub const EXP_OPERATION_NAME: &str = "exp";
 
 define_elementwise_operation!(
-    @unary
+    @unary @accuracy
     /// [`Operation`](crate::Operation) that computes the elementwise natural exponential of one value (i.e., `x ↦ eˣ`,
     /// the analytic continuation `e^z` on complex inputs) while preserving its array metadata. Only floating-point and
     /// complex inputs are supported, and inputs that still carry partial sums are rejected.
     ExpOperation,
     EXP_OPERATION_NAME,
     Exp,
-    exp,
+    exp_with_accuracy,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -70,32 +71,36 @@ impl_differentiable_elementwise_operation! {
 }
 
 define_elementwise_capability!(
-    @unary
+    @unary @accuracy
     /// Represents the ability to compute elementwise natural exponentials. Concrete arrays compute immediately while
     /// context-carrying values apply [`ExpOperation`] through their context.
     Exp,
     /// Computes the natural exponential of each floating-point or complex element. Returns an error if the input types
     /// or metadata are unsupported.
     exp,
+    /// Behaves like [`exp`](Self::exp), but requests the provided result [`Accuracy`], which selects among the
+    /// implementations of backends that provide several of them. Returns an error if the input types or metadata are
+    /// unsupported.
+    exp_with_accuracy,
     ExpOperation,
 );
 
 impl_array_elementwise_operation!(
     @unary
     Exp,
-    exp,
+    exp_with_accuracy(_accuracy),
     operation = "exp",
     inputs = @float,
     checks = [@no_unreduced],
     |input| FloatingPointArrayElement::exp(input),
 );
 
-/// Implements [`Exp`] for one host primitive type.
+/// Implements [`Exp`] for one host primitive type, which provides one implementation for every requested [`Accuracy`].
 macro_rules! impl_exp_for_primitive {
     ($type:ty) => {
         impl Exp for $type {
             #[inline]
-            fn exp(&self) -> Result<Self, ProgramError> {
+            fn exp_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
                 Ok(<$type>::exp(*self))
             }
         }
@@ -109,14 +114,14 @@ impl_exp_for_primitive!(f64);
 pub const LOG_OPERATION_NAME: &str = "log";
 
 define_elementwise_operation!(
-    @unary
+    @unary @accuracy
     /// [`Operation`](crate::Operation) that computes the elementwise natural logarithm of one value (i.e., `x ↦ ln(x)`,
     /// the principal branch `ln(z)` on complex inputs) while preserving its array metadata. Only floating-point and
     /// complex inputs are supported, and inputs that still carry partial sums are rejected.
     LogOperation,
     LOG_OPERATION_NAME,
     Log,
-    log,
+    log_with_accuracy,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -131,32 +136,36 @@ impl_differentiable_elementwise_operation! {
 }
 
 define_elementwise_capability!(
-    @unary
+    @unary @accuracy
     /// Represents the ability to compute elementwise natural logarithms. Concrete arrays compute immediately while
     /// context-carrying values apply [`LogOperation`] through their context.
     Log,
     /// Computes the natural logarithm of each element, using the principal branch for complex values. Returns an error
     /// if the input types or metadata are unsupported.
     log,
+    /// Behaves like [`log`](Self::log), but requests the provided result [`Accuracy`], which selects among the
+    /// implementations of backends that provide several of them. Returns an error if the input types or metadata
+    /// are unsupported.
+    log_with_accuracy,
     LogOperation,
 );
 
 impl_array_elementwise_operation!(
     @unary
     Log,
-    log,
+    log_with_accuracy(_accuracy),
     operation = "log",
     inputs = @float,
     checks = [@no_unreduced],
     |input| FloatingPointArrayElement::log(input),
 );
 
-/// Implements [`Log`] for one host primitive type.
+/// Implements [`Log`] for one host primitive type, which provides one implementation for every requested [`Accuracy`].
 macro_rules! impl_log_for_primitive {
     ($type:ty) => {
         impl Log for $type {
             #[inline]
-            fn log(&self) -> Result<Self, ProgramError> {
+            fn log_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
                 Ok(<$type>::ln(*self))
             }
         }
@@ -170,7 +179,7 @@ impl_log_for_primitive!(f64);
 pub const LN_1P_OPERATION_NAME: &str = "ln_1p";
 
 define_elementwise_operation!(
-    @unary
+    @unary @accuracy
     /// [`Operation`](crate::Operation) that computes `ln(1 + x)` elementwise while retaining accuracy near zero
     /// and preserving input metadata. Real inputs below `-1` produce NaN, and `-1` produces negative infinity,
     /// subject to the output format's representation. Complex inputs use the principal logarithm of `1 + x`,
@@ -179,7 +188,7 @@ define_elementwise_operation!(
     Ln1pOperation,
     LN_1P_OPERATION_NAME,
     Ln1p,
-    ln_1p,
+    ln_1p_with_accuracy,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -199,7 +208,7 @@ impl_differentiable_elementwise_operation! {
 }
 
 define_elementwise_capability!(
-    @unary
+    @unary @accuracy
     /// Represents the ability to compute elementwise `ln(1 + input)` accurately near zero. Concrete arrays compute
     /// immediately while context-carrying values apply [`Ln1pOperation`] through their context.
     Ln1p,
@@ -207,25 +216,29 @@ define_elementwise_capability!(
     /// inputs. Returns an error
     /// if the input types or metadata are unsupported.
     ln_1p,
+    /// Behaves like [`ln_1p`](Self::ln_1p), but requests the provided result [`Accuracy`], which selects among the
+    /// implementations of backends that provide several of them. Returns an error if the input types or metadata are
+    /// unsupported.
+    ln_1p_with_accuracy,
     Ln1pOperation,
 );
 
 impl_array_elementwise_operation!(
     @unary
     Ln1p,
-    ln_1p,
+    ln_1p_with_accuracy(_accuracy),
     operation = "ln_1p",
     inputs = @float,
     checks = [@no_unreduced],
     |input| FloatingPointArrayElement::ln_1p(input),
 );
 
-/// Implements [`Ln1p`] for one host primitive type.
+/// Implements [`Ln1p`] for one host primitive type, which provides one implementation for every requested [`Accuracy`].
 macro_rules! impl_ln_1p_for_primitive {
     ($type:ty) => {
         impl Ln1p for $type {
             #[inline]
-            fn ln_1p(&self) -> Result<Self, ProgramError> {
+            fn ln_1p_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
                 Ok(<$type>::ln_1p(*self))
             }
         }
@@ -415,14 +428,14 @@ impl_log_add_exp_for_primitive!(f64);
 pub const LOGISTIC_OPERATION_NAME: &str = "logistic";
 
 define_elementwise_operation!(
-    @unary
+    @unary @accuracy
     /// [`Operation`](crate::Operation) that computes the elementwise logistic sigmoid of one value (i.e.,
     /// `x ↦ 1 / (1 + e^{-x})`, the analytic continuation on complex inputs) while preserving its array metadata.
     /// Only floating-point and complex inputs are supported, and inputs that still carry partial sums are rejected.
     LogisticOperation,
     LOGISTIC_OPERATION_NAME,
     Logistic,
-    logistic,
+    logistic_with_accuracy,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -442,32 +455,37 @@ impl_differentiable_elementwise_operation! {
 }
 
 define_elementwise_capability!(
-    @unary
+    @unary @accuracy
     /// Represents the ability to compute the elementwise logistic function. Concrete arrays compute immediately while
     /// context-carrying values apply [`LogisticOperation`] through their context.
     Logistic,
     /// Computes `1 / (1 + exp(-input))` elementwise for floating-point or complex values. Returns an error if the input
     /// types or metadata are unsupported.
     logistic,
+    /// Behaves like [`logistic`](Self::logistic), but requests the provided result [`Accuracy`], which selects among
+    /// the implementations of backends that provide several of them. Returns an error if the input types or metadata
+    /// are unsupported.
+    logistic_with_accuracy,
     LogisticOperation,
 );
 
 impl_array_elementwise_operation!(
     @unary
     Logistic,
-    logistic,
+    logistic_with_accuracy(_accuracy),
     operation = "logistic",
     inputs = @float,
     checks = [@no_unreduced],
     |input| FloatingPointArrayElement::logistic(input),
 );
 
-/// Implements [`Logistic`] for one host primitive type.
+/// Implements [`Logistic`] for one host primitive type, which provides one implementation for every requested
+/// [`Accuracy`].
 macro_rules! impl_logistic_for_primitive {
     ($type:ty) => {
         impl Logistic for $type {
             #[inline]
-            fn logistic(&self) -> Result<Self, ProgramError> {
+            fn logistic_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
                 Ok(((-*self).exp() + 1.0).recip())
             }
         }

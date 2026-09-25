@@ -55,6 +55,7 @@ use crate::macros::{
     dispatch_on_array_element_type, impl_array_elementwise_operation, impl_differentiable_elementwise_operation,
     impl_differentiable_operation,
 };
+use crate::operations::Accuracy;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
 use crate::operations::constants::one_like::OneLike;
@@ -1265,7 +1266,6 @@ impl_array_elementwise_operation!(
 /// Implements [`Pow`] for one host primitive type. Only floating-point primitives are supported, matching the
 /// reference backends' float-only power operation.
 macro_rules! impl_pow_for_primitive {
-    // Implements the capability using the corresponding floating-point primitive function.
     ($type:ty) => {
         impl Pow for $type {
             #[inline]
@@ -1283,14 +1283,14 @@ impl_pow_for_primitive!(f64);
 pub const SQRT_OPERATION_NAME: &str = "sqrt";
 
 define_elementwise_operation!(
-    @unary
+    @unary @accuracy
     /// [`Operation`] that computes the elementwise square root of one value (i.e., `x ↦ √x`, the principal branch
     /// `√z` on complex operands) while preserving its array metadata. Only floating-point and complex operands are
     /// supported, and operands that still carry partial sums are rejected.
     SqrtOperation,
     SQRT_OPERATION_NAME,
     Sqrt,
-    sqrt,
+    sqrt_with_accuracy,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -1305,32 +1305,35 @@ impl_differentiable_elementwise_operation! {
 }
 
 define_elementwise_capability!(
-    @unary
+    @unary @accuracy
     /// Value capability for elementwise principal square roots on floating-point and complex inputs. Eager values
     /// compute directly while contextual values bind [`SqrtOperation`]. Failures are returned as [`ProgramError`]s.
     Sqrt,
     /// Computes [`SqrtOperation`] elementwise for this value.
     sqrt,
+    /// Behaves like [`sqrt`](Self::sqrt), but requests the provided result [`Accuracy`], which selects among the
+    /// implementations of backends that provide several of them. Returns an error if the input types or metadata
+    /// are unsupported.
+    sqrt_with_accuracy,
     SqrtOperation,
 );
 
 impl_array_elementwise_operation!(
     @unary
     Sqrt,
-    sqrt,
+    sqrt_with_accuracy(_accuracy),
     operation = "sqrt",
     inputs = @float,
     checks = [@no_unreduced],
     |input| FloatingPointArrayElement::sqrt(input),
 );
 
-/// Implements [`Sqrt`] for one host primitive type.
+/// Implements [`Sqrt`] for one host primitive type, which provides one implementation for every requested [`Accuracy`].
 macro_rules! impl_sqrt_for_primitive {
-    // Implements the capability using the corresponding floating-point primitive function.
     ($type:ty) => {
         impl Sqrt for $type {
             #[inline]
-            fn sqrt(&self) -> Result<Self, ProgramError> {
+            fn sqrt_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
                 Ok(<$type>::sqrt(*self))
             }
         }
@@ -1344,14 +1347,14 @@ impl_sqrt_for_primitive!(f64);
 pub const RSQRT_OPERATION_NAME: &str = "rsqrt";
 
 define_elementwise_operation!(
-    @unary
+    @unary @accuracy
     /// [`Operation`] that computes the elementwise reciprocal square root of one value (i.e., `x ↦ 1/√x`, the
-    /// principal branch `1/√z` on complex operands) while preserving its array metadata. Only floating-point and
-    /// complex operands are supported, and operands that still carry partial sums are rejected.
+    /// principal branch `1/√z` on complex operands) while preserving its array metadata. Only floating-point
+    /// and complex operands are supported, and operands that still carry partial sums are rejected.
     RsqrtOperation,
     RSQRT_OPERATION_NAME,
     Rsqrt,
-    rsqrt,
+    rsqrt_with_accuracy,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -1371,33 +1374,37 @@ impl_differentiable_elementwise_operation! {
 }
 
 define_elementwise_capability!(
-    @unary
+    @unary @accuracy
     /// Value capability for elementwise reciprocal principal square roots on floating-point and complex inputs.
     /// Eager values compute directly while contextual values bind [`RsqrtOperation`]. Failures are returned as
     /// [`ProgramError`]s.
     Rsqrt,
     /// Computes [`RsqrtOperation`] elementwise for this value.
     rsqrt,
+    /// Behaves like [`rsqrt`](Self::rsqrt), but requests the provided result [`Accuracy`], which selects among the
+    /// implementations of backends that provide several of them. Returns an error if the input types or metadata are
+    /// unsupported.
+    rsqrt_with_accuracy,
     RsqrtOperation,
 );
 
 impl_array_elementwise_operation!(
     @unary
     Rsqrt,
-    rsqrt,
+    rsqrt_with_accuracy(_accuracy),
     operation = "rsqrt",
     inputs = @float,
     checks = [@no_unreduced],
     |input| FloatingPointArrayElement::rsqrt(input),
 );
 
-/// Implements [`Rsqrt`] for one host primitive type.
+/// Implements [`Rsqrt`] for one host primitive type, which provides one implementation for every requested
+/// [`Accuracy`].
 macro_rules! impl_rsqrt_for_primitive {
-    // Implements the capability using the corresponding floating-point primitive function.
     ($type:ty) => {
         impl Rsqrt for $type {
             #[inline]
-            fn rsqrt(&self) -> Result<Self, ProgramError> {
+            fn rsqrt_with_accuracy(&self, _accuracy: Accuracy) -> Result<Self, ProgramError> {
                 Ok(<$type>::sqrt(*self).recip())
             }
         }

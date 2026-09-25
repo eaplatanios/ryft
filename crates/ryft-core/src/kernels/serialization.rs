@@ -37,7 +37,7 @@ use crate::kernels::memory::{
 use crate::kernels::operations::KernelOperation;
 use crate::kernels::validation::KernelParameterAccess;
 use crate::operations::{
-    AbsOperation, AddOperation, AndOperation, ClampOperation, CompareOperation, ComparisonDirection,
+    AbsOperation, Accuracy, AddOperation, AndOperation, ClampOperation, CompareOperation, ComparisonDirection,
     ConditionOperation, ConstantOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
     DimensionMulOperation, DimensionRemOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
     DotDimensionNumbers, DotOperation, ExpOperation, LogOperation, MaxOperation, MinOperation, MulOperation,
@@ -776,11 +776,22 @@ impl Encoder {
                     ArrayOperation::Min(_) => WireOperation::Min,
                     ArrayOperation::Max(_) => WireOperation::Max,
                     ArrayOperation::Clamp(_) => WireOperation::Clamp,
-                    ArrayOperation::Exp(_) => WireOperation::Exp,
-                    ArrayOperation::Log(_) => WireOperation::Log,
-                    ArrayOperation::Sqrt(_) => WireOperation::Sqrt,
-                    ArrayOperation::Rsqrt(_) => WireOperation::Rsqrt,
-                    ArrayOperation::Tanh(_) => WireOperation::Tanh,
+                    // The wire records encode only the default result accuracy, so other accuracies are rejected
+                    // rather than silently dropped.
+                    ArrayOperation::Exp(operation) if operation.accuracy() == Accuracy::Default => WireOperation::Exp,
+                    ArrayOperation::Log(operation) if operation.accuracy() == Accuracy::Default => WireOperation::Log,
+                    ArrayOperation::Sqrt(operation) if operation.accuracy() == Accuracy::Default => WireOperation::Sqrt,
+                    ArrayOperation::Rsqrt(operation) if operation.accuracy() == Accuracy::Default => {
+                        WireOperation::Rsqrt
+                    }
+                    ArrayOperation::Tanh(operation) if operation.accuracy() == Accuracy::Default => WireOperation::Tanh,
+                    operation @ (ArrayOperation::Exp(_)
+                    | ArrayOperation::Log(_)
+                    | ArrayOperation::Sqrt(_)
+                    | ArrayOperation::Rsqrt(_)
+                    | ArrayOperation::Tanh(_)) => {
+                        return Err(unsupported(format!("{} with a non-default accuracy", operation.name())));
+                    }
                     ArrayOperation::Not(_) => WireOperation::Not,
                     ArrayOperation::And(_) => WireOperation::And,
                     ArrayOperation::Or(_) => WireOperation::Or,

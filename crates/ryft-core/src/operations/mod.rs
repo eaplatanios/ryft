@@ -1,6 +1,8 @@
+use std::fmt::Display;
+
 use crate::arrays::{ArrayType, Broadcastable};
 use crate::macros::check_count;
-use crate::programs::{Operation, TypeError};
+use crate::programs::{Operation, ProgramError, TypeError};
 
 pub mod arithmetic;
 pub mod assertions;
@@ -132,6 +134,111 @@ pub trait ElementwiseOperation: Operation<Type = ArrayType> {
         ArrayType::check_matching_manual_variation(self.name(), &input_types.iter().collect::<Vec<_>>())?;
         ArrayType::broadcasted(input_types)
             .map_err(|_| TypeError::invalid(format!("`{}` input types are not broadcast-compatible", self.name())))
+    }
+}
+
+/// Result accuracy requested from an elementwise transcendental [`Operation`] (e.g., a [`SinOperation`] or a
+/// [`ExpOperation`]), mirroring the StableHLO [`result_accuracy`](https://openxla.org/stablehlo/spec#exponential)
+/// attribute. The accuracy only selects among the implementations that a backend provides for the operation, and so
+/// it never changes the operation's type or its mathematical definition. Backends without alternative implementations,
+/// including the eager reference [`Array`](crate::Array) kernels, evaluate their only implementation for every
+/// accuracy, and a backend compiler reports an error when it cannot satisfy a requested [`Tolerance`].
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum Accuracy {
+    /// Backend-selected default implementation.
+    #[default]
+    Default,
+
+    /// Most accurate implementation that the backend provides.
+    Highest,
+
+    /// Implementation whose error stays within the provided [`Tolerance`].
+    Tolerance(Tolerance),
+}
+
+impl Display for Accuracy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => formatter.write_str("default"),
+            Self::Highest => formatter.write_str("highest"),
+            Self::Tolerance(tolerance) => write!(
+                formatter,
+                "tolerance(absolute={}, relative={}, units_of_least_precision={})",
+                tolerance.absolute(),
+                tolerance.relative(),
+                tolerance.units_of_least_precision(),
+            ),
+        }
+    }
+}
+
+/// Error tolerance of an [`Accuracy::Tolerance`] request, mirroring JAX's
+/// [`jax.lax.Tolerance`](https://docs.jax.dev/en/latest/jax.lax.html#jax.lax.Tolerance). An implementation satisfies
+/// the tolerance when its error stays within the absolute tolerance, the relative tolerance, or the provided number of
+/// units in the last place of the exact result. At most two of the three tolerances are typically combined (i.e., an
+/// absolute tolerance with either a relative tolerance or a number of units in the last place).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Tolerance {
+    /// Absolute error tolerance.
+    absolute: f64,
+
+    /// Relative error tolerance.
+    relative: f64,
+
+    /// Error tolerance measured in Units in the Last Place (ULPs) of the exact result.
+    units_of_least_precision: usize,
+}
+
+impl Tolerance {
+    /// Creates a new [`Tolerance`], applying the same validation as JAX's
+    /// [`Tolerance`](https://docs.jax.dev/en/latest/jax.lax.html#jax.lax.Tolerance).
+    ///
+    /// # Parameters
+    ///
+    ///   - `absolute`: Absolute error tolerance, which must be finite and non-negative.
+    ///   - `relative`: Relative error tolerance, which must be finite and non-negative.
+    ///   - `units_of_least_precision`: Error tolerance in units in the last place of the exact result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] if either floating-point tolerance is negative or not finite,
+    /// or if all three tolerances are zero.
+    pub fn new(absolute: f64, relative: f64, units_of_least_precision: usize) -> Result<Self, ProgramError> {
+        if !absolute.is_finite() || !relative.is_finite() || absolute < 0.0 || relative < 0.0 {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "accuracy tolerances must be finite and non-negative but got absolute tolerance {absolute} and \
+                     relative tolerance {relative}",
+                ),
+            });
+        }
+
+        if absolute == 0.0 && relative == 0.0 && units_of_least_precision == 0 {
+            return Err(ProgramError::InvalidArgument {
+                message: "at least one accuracy tolerance must be non-zero".to_string(),
+            });
+        }
+
+        Ok(Self { absolute, relative, units_of_least_precision })
+    }
+
+    /// Returns the absolute error tolerance of this [`Tolerance`] instance.
+    #[inline]
+    pub fn absolute(&self) -> f64 {
+        self.absolute
+    }
+
+    /// Returns the relative error tolerance of this [`Tolerance`] instance.
+    #[inline]
+    pub fn relative(&self) -> f64 {
+        self.relative
+    }
+
+    /// Returns the error tolerance in Units in the Last Place (ULPs) of the exact result
+    /// for this [`Tolerance`] instance.
+    #[inline]
+    pub fn units_of_least_precision(&self) -> usize {
+        self.units_of_least_precision
     }
 }
 
@@ -304,6 +411,55 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid("`elementwise_test` input types are not broadcast-compatible".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_accuracy() {
+        let tolerance = Tolerance::new(1e-6, 0.0, 2).unwrap();
+        assert_eq!(Accuracy::default(), Accuracy::Default);
+        assert_eq!(Accuracy::Default.to_string(), "default");
+        assert_eq!(Accuracy::Highest.to_string(), "highest");
+        assert_eq!(
+            Accuracy::Tolerance(tolerance).to_string(),
+            "tolerance(absolute=0.000001, relative=0, units_of_least_precision=2)",
+        );
+        assert_eq!(format!("{:?}", Accuracy::Highest), "Highest");
+    }
+
+    #[test]
+    fn test_tolerance() {
+        let tolerance = Tolerance::new(1e-6, 1e-3, 2).unwrap();
+        assert_eq!(tolerance.absolute(), 1e-6);
+        assert_eq!(tolerance.relative(), 1e-3);
+        assert_eq!(tolerance.units_of_least_precision(), 2);
+        assert_eq!(Tolerance::new(0.0, 0.0, 1).map(|tolerance| tolerance.units_of_least_precision()), Ok(1));
+    }
+
+    #[test]
+    fn test_tolerance_new_validation() {
+        // Tolerances follow JAX's validation: they must be non-negative, finite, and not all zero.
+        assert_eq!(
+            Tolerance::new(-1.0, 0.0, 0),
+            Err(ProgramError::InvalidArgument {
+                message: "accuracy tolerances must be finite and non-negative but got absolute tolerance -1 and \
+                          relative tolerance 0"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(
+            Tolerance::new(0.0, f64::NAN, 0),
+            Err(ProgramError::InvalidArgument {
+                message: "accuracy tolerances must be finite and non-negative but got absolute tolerance 0 and \
+                          relative tolerance NaN"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(
+            Tolerance::new(0.0, 0.0, 0),
+            Err(ProgramError::InvalidArgument {
+                message: "at least one accuracy tolerance must be non-zero".to_string()
+            }),
         );
     }
 }

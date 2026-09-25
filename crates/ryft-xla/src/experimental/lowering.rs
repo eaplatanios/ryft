@@ -1578,6 +1578,19 @@ where
     Ok(input)
 }
 
+/// Returns the StableHLO result accuracy that requests the provided [`ryft_core::Accuracy`] from the backend.
+fn lower_accuracy(accuracy: ryft_core::Accuracy) -> Accuracy {
+    match accuracy {
+        ryft_core::Accuracy::Default => Accuracy::Default,
+        ryft_core::Accuracy::Highest => Accuracy::Highest,
+        ryft_core::Accuracy::Tolerance(tolerance) => Accuracy::Tolerance {
+            absolute_tolerance: tolerance.absolute(),
+            relative_tolerance: tolerance.relative(),
+            units_of_least_precision: tolerance.units_of_least_precision(),
+        },
+    }
+}
+
 /// Normalizes both operands of one implicitly broadcasting binary elementwise operation to its exact result type.
 fn normalize_binary_elementwise_operands<'b, 'c: 'b, 't: 'c, B, L>(
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -2095,10 +2108,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SinOperation<ArrayType>
                 lowerer.location,
             )?]);
         }
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::sine(input_values[0], Accuracy::Default, lowerer.location)?)?;
+        let result = lowerer.block.append_operation(stable_hlo::sine(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location,
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
     }
 }
@@ -2123,7 +2137,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CosOperation<ArrayType>
         }
         let result = lowerer.block.append_operation(stable_hlo::cosine(
             input_values[0],
-            Accuracy::Default,
+            lower_accuracy(self.accuracy()),
             lowerer.location,
         )?)?;
         Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
@@ -2160,7 +2174,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ExpOperation<ArrayType>
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result = lowerer.block.append_operation(stable_hlo::exponential(
             input_values[0],
-            Accuracy::Default,
+            lower_accuracy(self.accuracy()),
             lowerer.location,
         )?)?;
         Ok(vec![result.result(0).expect("stablehlo.exponential should return one result").as_ref()])
@@ -2175,10 +2189,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogOperation<ArrayType>
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::log(input_values[0], Accuracy::Default, lowerer.location)?)?;
+        let result = lowerer.block.append_operation(stable_hlo::log(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location,
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.log should return one result").as_ref()])
     }
 }
@@ -2202,7 +2217,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Ln1pOperation<ArrayType
         }
         let result = lowerer.block.append_operation(stable_hlo::log_plus_one(
             input_values[0],
-            Accuracy::Default,
+            lower_accuracy(self.accuracy()),
             lowerer.location,
         )?)?;
         Ok(vec![result.result(0).expect("stablehlo.log_plus_one should return one result").as_ref()])
@@ -2246,10 +2261,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SqrtOperation<ArrayType
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::sqrt(input_values[0], Accuracy::Default, lowerer.location)?)?;
+        let result = lowerer.block.append_operation(stable_hlo::sqrt(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location,
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.sqrt should return one result").as_ref()])
     }
 }
@@ -2262,10 +2278,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RsqrtOperation<ArrayTyp
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::rsqrt(input_values[0], Accuracy::Default, lowerer.location)?)?;
+        let result = lowerer.block.append_operation(stable_hlo::rsqrt(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location,
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.rsqrt should return one result").as_ref()])
     }
 }
@@ -2278,10 +2295,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for TanhOperation<ArrayType
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::tanh(input_values[0], Accuracy::Default, lowerer.location)?)?;
+        let result = lowerer.block.append_operation(stable_hlo::tanh(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location,
+        )?)?;
         Ok(vec![result.result(0).expect("stablehlo.tanh should return one result").as_ref()])
     }
 }
@@ -2296,7 +2314,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogisticOperation<Array
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let result = lowerer.block.append_operation(stable_hlo::logistic(
             input_values[0],
-            Accuracy::Default,
+            lower_accuracy(self.accuracy()),
             lowerer.location,
         )?)?;
         Ok(vec![result.result(0).expect("stablehlo.logistic should return one result").as_ref()])
