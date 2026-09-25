@@ -26,8 +26,9 @@ use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
-use ryft_macros::Parameter;
 use thiserror::Error;
+
+use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
@@ -44,11 +45,11 @@ use crate::operations::{
 };
 use crate::parameters::Parameter;
 use crate::programs::{
-    BatchableReferenceView, NoReferenceViewBinding, ProgramError, ReadyOrPendingReferenceGuard, Reference,
-    ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType, ReferenceError, ReferenceId,
-    ReferenceType, ReferenceView, ReferenceViewAnalysis, ReferenceViewOperation, ReferenceViewOverlap,
-    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, Type, TypeError, TypeIdentityRenaming, Typed,
-    Value, ValueId,
+    BatchableReferenceView, NoReferenceViewBinding, Operation, ProgramError, ReadyOrPendingReferenceGuard, Reference,
+    ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableType, ReferenceError, ReferenceId, ReferenceType, ReferenceView, ReferenceViewAnalysis,
+    ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError,
+    Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueId,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -200,6 +201,78 @@ impl ArrayReferenceView {
         };
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+
+    /// Discharges one allocation-preserving view operation that applies this view, by composing this view onto the incoming
+    /// handle's alias.
+    ///
+    /// A view creates a narrower alias of the same allocation, so on a discharged allocation the rewrite is metadata only:
+    /// it validates the composed referent type with exactly the eager handle's arithmetic, rejecting an invalid composition
+    /// before any handle exists, and then records the composed chain as the new handle's authoritative alias. Nothing is
+    /// bound into the destination, because the portion this handle selects is materialized at each access rather than at
+    /// the view. The step is closed over destination values: each input index this view reports binds the destination
+    /// value of that operand, so the operands of a view operation are its reference followed by one value per symbol, and a
+    /// static view binds nothing.
+    ///
+    /// On an allocation that partial discharge *preserved*, the view is additionally replayed into the destination, and the
+    /// reference it produces becomes the alias handle's own destination value, so that later accesses consume that
+    /// exact value instead of replaying the chain and duplicating the view operations. The composed alias is recorded
+    /// either way, which is what keeps one handle's view chain single-sourced whichever state its allocation is in.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: View operation being discharged, which applies this view to its reference operand and is replayed
+    ///     verbatim on a preserved allocation.
+    ///   - `context`: Active discharge context owning the allocation environment.
+    ///   - `inputs`: Carriers supplied as the view operation's operands, in operation-defined order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidInputCount`] for an application that does not supply exactly one operand per symbol
+    /// beyond the reference, [`ProgramError::MalformedProgram`] when the first operand is a value rather than a reference
+    /// handle, when a symbol operand is a reference rather than a value, or when a symbol names the reference operand or an
+    /// operand outside the application, and [`ProgramError::InvalidOutputCount`] when replaying a preserved view does not
+    /// produce exactly one value. Propagates the view algebra's [`TypeError`] when this view does not compose onto the
+    /// incoming handle's referent, and [`ProgramError::MalformedProgram`] when the replayed reference does not carry the
+    /// composed type.
+    pub(crate) fn discharge<C, P, O>(
+        &self,
+        operation: &O,
+        context: &ReferenceDischargeContext<C, P>,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
+    where
+        C: Context<Type = ArrayIrType, Operation: From<O>>,
+        P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceViewPath<C::Value>>,
+        O: Clone + Operation<Type = ArrayIrType>,
+    {
+        let symbols = self.symbols();
+        check_count!("input", inputs, 1 + symbols.len(), ProgramError);
+        let reference = inputs[0].try_as_reference("a reference to view")?;
+        let referent = self.output_type(reference.r#type().referent())?;
+        let bindings = symbols
+            .iter()
+            .map(|index| match inputs.get(*index) {
+                Some(input) if *index > 0 => input.try_as_value("a view index").cloned(),
+                _ => Err(ProgramError::MalformedProgram(format!(
+                    "reference view symbol names input {index} but the index inputs of a view with {} inputs are 1..{}",
+                    inputs.len(),
+                    inputs.len(),
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let alias = reference.alias().with_step(self.clone(), bindings.clone());
+        Ok(vec![
+            context
+                .alias_reference(reference, alias, ReferenceType::new(referent), |value| {
+                    let mut operands = vec![value.clone()];
+                    operands.extend(bindings.iter().cloned());
+                    let mut outputs = context.parent().bind(operation.clone(), Vec::new(), &operands)?;
+                    check_count!("output", outputs, 1, ProgramError);
+                    Ok(outputs.remove(0))
+                })?
+                .into(),
+        ])
     }
 
     /// Validates the axis of an [`Index`](Self::Index) transform against `input` and returns the static shape of
@@ -1384,15 +1457,15 @@ mod tests {
     use crate::arrays::types::ir::ArrayIrType;
     use crate::axes::Axis;
     use crate::contexts::EagerContext;
+    use crate::differentiation::differentiate_at;
     use crate::operations::{
-        ConditionOperation, REFERENCE_INDEX_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME,
-        REFERENCE_SLICE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceIndex, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ConditionOperation, REFERENCE_INDEX_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
+        REFERENCE_READ_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndex, ReferenceNew, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceSlice, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
         ReferenceWriteOperation, ScanOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::differentiation::differentiate_at;
     use crate::programs::{
         AtomId, EffectClass, EffectClasses, Operation, Program, ProgramBuilder, ProjectedValue, ReferenceCompletion,
         ReferenceReplacementPreparation, ReferenceType, RegionId, ValueProjection,

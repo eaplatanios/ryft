@@ -1,7 +1,7 @@
 //! Operations over _references_ (i.e., handles to mutable state that programs allocate, read, update in place, and
-//! finally consume). A reference has a [`ReferenceType`](crate::ReferenceType) naming the referent it stores. Reads
-//! and updates declare reference effects, so a program that touches state keeps its accesses in order and its reference
-//! discharge can later turn that state into explicit dataflow for backends without mutable buffers.
+//! finally consume). A reference has a [`ReferenceType`] naming the referent it stores. Reads and updates declare
+//! reference effects, so a program that touches state keeps its accesses in order and its reference discharge can
+//! later turn that state into explicit dataflow for backends without mutable buffers.
 //!
 //! The core operations are:
 //!
@@ -11,6 +11,12 @@
 //!     which replace it, with the swap also returning the previous value.
 //!   - [`ReferenceAddUpdate`], which adds an update into the referent, and [`ReferenceAtomicAddUpdate`],
 //!     its variant for updates that may race (e.g., within a kernel implementation).
+//!
+//! Array references additionally support _views_, which derive a narrower reference to the same allocation without
+//! accessing its state: [`ReferenceIndex`] and [`ReferenceDynamicIndex`] select one element on an axis (at a static
+//! index and at an index supplied as a value, respectively) and remove that axis, and [`ReferenceSlice`] selects one
+//! static range on every axis. Each view is described by an [`ArrayReferenceView`], and reads and updates through a
+//! view touch only the elements it selects.
 //!
 //! Every function is a value capability on the reference handle, so the same code updates eager state immediately
 //! and records reference instructions when the handle is a tracer.
@@ -60,9 +66,12 @@
 
 mod reference_add_update;
 mod reference_atomic_add_update;
+mod reference_dynamic_index;
 mod reference_freeze;
+mod reference_index;
 mod reference_new;
 mod reference_read;
+mod reference_slice;
 mod reference_swap;
 mod reference_write;
 
@@ -70,9 +79,14 @@ pub use reference_add_update::{REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAdd
 pub use reference_atomic_add_update::{
     REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
 };
+pub use reference_dynamic_index::{
+    REFERENCE_DYNAMIC_INDEX_OPERATION_NAME, ReferenceDynamicIndex, ReferenceDynamicIndexOperation,
+};
 pub use reference_freeze::{REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation};
+pub use reference_index::{REFERENCE_INDEX_OPERATION_NAME, ReferenceIndex, ReferenceIndexOperation};
 pub use reference_new::{REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation};
 pub use reference_read::{REFERENCE_READ_OPERATION_NAME, ReferenceRead, ReferenceReadOperation};
+pub use reference_slice::{REFERENCE_SLICE_OPERATION_NAME, ReferenceSlice, ReferenceSliceOperation};
 pub use reference_swap::{REFERENCE_SWAP_OPERATION_NAME, ReferenceSwap, ReferenceSwapOperation};
 pub use reference_write::{REFERENCE_WRITE_OPERATION_NAME, ReferenceWrite, ReferenceWriteOperation};
 
