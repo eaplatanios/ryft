@@ -844,9 +844,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayReferenceDischarge, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
@@ -1229,12 +1229,8 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let discharged = program
-            .clone()
-            .discharge_references::<ArrayReferenceDischarge>(0)
-            .unwrap()
-            .into_program_without_external_references()
-            .unwrap();
+        let discharged =
+            program.clone().discharge_references(0).unwrap().into_program_without_external_references().unwrap();
         assert_eq!(discharged.instructions()[0].regions().len(), 2);
         assert!(!discharged.entry_region_ref().contains_references_in_closure());
         let inputs = vec![
@@ -1248,7 +1244,7 @@ mod tests {
         // A targeted rewrite discharges only the selected region's allocation and retains the other lifecycle.
         let targets = program.reference_discharge_targets(0).unwrap();
         assert_eq!(targets.len(), 2);
-        let partial = program.partially_discharge_references::<ArrayReferenceDischarge>(0, &targets[..1]).unwrap();
+        let partial = program.partially_discharge_references(0, &targets[..1]).unwrap();
         assert!(partial.program().entry_region_ref().contains_references_in_closure());
     }
 

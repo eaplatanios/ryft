@@ -48,17 +48,17 @@ use thiserror::Error;
 
 mod aot;
 mod cuda;
-#[cfg(feature = "rocm")]
-mod rocm;
 #[cfg(feature = "cutile")]
 mod cutile;
 pub mod distributed;
 #[cfg(feature = "mosaic-gpu")]
 pub(crate) mod mosaic;
+#[cfg(feature = "rocm")]
+mod rocm;
 mod staging;
-mod tuning;
 #[cfg(feature = "triton")]
 mod triton;
+mod tuning;
 
 #[cfg(feature = "cutile")]
 pub use cutile::CuTileEmbedding;
@@ -81,9 +81,9 @@ pub use staging::{
 };
 
 #[cfg(feature = "rocm")]
-pub(crate) use rocm::RocmKernelRuntime;
-#[cfg(feature = "rocm")]
 pub use rocm::RocmKernelEmbedding;
+#[cfg(feature = "rocm")]
+pub(crate) use rocm::RocmKernelRuntime;
 
 /// Typed FFI target used by persisted ROCm kernel calls.
 pub const ROCM_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.rocm";
@@ -717,7 +717,7 @@ pub(crate) mod tests {
             formatdoc! {r#"
             module {{
               func.func @main(%arg0: tensor<i32>) -> tensor<i32> {{
-                %0 = stablehlo.custom_call @ryft.test.deferred_copy(%arg0) {{api_version = 4 : i32, backend_config = {{deferred.schema = 1 : i64, ryft.kernel.configuration = "{configuration}", ryft.kernel.schema = 1 : i64, ryft.kernel.semantic = "{semantic}"}}, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>]}} : (tensor<i32>) -> tensor<i32>
+                %0 = stablehlo.custom_call @ryft.test.deferred_copy(%arg0) {{api_version = 4 : i32, backend_config = {{deferred.schema = 1 : i64, ryft.kernel.configuration = "{configuration}", ryft.kernel.schema = 2 : i64, ryft.kernel.semantic = "{semantic}"}}, output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>]}} : (tensor<i32>) -> tensor<i32>
                 return %0 : tensor<i32>
               }}
             }}

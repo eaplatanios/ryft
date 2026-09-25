@@ -7,7 +7,7 @@
 //! Cooperative kernels then exchange row halves through cluster shared memory. Scale copies preserve the separate
 //! replicated `32x128b.warpx4` layout and become readable only after their explicit completion wait.
 
-use ryft_core::{ArrayReferenceView, ArraySliceAxis, ArrayType, DataType, ValueId};
+use ryft_core::{ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, ValueId};
 use ryft_mlir::dialects::builtin::VectorTypeDimension;
 use ryft_mlir::dialects::{arith, llvm, memref, nvvm, scf};
 use ryft_mlir::{Attribute, Block, DetachedBlock, Type, TypeRef, UnknownLocationRef};
@@ -331,7 +331,7 @@ impl<'c, 't> Lowering<'c, 't> {
             let left = [0, 1].map(|rank| {
                 (
                     inputs[0].owner,
-                    ArrayReferenceView::Slice {
+                    ArrayReferenceTransform::Slice {
                         axes: vec![ArraySliceAxis::new(rank * 128, 128, 1), ArraySliceAxis::new(0, contraction, 1)],
                     },
                 )
@@ -339,7 +339,7 @@ impl<'c, 't> Lowering<'c, 't> {
             let right = [0, 1].map(|rank| {
                 (
                     inputs[1].owner,
-                    ArrayReferenceView::Slice {
+                    ArrayReferenceTransform::Slice {
                         axes: vec![
                             ArraySliceAxis::new(
                                 if packed { rank * columns / 2 } else { 0 },
@@ -375,7 +375,7 @@ impl<'c, 't> Lowering<'c, 't> {
                     destination: destination.owner,
                     left: (
                         inputs[0].owner,
-                        ArrayReferenceView::Slice {
+                        ArrayReferenceTransform::Slice {
                             axes: shape(&inputs[0].r#type)?
                                 .into_iter()
                                 .map(|size| ArraySliceAxis::new(0, size, 1))
@@ -384,7 +384,7 @@ impl<'c, 't> Lowering<'c, 't> {
                     ),
                     right: (
                         inputs[1].owner,
-                        ArrayReferenceView::Slice {
+                        ArrayReferenceTransform::Slice {
                             axes: shape(&inputs[1].r#type)?
                                 .into_iter()
                                 .map(|size| ArraySliceAxis::new(0, size, 1))
@@ -548,7 +548,7 @@ impl<'c, 't> Lowering<'c, 't> {
                     destination: destination.owner,
                     source: (
                         source.owner,
-                        ArrayReferenceView::Slice {
+                        ArrayReferenceTransform::Slice {
                             axes: vec![ArraySliceAxis::new(0, rows, 1), ArraySliceAxis::new(0, blocks, 1)],
                         },
                     ),
@@ -562,7 +562,7 @@ impl<'c, 't> Lowering<'c, 't> {
                     destination: destination.owner,
                     source: (
                         source.owner,
-                        ArrayReferenceView::Slice {
+                        ArrayReferenceTransform::Slice {
                             axes: vec![ArraySliceAxis::new(0, rows, 1), ArraySliceAxis::new(0, blocks, 1)],
                         },
                     ),
@@ -669,7 +669,7 @@ impl<'c, 't> Lowering<'c, 't> {
                     thread,
                     SynchronizationEvent::LoadTensorMemory {
                         value: source.owner,
-                        view: ArrayReferenceView::Slice {
+                        view: ArrayReferenceTransform::Slice {
                             axes: vec![
                                 ArraySliceAxis::new(rank * 128 + thread as usize, 1, 1),
                                 ArraySliceAxis::new(0, source.columns, 1),

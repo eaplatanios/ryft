@@ -94,9 +94,10 @@ impl MaskedCopyCase {
             let context = references[0].context();
             let mask = context.lift(ArrayIrValue::Array(Array::vector(self.mask.clone())?))?;
             let other = context.lift(ArrayIrValue::Array(Array::vector(vec![0i32; block])?))?;
-            let value =
-                context.bind(MaskedLoadOperation, vec![], &[references[0].clone(), mask.clone(), other])?.remove(0);
-            context.bind(MaskedStoreOperation, vec![], &[references[1].clone(), value, mask])?;
+            let value = context
+                .bind(MaskedLoadOperation::new(), vec![], &[references[0].clone(), mask.clone(), other])?
+                .remove(0);
+            context.bind(MaskedStoreOperation::new(), vec![], &[references[1].clone(), value, mask])?;
             Ok(())
         })
         .unwrap()

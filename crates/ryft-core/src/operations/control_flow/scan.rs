@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayReferenceView, ArrayReferenceViewIndex, ArrayReferenceViewOperation, ArraySliceAxis, ArrayType, DataType,
-    Dimension, DimensionType, DimensionValue, MAX_DIMENSION_EXTENT, Shape,
+    ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionType,
+    DimensionValue, MAX_DIMENSION_EXTENT, Shape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -40,20 +40,20 @@ use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperatio
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::slicing::{Slice, SliceOperation, UpdateSlice, UpdateSliceOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
-use crate::operations::references::{ReferenceNewOperation, ReferenceSliceOperation};
+use crate::operations::references::ReferenceNewOperation;
 use crate::parameters::Placeholder;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput,
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
 use crate::programs::{
-    Atom, AtomId, CalleeRegionDriver, InputRegionProvenance, Instruction, MaybeZero, Operation, OperationFormatter,
+    Atom, AtomId, CalleeRegionDriver, InputRegionProvenance, MaybeZero, Operation, OperationFormatter,
     OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError,
-    ReferenceAlias, ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeRegionInput,
-    ReferenceDischargeRegionOutput, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType,
-    ReferenceViewOperation, Region, RegionArena, RegionInterface, RegionRef, RegionSlot, Type, TypeError,
-    TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    ReferenceDischargeRegionOutput, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, Region,
+    RegionArena, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
+    Typed, Value, ValueProjection, rewrite_reference_access_transforms, validated_reference_access_descriptors,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -84,13 +84,12 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// require a static length. Composite [`ArrayIrType`] scans may use a dynamic dimension identity and consume its
 /// matching first-class dimension value as a trailing runtime operand.
 ///
-/// A composite body receiving `ref<[length, t]>` selects its current slice by applying
-/// [`ReferenceDynamicIndexOperation`](crate::operations::ReferenceDynamicIndexOperation) to that root and its index input
-/// in the body itself. Reference operations and their transforms then handle this view just like any explicitly
-/// created view. The root parameter must not be consumed or frozen inside the body. Stacked reference outputs remain
-/// unsupported: a scan cannot assemble a reference value from per-iteration handles. Discharge can replace accesses
-/// confined to the current slice with ordinary stacked array inputs and updated slice outputs, preserving slice-sized
-/// state without exposing a second reference-body interface.
+/// A composite body receiving `ref<[length, t]>` selects its current slice by attaching a leading dynamic index view
+/// to each access, with the body's index input as the first view binding. Reference operations and their transforms
+/// preserve that access path. The root parameter must not be consumed or frozen inside the body. Stacked reference
+/// outputs remain unsupported: a scan cannot assemble a reference value from per-iteration handles. Discharge can
+/// replace accesses confined to the current slice with ordinary stacked array inputs and updated slice outputs,
+/// preserving slice-sized state without exposing a second reference-body interface.
 ///
 /// The optional [`unroll`](Self::unroll) factor (attached via [`with_unroll`](Self::with_unroll)) is a
 /// **lowering-only** attribute: interpretation and every transform rule (differentiation, transposition, batching)
@@ -98,7 +97,7 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// per loop trip — and a fully unrolled straight-line lowering with no loop at all when `unroll` equals `length`.
 ///
 /// The body computation is not part of this payload: it is a [`Region`] attached to the
-/// [`Instruction`] applying the operation (the single [`region_slots`](Operation::region_slots)
+/// [`Instruction`](crate::Instruction) applying the operation (the single [`region_slots`](Operation::region_slots)
 /// slot `["body"]`), and semantic rules reach it through their driver-granted region access. Scans with owned bodies
 /// supply the body [`Program`] through the region driver passed to [`Context::bind`];
 /// [`Operation::infer_output_types`] validates the body signature over the attached [`RegionInterface`].
@@ -782,8 +781,7 @@ where
 // replicated. Stacked inputs are arrays or references and stacked outputs are arrays, never first-class dimensions,
 // because one shared dimension value cannot represent a different stacked extent for each batch item. A reference
 // stack keeps the batch axis fixed by its referent (which must lie behind the leading scan axis). The body receives
-// the whole packed root, and its explicit view instruction adjusts the selected axis through
-// `BatchableReferenceView::batch`.
+// the whole packed root, and each access adjusts its folded views through `batch_reference_transforms`.
 impl<Capture, C> BatchableOperation<C, ArrayIrBatchingPolicy> for ScanOperation<Capture>
 where
     Capture: Value<Type = ArrayIrType>,
@@ -835,7 +833,7 @@ where
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
         // Mapped array stacks move their batch axis behind the leading scan axis. Reference roots retain
-        // their batch axis because storage cannot be moved; the explicit view operation handles indexing inside
+        // their batch axis because storage cannot be moved; each folded access handles indexing inside
         // the body instead of requiring a special view at the region boundary.
         let (stacks, slice_axes): (Vec<_>, Vec<_>) = scan_inputs[carry_count..]
             .iter()
@@ -1877,8 +1875,7 @@ impl<C, P> ScanReferenceDischarge<C, P> for ArrayIrType
 where
     C: Context<
             Type = ArrayIrType,
-            Operation: ArrayReferenceViewOperation
-                           + From<ReferenceSliceOperation>
+            Operation: ReferenceAccessOperation<Transform = ArrayReferenceTransform>
                            + From<CompareOperation<ArrayIrType>>
                            + From<AssertOperation<ArrayIrType>>,
         > + Zero<C::Value>
@@ -1937,8 +1934,8 @@ where
 
         // Discharged reference stacks can use slice-sized state when the body only selects its own current row.
         // Preserve source region, atom, and instruction identities: partial-discharge targets and capture scopes
-        // name those identities. Replacing the selection with a full slice, rather than deleting its instruction,
-        // keeps every later allocation's instruction index unchanged. The full slice disappears during discharge.
+        // name those identities. Removing the leading index from each access and its dynamic binding leaves every
+        // instruction in place, keeping later allocation target identities unchanged.
         let mut normalized = None;
         let mut viewed_inputs = BTreeSet::new();
         let mut carried_inputs = Vec::new();
@@ -1961,7 +1958,7 @@ where
             let root = source_body.input_ids()[position];
             let index = source_body.input_ids()[0];
             let reference = <&ReferenceType<ArrayType>>::try_from(&source_input_types[position])?;
-            let selection = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
+            let selection = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
             let slice_type = selection.output_type(reference.referent())?;
             if source_body.output_ids().contains(&root) {
                 return Err(ProgramError::MalformedProgram(format!(
@@ -1975,37 +1972,53 @@ where
                     continue;
                 }
                 let effects = instruction.operation().effects();
-                if instruction.inputs() != [root, index]
-                    || instruction.outputs().len() != 1
-                    || instruction.operation().reference_view(0).as_ref() != Some(&selection)
-                    || !instruction.regions().is_empty()
-                    || !effects.classes().is_empty()
-                    || !effects.reference_effects().is_empty()
-                    || effects.reference_aliases() != [ReferenceAlias::new(0, 0, ReferenceAliasKind::View)]
+                if !instruction.regions().is_empty()
+                    || effects.classes().into_iter().any(|class| effects.declares(class))
+                    || (0..instruction.outputs().len())
+                        .any(|output| instruction.operation().reference_output_identity_input(output).is_some())
                 {
                     slice_only = false;
                     break;
                 }
-                selections.push(instruction_index);
+                let descriptors =
+                    validated_reference_access_descriptors(instruction.operation(), instruction.inputs().len())?;
+                for (input_position, input) in instruction.inputs().iter().enumerate() {
+                    if *input != root {
+                        continue;
+                    }
+                    let Some(descriptor) = &descriptors[input_position] else {
+                        slice_only = false;
+                        break;
+                    };
+                    if !matches!(
+                        descriptor.transforms().first(),
+                        Some(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic })
+                    ) || instruction.inputs().get(descriptor.bindings().start) != Some(&index)
+                    {
+                        slice_only = false;
+                        break;
+                    }
+                    selections.push((instruction_index, input_position));
+                }
+                if !slice_only {
+                    break;
+                }
             }
             if !slice_only {
                 carried_inputs.push(position);
                 continue;
             }
-            let shape = slice_type
-                .static_shape()
-                .ok_or_else(|| TypeError::invalid("scan reference discharge requires a static slice shape"))?;
-            for instruction_index in selections {
-                let instruction = &source_body.instructions()[instruction_index];
-                let axes = shape.dimensions().iter().map(|size| ArraySliceAxis::new(0, *size, 1)).collect();
-                normalized.get_or_insert_with(|| source_body.region().clone()).instructions[instruction_index] =
-                    Instruction::new(
-                        ReferenceSliceOperation::new(axes).into(),
-                        vec![root],
-                        instruction.outputs().to_vec(),
-                        Vec::new(),
-                    )
-                    .with_provenance(instruction.provenance().clone());
+            for (instruction_index, input_position) in selections {
+                let normalized = normalized.get_or_insert_with(|| source_body.region().clone());
+                let instruction = &normalized.instructions[instruction_index];
+                let descriptor = instruction.operation().reference_access_descriptor(input_position).unwrap();
+                let bindings = instruction.inputs()[descriptor.bindings()].iter().skip(1).copied().collect();
+                normalized.instructions[instruction_index] = rewrite_reference_access_transforms(
+                    instruction,
+                    input_position,
+                    descriptor.transforms()[1..].to_vec(),
+                    bindings,
+                )?;
             }
             normalized.get_or_insert_with(|| source_body.region().clone()).atoms[root.index()] =
                 Atom::Variable(ReferenceType::new(slice_type).into());
@@ -2111,7 +2124,7 @@ where
             .map(|(position, allocation)| match *allocation {
                 None => ReferenceDischargeRegionInput::Value,
                 Some(allocation) if viewed_inputs.contains(&position) => {
-                    ReferenceDischargeRegionInput::View(allocation)
+                    ReferenceDischargeRegionInput::Transform(allocation)
                 }
                 Some(allocation) => ReferenceDischargeRegionInput::Allocation(allocation),
             })
@@ -2124,7 +2137,7 @@ where
             .filter_map(|(position, allocation)| {
                 allocation
                     .filter(|allocation| viewed_inputs.contains(&position) && widening.published().contains(allocation))
-                    .map(|_| ReferenceDischargeRegionOutput::View(position))
+                    .map(|_| ReferenceDischargeRegionOutput::Transform(position))
             })
             .collect();
         let mut state_allocations = entering.clone();
@@ -2171,7 +2184,7 @@ where
             .iter()
             .flat_map(|group| group.sources())
             .filter_map(|output| match output {
-                ReferenceDischargeRegionOutput::View(position) => Some(*position),
+                ReferenceDischargeRegionOutput::Transform(position) => Some(*position),
                 ReferenceDischargeRegionOutput::Allocation(_) => None,
             })
             .collect::<Vec<_>>();
@@ -3304,7 +3317,7 @@ impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayIrType
 where
     V: Value<Type = ArrayIrType>,
     F: Value<Type = ArrayIrType>,
-    Target: ReferenceViewOperation<Type = ArrayIrType>
+    Target: Operation<Type = ArrayIrType>
         + ResidualZeroProvider<ArrayIrType, Operation = Target>
         + From<ScanOperation<F>>
         + From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
@@ -3884,12 +3897,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
-        ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArraySliceAxis, DataType,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        Sharding, ShardingDimension,
     };
     use crate::batching::{BatchingTracer, batch};
-    use crate::captures::{CaptureReference, ClosedProgram};
+    use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{
@@ -3900,19 +3913,19 @@ mod tests {
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
-    use crate::operations::control_flow::tests::CountingBatchingDriver;
+    use crate::operations::control_flow::tests::{CountingBatchingDriver, resolve_captures};
     use crate::operations::manipulation::memory::TransferToMemoryOperation;
     use crate::operations::manipulation::slicing::DynamicSliceOperation;
     use crate::operations::references::{
-        ReferenceAddUpdateOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceWriteOperation,
     };
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceAliasKind, ReferenceSource, ReferenceType,
+        EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, ReferenceSource, ReferenceType, ViewedReference,
     };
-    use crate::tracing::{DomainTracingContext, Trace};
+    use crate::tracing::{DomainTracingContext, NestedTracingContext, Trace, Tracer, TracingContext};
 
     use super::*;
 
@@ -3993,14 +4006,23 @@ mod tests {
         let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = builder.add_input(scalar_type.clone().into());
         let stack = builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into());
-        let element = builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![stack, index], None)
-            .unwrap()[0];
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![element, carry], None)
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(transforms.clone()),
+                Vec::new(),
+                vec![stack, carry, index],
+                None,
+            )
             .unwrap();
-        let current =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![element], None).unwrap()[0];
+        let current = builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(transforms),
+                Vec::new(),
+                vec![stack, index],
+                None,
+            )
+            .unwrap()[0];
         let next_carry = builder
             .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
             .unwrap()[0];
@@ -4015,11 +4037,15 @@ mod tests {
         let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = builder.add_input(scalar_type.clone().into());
         let stack = builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into());
-        let element = builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![stack, index], None)
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let current = builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(transforms),
+                Vec::new(),
+                vec![stack, index],
+                None,
+            )
             .unwrap()[0];
-        let current =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![element], None).unwrap()[0];
         let next_carry = builder
             .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
             .unwrap()[0];
@@ -4855,11 +4881,10 @@ mod tests {
                     %4:f32[] = scan [carry_count=1, length=3, reverse=true] %0 %3 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
-                            let %3:ref<f32[]> = reference_dynamic_index [axis=0] %2 %0
-                                () = reference_add_update %3 %1
-                                %4:f32[] = reference_read %3
-                                %5:f32[] = add %1 %4
-                            in (%5)
+                            let () = reference_add_update [transforms=[dynamic_index(axis=0)]] %2 %1 %0
+                                %3:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %2 %0
+                                %4:f32[] = add %1 %3
+                            in (%4)
                         },
                     ]
                     %5:f32[3] = reference_freeze %3
@@ -4885,14 +4910,26 @@ mod tests {
             let stack =
                 builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![elements], None).unwrap()[0];
             for iteration in 0..3 {
-                let element = builder
-                    .add_instruction(ReferenceIndexOperation::new(0, iteration), Vec::new(), vec![stack], None)
-                    .unwrap()[0];
+                let element_transforms = vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Static(iteration),
+                }];
                 builder
-                    .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![element, carry], None)
+                    .add_instruction(
+                        ReferenceAddUpdateOperation::new().with_transforms(element_transforms.clone()),
+                        Vec::new(),
+                        vec![stack, carry],
+                        None,
+                    )
                     .unwrap();
-                let current =
-                    builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![element], None).unwrap()[0];
+                let current = builder
+                    .add_instruction(
+                        ReferenceReadOperation::new().with_transforms(element_transforms.clone()),
+                        Vec::new(),
+                        vec![stack],
+                        None,
+                    )
+                    .unwrap()[0];
                 carry = builder
                     .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
                     .unwrap()[0];
@@ -5005,12 +5042,9 @@ mod tests {
                 let %2:f32[], %3:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
-                        let %3:f32[] = slice [start_indices=[], limit_indices=[]] %2
-                            %4:f32[] = add %3 %1
-                            %5:f32[] = update_slice [start_indices=[]] %2 %4
-                            %6:f32[] = slice [start_indices=[], limit_indices=[]] %5
-                            %7:f32[] = add %1 %6
-                        in (%7, %5)
+                        let %3:f32[] = add %2 %1
+                            %4:f32[] = add %1 %3
+                        in (%4, %3)
                     },
                 ]
                 in (%2, %3)"},
@@ -5077,11 +5111,15 @@ mod tests {
         let index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let root = body_builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into());
-        let element = body_builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
-            .unwrap()[0];
+        let element_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![element, carry], None)
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(element_transforms),
+                Vec::new(),
+                vec![root, carry, index],
+                None,
+            )
             .unwrap();
         let doubled = body_builder
             .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, carry], None)
@@ -5637,6 +5675,65 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_captures_a_lazy_view_root_and_dynamic_binding() {
+        // A body traced as a nested region reads a captured root through a lazy view. The view is not a program
+        // value, so the region captures only its root and dynamic index, and the access re-applies the view.
+        let context = TracingContext::<DischargeCapture, TestIrOperation, TestIrValue>::new();
+        let stack = TestIrValue::Reference(ArrayReference::new(Array::vector(vec![10f32, 20., 30.]).unwrap()));
+        let index = TestIrValue::Array(Array::scalar(2i32).unwrap());
+        let (_, body) = NestedTracingContext::trace(
+            context.clone(),
+            |inputs: Vec<Tracer<_>>| {
+                let body = inputs[0].context().clone();
+                let root = StagingContext::constant(&body, body.capture(stack.clone())?);
+                let index = StagingContext::constant(&body, body.capture(index.clone())?);
+                ViewedReference::new(root)?.dynamic_index(0, &index)?.read()
+            },
+            vec![ArrayType::scalar(DataType::I64).into()],
+        )
+        .unwrap();
+        assert_eq!(body.instructions().len(), 1);
+        let access = &body.instructions()[0];
+        assert_eq!(access.inputs().len(), 2);
+        assert_eq!(access.operation().reference_access_descriptor(0).unwrap().bindings(), 1..2);
+        assert_eq!(
+            access.operation().reference_access_descriptor(0).unwrap().transforms(),
+            &[ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }],
+        );
+        let output = context.bind(ScanOperation::<TestIrValue>::new(0, 2), vec![body], &[]).unwrap().remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(
+                vec![output.atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        let captures = context.captures().borrow().clone();
+        assert_eq!(captures, vec![stack, index.clone()]);
+
+        // Discharge threads the captured root's state as an array input while the index capture stays an ordinary
+        // value, and executing the result selects the element the captured index names on every iteration.
+        let closed = ClosedProgram::new(program, captures.clone()).unwrap();
+        let discharged = closed.discharge_references().unwrap();
+        assert_eq!(
+            discharged.program().input_types(),
+            vec![ArrayType::new_static(DataType::F32, [3]).into(), ArrayType::scalar(DataType::I32).into()],
+        );
+        assert!(!discharged.program().entry_region_ref().contains_reference_accesses_in_closure());
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Capture { index: 0 });
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(
+            resolve_captures(discharged.program(), &captures)
+                .interpret(vec![TestIrValue::Array(Array::vector(vec![10f32, 20., 30.]).unwrap()), index]),
+            Ok(vec![TestIrValue::Array(Array::vector(vec![30f32, 30.]).unwrap())]),
+        );
+    }
+
+    #[test]
     fn test_scan_reference_discharge_threads_reference_captures_through_scan() {
         // A capture read by a scan body becomes a synthesized carry appended after the declared carry prefix, which
         // raises the rewritten scan's carry count without disturbing its length, direction, or unroll factor.
@@ -5821,14 +5918,24 @@ mod tests {
         let index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(ArrayType::scalar(DataType::F32).into());
         let stack = body_builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [4])).into());
-        let slice = body_builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![stack, index], None)
-            .unwrap()[0];
+        let slice_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![slice, carry], None)
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(slice_transforms.clone()),
+                Vec::new(),
+                vec![stack, carry, index],
+                None,
+            )
             .unwrap();
-        let current =
-            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![slice], None).unwrap()[0];
+        let current = body_builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(slice_transforms),
+                Vec::new(),
+                vec![stack, index],
+                None,
+            )
+            .unwrap()[0];
         let doubled = body_builder
             .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![current, current], None)
             .unwrap()[0];
@@ -5953,10 +6060,16 @@ mod tests {
         let mut branch = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let index = branch.add_input(ArrayType::scalar(DataType::I64).into());
         let root = branch.add_input(reference_type.clone().into());
-        let view = branch
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
+        let row_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let value = branch
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(row_transforms),
+                Vec::new(),
+                vec![root, index],
+                None,
+            )
             .unwrap()[0];
-        let value = branch.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![view], None).unwrap()[0];
         let branch = branch
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -6016,10 +6129,16 @@ mod tests {
         let index = body.add_input(ArrayType::scalar(DataType::I64).into());
         let root_type = ReferenceType::new(ArrayType::new_static(DataType::F32, [3]));
         let root = body.add_input(root_type.clone().into());
-        let row = body
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
+        let row_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let value = body
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(row_transforms),
+                Vec::new(),
+                vec![root, index],
+                None,
+            )
             .unwrap()[0];
-        let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![row], None).unwrap()[0];
         // This allocation's target follows the selection being normalized. Its instruction identity must survive.
         let local = body.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
         let output = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![local], None).unwrap()[0];
@@ -6053,11 +6172,15 @@ mod tests {
         let index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let stack = body_builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into());
-        let element = body_builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![stack, index], None)
-            .unwrap()[0];
+        let element_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         let current = body_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![element], None)
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(element_transforms),
+                Vec::new(),
+                vec![stack, index],
+                None,
+            )
             .unwrap()[0];
         let next_carry = body_builder
             .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
@@ -6091,9 +6214,8 @@ mod tests {
                 let %2:f32[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
-                        let %3:f32[] = slice [start_indices=[], limit_indices=[]] %2
-                            %4:f32[] = add %1 %3
-                        in (%4)
+                        let %3:f32[] = add %1 %2
+                        in (%3)
                     },
                 ]
                 in (%2, %1)"},
@@ -6112,6 +6234,244 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_reference_discharge_normalizes_chained_paths_and_remaining_bindings() {
+        // Remove only the leading row selection; the trailing dynamic column still selects within the row slice.
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let index_type = ArrayType::scalar(DataType::I32);
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let row = body.add_input(ArrayType::scalar(DataType::I64).into());
+        let column = body.add_input(index_type.clone().into());
+        let root = body.add_input(ReferenceType::new(matrix_type.clone()).into());
+        let update = body.add_constant(TestIrValue::Array(Array::scalar(10f32).unwrap()));
+        let transforms = vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ];
+        body.add_instruction(
+            ReferenceAddUpdateOperation::new().with_transforms(transforms.clone()),
+            Vec::new(),
+            vec![root, update, row, column],
+            None,
+        )
+        .unwrap();
+        let read = body
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(transforms),
+                Vec::new(),
+                vec![root, row, column],
+                None,
+            )
+            .unwrap()[0];
+        let body = body
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![column, read], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let matrix = builder.add_input(matrix_type.into());
+        let column = builder.add_input(index_type.into());
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![matrix], None).unwrap()[0];
+        let body = builder.import_program(body);
+        let mut outputs = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(1, 2), vec![body], vec![column, root], None)
+            .unwrap()
+            .to_vec();
+        outputs
+            .push(builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0]);
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 3])
+            .unwrap();
+        let discharged = program.clone().discharge_references(0).unwrap();
+        let scan = discharged
+            .program()
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.operation().name() == "scan")
+            .unwrap();
+        let body = discharged.program().region(scan.regions()[0]).unwrap();
+        assert_eq!(
+            body.input_types(),
+            vec![
+                ArrayType::scalar(DataType::I64).into(),
+                ArrayType::scalar(DataType::I32).into(),
+                ArrayType::new_static(DataType::F32, [3]).into(),
+            ]
+        );
+        assert!(!discharged.program().entry_region_ref().contains_reference_accesses_in_closure());
+        let inputs = vec![
+            TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap()),
+            TestIrValue::Array(Array::scalar(1i32).unwrap()),
+        ];
+        let expected = vec![
+            TestIrValue::Array(Array::scalar(1i32).unwrap()),
+            TestIrValue::Array(Array::vector(vec![13f32, 16.]).unwrap()),
+            TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 13., 4., 5., 16.]).unwrap()),
+        ];
+        assert_eq!(program.interpret(inputs.clone()), Ok(expected.clone()));
+        assert_eq!(discharged.program().interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_carries_the_whole_root_for_mixed_whole_and_row_accesses() {
+        // One access selects the current row and another reads the complete root, so per-row state cannot represent
+        // the body. The root must be carried whole, and each iteration observes the rows updated so far.
+        let vector_type = ArrayType::new_static(DataType::F32, [3]);
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let index = body.add_input(ArrayType::scalar(DataType::I64).into());
+        let root = body.add_input(ReferenceType::new(vector_type.clone()).into());
+        let one = body.add_constant(TestIrValue::Array(Array::scalar(1f32).unwrap()));
+        body.add_instruction(
+            ReferenceAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic,
+            }]),
+            Vec::new(),
+            vec![root, one, index],
+            None,
+        )
+        .unwrap();
+        let snapshot = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let body = body
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let input = builder.add_input(vector_type.into());
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let body = builder.import_program(body);
+        let snapshots = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(0, 3), vec![body], vec![root], None)
+            .unwrap()[0];
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![snapshots, frozen],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let inputs = vec![TestIrValue::Array(Array::vector(vec![1f32, 2., 3.]).unwrap())];
+        let expected = vec![
+            TestIrValue::Array(Array::matrix(3, 3, vec![2f32, 2., 3., 2., 3., 3., 2., 3., 4.]).unwrap()),
+            TestIrValue::Array(Array::vector(vec![2f32, 3., 4.]).unwrap()),
+        ];
+        assert_eq!(program.interpret(inputs.clone()), Ok(expected.clone()));
+        let discharged = program.discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[3] .
+                let %1:f32[3], %2:f32[3, 3] = scan [carry_count=1, length=3, reverse=false] %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[3] .
+                        let %2:f32[] = const 1.0
+                            %3:f32[1] = dynamic_slice [sizes=[1]] %1 %0
+                            %4:f32[] = reshape [shape=[]] %3
+                            %5:f32[] = add %4 %2
+                            %6:f32[1] = reshape [shape=[1]] %5
+                            %7:f32[3] = dynamic_update_slice %1 %6 %0
+                        in (%7, %7)
+                    },
+                ]
+                in (%2, %1)"},
+        );
+        assert_eq!(discharged.program().interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_carries_the_whole_root_for_a_non_leading_iteration_index() {
+        // The access indexes the iteration's column rather than its row, which a per-row slice cannot express, so the
+        // root must be carried whole.
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let index = body.add_input(ArrayType::scalar(DataType::I64).into());
+        let root = body.add_input(ReferenceType::new(matrix_type.clone()).into());
+        let column_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Dynamic }];
+        let update = body.add_constant(TestIrValue::Array(Array::vector(vec![10f32, 20.]).unwrap()));
+        body.add_instruction(
+            ReferenceAddUpdateOperation::new().with_transforms(column_transforms.clone()),
+            Vec::new(),
+            vec![root, update, index],
+            None,
+        )
+        .unwrap();
+        let column = body
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(column_transforms),
+                Vec::new(),
+                vec![root, index],
+                None,
+            )
+            .unwrap()[0];
+        let body = body
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![column], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let input = builder.add_input(matrix_type.into());
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let body = builder.import_program(body);
+        let columns = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(0, 2), vec![body], vec![root], None)
+            .unwrap()[0];
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![columns, frozen], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+
+        let inputs = vec![TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap())];
+        let expected = vec![
+            TestIrValue::Array(Array::matrix(2, 2, vec![11f32, 24., 12., 25.]).unwrap()),
+            TestIrValue::Array(Array::matrix(2, 3, vec![11f32, 12., 3., 24., 25., 6.]).unwrap()),
+        ];
+        assert_eq!(program.interpret(inputs.clone()), Ok(expected.clone()));
+        let discharged = program.discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3] .
+                let %1:f32[2, 3], %2:f32[2, 2] = scan [carry_count=1, length=2, reverse=false] %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[2, 3] .
+                        let %2:f32[2] = const [10.0, 20.0]
+                            %3:f32[2, 1] = dynamic_slice [sizes=[2, 1]] %1 %0 %0
+                            %4:f32[2] = reshape [shape=[2]] %3
+                            %5:f32[2] = add %4 %2
+                            %6:f32[2, 1] = reshape [shape=[2, 1]] %5
+                            %7:f32[2, 3] = dynamic_update_slice %1 %6 %0 %0
+                            %8:f32[2, 1] = dynamic_slice [sizes=[2, 1]] %7 %0 %0
+                            %9:f32[2] = reshape [shape=[2]] %8
+                        in (%7, %9)
+                    },
+                ]
+                in (%2, %1)"},
+        );
+        assert_eq!(discharged.program().interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_row_selection_requires_a_static_referent() {
+        // Per-row discharge strips the leading row selection and retypes the root to its row without consulting the
+        // row's shape. That is sound because the row selection only types statically shaped referents: an access that
+        // selects a row of a stacked root with a dynamic trailing extent is rejected when it is built, and the scan
+        // rule computes the row type through the same selection before it rewrites anything.
+        let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(4)).unwrap());
+        let matrix_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(extent)]));
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let index = body.add_input(ArrayType::scalar(DataType::I64).into());
+        let root = body.add_input(ReferenceType::new(matrix_type).into());
+        let read = ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+            axis: 0,
+            index: ArrayReferenceTransformIndex::Dynamic,
+        }]);
+        assert!(matches!(
+            body.add_instruction(read, Vec::new(), vec![root, index], None),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "reference indexing requires a static referent type but got `f32[2, extent]`",
+        ));
+    }
+
+    #[test]
     fn test_scan_reference_discharge_threads_whole_roots_through_nested_regions() {
         // Passing the root and index into a branch is valid even though its view is not visible directly in the scan
         // body. Read-only state remains unchanged; mutations must reach the next iteration and the final freeze.
@@ -6121,16 +6481,27 @@ mod tests {
             let mut branch = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
             let index = branch.add_input(ArrayType::scalar(DataType::I64).into());
             let root = branch.add_input(reference_type.clone().into());
-            let view = branch
-                .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
-                .unwrap()[0];
+            let row_transforms =
+                vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
             if mutates {
                 let increment = branch.add_constant(TestIrValue::Array(Array::scalar(1.0_f32).unwrap()));
                 branch
-                    .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, increment], None)
+                    .add_instruction(
+                        ReferenceAddUpdateOperation::new().with_transforms(row_transforms.clone()),
+                        Vec::new(),
+                        vec![root, increment, index],
+                        None,
+                    )
                     .unwrap();
             }
-            let value = branch.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![view], None).unwrap()[0];
+            let value = branch
+                .add_instruction(
+                    ReferenceReadOperation::new().with_transforms(row_transforms),
+                    Vec::new(),
+                    vec![root, index],
+                    None,
+                )
+                .unwrap()[0];
             let squared = branch
                 .add_instruction(
                     ArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new())),
@@ -6229,10 +6600,16 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let view = body
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
+        let row_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let value = body
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(row_transforms),
+                Vec::new(),
+                vec![root, index],
+                None,
+            )
             .unwrap()[0];
-        let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![view], None).unwrap()[0];
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -6267,11 +6644,15 @@ mod tests {
         let index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let total = body_builder.add_input(ReferenceType::new(scalar_type.clone()).into());
         let stack = body_builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into());
-        let element = body_builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![stack, index], None)
-            .unwrap()[0];
+        let element_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         let current = body_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![element], None)
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(element_transforms.clone()),
+                Vec::new(),
+                vec![stack, index],
+                None,
+            )
             .unwrap()[0];
         body_builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![total, current], None)
@@ -6279,7 +6660,12 @@ mod tests {
         let running =
             body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![total], None).unwrap()[0];
         body_builder
-            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![element, running], None)
+            .add_instruction(
+                ReferenceWriteOperation::new().with_transforms(element_transforms),
+                Vec::new(),
+                vec![stack, running, index],
+                None,
+            )
             .unwrap();
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![total], vec![Placeholder; 3], vec![Placeholder])
@@ -6328,10 +6714,8 @@ mod tests {
                 let %2:f32[], %3:f32[3] = scan [carry_count=1, length=3, reverse=true] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
-                        let %3:f32[] = slice [start_indices=[], limit_indices=[]] %2
-                            %4:f32[] = add %1 %3
-                            %5:f32[] = update_slice [start_indices=[]] %2 %4
-                        in (%4, %5)
+                        let %3:f32[] = add %1 %2
+                        in (%3, %3)
                     },
                 ]
                 in (%2, %3)"},
@@ -6353,11 +6737,10 @@ mod tests {
                     %3:f32[] = scan [carry_count=1, length=3, reverse=true] %0 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
-                            let %3:ref<f32[]> = reference_dynamic_index [axis=0] %2 %0
-                                %4:f32[] = reference_read %3
-                                %5:f32[] = add %1 %4
-                                () = reference_write %3 %5
-                            in (%5)
+                            let %3:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %2 %0
+                                %4:f32[] = add %1 %3
+                                () = reference_write [transforms=[dynamic_index(axis=0)]] %2 %4 %0
+                            in (%4)
                         },
                     ]
                     %4:f32[3] = reference_freeze %2
@@ -6376,11 +6759,15 @@ mod tests {
         let index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let stack = body_builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [0])).into());
-        let element = body_builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![stack, index], None)
-            .unwrap()[0];
+        let element_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         body_builder
-            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![element, carry], None)
+            .add_instruction(
+                ReferenceWriteOperation::new().with_transforms(element_transforms),
+                Vec::new(),
+                vec![stack, carry, index],
+                None,
+            )
             .unwrap();
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![carry], vec![Placeholder; 3], vec![Placeholder])
@@ -6411,8 +6798,7 @@ mod tests {
                 let %2:f32[], %3:f32[0] = scan [carry_count=1, length=0, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
-                        let %3:f32[] = update_slice [start_indices=[]] %2 %1
-                        in (%1, %3)
+                        in (%1, %1)
                     },
                 ]
                 in (%2, %3)"},
@@ -6514,11 +6900,15 @@ mod tests {
         let index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let whole = body_builder.add_input(ReferenceType::new(stacked_type.clone()).into());
         let element_root = body_builder.add_input(ReferenceType::new(stacked_type.clone()).into());
-        let element = body_builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![element_root, index], None)
-            .unwrap()[0];
+        let element_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         let current = body_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![element], None)
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(element_transforms),
+                Vec::new(),
+                vec![element_root, index],
+                None,
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
@@ -6553,17 +6943,26 @@ mod tests {
         let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let first_root = body_builder.add_input(ReferenceType::new(stacked_type.clone()).into());
-        let first = body_builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![first_root, index], None)
-            .unwrap()[0];
+        let first_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         let second_root = body_builder.add_input(ReferenceType::new(stacked_type.clone()).into());
-        let second = body_builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![second_root, index], None)
+        let second_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let current = body_builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(first_transforms),
+                Vec::new(),
+                vec![first_root, index],
+                None,
+            )
             .unwrap()[0];
-        let current =
-            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first], None).unwrap()[0];
         body_builder
-            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![second, current], None)
+            .add_instruction(
+                ReferenceWriteOperation::new().with_transforms(second_transforms),
+                Vec::new(),
+                vec![second_root, current, index],
+                None,
+            )
             .unwrap();
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![current], vec![Placeholder; 3], vec![Placeholder])
@@ -6639,14 +7038,23 @@ mod tests {
         let index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let stack = body_builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into());
-        let element = body_builder
-            .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![stack, index], None)
-            .unwrap()[0];
+        let element_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![element, carry], None)
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(element_transforms.clone()),
+                Vec::new(),
+                vec![stack, carry, index],
+                None,
+            )
             .unwrap();
         let current = body_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![element], None)
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(element_transforms),
+                Vec::new(),
+                vec![stack, index],
+                None,
+            )
             .unwrap()[0];
         let next_carry = body_builder
             .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
@@ -6679,30 +7087,25 @@ mod tests {
                     %3:f32[] = scan [carry_count=1, length=3, reverse=false] %0 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
-                            let %3:ref<f32[]> = reference_dynamic_index [axis=0] %2 %0
-                                () = reference_add_update %3 %1
-                                %4:f32[] = reference_read %3
-                                %5:f32[] = add %1 %4
-                            in (%5)
+                            let () = reference_add_update [transforms=[dynamic_index(axis=0)]] %2 %1 %0
+                                %3:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %2 %0
+                                %4:f32[] = add %1 %3
+                            in (%4)
                         },
                     ]
                     %4:f32[3] = reference_freeze %2
                 in (%3, %4)"},
         );
 
-        // The body receives the complete root. Its dynamic-index instruction defines the derived view,
-        // so alias analysis uses an ordinary instruction output instead of a special region boundary alias.
+        // The body receives the complete root. Each access carries its dynamic index directly, so reference
+        // analysis keeps the root identity while the ordinary body index supplies the access binding.
         let analysis = program.entry_region_ref().reference_analysis(0).unwrap();
         let bindings = analysis.region_input_bindings();
         assert_eq!(bindings.len(), 1);
-        assert!(!analysis.is_view(bindings[0].input()));
         let aliases = analysis.values().filter_map(|value| analysis.alias(value)).collect::<Vec<_>>();
-        assert_eq!(aliases.len(), 1);
-        assert_eq!(aliases[0].output_index(), 0);
-        assert_eq!(aliases[0].kind(), ReferenceAliasKind::View);
-        assert!(aliases[0].narrows());
+        assert!(aliases.is_empty());
 
-        // Eager interpretation supplies the index and whole root; the body creates the view. Refer to control-flow
+        // Eager interpretation supplies the index and whole root to each folded access. Refer to control-flow
         // module for the equivalence against the unrolled program.
         let inputs = vec![
             TestIrValue::Array(Array::scalar(1.0f32).unwrap()),
@@ -6730,15 +7133,13 @@ mod tests {
                     %6:f32[], %7:f32[] = scan [carry_count=2, length=3, reverse=false] %0 %2 %4 %5 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[], %3:ref<f32[3]>, %4:ref<f32[3]> .
-                            let %5:ref<f32[]> = reference_dynamic_index [axis=0] %3 %0
-                                %6:ref<f32[]> = reference_dynamic_index [axis=0] %4 %0
-                                () = reference_add_update %5 %1
-                                () = reference_add_update %6 %2
-                                %7:f32[] = reference_read %5
-                                %8:f32[] = reference_read %6
-                                %9:f32[] = add %1 %7
-                                %10:f32[] = add %2 %8
-                            in (%9, %10)
+                            let () = reference_add_update [transforms=[dynamic_index(axis=0)]] %3 %1 %0
+                                () = reference_add_update [transforms=[dynamic_index(axis=0)]] %4 %2 %0
+                                %5:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %3 %0
+                                %6:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %4 %0
+                                %7:f32[] = add %1 %5
+                                %8:f32[] = add %2 %6
+                            in (%7, %8)
                         },
                     ]
                     %8:f32[3] = reference_freeze %4
@@ -6774,12 +7175,9 @@ mod tests {
                 let %2:f32[], %3:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f32[], %2:f32[] .
-                        let %3:f32[] = slice [start_indices=[], limit_indices=[]] %2
-                            %4:f32[] = add %3 %1
-                            %5:f32[] = update_slice [start_indices=[]] %2 %4
-                            %6:f32[] = slice [start_indices=[], limit_indices=[]] %5
-                            %7:f32[] = add %1 %6
-                        in (%7, %5)
+                        let %3:f32[] = add %2 %1
+                            %4:f32[] = add %1 %3
+                        in (%4, %3)
                     },
                 ]
                 in (%2, %3)"},
@@ -8001,11 +8399,10 @@ mod tests {
                     %4:dimension<2>, %5:f32[2] = scan [carry_count=2, length=3, reverse=false] %0 %1 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:ref<f32[3, 2]> .
-                            let %4:ref<f32[2]> = reference_dynamic_index [axis=0] %3 %0
-                                () = reference_add_update %4 %2
-                                %5:f32[2] = reference_read %4
-                                %6:f32[2] = add %2 %5
-                            in (%1, %6)
+                            let () = reference_add_update [transforms=[dynamic_index(axis=0)]] %3 %2 %0
+                                %4:f32[2] = reference_read [transforms=[dynamic_index(axis=0)]] %3 %0
+                                %5:f32[2] = add %2 %4
+                            in (%1, %5)
                         },
                     ]
                     %6:f32[3, 2] = reference_freeze %3
@@ -8984,11 +9381,15 @@ mod tests {
         body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(vector_reference_type.clone());
         let element = body_builder.add_input(scalar_type.clone());
-        let view = body_builder
-            .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![carry], None)
-            .unwrap()[0];
+        let element_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }];
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, element], None)
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(element_transforms),
+                Vec::new(),
+                vec![carry, element],
+                None,
+            )
             .unwrap();
         let body = body_builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![carry], vec![Placeholder; 3], vec![Placeholder])

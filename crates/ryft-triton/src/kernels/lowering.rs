@@ -1,10 +1,13 @@
 //! Typed TTIR construction from the verified portable kernel arena.
 
+use std::collections::HashMap;
+
 use ryft_core::kernels::{GridExecution, KernelOperation, KernelSchedule, VerifiedKernel};
 use ryft_core::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Atom, ComparisonDirection, DataType,
-    Dimension, DimensionOperation, DimensionValue, DotDimensionNumbers, Layout, Memory, Operation as CoreOperation,
-    ReductionKind, RegionRef, Typed,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex,
+    ArrayType, Atom, ComparisonDirection, DataType, Dimension, DimensionOperation, DimensionValue, DotDimensionNumbers,
+    Layout, Memory, Operation as CoreOperation, ReductionKind, ReferenceAccessOperation, RegionRef, Typed,
+    validated_reference_access_descriptors,
 };
 use ryft_mlir::dialects::{arith, scf, triton::tt};
 use ryft_mlir::{
@@ -559,6 +562,58 @@ impl<'c, 't> Lowering<'c, 't> {
         Ok(())
     }
 
+    /// Applies one supported reference view while retaining physical coordinates and enclosing validity.
+    fn reference_view(
+        &mut self,
+        block: &mut DetachedBlock<'c, 't>,
+        reference: &mut Reference<'c, 't>,
+        view: &ArrayReferenceTransform,
+        operation: &'static str,
+    ) -> Result<(), Error> {
+        self.charge(1)?;
+        let location = self.location;
+        match view {
+            ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) } => {
+                let axis = *axis;
+                let index = self.integer(block, *index as i64)?;
+                let coordinate = append(block, arith::addi(reference.starts[axis], index, location)?)?;
+                let valid = append(
+                    block,
+                    arith::cmpi(
+                        coordinate,
+                        reference.limits[axis],
+                        arith::IntegerComparisonPredicate::SignedLessThan,
+                        location,
+                    )?,
+                )?;
+                reference.valid = append(block, arith::andi(reference.valid, valid, location)?)?;
+                reference.fixed[reference.axes.remove(axis)] = Some(coordinate);
+                reference.starts.remove(axis);
+                reference.limits.remove(axis);
+                reference.shape.remove(axis);
+            }
+            ArrayReferenceTransform::Slice { axes } => {
+                if axes.iter().any(|axis| axis.stride() != 1) {
+                    return Err(unsupported(operation, "strided reference views are unsupported"));
+                }
+                for (axis, selection) in axes.iter().enumerate() {
+                    let offset = self.integer(block, selection.start() as i64)?;
+                    let size = self.integer(block, selection.size() as i64)?;
+                    let start = append(block, arith::addi(reference.starts[axis], offset, location)?)?;
+                    let limit = append(block, arith::addi(start, size, location)?)?;
+                    reference.starts[axis] = start;
+                    reference.limits[axis] = append(block, arith::minsi(reference.limits[axis], limit, location)?)?;
+                    reference.shape[axis] = selection.size();
+                }
+            }
+            ArrayReferenceTransform::Index { .. } => {
+                return Err(unsupported(operation, "dynamic reference views are unsupported"));
+            }
+            _ => return Err(unsupported(operation, "reference view is outside the supported subset")),
+        }
+        Ok(())
+    }
+
     /// Replays canonical regions into typed SSA without changing portable operation semantics.
     fn region(
         &mut self,
@@ -583,9 +638,41 @@ impl<'c, 't> Lowering<'c, 't> {
                 }));
             }
         }
+        // A folded path may be repeated by many accesses. Cache only its immutable address calculations, never the
+        // loaded value or memory effect. Atom and binding identities are local to this region, and the complete
+        // ordered path is part of the key; separate region invocations construct independent caches and native SSA.
+        let mut reference_transforms = HashMap::<_, Reference<'c, 't>>::new();
         for instruction in region.instructions() {
             self.charge(1)?;
-            let inputs = instruction.inputs().iter().map(|id| values[id.index()].clone().unwrap()).collect::<Vec<_>>();
+            let mut inputs =
+                instruction.inputs().iter().map(|id| values[id.index()].clone().unwrap()).collect::<Vec<_>>();
+            let operation = instruction.operation();
+            let descriptors = validated_reference_access_descriptors(operation, instruction.inputs().len())?;
+            for (input_index, descriptor) in descriptors.iter().enumerate() {
+                let Some(descriptor) = descriptor else { continue };
+                if descriptor.transforms().is_empty() {
+                    continue;
+                }
+                let key = (
+                    instruction.inputs()[input_index],
+                    descriptor.transforms(),
+                    &instruction.inputs()[descriptor.bindings()],
+                );
+                let reference = if let Some(reference) = reference_transforms.get(&key) {
+                    reference.clone()
+                } else {
+                    let mut reference = inputs[input_index].reference()?.clone();
+                    for view in descriptor.transforms() {
+                        self.reference_view(block, &mut reference, view, operation.name())?;
+                    }
+                    reference_transforms.insert(key, reference.clone());
+                    reference
+                };
+                inputs[input_index] = LoweringValue::Reference(reference);
+            }
+            if descriptors.iter().any(Option::is_some) {
+                inputs.truncate(operation.base_input_count());
+            }
             let input_types = instruction
                 .inputs()
                 .iter()
@@ -654,33 +741,6 @@ impl<'c, 't> Lowering<'c, 't> {
                             })? as i64,
                         )?,
                     )]
-                }
-                KernelOperation::Portable(ArrayIrOperation::ReferenceIndex(operation)) => {
-                    let mut reference = inputs[0].reference()?.clone();
-                    let ryft_core::ArrayReferenceView::Index {
-                        axis,
-                        index: ryft_core::ArrayReferenceViewIndex::Static(index),
-                    } = operation.transform()
-                    else {
-                        return Err(unsupported("reference_index", "requires a static reference index"));
-                    };
-                    let index_value = self.integer(block, index as i64)?;
-                    let coordinate = append(block, arith::addi(reference.starts[axis], index_value, location)?)?;
-                    let valid = append(
-                        block,
-                        arith::cmpi(
-                            coordinate,
-                            reference.limits[axis],
-                            arith::IntegerComparisonPredicate::SignedLessThan,
-                            location,
-                        )?,
-                    )?;
-                    reference.valid = append(block, arith::andi(reference.valid, valid, location)?)?;
-                    reference.fixed[reference.axes.remove(axis)] = Some(coordinate);
-                    reference.starts.remove(axis);
-                    reference.limits.remove(axis);
-                    reference.shape.remove(axis);
-                    vec![LoweringValue::Reference(reference)]
                 }
                 KernelOperation::Portable(ArrayIrOperation::ReferenceRead(_)) => {
                     let zero = append(
@@ -1077,6 +1137,10 @@ fn unsupported(operation: &'static str, reason: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use ryft_core::kernels::{
+        Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter,
+    };
+    use ryft_core::{ArraySliceAxis, Placeholder, ProgramBuilder, ReferenceReadOperation, ReferenceWriteOperation};
     use ryft_mlir::{OpRef, Region};
 
     use super::*;
@@ -1351,6 +1415,114 @@ mod tests {
         let operation = block.operations().unwrap().last().unwrap().unwrap();
         let comparison = unsafe { operation.cast::<arith::CmpiOperationRef>() }.unwrap();
         assert_eq!(comparison.predicate().unwrap(), arith::IntegerComparisonPredicate::UnsignedLessThan);
+    }
+
+    #[test]
+    fn test_lowering_region_reuses_only_identical_reference_transforms() {
+        let context = Context::new();
+        let lower_paths = |reference_transforms: &[(usize, usize)]| {
+            let source_type = ArrayType::new_static(DataType::F32, [2, 2]);
+            let call = KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![
+                    whole_array_parameter(source_type.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                    whole_array_parameter(source_type, KernelParameterAccess::ReadOnly).unwrap(),
+                    whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::WriteOnly).unwrap(),
+                ],
+            )
+            .unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let inputs = call
+                .parameters()
+                .iter()
+                .map(|parameter| builder.add_input(parameter.body_type()))
+                .collect::<Vec<_>>();
+            let mut output = None;
+            for &(root, index) in reference_transforms {
+                let operation = ReferenceReadOperation::new().with_transforms(vec![
+                    ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(index) },
+                    ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) },
+                ]);
+                output = Some(builder.add_instruction(operation, vec![], vec![inputs[root]], None).unwrap()[0]);
+            }
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), vec![], vec![inputs[2], output.unwrap()], None)
+                .unwrap();
+            let body = builder.build(vec![], vec![Placeholder; 3], vec![]).unwrap();
+            let definition = KernelDefinition::new(call, body).unwrap();
+            let verified = VerifiedKernel::new(&definition, 1).unwrap();
+            lower(&context, &verified, &Options::default(), &KernelSchedule::default())
+                .unwrap()
+                .module
+                .to_string()
+        };
+        let single = lower_paths(&[(0, 0)]);
+        let repeated = lower_paths(&[(0, 0), (0, 0), (0, 0)]);
+        let different_path = lower_paths(&[(0, 0), (0, 0), (0, 1)]);
+        let different_root = lower_paths(&[(0, 0), (0, 0), (1, 0)]);
+        // Each load retains its own pointer arithmetic and memory effect; only the two view steps are shared.
+        assert_eq!(repeated.matches("tt.load").count(), 3);
+        assert_eq!(repeated.matches("arith.addi").count(), single.matches("arith.addi").count() + 4);
+        assert_eq!(different_path.matches("tt.load").count(), 3);
+        assert_eq!(different_path.matches("arith.addi").count(), repeated.matches("arith.addi").count() + 2);
+        assert_eq!(different_root.matches("tt.load").count(), 3);
+        assert_eq!(different_root.matches("arith.addi").count(), repeated.matches("arith.addi").count() + 2);
+    }
+
+    #[test]
+    fn test_lowering_reference_view() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
+        let mut lowering = Lowering {
+            context: &context,
+            location: context.unknown_location(),
+            remaining: 100,
+            maximum_tile_elements: 1024,
+        };
+        let mut block = context.block_with_no_arguments();
+        let zero = lowering.integer(&mut block, 0).unwrap();
+        let limit = lowering.integer(&mut block, 4).unwrap();
+        let valid = lowering.boolean(&mut block, true).unwrap();
+        let mut reference = Reference {
+            pointer: zero,
+            allocation: vec![4],
+            axes: vec![0],
+            fixed: vec![None],
+            starts: vec![zero],
+            limits: vec![limit],
+            shape: vec![4],
+            valid,
+        };
+        lowering
+            .reference_view(
+                &mut block,
+                &mut reference,
+                &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] },
+                "reference_read",
+            )
+            .unwrap();
+        assert_eq!(reference.shape, vec![2]);
+        lowering
+            .reference_view(
+                &mut block,
+                &mut reference,
+                &ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+                "reference_read",
+            )
+            .unwrap();
+        assert_eq!(
+            (reference.axes.len(), reference.starts.len(), reference.limits.len(), reference.shape.len()),
+            (0, 0, 0, 0)
+        );
+        assert!(reference.fixed[0].is_some());
+        assert!(matches!(lowering.reference_view(&mut block, &mut reference, &ArrayReferenceTransform::Index {
+            axis: 0, index: ArrayReferenceTransformIndex::Dynamic,
+        }, "reference_read"), Err(Error::Unsupported { operation: "reference_read", reason })
+            if reason == "dynamic reference views are unsupported"));
+        assert!(matches!(lowering.reference_view(&mut block, &mut reference, &ArrayReferenceTransform::Slice {
+            axes: vec![ArraySliceAxis::new(0, 1, 2)],
+        }, "reference_read"), Err(Error::Unsupported { operation: "reference_read", reason })
+            if reason == "strided reference views are unsupported"));
     }
 
     #[test]

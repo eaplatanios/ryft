@@ -185,7 +185,9 @@ fn async_copy_case(shape: &[usize]) -> KernelCase {
     let definition = KernelDefinition::trace(operation, |(references, _)| {
         let context = references[0].context();
         let destination = context.bind(scratch, vec![], &[])?.remove(0);
-        let token = context.bind(AsyncCopyOperation, vec![], &[references[0].clone(), destination.clone()])?.remove(0);
+        let token = context
+            .bind(AsyncCopyOperation::new(), vec![], &[references[0].clone(), destination.clone()])?
+            .remove(0);
         context.bind(WaitOperation, vec![], &[token])?;
         references[1].write(&destination.read()?)
     })

@@ -11,17 +11,17 @@ use ryft_core::kernels::{
 };
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
-    Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceView, Atom,
+    Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom,
     AtomId, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, ConstantOperation,
     Context, CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, Domain, Effects, InputRegionProvenance,
     Instruction, InterpretableOperation, InterpretationDriver, MaybeZero, Operation, OutputRegionProvenance,
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceViewOperation, ReferenceViewValidationError, Region, RegionInterface, RegionSlot, Tracer, TracingContext,
-    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed,
-    Value,
+    PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionInterface, RegionSlot, Tracer,
+    TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value,
 };
 
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
@@ -81,33 +81,30 @@ impl Display for XlaKernelExtension {
     }
 }
 
-impl ReferenceViewOperation for XlaKernelExtension {
-    type View = ArrayReferenceView;
+impl ReferenceAccessOperation for XlaKernelExtension {
+    type Transform = ArrayReferenceTransform;
 
-    fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
+    fn base_input_count(&self) -> usize {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
-            Self::Mosaic(ref operation) => operation.reference_view(_output_index),
+            Self::Mosaic(ref operation) => operation.base_input_count(),
         }
     }
 
-    fn validate_reference_view(
-        view: &ArrayReferenceView,
-        source: &ArrayIrType,
-        target: &ArrayIrType,
-    ) -> Result<(), ReferenceViewValidationError> {
-        view.validate(source, target)
+    fn reference_access_descriptor(&self, _input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => operation.reference_access_descriptor(_input_index),
+        }
     }
 
-    fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-        _context: &C,
-        _view: &ArrayReferenceView,
-        _source: C::Value,
-        _symbols: &[C::Value],
-    ) -> Result<C::Value, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "XLA extension family cannot construct portable reference views".to_owned(),
-        })
+    fn with_reference_access_transforms(&self, _input_index: usize, _views: Vec<Self::Transform>) -> Result<Self, ProgramError> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => {
+                operation.with_reference_access_transforms(_input_index, _views).map(Self::Mosaic)
+            }
+        }
     }
 }
 
@@ -1463,7 +1460,7 @@ pub(crate) mod tests {
         let literal = builder.add_constant(ArrayIrValue::Array(CpuArray::scalar(42_i32).unwrap()));
         builder
             .add_instruction(
-                ryft_core::ReferenceWriteOperation::<ryft_core::ArrayType, ArrayIrType>::new(),
+                ryft_core::ReferenceWriteOperation::<ryft_core::ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
                 vec![],
                 vec![reference, literal],
                 None,
@@ -2266,12 +2263,17 @@ pub(crate) mod tests {
         let mut builder = XlaProgramBuilder::new();
         let reference = builder.add_input(reference_type.clone());
         let value = builder
-            .add_instruction(ReferenceReadOperation::<ArrayType, ArrayIrType>::new(), vec![], vec![reference], None)
+            .add_instruction(
+                ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
+                vec![],
+                vec![reference],
+                None,
+            )
             .unwrap()[0];
         let outputs = builder.splice_program(&body, &[value]).unwrap();
         builder
             .add_instruction(
-                ReferenceWriteOperation::<ArrayType, ArrayIrType>::new(),
+                ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
                 vec![],
                 vec![reference, outputs[0]],
                 None,

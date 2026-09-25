@@ -5288,9 +5288,9 @@ mod tests {
         PartialEvaluationContext, PartialEvaluationValue, PartialTracer, PartialValue, PartiallyEvaluatableOperation,
     };
     use crate::programs::{
-        EmptyRegionDriver, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceDischargeContext,
-        ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType,
-        RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, ValueProjection,
+        EmptyRegionDriver, MaybeZero, NoReferenceTransform, Operation, OperationProvider, ProgramError,
+        ReferenceDischargeContext, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+        ReferenceType, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -6363,6 +6363,7 @@ mod tests {
 
         impl<C: Domain<Type = ArrayType>> ReferenceDischargePolicy<C> for TestArrayReferenceDischarge {
             type Referent = ArrayType;
+            type Transform = NoReferenceTransform<ArrayType, ArrayType>;
             type Alias = WholeArray;
 
             fn storage_alias(_referent: &ArrayType) -> WholeArray {

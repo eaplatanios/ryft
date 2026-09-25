@@ -609,9 +609,6 @@ where
             }
         }
         operation @ (ArrayIrOperation::ReferenceNew(_)
-        | ArrayIrOperation::ReferenceIndex(_)
-        | ArrayIrOperation::ReferenceDynamicIndex(_)
-        | ArrayIrOperation::ReferenceSlice(_)
         | ArrayIrOperation::ReferenceRead(_)
         | ArrayIrOperation::ReferenceWrite(_)
         | ArrayIrOperation::ReferenceSwap(_)

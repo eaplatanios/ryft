@@ -12,7 +12,10 @@ use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{OperationProvider, ProgramError, ReferenceMemberType, Type, Typed, Value};
+use crate::programs::{
+    OperationProvider, ProgramError, ReferenceAccessOperation, ReferenceMemberType, ReferenceTransform, Type, Typed,
+    Value,
+};
 use crate::tracing::TracingContext;
 
 /// Hessian of a function, represented as the Cartesian product of its output, first input, and second input
@@ -259,13 +262,19 @@ where
                            + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
                            + TransposableOperation<C::Constant, C::Operation>
                            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-                           + OperationProvider<
+                           + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
                 C::Type,
                 ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
                 Operation = C::Operation,
             > + OperationProvider<
                 C::Type,
-                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                ReferenceAddUpdateOperation<
+                    <C::Type as ReferenceMemberType>::Referent,
+                    C::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
         >,

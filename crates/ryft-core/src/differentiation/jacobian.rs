@@ -12,7 +12,9 @@ use crate::macros::check_count;
 use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{OperationProvider, ProgramError, ReferenceMemberType, Type, Typed};
+use crate::programs::{
+    OperationProvider, ProgramError, ReferenceAccessOperation, ReferenceMemberType, ReferenceTransform, Type, Typed,
+};
 use crate::tracing::TracingContext;
 
 /// Jacobian of a function, represented as the Cartesian product of its output and input [`Parameter`] leaves. `I` and
@@ -420,13 +422,18 @@ where
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>
+        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>>
         + OperationProvider<
             C::Type,
             ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
             Operation = C::Operation,
         > + OperationProvider<
             C::Type,
-            ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+            ReferenceAddUpdateOperation<
+                <C::Type as ReferenceMemberType>::Referent,
+                C::Type,
+                <C::Operation as ReferenceAccessOperation>::Transform,
+            >,
             Operation = C::Operation,
         > + From<AddOperation<C::Type>>,
 {

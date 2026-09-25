@@ -11,7 +11,7 @@ use std::fmt::{Display, Write};
 use thiserror::Error;
 
 use crate::arrays::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceView, ArraySliceAxis, ArrayType,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArraySliceAxis, ArrayType,
     ArrayTypeRefinements, Dimension, DimensionBounds, DimensionType, DimensionVariable,
 };
 use crate::contexts::EagerContext;
@@ -27,7 +27,7 @@ use crate::operations::{DimensionFromScalar, DimensionFromScalarOperation, PadOp
 use crate::parameters::Placeholder;
 use crate::programs::{
     Atom, FlatProgram, InputRegionProvenance, Operation, OperationFormatter, ProgramBuilder, ProgramError,
-    ReferenceAccessMode, ReferenceType, ReferenceViewOperation, RegionInterface, RegionRef, RegionSlot, Type,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceType, RegionInterface, RegionRef, RegionSlot, Type,
     TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -139,7 +139,7 @@ impl KernelParameter {
                 .zip(shape.dimensions())
                 .map(|(&block, &extent)| block.min(extent))
                 .collect::<Vec<_>>();
-            let view = ArrayReferenceView::Slice {
+            let view = ArrayReferenceTransform::Slice {
                 axes: valid_shape.iter().map(|&extent| ArraySliceAxis::new(0, extent, 1)).collect(),
             };
             let valid_type = view.output_type(&r#type)?;
@@ -161,7 +161,7 @@ impl KernelParameter {
                 .remove(0)
                 .with_layout(None)
         } else {
-            let view = ArrayReferenceView::Slice {
+            let view = ArrayReferenceTransform::Slice {
                 axes: mapping.block_shape().iter().map(|&extent| ArraySliceAxis::new(0, extent, 1)).collect(),
             };
             view.output_type(&r#type)?
@@ -235,7 +235,7 @@ pub const KERNEL_CALL_OPERATION_NAME: &str = "kernel_call";
 
 /// Version of the experimental kernel semantic-key schema. An incompatible change to the encoded semantics
 /// requires a new version; this is independent of adapter artifact and executable persistence versions.
-pub const KERNEL_SCHEMA_VERSION: u32 = 1;
+pub const KERNEL_SCHEMA_VERSION: u32 = 2;
 
 /// Higher-order operation with one attached, reference-preserving kernel body.
 ///
@@ -493,7 +493,7 @@ impl KernelCallOperation {
         region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
     ) -> Result<KernelReferenceSummary, KernelError>
     where
-        Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>,
+        Extension: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform>,
     {
         self.infer_output_types(&self.input_types(), &[region.interface()])?;
         let references = validate_kernel_body(region, &self.boundary_contract())?;
@@ -696,7 +696,7 @@ pub struct KernelDefinition<Extension: Operation<Type = ArrayIrType> = NoKernelE
 
 impl<Extension> KernelDefinition<Extension>
 where
-    Extension: ReferenceViewOperation<Type = ArrayIrType, View = crate::arrays::ArrayReferenceView>,
+    Extension: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform>,
 {
     /// Validates the actual body and its call interface before retaining either. Reference constants, reference
     /// outputs, undeclared accesses, and incompatible block types fail before a definition becomes observable.
@@ -1126,9 +1126,6 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::ReferenceNew(_)
             | ArrayIrOperation::ReferenceRead(_)
             | ArrayIrOperation::ReferenceWrite(_)
-            | ArrayIrOperation::ReferenceIndex(_)
-            | ArrayIrOperation::ReferenceDynamicIndex(_)
-            | ArrayIrOperation::ReferenceSlice(_)
             | ArrayIrOperation::ReferenceSwap(_)
             | ArrayIrOperation::ReferenceAddUpdate(_)
             | ArrayIrOperation::ReferenceAtomicAddUpdate(_)
@@ -1163,10 +1160,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, DataType, DimensionError, DimensionType, DimensionValue, Layout, Memory,
-        Shape, TiledLayout,
+        ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, DataType, DimensionError, DimensionType,
+        DimensionValue, Layout, Memory, Shape, TiledLayout,
     };
     use crate::contexts::Context;
+    use crate::kernels::authoring::whole_array_parameter;
     use crate::kernels::grids::{GridDimension, GridExecution};
     use crate::kernels::mappings::BoundaryPolicy;
     use crate::operations::{
@@ -1174,7 +1172,7 @@ mod tests {
         ReferenceWrite, ReferenceWriteOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{EffectClasses, ProgramBuilder};
+    use crate::programs::{EffectClasses, ProgramBuilder, ReferenceAccessDescriptor};
 
     use super::*;
 
@@ -1490,7 +1488,7 @@ mod tests {
             BlockMapping::new(program, vec![1, 3], BoundaryPolicy::InBounds).unwrap(),
         )
         .unwrap();
-        let view = ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)] };
+        let view = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)] };
         assert_eq!(
             partial.body_type(),
             ArrayIrType::Reference(ReferenceType::new(view.output_type(&full_type).unwrap()))
@@ -2201,25 +2199,26 @@ mod tests {
         }
     }
 
-    impl<const EXACT: bool> ReferenceViewOperation for HiddenKeyExtension<EXACT> {
-        type View = ArrayReferenceView;
-        fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
+    impl<const EXACT: bool> ReferenceAccessOperation for HiddenKeyExtension<EXACT> {
+        type Transform = ArrayReferenceTransform;
+
+        fn base_input_count(&self) -> usize {
+            0
+        }
+
+        fn reference_access_descriptor(
+            &self,
+            _input_index: usize,
+        ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
             None
         }
-        fn validate_reference_view(
-            view: &ArrayReferenceView,
-            source: &ArrayIrType,
-            target: &ArrayIrType,
-        ) -> Result<(), crate::programs::ReferenceViewValidationError> {
-            view.validate(source, target)
-        }
-        fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-            _context: &C,
-            _view: &ArrayReferenceView,
-            _source: C::Value,
-            _symbols: &[C::Value],
-        ) -> Result<C::Value, ProgramError> {
-            Err(ProgramError::UnsupportedOperation { message: "hidden extension has no reference views".to_owned() })
+
+        fn with_reference_access_transforms(
+            &self,
+            _input_index: usize,
+            _views: Vec<ArrayReferenceTransform>,
+        ) -> Result<Self, ProgramError> {
+            Err(ProgramError::UnsupportedOperation { message: "hidden extension has no reference accesses".to_owned() })
         }
     }
 
@@ -2279,5 +2278,37 @@ mod tests {
         assert_ne!(key, wider.semantic_key().unwrap());
         assert!(!key.contains("first"));
         assert!(key.starts_with(&format!("kernel key 2; schema {KERNEL_SCHEMA_VERSION}\n")));
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_reference_transforms() {
+        let mut keys = Vec::new();
+        for index in [0, 1] {
+            let call = KernelCallOperation::new(
+                Grid::new(vec![]).unwrap(),
+                vec![
+                    whole_array_parameter(ArrayType::new_static(DataType::I32, [2]), KernelParameterAccess::ReadOnly)
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let input = builder.add_input(call.body_input_types()[0].clone());
+            builder
+                .add_instruction(
+                    ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                        axis: 0,
+                        index: ArrayReferenceTransformIndex::Static(index),
+                    }]),
+                    vec![],
+                    vec![input],
+                    None,
+                )
+                .unwrap();
+            let definition =
+                KernelDefinition::new(call, builder.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap();
+            keys.push(definition.semantic_key().unwrap());
+        }
+        assert_ne!(keys[0], keys[1]);
     }
 }

@@ -5,9 +5,8 @@ use std::fmt::{Display, Formatter};
 
 use ryft_core::kernels::{KernelExtension, KernelExtensionMemory, NoKernelExtension};
 use ryft_core::{
-    ArrayIrType, ArrayReferenceView, ArrayType, Context, DataType, DotOperation, EffectClass, EffectClasses, Effects,
-    Operation, OperationFormatter, ProgramError, ReferenceViewOperation, ReferenceViewValidationError, RegionInterface,
-    TypeError,
+    ArrayIrType, ArrayReferenceTransform, ArrayType, DataType, DotOperation, EffectClass, EffectClasses, Effects, Operation,
+    OperationFormatter, ProgramError, ReferenceAccessDescriptor, ReferenceAccessOperation, RegionInterface, TypeError,
 };
 
 use crate::kernels::gpu::tmem::TmemOperation;
@@ -210,28 +209,32 @@ impl Operation for GpuOperation {
     }
 }
 
-impl ReferenceViewOperation for GpuOperation {
-    type View = ArrayReferenceView;
+impl ReferenceAccessOperation for GpuOperation {
+    type Transform = ArrayReferenceTransform;
 
-    fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
-        None
+    fn base_input_count(&self) -> usize {
+        match self {
+            Self::Tmem(operation) => operation.base_input_count(),
+            Self::Wgmma => 2,
+            Self::Nvfp4 { tensor_scale } => 5 + usize::from(*tensor_scale),
+            Self::Nvfp4Sparse { tensor_scale } => 6 + usize::from(*tensor_scale),
+        }
     }
 
-    fn validate_reference_view(
-        view: &ArrayReferenceView,
-        source: &ArrayIrType,
-        target: &ArrayIrType,
-    ) -> Result<(), ReferenceViewValidationError> {
-        view.validate(source, target)
+    fn reference_access_descriptor(&self, input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+        match self {
+            Self::Tmem(operation) => operation.reference_access_descriptor(input_index),
+            _ => None,
+        }
     }
 
-    fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-        _context: &C,
-        _view: &ArrayReferenceView,
-        _source: C::Value,
-        _symbols: &[C::Value],
-    ) -> Result<C::Value, ProgramError> {
-        Err(ProgramError::MalformedProgram("gpu instruction operations do not construct reference views".to_owned()))
+    fn with_reference_access_transforms(&self, input_index: usize, transforms: Vec<Self::Transform>) -> Result<Self, ProgramError> {
+        match self {
+            Self::Tmem(operation) => operation.with_reference_access_transforms(input_index, transforms).map(Self::Tmem),
+            _ => Err(ProgramError::UnsupportedOperation {
+                message: "GPU array operations have no reference inputs".to_owned(),
+            }),
+        }
     }
 }
 

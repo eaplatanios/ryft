@@ -51,6 +51,8 @@
 //! bounds (e.g., a dot policy requires `for<'a> &'a O: TryInto<&'a DotOperation>`), so configuring a policy whose
 //! operation capability is absent is a compile-time error at the configuration site.
 
+// TODO(eaplatanios): Review this module.
+
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{Debug, Display};
@@ -80,8 +82,8 @@ use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
     Atom, AtomId, EffectClass, EffectClasses, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
     OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode,
-    ReferenceAnalysis, ReferenceMemberType, ReferenceRoot, Region, RegionId, RegionInterface, RegionSlot, Type,
-    TypeError, Typed, Value, ValueId,
+    ReferenceAccessOperation, ReferenceAnalysis, ReferenceMemberType, ReferenceRoot, ReferenceTransform, Region, RegionId,
+    RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -2391,6 +2393,7 @@ where
             To<<D as Domain>::Constant> = OT::To<<D as Domain>::Constant>,
         >,
     <D as Domain>::Operation: From<RematerializeOperation<<D as Domain>::Type>>
+        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <D::Type as ReferenceMemberType>::Referent>>
         + ResidualZeroProvider<D::Type, Operation = D::Operation>
         + OperationProvider<
             D::Type,
@@ -2398,7 +2401,11 @@ where
             Operation = D::Operation,
         > + OperationProvider<
             D::Type,
-            ReferenceAddUpdateOperation<<D::Type as ReferenceMemberType>::Referent, D::Type>,
+            ReferenceAddUpdateOperation<
+                <D::Type as ReferenceMemberType>::Referent,
+                D::Type,
+                <D::Operation as ReferenceAccessOperation>::Transform,
+            >,
             Operation = D::Operation,
         > + From<AddOperation<D::Type>>
         + TransposableOperation<<D as Domain>::Constant, <D as Domain>::Operation>
@@ -2486,9 +2493,9 @@ where
         // `from_program_residual` returns `None` and they are never saved — the backward program always receives the
         // region inputs and recomputes everything else, exactly as before. A policy rejection aborts the whole
         // transformation. A reference-typed residual is a primal reference threaded by identity and is never saved: an
-        // external root's residual is the input reference itself (or a view of it), which the derived programs reach
-        // through the region inputs, while a local root's residual would carry a handle out of the recomputed
-        // lifecycle and is rejected.
+        // external root's residual is the input reference itself, which the derived programs reach through the region
+        // inputs, while a local root's residual would carry a handle out of the recomputed lifecycle and is rejected.
+        // Access views never produce reference values, so their dynamic bindings are ordinary residuals.
         let mut decisions = Vec::with_capacity(residual_count);
         for index in 0..residual_count {
             if residual_types[index].is_reference() {
@@ -2672,8 +2679,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceDischarge,
-        ArrayType, DataType, Dimension, Memory, Shape, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
+        Dimension, Memory, Shape, ShardingDimension,
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
@@ -4884,22 +4891,17 @@ mod tests {
 
             fn effects(&self) -> Cow<'_, Effects> {
                 Cow::Owned(match self {
-                    Self::Allocate => Effects::new(
-                        EffectClasses::NONE,
-                        vec![ReferenceEffect::Allocate { output_index: 0 }],
-                        Vec::new(),
-                    )
-                    .unwrap(),
+                    Self::Allocate => {
+                        Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap()
+                    }
                     Self::Mixed => Effects::new(
                         EffectClasses::single(EffectClass::OrderedState),
                         vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::ReadWrite }],
-                        Vec::new(),
                     )
                     .unwrap(),
                     Self::ReadWithRule => Effects::new(
                         EffectClasses::NONE,
                         vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-                        Vec::new(),
                     )
                     .unwrap(),
                     Self::Call => return Cow::Borrowed(Effects::empty()),
@@ -5251,12 +5253,8 @@ mod tests {
         let (_, program) = ReferenceTestContext::trace(|x| function.call(x), reference_test_scalar_type()).unwrap();
         let program = program.to_flat_program();
         assert!(program.entry_region_ref().contains_references_in_closure());
-        let discharged = program
-            .clone()
-            .discharge_references::<ArrayReferenceDischarge>(0)
-            .unwrap()
-            .into_program_without_external_references()
-            .unwrap();
+        let discharged =
+            program.clone().discharge_references(0).unwrap().into_program_without_external_references().unwrap();
         assert!(!discharged.entry_region_ref().contains_references_in_closure());
         assert_eq!(rematerialize_regions(&discharged).len(), 4);
         assert_eq!(
@@ -5274,7 +5272,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            program.to_flat_program().discharge_references::<ArrayReferenceDischarge>(0),
+            program.to_flat_program().discharge_references(0),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "`rematerialize` does not thread external references through discharge, but operand 0 \
                     is a reference; pass reference-free operands or discharge external references first",
@@ -5335,7 +5333,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            program.discharge_references::<ArrayReferenceDischarge>(0),
+            program.discharge_references(0),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "`rematerialize` does not thread external references through discharge, but input 0 of \
                     region 2 is a reference; pass reference-free operands or discharge external references first",

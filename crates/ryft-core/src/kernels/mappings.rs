@@ -8,7 +8,7 @@
 use thiserror::Error;
 
 use crate::arrays::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceView, ArraySliceAxis, ArrayTypeRefinements,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayTypeRefinements,
     DimensionOperation, DimensionValue, MAX_DIMENSION_EXTENT,
 };
 use crate::contexts::EagerContext;
@@ -287,7 +287,7 @@ impl BlockMapping {
             starts.push(start);
             axes.push(ArraySliceAxis::new(start.min(extent), limit.min(extent) - start.min(extent), 1));
         }
-        Ok(BlockWindow { starts, valid_view: ArrayReferenceView::Slice { axes }, requires_mask })
+        Ok(BlockWindow { starts, valid_transform: ArrayReferenceTransform::Slice { axes }, requires_mask })
     }
 }
 
@@ -297,7 +297,7 @@ pub struct BlockWindow {
     /// Original element starts before intersecting with the operand bounds.
     starts: Vec<usize>,
     /// Canonical unit-stride slice containing only valid operand coordinates.
-    valid_view: ArrayReferenceView,
+    valid_transform: ArrayReferenceTransform,
     /// Whether explicit masks are required before using the full logical block.
     requires_mask: bool,
 }
@@ -309,8 +309,8 @@ impl BlockWindow {
     }
 
     /// Returns the canonical view of the valid intersection, which may be empty.
-    pub fn valid_view(&self) -> &ArrayReferenceView {
-        &self.valid_view
+    pub fn valid_transform(&self) -> &ArrayReferenceTransform {
+        &self.valid_transform
     }
 
     /// Returns whether the original logical window extends beyond the operand.
@@ -322,8 +322,8 @@ impl BlockWindow {
     /// nonempty intersections are the same, and partially intersecting windows may overlap. Different ranks are
     /// conservatively reported as possibly overlapping; root identity remains the caller's responsibility.
     pub fn overlap(&self, other: &Self) -> ReferenceViewOverlap {
-        let (ArrayReferenceView::Slice { axes: left }, ArrayReferenceView::Slice { axes: right }) =
-            (&self.valid_view, &other.valid_view)
+        let (ArrayReferenceTransform::Slice { axes: left }, ArrayReferenceTransform::Slice { axes: right }) =
+            (&self.valid_transform, &other.valid_transform)
         else {
             unreachable!("block windows contain canonical slices");
         };
@@ -600,8 +600,8 @@ mod tests {
             let window = mapping.evaluate(&inputs(&mapping, &[coordinate]), &[16]).unwrap();
             assert_eq!(window.starts(), &[coordinate * 4]);
             assert_eq!(
-                window.valid_view(),
-                &ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(coordinate * 4, 4, 1)] },
+                window.valid_transform(),
+                &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(coordinate * 4, 4, 1)] },
             );
             assert!(!window.requires_mask());
         }
@@ -614,13 +614,13 @@ mod tests {
             let window = mapping.evaluate(&inputs(&mapping, &[start]), &[10]).unwrap();
             assert_eq!(window.starts(), &[start]);
             assert_eq!(
-                window.valid_view(),
-                &ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(valid_start, valid_size, 1)] },
+                window.valid_transform(),
+                &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(valid_start, valid_size, 1)] },
             );
             assert!(window.requires_mask());
         }
         let empty = mapping.evaluate(&inputs(&mapping, &[0]), &[0]).unwrap();
-        assert_eq!(empty.valid_view(), &ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 0, 1)] });
+        assert_eq!(empty.valid_transform(), &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 0, 1)] });
     }
 
     #[test]
@@ -676,12 +676,12 @@ mod tests {
         let scalar = BlockMapping::new(identity_program(0), vec![], BoundaryPolicy::InBounds).unwrap();
         let window = scalar.evaluate(&[], &[]).unwrap();
         assert_eq!(window.starts(), &[] as &[usize]);
-        assert_eq!(window.valid_view(), &ArrayReferenceView::Slice { axes: vec![] });
+        assert_eq!(window.valid_transform(), &ArrayReferenceTransform::Slice { axes: vec![] });
         assert!(!window.requires_mask());
         let empty = BlockMapping::new(identity_program(1), vec![0], BoundaryPolicy::InBounds).unwrap();
         assert_eq!(
-            empty.evaluate(&inputs(&empty, &[0]), &[0]).unwrap().valid_view(),
-            &ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 0, 1)] },
+            empty.evaluate(&inputs(&empty, &[0]), &[0]).unwrap().valid_transform(),
+            &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 0, 1)] },
         );
     }
 
@@ -695,8 +695,8 @@ mod tests {
     fn test_block_window_valid_view() {
         let mapping = BlockMapping::new(identity_program(2), vec![4, 8], BoundaryPolicy::Masked).unwrap();
         assert_eq!(
-            mapping.evaluate(&inputs(&mapping, &[2, 4]), &[5, 7]).unwrap().valid_view(),
-            &ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(2, 3, 1), ArraySliceAxis::new(4, 3, 1)] },
+            mapping.evaluate(&inputs(&mapping, &[2, 4]), &[5, 7]).unwrap().valid_transform(),
+            &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(2, 3, 1), ArraySliceAxis::new(4, 3, 1)] },
         );
     }
 

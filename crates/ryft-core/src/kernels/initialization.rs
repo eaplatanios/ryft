@@ -2,8 +2,9 @@
 //!
 //! Writes establish coverage only for their canonical root-relative selections. Branch joins intersect coverage;
 //! loops preserve the zero-body path while including their mandatory first condition. This initial verifier rejects
-//! symbolic views, extensions without checked memory contracts, dynamic launch shapes, and unsupported control flow. Padded parameter
-//! windows admit ordinary reads only through views valid in every invocation; masked accesses use explicit fallbacks.
+//! dynamic views, extensions without checked memory contracts, dynamic launch shapes, and unsupported control flow.
+//! Padded parameter windows admit ordinary reads only through views valid in every invocation; masked accesses use
+//! explicit fallbacks.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -11,7 +12,7 @@ use std::ops::Range;
 use thiserror::Error;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceView, ArrayReferenceViewPath,
+    Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayReferenceTransformPath,
     ArrayType, DataType, Dimension, DimensionValue,
 };
 use crate::kernels::calls::{KernelCallOperation, KernelError};
@@ -21,8 +22,8 @@ use crate::kernels::memory::KernelMemoryError;
 use crate::kernels::operations::{KernelExtension, KernelExtensionMemory, KernelOperation};
 use crate::kernels::validation::{KernelParameterAccess, KernelReferenceSummary, KernelSwapLowering};
 use crate::programs::{
-    Atom, AtomId, InputRegionProvenance, InstructionId, Operation, ProgramError, ReferenceAccessMode, ReferenceEffect,
-    ReferenceRoot, ReferenceType, ReferenceViewOverlap, RegionRef, Typed, ValueId,
+    Atom, AtomId, InstructionId, Operation, ProgramError, ReferenceAccessMode, ReferenceEffect, ReferenceRoot,
+    ReferenceType, ReferenceViewOverlap, RegionRef, Typed, ValueId,
 };
 
 /// A body or launch lacks a definite initialization or disjointness proof.
@@ -89,11 +90,15 @@ pub enum KernelInitializationError {
     #[error("kernel reference {value:?} is not a live allocation")]
     UnavailableReference { value: ValueId },
 
-    /// A reference selection cannot be resolved statically.
-    #[error("kernel initialization cannot prove the selection of reference {value:?}")]
+    /// A reference access selects a view that cannot be resolved statically. Selections are per access site: the same
+    /// root may be statically selected at one access and dynamically at another.
+    #[error("kernel initialization cannot prove the selection of reference input {input_index} at {instruction}")]
     UnknownSelection {
-        /// Reference operand whose view is symbolic or unsupported.
-        value: ValueId,
+        /// Accessing instruction.
+        instruction: InstructionId,
+
+        /// Position of the reference input, whose view is dynamic or unsupported, among the instruction's inputs.
+        input_index: usize,
     },
 
     /// An access reads coordinates not definitely initialized before that instruction.
@@ -265,7 +270,7 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
             let last = mapping.evaluate(&inputs, shape.dimensions())?;
             if mapping.boundary_policy() == BoundaryPolicy::Masked {
-                let ArrayReferenceView::Slice { axes } = last.valid_view() else { unreachable!() };
+                let ArrayReferenceTransform::Slice { axes } = last.valid_transform() else { unreachable!() };
                 valid_shapes.insert(
                     ReferenceRoot::RegionInput { region: region.id(), input_index: parameter },
                     axes.iter().map(|axis| axis.size()).collect::<Vec<_>>(),
@@ -316,7 +321,7 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let window = mapping.evaluate(&inputs, shape.dimensions())?;
-            let ArrayReferenceView::Slice { axes } = window.valid_view() else { unreachable!() };
+            let ArrayReferenceTransform::Slice { axes } = window.valid_transform() else { unreachable!() };
             for (valid, axis) in valid_shape.iter_mut().zip(axes) {
                 *valid = (*valid).min(axis.size());
             }
@@ -353,7 +358,7 @@ where
     }
     for (root, operation, view) in &initialization.unmasked_accesses {
         if let Some(valid_shape) = valid_shapes.get(root) {
-            let ArrayReferenceView::Slice { axes } = view else { unreachable!() };
+            let ArrayReferenceTransform::Slice { axes } = view else { unreachable!() };
             if !axes.iter().any(|axis| axis.size() == 0)
                 && axes.iter().zip(valid_shape).any(|(axis, &valid)| axis.start() + axis.size() > valid)
             {
@@ -368,7 +373,7 @@ where
 /// Canonical accesses reserved until a completion token is consumed.
 struct PendingCopy {
     /// Root, root-relative selection, and declared access mode for each outstanding access.
-    accesses: Vec<(ReferenceRoot, ArrayReferenceView, ReferenceAccessMode)>,
+    accesses: Vec<(ReferenceRoot, ArrayReferenceTransform, ReferenceAccessMode)>,
 }
 
 /// Ordered coverage state, keyed by canonical roots after attachment-specific input substitution.
@@ -380,7 +385,7 @@ struct Initialization<'a> {
     /// Static root array types used to interpret canonical selections.
     types: BTreeMap<ReferenceRoot, ArrayType>,
     /// Ordinary reads and read-write accesses checked against actual launch validity after body initialization.
-    unmasked_accesses: Vec<(ReferenceRoot, &'static str, ArrayReferenceView)>,
+    unmasked_accesses: Vec<(ReferenceRoot, &'static str, ArrayReferenceTransform)>,
     /// Outstanding asynchronous access reservations keyed by their canonical completion allocation.
     pending_copies: BTreeMap<ReferenceRoot, PendingCopy>,
 }
@@ -399,13 +404,13 @@ impl Initialization<'_> {
             }
             if matches!(instruction.operation(), KernelOperation::AsyncCopy(_)) {
                 let (source, source_view) =
-                    self.selection(ValueId::new(region.id(), instruction.inputs()[0]), bindings)?;
+                    self.selection(id, 0, ValueId::new(region.id(), instruction.inputs()[0]), bindings)?;
                 let (destination, destination_view) =
-                    self.selection(ValueId::new(region.id(), instruction.inputs()[1]), bindings)?;
+                    self.selection(id, 1, ValueId::new(region.id(), instruction.inputs()[1]), bindings)?;
                 if source == destination {
-                    let source_path = ArrayReferenceViewPath::<ValueId>::root().with_view(source_view.clone());
+                    let source_path = ArrayReferenceTransformPath::<ValueId>::root().with_transform(source_view.clone());
                     let destination_path =
-                        ArrayReferenceViewPath::<ValueId>::root().with_view(destination_view.clone());
+                        ArrayReferenceTransformPath::<ValueId>::root().with_transform(destination_view.clone());
                     let r#type = ArrayIrType::Reference(ReferenceType::new(self.types[&source].clone()));
                     if source_path.overlap(&destination_path, &r#type) != ReferenceViewOverlap::Disjoint {
                         return Err(KernelInitializationError::OverlappingCopy { instruction: id });
@@ -478,7 +483,7 @@ impl Initialization<'_> {
                         let mut joined = None;
                         for (position, &nested) in instruction.regions().iter().enumerate() {
                             self.states = entering.clone();
-                            let nested_bindings = self.bindings(region, id, position, bindings)?;
+                            let nested_bindings = self.bindings(id, position, bindings);
                             self.region(region.with_id(nested).unwrap(), &nested_bindings)?;
                             joined = Some(match joined {
                                 None => self.states.clone(),
@@ -497,10 +502,10 @@ impl Initialization<'_> {
                         // This is the monotone fixed-point subset: local allocations reset at each region entry,
                         // entering roots never lose initialized elements, and reads are checked before each write.
                         // The zero-iteration path prevents crediting body-only writes after the loop.
-                        let condition_bindings = self.bindings(region, id, 0, bindings)?;
+                        let condition_bindings = self.bindings(id, 0, bindings);
                         self.region(region.with_id(instruction.regions()[0]).unwrap(), &condition_bindings)?;
                         let condition_state = self.states.clone();
-                        let body_bindings = self.bindings(region, id, 1, bindings)?;
+                        let body_bindings = self.bindings(id, 1, bindings);
                         self.region(region.with_id(instruction.regions()[1]).unwrap(), &body_bindings)?;
                         self.states = condition_state;
                     }
@@ -536,7 +541,7 @@ impl Initialization<'_> {
             if mode == ReferenceAccessMode::Read {
                 continue;
             }
-            let ArrayReferenceView::Slice { axes } = view else { unreachable!() };
+            let ArrayReferenceTransform::Slice { axes } = view else { unreachable!() };
             let addressing = ArrayAddressing::new(self.types[&root].clone())?;
             let state = self.states.get_mut(&root).unwrap();
             for range in addressing.ranges(&axes)? {
@@ -579,6 +584,8 @@ impl Initialization<'_> {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let aliases = (0..instruction.outputs().len())
+            .any(|output_index| operation.reference_output_identity_input(output_index).is_some());
         match semantics {
             KernelExtensionMemory::Synchronous => {
                 if !allocations.is_empty() || accesses.iter().any(|(_, mode)| *mode == ReferenceAccessMode::Consume) {
@@ -588,7 +595,7 @@ impl Initialization<'_> {
             }
             KernelExtensionMemory::Allocation { output_index }
             | KernelExtensionMemory::Asynchronous { completion_output_index: output_index } => {
-                if allocations != [output_index] || !effects.reference_aliases().is_empty() {
+                if allocations != [output_index] || aliases {
                     return Err(invalid("classification requires exactly its declared allocation and no aliases"));
                 }
                 let asynchronous = matches!(semantics, KernelExtensionMemory::Asynchronous { .. });
@@ -617,8 +624,13 @@ impl Initialization<'_> {
                     let reservations = accesses
                         .iter()
                         .map(|(input, mode)| {
-                            self.selection(ValueId::new(region.id(), instruction.inputs()[*input]), bindings)
-                                .map(|(root, view)| (root, view, *mode))
+                            self.selection(
+                                id,
+                                *input,
+                                ValueId::new(region.id(), instruction.inputs()[*input]),
+                                bindings,
+                            )
+                            .map(|(root, view)| (root, view, *mode))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     self.pending_copies.insert(root, PendingCopy { accesses: reservations });
@@ -627,16 +639,13 @@ impl Initialization<'_> {
                 self.states.insert(root, Vec::new());
             }
             KernelExtensionMemory::Commit { completion_input_index: input_index } => {
-                if !allocations.is_empty()
-                    || accesses != [(input_index, ReferenceAccessMode::Read)]
-                    || !effects.reference_aliases().is_empty()
-                {
+                if !allocations.is_empty() || accesses != [(input_index, ReferenceAccessMode::Read)] || aliases {
                     return Err(invalid("commit must read exactly its declared completion reference"));
                 }
                 let input =
                     instruction.inputs().get(input_index).ok_or_else(|| invalid("completion input is absent"))?;
                 let value = ValueId::new(region.id(), *input);
-                let (root, _) = self.selection(value, bindings)?;
+                let (root, _) = self.selection(id, input_index, value, bindings)?;
                 if !matches!(root, ReferenceRoot::Allocation { instruction, .. } if instruction.region() == region.id())
                     || !self.pending_copies.contains_key(&root)
                 {
@@ -645,15 +654,12 @@ impl Initialization<'_> {
             }
             KernelExtensionMemory::Wait { completion_input_index: input_index }
             | KernelExtensionMemory::Release { input_index } => {
-                if !allocations.is_empty()
-                    || accesses != [(input_index, ReferenceAccessMode::Consume)]
-                    || !effects.reference_aliases().is_empty()
-                {
+                if !allocations.is_empty() || accesses != [(input_index, ReferenceAccessMode::Consume)] || aliases {
                     return Err(invalid("wait or release must consume exactly its declared reference"));
                 }
                 let input = instruction.inputs().get(input_index).ok_or_else(|| invalid("consumed input is absent"))?;
                 let value = ValueId::new(region.id(), *input);
-                let (root, _) = self.selection(value, bindings)?;
+                let (root, _) = self.selection(id, input_index, value, bindings)?;
                 if !matches!(root, ReferenceRoot::Allocation { instruction, .. } if instruction.region() == region.id())
                 {
                     return Err(invalid("wait or release requires an allocation from the current region"));
@@ -708,14 +714,14 @@ impl Initialization<'_> {
             .filter(|access| access.instruction() == id)
         {
             let value = ValueId::new(region.id(), instruction.inputs()[access.input_index()]);
-            let (root, view) = self.selection(value, bindings)?;
+            let (root, view) = self.selection(id, access.input_index(), value, bindings)?;
             if self.pending_copies.contains_key(&root) {
                 return Err(KernelInitializationError::InvalidCopyTokenAccess { instruction: id, token: root });
             }
             if mask.is_none() && access.mode() != ReferenceAccessMode::Write {
                 self.unmasked_accesses.push((root, instruction.operation().name(), view.clone()));
             }
-            let ArrayReferenceView::Slice { axes } = view else { unreachable!() };
+            let ArrayReferenceTransform::Slice { axes } = view else { unreachable!() };
             let addressing = ArrayAddressing::new(self.types[&root].clone())?;
             let writes_only = access.mode() == ReferenceAccessMode::Write
                 || self.references.swap_lowering(id) == Some(KernelSwapLowering::Store);
@@ -749,17 +755,19 @@ impl Initialization<'_> {
     /// Resolves a reference operand to its canonical allocation and root-relative static view.
     fn selection(
         &self,
+        instruction: InstructionId,
+        input_index: usize,
         value: ValueId,
         bindings: &BTreeMap<ReferenceRoot, ReferenceRoot>,
-    ) -> Result<(ReferenceRoot, ArrayReferenceView), KernelInitializationError> {
+    ) -> Result<(ReferenceRoot, ArrayReferenceTransform), KernelInitializationError> {
         let original = self.references.analysis().analysis().root_of(value).unwrap();
         let root = bindings.get(&original).copied().unwrap_or(original);
         let view = self
             .references
-            .view(value)
+            .path(instruction, input_index)
             .unwrap()
             .root_slice(&self.types[&root])
-            .ok_or(KernelInitializationError::UnknownSelection { value })?;
+            .ok_or(KernelInitializationError::UnknownSelection { instruction, input_index })?;
         if !self.states.contains_key(&root) {
             return Err(KernelInitializationError::UnavailableReference { value });
         }
@@ -778,7 +786,7 @@ impl Initialization<'_> {
             for (reserved_root, view, reserved_mode) in &copy.accesses {
                 let conflicts = *reserved_mode != ReferenceAccessMode::Read || mode != ReferenceAccessMode::Read;
                 if *reserved_root == root && conflicts {
-                    let ArrayReferenceView::Slice { axes } = view else { unreachable!() };
+                    let ArrayReferenceTransform::Slice { axes } = view else { unreachable!() };
                     let addressing = ArrayAddressing::new(self.types[&root].clone())?;
                     if addressing.ranges(axes)?.any(|reserved| {
                         let reserved = reserved.elements();
@@ -793,14 +801,12 @@ impl Initialization<'_> {
     }
 
     /// Resolves only this particular region attachment, keeping shared regions' callers independent.
-    fn bindings<Extension: KernelExtension>(
+    fn bindings(
         &self,
-        region: RegionRef<'_, ArrayIrValue<Array>, KernelOperation<Extension>>,
         instruction: InstructionId,
         region_index: usize,
         parent: &BTreeMap<ReferenceRoot, ReferenceRoot>,
-    ) -> Result<BTreeMap<ReferenceRoot, ReferenceRoot>, KernelInitializationError> {
-        let attaching = &region.instructions()[instruction.index()];
+    ) -> BTreeMap<ReferenceRoot, ReferenceRoot> {
         self.references
             .analysis()
             .analysis()
@@ -809,23 +815,7 @@ impl Initialization<'_> {
             .filter(|binding| binding.instruction() == instruction && binding.region_index() == region_index)
             .map(|binding| {
                 let local = self.references.analysis().analysis().root_of(binding.input()).unwrap();
-                let ReferenceRoot::RegionInput { input_index, .. } = local else { unreachable!() };
-                let InputRegionProvenance::Input { index } =
-                    attaching.operation().input_region_provenance(region_index, input_index)
-                else {
-                    return Err(KernelInitializationError::UnknownSelection { value: binding.input() });
-                };
-                let source = attaching
-                    .inputs()
-                    .get(index)
-                    .map(|&atom| ValueId::new(region.id(), atom))
-                    .ok_or(KernelInitializationError::UnknownSelection { value: binding.input() })?;
-                // Root substitution alone does not carry a narrowed caller view. Until path-prefix composition is
-                // modeled here, reject it instead of crediting writes to a different part of the parent root.
-                if !self.references.view(source).is_some_and(|path| path.is_root()) {
-                    return Err(KernelInitializationError::UnknownSelection { value: source });
-                }
-                Ok((local, parent.get(&binding.root()).copied().unwrap_or(binding.root())))
+                (local, parent.get(&binding.root()).copied().unwrap_or(binding.root()))
             })
             .collect()
     }
@@ -893,7 +883,9 @@ fn intersect_states(
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayOperation, DataType, DimensionBounds, DimensionType};
+    use crate::arrays::{
+        ArrayOperation, ArrayReferenceTransformIndex, ArraySliceAxis, DataType, DimensionBounds, DimensionType,
+    };
     use crate::contexts::EagerContext;
     use crate::kernels::calls::KernelParameter;
     use crate::kernels::grids::{Grid, GridDimension, GridExecution};
@@ -903,15 +895,13 @@ mod tests {
         WaitOperation,
     };
     use crate::kernels::operations::NoKernelExtension;
-    use crate::kernels::validation::KernelValidationError;
     use crate::operations::{
         ConditionOperation, DimensionAddOperation, DimensionMulOperation, NotOperation, ReferenceAddUpdateOperation,
-        ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceWriteOperation,
-        WhileOperation,
+        ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSwapOperation, ReferenceWriteOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{FlatProgram, ProgramBuilder, ReferenceAnalysisError, ReferenceViewAnalysisError};
+    use crate::programs::{FlatProgram, ProgramBuilder, ReferenceAccessDescriptor, ReferenceAccessOperation};
 
     use super::*;
 
@@ -975,32 +965,38 @@ mod tests {
                     vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }]
                 }
             };
-            std::borrow::Cow::Owned(Effects::new(EffectClasses::NONE, declarations, vec![]).unwrap())
+            std::borrow::Cow::Owned(Effects::new(EffectClasses::NONE, declarations).unwrap())
         }
     }
 
-    impl crate::programs::ReferenceViewOperation for MemoryExtension {
-        type View = ArrayReferenceView;
+    impl ReferenceAccessOperation for MemoryExtension {
+        type Transform = ArrayReferenceTransform;
 
-        fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
-            None
+        fn base_input_count(&self) -> usize {
+            match self {
+                Self::Allocate(_) | Self::MisclassifiedAllocation | Self::Synchronous => 0,
+                Self::Update => 3,
+                Self::Commit | Self::Wait | Self::Release => 1,
+            }
         }
 
-        fn validate_reference_view(
-            view: &ArrayReferenceView,
-            source: &ArrayIrType,
-            target: &ArrayIrType,
-        ) -> Result<(), crate::programs::ReferenceViewValidationError> {
-            view.validate(source, target)
+        fn reference_access_descriptor(&self, input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+            self.effects().accesses().any(|(index, _)| index == input_index).then(|| {
+                let count = self.base_input_count();
+                ReferenceAccessDescriptor::new(&[], count..count)
+            })
         }
 
-        fn reapply_reference_view<C: crate::contexts::Context<Type = ArrayIrType, Operation = Self>>(
-            _context: &C,
-            _view: &ArrayReferenceView,
-            _source: C::Value,
-            _symbols: &[C::Value],
-        ) -> Result<C::Value, ProgramError> {
-            Err(ProgramError::UnsupportedOperation { message: "test extension has no views".to_owned() })
+        fn with_reference_access_transforms(
+            &self,
+            input_index: usize,
+            transforms: Vec<Self::Transform>,
+        ) -> Result<Self, ProgramError> {
+            if transforms.is_empty() && self.reference_access_descriptor(input_index).is_some() {
+                Ok(self.clone())
+            } else {
+                Err(ProgramError::UnsupportedOperation { message: "test extension has no views".to_owned() })
+            }
         }
     }
 
@@ -1260,17 +1256,18 @@ mod tests {
         let reference = builder.add_input(call.parameters()[0].body_type());
         builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
         if let Some(partial) = selection {
-            let (reference, value) = if partial {
-                let view = builder
-                    .add_instruction(ReferenceIndexOperation::new(0, 0), vec![], vec![reference], None)
-                    .unwrap()[0];
-                (view, ArrayIrValue::Array(Array::scalar(0i32).unwrap()))
+            let transforms = if partial {
+                vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]
             } else {
-                (reference, contents(call))
+                vec![]
             };
-            let value = builder.add_constant(value);
+            let value = builder.add_constant(if partial {
+                ArrayIrValue::Array(Array::scalar(0i32).unwrap())
+            } else {
+                contents(call)
+            });
             builder
-                .add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, value], None)
+                .add_instruction(ReferenceWriteOperation::new().with_transforms(transforms), vec![], vec![reference, value], None)
                 .unwrap();
         }
         builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()
@@ -1287,7 +1284,7 @@ mod tests {
         builder.add_input(call.coordinate_types()[0].clone().into());
         let contents = builder.add_constant(contents(call));
         let source = builder.add_instruction(ReferenceNewOperation::new(), vec![], vec![contents], None).unwrap()[0];
-        let token = builder.add_instruction(AsyncCopyOperation, vec![], vec![source, output], None).unwrap()[0];
+        let token = builder.add_instruction(AsyncCopyOperation::new(), vec![], vec![source, output], None).unwrap()[0];
         if let Some((source_access, write)) = access {
             let reference = if source_access { source } else { output };
             if write {
@@ -1331,10 +1328,9 @@ mod tests {
         builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
         let value = builder.add_constant(ArrayIrValue::Array(Array::scalar(0i32).unwrap()));
         for index in 0..2 {
-            let view = builder
-                .add_instruction(ReferenceIndexOperation::new(0, index), vec![], vec![reference], None)
-                .unwrap()[0];
-            builder.add_instruction(ReferenceSwapOperation::new(), vec![], vec![view, value], None).unwrap();
+            let operation = ReferenceSwapOperation::new()
+                .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(index) }]);
+            builder.add_instruction(operation, vec![], vec![reference, value], None).unwrap();
         }
         let body = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
@@ -1447,12 +1443,14 @@ mod tests {
             .unwrap();
         let mut loop_body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
         let reference = loop_body.add_input(reference_type.clone());
-        let last = loop_body
-            .add_instruction(ReferenceIndexOperation::new(0, 1), vec![], vec![reference], None)
-            .unwrap()[0];
-        loop_body.add_instruction(ReferenceReadOperation::new(), vec![], vec![last], None).unwrap();
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }];
+        loop_body
+            .add_instruction(ReferenceReadOperation::new().with_transforms(transforms.clone()), vec![], vec![reference], None)
+            .unwrap();
         let update = loop_body.add_constant(ArrayIrValue::Array(Array::scalar(1i32).unwrap()));
-        loop_body.add_instruction(ReferenceWriteOperation::new(), vec![], vec![last, update], None).unwrap();
+        loop_body
+            .add_instruction(ReferenceWriteOperation::new().with_transforms(transforms), vec![], vec![reference, update], None)
+            .unwrap();
         let loop_body = loop_body
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![reference],
@@ -1491,7 +1489,7 @@ mod tests {
         assert_eq!(
             validate_kernel_initialization(region, &call, 64),
             Err(KernelInitializationError::UninitializedRead {
-                instruction: InstructionId::new(loop_body, 1),
+                instruction: InstructionId::new(loop_body, 0),
                 root: ReferenceRoot::Allocation { instruction: InstructionId::new(region.id(), 0), output_index: 0 },
             })
         );
@@ -1551,54 +1549,85 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_kernel_initialization_rejects_forwarded_slices() {
+    fn test_validate_kernel_initialization_folded_region_accesses() {
         let call = call(4, 4, 1);
-        let branch_call = self::call(2, 2, 1);
         let mut branch = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
-        let reference = branch.add_input(branch_call.parameters()[0].body_type());
-        branch.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
-        let value = branch.add_constant(contents(&branch_call));
+        let reference = branch.add_input(call.parameters()[0].body_type());
+        let value = branch.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::I32, [2])));
         branch
-            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, value], None)
+            .add_instruction(
+                ReferenceWriteOperation::new()
+                    .with_transforms(vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(2, 2, 1)] }]),
+                vec![],
+                vec![reference, value],
+                None,
+            )
             .unwrap();
         let branch = branch
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
             .unwrap();
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
         let reference = builder.add_input(call.parameters()[0].body_type());
-        let coordinate = builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
-        let view = builder
+        builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
+        let value = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![3i32, 7]).unwrap()));
+        builder
             .add_instruction(
-                ReferenceSliceOperation::new(vec![crate::arrays::ArraySliceAxis::new(2, 2, 1)]),
+                ReferenceWriteOperation::new()
+                    .with_transforms(vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 2, 1)] }]),
                 vec![],
-                vec![reference],
+                vec![reference, value],
                 None,
             )
-            .unwrap()[0];
+            .unwrap();
         let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
         let branch = builder.import_region(branch.entry_region_ref());
         builder
             .add_instruction(
                 ArrayIrOperation::Condition(ConditionOperation::new()),
                 vec![branch, branch],
-                vec![predicate, view, coordinate],
+                vec![predicate, reference, value],
                 None,
             )
             .unwrap();
         let body = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
             .unwrap();
+        assert_eq!(validate_kernel_initialization(body.entry_region_ref(), &call, 64), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_kernel_initialization_rejects_dynamic_view_steps() {
+        // Selections are resolved per access site: the same parameter root is statically selected by the first
+        // write, so only the dynamically indexed second write is reported.
+        let call = call(2, 2, 1);
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = builder.add_input(call.parameters()[0].body_type());
+        builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
+        let value = builder.add_constant(ArrayIrValue::Array(Array::scalar(0i32).unwrap()));
+        let index = builder.add_constant(ArrayIrValue::Array(Array::scalar(1i64).unwrap()));
+        let operation = ReferenceWriteOperation::new()
+            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]);
+        builder.add_instruction(operation, vec![], vec![reference, value], None).unwrap();
+        let operation = ReferenceWriteOperation::new()
+            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }]);
+        builder.add_instruction(operation, vec![], vec![reference, value, index], None).unwrap();
+        let body = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
+            .unwrap();
+        let result = validate_kernel_initialization(body.entry_region_ref(), &call, 64);
         assert_eq!(
-            validate_kernel_initialization(body.entry_region_ref(), &call, 64),
-            Err(KernelInitializationError::Call(KernelError::Validation(KernelValidationError::Analysis(
-                ReferenceViewAnalysisError::Analysis(ReferenceAnalysisError::ViewCrossesRegionBoundary {
-                    operation: "condition",
-                    instruction: InstructionId::new(body.entry_region_ref().id(), 1),
-                    region_index: 0,
-                    boundary: "input",
-                    index: 0,
-                }),
-            )))),
+            result,
+            Err(KernelInitializationError::UnknownSelection {
+                instruction: InstructionId::new(body.entry_region_ref().id(), 1),
+                input_index: 0,
+            }),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!(
+                "kernel initialization cannot prove the selection of reference input 0 at {}",
+                InstructionId::new(body.entry_region_ref().id(), 1),
+            ),
         );
     }
 
@@ -1651,11 +1680,18 @@ mod tests {
                 )
                 .unwrap()[0];
             if partial {
-                let view = builder
-                    .add_instruction(ReferenceIndexOperation::new(0, 0), vec![], vec![scratch], None)
-                    .unwrap()[0];
                 let value = builder.add_constant(ArrayIrValue::Array(Array::scalar(0i32).unwrap()));
-                builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![view, value], None).unwrap();
+                builder
+                    .add_instruction(
+                        ReferenceWriteOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                            axis: 0,
+                            index: ArrayReferenceTransformIndex::Static(0),
+                        }]),
+                        vec![],
+                        vec![scratch, value],
+                        None,
+                    )
+                    .unwrap();
             }
             let value =
                 builder.add_instruction(ReferenceFreezeOperation::new(), vec![], vec![scratch], None).unwrap()[0];
@@ -1667,7 +1703,7 @@ mod tests {
             assert_eq!(
                 validate_kernel_initialization(body.entry_region_ref(), &call, 64),
                 Err(KernelInitializationError::UninitializedRead {
-                    instruction: InstructionId::new(region, if partial { 3 } else { 1 }),
+                    instruction: InstructionId::new(region, if partial { 2 } else { 1 }),
                     root: ReferenceRoot::Allocation { instruction: InstructionId::new(region, 0), output_index: 0 },
                 }),
             );
@@ -1723,7 +1759,7 @@ mod tests {
         builder.add_input(call.coordinate_types()[0].clone().into());
         let contents = builder.add_constant(contents(&call));
         let source = builder.add_instruction(ReferenceNewOperation::new(), vec![], vec![contents], None).unwrap()[0];
-        let token = builder.add_instruction(AsyncCopyOperation, vec![], vec![source, source], None).unwrap()[0];
+        let token = builder.add_instruction(AsyncCopyOperation::new(), vec![], vec![source, source], None).unwrap()[0];
         builder.add_instruction(WaitOperation, vec![], vec![token], None).unwrap();
         builder
             .add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, contents], None)
@@ -1746,7 +1782,7 @@ mod tests {
         builder.add_input(call.coordinate_types()[0].clone().into());
         let contents = builder.add_constant(contents(&call));
         let source = builder.add_instruction(ReferenceNewOperation::new(), vec![], vec![contents], None).unwrap()[0];
-        let token = builder.add_instruction(AsyncCopyOperation, vec![], vec![source, output], None).unwrap()[0];
+        let token = builder.add_instruction(AsyncCopyOperation::new(), vec![], vec![source, output], None).unwrap()[0];
         builder.add_instruction(ReferenceFreezeOperation::new(), vec![], vec![token], None).unwrap();
         let body = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
@@ -1801,7 +1837,8 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let token = builder.add_instruction(AsyncCopyOperation, vec![], vec![source, destination], None).unwrap()[0];
+        let token =
+            builder.add_instruction(AsyncCopyOperation::new(), vec![], vec![source, destination], None).unwrap()[0];
         builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![destination], None).unwrap();
         builder.add_instruction(WaitOperation, vec![], vec![token], None).unwrap();
         builder
@@ -1829,7 +1866,7 @@ mod tests {
         let contents = builder.add_constant(contents(&call));
         let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
         let source = builder.add_instruction(ReferenceNewOperation::new(), vec![], vec![contents], None).unwrap()[0];
-        let token = builder.add_instruction(AsyncCopyOperation, vec![], vec![source, output], None).unwrap()[0];
+        let token = builder.add_instruction(AsyncCopyOperation::new(), vec![], vec![source, output], None).unwrap()[0];
         let first = builder.import_region(body(&call, Some(false)).entry_region_ref());
         let second = builder.import_region(body(&call, Some(false)).entry_region_ref());
         builder
@@ -1859,38 +1896,25 @@ mod tests {
         builder.add_input(call.coordinate_types()[0].clone().into());
         let contents = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![1i32, 2, 3, 4, 5, 6]).unwrap()));
         let root = builder.add_instruction(ReferenceNewOperation::new(), vec![], vec![contents], None).unwrap()[0];
-        let source = builder
+        let source = vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 2, 1)] }];
+        let destination = vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(2, 2, 1)] }];
+        let independent = vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(4, 2, 1)] }];
+        let token = builder
             .add_instruction(
-                ReferenceSliceOperation::new(vec![crate::arrays::ArraySliceAxis::new(0, 2, 1)]),
+                AsyncCopyOperation::new().with_source_transforms(source).with_destination_transforms(destination.clone()),
                 vec![],
-                vec![root],
+                vec![root, root],
                 None,
             )
             .unwrap()[0];
-        let destination = builder
-            .add_instruction(
-                ReferenceSliceOperation::new(vec![crate::arrays::ArraySliceAxis::new(2, 2, 1)]),
-                vec![],
-                vec![root],
-                None,
-            )
-            .unwrap()[0];
-        let independent = builder
-            .add_instruction(
-                ReferenceSliceOperation::new(vec![crate::arrays::ArraySliceAxis::new(4, 2, 1)]),
-                vec![],
-                vec![root],
-                None,
-            )
-            .unwrap()[0];
-        let token = builder.add_instruction(AsyncCopyOperation, vec![], vec![source, destination], None).unwrap()[0];
         let update = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![7i32, 8]).unwrap()));
         builder
-            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![independent, update], None)
+            .add_instruction(ReferenceWriteOperation::new().with_transforms(independent), vec![], vec![root, update], None)
             .unwrap();
         builder.add_instruction(WaitOperation, vec![], vec![token], None).unwrap();
-        let copied =
-            builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![destination], None).unwrap()[0];
+        let copied = builder
+            .add_instruction(ReferenceReadOperation::new().with_transforms(destination), vec![], vec![root], None)
+            .unwrap()[0];
         builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, copied], None).unwrap();
         let body = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
@@ -1899,7 +1923,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_kernel_initialization_masked_views() {
+    fn test_validate_kernel_initialization_masked_transforms() {
         let call = call(2, 2, 1);
         for read_start in [0, 1] {
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
@@ -1915,27 +1939,21 @@ mod tests {
                     None,
                 )
                 .unwrap()[0];
-            let written = builder
-                .add_instruction(
-                    ReferenceSliceOperation::new(vec![crate::arrays::ArraySliceAxis::new(1, 2, 1)]),
-                    vec![],
-                    vec![scratch],
-                    None,
-                )
-                .unwrap()[0];
+            let written = vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] }];
             let value = builder.add_constant(contents(&call));
             let mask = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![true, false]).unwrap()));
-            builder.add_instruction(MaskedStoreOperation, vec![], vec![written, value, mask], None).unwrap();
-            let read = builder
+            builder
                 .add_instruction(
-                    ReferenceSliceOperation::new(vec![crate::arrays::ArraySliceAxis::new(read_start, 2, 1)]),
+                    MaskedStoreOperation::new().with_transforms(written),
                     vec![],
-                    vec![scratch],
+                    vec![scratch, value, mask],
                     None,
                 )
+                .unwrap();
+            let read = vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(read_start, 2, 1)] }];
+            let loaded = builder
+                .add_instruction(MaskedLoadOperation::new().with_transforms(read), vec![], vec![scratch, mask, value], None)
                 .unwrap()[0];
-            let loaded =
-                builder.add_instruction(MaskedLoadOperation, vec![], vec![read, mask, value], None).unwrap()[0];
             builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, loaded], None).unwrap();
             let body = builder
                 .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
@@ -1945,7 +1963,7 @@ mod tests {
                 Ok(())
             } else {
                 Err(KernelInitializationError::UninitializedRead {
-                    instruction: InstructionId::new(region, 4),
+                    instruction: InstructionId::new(region, 2),
                     root: ReferenceRoot::Allocation { instruction: InstructionId::new(region, 0), output_index: 0 },
                 })
             };
@@ -1965,10 +1983,12 @@ mod tests {
                 let mask = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![true, complete]).unwrap()));
                 if swap {
                     builder
-                        .add_instruction(MaskedSwapOperation, vec![], vec![output, value, mask, value], None)
+                        .add_instruction(MaskedSwapOperation::new(), vec![], vec![output, value, mask, value], None)
                         .unwrap();
                 } else {
-                    builder.add_instruction(MaskedStoreOperation, vec![], vec![output, value, mask], None).unwrap();
+                    builder
+                        .add_instruction(MaskedStoreOperation::new(), vec![], vec![output, value, mask], None)
+                        .unwrap();
                 }
                 let body = builder
                     .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
@@ -1996,7 +2016,9 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        builder.add_instruction(MaskedStoreOperation, vec![], vec![output, value, mask], None).unwrap();
+        builder
+            .add_instruction(MaskedStoreOperation::new(), vec![], vec![output, value, mask], None)
+            .unwrap();
         let body = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
             .unwrap();
@@ -2025,7 +2047,9 @@ mod tests {
                 .unwrap()[0];
             let value = builder.add_constant(contents(&call));
             let mask = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![true, complete]).unwrap()));
-            builder.add_instruction(MaskedStoreOperation, vec![], vec![scratch, value, mask], None).unwrap();
+            builder
+                .add_instruction(MaskedStoreOperation::new(), vec![], vec![scratch, value, mask], None)
+                .unwrap();
             let false_mask = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![false, false]).unwrap()));
             let unknown = builder
                 .add_instruction(
@@ -2035,8 +2059,9 @@ mod tests {
                     None,
                 )
                 .unwrap()[0];
-            let loaded =
-                builder.add_instruction(MaskedLoadOperation, vec![], vec![scratch, unknown, value], None).unwrap()[0];
+            let loaded = builder
+                .add_instruction(MaskedLoadOperation::new(), vec![], vec![scratch, unknown, value], None)
+                .unwrap()[0];
             builder.add_instruction(ReferenceWriteOperation::new(), vec![], vec![output, loaded], None).unwrap();
             let body = builder
                 .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
@@ -2076,13 +2101,9 @@ mod tests {
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
             let reference = builder.add_input(call.parameters()[0].body_type());
             builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
-            let reference = if let Some(index) = selected {
-                builder
-                    .add_instruction(ReferenceIndexOperation::new(0, index), vec![], vec![reference], None)
-                    .unwrap()[0]
-            } else {
-                reference
-            };
+            let transforms = selected
+                .map(|index| vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(index) }])
+                .unwrap_or_default();
             if swap {
                 let value = builder.add_constant(if selected.is_some() {
                     ArrayIrValue::Array(Array::scalar(0i32).unwrap())
@@ -2090,10 +2111,17 @@ mod tests {
                     contents(&call)
                 });
                 builder
-                    .add_instruction(ReferenceSwapOperation::new(), vec![], vec![reference, value], None)
+                    .add_instruction(
+                        ReferenceSwapOperation::new().with_transforms(transforms),
+                        vec![],
+                        vec![reference, value],
+                        None,
+                    )
                     .unwrap();
             } else {
-                builder.add_instruction(ReferenceReadOperation::new(), vec![], vec![reference], None).unwrap();
+                builder
+                    .add_instruction(ReferenceReadOperation::new().with_transforms(transforms), vec![], vec![reference], None)
+                    .unwrap();
             }
             let body = builder
                 .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
@@ -2132,7 +2160,9 @@ mod tests {
         builder.add_input(ArrayIrType::Dimension(call.coordinate_types()[0].clone()));
         let mask = builder.add_constant(ArrayIrValue::Array(Array::vector(vec![true, true]).unwrap()));
         let other = builder.add_constant(contents(&call));
-        builder.add_instruction(MaskedLoadOperation, vec![], vec![reference, mask, other], None).unwrap();
+        builder
+            .add_instruction(MaskedLoadOperation::new(), vec![], vec![reference, mask, other], None)
+            .unwrap();
         let body = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
             .unwrap();

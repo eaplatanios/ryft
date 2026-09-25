@@ -45,7 +45,7 @@ use crate::programs::{
     CalleeRegionDriver, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationProjection,
     OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRoot, ReferenceViewOperation, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
+    ReferenceRoot, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
     discharge_positional_region_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -1475,7 +1475,7 @@ where
 impl<V, O> ConditionTransposition<V, O> for ArrayIrType
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceViewOperation<Type = ArrayIrType>
+    O: Operation<Type = ArrayIrType>
         + ResidualZeroProvider<ArrayIrType, Operation = O>
         + From<ConditionOperation<V>>
         + From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
@@ -1692,11 +1692,12 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
-        ArrayReference, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
-    use crate::captures::{CaptureReference, ClosedProgram};
+    use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
@@ -1704,18 +1705,18 @@ mod tests {
     use crate::operations::assertions::AssertionError;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
-    use crate::operations::control_flow::tests::CountingBatchingDriver;
+    use crate::operations::control_flow::tests::{CountingBatchingDriver, resolve_captures};
     use crate::operations::references::{
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
     };
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, ProgramBuilder, ReferenceDischargeResult,
-        ReferenceSource, ReferenceType, TypeError,
+        EffectClasses, EmptyRegionDriver, ExternalReferenceBinding, ProgramBuilder, ReferenceAccessOperation,
+        ReferenceDischargeResult, ReferenceSource, ReferenceType, TypeError, ViewedReference,
     };
-    use crate::tracing::{DomainTracingContext, Trace, TracingContext};
+    use crate::tracing::{DomainTracingContext, NestedTracingContext, Trace, Tracer, TracingContext};
 
     use super::*;
 
@@ -2312,6 +2313,115 @@ mod tests {
                 vec![Array::scalar(false).unwrap()],
             ),
             vec![Array::scalar(8.0_f32).unwrap(), Array::scalar(5.0_f32).unwrap()],
+        );
+    }
+
+    #[test]
+    fn test_condition_transposition_reference_access_with_enclosing_binding() {
+        // Each branch accesses the reference root through a dynamic index that the enclosing region computes. The
+        // transposed branches apply the same view to the root's cotangent reference, so the index reaches them as an
+        // ordinary known input recomputed in the enclosing region: `add_update(r[i], x)` transposes into
+        // `x̄ = read(r̄[i])`, and `write(r[i], x)` additionally clears `r̄[i]`.
+        let vector_reference_type = ArrayIrType::from(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
+        let element_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let true_branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(vector_reference_type.clone());
+            let value = builder.add_input(scalar_type.clone());
+            let index = builder.add_input(index_type.clone());
+            builder
+                .add_instruction(
+                    ReferenceAddUpdateOperation::new().with_transforms(element_transforms.clone()),
+                    Vec::new(),
+                    vec![reference, value, index],
+                    None,
+                )
+                .unwrap();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
+                .unwrap()
+        };
+        let false_branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(vector_reference_type.clone());
+            let value = builder.add_input(scalar_type.clone());
+            let index = builder.add_input(index_type.clone());
+            builder
+                .add_instruction(
+                    ReferenceWriteOperation::new().with_transforms(element_transforms),
+                    Vec::new(),
+                    vec![reference, value, index],
+                    None,
+                )
+                .unwrap();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let reference = builder.add_input(vector_reference_type.clone());
+        let value = builder.add_input(scalar_type.clone());
+        let offset = builder.add_input(index_type);
+        let one = builder.add_constant(TestValue::Array(Array::scalar(1i32).unwrap()));
+        let index = builder.add_instruction(AddOperation::new(), Vec::new(), vec![offset, one], None).unwrap()[0];
+        builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference, value, index],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 4], Vec::<Placeholder>::new())
+            .unwrap();
+
+        let transposed = program.transpose_with_respect_to(&[1, 2], &[]).unwrap();
+        assert_eq!(transposed.output_types(), vec![vector_reference_type, scalar_type]);
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[3]>, %1:bool[], %2:i32[] .
+                let %3:i32[] = const 1
+                    %4:i32[] = add %2 %3
+                    %5:ref<f32[3]>, %6:f32[] = condition %1 %0 %4 [
+                        true={
+                            lambda %0:ref<f32[3]>, %1:i32[] .
+                            let %2:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %0 %1
+                            in (%0, %2)
+                        },
+                        false={
+                            lambda %0:ref<f32[3]>, %1:i32[] .
+                            let %2:f32[] = zero [type=f32[]]
+                                %3:f32[] = reference_swap [transforms=[dynamic_index(axis=0)]] %0 %2 %1
+                            in (%0, %3)
+                        },
+                    ]
+                in (%0, %6)"},
+        );
+        assert_eq!(
+            run_transposed_with_destinations(
+                &transposed,
+                vec![],
+                vec![Array::vector(vec![1f32, 2., 3.]).unwrap()],
+                vec![Array::scalar(true).unwrap(), Array::scalar(0i32).unwrap()],
+            ),
+            vec![Array::scalar(2f32).unwrap(), Array::vector(vec![1f32, 2., 3.]).unwrap()],
+        );
+        assert_eq!(
+            run_transposed_with_destinations(
+                &transposed,
+                vec![],
+                vec![Array::vector(vec![1f32, 2., 3.]).unwrap()],
+                vec![Array::scalar(false).unwrap(), Array::scalar(1i32).unwrap()],
+            ),
+            vec![Array::scalar(3f32).unwrap(), Array::vector(vec![1f32, 2., 0.]).unwrap()],
         );
     }
 
@@ -3297,6 +3407,98 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_captures_a_lazy_view_root_and_dynamic_binding() {
+        // Branches traced as nested regions read a captured root through lazy views. The views are not program values,
+        // so the regions capture only the root and the dynamic index, and each access re-applies its own view.
+        let context = TracingContext::<DischargeCapture, TestOperation, TestValue>::new();
+        let predicate = context.input(ArrayType::scalar(DataType::Boolean).into());
+        let offset = context.input(ArrayType::scalar(DataType::F32).into());
+        let root = TestValue::Reference(ArrayReference::new(Array::vector(vec![10f32, 20., 30.]).unwrap()));
+        let index = TestValue::Array(Array::scalar(2i32).unwrap());
+        let (_, then_branch) = NestedTracingContext::trace(
+            context.clone(),
+            |inputs: Vec<Tracer<_>>| {
+                let branch = inputs[0].context().clone();
+                let root = StagingContext::constant(&branch, branch.capture(root.clone())?);
+                let index = StagingContext::constant(&branch, branch.capture(index.clone())?);
+                let element = ViewedReference::new(root)?.dynamic_index(0, &index)?.read()?;
+                Ok(branch
+                    .bind(AddOperation::<ArrayIrType>::new(), Vec::new(), &[element, inputs[0].clone()])?
+                    .remove(0))
+            },
+            vec![ArrayType::scalar(DataType::F32).into()],
+        )
+        .unwrap();
+        let (_, else_branch) = NestedTracingContext::trace(
+            context.clone(),
+            |inputs: Vec<Tracer<_>>| Ok(inputs[0].clone()),
+            vec![ArrayType::scalar(DataType::F32).into()],
+        )
+        .unwrap();
+        let access = &then_branch.instructions()[0];
+        assert_eq!(access.inputs().len(), 2);
+        assert_eq!(access.operation().reference_access_descriptor(0).unwrap().bindings(), 1..2);
+        assert_eq!(
+            access.operation().reference_access_descriptor(0).unwrap().transforms(),
+            &[ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }],
+        );
+        let output = context
+            .bind(ConditionOperation::<TestValue>::new(), vec![then_branch, else_branch], &[predicate, offset])
+            .unwrap()
+            .remove(0);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let captures = context.captures().borrow().clone();
+        assert_eq!(captures, vec![root, index.clone()]);
+
+        // Discharge threads the captured root's state as an array input while the index capture stays an ordinary
+        // value, and executing the result selects the element the captured index names when the branch runs.
+        let closed = ClosedProgram::new(program, captures.clone()).unwrap();
+        let discharged = closed.discharge_references().unwrap();
+        assert_eq!(
+            discharged.program().input_types(),
+            vec![
+                ArrayType::new_static(DataType::F32, [3]).into(),
+                ArrayType::scalar(DataType::I32).into(),
+                ArrayType::scalar(DataType::Boolean).into(),
+                ArrayType::scalar(DataType::F32).into(),
+            ],
+        );
+        assert!(!discharged.program().entry_region_ref().contains_reference_accesses_in_closure());
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Capture { index: 0 });
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        let executable = resolve_captures(discharged.program(), &captures);
+        let state = TestValue::Array(Array::vector(vec![10f32, 20., 30.]).unwrap());
+        assert_eq!(
+            executable.interpret(vec![
+                state.clone(),
+                index.clone(),
+                TestValue::Array(Array::scalar(true).unwrap()),
+                TestValue::Array(Array::scalar(0.5f32).unwrap()),
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar(30.5f32).unwrap())]),
+        );
+        assert_eq!(
+            executable.interpret(vec![
+                state,
+                index,
+                TestValue::Array(Array::scalar(false).unwrap()),
+                TestValue::Array(Array::scalar(0.5f32).unwrap()),
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar(0.5f32).unwrap())]),
+        );
+    }
+
+    #[test]
     fn test_condition_reference_discharge_resolves_reference_captures_inside_condition_regions() {
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let mut branch_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
@@ -3419,18 +3621,23 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_reference_discharge_recreates_view_inside_region() {
+    fn test_condition_reference_discharge_preserves_folded_path_inside_region() {
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
         let reference_type = ReferenceType::new(vector_type.clone());
         let true_branch = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let reference = builder.add_input(reference_type.clone().into());
-            let view = builder
-                .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
-                .unwrap()[0];
             let update = builder.add_constant(TestValue::Array(Array::scalar::<f32>(1.0).unwrap()));
             builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, update], None)
+                .add_instruction(
+                    ReferenceAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                        axis: 0,
+                        index: ArrayReferenceTransformIndex::Static(1),
+                    }]),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
                 .unwrap();
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])

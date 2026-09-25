@@ -26,9 +26,9 @@ use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, BindingRegionDriver, EffectClass, EmptyRegionDriver, Instruction, InstructionId, MaybeZero,
     Operation, OperationProjection, OperationProvider, Program, ProgramBuilder, ProgramError, Provenance,
-    ReferenceAccessMode, ReferenceAliasKind, ReferenceAnalysis, ReferenceBoundary, ReferenceMemberType, ReferenceRoot,
-    ReferenceType, ReferenceViewOperation, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
-    Type, TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceAnalysis, ReferenceBoundary, ReferenceMemberType,
+    ReferenceRoot, ReferenceTransform, ReferenceType, Region, RegionDriver, RegionRef, RegionReplayMappings,
+    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -543,23 +543,12 @@ impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O> {
 /// These sources remain available after value cotangents are extracted, so a later rule can still construct a
 /// correctly shaped zero even when its type alone does not supply the required dimensions.
 ///
-/// # Reference Views
+/// # Reference Accesses
 ///
-/// A rule accessing a primal reference view receives the corresponding view of its root's cotangent buffer. For
-/// example, a primal slice `r[i..i + k]` needs a slice of the cotangent buffer using the same indices. The context
-/// obtains the view path from the region's [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis) and reapplies its
-/// steps through [`ReferenceViewOperation::reapply_reference_view`]. The root buffer is allocated if needed, and
-/// reconstruction validates the resulting view's type. An unavailable view path is rejected rather than treated
-/// as the whole root.
-///
-/// The reverse sweep materializes known primal values into the transposed program before a rule needs them. The context
-/// retains these values separately from the generated cotangent views: two slices may share the same dynamic index
-/// while requiring distinct views. Generated views are cached by the primal view's [`ValueId`] so repeated accesses
-/// reuse staged operations; consuming a root accumulator removes its cached views.
-///
-/// Generic view reconstruction requires known values for the view's symbols. It rejects a symbol bound to a linear
-/// value or a value supplied locally by a nested region. An enclosing operation's transpose rule must handle these
-/// views when supporting that case; the context cannot reconstruct them from the region's non-reference operands alone.
+/// A reference rule receives its root's cotangent buffer. The operation carries its own view path and ordinary dynamic
+/// bindings, and applies that same selection to the cotangent access. The reverse sweep materializes known primal
+/// inputs before invoking the rule, so dynamic indices follow the ordinary residual-value path. Root buffers are shared
+/// by all accesses and allocated only when needed.
 ///
 /// # Nested Regions
 ///
@@ -589,22 +578,6 @@ pub struct TranspositionContext<V: Value, O: Operation<Type = V::Type>> {
     /// Root accumulators accessed by [`Self::cotangent_accumulator_reference`]. Refer to that function for more information.
     reference_accumulators: BTreeMap<ReferenceRoot, CotangentReferenceAccumulator<Tracer<TracingContext<V, O>>>>,
 
-    /// Generated cotangent reference views, keyed by the primal view's [`ValueId`]. Repeated accesses to one primal
-    /// view reuse the same staged cotangent view. For example, a primal slice `r[i..i + k]` maps to the corresponding
-    /// slice of `r`'s cotangent buffer. [`Self::cotangent_view_coordinates`] supplies the preserved primal values
-    /// needed to construct that slice; this map retains the resulting reference, not those values. Entries are removed
-    /// when the root accumulator is consumed. Refer to [`Self::cotangent_reference_view`] for information on view
-    /// reconstruction.
-    cotangent_views: BTreeMap<ValueId, Tracer<TracingContext<V, O>>>,
-
-    /// Known primal values used by view symbols, materialized in the transposed program and keyed by their primal
-    /// [`ValueId`]. These are the original indices used to reconstruct cotangent views, not derivatives of the indices.
-    /// For example, two primal slices that use the same dynamic index `i` share its entry here, while each slice has
-    /// its own entry in [`Self::cotangent_views`]. A single view can also require several values. The maps thus have
-    /// different keys and are not paired entry by entry. This map supplies values during reconstruction, and
-    /// [`Self::cotangent_views`] caches the resulting references.
-    cotangent_view_coordinates: BTreeMap<ValueId, Tracer<TracingContext<V, O>>>,
-
     /// Values supplying runtime dimensions, returned by [`Self::dimension_sources`].
     /// Refer to that function for more information.
     dimension_sources: Vec<Tracer<TracingContext<V, O>>>,
@@ -622,8 +595,6 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
             cotangent_storage: Vec::new(),
             reference_analysis: None,
             reference_accumulators: BTreeMap::new(),
-            cotangent_views: BTreeMap::new(),
-            cotangent_view_coordinates: BTreeMap::new(),
             dimension_sources: Vec::new(),
         }
     }
@@ -753,11 +724,10 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     }
 
     /// Returns the cotangent reference of the reference-typed operand at `input_index` of the current instruction,
-    /// allocating the root's accumulator with a zero initial value first when it is still unallocated, and viewing it
-    /// as the operand views its root. This is the accumulator lookup for rules that must produce a cotangent reference
-    /// regardless of prior use: the transposes of the `reference_read` and `reference_freeze` operations accumulate a
-    /// live output cotangent into it, `reference_swap` swaps a live output cotangent into it, and structured operations
-    /// thread it into their nested regions.
+    /// allocating the root's accumulator with a zero initial value first when it is still unallocated. This lookup
+    /// serves rules that must produce a cotangent reference regardless of prior use: the transposes of the
+    /// `reference_read` and `reference_freeze` operations accumulate a live output cotangent into it, `reference_swap`
+    /// swaps a live output cotangent into it, and structured operations thread it into their nested regions.
     ///
     /// # Parameters
     ///
@@ -767,8 +737,8 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the operand is not a linear reference operand of the transposed region, when its view
-    /// path cannot be reapplied, or when the accumulator cannot be allocated.
+    /// Returns an error when the input is not a linear reference input of the transposed region, when its
+    /// cotangent type disagrees with the root accumulator, or when the accumulator cannot be allocated.
     pub fn cotangent_reference<D: TranspositionDriver<V, O>>(
         &mut self,
         driver: &D,
@@ -776,8 +746,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
     where
         V::Type: DifferentiableType + ReferenceMemberType,
-        O: ReferenceViewOperation
-            + ResidualZeroProvider<V::Type, Operation = O>
+        O: ResidualZeroProvider<V::Type, Operation = O>
             + OperationProvider<
                 V::Type,
                 ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
@@ -790,12 +759,12 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
             let accumulator = self.reference_accumulators.get_mut(&root).unwrap();
             accumulator.allocate_in(&self.parent, &self.dimension_sources)?.clone()
         };
-        self.cotangent_reference_view(driver, value, root_reference)
+        self.checked_cotangent_reference(driver, value, root_reference)
     }
 
-    /// Returns the existing cotangent reference for the reference operand at `input_index`, applying the same view
-    /// as the primal operand. Returns [`None`] if the root's cotangent buffer has not been allocated; in that case,
-    /// its state cotangent is represented by a symbolic zero, and this function leaves it that way.
+    /// Returns the existing root cotangent reference for the reference input at `input_index`. Returns [`None`] if
+    /// the root's cotangent buffer has not been allocated; in that case, its state cotangent is represented by a
+    /// symbolic zero, and this function leaves it that way.
     ///
     /// For example, when transposing `reference_write(r, x)`, the current cotangent of `r` determines the contribution
     /// to `x`'s cotangent. If `r` has no allocated cotangent buffer, that contribution is zero. The rule can return
@@ -811,8 +780,8 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the operand is not a linear reference operand of the transposed region or when its view
-    /// path cannot be reapplied.
+    /// Returns an error when the input is not a linear reference input of the transposed region or when its
+    /// cotangent type disagrees with the root accumulator.
     pub fn cotangent_reference_if_allocated<D: TranspositionDriver<V, O>>(
         &mut self,
         driver: &D,
@@ -820,11 +789,10 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ) -> Result<Option<Tracer<TracingContext<V, O>>>, DifferentiationError>
     where
         V::Type: DifferentiableType,
-        O: ReferenceViewOperation,
     {
         let (_, value, root) = self.reference_input(driver, input_index)?;
         match self.cotangent_accumulator_reference(root).cloned() {
-            Some(root_reference) => self.cotangent_reference_view(driver, value, root_reference).map(Some),
+            Some(root_reference) => self.checked_cotangent_reference(driver, value, root_reference).map(Some),
             None => Ok(None),
         }
     }
@@ -882,81 +850,29 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         self.reference_accumulators.get(&root).and_then(CotangentReferenceAccumulator::reference)
     }
 
-    /// Returns the cotangent reference viewed exactly as the primal `value` views its root, deriving it from the root's
-    /// cotangent reference `root_reference` through the region's retained view overlay on first use, and validating
-    /// that the result has the operand's cotangent type in either case. Derived views are cached by primal value so
-    /// repeated accesses reuse the same staged slice or index operations. The cache holds emitted cotangent values;
-    /// the reference analysis holds descriptions of the original primal views.
-    fn cotangent_reference_view<D: TranspositionDriver<V, O>>(
-        &mut self,
+    /// Checks that the root accumulator has the primal input's cotangent type before a rule accesses it.
+    fn checked_cotangent_reference<D: TranspositionDriver<V, O>>(
+        &self,
         driver: &D,
         value: ValueId,
-        root_reference: Tracer<TracingContext<V, O>>,
+        reference: Tracer<TracingContext<V, O>>,
     ) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
     where
         V::Type: DifferentiableType,
-        O: ReferenceViewOperation,
     {
-        if let Some(viewed) = self.cotangent_views.get(&value) {
-            return Ok(viewed.clone());
-        }
-
-        // `reference_input` established that the driver supplies a source instruction and the context has reference
-        // analysis. The driver's source scope stays fixed throughout this invocation. A root skips the view overlay.
+        // `reference_input` established the source scope and its root accumulator.
         let (region, _, _) = driver.scope()?.unwrap();
-        let is_view = self.reference_analysis.as_ref().unwrap().is_view(value);
         let expected = region.atoms()[value.atom().index()].r#type().cotangent()?;
-        let mut view = root_reference;
-        if is_view {
-            // Each reapplied step stages the view operation over the current transformed source, whose type inference
-            // validates the description against that source.
-            let overlay = region.reference_view_analysis(0).map_err(ProgramError::from)?;
-            let path = overlay.path(value).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "the view overlay of the transposed region has no path for reference operand {value:?}"
-                ))
-            })?;
-
-            view = path.steps().iter().try_fold(view, |view, step| {
-                // Each binding names a known primal value, including the explicit index input of a `scan` operation's
-                // body. The reverse sweep materialized these values before invoking the rule, so no loop-specific
-                // symbol resolution, for example, is needed to reconstruct the cotangent view.
-                let symbols = step
-                    .bindings()
-                    .iter()
-                    .map(|id| {
-                        self.cotangent_view_coordinates.get(id).cloned().ok_or_else(|| {
-                            ProgramError::UnsupportedOperation {
-                                message: format!(
-                                    "the index {id:?} of reference operand {value:?} is a linear value, so the view \
-                                     cannot be reapplied to the operand's cotangent reference",
-                                ),
-                            }
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                O::reapply_reference_view(&self.parent, step.view(), view, symbols.as_slice())
-            })?;
-        }
-
-        // The final type is checked against the operand's cotangent type for roots and views alike, so that a view
-        // chain that composes but lands elsewhere, or a root accumulator whose type disagrees with the operand it is
-        // handed out for, is rejected rather than accumulated into.
-        if view.r#type().as_ref() != &expected {
+        if reference.r#type().as_ref() != &expected {
             return Err(ProgramError::MalformedProgram(format!(
                 "the cotangent reference of reference operand {:?} has type {} but the operand's cotangent type is {}",
                 value,
-                view.r#type().as_ref(),
+                reference.r#type().as_ref(),
                 expected,
             ))
             .into());
         }
-
-        if is_view {
-            self.cotangent_views.insert(value, view.clone());
-        }
-
-        Ok(view)
+        Ok(reference)
     }
 
     /// Resolves the [`CotangentDestinations`] of the instruction whose operands are described by `inputs`. A linear
@@ -984,8 +900,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ) -> Result<CotangentDestinations<Tracer<TracingContext<V, O>>>, DifferentiationError>
     where
         V::Type: DifferentiableType + ReferenceMemberType,
-        O: ReferenceViewOperation
-            + ResidualZeroProvider<V::Type, Operation = O>
+        O: ResidualZeroProvider<V::Type, Operation = O>
             + OperationProvider<
                 V::Type,
                 ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
@@ -1102,8 +1017,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
 
     /// Removes the [`CotangentReferenceAccumulator`] for the reference allocated by the `output_index`-th output of the
     /// current instruction and returns its buffer, if allocated. Returns [`None`] if the accumulator was unallocated or
-    /// has already been removed. Cached cotangent views of that reference are removed as well. This function stages no
-    /// operations and does not freeze or read the returned buffer.
+    /// has already been removed. This function stages no operations and does not freeze or read the returned buffer.
     ///
     /// This extracts reference state storage, independently of the value sums extracted by [`Self::take_cotangents`].
     /// For example, when transposing `r = reference_new(x)`, the rule takes `r`'s cotangent buffer here, freezes it
@@ -1112,12 +1026,12 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ///
     /// Taking the buffer marks the end of the reverse sweep for this allocation: its allocation precedes every use
     /// in forward order, so all of those uses have already been transposed. The context no longer retains the root's
-    /// accumulator or derived views after this function returns.
+    /// accumulator after this function returns.
     ///
     /// # Parameters
     ///
     ///   - `driver`: [`TranspositionDriver`] identifying the current source instruction. It must identify the
-    ///     instruction that allocated the reference and not a later instruction that reads, updates, or views it.
+    ///     instruction that allocated the reference and not a later instruction that reads or updates it.
     ///   - `output_index`: Position of the allocating output among that instruction's outputs. This identifies a
     ///     reference allocation, not a value cotangent handle or an operand index.
     ///
@@ -1146,9 +1060,6 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
             .into());
         }
         let root = ReferenceRoot::Allocation { instruction: id, output_index };
-        if let Some(analysis) = &self.reference_analysis {
-            self.cotangent_views.retain(|value, _| analysis.root_of(*value) != Some(root));
-        }
         Ok(match self.reference_accumulators.remove(&root) {
             Some(CotangentReferenceAccumulator::Allocated { reference }) => Some(reference),
             Some(CotangentReferenceAccumulator::Unallocated { .. }) | None => None,
@@ -1342,13 +1253,19 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
                 C::Type,
                 ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
                 Operation = C::Operation,
             > + OperationProvider<
                 C::Type,
-                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                ReferenceAddUpdateOperation<
+                    <C::Type as ReferenceMemberType>::Referent,
+                    C::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
     {
@@ -1401,9 +1318,15 @@ impl<
                 C::Type,
                 ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
                 Operation = C::Operation,
+            > + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
             > + OperationProvider<
                 C::Type,
-                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                ReferenceAddUpdateOperation<
+                    <C::Type as ReferenceMemberType>::Referent,
+                    C::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
     {
@@ -1427,13 +1350,19 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
                 C::Type,
                 ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
                 Operation = C::Operation,
             > + OperationProvider<
                 C::Type,
-                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                ReferenceAddUpdateOperation<
+                    <C::Type as ReferenceMemberType>::Referent,
+                    C::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
     {
@@ -1500,13 +1429,19 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
                 C::Type,
                 ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
                 Operation = C::Operation,
             > + OperationProvider<
                 C::Type,
-                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                ReferenceAddUpdateOperation<
+                    <C::Type as ReferenceMemberType>::Referent,
+                    C::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
         Input::Family: ParameterizedFamily<CotangentDestination<C::Value>> + ParameterizedFamily<Option<C::Value>>,
@@ -1534,13 +1469,19 @@ impl<
                 Operation = C::Operation,
             > + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
                 C::Type,
                 ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
                 Operation = C::Operation,
             > + OperationProvider<
                 C::Type,
-                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                ReferenceAddUpdateOperation<
+                    <C::Type as ReferenceMemberType>::Referent,
+                    C::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
     {
@@ -1589,13 +1530,19 @@ impl<
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
                 C::Type,
                 ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
                 Operation = C::Operation,
             > + OperationProvider<
                 C::Type,
-                ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+                ReferenceAddUpdateOperation<
+                    <C::Type as ReferenceMemberType>::Referent,
+                    C::Type,
+                    <C::Operation as ReferenceAccessOperation>::Transform,
+                >,
                 Operation = C::Operation,
             > + From<AddOperation<C::Type>>,
     {
@@ -1893,13 +1840,18 @@ impl<
     V: Value<Type: DifferentiableType + ReferenceMemberType>,
     O: TransposableOperation<V, O>
         + ResidualZeroProvider<V::Type, Operation = O>
+        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>>
         + OperationProvider<
             V::Type,
             ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
             Operation = O,
         > + OperationProvider<
             V::Type,
-            ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+            ReferenceAddUpdateOperation<
+                <V::Type as ReferenceMemberType>::Referent,
+                V::Type,
+                <O as ReferenceAccessOperation>::Transform,
+            >,
             Operation = O,
         > + From<AddOperation<V::Type>>,
 > TranspositionDriver<V, O> for RecursiveTranspositionDriver<'_, V, O>
@@ -2126,9 +2078,17 @@ impl<
     V: Value<Type = T>,
     O: TransposableOperation<V, O>
         + ResidualZeroProvider<T, Operation = O>
+        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <T as ReferenceMemberType>::Referent>>
         + OperationProvider<T, ReferenceNewOperation<<T as ReferenceMemberType>::Referent, T>, Operation = O>
-        + OperationProvider<T, ReferenceAddUpdateOperation<<T as ReferenceMemberType>::Referent, T>, Operation = O>
-        + From<AddOperation<T>>,
+        + OperationProvider<
+            T,
+            ReferenceAddUpdateOperation<
+                <T as ReferenceMemberType>::Referent,
+                T,
+                <O as ReferenceAccessOperation>::Transform,
+            >,
+            Operation = O,
+        > + From<AddOperation<T>>,
 > RegionRef<'_, V, O>
 {
     /// Transposes this borrowed linear _pushforward_ [`Region`] into its reverse-mode _pullback_ with respect to
@@ -2424,27 +2384,17 @@ impl<
 
         // A reference-typed output either forwards an input root, whose state cotangent lives in that input's
         // accumulator, or escapes a local allocation, which cannot be pulled back because its later uses are unknown
-        // to the program. A derived view at the boundary is rejected as well, because its cotangent would have to be
-        // a view of a root cotangent that the boundary does not expose. The analysis handle is shared with the reverse
-        // walk below, which consults it for state liveness.
+        // to the program. The analysis handle is shared with the reverse walk below, which consults it for state
+        // liveness.
         let analysis = context.reference_analysis().cloned();
         if let Some(analysis) = &analysis {
-            for (output_index, (output, root)) in self.output_ids().iter().zip(analysis.output_roots()).enumerate() {
+            for (output_index, root) in analysis.output_roots().iter().enumerate() {
                 match root {
                     Some(ReferenceRoot::Allocation { .. }) => {
                         return Err(ProgramError::UnsupportedOperation {
                             message: format!(
                                 "output {output_index} is a reference allocated inside the transposed program and \
                                  cannot be pulled back because its later uses are unknown to the program",
-                            ),
-                        }
-                        .into());
-                    }
-                    Some(ReferenceRoot::RegionInput { .. }) if analysis.is_view(ValueId::new(self.id(), *output)) => {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: format!(
-                                "output {output_index} is a derived view of a reference and cannot be transposed; \
-                                 return the viewed reference and apply the view outside the transposed program",
                             ),
                         }
                         .into());
@@ -2528,8 +2478,10 @@ impl<
                                 ),
                             })?;
                         let reference_type = T::from(ReferenceType::new(referent.clone()));
-                        let update =
-                            O::provide(ReferenceAddUpdateOperation::new(), &[&reference_type, &cotangent_type])?;
+                        let update = O::provide(
+                            ReferenceAddUpdateOperation::<_, _, <O as ReferenceAccessOperation>::Transform>::new(),
+                            &[&reference_type, &cotangent_type],
+                        )?;
                         let reference = context.input(reference_type);
                         let handle = &atom_accumulators[input.index()];
                         let slot = &mut context.cotangent_storage[handle.storage_index];
@@ -2783,55 +2735,6 @@ impl<
                 );
             }
 
-            // Walk each operand's alias chain to find the values needed to reconstruct its cotangent view.
-            // The view descriptions bind symbols to non-reference inputs of the view-creating instructions.
-            if let Some(analysis) = &analysis {
-                for operand in instruction.inputs() {
-                    let mut value = ValueId::new(self.id(), *operand);
-                    while let Some(edge) = analysis.alias(value) {
-                        // Views created outside this region have no local symbol operands. The enclosing operation's
-                        // transpose rule must handle those boundary views, including ones with region-local values.
-                        if edge.kind() == ReferenceAliasKind::View && edge.instruction().region() == self.id() {
-                            for coordinate in self.instructions()[edge.instruction().index()].inputs() {
-                                let id = ValueId::new(self.id(), *coordinate);
-                                let r#type = self.atoms()[coordinate.index()].r#type();
-
-                                // Several views can share a symbol. Reuse its staged value, and exclude the
-                                // source reference itself from the candidate values.
-                                if r#type.is_reference() || context.cotangent_view_coordinates.contains_key(&id) {
-                                    continue;
-                                }
-
-                                // View symbols must resolve to known primal values. Skip linear values here;
-                                // view reconstruction rejects them if a view actually requires them.
-                                if *linear
-                                    .get(coordinate.index())
-                                    .ok_or(ProgramError::UnboundAtomId { id: *coordinate })?
-                                {
-                                    continue;
-                                }
-
-                                let atom = materialize_known(
-                                    *self,
-                                    instruction_by_output.as_slice(),
-                                    linear.as_slice(),
-                                    &region_mappings,
-                                    &builder,
-                                    known_map.as_mut_slice(),
-                                    materialization_state.as_mut_slice(),
-                                    *coordinate,
-                                )?;
-
-                                context
-                                    .cotangent_view_coordinates
-                                    .insert(id, context.tracer(atom, Some(r#type.into_owned())));
-                            }
-                        }
-                        value = edge.source();
-                    }
-                }
-            }
-
             let operand_accumulators = instruction
                 .inputs()
                 .iter()
@@ -2942,9 +2845,17 @@ where
     V: Value<Type = T>,
     O: TransposableOperation<V, O>
         + ResidualZeroProvider<T, Operation = O>
+        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <T as ReferenceMemberType>::Referent>>
         + OperationProvider<T, ReferenceNewOperation<<T as ReferenceMemberType>::Referent, T>, Operation = O>
-        + OperationProvider<T, ReferenceAddUpdateOperation<<T as ReferenceMemberType>::Referent, T>, Operation = O>
-        + From<AddOperation<T>>,
+        + OperationProvider<
+            T,
+            ReferenceAddUpdateOperation<
+                <T as ReferenceMemberType>::Referent,
+                T,
+                <O as ReferenceAccessOperation>::Transform,
+            >,
+            Operation = O,
+        > + From<AddOperation<T>>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -3179,13 +3090,19 @@ pub trait ReverseModeDifferentiate:
                        + DifferentiableOperation<PartialEvaluationContext<Self>>
                        + TransposableOperation<Self::Constant, Self::Operation>
                        + ResidualZeroProvider<Self::Type, Operation = Self::Operation>
-                       + OperationProvider<
+                       + ReferenceAccessOperation<
+            Transform: ReferenceTransform<Referent = <Self::Type as ReferenceMemberType>::Referent>,
+        > + OperationProvider<
             Self::Type,
             ReferenceNewOperation<<Self::Type as ReferenceMemberType>::Referent, Self::Type>,
             Operation = Self::Operation,
         > + OperationProvider<
             Self::Type,
-            ReferenceAddUpdateOperation<<Self::Type as ReferenceMemberType>::Referent, Self::Type>,
+            ReferenceAddUpdateOperation<
+                <Self::Type as ReferenceMemberType>::Referent,
+                Self::Type,
+                <Self::Operation as ReferenceAccessOperation>::Transform,
+            >,
             Operation = Self::Operation,
         > + From<AddOperation<Self::Type>>,
     >
@@ -3268,13 +3185,18 @@ impl<C: ForwardModeDifferentiate + Context<Type: ReferenceMemberType>> ReverseMo
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
         + ResidualZeroProvider<C::Type, Operation = C::Operation>
+        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>>
         + OperationProvider<
             C::Type,
             ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
             Operation = C::Operation,
         > + OperationProvider<
             C::Type,
-            ReferenceAddUpdateOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
+            ReferenceAddUpdateOperation<
+                <C::Type as ReferenceMemberType>::Referent,
+                C::Type,
+                <C::Operation as ReferenceAccessOperation>::Transform,
+            >,
             Operation = C::Operation,
         > + From<AddOperation<C::Type>>
 {
@@ -3772,8 +3694,8 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
-        Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -3782,16 +3704,16 @@ pub(crate) mod tests {
     use crate::macros::{check_count, check_types};
     use crate::operations::{
         AddOperation, ConditionOperation, Constant, MulOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
-        ReferenceWrite, ReferenceWriteOperation, Sin, ZeroOperation,
+        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+        ReferenceWriteOperation, Sin, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        AtomId, Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, Operation, Program, ProgramBuilder,
-        ProgramError, ProvenanceScope, ReferenceError, ReferenceType, RegionInterface, RegionSlot, TypeError, Typed,
-        Value,
+        AtomId, Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, NoReferenceTransform, NoReferent,
+        Operation, Program, ProgramBuilder, ProgramError, ProvenanceScope, ReferenceAccessDescriptor, ReferenceError,
+        ReferenceType, RegionInterface, RegionSlot, TypeError, Typed, Value,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::{
@@ -3942,6 +3864,29 @@ pub(crate) mod tests {
                 Self::Zero(zero) => zero.render(formatter, indentation),
                 _ => formatter.write_str(self.name()),
             }
+        }
+    }
+
+    impl ReferenceAccessOperation for TestLinearOperation {
+        type Transform = NoReferenceTransform<NoReferent, ArrayType>;
+
+        fn base_input_count(&self) -> usize {
+            0
+        }
+
+        fn reference_access_descriptor(
+            &self,
+            _input_index: usize,
+        ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+            None
+        }
+
+        fn with_reference_access_transforms(
+            &self,
+            _input_index: usize,
+            _views: Vec<Self::Transform>,
+        ) -> Result<Self, ProgramError> {
+            Err(ProgramError::MalformedProgram("test linear operations have no reference inputs".to_owned()))
         }
     }
 
@@ -4965,7 +4910,9 @@ pub(crate) mod tests {
     fn test_pullback_apply_with_destinations() {
         // `f(r, x) = { add_update(r, x); read(r) }` over a live reference. Under an `Ignore` destination the pullback
         // accumulates through an internal cotangent reference and returns `x̄ = ȳ` at the `Return` leaf only.
-        fn function<V: ReferenceAddUpdate + ReferenceRead>((reference, x): (V, V)) -> Result<V, ProgramError> {
+        fn function<V: ReferenceAddUpdate<ArrayReferenceTransform> + ReferenceRead<ArrayReferenceTransform>>(
+            (reference, x): (V, V),
+        ) -> Result<V, ProgramError> {
             reference.add_update(&x)?;
             reference.read()
         }
@@ -5260,7 +5207,9 @@ pub(crate) mod tests {
         // `f(r, x) = { write(r, x); read(r) }` under a `Reference` destination whose initial contents are a nonzero
         // post-state cotangent: the read accumulates `ȳ` into the destination, and the write hands the accumulated
         // `5 + ȳ` to `x̄` and leaves the destination holding the zero pre-state cotangent.
-        fn write_then_read<V: ReferenceWrite + ReferenceRead>((reference, x): (V, V)) -> Result<V, ProgramError> {
+        fn write_then_read<V: ReferenceWrite<ArrayReferenceTransform> + ReferenceRead<ArrayReferenceTransform>>(
+            (reference, x): (V, V),
+        ) -> Result<V, ProgramError> {
             reference.write(&x)?;
             reference.read()
         }
@@ -5287,7 +5236,7 @@ pub(crate) mod tests {
         assert_eq!(destination.read(), Ok(Array::scalar(0.0_f32).unwrap()));
 
         // `y = swap(r, x)` swaps `ȳ` into the destination and hands the previous post-state cotangent to `x̄`.
-        fn swap<V: ReferenceSwap<V, V>>((reference, x): (V, V)) -> Result<V, ProgramError> {
+        fn swap<V: ReferenceSwap<ArrayReferenceTransform>>((reference, x): (V, V)) -> Result<V, ProgramError> {
             reference.swap(&x)
         }
         let reference = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
@@ -6832,11 +6781,15 @@ pub(crate) mod tests {
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let reference = builder.add_input(vector_reference_type.clone());
         let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
-        let view = builder
-            .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
-            .unwrap()[0];
+        let element_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, value], None)
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(element_transforms),
+                Vec::new(),
+                vec![reference, value],
+                None,
+            )
             .unwrap();
         let program = builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
@@ -6857,7 +6810,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|instruction| instruction.operation().name())
                 .collect::<Vec<_>>(),
-            vec!["reference_index", "reference_read"],
+            vec!["reference_read"],
         );
         assert_eq!(
             run_transposed_with_destinations(

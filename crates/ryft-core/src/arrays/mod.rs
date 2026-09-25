@@ -36,8 +36,9 @@ pub use operations::{
     DimensionOperations, DimensionTracingContext,
 };
 pub use references::{
-    ArrayReference, ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceView, ArrayReferenceViewError,
-    ArrayReferenceViewIndex, ArrayReferenceViewOperation, ArrayReferenceViewPath,
+    ArrayReference, ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceTransform,
+    ArrayReferenceTransformIndex, ArrayReferenceTransformOperation, ArrayReferenceTransformPath,
+    ArrayReferenceViewError,
 };
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,

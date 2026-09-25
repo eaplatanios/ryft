@@ -5152,9 +5152,6 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         }
         XlaOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
         XlaOperation::ReferenceNew(_)
-        | XlaOperation::ReferenceIndex(_)
-        | XlaOperation::ReferenceDynamicIndex(_)
-        | XlaOperation::ReferenceSlice(_)
         | XlaOperation::ReferenceRead(_)
         | XlaOperation::ReferenceWrite(_)
         | XlaOperation::ReferenceSwap(_)
@@ -6258,26 +6255,26 @@ mod tests {
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
-        AddOperation, AndOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayOperation, ArraySliceAxis,
-        Assert, AssertOperation, Atan2Operation, BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver,
-        CaptureReference, CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
-        CompiledFunctionDispatcher, ConcatenateOperation, ConditionOperation, ConstantOperation,
-        ConvertElementTypeOperation, CotangentDestinationKind, CumulativeLogSumExpOperation, CumulativeMaxOperation,
-        CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, Dimension,
-        DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation,
-        DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
-        DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
-        DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
-        DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather,
-        GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization,
-        MulOperation, NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation,
-        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
-        ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter, ScatterDimensionNumbers,
-        ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding, ShardingDimension, SliceOperation,
-        StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation, batch,
-        try_jit_with_options,
+        AddOperation, AndOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayOperation, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArraySliceAxis, Assert, AssertOperation, Atan2Operation, BatchAxis,
+        BatchableOperation, BatchingContext, CalleeRegionDriver, CaptureReference, CompareOperation,
+        ComparisonDirection, CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher,
+        ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
+        CotangentDestinationKind, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
+        CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, Dimension, DimensionAddOperation,
+        DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
+        DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
+        DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
+        DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
+        DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers,
+        GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
+        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
+        ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter,
+        ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding,
+        ShardingDimension, SliceOperation, StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation,
+        ZeroOperation, batch, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -12686,7 +12683,7 @@ mod tests {
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         assert_eq!(
             pullback.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["reference_slice", "reference_add_update"],
+            vec!["reference_add_update"],
         );
 
         // Discharge reads only the selected buffer entries, adds the seed, and writes that slice back. The lowered
@@ -12702,7 +12699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_lowering_discharges_local_index_and_slice_reference_views() {
+    fn test_xla_lowering_discharges_local_index_and_slice_reference_transforms() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -12717,32 +12714,34 @@ mod tests {
         let update = builder.add_input(pair_type.into());
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let indexed = builder
-            .add_instruction(ReferenceIndexOperation::new(0, 3), Vec::new(), vec![reference], None)
-            .unwrap()[0];
-        let indexed_snapshot =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![indexed], None).unwrap()[0];
-        let outer = builder
+        let indexed_snapshot = builder
             .add_instruction(
-                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 3, 1)]),
+                ReferenceReadOperation::new()
+                    .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(3) }]),
                 Vec::new(),
                 vec![reference],
                 None,
             )
             .unwrap()[0];
-        let composed = builder
+        let transforms = vec![
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] },
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 2, 1)] },
+        ];
+        let old = builder
             .add_instruction(
-                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]),
+                ReferenceSwapOperation::new().with_transforms(transforms.clone()),
                 Vec::new(),
-                vec![outer],
+                vec![reference, replacement],
                 None,
             )
             .unwrap()[0];
-        let old = builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![composed, replacement], None)
-            .unwrap()[0];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![composed, update], None)
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(transforms),
+                Vec::new(),
+                vec![reference, update],
+                None,
+            )
             .unwrap();
         let final_snapshot =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
@@ -12832,16 +12831,14 @@ mod tests {
         let replacement = builder.add_input(pair_type.into());
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let view = builder
+        builder
             .add_instruction(
-                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1)]),
+                ReferenceWriteOperation::new()
+                    .with_transforms(vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] }]),
                 Vec::new(),
-                vec![reference],
+                vec![reference, replacement],
                 None,
             )
-            .unwrap()[0];
-        builder
-            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![view, replacement], None)
             .unwrap();
         let output =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
@@ -12876,14 +12873,22 @@ mod tests {
         let update = builder.add_input(scalar_type.into());
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let indexed = builder
-            .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
-            .unwrap()[0];
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }];
         let old = builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![indexed, replacement], None)
+            .add_instruction(
+                ReferenceSwapOperation::new().with_transforms(transforms.clone()),
+                Vec::new(),
+                vec![reference, replacement],
+                None,
+            )
             .unwrap()[0];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![indexed, update], None)
+            .add_instruction(
+                ReferenceAddUpdateOperation::new().with_transforms(transforms),
+                Vec::new(),
+                vec![reference, update],
+                None,
+            )
             .unwrap();
         let final_snapshot =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
@@ -13138,13 +13143,18 @@ mod tests {
         let true_branch = {
             let mut builder = XlaProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone().into());
-            let view = builder
-                .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
-                .unwrap()[0];
             let update =
                 builder.add_instruction(OneOperation::new(scalar_type), Vec::new(), Vec::new(), None).unwrap()[0];
             builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, update], None)
+                .add_instruction(
+                    ReferenceAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                        axis: 0,
+                        index: ArrayReferenceTransformIndex::Static(1),
+                    }]),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
                 .unwrap();
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])

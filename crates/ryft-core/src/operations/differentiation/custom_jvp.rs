@@ -680,7 +680,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayReference, ArrayReferenceDischarge, ArrayType, DataType, Dimension, Shape, ShardingDimension,
+        ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, Shape,
+        ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{
@@ -700,8 +701,8 @@ mod tests {
     use crate::operations::dot::{Dot, DotDimensionNumbers};
     use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
     use crate::operations::references::{
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation,
-        ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation,
     };
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
@@ -1355,12 +1356,8 @@ mod tests {
                 )
                 .unwrap();
             // Dormant rule state is normalized before lowering while the declared JVP remains attached and active.
-            let discharged = program
-                .clone()
-                .discharge_references::<ArrayReferenceDischarge>(0)
-                .unwrap()
-                .into_program_without_external_references()
-                .unwrap();
+            let discharged =
+                program.clone().discharge_references(0).unwrap().into_program_without_external_references().unwrap();
             assert_eq!(discharged.instructions()[0].regions().len(), 2);
             assert!(!discharged.entry_region_ref().contains_references_in_closure());
             assert_eq!(
@@ -1580,21 +1577,18 @@ mod tests {
             let known_reference = body.add_input(reference_type.clone());
             let increment = body.add_input(scalar_type.clone());
             let unknown_root = body.add_input(reference_type.clone());
-            let unknown_reference = if scanned_view {
-                body.add_instruction(
-                    ReferenceDynamicIndexOperation::new(0),
-                    Vec::new(),
-                    vec![unknown_root, index],
-                    None,
+            let (transforms, inputs) = if scanned_view {
+                (
+                    vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }],
+                    vec![unknown_root, increment, index],
                 )
-                .unwrap()[0]
             } else {
-                unknown_root
+                (Vec::new(), vec![unknown_root, increment])
             };
             body.add_instruction(
-                ReferenceAddUpdateOperation::new(),
+                ReferenceAddUpdateOperation::new().with_transforms(transforms),
                 Vec::new(),
-                vec![unknown_reference, increment],
+                inputs,
                 None,
             )
             .unwrap();
@@ -1613,7 +1607,7 @@ mod tests {
                 read
             };
             let body_outputs =
-                if scanned_view { vec![known_reference, read] } else { vec![known_reference, read, unknown_reference] };
+                if scanned_view { vec![known_reference, read] } else { vec![known_reference, read, unknown_root] };
             let carry_count = body_outputs.len();
             let body = body
                 .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(

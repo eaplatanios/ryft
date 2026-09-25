@@ -382,7 +382,7 @@ mod tests {
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
-    use crate::arrays::references::{ArrayReference, ArrayReferenceView, ArrayReferenceViewIndex};
+    use crate::arrays::references::{ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex};
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::sharding::shardings::Sharding;
     use crate::arrays::types::arrays::ArrayType;
@@ -395,8 +395,8 @@ mod tests {
     use crate::operations::{
         Add, AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
-        ReferenceAddUpdateOperation, ReferenceDynamicIndexOperation, ReferenceReadOperation, ScanOperation,
-        StopGradientOperation, WhileOperation, WhilePredicate, ZeroOperation,
+        ReferenceAddUpdateOperation, ReferenceReadOperation, ScanOperation, StopGradientOperation, WhileOperation,
+        WhilePredicate, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
@@ -911,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_scan_interprets_stacked_reference_operands_as_per_iteration_views() {
+    fn test_composite_scan_interprets_stacked_reference_operands_as_per_iteration_transforms() {
         /// Builds a program over `[carry, stack]` that applies `operation` to a body which accumulates the carry into
         /// the per-iteration slice reference and then folds the updated slice into the carry, and that returns the
         /// final carry.
@@ -925,14 +925,23 @@ mod tests {
             let carry = body_builder.add_input(scalar_type.clone().into());
             let root =
                 body_builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [length])).into());
-            let element = body_builder
-                .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
-                .unwrap()[0];
+            let transforms =
+                vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
             body_builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![element, carry], None)
+                .add_instruction(
+                    ReferenceAddUpdateOperation::new().with_transforms(transforms.clone()),
+                    Vec::new(),
+                    vec![root, carry, index],
+                    None,
+                )
                 .unwrap();
             let current = body_builder
-                .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![element], None)
+                .add_instruction(
+                    ReferenceReadOperation::new().with_transforms(transforms),
+                    Vec::new(),
+                    vec![root, index],
+                    None,
+                )
                 .unwrap()[0];
             let next_carry = body_builder
                 .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
@@ -954,9 +963,9 @@ mod tests {
         fn unrolled(stack: &ArrayReference<Array>, iterations: &[usize]) -> Result<Vec<TestValue>, ProgramError> {
             let mut carry = Array::scalar(1.0f32).unwrap();
             for &iteration in iterations {
-                let element = stack.with_transform(ArrayReferenceView::Index {
+                let element = stack.with_transform(ArrayReferenceTransform::Index {
                     axis: 0,
-                    index: ArrayReferenceViewIndex::Static(iteration),
+                    index: ArrayReferenceTransformIndex::Static(iteration),
                 })?;
                 element.add_update(&carry)?;
                 carry = carry.add(&element.read()?)?;

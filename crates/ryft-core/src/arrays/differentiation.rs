@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use crate::arrays::batching::{ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatchingPolicy};
 use crate::arrays::dimensions::DimensionValue;
+use crate::arrays::references::ArrayReferenceTransform;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable, Shape};
 use crate::arrays::types::ir::ArrayIrType;
@@ -39,7 +40,7 @@ where
         + OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>, Operation = O>
         + From<ZeroOperation<ArrayType>>
         + From<DimensionSizeOperation>
-        + From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
+        + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
 {
     #[inline]
     fn zero_residual_types(r#type: &ArrayIrType) -> Vec<ArrayIrType> {

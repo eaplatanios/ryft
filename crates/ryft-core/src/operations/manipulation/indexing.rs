@@ -1,7 +1,9 @@
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
-use crate::arrays::{Array, ArrayIrType, ArraySliceAxis, ArrayType, Broadcastable, DataType, Dimension, Shape};
+use crate::arrays::{
+    Array, ArrayIrType, ArrayReferenceTransform, ArraySliceAxis, ArrayType, Broadcastable, DataType, Dimension, Shape,
+};
 use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::operations::arithmetic::Add;
@@ -23,11 +25,8 @@ use crate::operations::manipulation::scattering::{
     DynamicScatter, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOptions, ScatterReductionKind,
 };
 use crate::operations::manipulation::slicing::Slice;
-use crate::operations::references::{
-    ReferenceAddUpdate, ReferenceDynamicIndex, ReferenceIndex, ReferenceRead, ReferenceSlice, ReferenceSwap,
-    ReferenceWrite,
-};
-use crate::programs::{ProgramError, ReferenceType, Type, TypeError, Typed, Value, ValueProjection};
+use crate::operations::references::{ReferenceAddUpdate, ReferenceRead, ReferenceSwap, ReferenceWrite};
+use crate::programs::{ProgramError, ReferenceType, Type, TypeError, Typed, Value, ValueProjection, ViewedReference};
 
 /// A host integer that can be represented exactly as an indexing coordinate, slice endpoint, or stride. The [`index!`]
 /// macro and range conversions into [`IndexSelector`] use this trait to accept integer types such as `usize` without
@@ -1346,19 +1345,18 @@ impl<
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceDynamicIndex>
-    Indexed<'_, '_, '_, V, ArrayIrType>
-{
+impl<V: Value<Type = ArrayIrType>> Indexed<'_, '_, '_, V, ArrayIrType> {
     /// Derives a reference view of the selected region of a reference input without accessing its state. The view
     /// shares the input's allocation, so reads through it observe later writes to the input and writes through it are
     /// visible to the input, which is the reference counterpart of NumPy's basic-indexing views and of `ref.at[...]`
     /// in [JAX](https://docs.jax.dev/en/latest/jax.ref.html). Reference views are restricted to the transforms the
-    /// reference machinery can reconstruct:host integers remove their axis, unit-stride forward slices keep theirs, an
+    /// reference machinery can reconstruct: host integers remove their axis, unit-stride forward slices keep theirs, an
     /// ellipsis expands over the unspecified axes, and a scalar integer array selects one position on its axis at run
-    /// time (clamped into bounds, as for [`reference_dynamic_index`](ReferenceDynamicIndex::reference_dynamic_index)).
-    /// Inserted axes, masks, non-scalar index arrays, strided or reversed slices, and out-of-bounds host integers are
-    /// rejected. Every axis that a host integer or slice touches must have a static extent, and when any slice is
-    /// present the whole referent shape must be static. A selection that touches no axis returns the input itself.
+    /// time (clamped into bounds when the view is accessed). Inserted axes, masks, non-scalar index arrays, strided or
+    /// reversed slices, and out-of-bounds host integers are rejected. Every axis that a host integer or slice touches
+    /// must have a static extent, and when any slice is present the whole referent shape must be static. Indexing no
+    /// axes returns a view with an empty path. Constructing a view emits no operation; an access records its root and
+    /// dynamic indices as inputs.
     ///
     /// # Example
     ///
@@ -1371,7 +1369,7 @@ impl<V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceD
     /// # Ok(())
     /// # }
     /// ```
-    pub fn view(&self) -> Result<V, ProgramError> {
+    pub fn view(&self) -> Result<ViewedReference<V, V, ArrayReferenceTransform>, ProgramError> {
         let input_type = self.input.r#type();
         let referent = <&ReferenceType<ArrayType>>::try_from(input_type.as_ref())?.referent();
         let rank = referent.rank();
@@ -1484,7 +1482,7 @@ impl<V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceD
 
         // Windows are applied first through one rank-preserving slice over every axis, and then the indexed axes
         // are removed from the sliced view in ascending order, adjusting for the axes removed before them.
-        let mut view = self.input.clone();
+        let mut view = ViewedReference::new(self.input.clone())?;
         if selections.iter().any(|selection| matches!(selection, ReferenceAxisSelection::Window(_))) {
             let axes = selections
                 .iter()
@@ -1494,18 +1492,18 @@ impl<V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceD
                     _ => Ok(ArraySliceAxis::new(0, extent(axis)?, 1)),
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
-            view = view.reference_slice(&axes)?;
+            view = view.slice(&axes)?;
         }
 
         let mut removed = 0;
         for (axis, selection) in selections.iter().enumerate() {
             match selection {
                 ReferenceAxisSelection::Index(index) => {
-                    view = view.reference_index(axis - removed, *index)?;
+                    view = view.index(axis - removed, *index)?;
                     removed += 1;
                 }
                 ReferenceAxisSelection::Dynamic(index) => {
-                    view = view.reference_dynamic_index(axis - removed, index)?;
+                    view = view.dynamic_index(axis - removed, *index)?;
                     removed += 1;
                 }
                 ReferenceAxisSelection::Full | ReferenceAxisSelection::Window(_) => {}
@@ -1516,9 +1514,7 @@ impl<V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceD
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceDynamicIndex + ReferenceRead>
-    Indexed<'_, '_, '_, V, ArrayIrType>
-{
+impl<V: Value<Type = ArrayIrType> + ReferenceRead<ArrayReferenceTransform>> Indexed<'_, '_, '_, V, ArrayIrType> {
     /// Reads the selected region of a reference input as an immutable snapshot. This is [`view`](Self::view) followed
     /// by [`read`](ReferenceRead::read), so it supports exactly the selections that [`view`](Self::view) accepts and
     /// observes the reference state at the point of the read in program order.
@@ -1530,12 +1526,9 @@ impl<V: Value<Type = ArrayIrType> + ReferenceIndex + ReferenceSlice + ReferenceD
 
 impl<
     V: Value<Type = ArrayIrType>
-        + ReferenceIndex
-        + ReferenceSlice
-        + ReferenceDynamicIndex
-        + ReferenceWrite
-        + ReferenceAddUpdate
-        + ReferenceSwap,
+        + ReferenceWrite<ArrayReferenceTransform>
+        + ReferenceAddUpdate<ArrayReferenceTransform>
+        + ReferenceSwap<ArrayReferenceTransform>,
 > Indexed<'_, '_, '_, V, ArrayIrType>
 {
     /// Overwrites the selected region of a reference input in place. This is [`view`](Self::view) followed by
@@ -3264,7 +3257,7 @@ mod tests {
 
         // Full selections derive no view transform and hand back the input allocation.
         let view = buffer.at(&index![.., 0..3]).view().unwrap();
-        assert_eq!(view.r#type(), buffer.r#type());
+        assert_eq!(view.r#type().as_ref(), <&ReferenceType<ArrayType>>::try_from(buffer.r#type().as_ref()).unwrap());
         assert_eq!(view.read(), buffer.read());
         assert_eq!(buffer.at(&[]).view().unwrap().read(), buffer.read());
 
@@ -3387,16 +3380,12 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4], %1:f32[2], %2:i32[] .
                 let %3:ref<f32[4]> = reference_new %0
-                    %4:ref<f32[2]> = reference_slice [axes=[ArraySliceAxis { start: 1, size: 2, stride: 1 }]] %3
-                    () = reference_write %4 %1
-                    %5:ref<f32[2]> = reference_slice [axes=[ArraySliceAxis { start: 0, size: 2, stride: 1 }]] %3
-                    () = reference_add_update %5 %1
-                    %6:ref<f32[]> = reference_dynamic_index [axis=0] %3 %2
-                    %7:f32[] = reference_read %6
-                    %8:ref<f32[]> = reference_index [axis=0, index=3] %3
-                    %9:f32[] = reference_swap %8 %7
-                    %10:f32[4] = reference_freeze %3
-                in (%9, %10)"},
+                    () = reference_write [transforms=[slice(axes=[1:3])]] %3 %1
+                    () = reference_add_update [transforms=[slice(axes=[0:2])]] %3 %1
+                    %4:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %3 %2
+                    %5:f32[] = reference_swap [transforms=[index(axis=0, index=3)]] %3 %4
+                    %6:f32[4] = reference_freeze %3
+                in (%5, %6)"},
         );
         let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
         let replacement = ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0]).unwrap());

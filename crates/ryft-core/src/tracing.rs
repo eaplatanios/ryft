@@ -1063,19 +1063,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceTransform, ArrayType,
+        DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::axes::NamedAxes;
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::{
-        AddOperation, NegOperation, OneLike, OneOperation, ReferenceIndexOperation, ZeroLike, ZeroOperation,
-    };
+    use crate::operations::{AddOperation, NegOperation, OneLike, OneOperation, ZeroLike, ZeroOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{
         AtomId, Operation, ProgramError, ReferenceBoundary, ReferenceType, RegionInterface, TypeError, Typed,
+        ViewedReference,
     };
     use crate::tests::{TestArrayContext, TestArrayOperation};
 
@@ -1514,10 +1513,14 @@ mod tests {
     fn test_tracing_context_reference_identity() {
         let context = DomainTracingContext::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::new();
         let root = context.input(ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))));
-        let view = context.bind(ReferenceIndexOperation::new(0, 0), Vec::new(), &[root.clone()]).unwrap().remove(0);
-        assert_eq!(context.reference_identity(&view), context.reference_identity(&root));
+        let view = ViewedReference::<_, _, ArrayReferenceTransform>::new(root.clone())
+            .unwrap()
+            .dynamic_index(0, &context.constant(ArrayIrValue::Array(Array::scalar(0i32).unwrap())))
+            .unwrap();
+        assert_eq!(context.reference_identity(view.root()), context.reference_identity(&root));
         assert!(matches!(
-            ReferenceBoundary::new(&context, [("input 0", &root), ("input 1", &view)]).map_err(ProgramError::from),
+            ReferenceBoundary::new(&context, [("input 0", &root), ("input 1", view.root())])
+                .map_err(ProgramError::from),
             Err(ProgramError::InvalidArgument { message })
                 if message == "input 1 and input 0 bind the same reference allocation",
         ));

@@ -31,11 +31,11 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::arrays::{
-    ArrayIrOperation, ArrayIrType, ArrayReferenceAnalysis, ArrayReferenceView, ArrayReferenceViewPath, ArrayType,
+    ArrayIrOperation, ArrayIrType, ArrayReferenceAnalysis, ArrayReferenceTransform, ArrayReferenceTransformPath, ArrayType,
 };
 use crate::programs::{
-    AtomId, InstructionId, Operation, ReferenceAccessMode, ReferenceRoot, ReferenceViewAnalysisError,
-    ReferenceViewOperation, RegionId, RegionRef, Value, ValueId,
+    AtomId, InstructionId, Operation, ReferenceAccessMode, ReferenceAccessOperation, ReferenceRoot,
+    ReferenceViewAnalysisError, RegionId, RegionRef, Value, ValueId,
 };
 
 /// Error produced by [`validate_kernel_body`] when a kernel body or its [`KernelBoundaryContract`] violates the
@@ -113,7 +113,7 @@ pub enum KernelValidationError {
 /// Operation-local reference semantics used by kernel boundary validation. Implementations identify an old-value
 /// result only for a swap whose first reference operand is read and replaced; the result index must exist and denote
 /// exactly that previous value. Ordinary read-write operations and unrecognized extensions return `None`.
-pub trait KernelReferenceOperation: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView> {
+pub trait KernelReferenceOperation: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform> {
     /// Returns the old-value output of a swap, allowing dead results to be classified as stores.
     fn swap_output_index(&self) -> Option<usize> {
         None
@@ -279,12 +279,13 @@ impl KernelReferenceSummary {
         self.parameters.as_slice()
     }
 
-    /// Returns the [`ArrayReferenceViewPath`] of the reference-typed `value`, or [`None`] when `value` is not a
-    /// reference-typed value of the body closure. Refer to the documentation of [`ArrayReferenceAnalysis::path`] for
-    /// more information.
+    /// Returns the [`ArrayReferenceTransformPath`] selected by the reference access at `input_index` of `instruction`, or
+    /// [`None`] when that input is not a reference access or the instruction is outside the body closure. Empty
+    /// paths select complete roots. Refer to the documentation of [`ArrayReferenceAnalysis::path`] for more
+    /// information.
     #[inline]
-    pub fn view(&self, value: ValueId) -> Option<&ArrayReferenceViewPath> {
-        self.analysis.path(value)
+    pub fn path(&self, instruction: InstructionId, input_index: usize) -> Option<&ArrayReferenceTransformPath> {
+        self.analysis.path(instruction, input_index)
     }
 
     /// Returns the lowering of the swap at `instruction`, or [`None`] when that instruction is not a swap of the body
@@ -447,12 +448,11 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayReferenceViewIndex, ArraySliceAxis, DataType};
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayReferenceTransformIndex, ArraySliceAxis, DataType};
     use crate::captures::CaptureReference;
     use crate::operations::{
-        ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
-        ReferenceWriteOperation,
+        ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder, ReferenceAnalysisError, ReferenceSource, ReferenceType};
@@ -474,11 +474,6 @@ mod tests {
     /// Identifies an instruction in a fixture's numbered region.
     fn id(region: usize, index: usize) -> InstructionId {
         InstructionId::new(RegionId::new(region), index)
-    }
-
-    /// Identifies a value in a fixture's numbered region.
-    fn value(region: usize, atom: usize) -> ValueId {
-        ValueId::new(RegionId::new(region), AtomId::new(atom))
     }
 
     /// Identifies an entering reference in a fixture's numbered region.
@@ -505,21 +500,23 @@ mod tests {
         let write_only = builder.add_input(reference_type([2]));
         let read_write = builder.add_input(reference_type([2]));
         let scalar = builder.add_input(array_type([]));
-        let prefix = builder
+        let snapshot = builder
             .add_instruction(
-                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)]),
+                ReferenceReadOperation::new()
+                    .with_transforms(vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1)] }]),
                 Vec::new(),
                 vec![read_only],
                 None,
             )
             .unwrap()[0];
-        let snapshot =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![prefix], None).unwrap()[0];
-        let element = builder
-            .add_instruction(ReferenceIndexOperation::new(0, 0), Vec::new(), vec![write_only], None)
-            .unwrap()[0];
         builder
-            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![element, scalar], None)
+            .add_instruction(
+                ReferenceWriteOperation::new()
+                    .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]),
+                Vec::new(),
+                vec![write_only, scalar],
+                None,
+            )
             .unwrap();
         let current =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![read_write], None).unwrap()[0];
@@ -577,13 +574,13 @@ mod tests {
     #[test]
     fn test_kernel_validation_error() {
         assert_eq!(
-            KernelValidationError::from(ReferenceViewAnalysisError::MissingView {
-                operation: "view",
+            KernelValidationError::from(ReferenceViewAnalysisError::InvalidAccess {
                 instruction: id(0, 1),
-                output_index: 0,
+                input_index: 0,
+                message: "missing view descriptor".to_owned(),
             })
             .to_string(),
-            "operation `view` at ^0[1] declares a reference view at output 0 but describes no view",
+            "invalid reference access at ^0[1] input 0: missing view descriptor",
         );
         assert_eq!(
             KernelValidationError::ParameterCountMismatch { expected: 3, actual: 2 }.to_string(),
@@ -743,25 +740,63 @@ mod tests {
     fn test_kernel_reference_summary_view() {
         let (program, contract) = accepted_body();
         let summary = validate_kernel_body(program.entry_region_ref(), &contract).unwrap();
-        assert_eq!(summary.view(value(0, 0)), Some(&ArrayReferenceViewPath::root()));
+        assert_eq!(summary.path(id(0, 2), 0), Some(&ArrayReferenceTransformPath::root()));
         assert_eq!(
-            summary.view(value(0, 4)).map(|view| view.views().cloned().collect::<Vec<_>>()),
-            Some(vec![ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1)] }]),
+            summary.path(id(0, 0), 0).map(|view| view.transforms().cloned().collect::<Vec<_>>()),
+            Some(vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1)] }]),
         );
         assert_eq!(
-            summary.view(value(0, 6)).map(|view| view.views().cloned().collect::<Vec<_>>()),
-            Some(vec![ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) }]),
+            summary.path(id(0, 1), 0).map(|view| view.transforms().cloned().collect::<Vec<_>>()),
+            Some(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]),
         );
-        assert_eq!(summary.view(value(0, 3)), None);
-        assert_eq!(summary.view(value(0, 5)), None);
+        assert_eq!(summary.path(id(0, 1), 1), None);
+        assert_eq!(summary.path(id(0, 0), 1), None);
+    }
+
+    #[test]
+    fn test_kernel_reference_summary_view_folded_accesses() {
+        let mut builder = TestBuilder::new();
+        let reference = builder.add_input(reference_type([2, 3]));
+        let index = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
+        let dynamic = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(vec![dynamic.clone()]),
+                vec![],
+                vec![reference, index],
+                None,
+            )
+            .unwrap();
+        let slice =
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(1, 2, 1)] };
+        builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(vec![slice.clone()]),
+                vec![],
+                vec![reference],
+                None,
+            )
+            .unwrap();
+        let program = builder.build::<Vec<TestValue>, Vec<TestValue>>(vec![], vec![Placeholder; 2], vec![]).unwrap();
+        let contract = KernelBoundaryContract::new(vec![Some(KernelParameterAccess::ReadOnly), None]);
+        let summary = validate_kernel_body(program.entry_region_ref(), &contract).unwrap();
+        let region = program.entry();
+        let first = summary.path(InstructionId::new(region, 0), 0).unwrap();
+        assert_eq!(first.transforms().cloned().collect::<Vec<_>>(), vec![dynamic]);
+        assert_eq!(first.bound_transforms()[0].bindings(), &[ValueId::new(region, index)]);
+        assert_eq!(
+            summary.path(InstructionId::new(region, 1), 0).unwrap().transforms().cloned().collect::<Vec<_>>(),
+            vec![slice]
+        );
+        assert_eq!(summary.path(InstructionId::new(region, 0), 1), None);
     }
 
     #[test]
     fn test_kernel_reference_summary_swap_lowering() {
         let (program, contract) = accepted_body();
         let summary = validate_kernel_body(program.entry_region_ref(), &contract).unwrap();
-        assert_eq!(summary.swap_lowering(id(0, 6)), Some(KernelSwapLowering::Store));
-        assert_eq!(summary.swap_lowering(id(0, 5)), None);
+        assert_eq!(summary.swap_lowering(id(0, 4)), Some(KernelSwapLowering::Store));
+        assert_eq!(summary.swap_lowering(id(0, 3)), None);
         assert_eq!(summary.swap_lowering(id(1, 0)), None);
     }
 
@@ -777,7 +812,7 @@ mod tests {
         assert_eq!(summary.parameter(2).map(KernelParameterSummary::root), Some(input_root(0, 2)));
         assert_eq!(summary.parameter(3), None);
         assert_eq!(summary.analysis().analysis().output_roots(), &[None]);
-        assert_eq!(summary.swap_lowering(id(0, 6)), Some(KernelSwapLowering::Store));
+        assert_eq!(summary.swap_lowering(id(0, 4)), Some(KernelSwapLowering::Store));
     }
 
     #[test]
@@ -1018,8 +1053,8 @@ mod tests {
         );
         assert!(summary.parameter(1).unwrap().is_mutated());
         assert_eq!(summary.swap_lowering(id(1, 0)), Some(KernelSwapLowering::Store));
-        assert_eq!(summary.view(value(0, 0)), Some(&ArrayReferenceViewPath::root()));
-        assert_eq!(summary.view(value(1, 0)), Some(&ArrayReferenceViewPath::root()));
+        assert_eq!(summary.path(id(0, 0), 0), Some(&ArrayReferenceTransformPath::root()));
+        assert_eq!(summary.path(id(1, 0), 0), Some(&ArrayReferenceTransformPath::root()));
 
         // The nested writes are attributed to the operand, so a read-only declaration is rejected at the branch
         // instruction that performs the first write.

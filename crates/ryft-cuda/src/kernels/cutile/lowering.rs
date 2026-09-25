@@ -5,9 +5,10 @@
 
 use ryft_core::kernels::{GridExecution, KernelOperation, KernelSchedule, NoKernelExtension, VerifiedKernel};
 use ryft_core::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Atom, ComparisonDirection, DataType,
-    Dimension, DimensionOperation, DimensionValue, DotDimensionNumbers, Operation, ProgramError, ReductionKind,
-    RegionRef, Typed,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex,
+    ArrayType, Atom, ComparisonDirection, DataType, Dimension, DimensionOperation, DimensionValue, DotDimensionNumbers,
+    Operation, ProgramError, ReductionKind, ReferenceAccessOperation, RegionRef, Typed,
+    validated_reference_access_descriptors,
 };
 
 use crate::kernels::cutile::{Error, Options, Parameter, data_type_name, launch_grid};
@@ -49,6 +50,9 @@ enum Value {
 
         /// Fixed physical coordinates for indexed axes; surviving axes contain `None`.
         fixed: Vec<Option<String>>,
+
+        /// Validity constraints retained for indexed-away axes.
+        validity: Vec<String>,
     },
 }
 
@@ -147,7 +151,7 @@ pub(super) fn lower(
         let limits = starts.iter().zip(&shape).map(|(start, extent)| format!("({start} + {extent})")).collect();
         let axes = (0..shape.len()).collect();
         let fixed = vec![None; shape.len()];
-        inputs.push(Value::Reference { parameter, starts, shape, limits, axes, fixed });
+        inputs.push(Value::Reference { parameter, starts, shape, limits, axes, fixed, validity: vec![] });
     }
     inputs.extend(coordinates.into_iter().map(Value::Expression));
     lowering.region(kernel.definition().body().entry_region_ref(), &inputs)?;
@@ -231,7 +235,18 @@ impl Lowering {
         }
         for instruction in region.instructions() {
             self.charge(1)?;
-            let inputs = instruction.inputs().iter().map(|id| values[id.index()].clone().unwrap()).collect::<Vec<_>>();
+            let mut inputs =
+                instruction.inputs().iter().map(|id| values[id.index()].clone().unwrap()).collect::<Vec<_>>();
+            let operation = instruction.operation();
+            let descriptors = validated_reference_access_descriptors(operation, instruction.inputs().len())?;
+            for (input_index, descriptor) in descriptors.iter().enumerate() {
+                for view in descriptor.iter().flat_map(|descriptor| descriptor.transforms()) {
+                    self.reference_view(&mut inputs[input_index], view, operation.name())?;
+                }
+            }
+            if descriptors.iter().any(Option::is_some) {
+                inputs.truncate(operation.base_input_count());
+            }
             let types = instruction
                 .inputs()
                 .iter()
@@ -296,23 +311,6 @@ impl Lowering {
                             .to_string(),
                     )]
                 }
-                KernelOperation::Portable(ArrayIrOperation::ReferenceIndex(operation)) => {
-                    let mut reference = inputs[0].clone();
-                    let ryft_core::ArrayReferenceView::Index {
-                        axis,
-                        index: ryft_core::ArrayReferenceViewIndex::Static(index),
-                    } = operation.transform()
-                    else {
-                        unreachable!()
-                    };
-                    let Value::Reference { starts, shape, limits, axes, fixed, .. } = &mut reference else {
-                        unreachable!()
-                    };
-                    fixed[axes.remove(axis)] = Some(format!("({} + {index})", starts.remove(axis)));
-                    shape.remove(axis);
-                    limits.remove(axis);
-                    vec![reference]
-                }
                 KernelOperation::Portable(ArrayIrOperation::ReferenceRead(_)) => {
                     vec![Value::Expression(self.read(&inputs[0], "0")?)]
                 }
@@ -326,7 +324,7 @@ impl Lowering {
                     vec![Value::Expression(previous)]
                 }
                 KernelOperation::TileLoad(operation) => {
-                    let Value::Reference { parameter, starts, limits, axes, fixed, .. } = &inputs[0] else {
+                    let Value::Reference { parameter, starts, limits, axes, fixed, validity, .. } = &inputs[0] else {
                         unreachable!()
                     };
                     let starts = starts
@@ -341,6 +339,7 @@ impl Lowering {
                         limits: limits.clone(),
                         axes: axes.clone(),
                         fixed: fixed.clone(),
+                        validity: validity.clone(),
                     };
                     vec![Value::Expression(self.read(&reference, &expression(inputs.len() - 1)?)?)]
                 }
@@ -456,6 +455,42 @@ impl Lowering {
         Ok(self.assign(format!("ct.broadcast_to({scalar}, {})", physical_shape(&shape))))
     }
 
+    /// Applies one supported reference view while preserving enclosing-window bounds.
+    fn reference_view(
+        &mut self,
+        reference: &mut Value,
+        view: &ArrayReferenceTransform,
+        operation: &'static str,
+    ) -> Result<(), Error> {
+        self.charge(1)?;
+        let Value::Reference { starts, shape, limits, axes, fixed, validity, .. } = reference else {
+            return Err(unsupported(operation, "expected a global reference"));
+        };
+        match view {
+            ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) } => {
+                let coordinate = format!("({} + {index})", starts.remove(*axis));
+                validity.push(format!("({coordinate} < {})", limits.remove(*axis)));
+                fixed[axes.remove(*axis)] = Some(coordinate);
+                shape.remove(*axis);
+            }
+            ArrayReferenceTransform::Slice { axes: selections } => {
+                if selections.iter().any(|selection| selection.stride() != 1) {
+                    return Err(unsupported(operation, "strided reference views are unsupported"));
+                }
+                for (axis, selection) in selections.iter().enumerate() {
+                    starts[axis] = format!("({} + {})", starts[axis], selection.start());
+                    limits[axis] = format!("ct.minimum({}, ({} + {}))", limits[axis], starts[axis], selection.size());
+                    shape[axis] = selection.size();
+                }
+            }
+            ArrayReferenceTransform::Index { .. } => {
+                return Err(unsupported(operation, "dynamic reference views are unsupported"));
+            }
+            _ => return Err(unsupported(operation, "reference view is outside the supported subset")),
+        }
+        Ok(())
+    }
+
     /// Computes broadcasted element indices and the logical tile-padding mask.
     fn indices(&mut self, starts: &[String], shape: &[usize]) -> (String, String) {
         let mut indices = Vec::new();
@@ -495,12 +530,17 @@ impl Lowering {
 
     /// Loads a clipped global window with an explicit exact padding value.
     fn read(&mut self, reference: &Value, other: &str) -> Result<String, Error> {
-        let Value::Reference { parameter, starts, shape, limits, axes, fixed } = reference else { unreachable!() };
+        let Value::Reference { parameter, starts, shape, limits, axes, fixed, validity } = reference else {
+            unreachable!()
+        };
         checked_tile(shape)?;
         if fixed.is_empty() {
             return Ok(self.assign(format!("ct.reshape(ct.load(p{parameter}, (0,), (1,)), ())")));
         }
-        let (logical_indices, mask) = self.window_indices(starts, shape, limits);
+        let (logical_indices, mut mask) = self.window_indices(starts, shape, limits);
+        for condition in validity {
+            mask = format!("({mask}) & ({condition})");
+        }
         let mut indices = fixed.clone();
         for (&axis, index) in axes.iter().zip(logical_indices) {
             indices[axis] = Some(index);
@@ -513,13 +553,18 @@ impl Lowering {
 
     /// Publishes only valid logical/global coordinates.
     fn write(&mut self, reference: &Value, value: &str) -> Result<(), Error> {
-        let Value::Reference { parameter, starts, shape, limits, axes, fixed } = reference else { unreachable!() };
+        let Value::Reference { parameter, starts, shape, limits, axes, fixed, validity } = reference else {
+            unreachable!()
+        };
         checked_tile(shape)?;
         if fixed.is_empty() {
             self.line(format!("ct.store(p{parameter}, (0,), ct.reshape({value}, (1,)))"));
             return Ok(());
         }
-        let (logical_indices, mask) = self.window_indices(starts, shape, limits);
+        let (logical_indices, mut mask) = self.window_indices(starts, shape, limits);
+        for condition in validity {
+            mask = format!("({mask}) & ({condition})");
+        }
         let mut indices = fixed.clone();
         for (&axis, index) in axes.iter().zip(logical_indices) {
             indices[axis] = Some(index);
@@ -766,7 +811,9 @@ mod tests {
     use ryft_core::kernels::{
         Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter,
     };
-    use ryft_core::{DimensionBounds, DimensionMulOperation, DimensionType, ReferenceRead, ReferenceWrite};
+    use ryft_core::{
+        ArraySliceAxis, DimensionBounds, DimensionMulOperation, DimensionType, ReferenceRead, ReferenceWrite,
+    };
 
     use super::*;
 
@@ -814,6 +861,19 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_batched_folded_transforms() {
+        let definition = scalar_copy().batched(2, &[Some(0), Some(0)], 2).unwrap();
+        let kernel = VerifiedKernel::new(&definition, 2).unwrap();
+        let source = lower(&kernel, &Options::default(), &KernelSchedule::default()).unwrap();
+        assert_eq!(source.grid, [2, 1, 1]);
+        assert_eq!(
+            source.parameters.iter().map(|parameter| parameter.shape.clone()).collect::<Vec<_>>(),
+            vec![vec![2]; 2]
+        );
+        assert_eq!(definition.body().instructions().len(), 2);
+    }
+
+    #[test]
     fn test_lower_scratch_budget() {
         let definition = scalar_copy();
         let kernel = VerifiedKernel::new(&definition, 1).unwrap();
@@ -845,6 +905,46 @@ mod tests {
     }
 
     #[test]
+    fn test_lowering_reference_view() {
+        let mut lowering = Lowering { code: String::new(), indentation: 0, next: 0, remaining: 10 };
+        let mut reference = Value::Reference {
+            parameter: 0,
+            starts: vec!["8".to_owned()],
+            shape: vec![4],
+            limits: vec!["12".to_owned()],
+            axes: vec![0],
+            fixed: vec![None],
+            validity: vec![],
+        };
+        lowering
+            .reference_view(
+                &mut reference,
+                &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] },
+                "reference_read",
+            )
+            .unwrap();
+        lowering
+            .reference_view(
+                &mut reference,
+                &ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+                "reference_read",
+            )
+            .unwrap();
+        let Value::Reference { starts, shape, limits, axes, fixed, validity, .. } = &reference else { unreachable!() };
+        assert_eq!((starts.len(), shape.len(), limits.len(), axes.len()), (0, 0, 0, 0));
+        assert_eq!(fixed, &vec![Some("((8 + 1) + 1)".to_owned())]);
+        assert_eq!(validity, &vec!["(((8 + 1) + 1) < ct.minimum(12, ((8 + 1) + 2)))".to_owned()]);
+        assert!(matches!(lowering.reference_view(&mut reference, &ArrayReferenceTransform::Index {
+            axis: 0, index: ArrayReferenceTransformIndex::Dynamic,
+        }, "reference_read"), Err(Error::Unsupported { operation: "reference_read", reason })
+            if reason == "dynamic reference views are unsupported"));
+        assert!(matches!(lowering.reference_view(&mut reference, &ArrayReferenceTransform::Slice {
+            axes: vec![ArraySliceAxis::new(0, 1, 2)],
+        }, "reference_read"), Err(Error::Unsupported { operation: "reference_read", reason })
+            if reason == "strided reference views are unsupported"));
+    }
+
+    #[test]
     fn test_lowering_window_indices() {
         let mut lowering = Lowering { code: String::new(), indentation: 0, next: 0, remaining: 10 };
         let (indices, mask) = lowering.window_indices(&["16".to_owned()], &[3], &["18".to_owned()]);
@@ -869,6 +969,7 @@ mod tests {
             limits: vec!["10".to_owned()],
             axes: vec![1],
             fixed: vec![Some("3".to_owned()), None],
+            validity: vec![],
         };
         assert_eq!(lowering.read(&reference, "0").unwrap(), "v2");
         assert_eq!(

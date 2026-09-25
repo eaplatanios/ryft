@@ -17,8 +17,8 @@ use ryft_core::operations::sort::SortOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceView,
-    ArrayReferenceViewOperation, ArrayType, AssertOperation, AssertionValue, Atan2Operation, AxisIndexOperation,
+    ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceTransform,
+    ArrayReferenceTransformOperation, ArrayType, AssertOperation, AssertionValue, Atan2Operation, AxisIndexOperation,
     BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, ClampOperation,
     CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
@@ -38,17 +38,17 @@ use ryft_core::{
     OutputRegionProvenance, PadOperation, ParallelReduceOperation, ParallelVaryOperation, Parameter,
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation,
-    ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation,
-    ReferenceSwapOperation, ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation,
-    RegionInterface, RegionSlot, RemOperation, ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation,
-    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, SignOperation, SinOperation, SliceOperation,
-    SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer,
-    TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext,
-    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
-    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
+    ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAccessDescriptor,
+    ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+    ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
+    ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
+    SelectOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation,
+    SubOperation, TagOperation, TanhOperation, Tracer, TracingContext, TransferToMemoryOperation,
+    TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
+    TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
+    ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;
 
@@ -437,29 +437,20 @@ where
     /// Unresolved whole-array reference allocation retained until reference discharge.
     ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
 
-    /// Unresolved axis-removing reference view retained until reference discharge.
-    ReferenceIndex(ReferenceIndexOperation),
+    /// Unresolved read through an optional folded view path retained until reference discharge.
+    ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Unresolved dynamic axis-removing reference view retained until reference discharge.
-    ReferenceDynamicIndex(ReferenceDynamicIndexOperation),
+    /// Unresolved write-only replacement through an optional folded view path retained until reference discharge.
+    ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Unresolved static slice reference view retained until reference discharge.
-    ReferenceSlice(ReferenceSliceOperation),
+    /// Unresolved replacement through an optional folded view path retained until reference discharge.
+    ReferenceSwap(ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Unresolved read from a root reference or derived view retained until reference discharge.
-    ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType>),
-
-    /// Unresolved write-only replacement through a root reference or derived view retained until reference discharge.
-    ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType>),
-
-    /// Unresolved replacement through a root reference or derived view retained until reference discharge.
-    ReferenceSwap(ReferenceSwapOperation<ArrayType, ArrayIrType>),
-
-    /// Unresolved additive update through a root reference or derived view retained until reference discharge.
-    ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType>),
+    /// Unresolved additive update through an optional folded view path retained until reference discharge.
+    ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
     /// Unresolved atomic additive update retained until sequential reference discharge or a supporting kernel lowering.
-    ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>),
+    ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
     /// Unresolved consuming whole-array reference freeze retained until reference discharge.
     ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
@@ -539,39 +530,64 @@ where
     ShardMap(Box<ShardMapOperation<Constant>>),
 }
 
-impl<Constant> ReferenceViewOperation for XlaOperation<Constant>
+impl<Constant> ReferenceAccessOperation for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    type View = ArrayReferenceView;
+    type Transform = ArrayReferenceTransform;
 
-    fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
-        // The view derivations are the only members whose effects declare a view alias, each at its
-        // single output; every other member and every backend-owned higher-order operation derives no view.
+    fn base_input_count(&self) -> usize {
         match self {
-            Self::Kernel(operation) => operation.operation().reference_view(output_index),
-            Self::ReferenceIndex(operation) if output_index == 0 => Some(operation.transform()),
-            Self::ReferenceDynamicIndex(operation) if output_index == 0 => Some(operation.transform()),
-            Self::ReferenceSlice(operation) if output_index == 0 => Some(operation.transform()),
+            Self::Kernel(operation) => operation.operation().base_input_count(),
+            Self::ReferenceRead(operation) => operation.base_input_count(),
+            Self::ReferenceWrite(operation) => operation.base_input_count(),
+            Self::ReferenceSwap(operation) => operation.base_input_count(),
+            Self::ReferenceAddUpdate(operation) => operation.base_input_count(),
+            Self::ReferenceAtomicAddUpdate(operation) => operation.base_input_count(),
+            Self::ReferenceFreeze(_) => 1,
+            _ => 0,
+        }
+    }
+
+    fn reference_access_descriptor(&self, input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+        match self {
+            Self::Kernel(operation) => operation.operation().reference_access_descriptor(input_index),
+            Self::ReferenceRead(operation) => operation.reference_access_descriptor(input_index),
+            Self::ReferenceWrite(operation) => operation.reference_access_descriptor(input_index),
+            Self::ReferenceSwap(operation) => operation.reference_access_descriptor(input_index),
+            Self::ReferenceAddUpdate(operation) => operation.reference_access_descriptor(input_index),
+            Self::ReferenceAtomicAddUpdate(operation) => operation.reference_access_descriptor(input_index),
+            Self::ReferenceFreeze(_) if input_index == 0 => Some(ReferenceAccessDescriptor::new(&[], 1..1)),
             _ => None,
         }
     }
 
-    fn validate_reference_view(
-        view: &ArrayReferenceView,
-        source: &ArrayIrType,
-        target: &ArrayIrType,
-    ) -> Result<(), ReferenceViewValidationError> {
-        view.validate(source, target)
-    }
-
-    fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-        context: &C,
-        view: &ArrayReferenceView,
-        source: C::Value,
-        symbols: &[C::Value],
-    ) -> Result<C::Value, ProgramError> {
-        view.reapply(context, source, symbols)
+    fn with_reference_access_transforms(&self, input_index: usize, transforms: Vec<Self::Transform>) -> Result<Self, ProgramError> {
+        match self {
+            Self::Kernel(operation) => operation
+                .operation()
+                .with_reference_access_transforms(input_index, transforms)
+                .map(|operation| Self::Kernel(operation.into())),
+            Self::ReferenceRead(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceRead)
+            }
+            Self::ReferenceWrite(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceWrite)
+            }
+            Self::ReferenceSwap(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceSwap)
+            }
+            Self::ReferenceAddUpdate(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceAddUpdate)
+            }
+            Self::ReferenceAtomicAddUpdate(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceAtomicAddUpdate)
+            }
+            Self::ReferenceFreeze(_) if input_index == 0 && transforms.is_empty() => Ok(self.clone()),
+            _ => Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` cannot replace the reference view at input {input_index}", self.name()),
+            }),
+        }
     }
 }
 
@@ -587,7 +603,7 @@ where
     }
 }
 
-impl<Constant> ArrayReferenceViewOperation for XlaOperation<Constant>
+impl<Constant> ArrayReferenceTransformOperation for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
@@ -640,9 +656,6 @@ where
             ArrayIrOperation::Assert(operation) => Self::Assert(operation),
             ArrayIrOperation::DimensionSize(operation) => Self::DimensionSize(operation),
             ArrayIrOperation::ReferenceNew(operation) => Self::ReferenceNew(operation),
-            ArrayIrOperation::ReferenceIndex(operation) => Self::ReferenceIndex(operation),
-            ArrayIrOperation::ReferenceDynamicIndex(operation) => Self::ReferenceDynamicIndex(operation),
-            ArrayIrOperation::ReferenceSlice(operation) => Self::ReferenceSlice(operation),
             ArrayIrOperation::ReferenceRead(operation) => Self::ReferenceRead(operation),
             ArrayIrOperation::ReferenceWrite(operation) => Self::ReferenceWrite(operation),
             ArrayIrOperation::ReferenceSwap(operation) => Self::ReferenceSwap(operation),
@@ -899,14 +912,11 @@ where
             Self::Assert(operation) => ArrayIrOperation::Assert(operation.clone()),
             Self::DimensionSize(operation) => ArrayIrOperation::DimensionSize(operation.clone()),
             Self::ReferenceNew(operation) => ArrayIrOperation::ReferenceNew(*operation),
-            Self::ReferenceIndex(operation) => ArrayIrOperation::ReferenceIndex(*operation),
-            Self::ReferenceDynamicIndex(operation) => ArrayIrOperation::ReferenceDynamicIndex(*operation),
-            Self::ReferenceSlice(operation) => ArrayIrOperation::ReferenceSlice(operation.clone()),
-            Self::ReferenceRead(operation) => ArrayIrOperation::ReferenceRead(*operation),
-            Self::ReferenceWrite(operation) => ArrayIrOperation::ReferenceWrite(*operation),
-            Self::ReferenceSwap(operation) => ArrayIrOperation::ReferenceSwap(*operation),
-            Self::ReferenceAddUpdate(operation) => ArrayIrOperation::ReferenceAddUpdate(*operation),
-            Self::ReferenceAtomicAddUpdate(operation) => ArrayIrOperation::ReferenceAtomicAddUpdate(*operation),
+            Self::ReferenceRead(operation) => ArrayIrOperation::ReferenceRead(operation.clone()),
+            Self::ReferenceWrite(operation) => ArrayIrOperation::ReferenceWrite(operation.clone()),
+            Self::ReferenceSwap(operation) => ArrayIrOperation::ReferenceSwap(operation.clone()),
+            Self::ReferenceAddUpdate(operation) => ArrayIrOperation::ReferenceAddUpdate(operation.clone()),
+            Self::ReferenceAtomicAddUpdate(operation) => ArrayIrOperation::ReferenceAtomicAddUpdate(operation.clone()),
             Self::ReferenceFreeze(operation) => ArrayIrOperation::ReferenceFreeze(*operation),
             Self::DimensionFromScalar(operation) => ArrayIrOperation::DimensionFromScalar(operation.clone()),
             Self::DimensionToScalar(operation) => ArrayIrOperation::DimensionToScalar(*operation),
@@ -1655,20 +1665,19 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
-        ArrayReferenceView, ArrayReferenceViewIndex, ArrayType, Assert, AssertOperation, CaptureReference,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, CaptureReference,
         CapturingContext, Compare, CompareOperation, ComparisonDirection, ConditionOperation, Context,
         CotangentDestinationKind, CotangentDestinations, CustomJvpOperation, CustomVjpOperation, DataType,
         DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, EffectClass,
         EffectClasses, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
         MulOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
-        ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
-        ReferenceDischargeTarget, ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceViewOperation,
-        ReferenceViewValidationError, ReferenceWriteOperation, RegionDriver, RegionInterface, RegionRef,
-        RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension,
-        StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value,
-        ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
+        ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
+        RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
+        Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
+        TypeIdentityRenaming, Typed, Value, ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -2063,20 +2072,19 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_operation_reference_view() {
-        let operation = XlaOperation::<XlaConstant>::ReferenceDynamicIndex(ReferenceDynamicIndexOperation::new(0));
-        let view = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
-        assert_eq!(operation.reference_view(0), Some(view.clone()));
-        assert_eq!(operation.reference_view(1), None);
-        let stacked = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));
-        let slice = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
-        assert_eq!(XlaOperation::<XlaConstant>::validate_reference_view(&view, &stacked, &slice), Ok(()));
+    fn test_xla_operation_reference_access_descriptor() {
+        let view = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let operation =
+            XlaOperation::<XlaConstant>::ReferenceRead(ReferenceReadOperation::new().with_transforms(vec![view.clone()]));
+        let descriptor = operation.reference_access_descriptor(0).unwrap();
+        assert_eq!(descriptor.transforms(), &[view]);
+        assert_eq!(descriptor.bindings(), 1..2);
+        assert_eq!(operation.reference_access_descriptor(1), None);
+        let root = ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])).into();
+        let index = ArrayType::scalar(DataType::I64).into();
         assert_eq!(
-            XlaOperation::<XlaConstant>::validate_reference_view(&view, &stacked, &stacked),
-            Err(ReferenceViewValidationError::TypeMismatch {
-                expected: "f32[2]".to_string(),
-                actual: "f32[3, 2]".to_string(),
-            }),
+            operation.infer_output_types(&[root, index], &[]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [2]).into()])
         );
     }
 

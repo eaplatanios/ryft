@@ -24,9 +24,10 @@ use crate::partial::{
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, OperationProvider,
-    Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, ReferenceBoundary,
-    ReferenceIdentity, ReferenceMemberType, ReferenceRoot, Region, RegionDriver, RegionRef, RegionReplayMappings,
-    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
+    Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, ReferenceAccessOperation,
+    ReferenceBoundary, ReferenceIdentity, ReferenceMemberType, ReferenceRoot, ReferenceTransform, Region, RegionDriver,
+    RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
@@ -463,13 +464,19 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         V::Type: DifferentiableType + ReferenceMemberType,
         O: TransposableOperation<V, O>
             + ResidualZeroProvider<V::Type, Operation = O>
-            + OperationProvider<
+            + ReferenceAccessOperation<
+                Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>,
+            > + OperationProvider<
                 V::Type,
                 ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
                 Operation = O,
             > + OperationProvider<
                 V::Type,
-                ReferenceAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                ReferenceAddUpdateOperation<
+                    <V::Type as ReferenceMemberType>::Referent,
+                    V::Type,
+                    <O as ReferenceAccessOperation>::Transform,
+                >,
                 Operation = O,
             > + From<AddOperation<V::Type>>,
     {
@@ -1818,7 +1825,7 @@ where
     ///
     /// Non-zero space ordinary outputs retain tangent outputs even when they are zero. Reference outputs rooted in
     /// selected inputs or local allocations retain tangent reference outputs; those rooted in unselected inputs or
-    /// captures do not. A reference output that is a derived view is rejected.
+    /// captures do not.
     ///
     /// Before executing the returned program, callers must ensure that reference arguments satisfy the
     /// [allocation independence requirements](Linearization#reference-arguments). The generated program does not
@@ -1836,8 +1843,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::InvalidArgument`] for duplicate or out-of-range indices and
-    /// [`ProgramError::UnsupportedOperation`] for reference outputs that are derived views. Propagates errors from
+    /// Returns [`ProgramError::InvalidArgument`] for duplicate or out-of-range indices. Propagates errors from
     /// tangent-type derivation and the replayed forward-mode rules.
     #[inline]
     pub fn jvp(&self, input_indices: &[usize]) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
@@ -1882,7 +1888,6 @@ where
         &self,
         arguments: &JvpAndLinearizationTransformArguments,
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
-        self.validate_reference_output_views()?;
         let primal_input_count = self.input_ids().len();
         let tangent_input_count = arguments.input_indices.len();
 
@@ -2158,7 +2163,6 @@ where
         &self,
         arguments: &JvpAndLinearizationTransformArguments,
     ) -> Result<Linearization<V, O>, DifferentiationError> {
-        self.validate_reference_output_views()?;
         let primal_input_count = self.input_ids().len();
         let tangent_input_count = arguments.input_indices.len();
 
@@ -2436,33 +2440,6 @@ where
         Linearization::new_with_respect_to(primal_program, tangent_program, residual_count, &arguments.input_indices)
             .map_err(DifferentiationError::from)
     }
-
-    /// Rejects a reference-typed output of this [`Region`] that is a derived view of a reference (i.e., whose alias
-    /// chain contains a [`ReferenceAliasKind::View`](crate::ReferenceAliasKind::View) edge), since supporting such an
-    /// output would require applying the same view to the transformed root. Returned reference views are not currently
-    /// supported. Their tangent outputs would need to preserve the view of the corresponding tangent reference. Return
-    /// the underlying reference and apply the view outside the differentiated program instead. Refer to the
-    /// documentation of [`ReferenceAnalysis::is_view`](crate::ReferenceAnalysis::is_view) for the analysis this
-    /// consults.
-    fn validate_reference_output_views(&self) -> Result<(), DifferentiationError> {
-        // Local reference state does not require this output-boundary check unless a reference actually escapes.
-        if !self.output_ids().iter().any(|output| self.atoms()[output.index()].r#type().is_reference()) {
-            return Ok(());
-        }
-        let analysis = self.reference_analysis_with_configuration(None, true, &[]).map_err(ProgramError::from)?;
-        for (output_index, output_atom) in self.output_ids().iter().copied().enumerate() {
-            if analysis.is_view(ValueId::new(self.id(), output_atom)) {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "output {output_index} is a derived view of a reference and cannot be differentiated; \
-                         return the viewed reference and apply the view outside the differentiated program"
-                    ),
-                }
-                .into());
-            }
-        }
-        Ok(())
-    }
 }
 
 impl<V: Value<Type: DifferentiableType>, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>>
@@ -2513,9 +2490,9 @@ where
     /// type `ref<tangent(T)>`, the reference operations' forward mode differentiation rules propagate tangents through
     /// the referenced state (allocating a tangent reference for every local allocation), and a reference-typed output
     /// has as its tangent output the tangent reference of the input root it forwards or of the local allocation that
-    /// escapes through it. A reference output rooted in a captured (plumbing) reference and an output that is a derived
-    /// view of a reference are rejected. Refer to the documentation of [`RegionRef::jvp`] for the selected-input form
-    /// used by structured operation rules and for these boundary rules.
+    /// escapes through it. A reference output rooted in a captured (plumbing) reference is rejected. Refer to the
+    /// documentation of [`RegionRef::jvp`] for the selected-input form used by structured operation rules and for
+    /// these boundary rules.
     ///
     /// # Reference Arguments
     ///
@@ -3293,21 +3270,21 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArraySliceAxis, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        ConditionOperation, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdate,
+        AddOperation, ConditionOperation, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceSliceOperation, ReferenceWriteOperation, StopGradient, StopGradientOperation,
-        ZeroOperation,
+        ReferenceReadOperation, ReferenceWriteOperation, StopGradient, StopGradientOperation, ZeroOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
         Concretizable, Operation, OperationProvider, ProgramBuilder, ReferenceError, ReferenceType, RegionId,
+        ViewedReference,
     };
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
@@ -3398,13 +3375,17 @@ mod tests {
     }
 
     /// Adds the numeric input to a reference and returns its updated contents.
-    fn add_to_reference<V: ReferenceAddUpdate + ReferenceRead>((reference, x): (V, V)) -> Result<V, ProgramError> {
+    fn add_to_reference<V: ReferenceAddUpdate<ArrayReferenceTransform> + ReferenceRead<ArrayReferenceTransform>>(
+        (reference, x): (V, V),
+    ) -> Result<V, ProgramError> {
         reference.add_update(&x)?;
         reference.read()
     }
 
     /// Adds one reference's contents to another and returns the updated contents.
-    fn add_reference_contents<V: ReferenceAddUpdate + ReferenceRead>(
+    fn add_reference_contents<
+        V: ReferenceAddUpdate<ArrayReferenceTransform> + ReferenceRead<ArrayReferenceTransform>,
+    >(
         (reference, other): (V, V),
     ) -> Result<V, ProgramError> {
         reference.add_update(&other.read()?)?;
@@ -4380,32 +4361,6 @@ mod tests {
     }
 
     #[test]
-    fn test_region_jvp_rejects_reference_view_outputs() {
-        let reference_type = ReferenceType::new(ArrayType::new_static(DataType::F32, [4]));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(reference_type.into());
-        let view = builder
-            .add_instruction(
-                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]),
-                Vec::new(),
-                vec![reference],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![view], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // A derived view output would need the same view applied to the tangent root, which is not supported.
-        assert!(matches!(
-            program.entry_region_ref().jvp(&[0]),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "output 0 is a derived view of a reference and cannot be differentiated; return the \
-                    viewed reference and apply the view outside the differentiated program",
-        ));
-    }
-
-    #[test]
     fn test_region_jvp_shared() {
         // A shared region is differentiated once and reused by every copy of it, which is what removes the repeated
         // re-transformation that programs attaching one shared `condition` branch or `scan` body would otherwise pay.
@@ -4622,32 +4577,6 @@ mod tests {
         assert_eq!(linearization.residual_count(), 0);
         assert!(linearization.tangent().instructions().is_empty());
         assert_eq!(linearization.tangent().output_ids(), linearization.tangent().input_ids());
-    }
-
-    #[test]
-    fn test_region_linearize_rejects_reference_view_outputs() {
-        let reference_type = ReferenceType::new(ArrayType::new_static(DataType::F32, [4]));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(reference_type.into());
-        let view = builder
-            .add_instruction(
-                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]),
-                Vec::new(),
-                vec![reference],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![view], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // The derived-view rejection applies to linearization exactly as it applies to the fused program.
-        assert!(matches!(
-            program.entry_region_ref().linearize(&[0]),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "output 0 is a derived view of a reference and cannot be differentiated; return the \
-                    viewed reference and apply the view outside the differentiated program",
-        ));
     }
 
     #[test]
@@ -5419,6 +5348,48 @@ mod tests {
     }
 
     #[test]
+    fn test_program_linearize_retains_known_view_binding_as_residual() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let root = builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into());
+        let index = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let output = builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(transforms.clone()),
+                Vec::new(),
+                vec![root, index],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let read = &linearization.tangent().instructions()[0];
+        assert_eq!(read.operation().reference_access_descriptor(0).unwrap().transforms(), transforms.as_slice());
+        assert_eq!(read.inputs(), linearization.tangent().input_ids());
+        let primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                TestValue::Reference(ArrayReference::new(Array::vector(vec![1f32, 2., 3.]).unwrap())),
+                TestValue::Array(Array::scalar(1i32).unwrap()),
+            ])
+            .unwrap();
+        assert_eq!(
+            primal_outputs,
+            vec![TestValue::Array(Array::scalar(2f32).unwrap()), TestValue::Array(Array::scalar(1i32).unwrap()),]
+        );
+        assert_eq!(
+            linearization.tangent().interpret(vec![
+                TestValue::Reference(ArrayReference::new(Array::vector(vec![4f32, 5., 6.]).unwrap())),
+                primal_outputs[1].clone(),
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar(5f32).unwrap())])
+        );
+    }
+
+    #[test]
     fn test_program_linearize_dynamic_reference_preserves_access_order() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
         let reference_type =
@@ -5730,6 +5701,36 @@ mod tests {
     }
 
     #[test]
+    fn test_forward_mode_differentiate_jvp_captures_view_root_and_binding() {
+        let reference = TestValue::Reference(ArrayReference::new(Array::vector(vec![1f32, 2., 3.]).unwrap()));
+        let index = TestValue::Array(Array::scalar(-1i32).unwrap());
+        let input = TestValue::Array(Array::scalar(5f32).unwrap());
+        let result = differentiate_at(input).with_captures((reference.clone(), index)).jvp(
+            TestValue::Array(Array::scalar(7f32).unwrap()),
+            |input, (root, index)| {
+                let viewed = ViewedReference::new(root)?.with_transform(
+                    ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+                    vec![index],
+                )?;
+                let selected = viewed.read()?;
+                Ok(input
+                    .dispatch_domain()
+                    .bind(
+                        TestOperation::Array(ArrayOperation::Add(AddOperation::new())),
+                        Vec::new(),
+                        &[input, selected],
+                    )?
+                    .remove(0))
+            },
+        );
+        assert_eq!(
+            result,
+            Ok((TestValue::Array(Array::scalar(8f32).unwrap()), TestValue::Array(Array::scalar(7f32).unwrap())))
+        );
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![1f32, 2., 3.]).unwrap())));
+    }
+
+    #[test]
     fn test_forward_mode_differentiate_jvp_rejects_aliased_reference_inputs() {
         // The canonical boundary validator runs on the concrete inputs before any tracer exists, so the same allocation
         // at two input positions is rejected before the differentiation context could observe it.
@@ -6005,6 +6006,37 @@ mod tests {
         assert_eq!(value, Array::scalar(4.0).unwrap());
         assert_eq!(pushforward.apply(Array::scalar(1.0).unwrap()), Ok(Array::scalar(4.0).unwrap()));
         assert_eq!(pushforward.apply(Array::scalar(3.0).unwrap()), Ok(Array::scalar(12.0).unwrap()));
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_linearize_captures_view_root_and_binding() {
+        let reference = TestValue::Reference(ArrayReference::new(Array::vector(vec![1f32, 2., 3.]).unwrap()));
+        let index = TestValue::Array(Array::scalar(-1i32).unwrap());
+        let input = TestValue::Array(Array::scalar(5f32).unwrap());
+        let (primal, pushforward) = differentiate_at(input)
+            .with_captures((reference.clone(), index))
+            .linearize(|input, (root, index)| {
+                let viewed = ViewedReference::new(root)?.with_transform(
+                    ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+                    vec![index],
+                )?;
+                let selected = viewed.read()?;
+                Ok(input
+                    .dispatch_domain()
+                    .bind(
+                        TestOperation::Array(ArrayOperation::Add(AddOperation::new())),
+                        Vec::new(),
+                        &[input, selected],
+                    )?
+                    .remove(0))
+            })
+            .unwrap();
+        assert_eq!(primal, TestValue::Array(Array::scalar(8f32).unwrap()));
+        assert_eq!(
+            pushforward.apply(TestValue::Array(Array::scalar(7f32).unwrap())),
+            Ok(TestValue::Array(Array::scalar(7f32).unwrap()))
+        );
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![1f32, 2., 3.]).unwrap())));
     }
 
     #[test]

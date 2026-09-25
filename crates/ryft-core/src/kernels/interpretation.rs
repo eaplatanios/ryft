@@ -41,7 +41,7 @@ use num_complex::Complex;
 use thiserror::Error;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceView,
+    Array, ArrayAddressing, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
     ArraySliceAxis, ArrayType, DataType, DimensionValue,
 };
 use crate::contexts::{Context, Domain, EagerContext, ValueResolution};
@@ -57,7 +57,7 @@ use crate::kernels::validation::KernelParameterAccess;
 use crate::operations::Zero;
 use crate::programs::{
     BindingRegionDriver, Operation, ProgramError, Provenance, ProvenanceScope, ProvenanceState, ReferenceAccessMode,
-    ReferenceId, RegionDriver, RegionRef, TypeError, Typed,
+    ReferenceId, RegionDriver, RegionRef, TypeError, Typed, validated_reference_access_descriptors,
 };
 
 /// Host debugging limits exceeded while replaying a kernel; these limits do not alter its device semantics.
@@ -440,13 +440,13 @@ impl KernelCallOperation {
                         .mapping()
                         .evaluate(&mapping_inputs, shape.dimensions())
                         .map_err(ProgramError::custom)?;
-                    let source = root.with_transform(window.valid_view().clone())?;
+                    let source = root.with_transform(window.valid_transform().clone())?;
                     let reference = if parameter.mapping().boundary_policy() == BoundaryPolicy::Masked {
                         let ArrayIrType::Reference(body_type) = parameter.body_type() else { unreachable!() };
                         let tile_type = body_type.referent();
                         let tile = ArrayReference::new(array_context.zero(tile_type)?);
                         let valid_shape = source.r#type().referent().static_shape().unwrap();
-                        let selected = tile.with_transform(ArrayReferenceView::Slice {
+                        let selected = tile.with_transform(ArrayReferenceTransform::Slice {
                             axes: valid_shape
                                 .dimensions()
                                 .iter()
@@ -675,7 +675,7 @@ impl<Extension: Operation<Type = ArrayIrType>> QualifiedKernelContext<Extension>
             return Ok(None);
         };
         let mut selected = validity.clone();
-        for view in reference.view().views() {
+        for view in reference.path().transforms() {
             selected = selected.with_transform(view.clone())?;
         }
         selected.read().map(Some)
@@ -704,14 +704,27 @@ where
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         let operation = operation.into();
+        // Qualification and diagnostics inspect the same selection that ordinary access interpretation will apply.
+        // Keep the original inputs for that interpretation so paths are never applied twice.
+        let mut selected_references = BTreeMap::new();
+        for (input_index, descriptor) in
+            validated_reference_access_descriptors(&operation, inputs.len())?.iter().enumerate()
+        {
+            let (Some(descriptor), Some(ArrayIrValue::Reference(reference))) = (descriptor, inputs.get(input_index))
+            else {
+                continue;
+            };
+            selected_references
+                .insert(input_index, reference.with_transforms(descriptor.transforms(), &inputs[descriptor.bindings()])?);
+        }
         if let Some(trace) = &self.trace {
             let mut trace = trace.borrow_mut();
             let mut accesses = Vec::new();
             for (input, mode) in operation.effects().accesses() {
-                if let Some(ArrayIrValue::Reference(reference)) = inputs.get(input) {
+                if let Some(reference) = selected_references.get(&input) {
                     let next = trace.roots.len();
                     let root = *trace.roots.entry(reference.id()).or_insert(next);
-                    let view = reference.view().views().map(|view| format!("/{view:?}")).collect();
+                    let view = reference.path().transforms().map(|view| format!("/{view:?}")).collect();
                     accesses.push(KernelTraceAccess { input, mode, root, view });
                 }
             }
@@ -751,7 +764,7 @@ where
                     &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
                     &driver.regions().map(|region| region.interface()).collect::<Vec<_>>(),
                 )?;
-                let ArrayIrValue::Reference(reference) = &inputs[0] else { unreachable!() };
+                let reference = selected_references.get(&0).unwrap();
                 if let Some(validity) = self.window_validity(reference)? {
                     let ArrayIrValue::Array(mask) = &inputs[mask_index] else { unreachable!() };
                     let lanes = mask
@@ -773,7 +786,7 @@ where
                 // read-modify-write must never expose physical padding as initialized operand data.
                 for (input_index, mode) in operation.effects().accesses() {
                     if mode != ReferenceAccessMode::Write
-                        && let Some(ArrayIrValue::Reference(reference)) = inputs.get(input_index)
+                        && let Some(reference) = selected_references.get(&input_index)
                         && let Some(validity) = self.window_validity(reference)?
                         && validity.elements::<bool>()?.iter().any(|valid| !valid)
                     {
@@ -789,8 +802,8 @@ where
                         &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
                         &[],
                     )?;
-                    let ArrayIrValue::Reference(source) = &inputs[0] else { unreachable!() };
-                    let ArrayIrValue::Reference(destination) = &inputs[1] else { unreachable!() };
+                    let source = selected_references.get(&0).unwrap();
+                    let destination = selected_references.get(&1).unwrap();
                     let source = source.read()?;
                     self.check_nans(operation.name(), "input", &[ArrayIrValue::Array(source.clone())])?;
                     let token = ArrayReference::new(Array::new(ArrayType::scalar(DataType::Token), vec![])?);
@@ -891,7 +904,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, Layout, Memory, StridedLayout,
+        ArrayIrOperation, ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
+        Layout, Memory, StridedLayout,
     };
     use crate::contexts::Context;
     use crate::kernels::authoring::whole_array_parameter;
@@ -907,7 +921,7 @@ mod tests {
     };
     use crate::operations::{
         AddOperation, ConditionOperation, DimensionMulOperation, DimensionToScalarOperation, ReduceOperation,
-        ReductionKind, ReferenceIndexOperation, ReferenceRead, ReferenceWrite, ScaledDotOperation, WhileOperation,
+        ReductionKind, ReferenceRead, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
@@ -1153,8 +1167,13 @@ mod tests {
             let value = context
                 .bind(ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation), vec![], &coordinates)?
                 .remove(0);
-            let output = context.bind(ReferenceIndexOperation::new(0, 0), vec![], &references)?.remove(0);
-            output.write(&value)
+            context.bind(
+                ReferenceWriteOperation::new()
+                    .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]),
+                vec![],
+                &[references[0].clone(), value],
+            )?;
+            Ok(())
         })
         .unwrap();
         assert_eq!(definition.interpret(vec![], 4), Ok(vec![Array::vector(vec![0i64, 1, 2, 3]).unwrap()]));
@@ -1251,8 +1270,9 @@ mod tests {
         .unwrap();
         let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _coordinates)| {
             let context = references[0].context();
-            let token =
-                context.bind(AsyncCopyOperation, vec![], &[references[0].clone(), references[1].clone()])?.remove(0);
+            let token = context
+                .bind(AsyncCopyOperation::new(), vec![], &[references[0].clone(), references[1].clone()])?
+                .remove(0);
             context.bind(WaitOperation, vec![], &[token])?;
             Ok(())
         })
@@ -1293,9 +1313,10 @@ mod tests {
             let context = references[0].context();
             let mask = context.lift(ArrayIrValue::Array(Array::matrix(2, 2, vec![true; 4])?))?;
             let other = context.lift(ArrayIrValue::Array(Array::matrix(2, 2, vec![-7i32; 4])?))?;
-            let value =
-                context.bind(MaskedLoadOperation, vec![], &[references[0].clone(), mask.clone(), other])?.remove(0);
-            context.bind(MaskedStoreOperation, vec![], &[references[1].clone(), value, mask])?;
+            let value = context
+                .bind(MaskedLoadOperation::new(), vec![], &[references[0].clone(), mask.clone(), other])?
+                .remove(0);
+            context.bind(MaskedStoreOperation::new(), vec![], &[references[1].clone(), value, mask])?;
             Ok(())
         })
         .unwrap();
@@ -1329,7 +1350,8 @@ mod tests {
             let context = references[0].context();
             let mask = context.lift(ArrayIrValue::Array(Array::vector(vec![true, false, true, true])?))?;
             let other = context.lift(ArrayIrValue::Array(Array::vector(vec![7i32; 4])?))?;
-            let value = context.bind(MaskedLoadOperation, vec![], &[references[0].clone(), mask, other])?.remove(0);
+            let value =
+                context.bind(MaskedLoadOperation::new(), vec![], &[references[0].clone(), mask, other])?.remove(0);
             references[1].write(&value)
         })
         .unwrap();
@@ -1357,7 +1379,7 @@ mod tests {
             let replacement = context.lift(ArrayIrValue::Array(Array::vector(vec![9i32, 10, 11, 12])?))?;
             let other = context.lift(ArrayIrValue::Array(Array::vector(vec![-1i32; 4])?))?;
             let old = context
-                .bind(MaskedSwapOperation, vec![], &[references[0].clone(), replacement, mask, other])?
+                .bind(MaskedSwapOperation::new(), vec![], &[references[0].clone(), replacement, mask, other])?
                 .remove(0);
             references[1].write(&old)
         })
@@ -1621,7 +1643,7 @@ mod tests {
         let destination = ArrayReference::new(Array::vector(vec![0i32, 0]).unwrap());
         let token = context
             .bind(
-                AsyncCopyOperation,
+                AsyncCopyOperation::new(),
                 vec![],
                 &[ArrayIrValue::Reference(source), ArrayIrValue::Reference(destination.clone())],
             )
@@ -1637,6 +1659,74 @@ mod tests {
             Some(&KernelInterpretationError::UnknownCopyToken { token: reference.id() }),
         );
         assert_eq!(error.to_string(), "async copy completion token is unknown or already consumed");
+    }
+
+    #[test]
+    fn test_qualified_kernel_context_async_completion_transforms() {
+        let context = QualifiedKernelContext::<NoKernelExtension> {
+            eager: EagerContext::new(),
+            validity: BTreeMap::new(),
+            coordinate: vec![],
+            maximum_steps: 10,
+            remaining_steps: Rc::new(Cell::new(10)),
+            provenance: Rc::new(ProvenanceState::new()),
+            trace: None,
+            pending_copies: Rc::new(RefCell::new(BTreeMap::new())),
+        };
+        let source = ArrayReference::new(Array::matrix(2, 2, vec![1i32, 2, 11, 13]).unwrap());
+        let destination = ArrayReference::new(Array::matrix(3, 2, vec![0i32; 6]).unwrap());
+        let operation = AsyncCopyOperation::new()
+            .with_source_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }])
+            .with_destination_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic,
+            }]);
+        let token = context
+            .bind(
+                operation,
+                vec![],
+                &[
+                    ArrayIrValue::Reference(source),
+                    ArrayIrValue::Reference(destination.clone()),
+                    ArrayIrValue::Array(Array::scalar(1i64).unwrap()),
+                    ArrayIrValue::Array(Array::scalar(2i64).unwrap()),
+                ],
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(destination.read(), Ok(Array::matrix(3, 2, vec![0i32; 6]).unwrap()));
+        assert_eq!(context.bind(WaitOperation, vec![], &[token]), Ok(vec![]));
+        assert_eq!(destination.read(), Ok(Array::matrix(3, 2, vec![0i32, 0, 0, 0, 11, 13]).unwrap()));
+    }
+
+    #[test]
+    fn test_qualified_kernel_context_masked_views_project_validity() {
+        let reference = ArrayReference::new(Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap());
+        let validity = ArrayReference::new(Array::matrix(2, 2, vec![false, false, true, false]).unwrap());
+        let context = QualifiedKernelContext::<NoKernelExtension> {
+            eager: EagerContext::new(),
+            validity: BTreeMap::from([(reference.id(), validity)]),
+            coordinate: vec![],
+            maximum_steps: 10,
+            remaining_steps: Rc::new(Cell::new(10)),
+            provenance: Rc::new(ProvenanceState::new()),
+            trace: None,
+            pending_copies: Rc::new(RefCell::new(BTreeMap::new())),
+        };
+        let operation = MaskedLoadOperation::new()
+            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }]);
+        assert_eq!(
+            context.bind(
+                operation,
+                vec![],
+                &[
+                    ArrayIrValue::Reference(reference),
+                    ArrayIrValue::Array(Array::vector(vec![true, true]).unwrap()),
+                    ArrayIrValue::Array(Array::vector(vec![-1i32, -2]).unwrap()),
+                ]
+            ),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![3i32, -2]).unwrap())])
+        );
     }
 
     #[test]

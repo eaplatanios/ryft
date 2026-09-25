@@ -667,16 +667,14 @@ pub(crate) mod tests {
         for effect in
             [EffectClass::OrderedIo, EffectClass::DeviceOrderedIo, EffectClass::UnorderedIo, EffectClass::OrderedState]
         {
-            loaded.effects = Effects::new(EffectClasses::single(effect), vec![], vec![]).unwrap().summary();
+            loaded.effects = Effects::new(EffectClasses::single(effect), vec![]).unwrap().summary();
             assert!(matches!(
                 loaded.validate_distributed_effects(),
                 Err(KernelAotError::Embedding(KernelEmbeddingError::UnsupportedEffect { effect: actual }))
                     if actual == effect,
             ));
         }
-        loaded.effects = Effects::new(EffectClasses::single(EffectClass::OrderedAssertion), vec![], vec![])
-            .unwrap()
-            .summary();
+        loaded.effects = Effects::new(EffectClasses::single(EffectClass::OrderedAssertion), vec![]).unwrap().summary();
         assert!(loaded.validate_distributed_effects().is_ok());
     }
 }

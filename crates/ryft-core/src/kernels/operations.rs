@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
 use crate::arrays::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceView, ArrayType,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayType,
     DimensionOperation, DimensionType, DimensionValue,
 };
 use crate::contexts::{Context, Domain};
@@ -22,8 +22,7 @@ use crate::kernels::memory::{
 use crate::kernels::validation::KernelReferenceOperation;
 use crate::operations::{
     ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation,
-    ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
     ReferenceSwapOperation, ReferenceWriteOperation,
 };
 use crate::partial::{
@@ -31,7 +30,7 @@ use crate::partial::{
 };
 use crate::programs::{
     Effects, InputRegionProvenance, Operation, OperationProjection, OutputRegionProvenance, ProgramError,
-    ReferenceAccessMode, ReferenceViewOperation, ReferenceViewValidationError, RegionInterface, RegionSlot, Type,
+    ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, RegionInterface, RegionSlot, Type,
     TypeError, TypeIdentityRenaming,
 };
 
@@ -65,7 +64,7 @@ pub enum KernelExtensionMemory {
 ///
 /// Implementations are trusted semantic contracts, not target admission. A compiler must still validate the exact
 /// architecture, instruction capabilities, and resource requirements before compiling an extension.
-pub trait KernelExtension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView> {
+pub trait KernelExtension: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform> {
     /// Returns the checked initialization timing and lifetime contract for this operation.
     ///
     /// The verifier checks consistency with canonical effects, output referents, and completion-token types. Nested
@@ -135,28 +134,26 @@ impl<C: Domain> InterpretableOperation<C> for NoKernelExtension {
     }
 }
 
-impl ReferenceViewOperation for NoKernelExtension {
-    type View = ArrayReferenceView;
+impl ReferenceAccessOperation for NoKernelExtension {
+    type Transform = ArrayReferenceTransform;
 
-    fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
+    fn base_input_count(&self) -> usize {
         match *self {}
     }
 
-    fn validate_reference_view(
-        view: &ArrayReferenceView,
-        source: &ArrayIrType,
-        target: &ArrayIrType,
-    ) -> Result<(), ReferenceViewValidationError> {
-        view.validate(source, target)
+    fn reference_access_descriptor(
+        &self,
+        _input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+        match *self {}
     }
 
-    fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-        _context: &C,
-        _view: &ArrayReferenceView,
-        _source: C::Value,
-        _symbols: &[C::Value],
-    ) -> Result<C::Value, ProgramError> {
-        Err(ProgramError::MalformedProgram("an empty extension family cannot construct reference views".to_owned()))
+    fn with_reference_access_transforms(
+        &self,
+        _input_index: usize,
+        _views: Vec<ArrayReferenceTransform>,
+    ) -> Result<Self, ProgramError> {
+        match *self {}
     }
 }
 
@@ -512,42 +509,67 @@ where
     }
 }
 
-impl<Extension> ReferenceViewOperation for KernelOperation<Extension>
+impl<Extension> ReferenceAccessOperation for KernelOperation<Extension>
 where
-    Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>,
+    Extension: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform>,
 {
-    type View = ArrayReferenceView;
+    type Transform = ArrayReferenceTransform;
 
-    fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
+    fn base_input_count(&self) -> usize {
         match self {
-            Self::Portable(operation) => operation.reference_view(output_index),
-            Self::Call(_)
-            | Self::Scratch(_)
-            | Self::TileLoad(_)
-            | Self::AsyncCopy(_)
-            | Self::Wait(_)
-            | Self::MaskedLoad(_)
-            | Self::MaskedStore(_)
-            | Self::MaskedSwap(_) => None,
-            Self::Extension(operation) => operation.reference_view(output_index),
+            Self::Portable(operation) => operation.base_input_count(),
+            Self::Call(operation) => operation.input_types().len(),
+            Self::Scratch(_) => 0,
+            Self::TileLoad(operation) => operation.base_input_count(),
+            Self::AsyncCopy(operation) => operation.base_input_count(),
+            Self::Wait(_) => 1,
+            Self::MaskedLoad(operation) => operation.base_input_count(),
+            Self::MaskedStore(operation) => operation.base_input_count(),
+            Self::MaskedSwap(operation) => operation.base_input_count(),
+            Self::Extension(operation) => operation.base_input_count(),
         }
     }
 
-    fn validate_reference_view(
-        view: &ArrayReferenceView,
-        source: &ArrayIrType,
-        target: &ArrayIrType,
-    ) -> Result<(), ReferenceViewValidationError> {
-        view.validate(source, target)
+    fn reference_access_descriptor(
+        &self,
+        input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+        match self {
+            Self::Portable(operation) => operation.reference_access_descriptor(input_index),
+            Self::Call(_) | Self::Scratch(_) => None,
+            Self::TileLoad(operation) => operation.reference_access_descriptor(input_index),
+            Self::AsyncCopy(operation) => operation.reference_access_descriptor(input_index),
+            Self::Wait(_) => (input_index == 0).then(|| ReferenceAccessDescriptor::new(&[], 1..1)),
+            Self::MaskedLoad(operation) => operation.reference_access_descriptor(input_index),
+            Self::MaskedStore(operation) => operation.reference_access_descriptor(input_index),
+            Self::MaskedSwap(operation) => operation.reference_access_descriptor(input_index),
+            Self::Extension(operation) => operation.reference_access_descriptor(input_index),
+        }
     }
 
-    fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-        context: &C,
-        view: &ArrayReferenceView,
-        source: C::Value,
-        symbols: &[C::Value],
-    ) -> Result<C::Value, ProgramError> {
-        view.reapply(context, source, symbols)
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<ArrayReferenceTransform>,
+    ) -> Result<Self, ProgramError> {
+        Ok(match self {
+            Self::Portable(operation) => Self::Portable(operation.with_reference_access_transforms(input_index, transforms)?),
+            Self::TileLoad(operation) => Self::TileLoad(operation.with_reference_access_transforms(input_index, transforms)?),
+            Self::AsyncCopy(operation) => Self::AsyncCopy(operation.with_reference_access_transforms(input_index, transforms)?),
+            Self::MaskedLoad(operation) => Self::MaskedLoad(operation.with_reference_access_transforms(input_index, transforms)?),
+            Self::MaskedStore(operation) => {
+                Self::MaskedStore(operation.with_reference_access_transforms(input_index, transforms)?)
+            }
+            Self::MaskedSwap(operation) => Self::MaskedSwap(operation.with_reference_access_transforms(input_index, transforms)?),
+            Self::Extension(operation) => Self::Extension(operation.with_reference_access_transforms(input_index, transforms)?),
+            Self::Wait(_) if input_index == 0 && transforms.is_empty() => self.clone(),
+            _ => {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "operation `{}` does not support the requested views at input {input_index}",
+                    self.name(),
+                )));
+            }
+        })
     }
 }
 
@@ -571,19 +593,17 @@ kernel_operation_from!(
     DimensionSizeOperation,
     DynamicBroadcastOperation,
     ReferenceNewOperation<ArrayType, ArrayIrType>,
-    ReferenceReadOperation<ArrayType, ArrayIrType>,
-    ReferenceWriteOperation<ArrayType, ArrayIrType>,
-    ReferenceSwapOperation<ArrayType, ArrayIrType>,
-    ReferenceAddUpdateOperation<ArrayType, ArrayIrType>,
-    ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>,
+    ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
+    ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
+    ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
+    ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
+    ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
     ReferenceFreezeOperation<ArrayType, ArrayIrType>,
-    ReferenceIndexOperation,
-    ReferenceDynamicIndexOperation,
-    ReferenceSliceOperation,
 );
 
-impl<Extension: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView>> KernelReferenceOperation
-    for KernelOperation<Extension>
+impl<Extension> KernelReferenceOperation for KernelOperation<Extension>
+where
+    Extension: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform>,
 {
     fn swap_output_index(&self) -> Option<usize> {
         match self {
@@ -652,7 +672,7 @@ impl<Extension: Operation<Type = ArrayIrType>> OperationProjection<DimensionType
 }
 
 impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<Extension>>
-    for &'o ReferenceSwapOperation<ArrayType, ArrayIrType>
+    for &'o ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>
 {
     type Error = TypeError;
 
@@ -681,7 +701,7 @@ impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<E
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrValue, DataType};
+    use crate::arrays::{ArrayIrValue, ArrayReferenceTransformIndex, DataType};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{AddOperation, ReferenceRead, ReferenceSwap};
     use crate::programs::{EmptyRegionDriver, ReferenceType};
@@ -761,22 +781,16 @@ mod tests {
     }
 
     #[test]
-    fn test_kernel_operation_reference_view() {
-        let canonical = ArrayIrOperation::<Array>::from(ReferenceIndexOperation::new(0, 1));
+    fn test_kernel_operation_reference_access_descriptor() {
+        let view = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) };
+        let canonical = ArrayIrOperation::<Array>::from(ReferenceReadOperation::new().with_transforms(vec![view.clone()]));
         let operation: KernelOperation = KernelOperation::from(canonical.clone());
-        assert_eq!(operation.reference_view(0), canonical.reference_view(0));
-        assert_eq!(operation.reference_view(1), None);
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().transforms(), &[view]);
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 1..1);
+        assert!(operation.reference_access_descriptor(1).is_none());
         assert_eq!(operation.effects(), canonical.effects());
         let source = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
-        let target = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        assert_eq!(
-            KernelOperation::<NoKernelExtension>::validate_reference_view(
-                &operation.reference_view(0).unwrap(),
-                &source,
-                &target,
-            ),
-            Ok(()),
-        );
+        let target = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         assert_eq!(operation.infer_output_types(&[source], &[]), Ok(vec![target]));
     }
 
@@ -789,7 +803,7 @@ mod tests {
         reference.swap(&value).unwrap();
         let builder = context.builder().borrow();
         let swap = builder.instructions()[1].operation();
-        let projected = <&ReferenceSwapOperation<ArrayType, ArrayIrType>>::try_from(swap).unwrap();
+        let projected = <&ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>::try_from(swap).unwrap();
         assert_eq!(projected.name(), "reference_swap");
         assert!(matches!(swap, KernelOperation::Portable(ArrayIrOperation::ReferenceSwap(_))));
         assert_eq!(swap.effects(), projected.effects());
@@ -828,28 +842,26 @@ mod tests {
             }
         }
 
-        impl ReferenceViewOperation for UnavailableExtension {
-            type View = ArrayReferenceView;
+        impl ReferenceAccessOperation for UnavailableExtension {
+            type Transform = ArrayReferenceTransform;
 
-            fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
+            fn base_input_count(&self) -> usize {
+                0
+            }
+
+            fn reference_access_descriptor(
+                &self,
+                _input_index: usize,
+            ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
                 None
             }
 
-            fn validate_reference_view(
-                view: &ArrayReferenceView,
-                source: &ArrayIrType,
-                target: &ArrayIrType,
-            ) -> Result<(), ReferenceViewValidationError> {
-                view.validate(source, target)
-            }
-
-            fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-                _context: &C,
-                _view: &ArrayReferenceView,
-                _source: C::Value,
-                _symbols: &[C::Value],
-            ) -> Result<C::Value, ProgramError> {
-                Err(ProgramError::UnsupportedOperation { message: "extension has no reference views".to_owned() })
+            fn with_reference_access_transforms(
+                &self,
+                _input_index: usize,
+                _views: Vec<ArrayReferenceTransform>,
+            ) -> Result<Self, ProgramError> {
+                Err(ProgramError::UnsupportedOperation { message: "extension has no reference accesses".to_owned() })
             }
         }
 
@@ -875,7 +887,8 @@ mod tests {
             Err(ProgramError::MalformedProgram("extension has no registered interpreter".to_owned())),
         );
         assert_eq!(
-            <&ReferenceSwapOperation<ArrayType, ArrayIrType>>::try_from(&operation).map(|swap| swap.name()),
+            <&ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>::try_from(&operation)
+                .map(|swap| swap.name()),
             Err(TypeError::invalid(
                 "cannot project extension operation `unavailable_extension` into a canonical reference swap",
             )),

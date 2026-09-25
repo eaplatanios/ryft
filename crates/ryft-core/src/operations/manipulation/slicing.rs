@@ -4,8 +4,9 @@ use std::marker::PhantomData;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayIrValue, ArraySliceAxis, ArrayType, ArrayTypeRefinements, DataType, Dimension, DimensionType,
-    DimensionValue, LinearResiduals, MeshAxisType, Shape, Sharding, ShardingDimension, StaticShape,
+    ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType, ArrayTypeRefinements, DataType,
+    Dimension, DimensionType, DimensionValue, LinearResiduals, MeshAxisType, Shape, Sharding, ShardingDimension,
+    StaticShape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -49,9 +50,7 @@ use crate::operations::manipulation::scattering::{
 };
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
-use crate::operations::references::{
-    ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceWriteOperation,
-};
+use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -510,8 +509,7 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> MemberTrans
 where
     V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     O: From<AddOperation<ArrayIrType>>
-        + From<ReferenceSliceOperation>
-        + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>
+        + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + OperationProjection<
             ArrayType,
             Projected: TransposableOperation<
@@ -532,22 +530,23 @@ where
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
 
-        if let Some(reference) = accumulators[0].reference(context)? {
+        if self.strides().iter().all(|stride| *stride == 1)
+            && let Some(reference) = accumulators[0].reference(context)?
+        {
             if let MaybeZero::Value(cotangent) = &outputs[0] {
-                // A reference slice describes the same coordinates as the array slice, including empty selections and
-                // non-unit strides. Updating its view adds only the selected entries, without padding a dense gradient
-                // with zeros or reading and replacing the caller's whole buffer.
+                // Unit-stride slices update only their selected coordinates. Strided slices use the ordinary member
+                // transpose below, whose dense contribution preserves coordinates unsupported by reference views.
                 let axes = self
                     .start_indices()
                     .iter()
                     .zip(self.limit_indices())
-                    .zip(self.strides())
-                    .map(|((&start, &limit), &stride)| {
-                        ArraySliceAxis::new(start, (limit - start).div_ceil(stride), stride)
-                    })
+                    .map(|(&start, &limit)| ArraySliceAxis::new(start, limit - start, 1))
                     .collect();
-                let reference = context.bind(ReferenceSliceOperation::new(axes), Vec::new(), &[reference])?.remove(0);
-                context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[reference, cotangent.clone()])?;
+                context.bind(
+                    ReferenceAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Slice { axes }]),
+                    Vec::new(),
+                    &[reference, cotangent.clone()],
+                )?;
             }
             return Ok(());
         }
@@ -2027,8 +2026,8 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> MemberTrans
 where
     V: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     O: From<AddOperation<ArrayIrType>>
-        + From<ReferenceReadOperation<ArrayType, ArrayIrType>>
-        + From<ReferenceWriteOperation<ArrayType, ArrayIrType>>
+        + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+        + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
         + OperationProjection<
             ArrayType,
             Projected: TransposableOperation<
@@ -5208,10 +5207,8 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[3], %2:ref<f64[5]> .
-                let %3:ref<f64[3]> = reference_slice [axes=[ArraySliceAxis { start: 2, size: 3, stride: 1 }]] %2
-                    () = reference_add_update %3 %1
-                    %4:ref<f64[3]> = reference_slice [axes=[ArraySliceAxis { start: 1, size: 3, stride: 1 }]] %2
-                    () = reference_add_update %4 %0
+                let () = reference_add_update [transforms=[slice(axes=[2:5])]] %2 %1
+                    () = reference_add_update [transforms=[slice(axes=[1:4])]] %2 %0
                 in ()
             "}
             .trim_end(),
@@ -5237,6 +5234,34 @@ mod tests {
             returned.interpret(seeds.to_vec()),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 6.0, 8.0, 6.0]).unwrap())]),
         );
+    }
+
+    #[test]
+    fn test_slice_transposition_array_ir_strided() {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F64, [5]).into());
+        let output = builder
+            .add_instruction(
+                ArrayOperation::Slice(SliceOperation::new(vec![0], vec![5]).with_strides(vec![2]).unwrap()),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        let buffer = ArrayIrValue::Array(Array::vector(vec![10f64; 5]).unwrap()).reference_new().unwrap();
+        let seed = ArrayIrValue::Array(Array::vector(vec![1f64, 2.0, 3.0]).unwrap());
+        assert_eq!(pullback.interpret(vec![seed.clone(), buffer.clone()]), Ok(vec![]));
+        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![11f64, 10.0, 12.0, 10.0, 13.0]).unwrap())));
+        assert_eq!(pullback.interpret(vec![seed, buffer.clone()]), Ok(vec![]));
+        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![12f64, 10.0, 14.0, 10.0, 16.0]).unwrap())));
     }
 
     #[test]

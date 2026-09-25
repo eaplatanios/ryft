@@ -3,7 +3,7 @@
 use ryft_core::kernels::memory::ASYNC_COPY_OPERATION_NAME;
 use ryft_core::kernels::{KernelExtension, KernelOperation, KernelParameterAccess, VerifiedKernel};
 use ryft_core::{
-    ArrayAddressing, ArrayIrOperation, ArrayReferenceView, ArraySliceAxis, ArrayType, DataType, Operation, Typed,
+    ArrayAddressing, ArrayIrOperation, ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, Operation, Typed,
     ValueId,
 };
 use ryft_mlir::dialects::{arith, llvm, memref, nvgpu, nvvm, scf};
@@ -130,13 +130,7 @@ pub(super) fn validate_async_copies<'o, Extension: 'o + KernelExtension>(
             KernelOperation::AsyncCopy(_) => pending = true,
             KernelOperation::Wait(_) => pending = false,
             KernelOperation::Scratch(_)
-            | KernelOperation::Portable(
-                ArrayIrOperation::Dimension(_)
-                | ArrayIrOperation::DimensionSize(_)
-                | ArrayIrOperation::ReferenceIndex(_)
-                | ArrayIrOperation::ReferenceSlice(_)
-                | ArrayIrOperation::ReferenceDynamicIndex(_),
-            ) => {}
+            | KernelOperation::Portable(ArrayIrOperation::Dimension(_) | ArrayIrOperation::DimensionSize(_)) => {}
             _ if pending => {
                 return Err(Error::Unsupported {
                     operation: operation.name(),
@@ -186,14 +180,14 @@ impl<'c, 't> Lowering<'c, 't> {
         }
         for reference in [source, destination] {
             let root_shape = reference.buffer.r#type.static_shape().unwrap();
-            let full_view = ArrayReferenceView::Slice {
+            let full_view = ArrayReferenceTransform::Slice {
                 axes: root_shape.dimensions().iter().map(|extent| ArraySliceAxis::new(0, *extent, 1)).collect(),
             };
             let expected_strides = (0..reference.shape.len())
                 .map(|axis| reference.shape[axis + 1..].iter().product::<usize>())
                 .collect::<Vec<_>>();
             if reference.shape != root_shape.dimensions()
-                || reference.static_view.as_ref() != Some(&full_view)
+                || reference.static_transform.as_ref() != Some(&full_view)
                 || reference.strides != expected_strides
                 || reference.predicate.is_some()
             {
@@ -216,7 +210,7 @@ impl<'c, 't> Lowering<'c, 't> {
                     axes[axis] = ArraySliceAxis::new(remaining % source.shape[axis], 1, 1);
                     remaining /= source.shape[axis];
                 }
-                let view = ArrayReferenceView::Slice { axes };
+                let view = ArrayReferenceTransform::Slice { axes };
                 self.record_synchronization(
                     None,
                     thread,
@@ -281,8 +275,8 @@ impl<'c, 't> Lowering<'c, 't> {
             0,
             SynchronizationEvent::TmaCopy {
                 barrier: owner,
-                source: (source.buffer.owner, source.static_view.clone().unwrap()),
-                destination: (destination.buffer.owner, destination.static_view.clone().unwrap()),
+                source: (source.buffer.owner, source.static_transform.clone().unwrap()),
+                destination: (destination.buffer.owner, destination.static_transform.clone().unwrap()),
             },
         )?;
         self.tma_leader(block, |lowering, body| {
@@ -485,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_validate_async_copies() {
-        let copy: KernelOperation = KernelOperation::AsyncCopy(AsyncCopyOperation);
+        let copy: KernelOperation = KernelOperation::AsyncCopy(AsyncCopyOperation::new());
         let wait = KernelOperation::Wait(WaitOperation);
         let compute = KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Constant(
             ConstantOperation::new(Array::vector(vec![1i32]).unwrap()),

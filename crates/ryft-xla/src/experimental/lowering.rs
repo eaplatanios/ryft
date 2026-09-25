@@ -621,11 +621,10 @@ where
 }
 
 /// Returns `true` if `program` contains a reference-typed atom or an [`Operation`] whose [effects](Operation::effects)
-/// declare a [`ReferenceEffect`](ryft_core::ReferenceEffect) or [`ReferenceAlias`](ryft_core::ReferenceAlias) in any
-/// region.
+/// declare a [`ReferenceEffect`](ryft_core::ReferenceEffect) in any region.
 ///
 /// This check is independent from [`contains_unresolved_state`]: a pure reference pass-through or forwarded
-/// reference capture can carry reference declarations without executing a stateful instruction. Both predicates back
+/// reference capture can carry reference values without executing a stateful instruction. Both predicates back
 /// the pre-compilation state checks and the two direct module-lowering entries; eager binding, dispatch, and staging
 /// enforce their corresponding boundary invariants separately.
 pub(crate) fn contains_unresolved_references<ProgramInput, ProgramOutput>(

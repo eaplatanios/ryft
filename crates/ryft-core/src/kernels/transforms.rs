@@ -3,11 +3,13 @@
 //! Batching adds a grid coordinate and disjoint array windows rather than vectorizing mutable instructions. Static
 //! specialization uses the existing program splicer; derivative rules belong to the ordinary custom JVP/VJP carriers.
 
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 
 use crate::arrays::{
-    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, Dimension,
-    DimensionBounds, DimensionType,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform,
+    ArrayReferenceTransformIndex, Dimension, DimensionBounds, DimensionType,
 };
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::Context;
@@ -19,9 +21,11 @@ use crate::kernels::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRA
 use crate::kernels::mappings::{BlockMapping, BoundaryPolicy};
 use crate::kernels::operations::{KernelExtension, KernelOperation};
 use crate::kernels::validation::KernelParameterAccess;
-use crate::operations::ReferenceIndexOperation;
 use crate::parameters::Placeholder;
-use crate::programs::{Operation, ProgramBuilder, ProgramError, Typed, Value};
+use crate::programs::{
+    Atom, Operation, ProgramBuilder, ProgramError, Typed, Value, rewrite_reference_access_transforms,
+    validated_reference_access_descriptors,
+};
 
 /// A kernel transform cannot preserve the declared boundary or prove its rewritten accesses.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
@@ -44,12 +48,12 @@ pub enum KernelTransformError {
 
 impl<Extension: KernelExtension> KernelDefinition<Extension> {
     /// Adds an independent parallel batch coordinate and canonical size-one windows for mapped parameters. The body
-    /// receives indexed views with its original types and executes once per batch item. Unmapped read-only arrays
-    /// remain shared; every writable parameter must be mapped, including functional read-write aliases.
+    /// selects the original referents through folded access paths and executes once per batch item. Unmapped read-only
+    /// arrays remain shared; every writable parameter must be mapped, including functional read-write aliases.
     ///
     /// `axes` follows all parameters, including write-only outputs. Each mapped axis is inserted into that parameter's
     /// full array and block shape. Canonical type insertion preserves dtype, memory, and sharding while clearing
-    /// layout; explicit source layouts are rejected because restoring them on indexed body views is not justified.
+    /// layout; explicit source layouts are rejected because restoring them on the selected referents is not justified.
     /// Scalar-prefetched inputs must be specialized first. A new executable proof checks all transformed accesses.
     ///
     /// # Parameters
@@ -105,7 +109,7 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
             let program = builder
                 .build(starts, vec![Placeholder; inputs.len() + 1], vec![Placeholder; shape.len()])
                 .map_err(KernelError::from)?;
-            // No invocation exists for an empty batch. Padding preserves the formal indexed body type without
+            // No invocation exists for an empty batch. Padding preserves the formal selected referent type without
             // constructing an invalid one-element slice of the empty full operand.
             let policy = if axis.is_some() && batch_size == 0 {
                 BoundaryPolicy::Masked
@@ -121,22 +125,63 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation<Extension>>::new();
         let inputs =
             operation.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
-        let mut body_inputs = Vec::with_capacity(self.body().input_types().len());
-        for (input, axis) in inputs.iter().zip(axes) {
-            body_inputs.push(match axis {
-                Some(axis) => builder
-                    .add_instruction(
-                        ArrayIrOperation::from(ReferenceIndexOperation::new(*axis, 0)),
-                        vec![],
-                        vec![*input],
-                        None,
-                    )
-                    .map_err(KernelError::from)?[0],
-                None => *input,
-            });
+        let source = self.body();
+        let mut atoms = vec![None; source.atoms().len()];
+        for (&original, &input) in source.input_ids().iter().zip(&inputs[..inputs.len() - 1]) {
+            atoms[original.index()] = Some(input);
         }
-        body_inputs.extend_from_slice(&inputs[axes.len()..inputs.len() - 1]);
-        let outputs = builder.splice_program(self.body(), &body_inputs).map_err(KernelError::from)?;
+        for (index, atom) in source.atoms().iter().enumerate() {
+            if let Atom::Constant(value) = atom {
+                atoms[index] = Some(builder.add_constant(value.clone()));
+            }
+        }
+        let mapped = source
+            .input_ids()
+            .iter()
+            .zip(axes)
+            .filter_map(|(&input, axis)| axis.map(|axis| (input, axis)))
+            .collect::<BTreeMap<_, _>>();
+        let attached = source
+            .instructions()
+            .iter()
+            .flat_map(|instruction| instruction.regions().iter().copied())
+            .collect::<Vec<_>>();
+        let regions = attached
+            .iter()
+            .map(|&region| source.region_ref(region))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(KernelError::from)?;
+        let imported = builder.import_regions(&regions).map_err(KernelError::from)?;
+        let regions = attached.into_iter().zip(imported).collect::<BTreeMap<_, _>>();
+        for instruction in source.instructions() {
+            let mut rewritten = instruction.clone();
+            for (input_index, input) in instruction.inputs().iter().enumerate() {
+                let Some(&axis) = mapped.get(input) else { continue };
+                let descriptors =
+                    validated_reference_access_descriptors(rewritten.operation(), rewritten.inputs().len())
+                        .map_err(KernelError::from)?;
+                let descriptor = descriptors[input_index].as_ref().ok_or_else(|| {
+                    unsupported(format!(
+                        "operation `{}` uses mapped reference input {input_index} outside a reference access",
+                        instruction.operation().name(),
+                    ))
+                })?;
+                let mut transforms = vec![ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(0) }];
+                transforms.extend_from_slice(descriptor.transforms());
+                let bindings = rewritten.inputs()[descriptor.bindings()].to_vec();
+                rewritten = rewrite_reference_access_transforms(&rewritten, input_index, transforms, bindings)
+                    .map_err(KernelError::from)?;
+            }
+            let inputs = rewritten.inputs().iter().map(|input| atoms[input.index()].unwrap()).collect();
+            let attached = rewritten.regions().iter().map(|region| regions[region]).collect();
+            let outputs = builder
+                .add_instruction(rewritten.operation().clone(), attached, inputs, Some(rewritten.provenance().clone()))
+                .map_err(KernelError::from)?;
+            for (&original, &output) in instruction.outputs().iter().zip(outputs) {
+                atoms[original.index()] = Some(output);
+            }
+        }
+        let outputs = source.output_ids().iter().map(|output| atoms[output.index()].unwrap()).collect();
         let body = builder.build(outputs, vec![Placeholder; inputs.len()], vec![]).map_err(KernelError::from)?;
         let definition = Self::new(operation, body)?;
         VerifiedKernel::new(&definition, maximum_programs)?;
@@ -240,9 +285,11 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType};
+    use crate::arrays::{ArraySliceAxis, ArrayType, DataType};
     use crate::kernels::authoring::whole_array_parameter;
-    use crate::operations::{ReferenceRead, ReferenceWrite};
+    use crate::kernels::memory::{AsyncCopyOperation, WaitOperation};
+    use crate::operations::{ConditionOperation, ReferenceRead, ReferenceWrite, ReferenceWriteOperation};
+    use crate::programs::ReferenceAccessOperation;
 
     use super::*;
 
@@ -264,6 +311,11 @@ mod tests {
         .unwrap();
         let batched = definition.batched(3, &[Some(0), Some(0)], 10).unwrap();
         assert_eq!(batched.operation().grid().dimensions().len(), 1);
+        assert_eq!(batched.body().instructions().len(), definition.body().instructions().len());
+        assert_eq!(
+            batched.body().instructions()[0].operation().reference_access_descriptor(0).unwrap().transforms(),
+            &[ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }],
+        );
         assert_eq!(
             batched.operation().output_types(),
             vec![ArrayIrType::Array(ArrayType::new_static(DataType::I32, [3]))]
@@ -279,6 +331,50 @@ mod tests {
         let empty = definition.batched(0, &[Some(0), Some(0)], 0).unwrap();
         let input = Array::from_elements(ArrayType::new_static(DataType::I32, [0]), &[] as &[i32]).unwrap();
         assert_eq!(empty.interpret(vec![input.clone()], 0).unwrap(), vec![input]);
+    }
+
+    #[test]
+    fn test_kernel_definition_batched_independent_copy_transforms() {
+        let vector = ArrayType::new_static(DataType::I32, [2]);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(vector.clone(), KernelParameterAccess::ReadOnly).unwrap(),
+                whole_array_parameter(vector, KernelParameterAccess::WriteOnly).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let source = builder.add_input(call.parameters()[0].body_type());
+        let destination = builder.add_input(call.parameters()[1].body_type());
+        let selection = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 2, 1)] };
+        let token = builder
+            .add_instruction(
+                AsyncCopyOperation::new()
+                    .with_source_transforms(vec![selection.clone()])
+                    .with_destination_transforms(vec![selection.clone()]),
+                vec![],
+                vec![source, destination],
+                None,
+            )
+            .unwrap()[0];
+        builder.add_instruction(WaitOperation, vec![], vec![token], None).unwrap();
+        let body = builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap();
+        let definition = KernelDefinition::new(call, body).unwrap();
+        let batched = definition.batched(3, &[Some(0), Some(1)], 10).unwrap();
+        let operation = batched.body().instructions()[0].operation();
+        assert_eq!(
+            operation.reference_access_descriptor(0).unwrap().transforms(),
+            &[ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }, selection.clone(),],
+        );
+        assert_eq!(
+            operation.reference_access_descriptor(1).unwrap().transforms(),
+            &[ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Static(0) }, selection,],
+        );
+        let input = Array::from_elements(ArrayType::new_static(DataType::I32, [3, 2]), &[1i32, 2, 3, 4, 5, 6]).unwrap();
+        let output =
+            Array::from_elements(ArrayType::new_static(DataType::I32, [2, 3]), &[1i32, 3, 5, 2, 4, 6]).unwrap();
+        assert_eq!(batched.interpret(vec![input], 10).unwrap(), vec![output]);
     }
 
     #[test]
@@ -302,6 +398,47 @@ mod tests {
             definition.batched(2, &[], 10),
             Err(KernelTransformError::Unsupported { message })
                 if message == "batch axes must match every kernel parameter",
+        ));
+    }
+
+    #[test]
+    fn test_kernel_definition_batched_rejects_non_access_reference_uses() {
+        // A mapped reference can only be batched by prefixing an access path. Passing it into a region-carrying
+        // operation such as `condition` is not an access, so no path exists to receive the batch selection.
+        let scalar = ArrayType::scalar(DataType::I32);
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![whole_array_parameter(scalar.clone(), KernelParameterAccess::WriteOnly).unwrap()],
+        )
+        .unwrap();
+        let mut branch = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = branch.add_input(call.parameters()[0].body_type());
+        let value = branch.add_input(ArrayIrType::Array(scalar));
+        branch
+            .add_instruction(ReferenceWriteOperation::new(), vec![], vec![reference, value], None)
+            .unwrap();
+        let branch = branch
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = builder.add_input(call.parameters()[0].body_type());
+        let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
+        let value = builder.add_constant(ArrayIrValue::Array(Array::scalar(7i32).unwrap()));
+        let branch = builder.import_region(branch.entry_region_ref());
+        builder
+            .add_instruction(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                vec![branch, branch],
+                vec![predicate, reference, value],
+                None,
+            )
+            .unwrap();
+        let body = builder.build(vec![], vec![Placeholder], vec![]).unwrap();
+        let definition = KernelDefinition::new(call, body).unwrap();
+        assert!(matches!(
+            definition.batched(2, &[Some(0)], 10),
+            Err(KernelTransformError::Unsupported { message })
+                if message == "operation `condition` uses mapped reference input 1 outside a reference access",
         ));
     }
 

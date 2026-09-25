@@ -602,7 +602,8 @@ mod tests {
             let context = references[0].context();
             for _ in 0..copies {
                 let destination = context.bind(scratch.clone(), vec![], &[])?.remove(0);
-                let token = context.bind(AsyncCopyOperation, vec![], &[references[0].clone(), destination])?.remove(0);
+                let token =
+                    context.bind(AsyncCopyOperation::new(), vec![], &[references[0].clone(), destination])?.remove(0);
                 context.bind(WaitOperation, vec![], &[token])?;
             }
             Ok(())

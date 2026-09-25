@@ -35,8 +35,9 @@
 //! single-process mesh: static references may be replicated or sharded with identical input/final-state sharding;
 //! finite bounded-dynamic references are read-only and replicated. Zero-space, host-memory, unbounded-dynamic,
 //! dynamic nonreplicated, input-bucketed, foreign/non-addressable-mesh, multi-host, and bounded-dynamic mutation cases
-//! are rejected. Reference arguments must be distinct root handles; views remain an internal program construct and
-//! are discharged before this boundary.
+//! are rejected. Reference arguments must be distinct root handles. Internal accesses carry view paths and dynamic
+//! indices, which discharge rewrites as array operations before compilation. Views are not separate program values
+//! and cannot cross this boundary.
 //!
 //! # Stateful Call Shape
 //!
@@ -1854,18 +1855,18 @@ mod tests {
     use ryft_core::operations::sort::{ArgMax, TopK};
     use ryft_core::{
         Add, AddOperation, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayReferenceView, ArrayReferenceViewIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference,
         Compare, ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind, CumulativeLogSumExp,
         CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
         DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
         DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
         LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation,
         Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceDynamicIndexOperation,
-        ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin,
-        StopGradient, StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection,
-        WhileOperation, ZeroLike, differentiate_at,
+        ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
+        StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
+        ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -2395,16 +2396,39 @@ mod tests {
             builder.add_input(reference_type.clone());
             let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
             let root = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, reference_type.clone())));
-            let reference = builder
-                .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
+            let current = builder
+                .add_instruction(
+                    ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                        axis: 0,
+                        index: ArrayReferenceTransformIndex::Dynamic,
+                    }]),
+                    Vec::new(),
+                    vec![root, index],
+                    None,
+                )
                 .unwrap()[0];
-            let current =
-                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, current], None)
+                .add_instruction(
+                    ReferenceAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                        axis: 0,
+                        index: ArrayReferenceTransformIndex::Dynamic,
+                    }]),
+                    Vec::new(),
+                    vec![root, current, index],
+                    None,
+                )
                 .unwrap();
-            let updated =
-                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            let updated = builder
+                .add_instruction(
+                    ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                        axis: 0,
+                        index: ArrayReferenceTransformIndex::Dynamic,
+                    }]),
+                    Vec::new(),
+                    vec![root, index],
+                    None,
+                )
+                .unwrap()[0];
             let callee = builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![updated], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
@@ -2424,17 +2448,38 @@ mod tests {
                     .unwrap()
                     .to_vec()
             } else {
-                let reference = builder
-                    .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
-                    .unwrap()[0];
                 let current = builder
-                    .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+                    .add_instruction(
+                        ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                            axis: 0,
+                            index: ArrayReferenceTransformIndex::Dynamic,
+                        }]),
+                        Vec::new(),
+                        vec![root, index],
+                        None,
+                    )
                     .unwrap()[0];
                 builder
-                    .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, current], None)
+                    .add_instruction(
+                        ReferenceAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                            axis: 0,
+                            index: ArrayReferenceTransformIndex::Dynamic,
+                        }]),
+                        Vec::new(),
+                        vec![root, current, index],
+                        None,
+                    )
                     .unwrap();
                 builder
-                    .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+                    .add_instruction(
+                        ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                            axis: 0,
+                            index: ArrayReferenceTransformIndex::Dynamic,
+                        }]),
+                        Vec::new(),
+                        vec![root, index],
+                        None,
+                    )
                     .unwrap()
                     .to_vec()
             };
@@ -3074,7 +3119,7 @@ mod tests {
                 .unwrap(),
         );
         let view = root
-            .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
+            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) })
             .unwrap();
         assert!(matches!(
             compiled.call_statefully(&domain, ArrayIrValue::Reference(view)),

@@ -4,20 +4,20 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayOperation, ArrayReferenceDischarge, ArrayType,
-    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation,
-    CalleeRegionDriver, CaptureConstant, Concretizable, Context, CotangentDestinationKind, CotangentDestinations,
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, Dimension, InputRegionProvenance, LogicalMesh, MaybeZero,
-    MeshAxisType, NamedAxes, NamedAxis, Operation, OperationFormatter, OutputRegionProvenance, Parameterized,
-    ParameterizedFamily, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBuilder,
-    ProgramError, ProjectedValue, ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation,
-    ReferenceNewOperation, ReferenceRoot, ReferenceSource, ReferenceType, RegionInterface, RegionRef, RegionSlot,
-    ReshapeOperation, Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TransposableOperation,
-    TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId, ValueProjection, Zero,
-    ZeroOperation, discharge_reference_free_operation,
+    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType, BatchableOperation, BatchedOutputs,
+    BatchingContext, BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant,
+    Concretizable, Context, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation,
+    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, Dimension, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxisType, NamedAxes,
+    NamedAxis, Operation, OperationFormatter, OutputRegionProvenance, Parameterized, ParameterizedFamily,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBuilder, ProgramError, ProjectedValue,
+    ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceRoot, ReferenceSource, ReferenceType, RegionInterface, RegionRef, RegionSlot, ReshapeOperation, Sharding,
+    ShardingDimension, StagingContext, Tracer, TracingContext, TransposableOperation, TranspositionContext,
+    TranspositionDriver, Type, TypeError, Typed, Value, ValueProjection, Zero, ZeroOperation,
+    discharge_reference_free_operation,
 };
 
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, materialize_transpose_cotangent};
@@ -183,8 +183,8 @@ impl<V> ShardMapOperation<V> {
 
     /// Returns, for each global output, the input whose reference the output forwards by identity, or [`None`] for a
     /// value output. Every reference output must name its forwarded input here: the body's reference outputs can only
-    /// forward the body's reference inputs (a reference allocated inside the body cannot escape and a derived view
-    /// cannot be returned), and the forwarded input's sharding must equal the output's sharding.
+    /// forward the body's reference inputs; a reference allocated inside the body cannot escape. Transform paths belong to
+    /// accesses and produce no reference outputs. The forwarded input's sharding must equal the output's sharding.
     #[inline]
     pub(crate) fn output_forwarding(&self) -> &[Option<usize>] {
         &self.output_forwarding
@@ -503,10 +503,10 @@ impl<V: Clone> ShardMapOperation<V> {
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the body stores a captured reference (a reference must be an
-    /// explicit input with an input sharding), when a reference output is rooted in an allocation made inside the body
-    /// or in a derived view, when a reference output forwards an input the operation does not declare, or when the
-    /// forwarded input's sharding differs from the output's sharding, and [`ProgramError::UnsupportedOperation`] when
-    /// the body mutates a reference input that is replicated along an active manual axis.
+    /// explicit input with an input sharding), when a reference output is rooted in an allocation made inside the body,
+    /// when a reference output forwards an input the operation does not declare, or when the forwarded input's sharding
+    /// differs from the output's sharding, and [`ProgramError::UnsupportedOperation`] when the body mutates a reference
+    /// input that is replicated along an active manual axis.
     pub(crate) fn validate_reference_body<O: Operation<Type = ArrayIrType>>(
         &self,
         body: RegionRef<'_, V, O>,
@@ -533,11 +533,6 @@ impl<V: Clone> ShardMapOperation<V> {
             }
         }
         for (index, root) in analysis.output_roots().iter().enumerate() {
-            if analysis.is_view(ValueId::new(body.id(), body.output_ids()[index])) {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "`{name}` output {index} is a derived reference view; return its root reference instead",
-                )));
-            }
             let forwarded = match root {
                 None => continue,
                 Some(ReferenceRoot::RegionInput { region, input_index }) if *region == body.id() => *input_index,
@@ -635,7 +630,7 @@ where
                 vec![Placeholder; value_output_indices.len()],
             )?
         };
-        let discharged = local_body.discharge_references::<ArrayReferenceDischarge>(0)?;
+        let discharged = local_body.discharge_references(0)?;
         let mutated_inputs = discharged
             .external_reference_bindings()
             .iter()

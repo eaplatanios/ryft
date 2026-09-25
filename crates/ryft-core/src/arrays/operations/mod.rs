@@ -12,6 +12,7 @@ use crate::arrays::arrays::Array;
 use crate::arrays::batching::ReplicatedDimensionBatchingPolicy;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::references::ArrayReferenceTransform;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
@@ -55,20 +56,20 @@ use crate::operations::{
     Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation, OneLike, OneLikeOperation,
     OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation, ParallelVaryOperation, Pow,
     PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceDynamicIndex,
-    ReferenceDynamicIndexOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndex, ReferenceIndexOperation,
-    ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSlice,
-    ReferenceSliceOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem,
-    RemOperation, Reshape, ReshapeOperation, ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt,
-    RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation,
-    Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient,
-    StopGradientOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose,
-    TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze,
+    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape,
+    ReshapeOperation, ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation,
+    ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign,
+    SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
+    Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation,
+    UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation,
+    ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, Operation, OperationProjection, ProgramError, Type, TypeError, TypeIdentityPosition, Typed, Value,
+    MaybeZero, NoReferenceTransform, NoReferent, Operation, OperationProjection, ProgramError,
+    ReferenceAccessDescriptor, ReferenceAccessOperation, Type, TypeError, TypeIdentityPosition, Typed, Value,
     ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -457,29 +458,20 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Creates a new whole-array reference root.
     ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
 
-    /// Reads the array value selected by a root reference or derived view.
-    ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType>),
+    /// Reads the array value addressed by a reference and the operation's views.
+    ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Replaces the array value selected by a root reference or derived view without observing its previous value.
-    ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType>),
+    /// Replaces the array value addressed by a reference and the operation's views without reading its previous value.
+    ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Derives an axis-removing indexed view of a reference.
-    ReferenceIndex(ReferenceIndexOperation),
+    /// Replaces the array value addressed by a reference and the operation's views and returns its previous value.
+    ReferenceSwap(ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Derives a reference view using a clamped scalar index operand.
-    ReferenceDynamicIndex(ReferenceDynamicIndexOperation),
+    /// Adds an array update through the operation's views of a reference, in program order.
+    ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Derives a rank-preserving static slice view of a reference.
-    ReferenceSlice(ReferenceSliceOperation),
-
-    /// Replaces the array value selected by a root reference or derived view and returns its previous value.
-    ReferenceSwap(ReferenceSwapOperation<ArrayType, ArrayIrType>),
-
-    /// Adds an array update into the value selected by a root reference or derived view in program order.
-    ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType>),
-
-    /// Atomically adds an array update into the elements selected by a root reference or derived view.
-    ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>),
+    /// Atomically adds an array update through the operation's views of a reference.
+    ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
     /// Consumes a whole-array reference and returns its final value.
     ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
@@ -572,10 +564,11 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 ///
 ///   - Mixed capabilities, whose signatures cross the array and first-class-dimension member kinds, exist only at
 ///     the composite level and are therefore the bundle's members: [`Compare`] of two first-class dimensions,
-///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], [`DynamicBroadcast`], and
-///     [`DynamicReshape`], the whole-value reference capabilities [`ReferenceNew`], [`ReferenceRead`],
-///     [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], [`ReferenceAtomicAddUpdate`], and [`ReferenceFreeze`], and the reference view
-///     derivations [`ReferenceIndex`], [`ReferenceDynamicIndex`], and [`ReferenceSlice`].
+///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], [`DynamicBroadcast`], [`DynamicReshape`],
+///     and the reference capabilities. The latter comprise the allocation [`ReferenceNew`], the consuming
+///     [`ReferenceFreeze`], and the accesses [`ReferenceRead`], [`ReferenceWrite`], [`ReferenceSwap`],
+///     [`ReferenceAddUpdate`], and [`ReferenceAtomicAddUpdate`], each of which addresses either the complete referent
+///     or the state selected by a path of [`ArrayReferenceTransform`]s.
 ///   - Homogeneous array and dimension capabilities such as [`Add`], [`Dot`], and [`DimensionPow`] are reached
 ///     through member projections. The composite family carries array payloads through [`ArrayIrOperation::Array`]
 ///     and dimension payloads through [`ArrayIrOperation::Dimension`]. Composite values perform their capabilities
@@ -649,9 +642,10 @@ pub trait ArrayIrOperations:
     // First-class dimensions.
     + DimensionSize + DimensionFromScalar + DimensionToScalar
     + DynamicBroadcast + DynamicReshape
-    // Whole-value references.
-    + ReferenceNew + ReferenceDynamicIndex + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap
-    + ReferenceAddUpdate + ReferenceAtomicAddUpdate
+    // References, whose accesses address the complete referent or an `ArrayReferenceTransform` path.
+    + ReferenceNew + ReferenceRead<ArrayReferenceTransform> + ReferenceWrite<ArrayReferenceTransform>
+    + ReferenceSwap<ArrayReferenceTransform>
+    + ReferenceAddUpdate<ArrayReferenceTransform> + ReferenceAtomicAddUpdate<ArrayReferenceTransform>
     + ReferenceFreeze
 {
 }
@@ -664,13 +658,10 @@ where
     V: DimensionSize + DimensionFromScalar + DimensionToScalar,
     V: DynamicBroadcast + DynamicReshape,
     V: ReferenceNew
-        + ReferenceDynamicIndex
-        + ReferenceIndex
-        + ReferenceSlice
-        + ReferenceRead
-        + ReferenceWrite
-        + ReferenceSwap,
-    V: ReferenceAddUpdate + ReferenceAtomicAddUpdate,
+        + ReferenceRead<ArrayReferenceTransform>
+        + ReferenceWrite<ArrayReferenceTransform>
+        + ReferenceSwap<ArrayReferenceTransform>,
+    V: ReferenceAddUpdate<ArrayReferenceTransform> + ReferenceAtomicAddUpdate<ArrayReferenceTransform>,
     V: ReferenceFreeze,
     V: ValueProjection<ArrayType, Projected: ArrayOperations>,
     V: ValueProjection<DimensionType, Projected: DimensionOperations>,
@@ -683,6 +674,33 @@ pub type ArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
 
 /// [`TracingContext`] over [`DimensionValue`]s and [`DimensionOperation`]s.
 pub type DimensionTracingContext = TracingContext<DimensionValue, DimensionOperation<DimensionValue>>;
+
+// The array-only family has no reference inputs and therefore declares no access layout. It still implements the
+// trait because reverse-mode differentiation and the `reference_freeze` transpose name the family's view type (i.e.,
+// `ReferenceAccessOperation::Transform`) to select the `reference_add_update` that accumulates reference cotangents. For
+// this family, that selection resolves to the reference-free provider, which ordinary array gradients never invoke.
+impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayOperation<A> {
+    type Transform = NoReferenceTransform<NoReferent, ArrayType>;
+
+    fn base_input_count(&self) -> usize {
+        0
+    }
+
+    fn reference_access_descriptor(
+        &self,
+        _input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+        None
+    }
+
+    fn with_reference_access_transforms(
+        &self,
+        _input_index: usize,
+        _views: Vec<Self::Transform>,
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::MalformedProgram("array-only operations have no reference inputs".to_owned()))
+    }
+}
 
 impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A> {
     #[inline]
@@ -976,10 +994,9 @@ where
     O: Operation<Type = ArrayIrType>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
         + From<AddOperation<ArrayIrType>>
-        + From<ReferenceSliceOperation>
-        + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>
-        + From<ReferenceReadOperation<ArrayType, ArrayIrType>>
-        + From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
+        + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+        + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+        + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
 {
     fn transpose_in_parent<D: TranspositionDriver<V, O>>(
         &self,
@@ -1006,13 +1023,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::addressing::ArraySliceAxis;
     use crate::arrays::arrays::Array;
     use crate::arrays::batching::{ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::elements::f8e8m0fnu;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
+    use crate::arrays::references::ArrayReferenceTransform;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{
@@ -1805,32 +1822,34 @@ mod tests {
             ArrayIrOperation::ReferenceNew(_),
         ));
         assert!(matches!(
-            ArrayIrOperation::<Array>::from(ReferenceReadOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::<Array>::from(
+                ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
+            ),
             ArrayIrOperation::ReferenceRead(_),
         ));
         assert!(matches!(
-            ArrayIrOperation::<Array>::from(ReferenceWriteOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::<Array>::from(
+                ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
+            ),
             ArrayIrOperation::ReferenceWrite(_),
         ));
         assert!(matches!(
-            ArrayIrOperation::<Array>::from(ReferenceSwapOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::<Array>::from(
+                ReferenceSwapOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
+            ),
             ArrayIrOperation::ReferenceSwap(_),
         ));
         assert!(matches!(
-            ArrayIrOperation::<Array>::from(ReferenceAddUpdateOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::<Array>::from(ReferenceAddUpdateOperation::<
+                ArrayType,
+                ArrayIrType,
+                ArrayReferenceTransform,
+            >::new()),
             ArrayIrOperation::ReferenceAddUpdate(_),
         ));
         assert!(matches!(
             ArrayIrOperation::<Array>::from(ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new()),
             ArrayIrOperation::ReferenceFreeze(_),
-        ));
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(ReferenceIndexOperation::new(0, 0)),
-            ArrayIrOperation::ReferenceIndex(_),
-        ));
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)])),
-            ArrayIrOperation::ReferenceSlice(_),
         ));
     }
 
@@ -3382,9 +3401,6 @@ mod tests {
         /// Creates a new reference root initialized from ordinary array data.
         ArrayToReference,
 
-        /// Derives a root-preserving reference view from another reference handle.
-        ReferenceToReference,
-
         /// Reads or consumes ordinary array data from a reference.
         ReferenceToArray,
 
@@ -3423,9 +3439,6 @@ mod tests {
             ArrayIrOperation::Assert(_) => MemberKindSignature::AssertionToUnit,
             ArrayIrOperation::DimensionSize(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::ReferenceNew(_) => MemberKindSignature::ArrayToReference,
-            ArrayIrOperation::ReferenceDynamicIndex(_)
-            | ArrayIrOperation::ReferenceIndex(_)
-            | ArrayIrOperation::ReferenceSlice(_) => MemberKindSignature::ReferenceToReference,
             ArrayIrOperation::ReferenceRead(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::ReferenceWrite(_) => MemberKindSignature::ReferenceAndArrayToUnit,
             ArrayIrOperation::ReferenceSwap(_) => MemberKindSignature::ReferenceAndArrayToArray,
@@ -3500,14 +3513,6 @@ mod tests {
                 MemberKindSignature::GeometryMixed,
             ),
             (ArrayIrOperation::ReferenceNew(ReferenceNewOperation::new()), MemberKindSignature::ArrayToReference),
-            (
-                ArrayIrOperation::ReferenceIndex(ReferenceIndexOperation::new(0, 0)),
-                MemberKindSignature::ReferenceToReference,
-            ),
-            (
-                ArrayIrOperation::ReferenceSlice(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)])),
-                MemberKindSignature::ReferenceToReference,
-            ),
             (ArrayIrOperation::ReferenceRead(ReferenceReadOperation::new()), MemberKindSignature::ReferenceToArray),
             (
                 ArrayIrOperation::ReferenceWrite(ReferenceWriteOperation::new()),
@@ -3620,7 +3625,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 37);
+        assert_eq!(expected.len(), 35);
         assert_eq!(
             expected
                 .iter()
@@ -3645,13 +3650,6 @@ mod tests {
         );
         assert_eq!(
             expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::ReferenceToArray).count(),
-            2,
-        );
-        assert_eq!(
-            expected
-                .iter()
-                .filter(|(_, signature)| *signature == MemberKindSignature::ReferenceToReference)
-                .count(),
             2,
         );
         assert_eq!(

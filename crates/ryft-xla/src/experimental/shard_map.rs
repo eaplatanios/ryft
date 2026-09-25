@@ -26,8 +26,8 @@
 //! - **Captured references are rejected.** A reference must be an explicit shard-map input with an input spec. A
 //!   reference reaching the body as a captured constant has no spec and therefore no owner.
 //! - **Outputs forward inputs only.** A reference-typed output must forward a reference input by identity, with an
-//!   output spec equal to that input's spec. A reference allocated inside the body cannot escape as an output, and a
-//!   derived view of a reference cannot be returned; both are rejected by index.
+//!   output spec equal to that input's spec. A reference allocated inside the body cannot escape as an output and is
+//!   rejected by index. Transform paths belong to the accesses that use them, so a view is never a returnable value.
 //! - **Discharge threads owned shards.** Discharging a shard-map with reference inputs turns each reference into a
 //!   state carry sharded by its input spec: the body's local state threads through the local program as local arrays,
 //!   the hidden final-state output of a mutated reference carries the input spec, and the stateful ABI commits each

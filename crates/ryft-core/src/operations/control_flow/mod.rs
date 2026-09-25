@@ -36,13 +36,59 @@ pub(crate) trait TemporalResidualOperation<T: TemporalResidualType>: Operation<T
 pub(crate) mod tests {
     use std::cell::Cell;
 
+    use crate::arrays::{Array, ArrayIrType, ArrayIrValue};
     use crate::axes::Axis;
     use crate::batching::{
         BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
         RecursiveBatchingDriver, RecursiveBatchingPolicy,
     };
+    use crate::captures::CaptureReference;
     use crate::contexts::Context;
-    use crate::programs::{Operation, Program, RegionDriver, RegionRef, Value};
+    use crate::parameters::Placeholder;
+    use crate::programs::{Atom, Operation, Program, Region, RegionDriver, RegionRef, Value};
+
+    /// Replaces every capture constant of a capture-lifted `program` with the concrete capture value it names, so that
+    /// control-flow tests can interpret the discharged form of a captured program eagerly. Lifting turns the entry
+    /// region's capture constants into leading inputs but keeps the capture constants of attached regions, which a
+    /// backend resolves against the same leading capture arguments while lowering, and eager interpretation has no
+    /// capture table to resolve them against.
+    pub(crate) fn resolve_captures<O: Operation<Type = ArrayIrType>>(
+        program: &Program<
+            CaptureReference<ArrayIrType>,
+            O,
+            Vec<CaptureReference<ArrayIrType>>,
+            Vec<CaptureReference<ArrayIrType>>,
+        >,
+        captures: &[ArrayIrValue<Array>],
+    ) -> Program<ArrayIrValue<Array>, O, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>> {
+        let regions = program
+            .regions()
+            .iter()
+            .map(|region| {
+                let atoms = region
+                    .atoms()
+                    .iter()
+                    .map(|atom| match atom {
+                        Atom::Constant(capture) => Atom::Constant(captures[capture.index()].clone()),
+                        Atom::Variable(r#type) => Atom::Variable(r#type.clone()),
+                    })
+                    .collect();
+                Region::new(
+                    atoms,
+                    region.input_ids().to_vec(),
+                    region.output_ids().to_vec(),
+                    region.instructions().to_vec(),
+                )
+            })
+            .collect();
+        Program::new(
+            vec![Placeholder; program.input_count()],
+            vec![Placeholder; program.output_count()],
+            regions,
+            program.entry(),
+        )
+        .unwrap()
+    }
 
     /// [`BatchingDriver`] that counts the structural [`batch_program`](BatchingDriver::batch_program) requests a
     /// region-carrying batching rule makes, delegating every request to the ordinary [`RecursiveBatchingDriver`] over

@@ -23,7 +23,7 @@ use std::fmt::Display;
 use std::sync::LazyLock;
 
 use crate::arrays::{
-    Array, ArrayIrType, ArrayIrValue, ArrayReferenceView, ArraySliceAxis, ArrayType, MAX_DIMENSION_EXTENT,
+    Array, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType, MAX_DIMENSION_EXTENT,
 };
 use crate::contexts::EagerContext;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -31,15 +31,17 @@ use crate::kernels::mappings::BoundaryPolicy;
 use crate::macros::check_count;
 use crate::operations::{Pad, PadOperation};
 use crate::programs::{
-    EffectClasses, Effects, Operation, OperationFormatter, ProgramError, ReferenceAccessMode, ReferenceEffect,
-    RegionInterface, TypeError, Typed,
+    EffectClasses, Effects, Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect, ReferenceTransform, RegionInterface, TypeError, Typed,
+    infer_reference_view_type,
 };
 
 /// Canonical operation name for [`TileLoadOperation`].
 pub const TILE_LOAD_OPERATION_NAME: &str = "tile_load";
 
 /// Reads a dynamically selected fixed-size tile from a canonical reference. Inputs are the source reference,
-/// one checked dimension start per axis, and an explicit scalar padding value with the source dtype and memory.
+/// one checked dimension start per selected axis, and an explicit scalar padding value with the source dtype and
+/// memory, followed by the source path bindings. The source path is applied before the tile window.
 /// The result is an ordinary dense array. Masked loads create only a valid clipped reference view; all other result
 /// positions contain the exact padding-value encoding. No out-of-bounds reference is constructed or accessed.
 /// Initialization validation conservatively requires the entire source view initialized for dynamic selections.
@@ -47,8 +49,12 @@ pub const TILE_LOAD_OPERATION_NAME: &str = "tile_load";
 pub struct TileLoadOperation {
     /// Static logical shape of each result tile.
     block_shape: Vec<usize>,
+
     /// Whether coordinates outside the source are rejected or filled explicitly.
     boundary_policy: BoundaryPolicy,
+
+    /// Ordered selections applied to the source before selecting the tile window.
+    transforms: Vec<ArrayReferenceTransform>,
 }
 
 impl TileLoadOperation {
@@ -57,7 +63,7 @@ impl TileLoadOperation {
         if block_shape.iter().any(|&extent| extent > MAX_DIMENSION_EXTENT) {
             return Err(TypeError::invalid("`tile_load` block shape exceeds the canonical dimension width"));
         }
-        Ok(Self { block_shape, boundary_policy })
+        Ok(Self { block_shape, boundary_policy, transforms: Vec::new() })
     }
 
     /// Returns the fixed result shape.
@@ -65,9 +71,20 @@ impl TileLoadOperation {
         &self.block_shape
     }
 
+    /// Returns the views applied to the source reference before the tile window.
+    pub fn transforms(&self) -> &[ArrayReferenceTransform] {
+        &self.transforms
+    }
+
     /// Returns the boundary contract applied before reference access.
     pub fn boundary_policy(&self) -> BoundaryPolicy {
         self.boundary_policy
+    }
+
+    /// Replaces the source selections applied before the tile window.
+    pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
+        self.transforms = transforms;
+        self
     }
 }
 
@@ -90,12 +107,18 @@ impl Operation for TileLoadOperation {
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
         let rank = self.block_shape.len();
-        check_count!("input", input_types, rank + 2, TypeError);
+        let binding_count = self.transforms.iter().map(|view| view.binding_count()).sum::<usize>();
+        check_count!("input", input_types, rank + 2 + binding_count, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let ArrayIrType::Reference(reference) = &input_types[0] else {
             return Err(TypeError::invalid("`tile_load` first input must be an array reference"));
         };
-        let source = reference.referent();
+        let source = infer_reference_view_type(
+            reference.referent(),
+            &self.transforms,
+            &input_types[rank + 2..].iter().collect::<Vec<_>>(),
+            ReferenceAccessMode::Read,
+        )?;
         if source.rank() != rank || source.static_shape().is_none() {
             return Err(TypeError::invalid("`tile_load` source requires a static shape with the block rank"));
         }
@@ -107,7 +130,8 @@ impl Operation for TileLoadOperation {
         };
         // Infer through an empty valid slice and canonical padding, so distributed-axis and padding-value rules
         // remain owned by the existing operations. Clear physical layout for the declared dense result contract.
-        let empty = ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 0, 1); rank] }.output_type(source)?;
+        let empty =
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 0, 1); rank] }.output_type(&source)?;
         let padding = PadOperation::<ArrayType>::new(
             vec![0; rank],
             self.block_shape.iter().map(|&extent| extent as i64).collect(),
@@ -123,7 +147,6 @@ impl Operation for TileLoadOperation {
             Effects::new(
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-                vec![],
             )
             .unwrap()
         });
@@ -133,8 +156,47 @@ impl Operation for TileLoadOperation {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("block_shape", format_args!("{:?}", self.block_shape))?;
-            operation.field("boundary", format_args!("{:?}", self.boundary_policy))
+            operation.field("boundary", format_args!("{:?}", self.boundary_policy))?;
+            if !self.transforms.is_empty() {
+                operation.list("transforms", &self.transforms)?;
+            }
+            Ok(())
         })
+    }
+}
+
+impl ReferenceAccessOperation for TileLoadOperation {
+    type Transform = ArrayReferenceTransform;
+
+    fn base_input_count(&self) -> usize {
+        self.block_shape.len() + 2
+    }
+
+    fn reference_access_descriptor(
+        &self,
+        input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+        (input_index == 0).then(|| {
+            let start = self.base_input_count();
+            ReferenceAccessDescriptor::new(
+                &self.transforms,
+                start..start + self.transforms.iter().map(|view| view.binding_count()).sum::<usize>(),
+            )
+        })
+    }
+
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<ArrayReferenceTransform>,
+    ) -> Result<Self, ProgramError> {
+        if input_index != 0 {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` has no reference access at input {input_index}",
+                self.name(),
+            )));
+        }
+        Ok(self.clone().with_transforms(transforms))
     }
 }
 
@@ -151,14 +213,14 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<Array
             self.infer_output_types(&inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
         let ArrayIrType::Array(output_type) = &output_types[0] else { unreachable!() };
         let ArrayIrValue::Reference(source) = &inputs[0] else { unreachable!() };
-        let ArrayIrValue::Array(other) = &inputs[inputs.len() - 1] else { unreachable!() };
+        let rank = self.block_shape.len();
+        let ArrayIrValue::Array(other) = &inputs[rank + 1] else { unreachable!() };
+        let source = source.with_transforms(&self.transforms, &inputs[rank + 2..])?;
         let source_type = source.r#type();
         let shape = source_type.referent().static_shape().unwrap();
         let mut axes = Vec::with_capacity(self.block_shape.len());
         let mut padding = Vec::with_capacity(self.block_shape.len());
-        for ((start, &block), &extent) in
-            inputs[1..inputs.len() - 1].iter().zip(&self.block_shape).zip(shape.dimensions())
-        {
+        for ((start, &block), &extent) in inputs[1..rank + 1].iter().zip(&self.block_shape).zip(shape.dimensions()) {
             let ArrayIrValue::Dimension(start) = start else { unreachable!() };
             let start = start.extent();
             let limit = start
@@ -173,7 +235,7 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<Array
             axes.push(ArraySliceAxis::new(valid_start, valid_size, 1));
             padding.push((block - valid_size) as i64);
         }
-        let selected = source.with_transform(ArrayReferenceView::Slice { axes })?.read()?;
+        let selected = source.with_transform(ArrayReferenceTransform::Slice { axes })?.read()?;
         let rank = self.block_shape.len();
         let padded = selected.pad(other, &vec![0; rank], &padding, &vec![0; rank])?;
         let output = Array::from_logical_bytes(output_type.clone(), &padded.logical_bytes())?;
@@ -183,9 +245,12 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<Array
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrOperation, ArrayOperation, ArrayReference, DataType, DimensionValue};
+    use crate::arrays::{
+        ArrayIrOperation, ArrayOperation, ArrayReference, ArrayReferenceTransformIndex, DataType, DimensionValue,
+    };
     use crate::contexts::Context;
     use crate::kernels::authoring::{tiled_call, whole_array_parameter};
     use crate::kernels::calls::{KernelCallOperation, KernelDefinition, KernelError};
@@ -345,6 +410,15 @@ mod tests {
     }
 
     #[test]
+    fn test_tile_load_operation_with_transforms() {
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap().with_transforms(transforms.clone());
+        assert_eq!(operation.transforms(), transforms);
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 3..4);
+        assert!(operation.reference_access_descriptor(1).is_none());
+    }
+
+    #[test]
     fn test_tile_load_operation_infer_output_types() {
         let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap();
         let inputs = vec![
@@ -393,6 +467,28 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid("`tile_load` in-bounds window exceeds the source extent")))
         );
         assert_eq!(source.read().unwrap().elements::<i32>().unwrap(), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_tile_load_operation_interpretation_transforms() {
+        let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
+        let source = ArrayReference::new(Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap());
+        let operation = TileLoadOperation::new(vec![3], BoundaryPolicy::Masked)
+            .unwrap()
+            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }]);
+        assert_eq!(
+            context.bind(
+                operation,
+                vec![],
+                &[
+                    ArrayIrValue::Reference(source),
+                    ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()),
+                    ArrayIrValue::Array(Array::scalar(-7i32).unwrap()),
+                    ArrayIrValue::Array(Array::scalar(1i64).unwrap()),
+                ]
+            ),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![5i32, 6, -7]).unwrap())])
+        );
     }
 
     #[test]
@@ -486,11 +582,38 @@ mod tests {
             &Effects::new(
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-                vec![]
             )
             .unwrap()
         );
     }
+
+    #[test]
+    fn test_tile_load_operation_render() {
+        let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap();
+        assert_eq!(operation.to_string(), "tile_load [block_shape=[2], boundary=Masked]");
+        let operation = operation
+            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }]);
+        assert_eq!(
+            operation.to_string(),
+            "tile_load [block_shape=[2], boundary=Masked, transforms=[index(axis=0, index=1)]]",
+        );
+
+        // Long metadata wraps one field per line.
+        let operation = operation.with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] },
+        ]);
+        assert_eq!(
+            operation.to_string(),
+            indoc! {"
+                tile_load [
+                    block_shape=[2],
+                    boundary=Masked,
+                    transforms=[dynamic_index(axis=0), slice(axes=[1:4])],
+                ]"},
+        );
+    }
+
     #[test]
     fn test_kernel_advanced_indexing_broadcast_and_mask() {
         let definition = advanced_index_definition(KernelParameterAccess::ReadWrite).unwrap();

@@ -2,12 +2,13 @@
 
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
+use std::sync::LazyLock;
 
 use ryft_core::kernels::{KernelExtension, KernelExtensionMemory};
 use ryft_core::{
-    ArrayIrType, ArrayReferenceView, ArrayType, Context, DataType, EffectClasses, Effects, Operation,
-    OperationFormatter, ProgramError, ReferenceAccessMode, ReferenceEffect, ReferenceType, ReferenceViewOperation,
-    ReferenceViewValidationError, RegionInterface, TypeError,
+    ArrayIrType, ArrayReferenceTransform, ArrayType, DataType, EffectClasses, Effects, Operation, OperationFormatter,
+    ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect,
+    ReferenceType, RegionInterface, TypeError,
 };
 
 /// A datacenter Blackwell tensor-memory allocation and its ordered asynchronous operations.
@@ -100,13 +101,7 @@ impl Operation for TmemOperation {
         if !regions.is_empty() {
             return Err(TypeError::invalid(format!("`{}` does not accept regions", self.name())));
         }
-        let count = match self {
-            Self::AllocateScales { .. } | Self::Allocate { .. } => 0,
-            Self::CopyScales => 2,
-            Self::MmaBlockScaled { .. } | Self::MmaNvfp4 { .. } => 5,
-            Self::Mma { .. } => 3,
-            _ => 1,
-        };
+        let count = self.base_input_count();
         if inputs.len() != count {
             return Err(TypeError::invalid(format!("`{}` requires {count} inputs", self.name())));
         }
@@ -276,36 +271,54 @@ impl Operation for TmemOperation {
     }
 
     fn effects(&self) -> Cow<'_, Effects> {
-        let effects = match self {
-            Self::AllocateScales { .. } | Self::Allocate { .. } => vec![ReferenceEffect::Allocate { output_index: 0 }],
-            Self::CopyScales => vec![
+        // Every variant declares one of a few fixed effect lists. Each list is built once, so that the per-input
+        // descriptor queries issued by layout validation and lowering do not allocate.
+        fn declare(effects: Vec<ReferenceEffect>) -> Effects {
+            Effects::new(EffectClasses::NONE, effects).unwrap()
+        }
+        static ALLOCATE: LazyLock<Effects> =
+            LazyLock::new(|| declare(vec![ReferenceEffect::Allocate { output_index: 0 }]));
+        static COPY_SCALES: LazyLock<Effects> = LazyLock::new(|| {
+            declare(vec![
                 ReferenceEffect::Access { input_index: 1, mode: ReferenceAccessMode::Write },
                 ReferenceEffect::Allocate { output_index: 0 },
-            ],
-            Self::MmaBlockScaled { accumulate } | Self::MmaNvfp4 { accumulate } => vec![
-                ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Read },
-                ReferenceEffect::Access { input_index: 3, mode: ReferenceAccessMode::Read },
-                ReferenceEffect::Access {
-                    input_index: 4,
-                    mode: if *accumulate { ReferenceAccessMode::ReadWrite } else { ReferenceAccessMode::Write },
-                },
-                ReferenceEffect::Allocate { output_index: 0 },
-            ],
-            Self::Mma { accumulate } => vec![
-                ReferenceEffect::Access {
-                    input_index: 2,
-                    mode: if *accumulate { ReferenceAccessMode::ReadWrite } else { ReferenceAccessMode::Write },
-                },
-                ReferenceEffect::Allocate { output_index: 0 },
-            ],
-            Self::Commit | Self::Load => {
-                vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }]
+            ])
+        });
+        // Multiplication lists are indexed by `accumulate`: accumulating multiplications also read their accumulator.
+        static SCALED_MMA: LazyLock<[Effects; 2]> = LazyLock::new(|| {
+            [ReferenceAccessMode::Write, ReferenceAccessMode::ReadWrite].map(|mode| {
+                declare(vec![
+                    ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Read },
+                    ReferenceEffect::Access { input_index: 3, mode: ReferenceAccessMode::Read },
+                    ReferenceEffect::Access { input_index: 4, mode },
+                    ReferenceEffect::Allocate { output_index: 0 },
+                ])
+            })
+        });
+        static MMA: LazyLock<[Effects; 2]> = LazyLock::new(|| {
+            [ReferenceAccessMode::Write, ReferenceAccessMode::ReadWrite].map(|mode| {
+                declare(vec![
+                    ReferenceEffect::Access { input_index: 2, mode },
+                    ReferenceEffect::Allocate { output_index: 0 },
+                ])
+            })
+        });
+        static READ: LazyLock<Effects> = LazyLock::new(|| {
+            declare(vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }])
+        });
+        static CONSUME: LazyLock<Effects> = LazyLock::new(|| {
+            declare(vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }])
+        });
+        Cow::Borrowed(match self {
+            Self::AllocateScales { .. } | Self::Allocate { .. } => &ALLOCATE,
+            Self::CopyScales => &COPY_SCALES,
+            Self::MmaBlockScaled { accumulate } | Self::MmaNvfp4 { accumulate } => {
+                &SCALED_MMA[usize::from(*accumulate)]
             }
-            Self::Wait | Self::Release => {
-                vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }]
-            }
-        };
-        Cow::Owned(Effects::new(EffectClasses::NONE, effects, vec![]).unwrap())
+            Self::Mma { accumulate } => &MMA[usize::from(*accumulate)],
+            Self::Commit | Self::Load => &READ,
+            Self::Wait | Self::Release => &CONSUME,
+        })
     }
 
     fn render(&self, formatter: &mut Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -331,28 +344,35 @@ impl Operation for TmemOperation {
     }
 }
 
-impl ReferenceViewOperation for TmemOperation {
-    type View = ArrayReferenceView;
+impl ReferenceAccessOperation for TmemOperation {
+    type Transform = ArrayReferenceTransform;
 
-    fn reference_view(&self, _output_index: usize) -> Option<ArrayReferenceView> {
-        None
+    fn base_input_count(&self) -> usize {
+        match self {
+            Self::AllocateScales { .. } | Self::Allocate { .. } => 0,
+            Self::CopyScales => 2,
+            Self::MmaBlockScaled { .. } | Self::MmaNvfp4 { .. } => 5,
+            Self::Mma { .. } => 3,
+            _ => 1,
+        }
     }
 
-    fn validate_reference_view(
-        view: &ArrayReferenceView,
-        source: &ArrayIrType,
-        target: &ArrayIrType,
-    ) -> Result<(), ReferenceViewValidationError> {
-        view.validate(source, target)
+    fn reference_access_descriptor(&self, input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+        // Tensor-memory accesses take whole references, so every access has an empty path and no bindings.
+        let count = self.base_input_count();
+        self.effects()
+            .accesses()
+            .any(|(index, _)| index == input_index)
+            .then(|| ReferenceAccessDescriptor::new(&[], count..count))
     }
 
-    fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-        _context: &C,
-        _view: &ArrayReferenceView,
-        _source: C::Value,
-        _symbols: &[C::Value],
-    ) -> Result<C::Value, ProgramError> {
-        Err(ProgramError::MalformedProgram("tensor-memory operations do not construct reference views".to_owned()))
+    fn with_reference_access_transforms(&self, input_index: usize, transforms: Vec<Self::Transform>) -> Result<Self, ProgramError> {
+        if transforms.is_empty() && self.reference_access_descriptor(input_index).is_some() {
+            return Ok(*self);
+        }
+        Err(ProgramError::UnsupportedOperation {
+            message: "tensor-memory operations require whole references".to_owned(),
+        })
     }
 }
 

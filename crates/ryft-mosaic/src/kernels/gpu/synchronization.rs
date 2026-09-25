@@ -46,7 +46,7 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 
 use ryft_core::{
-    ArrayAddressing, ArrayReferenceView, ArrayReferenceViewPath, ArraySliceAxis, ArrayType, InstructionId,
+    ArrayAddressing, ArrayReferenceTransform, ArrayReferenceTransformPath, ArraySliceAxis, ArrayType, InstructionId,
     ProgramError, ReferenceAccessMode, ValueId,
 };
 use thiserror::Error;
@@ -142,10 +142,10 @@ pub enum SynchronizationError {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SynchronizationEvent {
     /// Read or write through a canonical static view of a lowering-owned buffer.
-    Access { value: ValueId, view: ArrayReferenceView, mode: ReferenceAccessMode },
+    Access { value: ValueId, view: ArrayReferenceTransform, mode: ReferenceAccessMode },
 
     /// One native `cp.async` transfer, pending until its committed group is waited.
-    AsyncCopy { source: (ValueId, ArrayReferenceView), destination: (ValueId, ArrayReferenceView) },
+    AsyncCopy { source: (ValueId, ArrayReferenceTransform), destination: (ValueId, ArrayReferenceTransform) },
 
     /// Commits the issuing thread's preceding uncommitted transfers, including an empty group.
     CommitGroup,
@@ -160,7 +160,7 @@ pub enum SynchronizationEvent {
     WgmmaFence { accumulator: ValueId },
 
     /// Issues one collective matrix operation using the canonical operands and accumulator owner.
-    WgmmaIssue { accumulator: ValueId, left: (ValueId, ArrayReferenceView), right: (ValueId, ArrayReferenceView) },
+    WgmmaIssue { accumulator: ValueId, left: (ValueId, ArrayReferenceTransform), right: (ValueId, ArrayReferenceTransform) },
 
     /// Commits preceding collectively issued matrix operations as one FIFO group.
     WgmmaCommit,
@@ -175,27 +175,27 @@ pub enum SynchronizationEvent {
     IssueTensorMemory {
         token: ValueId,
         destination: ValueId,
-        left: (ValueId, ArrayReferenceView),
-        right: (ValueId, ArrayReferenceView),
+        left: (ValueId, ArrayReferenceTransform),
+        right: (ValueId, ArrayReferenceTransform),
         accumulate: bool,
         scales: Vec<ValueId>,
     },
 
     /// Copies shared scale storage into tensor memory under a canonical completion token.
-    CopyTensorMemory { token: ValueId, source: (ValueId, ArrayReferenceView), destination: ValueId },
+    CopyTensorMemory { token: ValueId, source: (ValueId, ArrayReferenceTransform), destination: ValueId },
 
     /// Issues one two-CTA matrix instruction from CTA zero, retaining each CTA's actual operand selections.
     IssueTensorMemoryCluster {
         token: ValueId,
         destination: ValueId,
-        left: [(ValueId, ArrayReferenceView); 2],
-        right: [(ValueId, ArrayReferenceView); 2],
+        left: [(ValueId, ArrayReferenceTransform); 2],
+        right: [(ValueId, ArrayReferenceTransform); 2],
         accumulate: bool,
         scales: Vec<ValueId>,
     },
 
     /// Copies the elected CTA's shared scales into both CTAs' tensor-memory allocations.
-    CopyTensorMemoryCluster { token: ValueId, source: (ValueId, ArrayReferenceView), destination: ValueId },
+    CopyTensorMemoryCluster { token: ValueId, source: (ValueId, ArrayReferenceTransform), destination: ValueId },
 
     /// Multicasts completion of one two-CTA instruction to both local hardware barriers.
     CommitTensorMemoryCluster { token: ValueId },
@@ -207,7 +207,7 @@ pub enum SynchronizationEvent {
     WaitTensorMemory { token: ValueId },
 
     /// Reads the actual thread-owned tensor-memory selection as part of one uniform full-CTA load.
-    LoadTensorMemory { value: ValueId, view: ArrayReferenceView },
+    LoadTensorMemory { value: ValueId, view: ArrayReferenceTransform },
 
     /// Releases a completed allocation collectively in lanes zero through 31.
     ReleaseTensorMemory { value: ValueId },
@@ -219,7 +219,7 @@ pub enum SynchronizationEvent {
     ArriveExpectTransaction { barrier: ValueId, bytes: usize },
 
     /// Issues a TMA transfer tracked by the current transaction-barrier generation; completion is simulated internally.
-    TmaCopy { barrier: ValueId, source: (ValueId, ArrayReferenceView), destination: (ValueId, ArrayReferenceView) },
+    TmaCopy { barrier: ValueId, source: (ValueId, ArrayReferenceTransform), destination: (ValueId, ArrayReferenceTransform) },
 
     /// Acquires one completed generation for this thread. Native parity is the low bit of `generation`.
     WaitBarrier { barrier: ValueId, generation: u64 },
@@ -234,8 +234,8 @@ pub enum SynchronizationEvent {
     /// Every CTA thread participates at the same instruction, immediately between cluster publication barriers.
     DistributedCopy {
         source_block: u32,
-        source: (ValueId, ArrayReferenceView),
-        destination: (ValueId, ArrayReferenceView),
+        source: (ValueId, ArrayReferenceTransform),
+        destination: (ValueId, ArrayReferenceTransform),
     },
 
     /// Rendezvous with the peer CTA after the preceding local completion barrier.
@@ -711,8 +711,8 @@ impl CtaSynchronization {
                                 else {
                                     unreachable!()
                                 };
-                                let Some(ArrayReferenceView::Slice { axes }) = ArrayReferenceViewPath::root()
-                                    .with_view(view.clone())
+                                let Some(ArrayReferenceTransform::Slice { axes }) = ArrayReferenceTransformPath::root()
+                                    .with_transform(view.clone())
                                     .root_slice(&plan.storage[&value])
                                 else {
                                     unreachable!()
@@ -955,10 +955,10 @@ impl CtaSynchronization {
     }
 
     /// Resolves a static view through the canonical root-selection and addressing implementations.
-    fn access(&self, value: ValueId, view: &ArrayReferenceView, writes: bool) -> Result<Access, SynchronizationError> {
+    fn access(&self, value: ValueId, view: &ArrayReferenceTransform, writes: bool) -> Result<Access, SynchronizationError> {
         let r#type = self.storage.get(&value).ok_or(SynchronizationError::Storage { value })?;
-        let path = ArrayReferenceViewPath::root().with_view(view.clone());
-        let Some(ArrayReferenceView::Slice { axes }) = path.root_slice(r#type) else {
+        let path = ArrayReferenceTransformPath::root().with_transform(view.clone());
+        let Some(ArrayReferenceTransform::Slice { axes }) = path.root_slice(r#type) else {
             return Err(SynchronizationError::Selection { value });
         };
         let addressing = ArrayAddressing::new(r#type.clone())?;
@@ -1080,7 +1080,7 @@ impl TensorOperation {
                     return Err(error("scale initialization is not published to the cta"));
                 }
                 let r#type = &plan.storage[value];
-                let view = ArrayReferenceView::Slice {
+                let view = ArrayReferenceTransform::Slice {
                     axes: r#type
                         .shape()
                         .dimensions()
@@ -1508,7 +1508,7 @@ impl CtaState {
                     let sources = [plan.access(left.0, &left.1, false)?, plan.access(right.0, &right.1, false)?];
                     let r#type = &plan.storage[accumulator];
                     let shape = r#type.static_shape().ok_or(SynchronizationError::Selection { value: *accumulator })?;
-                    let view = ArrayReferenceView::Slice {
+                    let view = ArrayReferenceTransform::Slice {
                         axes: shape.dimensions().iter().map(|extent| ArraySliceAxis::new(0, *extent, 1)).collect(),
                     };
                     let destination = plan.access(*accumulator, &view, true)?;
@@ -1849,8 +1849,8 @@ mod tests {
     }
 
     /// Selects an exact byte interval in the fixture's byte-valued buffers.
-    fn view(start: usize, size: usize) -> ArrayReferenceView {
-        ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(start, size, 1)] }
+    fn view(start: usize, size: usize) -> ArrayReferenceTransform {
+        ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(start, size, 1)] }
     }
 
     /// Declares one global source and one shared destination, each with 16 physical bytes.
@@ -2633,7 +2633,7 @@ mod tests {
                 instruction(10),
                 SynchronizationEvent::LoadTensorMemory {
                     value: value(2),
-                    view: ArrayReferenceView::Slice {
+                    view: ArrayReferenceTransform::Slice {
                         axes: vec![ArraySliceAxis::new(thread as usize, 1, 1), ArraySliceAxis::new(0, 8, 1)],
                     },
                 },
@@ -2664,7 +2664,7 @@ mod tests {
             2,
             SynchronizationEvent::LoadTensorMemory {
                 value: value(2),
-                view: ArrayReferenceView::Slice {
+                view: ArrayReferenceTransform::Slice {
                     axes: vec![ArraySliceAxis::new(0, 128, 1), ArraySliceAxis::new(0, 8, 1)],
                 },
             },
@@ -3039,7 +3039,7 @@ mod tests {
                 else {
                     unreachable!()
                 };
-                source.1 = ArrayReferenceView::Slice {
+                source.1 = ArrayReferenceTransform::Slice {
                     axes: vec![ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(0, 2, 1)],
                 };
                 destination.1 = source.1.clone();
@@ -3089,7 +3089,7 @@ mod tests {
                     left: [0, 128].map(|start| {
                         (
                             value(0),
-                            ArrayReferenceView::Slice {
+                            ArrayReferenceTransform::Slice {
                                 axes: vec![ArraySliceAxis::new(start, 128, 1), ArraySliceAxis::new(0, 16, 1)],
                             },
                         )
@@ -3097,7 +3097,7 @@ mod tests {
                     right: [0, 8].map(|start| {
                         (
                             value(1),
-                            ArrayReferenceView::Slice {
+                            ArrayReferenceTransform::Slice {
                                 axes: vec![ArraySliceAxis::new(0, 16, 1), ArraySliceAxis::new(start, 8, 1)],
                             },
                         )
@@ -3120,7 +3120,7 @@ mod tests {
                     instruction(8),
                     SynchronizationEvent::LoadTensorMemory {
                         value: value(2),
-                        view: ArrayReferenceView::Slice {
+                        view: ArrayReferenceTransform::Slice {
                             axes: vec![
                                 ArraySliceAxis::new(block * 128 + thread as usize, 1, 1),
                                 ArraySliceAxis::new(0, 16, 1),
@@ -3150,7 +3150,7 @@ mod tests {
         else {
             unreachable!()
         };
-        *view = ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 16, 1)] };
+        *view = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 16, 1)] };
         assert_eq!(
             plans[0].simulate_cluster(&wrong_rows),
             Err(SynchronizationError::TensorMemory {
@@ -3176,7 +3176,7 @@ mod tests {
         let mut plans = [plan(128), plan(128)];
         let scale_type = ArrayType::new_static(DataType::F8E8M0FNU, [128, 4]);
         let whole =
-            ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 128, 1), ArraySliceAxis::new(0, 4, 1)] };
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 128, 1), ArraySliceAxis::new(0, 4, 1)] };
         for plan in &mut plans {
             plan.storage.insert(value(0), scale_type.clone());
             plan.storage.insert(value(2), scale_type.clone());

@@ -13,18 +13,11 @@
 //! reads, writes, or swaps. Only its own `register.add_update` has no discharge arm, so a program containing it fails
 //! to discharge at exactly that operation.
 //!
-//! The universe has two views, which together exercise the generic view contract ([`ReferenceView`] and
-//! [`ReferenceViewOperation`]) from downstream position. `register.halves` is a static two-output view whose outputs
-//! carry two distinct descriptions; it has no discharge rule, no eager interpretation, and no transform rules, so it
-//! pins the analysis side of the contract only. `register.bit` is a dynamic single-output view of one bit of a
-//! register, described through the input that carries the bit index by its operand position: the analysis
-//! closes the description over that input, the discharge alias is the view path closed over destination values
-//! (`ReferenceViewPath<RegisterView, C::Value>`) through which the policy reads and writes by binding the family's own
-//! bit operations on the destination, forward mode reapplies the view to the tangent reference with the primal index,
-//! reverse mode reaches the viewed cotangent reference through [`TranspositionContext`], which resolves the bound index
-//! to its transposed-program value, and batching goes through the shared [`ReferenceViewOperation::batch`] rule.
-//! Eagerly, a bit view is a [`RegisterValue::BitReference`] handle over the root reference; a bit of a bit has no eager
-//! handle, so nested bit views are reachable only through staged programs and their discharge.
+//! The universe describes static halves and dynamically selected bits through folded access paths. Static halves
+//! exercise disjoint-path analysis; bit accesses carry their index as an ordinary trailing input. Discharge closes
+//! paths over destination values and binds the family's bit extraction/insertion operations. Forward and reverse mode
+//! retain the same paths and primal index bindings on tangent and cotangent accesses. Lazy eager views keep the root
+//! and bindings in [`ViewedReference`], without creating another value or reference identity.
 //!
 //! The transform legs are reached through the public entry points ([`differentiate_at`] for `jvp`, `vjp`, and
 //! `value_and_gradient`, and [`batch`]) over a live register reference. The generic reference primitives
@@ -50,31 +43,31 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::{
     AddOperation, Array, ArrayIrType, ArrayIrValue, ArrayType, AtomId, BatchAxis, BatchAxisSpecification,
-    BatchableOperation, BatchableReferenceView, BatchableType, BatchedOutputs, BatchingContext, BatchingDriver,
-    BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BoundaryPreservingBatchedProgram, BroadcastOperation,
-    CompareOperation, ConstantOperation, Context, ConvertElementTypeOperation, CotangentAccumulator,
-    CotangentDestination, CotangentDestinationKind, CotangentSeed, DataType, DifferentiableOperation,
-    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, DivOperation, Domain, EagerContext, EffectClass, EffectClasses, Effects, ExpOperation,
-    ExternalReferenceBinding, InputRegionProvenance, InstructionId, InterpretableOperation, InterpretationDriver,
-    MaybeZero, MemberDifferentiableOperation, MemberTransposableOperation, MulOperation, NegOperation, NoIdentity,
-    OneLikeOperation, OneOperation, Operation, OperationProvider, OutputRegionProvenance, ParallelVaryOperation,
-    Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver,
-    ReduceOperation, Reference, ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAlias,
-    ReferenceAliasEdge, ReferenceAliasKind, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext,
+    BatchableOperation, BatchableReferenceTransform, BatchableType, BatchedOutputs, BatchingContext, BatchingDriver,
+    BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BoundReferenceTransform, BoundaryPreservingBatchedProgram,
+    BroadcastOperation, CompareOperation, ConstantOperation, Context, ConvertElementTypeOperation,
+    CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentSeed, DataType,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, DivOperation, Domain, EagerContext, EffectClass, EffectClasses,
+    Effects, ExpOperation, ExternalReferenceBinding, InputRegionProvenance, InstructionId, InterpretableOperation,
+    InterpretationDriver, MaybeZero, MemberDifferentiableOperation, MemberTransposableOperation, MulOperation,
+    NegOperation, NoIdentity, NoReferenceTransform, OneLikeOperation, OneOperation, Operation, OperationFormatter,
+    OperationProvider, OutputRegionProvenance, ParallelVaryOperation, Parameter, PartialValue,
+    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError,
+    ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, ReduceOperation, Reference,
+    ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
     ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceMemberType, ReferenceNew, ReferenceNewOperation,
-    ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceType,
-    ReferenceView, ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep,
-    ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef,
-    RegionSlot, ReshapeOperation, ReshardOperation, ResidualZeroProvider, SubOperation, Trace, Tracer, TracingContext,
-    TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed,
-    Value, ValueId, ValueProjection, Zero, ZeroLikeOperation, ZeroOperation, batch, check_count, differentiate_at,
-    discharge_reference_free_operation, jvp_projected_operation, transpose_projected_operation,
-    validate_reference_boundary,
+    ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceTransform,
+    ReferenceTransformPath, ReferenceType, ReferenceViewOverlap, ReferenceWrite, ReferenceWriteOperation, RegionId,
+    RegionInterface, RegionRef, RegionSlot, ReshapeOperation, ReshardOperation, ResidualZeroProvider, SubOperation,
+    Trace, Tracer, TracingContext, TransposableOperation, TransposeOperation, TranspositionContext,
+    TranspositionDriver, Type, TypeError, Typed, Value, ValueId, ValueProjection, ViewedReference, Zero,
+    ZeroLikeOperation, ZeroOperation, batch, check_count, differentiate_at, discharge_reference_free_operation,
+    infer_reference_view_type, jvp_projected_operation, transpose_projected_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -243,11 +236,6 @@ enum RegisterValue {
 
     /// Live handle to a complete register allocation.
     Reference(Reference<RegisterValue>),
-
-    /// Live handle to bit `index` of the register allocation `root`, which is the eager form of a `register.bit` view:
-    /// it reads and writes that bit through the root handle and reports the root's identity. A bit of a bit has no
-    /// eager handle.
-    BitReference { root: Reference<RegisterValue>, index: i64 },
 }
 
 impl RegisterValue {
@@ -255,20 +243,15 @@ impl RegisterValue {
     fn register(&self) -> Result<i64, ProgramError> {
         match self {
             Self::Register(value) => Ok(*value),
-            Self::Reference(_) | Self::BitReference { .. } => {
-                Err(TypeError::invalid("expected a register value but got a reference").into())
-            }
+            Self::Reference(_) => Err(TypeError::invalid("expected a register value but got a reference").into()),
         }
     }
 
-    /// Returns the live complete-register reference this value holds, rejecting a register and a bit handle.
+    /// Returns the live complete-register reference this value holds, rejecting a register value.
     fn reference(&self) -> Result<&Reference<RegisterValue>, ProgramError> {
         match self {
             Self::Reference(reference) => Ok(reference),
             Self::Register(_) => Err(TypeError::invalid("expected a register reference but got a register").into()),
-            Self::BitReference { .. } => {
-                Err(TypeError::invalid("expected a complete register reference but got a bit handle").into())
-            }
         }
     }
 }
@@ -301,7 +284,6 @@ impl Display for RegisterValue {
         match self {
             Self::Register(value) => Display::fmt(value, formatter),
             Self::Reference(reference) => Display::fmt(reference, formatter),
-            Self::BitReference { root, index } => write!(formatter, "{root}[bit {index}]"),
         }
     }
 }
@@ -314,9 +296,7 @@ impl Typed for RegisterValue {
     fn r#type(&self) -> Cow<'_, RegisterIrType> {
         Cow::Owned(match self {
             Self::Register(_) => RegisterIrType::Register(RegisterType),
-            Self::Reference(_) | Self::BitReference { .. } => {
-                RegisterIrType::Reference(ReferenceType::new(RegisterType))
-            }
+            Self::Reference(_) => RegisterIrType::Reference(ReferenceType::new(RegisterType)),
         })
     }
 }
@@ -337,7 +317,6 @@ impl Value for RegisterValue {
         match self {
             Self::Register(_) => None,
             Self::Reference(reference) => Some(reference.id()),
-            Self::BitReference { root, .. } => Some(root.id()),
         }
     }
 }
@@ -354,44 +333,52 @@ impl ReferenceNew for RegisterValue {
     }
 }
 
-impl ReferenceRead for RegisterValue {
-    fn read(&self) -> Result<Self, ProgramError> {
-        match self {
-            Self::BitReference { root, index } => {
-                let register = root.read().map_err(ProgramError::custom)?.register()?;
-                Ok(Self::Register(extract_bit(register, *index)?))
-            }
-            _ => self.reference()?.read().map_err(ProgramError::custom),
+impl ReferenceRead<RegisterTransform> for RegisterValue {
+    fn read_through(&self, transforms: &[RegisterTransform], bindings: &[Self]) -> Result<Self, ProgramError> {
+        if !transforms.is_empty() || !bindings.is_empty() {
+            let path = ReferenceTransformPath::from_transforms(transforms, bindings)?;
+            return RegisterReferenceDischarge::read(&RegisterDestination::new(), &self.read()?, &path);
         }
+        self.reference()?.read().map_err(ProgramError::custom)
     }
 }
 
-impl ReferenceWrite for RegisterValue {
-    fn write(&self, replacement: &Self) -> Result<(), ProgramError> {
-        let stored = replacement.register()?;
-        match self {
-            Self::BitReference { root, index } => {
-                let register = root.read().map_err(ProgramError::custom)?.register()?;
-                root.write(Self::Register(insert_bit(register, stored, *index)?)).map_err(ProgramError::custom)
-            }
-            _ => self.reference()?.write(replacement.clone()).map_err(ProgramError::custom),
+impl ReferenceWrite<RegisterTransform> for RegisterValue {
+    fn write_through(
+        &self,
+        replacement: &Self,
+        transforms: &[RegisterTransform],
+        bindings: &[Self],
+    ) -> Result<(), ProgramError> {
+        if !transforms.is_empty() || !bindings.is_empty() {
+            let path = ReferenceTransformPath::from_transforms(transforms, bindings)?;
+            let updated = RegisterReferenceDischarge::write(
+                &RegisterDestination::new(),
+                &self.read()?,
+                replacement.clone(),
+                &path,
+            )?;
+            return self.write(&updated);
         }
+        replacement.register()?;
+        self.reference()?.write(replacement.clone()).map_err(ProgramError::custom)
     }
 }
 
-impl ReferenceSwap for RegisterValue {
-    fn swap(&self, replacement: &Self) -> Result<Self, ProgramError> {
-        match self {
-            Self::BitReference { .. } => {
-                let previous = self.read()?;
-                self.write(replacement)?;
-                Ok(previous)
-            }
-            _ => {
-                replacement.register()?;
-                self.reference()?.swap(replacement.clone()).map_err(ProgramError::custom)
-            }
+impl ReferenceSwap<RegisterTransform> for RegisterValue {
+    fn swap_through(
+        &self,
+        replacement: &Self,
+        transforms: &[RegisterTransform],
+        bindings: &[Self],
+    ) -> Result<Self, ProgramError> {
+        if !transforms.is_empty() || !bindings.is_empty() {
+            let previous = self.read_through(transforms, bindings)?;
+            self.write_through(replacement, transforms, bindings)?;
+            return Ok(previous);
         }
+        replacement.register()?;
+        self.reference()?.swap(replacement.clone()).map_err(ProgramError::custom)
     }
 }
 
@@ -421,18 +408,15 @@ impl ReferenceDischargeableType for RegisterIrType {
     type Policy = RegisterReferenceDischarge;
 }
 
-/// Returns the destination value of the bit index that the `register.bit` step `step` of a discharge alias is bound
-/// to, rejecting a half step: `register.halves` has no discharge rule, so a half step never reaches the policy.
-fn bit_coordinate<V>(step: &ReferenceViewStep<RegisterView, V>) -> Result<&V, ProgramError> {
+/// Returns the destination value bound to one bit step, rejecting the static half descriptions reserved for analysis.
+fn bit_coordinate<V>(step: &BoundReferenceTransform<RegisterTransform, V>) -> Result<&V, ProgramError> {
     match step.view() {
-        RegisterView::Bit(_) => {
+        RegisterTransform::Bit => {
             check_count!("input", step.bindings(), 1, ProgramError);
             Ok(&step.bindings()[0])
         }
-        RegisterView::Half(_) => Err(ProgramError::UnsupportedOperation {
-            message: "`register.halves` has no discharge rule in the register universe, so a half step never reaches \
-                      its discharge policy"
-                .to_string(),
+        RegisterTransform::Half(_) => Err(ProgramError::UnsupportedOperation {
+            message: "static half descriptions support analysis only".to_string(),
         }),
     }
 }
@@ -444,7 +428,7 @@ fn insert_bits<C: Context<Type = RegisterIrType, Operation: From<RegisterOperati
     context: &C,
     current: C::Value,
     replacement: C::Value,
-    steps: &[ReferenceViewStep<RegisterView, C::Value>],
+    steps: &[BoundReferenceTransform<RegisterTransform, C::Value>],
 ) -> Result<C::Value, ProgramError> {
     let Some((step, rest)) = steps.split_first() else {
         return Ok(replacement);
@@ -469,19 +453,34 @@ impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>> Refe
     for RegisterReferenceDischarge
 {
     type Referent = RegisterType;
-    type Alias = ReferenceViewPath<RegisterView, C::Value>;
+    type Alias = ReferenceTransformPath<RegisterTransform, C::Value>;
+    type Transform = RegisterTransform;
 
-    fn storage_alias(_referent: &RegisterType) -> ReferenceViewPath<RegisterView, C::Value> {
-        ReferenceViewPath::root()
+    fn compose_transforms(
+        _context: &C,
+        alias: &Self::Alias,
+        transforms: &[RegisterTransform],
+        bindings: &[C::Value],
+    ) -> Result<Self::Alias, ProgramError> {
+        let suffix = ReferenceTransformPath::from_transforms(transforms, bindings)?;
+        let mut composed = alias.clone();
+        for step in suffix.bound_transforms() {
+            composed = composed.with_bound_transform(*step.view(), step.bindings().to_vec());
+        }
+        Ok(composed)
+    }
+
+    fn storage_alias(_referent: &RegisterType) -> ReferenceTransformPath<RegisterTransform, C::Value> {
+        ReferenceTransformPath::root()
     }
 
     fn read(
         context: &C,
         current: &C::Value,
-        alias: &ReferenceViewPath<RegisterView, C::Value>,
+        alias: &ReferenceTransformPath<RegisterTransform, C::Value>,
     ) -> Result<C::Value, ProgramError> {
         let mut selected = current.clone();
-        for step in alias.steps() {
+        for step in alias.bound_transforms() {
             let coordinate = bit_coordinate(step)?.clone();
             selected = bind_register_output(context, RegisterOperation::BitExtract, &[selected, coordinate])?;
         }
@@ -492,16 +491,16 @@ impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>> Refe
         context: &C,
         current: &C::Value,
         replacement: C::Value,
-        alias: &ReferenceViewPath<RegisterView, C::Value>,
+        alias: &ReferenceTransformPath<RegisterTransform, C::Value>,
     ) -> Result<C::Value, ProgramError> {
-        insert_bits(context, current.clone(), replacement, alias.steps())
+        insert_bits(context, current.clone(), replacement, alias.bound_transforms())
     }
 }
 
 /// Operation family of the downstream universe. The reference accesses wrap the generic `ryft-core` primitives, so
 /// their type inference, reference semantics, effects, and eager interpretation are the canonical ones; the additive
 /// update is the family's own because the generic primitive requires an [`Operation`] implementation for
-/// `AddOperation<RegisterType>` that only `ryft-core` can provide. `register.halves` and `register.bit` are the
+/// `AddOperation<RegisterType>` that only `ryft-core` can provide. Static half and dynamic bit descriptions are the
 /// family's static and dynamic views (refer to the module documentation), and `register.bit_extract` and
 /// `register.bit_insert` are the value-level bit operations through which the discharge policy reads and writes a bit
 /// view.
@@ -512,14 +511,12 @@ enum RegisterOperation {
     Zero(ZeroOperation<RegisterIrType>),
     One,
     ReferenceNew(ReferenceNewOperation<RegisterType, RegisterIrType>),
-    Read(ReferenceReadOperation<RegisterType, RegisterIrType>),
-    Write(ReferenceWriteOperation<RegisterType, RegisterIrType>),
-    Swap(ReferenceSwapOperation<RegisterType, RegisterIrType>),
-    AddUpdate,
+    Read(ReferenceReadOperation<RegisterType, RegisterIrType, RegisterTransform>),
+    Write(ReferenceWriteOperation<RegisterType, RegisterIrType, RegisterTransform>),
+    Swap(ReferenceSwapOperation<RegisterType, RegisterIrType, RegisterTransform>),
+    AddUpdate(Vec<RegisterTransform>),
     Freeze(ReferenceFreezeOperation<RegisterType, RegisterIrType>),
     Call,
-    Halves,
-    Bit,
     BitExtract,
     BitInsert,
 }
@@ -561,20 +558,20 @@ impl From<ReferenceNewOperation<RegisterType, RegisterIrType>> for RegisterOpera
     }
 }
 
-impl From<ReferenceReadOperation<RegisterType, RegisterIrType>> for RegisterOperation {
-    fn from(operation: ReferenceReadOperation<RegisterType, RegisterIrType>) -> Self {
+impl From<ReferenceReadOperation<RegisterType, RegisterIrType, RegisterTransform>> for RegisterOperation {
+    fn from(operation: ReferenceReadOperation<RegisterType, RegisterIrType, RegisterTransform>) -> Self {
         Self::Read(operation)
     }
 }
 
-impl From<ReferenceWriteOperation<RegisterType, RegisterIrType>> for RegisterOperation {
-    fn from(operation: ReferenceWriteOperation<RegisterType, RegisterIrType>) -> Self {
+impl From<ReferenceWriteOperation<RegisterType, RegisterIrType, RegisterTransform>> for RegisterOperation {
+    fn from(operation: ReferenceWriteOperation<RegisterType, RegisterIrType, RegisterTransform>) -> Self {
         Self::Write(operation)
     }
 }
 
-impl From<ReferenceSwapOperation<RegisterType, RegisterIrType>> for RegisterOperation {
-    fn from(operation: ReferenceSwapOperation<RegisterType, RegisterIrType>) -> Self {
+impl From<ReferenceSwapOperation<RegisterType, RegisterIrType, RegisterTransform>> for RegisterOperation {
+    fn from(operation: ReferenceSwapOperation<RegisterType, RegisterIrType, RegisterTransform>) -> Self {
         Self::Swap(operation)
     }
 }
@@ -609,17 +606,24 @@ impl OperationProvider<RegisterIrType, ReferenceFreezeOperation<RegisterType, Re
     }
 }
 
-impl OperationProvider<RegisterIrType, ReferenceAddUpdateOperation<RegisterType, RegisterIrType>>
+impl OperationProvider<RegisterIrType, ReferenceAddUpdateOperation<RegisterType, RegisterIrType, RegisterTransform>>
     for RegisterOperation
 {
     type Operation = Self;
 
     fn provide(
-        _request: ReferenceAddUpdateOperation<RegisterType, RegisterIrType>,
+        request: ReferenceAddUpdateOperation<RegisterType, RegisterIrType, RegisterTransform>,
         input_types: &[&RegisterIrType],
     ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        Ok(Self::AddUpdate)
+        check_count!(
+            "input",
+            input_types,
+            2 + request.transforms().iter().map(ReferenceTransform::binding_count).sum::<usize>(),
+            ProgramError
+        );
+        let operation = Self::AddUpdate(request.transforms().to_vec());
+        operation.infer_output_types(&input_types.iter().map(|r#type| (*r#type).clone()).collect::<Vec<_>>(), &[])?;
+        Ok(operation)
     }
 }
 
@@ -636,11 +640,9 @@ impl Operation for RegisterOperation {
             Self::Read(operation) => operation.name(),
             Self::Write(operation) => operation.name(),
             Self::Swap(operation) => operation.name(),
-            Self::AddUpdate => "register.add_update",
+            Self::AddUpdate(_) => "register.add_update",
             Self::Freeze(operation) => operation.name(),
             Self::Call => "register.call",
-            Self::Halves => "register.halves",
-            Self::Bit => "register.bit",
             Self::BitExtract => "register.bit_extract",
             Self::BitInsert => "register.bit_insert",
         }
@@ -703,25 +705,19 @@ impl Operation for RegisterOperation {
             Self::Read(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Write(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Swap(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::AddUpdate => {
-                check_count!("input", input_types, 2, TypeError);
-                referent()?;
+            Self::AddUpdate(transforms) => {
+                let bindings = transforms.iter().map(ReferenceTransform::binding_count).sum::<usize>();
+                check_count!("input", input_types, 2 + bindings, TypeError);
+                infer_reference_view_type(
+                    &referent()?,
+                    transforms,
+                    &input_types[2..].iter().collect::<Vec<_>>(),
+                    ReferenceAccessMode::Accumulate,
+                )?;
                 <&RegisterType>::try_from(&input_types[1])?;
                 Ok(Vec::new())
             }
             Self::Freeze(operation) => operation.infer_output_types(input_types, region_interfaces),
-            Self::Halves => {
-                check_count!("input", input_types, 1, TypeError);
-                Ok(vec![RegisterIrType::Reference(ReferenceType::new(referent()?)); 2])
-            }
-            // A bit is modeled as a register holding 0 or 1, so the referent type of the view is the referent type of
-            // the viewed reference.
-            Self::Bit => {
-                check_count!("input", input_types, 2, TypeError);
-                let referent = referent()?;
-                <&RegisterType>::try_from(&input_types[1])?;
-                Ok(vec![RegisterIrType::Reference(ReferenceType::new(referent))])
-            }
             Self::BitExtract | Self::BitInsert => {
                 check_count!("input", input_types, if matches!(self, Self::BitExtract) { 2 } else { 3 }, TypeError);
                 for r#type in input_types {
@@ -736,6 +732,19 @@ impl Operation for RegisterOperation {
         }
     }
 
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::Read(operation) => operation.render(formatter, indentation),
+            Self::Write(operation) => operation.render(formatter, indentation),
+            Self::Swap(operation) => operation.render(formatter, indentation),
+            Self::AddUpdate(transforms) if !transforms.is_empty() => {
+                OperationFormatter::new(formatter, indentation, self.name())?
+                    .bracketed(|operation| operation.field("transforms", format_args!("{transforms:?}")))
+            }
+            _ => OperationFormatter::new(formatter, indentation, self.name()).map(|_| ()),
+        }
+    }
+
     fn effects(&self) -> Cow<'_, Effects> {
         match self {
             Self::Negate | Self::Add(_) | Self::Zero(_) | Self::One | Self::BitExtract | Self::BitInsert => {
@@ -746,38 +755,71 @@ impl Operation for RegisterOperation {
             Self::Write(operation) => operation.effects(),
             Self::Swap(operation) => operation.effects(),
             Self::Freeze(operation) => operation.effects(),
-            Self::AddUpdate => Cow::Owned(
+            Self::AddUpdate(_) => Cow::Owned(
                 Effects::new(
                     EffectClasses::NONE,
                     vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Accumulate }],
-                    Vec::new(),
                 )
                 .unwrap(),
             ),
             // A structured operation declares no operation-local reference effects (its accesses are summarized
             // transitively from the region closure it attaches) but carries opaque ordered state of its own.
             Self::Call => Cow::Owned(Effects::explicit(EffectClasses::single(EffectClass::OrderedState))),
-            // Both halves are narrowing views of the one operand.
-            Self::Halves => Cow::Owned(
-                Effects::new(
-                    EffectClasses::NONE,
-                    Vec::new(),
-                    vec![
-                        ReferenceAlias::new(0, 0, ReferenceAliasKind::View),
-                        ReferenceAlias::new(1, 0, ReferenceAliasKind::View),
-                    ],
-                )
-                .unwrap(),
-            ),
-            // The bit is a narrowing view of the reference operand; its index input must be a non-reference value.
-            Self::Bit => Cow::Owned(
-                Effects::new(
-                    EffectClasses::NONE,
-                    Vec::new(),
-                    vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
-                )
-                .unwrap(),
-            ),
+        }
+    }
+}
+
+impl ReferenceAccessOperation for RegisterOperation {
+    type Transform = RegisterTransform;
+
+    fn base_input_count(&self) -> usize {
+        match self {
+            Self::Read(operation) => operation.base_input_count(),
+            Self::Write(operation) => operation.base_input_count(),
+            Self::Swap(operation) => operation.base_input_count(),
+            Self::AddUpdate(_) => 2,
+            Self::Freeze(_) => 1,
+            _ => 0,
+        }
+    }
+
+    fn reference_access_descriptor(
+        &self,
+        input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, RegisterTransform>> {
+        match self {
+            Self::Read(operation) => operation.reference_access_descriptor(input_index),
+            Self::Write(operation) => operation.reference_access_descriptor(input_index),
+            Self::Swap(operation) => operation.reference_access_descriptor(input_index),
+            Self::AddUpdate(transforms) if input_index == 0 => Some(ReferenceAccessDescriptor::new(
+                transforms,
+                2..2 + transforms.iter().map(ReferenceTransform::binding_count).sum::<usize>(),
+            )),
+            Self::Freeze(_) if input_index == 0 => Some(ReferenceAccessDescriptor::new(&[], 1..1)),
+            _ => None,
+        }
+    }
+
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<RegisterTransform>,
+    ) -> Result<Self, ProgramError> {
+        match self {
+            Self::Read(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::Read)
+            }
+            Self::Write(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::Write)
+            }
+            Self::Swap(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::Swap)
+            }
+            Self::AddUpdate(_) if input_index == 0 => Ok(Self::AddUpdate(transforms)),
+            _ if self.reference_access_descriptor(input_index).is_some() && transforms.is_empty() => Ok(self.clone()),
+            _ => Err(ProgramError::UnsupportedOperation {
+                message: "register operation does not support replacing these access views".to_string(),
+            }),
         }
     }
 }
@@ -808,45 +850,16 @@ where
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(vec![context.bind_preserved(ReferenceType::new(RegisterType), outputs.remove(0))?.into()])
             }
-            Self::Read(_) => {
-                check_count!("input", inputs, 1, ProgramError);
-                let reference = inputs[0].try_as_reference("a reference to read")?;
-                Ok(vec![ReferenceDischargeValue::Value(context.read(reference)?)])
-            }
-            Self::Write(_) => {
-                check_count!("input", inputs, 2, ProgramError);
-                let reference = inputs[0].try_as_reference("a reference to write")?;
-                let replacement = inputs[1].try_as_value("a replacement value")?.clone();
-                context.write(reference, replacement)?;
-                Ok(Vec::new())
-            }
-            Self::Swap(_) => {
-                check_count!("input", inputs, 2, ProgramError);
-                let reference = inputs[0].try_as_reference("a reference to replace")?;
-                let replacement = inputs[1].try_as_value("a replacement value")?.clone();
-                Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
-            }
+            Self::Read(operation) => operation.discharge_references(context, driver, inputs),
+            Self::Write(operation) => operation.discharge_references(context, driver, inputs),
+            Self::Swap(operation) => operation.discharge_references(context, driver, inputs),
             Self::Freeze(_) => {
                 check_count!("input", inputs, 1, ProgramError);
                 let reference = inputs[0].try_as_reference("a reference to freeze")?;
                 Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
             }
-            // The bit view composes its step onto the operand's alias, closed over the destination value of its index,
-            // exactly as the array family's view rules do; on a preserved allocation the view replays verbatim over the
-            // parent destination reference.
-            Self::Bit => {
-                check_count!("input", inputs, 2, ProgramError);
-                let reference = inputs[0].try_as_reference("a reference to view")?;
-                let index = inputs[1].try_as_value("a bit index")?.clone();
-                let alias = reference.alias().with_step(RegisterView::Bit(1), vec![index.clone()]);
-                let viewed = context.alias_reference(reference, alias, ReferenceType::new(RegisterType), |parent| {
-                    bind_register_output(context.parent(), Self::Bit, &[parent.clone(), index])
-                })?;
-                Ok(vec![viewed.into()])
-            }
-            // The non-accumulating discharge policy has no accumulation capability for the additive update, and the
-            // static two-output view has no discharge rule, so both are rejected by name.
-            Self::AddUpdate | Self::Halves => Err(ProgramError::UnsupportedOperation {
+            // This policy deliberately does not implement accumulation.
+            Self::AddUpdate(_) => Err(ProgramError::UnsupportedOperation {
                 message: format!("`{}` has no discharge rule in the register universe", self.name()),
             }),
             // The hand-rolled structured widening a backend-owned region operation performs: summarize the closure,
@@ -915,41 +928,61 @@ where
     }
 }
 
-/// Static half selector of `register.halves`: which half of a register one of its outputs selects.
+/// Static half selector used to compare disjoint folded access paths.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum RegisterHalf {
     Low,
     High,
 }
 
-/// View description of the downstream universe.
+/// Transform description of the downstream universe.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum RegisterView {
-    /// Static half of a register, selected by `register.halves`.
+enum RegisterTransform {
+    /// Static half of a register, used by analysis-only access fixtures.
     Half(RegisterHalf),
 
-    /// One bit of a register, selected by the value supplied at this instruction input position.
-    Bit(usize),
+    /// One bit of a register, selected by the next dynamic binding in the access input list.
+    Bit,
 }
 
-// A half is a static description while a bit depends on the one index its symbol names. Paths are compared step
+// A half is a static description while a bit consumes one dynamic index binding. Paths are compared step
 // by step: two static halves are disjoint as soon as they differ, two bits are the same index iff their
 // bindings are equal and may otherwise overlap, a bit and a half may overlap, and paths that agree on every shared step
 // are the same when they have the same length and otherwise one is a strict prefix that contains the other.
-impl ReferenceView for RegisterView {
-    type Type = RegisterIrType;
-
-    fn symbols(&self) -> Vec<usize> {
+impl Display for RegisterTransform {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Half(_) => Vec::new(),
-            Self::Bit(symbol) => vec![*symbol],
+            Self::Half(RegisterHalf::Low) => formatter.write_str("half(low)"),
+            Self::Half(RegisterHalf::High) => formatter.write_str("half(high)"),
+            Self::Bit => formatter.write_str("bit"),
         }
+    }
+}
+
+impl ReferenceTransform for RegisterTransform {
+    type Type = RegisterIrType;
+    type Referent = RegisterType;
+
+    fn binding_count(&self) -> usize {
+        usize::from(matches!(self, Self::Bit))
+    }
+
+    fn validate_bindings(&self, _input: &RegisterType, bindings: &[&RegisterIrType]) -> Result<(), TypeError> {
+        check_count!("binding", bindings, self.binding_count(), TypeError);
+        for binding in bindings {
+            <&RegisterType>::try_from(*binding)?;
+        }
+        Ok(())
+    }
+
+    fn output_type(&self, input: &RegisterType) -> Result<RegisterType, TypeError> {
+        Ok(input.clone())
     }
 
     fn overlap(
         _type: &RegisterIrType,
-        lhs: &[ReferenceViewStep<Self>],
-        rhs: &[ReferenceViewStep<Self>],
+        lhs: &[BoundReferenceTransform<Self>],
+        rhs: &[BoundReferenceTransform<Self>],
     ) -> ReferenceViewOverlap {
         for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
             match (lhs.view(), rhs.view()) {
@@ -957,7 +990,7 @@ impl ReferenceView for RegisterView {
                     return ReferenceViewOverlap::Disjoint;
                 }
                 (Self::Half(_), Self::Half(_)) => {}
-                (Self::Bit(_), Self::Bit(_)) if lhs == rhs => {}
+                (Self::Bit, Self::Bit) if lhs == rhs => {}
                 _ => return ReferenceViewOverlap::MayOverlap,
             }
         }
@@ -966,7 +999,7 @@ impl ReferenceView for RegisterView {
 }
 
 // Registers have no axes: replicated descriptions pass through unchanged, while mapped axes are unsupported.
-impl BatchableReferenceView for RegisterView {
+impl BatchableReferenceTransform for RegisterTransform {
     fn batch(&self, _type: &RegisterIrType, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
         if !batch_axis.is_replicated() {
             return Err(BatchingError::UnsupportedOperation {
@@ -974,62 +1007,6 @@ impl BatchableReferenceView for RegisterView {
             });
         }
         Ok((*self, batch_axis))
-    }
-}
-
-// The view contract from downstream position: one owned description per view output, a type-level check that only
-// requires both ends to be register references (a half or a bit of a register is still a register), and reapplication
-// that stages the describing operation over another source, keeping the described half or supplying the bit index.
-impl ReferenceViewOperation for RegisterOperation {
-    type View = RegisterView;
-
-    fn reference_view(&self, output_index: usize) -> Option<RegisterView> {
-        match (self, output_index) {
-            (Self::Halves, 0) => Some(RegisterView::Half(RegisterHalf::Low)),
-            (Self::Halves, 1) => Some(RegisterView::Half(RegisterHalf::High)),
-            (Self::Bit, 0) => Some(RegisterView::Bit(1)),
-            _ => None,
-        }
-    }
-
-    fn validate_reference_view(
-        _view: &RegisterView,
-        source: &RegisterIrType,
-        target: &RegisterIrType,
-    ) -> Result<(), ReferenceViewValidationError> {
-        for r#type in [source, target] {
-            if !r#type.is_reference() {
-                return Err(ReferenceViewValidationError::InvalidComposition {
-                    message: format!("expected a register reference but got `{type}`"),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn reapply_reference_view<C: Context<Type = RegisterIrType, Operation = Self>>(
-        context: &C,
-        view: &RegisterView,
-        source: C::Value,
-        symbols: &[C::Value],
-    ) -> Result<C::Value, ProgramError> {
-        match view {
-            RegisterView::Half(half) => {
-                check_count!("input", symbols, 0, ProgramError);
-                let mut outputs = context.bind(Self::Halves, Vec::new(), std::slice::from_ref(&source))?;
-                check_count!("output", outputs, 2, ProgramError);
-                Ok(outputs.swap_remove(match half {
-                    RegisterHalf::Low => 0,
-                    RegisterHalf::High => 1,
-                }))
-            }
-            RegisterView::Bit(_) => {
-                check_count!("input", symbols, 1, ProgramError);
-                let mut outputs = context.bind(Self::Bit, Vec::new(), &[source, symbols[0].clone()])?;
-                check_count!("output", outputs, 1, ProgramError);
-                Ok(outputs.remove(0))
-            }
-        }
     }
 }
 
@@ -1068,27 +1045,23 @@ impl<C: Domain<Type = RegisterIrType, Value = RegisterValue>> InterpretableOpera
             Self::Write(operation) => operation.interpret(context, driver, inputs),
             Self::Swap(operation) => operation.interpret(context, driver, inputs),
             Self::Freeze(operation) => operation.interpret(context, driver, inputs),
-            Self::AddUpdate => {
-                check_count!("input", inputs, 2, ProgramError);
-                // The capability dispatches to this operation for both eager values and tracers. Execute the
-                // primitive here instead of calling the capability again, which would recursively bind itself.
-                let current = inputs[0].read()?.register()?;
-                inputs[0].write(&RegisterValue::Register(current + inputs[1].register()?))?;
+            Self::AddUpdate(transforms) => {
+                check_count!(
+                    "input",
+                    inputs,
+                    2 + transforms.iter().map(ReferenceTransform::binding_count).sum::<usize>(),
+                    ProgramError
+                );
+                // Execute directly: rebinding the additive capability would dispatch back to this operation.
+                let current = inputs[0].read_through(transforms, &inputs[2..])?.register()?;
+                inputs[0].write_through(
+                    &RegisterValue::Register(current + inputs[1].register()?),
+                    transforms,
+                    &inputs[2..],
+                )?;
                 Ok(Vec::new())
             }
             Self::Call => driver.interpret_region(context, 0, inputs.to_vec()),
-            Self::Halves => Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` has no eager interpretation in the register universe", self.name()),
-            }),
-            // The eager form of the bit view is a bit handle over the complete root reference; the index is validated
-            // when the view is created so that every access through the handle is in range.
-            Self::Bit => {
-                check_count!("input", inputs, 2, ProgramError);
-                let root = inputs[0].reference()?.clone();
-                let index = inputs[1].register()?;
-                bit_index(index)?;
-                Ok(vec![RegisterValue::BitReference { root, index }])
-            }
             Self::BitExtract => {
                 check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![RegisterValue::Register(extract_bit(inputs[0].register()?, inputs[1].register()?)?)])
@@ -1172,8 +1145,13 @@ impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::
             Self::Freeze(operation) => operation.jvp(context, driver, inputs),
             Self::Write(operation) => operation.jvp(context, driver, inputs),
             Self::Swap(operation) => operation.jvp(context, driver, inputs),
-            Self::AddUpdate => {
-                check_count!("input", inputs, 2, ProgramError);
+            Self::AddUpdate(transforms) => {
+                check_count!(
+                    "input",
+                    inputs,
+                    2 + transforms.iter().map(ReferenceTransform::binding_count).sum::<usize>(),
+                    ProgramError
+                );
                 if inputs[0].tangent().is_zero() && !inputs[1].tangent().is_zero() {
                     return Err(ProgramError::InvalidArgument {
                         message: format!(
@@ -1188,26 +1166,15 @@ impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::
                 if let (MaybeZero::Value(reference), MaybeZero::Value(tangent)) =
                     (inputs[0].tangent(), inputs[1].tangent())
                 {
-                    context.tangent().bind(self.clone(), Vec::new(), &[reference.clone(), tangent.clone()])?;
+                    let mut tangent_inputs = vec![reference.clone(), tangent.clone()];
+                    for binding in &primals[2..] {
+                        tangent_inputs.push(context.primal_to_tangent(binding.clone())?);
+                    }
+                    context.tangent().bind(self.clone(), Vec::new(), &tangent_inputs)?;
                 }
                 Ok(Vec::new())
             }
-            // The tangent of a bit view is the same bit of the tangent reference, selected by the primal index (the
-            // index selects the bit, so its tangent is dropped); a plumbing reference yields a plumbing view.
-            Self::Bit => {
-                check_count!("input", inputs, 2, ProgramError);
-                let primal = bind_register_output(context.primal(), self.clone(), &primals)?;
-                let tangent = match inputs[0].tangent() {
-                    MaybeZero::Value(reference) => MaybeZero::Value(bind_register_output(
-                        context.tangent(),
-                        self.clone(),
-                        &[reference.clone(), context.primal_to_tangent(primals[1].clone())?],
-                    )?),
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
-                };
-                Ok(vec![DifferentiationDual::new(primal, tangent)?])
-            }
-            Self::Call | Self::Halves | Self::BitExtract | Self::BitInsert => Err(ProgramError::UnsupportedOperation {
+            Self::Call | Self::BitExtract | Self::BitInsert => Err(ProgramError::UnsupportedOperation {
                 message: format!("`{}` has no forward-mode rule in the register universe", self.name()),
             }
             .into()),
@@ -1261,30 +1228,36 @@ impl TransposableOperation<RegisterValue, RegisterOperation> for RegisterOperati
             Self::Freeze(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
             Self::Write(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
             Self::Swap(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
-            Self::AddUpdate => {
-                check_count!("input", inputs, 2, ProgramError);
+            Self::AddUpdate(transforms) => {
+                check_count!(
+                    "input",
+                    inputs,
+                    2 + transforms.iter().map(ReferenceTransform::binding_count).sum::<usize>(),
+                    ProgramError
+                );
                 check_count!("output", outputs, 0, ProgramError);
-                check_count!("accumulator", accumulators, 2, DifferentiationError);
+                check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
                 let update_cotangent = match context.cotangent_reference_if_allocated(driver, 0)? {
-                    Some(accumulator) => MaybeZero::Value(bind_register_output(
-                        &**context,
-                        Self::Read(ReferenceReadOperation::new()),
-                        &[accumulator],
-                    )?),
+                    Some(accumulator) => {
+                        let mut access_inputs = vec![accumulator];
+                        for binding in &inputs[2..] {
+                            access_inputs.push(binding.as_known().cloned().ok_or_else(|| {
+                                ProgramError::UnsupportedOperation {
+                                    message: "register view bindings must be known during transposition".to_string(),
+                                }
+                            })?);
+                        }
+                        MaybeZero::Value(bind_register_output(
+                            &**context,
+                            Self::Read(ReferenceReadOperation::new().with_transforms(transforms.clone())),
+                            &access_inputs,
+                        )?)
+                    }
                     None => MaybeZero::Zero(inputs[1].r#type().cotangent()?),
                 };
                 accumulators[1].accumulate(context, update_cotangent)
             }
-            // A view has no cotangent of its own: the accesses through it reach the same bit of the root's cotangent
-            // reference through the transposition context, which reapplies the view over the root's accumulator with
-            // the transposed value of the index.
-            Self::Bit => {
-                check_count!("input", inputs, 2, ProgramError);
-                check_count!("output", outputs, 1, ProgramError);
-                check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-                Ok(())
-            }
-            Self::Call | Self::Halves | Self::BitExtract | Self::BitInsert => Err(ProgramError::UnsupportedOperation {
+            Self::Call | Self::BitExtract | Self::BitInsert => Err(ProgramError::UnsupportedOperation {
                 message: format!("`{}` has no transposition rule in the register universe", self.name()),
             }
             .into()),
@@ -1293,16 +1266,10 @@ impl TransposableOperation<RegisterValue, RegisterOperation> for RegisterOperati
 }
 
 // Registers have no axes, so the family batches replicated carriers only: every region-free operation runs once on the
-// parent context over the packed values and its outputs stay replicated. A mapped carrier is rejected by name. The bit
-// view goes through the shared view rule instead, which moves the source's (replicated) batch axis through the
-// description and binds the batched view on the parent context with the packed index.
-impl<
-    C: Context<
-            Type = RegisterIrType,
-            Operation: ReferenceViewOperation<View: BatchableReferenceView> + From<RegisterOperation>,
-        >,
-    P: BatchingPolicy<C>,
-> BatchableOperation<C, P> for RegisterOperation
+// parent context over the packed values and its outputs stay replicated. A mapped carrier is rejected by name.
+// Folded paths remain on the copied access, and their dynamic bindings retain their packed input positions.
+impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>, P: BatchingPolicy<C>>
+    BatchableOperation<C, P> for RegisterOperation
 {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
@@ -1311,13 +1278,10 @@ impl<
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         match self {
-            Self::Call | Self::Halves => {
+            Self::Call => {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!("`{}` has no batching rule in the register universe", self.name()),
                 });
-            }
-            Self::Bit => {
-                return ReferenceViewOperation::batch(&C::Operation::from(self.clone()), context, inputs);
             }
             _ => {}
         }
@@ -1931,86 +1895,45 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
 }
 
 #[test]
-fn test_downstream_view_operation_records_output_indices_and_distinct_paths() {
-    // `f(register) = (read(low half), read(high half))`: one two-output view whose outputs are two distinct views of
-    // the same root, exercised through the generic static view contract from downstream position.
+fn test_downstream_access_descriptors_record_distinct_paths() {
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
-    let halves = builder
-        .add_instruction(RegisterOperation::Halves, Vec::new(), vec![reference], None)
-        .unwrap()
-        .to_vec();
     let low = builder
-        .add_instruction(RegisterOperation::Read(ReferenceReadOperation::new()), Vec::new(), vec![halves[0]], None)
+        .add_instruction(
+            RegisterOperation::Read(
+                ReferenceReadOperation::new().with_transforms(vec![RegisterTransform::Half(RegisterHalf::Low)]),
+            ),
+            Vec::new(),
+            vec![reference],
+            None,
+        )
         .unwrap()[0];
     let high = builder
-        .add_instruction(RegisterOperation::Read(ReferenceReadOperation::new()), Vec::new(), vec![halves[1]], None)
+        .add_instruction(
+            RegisterOperation::Read(
+                ReferenceReadOperation::new().with_transforms(vec![RegisterTransform::Half(RegisterHalf::High)]),
+            ),
+            Vec::new(),
+            vec![reference],
+            None,
+        )
         .unwrap()[0];
     let program = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![low, high], vec![Placeholder], vec![Placeholder; 2])
         .unwrap();
-
-    // The contract itself: exactly the two view outputs are described, each by its own half.
-    assert_eq!(RegisterOperation::Halves.reference_view(0), Some(RegisterView::Half(RegisterHalf::Low)));
-    assert_eq!(RegisterOperation::Halves.reference_view(1), Some(RegisterView::Half(RegisterHalf::High)));
-    assert_eq!(RegisterOperation::Halves.reference_view(2), None);
-    assert_eq!(RegisterOperation::Read(ReferenceReadOperation::new()).reference_view(0), None);
-
-    // The overlay records which output defines each alias edge and asks the operation for exactly that description, so
-    // the two paths differ while the root keeps the empty path and the read outputs have none.
-    let analysis = program.entry_region_ref().reference_view_analysis(0).unwrap();
-    let value = |atom: usize| ValueId::new(RegionId::new(0), AtomId::new(atom));
-    let halves_instruction = InstructionId::new(RegionId::new(0), 0);
+    let region = program.entry_region_ref();
+    let analysis = region.reference_view_analysis(0).unwrap();
     assert_eq!(
-        analysis.analysis().alias(value(1)),
-        Some(ReferenceAliasEdge::new(halves_instruction, 0, value(0), ReferenceAliasKind::View, true,)),
+        analysis.path(InstructionId::new(region.id(), 0), 0).cloned(),
+        Some(ReferenceTransformPath::root().with_transform(RegisterTransform::Half(RegisterHalf::Low)))
     );
     assert_eq!(
-        analysis.analysis().alias(value(2)),
-        Some(ReferenceAliasEdge::new(halves_instruction, 1, value(0), ReferenceAliasKind::View, true,)),
+        analysis.path(InstructionId::new(region.id(), 1), 0).cloned(),
+        Some(ReferenceTransformPath::root().with_transform(RegisterTransform::Half(RegisterHalf::High)))
     );
-    assert_eq!(analysis.path(value(0)), Some(&ReferenceViewPath::root()));
-    assert_eq!(
-        analysis.path(value(1)),
-        Some(&ReferenceViewPath::root().with_view(RegisterView::Half(RegisterHalf::Low)))
-    );
-    assert_eq!(
-        analysis.path(value(2)),
-        Some(&ReferenceViewPath::root().with_view(RegisterView::Half(RegisterHalf::High)))
-    );
-    assert_eq!(analysis.path(value(3)), None);
-    assert_eq!(analysis.path(value(4)), None);
-
-    // Reapplication stages the view over another register reference and keeps the described half, which the traced
-    // program then reads.
-    let (_, reapplied): (_, Program<_, _, Vec<RegisterValue>, Vec<RegisterValue>>) =
-        EagerContext::<RegisterValue, RegisterOperation>::trace(
-            |inputs: Vec<Tracer<TracingContext<RegisterValue, RegisterOperation>>>| {
-                let context = inputs[0].context().clone();
-                let high = RegisterOperation::reapply_reference_view(
-                    &context,
-                    &RegisterView::Half(RegisterHalf::High),
-                    inputs[0].clone(),
-                    &[],
-                )?;
-                context.bind(
-                    RegisterOperation::Read(ReferenceReadOperation::new()),
-                    Vec::new(),
-                    std::slice::from_ref(&high),
-                )
-            },
-            vec![RegisterIrType::Reference(ReferenceType::new(RegisterType))],
-        )
-        .unwrap();
-    assert_eq!(
-        reapplied.to_string(),
-        indoc! {"
-            lambda %0:ref<register> .
-            let %1:ref<register>, %2:ref<register> = register.halves %0
-                %3:register = reference_read %2
-            in (%3)"},
-    );
+    assert!(analysis.analysis().values().filter_map(|value| analysis.analysis().alias(value)).next().is_none());
 }
+
 /// `f(r, x) = { r.add_update(x); r.read() }` over the register universe, written against whatever context the input
 /// values dispatch to so that one closure serves the forward-mode, reverse-mode, and batching tracers alike.
 fn read_modify_write<V: Value<Type = RegisterIrType>>((reference, x): (V, V)) -> Result<V, ProgramError>
@@ -2018,20 +1941,29 @@ where
     V::DispatchDomain: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>,
 {
     let context = reference.dispatch_domain();
-    context.bind(RegisterOperation::AddUpdate, Vec::new(), &[reference.clone(), x])?;
+    context.bind(RegisterOperation::AddUpdate(Vec::new()), Vec::new(), &[reference.clone(), x])?;
     bind_register_output(&context, RegisterOperation::Read(ReferenceReadOperation::new()), &[reference])
 }
 
-/// `f(r, x, i) = { b = bit(r, i); b.write(x); b.read() }` over the register universe: a write and a read through the
-/// dynamic bit view, written against whatever context the input values dispatch to (refer to [`read_modify_write`]).
-fn write_read_bit<V: Value<Type = RegisterIrType>>((reference, x, index): (V, V, V)) -> Result<V, ProgramError>
+/// Writes and reads one dynamic bit with the path stored on each access operation.
+fn write_read_folded_bit<V: Value<Type = RegisterIrType>>(
+    (reference, value, index): (V, V, V),
+) -> Result<V, ProgramError>
 where
     V::DispatchDomain: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>,
 {
     let context = reference.dispatch_domain();
-    let bit = bind_register_output(&context, RegisterOperation::Bit, &[reference, index])?;
-    context.bind(RegisterOperation::Write(ReferenceWriteOperation::new()), Vec::new(), &[bit.clone(), x])?;
-    bind_register_output(&context, RegisterOperation::Read(ReferenceReadOperation::new()), &[bit])
+    let transforms = vec![RegisterTransform::Bit];
+    context.bind(
+        RegisterOperation::Write(ReferenceWriteOperation::new().with_transforms(transforms.clone())),
+        Vec::new(),
+        &[reference.clone(), value, index.clone()],
+    )?;
+    bind_register_output(
+        &context,
+        RegisterOperation::Read(ReferenceReadOperation::new().with_transforms(transforms)),
+        &[reference, index],
+    )
 }
 
 #[test]
@@ -2041,12 +1973,12 @@ fn test_downstream_view_description_overlap_and_batch() {
     // bindings agree and may otherwise overlap, and a bit may overlap with a half.
     let root = RegisterIrType::Reference(ReferenceType::new(RegisterType));
     let value = |atom: usize| ValueId::new(RegionId::new(0), AtomId::new(atom));
-    let empty = ReferenceViewPath::<RegisterView>::root();
-    let low = empty.with_view(RegisterView::Half(RegisterHalf::Low));
-    let high = empty.with_view(RegisterView::Half(RegisterHalf::High));
-    let low_high = low.with_view(RegisterView::Half(RegisterHalf::High));
-    let bit_of_1 = empty.with_step(RegisterView::Bit(1), vec![value(1)]);
-    let bit_of_2 = empty.with_step(RegisterView::Bit(1), vec![value(2)]);
+    let empty = ReferenceTransformPath::<RegisterTransform>::root();
+    let low = empty.with_transform(RegisterTransform::Half(RegisterHalf::Low));
+    let high = empty.with_transform(RegisterTransform::Half(RegisterHalf::High));
+    let low_high = low.with_transform(RegisterTransform::Half(RegisterHalf::High));
+    let bit_of_1 = empty.with_bound_transform(RegisterTransform::Bit, vec![value(1)]);
+    let bit_of_2 = empty.with_bound_transform(RegisterTransform::Bit, vec![value(2)]);
     assert_eq!(low.overlap(&high, &root), ReferenceViewOverlap::Disjoint);
     assert_eq!(low.overlap(&low, &root), ReferenceViewOverlap::Same);
     assert_eq!(empty.overlap(&empty, &root), ReferenceViewOverlap::Same);
@@ -2058,217 +1990,150 @@ fn test_downstream_view_description_overlap_and_batch() {
     assert_eq!(bit_of_1.overlap(&low, &root), ReferenceViewOverlap::MayOverlap);
     assert_eq!(empty.overlap(&bit_of_1, &root), ReferenceViewOverlap::MayOverlap);
     assert_eq!(
-        low.with_step(RegisterView::Bit(1), vec![value(1)]).overlap(&bit_of_1, &root),
+        low.with_bound_transform(RegisterTransform::Bit, vec![value(1)]).overlap(&bit_of_1, &root),
         ReferenceViewOverlap::MayOverlap
     );
 
-    // The analysis-level query resolves both values to their roots first: `f(register) = (read(low), read(high))`
-    // has one root, so its two halves are disjoint, each half may overlap with the root, and a non-reference value has
-    // no answer.
-    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
-    let reference = builder.add_input(root.clone());
-    let halves = builder
-        .add_instruction(RegisterOperation::Halves, Vec::new(), vec![reference], None)
-        .unwrap()
-        .to_vec();
-    let low_read = builder
-        .add_instruction(RegisterOperation::Read(ReferenceReadOperation::new()), Vec::new(), vec![halves[0]], None)
-        .unwrap()[0];
-    let high_read = builder
-        .add_instruction(RegisterOperation::Read(ReferenceReadOperation::new()), Vec::new(), vec![halves[1]], None)
-        .unwrap()[0];
-    let program = builder
-        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(
-            vec![low_read, high_read],
-            vec![Placeholder],
-            vec![Placeholder; 2],
-        )
-        .unwrap();
-    let region = program.entry_region_ref();
-    let analysis = region.reference_view_analysis(0).unwrap();
-    assert_eq!(analysis.overlap(region, value(1), value(2)), Some(ReferenceViewOverlap::Disjoint));
-    assert_eq!(analysis.overlap(region, value(0), value(1)), Some(ReferenceViewOverlap::MayOverlap));
-    assert_eq!(analysis.overlap(region, value(2), value(2)), Some(ReferenceViewOverlap::Same));
-    assert_eq!(analysis.overlap(region, value(1), value(3)), None);
-
-    // Registers have no axes, so a description batches only replicated sources and passes through unchanged, symbols
-    // included.
+    // Registers have no axes, so a description batches only replicated sources and passes through unchanged.
     assert_eq!(
-        RegisterView::Half(RegisterHalf::Low).batch(&root, BatchAxis::replicated()),
-        Ok((RegisterView::Half(RegisterHalf::Low), BatchAxis::replicated()))
+        RegisterTransform::Half(RegisterHalf::Low).batch(&root, BatchAxis::replicated()),
+        Ok((RegisterTransform::Half(RegisterHalf::Low), BatchAxis::replicated()))
     );
     assert_eq!(
-        RegisterView::Bit(1).batch(&root, BatchAxis::replicated()),
-        Ok((RegisterView::Bit(1), BatchAxis::replicated()))
+        RegisterTransform::Bit.batch(&root, BatchAxis::replicated()),
+        Ok((RegisterTransform::Bit, BatchAxis::replicated()))
     );
     assert!(matches!(
-        RegisterView::Half(RegisterHalf::High).batch(&root, BatchAxis::new(0)),
+        RegisterTransform::Half(RegisterHalf::High).batch(&root, BatchAxis::new(0)),
         Err(BatchingError::UnsupportedOperation { message })
             if message == "a register view cannot carry a mapped batch axis; registers have no axes",
     ));
 }
 
 #[test]
-fn test_downstream_dynamic_view_analysis_closes_the_index_input() {
-    // `f(r, i, j) = read(bit(r, i))` with two more views alongside: a second bit at the same index input, a bit at
-    // another index input, and the two static halves.
+fn test_downstream_dynamic_access_analysis_closes_index_bindings() {
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
-    let i = builder.add_input(RegisterIrType::Register(RegisterType));
-    let j = builder.add_input(RegisterIrType::Register(RegisterType));
-    let bit_i = builder.add_instruction(RegisterOperation::Bit, Vec::new(), vec![reference, i], None).unwrap()[0];
-    builder.add_instruction(RegisterOperation::Bit, Vec::new(), vec![reference, i], None).unwrap();
-    builder.add_instruction(RegisterOperation::Bit, Vec::new(), vec![reference, j], None).unwrap();
-    builder.add_instruction(RegisterOperation::Halves, Vec::new(), vec![reference], None).unwrap();
-    let observed = builder
-        .add_instruction(RegisterOperation::Read(ReferenceReadOperation::new()), Vec::new(), vec![bit_i], None)
-        .unwrap()[0];
+    let first_index = builder.add_input(RegisterIrType::Register(RegisterType));
+    let second_index = builder.add_input(RegisterIrType::Register(RegisterType));
+    for index in [first_index, first_index, second_index] {
+        builder
+            .add_instruction(
+                RegisterOperation::Read(ReferenceReadOperation::new().with_transforms(vec![RegisterTransform::Bit])),
+                Vec::new(),
+                vec![reference, index],
+                None,
+            )
+            .unwrap();
+    }
     let program = builder
-        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![observed], vec![Placeholder; 3], vec![Placeholder])
+        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
         .unwrap();
-
-    // The dynamic description names the index input symbolically and reports it as its one symbol.
-    assert_eq!(RegisterOperation::Bit.reference_view(0), Some(RegisterView::Bit(1)));
-    assert_eq!(RegisterOperation::Bit.reference_view(1), None);
-    assert_eq!(RegisterView::Bit(1).symbols(), vec![1]);
-    assert_eq!(RegisterView::Half(RegisterHalf::Low).symbols(), Vec::new());
-
-    // The overlay closes the symbol over the index input of the instruction that created each view, so the two bits
-    // at the same operand share one path, the bit at the other operand has a different path, and the overlap query
-    // decides all three outcomes from the closed paths alone.
     let region = program.entry_region_ref();
     let analysis = region.reference_view_analysis(0).unwrap();
-    let value = |atom: usize| ValueId::new(RegionId::new(0), AtomId::new(atom));
+    let first = analysis.path(InstructionId::new(region.id(), 0), 0).cloned().unwrap();
+    let repeated = analysis.path(InstructionId::new(region.id(), 1), 0).cloned().unwrap();
+    let second = analysis.path(InstructionId::new(region.id(), 2), 0).cloned().unwrap();
     assert_eq!(
-        analysis.analysis().alias(value(3)),
-        Some(ReferenceAliasEdge::new(
-            InstructionId::new(RegionId::new(0), 0),
-            0,
-            value(0),
-            ReferenceAliasKind::View,
-            true,
-        )),
+        first,
+        ReferenceTransformPath::root()
+            .with_bound_transform(RegisterTransform::Bit, vec![ValueId::new(region.id(), first_index)])
     );
-    let bit_path = |index: usize| ReferenceViewPath::root().with_step(RegisterView::Bit(1), vec![value(index)]);
-    assert_eq!(analysis.path(value(3)), Some(&bit_path(1)));
-    assert_eq!(analysis.path(value(4)), Some(&bit_path(1)));
-    assert_eq!(analysis.path(value(5)), Some(&bit_path(2)));
-    assert_eq!(analysis.overlap(region, value(3), value(4)), Some(ReferenceViewOverlap::Same));
-    assert_eq!(analysis.overlap(region, value(3), value(5)), Some(ReferenceViewOverlap::MayOverlap));
-    assert_eq!(analysis.overlap(region, value(3), value(6)), Some(ReferenceViewOverlap::MayOverlap));
-    assert_eq!(analysis.overlap(region, value(6), value(7)), Some(ReferenceViewOverlap::Disjoint));
-    assert_eq!(analysis.overlap(region, value(0), value(3)), Some(ReferenceViewOverlap::MayOverlap));
+    assert_eq!(repeated, first);
+    assert_eq!(
+        second,
+        ReferenceTransformPath::root()
+            .with_bound_transform(RegisterTransform::Bit, vec![ValueId::new(region.id(), second_index)])
+    );
+    assert_eq!(
+        RegisterTransform::overlap(
+            &RegisterIrType::Register(RegisterType),
+            first.bound_transforms(),
+            second.bound_transforms()
+        ),
+        ReferenceViewOverlap::MayOverlap
+    );
 }
 
 #[test]
-fn test_downstream_reference_view_analysis_does_not_require_batching() {
-    /// A bit-selection operation whose description supports analysis without implementing batching.
+fn test_downstream_reference_access_analysis_does_not_require_batching() {
+    /// Downstream bit description intentionally lacking a batching implementation.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct UnbatchedBit;
 
-    impl Operation for UnbatchedBit {
-        type Type = RegisterIrType;
-
-        fn name(&self) -> &'static str {
-            "register.unbatched_bit"
-        }
-
-        fn effects(&self) -> Cow<'_, Effects> {
-            Cow::Owned(RegisterOperation::Bit.effects().into_owned())
-        }
-
-        fn infer_output_types(
-            &self,
-            input_types: &[RegisterIrType],
-            region_interfaces: &[RegionInterface<RegisterIrType>],
-        ) -> Result<Vec<RegisterIrType>, TypeError> {
-            RegisterOperation::Bit.infer_output_types(input_types, region_interfaces)
+    impl Display for UnbatchedBit {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("bit")
         }
     }
 
-    impl ReferenceView for UnbatchedBit {
+    impl ReferenceTransform for UnbatchedBit {
         type Type = RegisterIrType;
+        type Referent = RegisterType;
 
-        fn symbols(&self) -> Vec<usize> {
-            vec![1]
+        fn binding_count(&self) -> usize {
+            1
+        }
+
+        fn validate_bindings(&self, input: &RegisterType, bindings: &[&RegisterIrType]) -> Result<(), TypeError> {
+            RegisterTransform::Bit.validate_bindings(input, bindings)
+        }
+
+        fn output_type(&self, input: &RegisterType) -> Result<RegisterType, TypeError> {
+            Ok(input.clone())
         }
 
         fn overlap(
             _type: &RegisterIrType,
-            lhs: &[ReferenceViewStep<Self>],
-            rhs: &[ReferenceViewStep<Self>],
+            lhs: &[BoundReferenceTransform<Self>],
+            rhs: &[BoundReferenceTransform<Self>],
         ) -> ReferenceViewOverlap {
             if lhs == rhs { ReferenceViewOverlap::Same } else { ReferenceViewOverlap::MayOverlap }
         }
     }
 
-    impl ReferenceViewOperation for UnbatchedBit {
-        type View = Self;
-
-        fn reference_view(&self, output_index: usize) -> Option<Self> {
-            (output_index == 0).then_some(Self)
-        }
-
-        fn validate_reference_view(
-            _view: &Self,
-            source: &RegisterIrType,
-            target: &RegisterIrType,
-        ) -> Result<(), ReferenceViewValidationError> {
-            RegisterOperation::validate_reference_view(&RegisterView::Bit(1), source, target)
-        }
-
-        fn reapply_reference_view<C: Context<Type = RegisterIrType, Operation = Self>>(
-            context: &C,
-            _view: &Self,
-            source: C::Value,
-            symbols: &[C::Value],
-        ) -> Result<C::Value, ProgramError> {
-            check_count!("input", symbols, 1, ProgramError);
-            let mut outputs = context.bind(Self, Vec::new(), &[source, symbols[0].clone()])?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok(outputs.remove(0))
-        }
-    }
-
-    // Two selections of the same bit close their symbols over the same input value. This analysis and its overlap
-    // query must compile using only ReferenceView; UnbatchedBit deliberately has no BatchableReferenceView impl.
-    let mut builder = ProgramBuilder::<RegisterValue, UnbatchedBit>::new();
+    let mut builder =
+        ProgramBuilder::<RegisterValue, ReferenceReadOperation<RegisterType, RegisterIrType, UnbatchedBit>>::new();
     let root = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
     let index = builder.add_input(RegisterIrType::Register(RegisterType));
-    let first = builder.add_instruction(UnbatchedBit, Vec::new(), vec![root, index], None).unwrap()[0];
-    let second = builder.add_instruction(UnbatchedBit, Vec::new(), vec![root, index], None).unwrap()[0];
+    builder
+        .add_instruction(
+            ReferenceReadOperation::new().with_transforms(vec![UnbatchedBit]),
+            Vec::new(),
+            vec![root, index],
+            None,
+        )
+        .unwrap();
     let program = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
         .unwrap();
     let region = program.entry_region_ref();
     let analysis = region.reference_view_analysis(0).unwrap();
-    let first = ValueId::new(region.id(), first);
-    let second = ValueId::new(region.id(), second);
     assert_eq!(
-        analysis.path(first),
-        Some(&ReferenceViewPath::root().with_step(UnbatchedBit, vec![ValueId::new(region.id(), index)])),
+        analysis.path(InstructionId::new(region.id(), 0), 0).cloned(),
+        Some(ReferenceTransformPath::root().with_bound_transform(UnbatchedBit, vec![ValueId::new(region.id(), index)]))
     );
-    assert_eq!(analysis.overlap(region, first, second), Some(ReferenceViewOverlap::Same));
 }
 
 #[test]
-fn test_downstream_reference_view_analysis_binds_explicit_region_inputs() {
+fn test_downstream_reference_access_analysis_binds_explicit_region_inputs() {
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
     let first_index = builder.add_input(RegisterIrType::Register(RegisterType));
     let second_index = builder.add_input(RegisterIrType::Register(RegisterType));
-    let first = builder
-        .add_instruction(RegisterOperation::Bit, Vec::new(), vec![reference, first_index], None)
-        .unwrap()[0];
-    let second = builder
-        .add_instruction(RegisterOperation::Bit, Vec::new(), vec![reference, second_index], None)
-        .unwrap()[0];
+    for index in [first_index, second_index] {
+        builder
+            .add_instruction(
+                RegisterOperation::Read(ReferenceReadOperation::new().with_transforms(vec![RegisterTransform::Bit])),
+                Vec::new(),
+                vec![reference, index],
+                None,
+            )
+            .unwrap();
+    }
     let body = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
         .unwrap();
-
-    // The caller forwards a whole register and two ordinary index values. The body's instruction operands identify
-    // the indices directly; no operation-specific symbol representation is needed in generic analysis.
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let inputs = body.input_types().iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
     let region = builder.import_region(body.entry_region_ref());
@@ -2279,44 +2144,18 @@ fn test_downstream_reference_view_analysis_binds_explicit_region_inputs() {
     let entry = program.entry_region_ref();
     let analysis = entry.reference_view_analysis(0).unwrap();
     assert_eq!(
-        analysis.path(ValueId::new(region, first)),
-        Some(&ReferenceViewPath::root().with_step(RegisterView::Bit(1), vec![ValueId::new(region, first_index)]))
+        analysis.path(InstructionId::new(region, 0), 0).cloned(),
+        Some(
+            ReferenceTransformPath::root()
+                .with_bound_transform(RegisterTransform::Bit, vec![ValueId::new(region, first_index)])
+        )
     );
     assert_eq!(
-        analysis.path(ValueId::new(region, second)),
-        Some(&ReferenceViewPath::root().with_step(RegisterView::Bit(1), vec![ValueId::new(region, second_index)]))
-    );
-    assert_eq!(
-        analysis.overlap(entry, ValueId::new(region, first), ValueId::new(region, second)),
-        Some(ReferenceViewOverlap::MayOverlap)
-    );
-}
-
-#[test]
-fn test_downstream_dynamic_view_reapplies_with_its_index() {
-    // Reapplication binds the view over another source with the supplied index value, here eagerly into a bit handle,
-    // and rejects a symbol count that disagrees with the description.
-    let context = RegisterDestination::new();
-    let reference = Reference::new(RegisterValue::Register(6)).unwrap();
-    let source = RegisterValue::Reference(reference.clone());
-    let bit = RegisterView::Bit(1);
-    let reapplied =
-        RegisterOperation::reapply_reference_view(&context, &bit, source.clone(), &[RegisterValue::Register(1)])
-            .unwrap();
-    assert_eq!(reapplied, RegisterValue::BitReference { root: reference.clone(), index: 1 });
-    assert_eq!(reapplied.read(), Ok(RegisterValue::Register(1)));
-    assert_eq!(
-        RegisterOperation::reapply_reference_view(&context, &bit, source.clone(), &[]),
-        Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-    );
-    assert_eq!(
-        RegisterOperation::reapply_reference_view(
-            &context,
-            &RegisterView::Half(RegisterHalf::Low),
-            source.clone(),
-            &[RegisterValue::Register(1)],
-        ),
-        Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
+        analysis.path(InstructionId::new(region, 1), 0).cloned(),
+        Some(
+            ReferenceTransformPath::root()
+                .with_bound_transform(RegisterTransform::Bit, vec![ValueId::new(region, second_index)])
+        )
     );
 }
 
@@ -2330,17 +2169,21 @@ fn test_downstream_dynamic_view_discharges_through_a_value_bound_alias() {
     let allocation = builder
         .add_instruction(RegisterOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![initial], None)
         .unwrap()[0];
-    let bit = builder.add_instruction(RegisterOperation::Bit, Vec::new(), vec![allocation, index], None).unwrap()[0];
     let previous = builder
         .add_instruction(
-            RegisterOperation::Swap(ReferenceSwapOperation::new()),
+            RegisterOperation::Swap(ReferenceSwapOperation::new().with_transforms(vec![RegisterTransform::Bit])),
             Vec::new(),
-            vec![bit, replacement],
+            vec![allocation, replacement, index],
             None,
         )
         .unwrap()[0];
     let observed = builder
-        .add_instruction(RegisterOperation::Read(ReferenceReadOperation::new()), Vec::new(), vec![bit], None)
+        .add_instruction(
+            RegisterOperation::Read(ReferenceReadOperation::new().with_transforms(vec![RegisterTransform::Bit])),
+            Vec::new(),
+            vec![allocation, index],
+            None,
+        )
         .unwrap()[0];
     let frozen = builder
         .add_instruction(RegisterOperation::Freeze(ReferenceFreezeOperation::new()), Vec::new(), vec![allocation], None)
@@ -2353,9 +2196,9 @@ fn test_downstream_dynamic_view_discharges_through_a_value_bound_alias() {
         )
         .unwrap();
 
-    // Eager execution goes through the bit handle: `r = 0b101`, bit 1 was `0`, becomes `1`, and the register ends at
-    // `0b111`. Discharge into the eager destination reaches the same values through the value-bound alias, whose bit
-    // step the policy reads and writes with the family's bit operations.
+    // Eager execution accesses the bit through the view path: `r = 0b101`, bit 1 was `0`, becomes `1`, and the register
+    // ends at `0b111`. Discharge into the eager destination reaches the same values through the value-bound alias,
+    // whose bit step the policy reads and writes with the family's bit operations.
     let inputs = vec![RegisterValue::Register(5), RegisterValue::Register(1), RegisterValue::Register(1)];
     let expected = vec![RegisterValue::Register(0), RegisterValue::Register(1), RegisterValue::Register(7)];
     assert_eq!(source.interpret(inputs.clone()), Ok(expected.clone()));
@@ -2398,19 +2241,17 @@ fn test_downstream_dynamic_view_discharges_through_a_value_bound_alias() {
             in (%3, %5, %4)"},
     );
 
-    // When the allocation is not selected, the view replays verbatim over the preserved reference and the accesses
-    // through it replay as well.
+    // Preserving the allocation keeps the same root and bindings on the copied access operations.
     let preserved = source.partially_discharge_references(0, &[]).unwrap();
     assert_eq!(
         preserved.program().to_string(),
         indoc! {"
             lambda %0:register, %1:register, %2:register .
             let %3:ref<register> = reference_new %0
-                %4:ref<register> = register.bit %3 %1
-                %5:register = reference_swap %4 %2
-                %6:register = reference_read %4
-                %7:register = reference_freeze %3
-            in (%5, %6, %7)"},
+                %4:register = reference_swap [transforms=[bit]] %3 %2 %1
+                %5:register = reference_read [transforms=[bit]] %3 %1
+                %6:register = reference_freeze %3
+            in (%4, %5, %6)"},
     );
 }
 
@@ -2573,6 +2414,31 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         One(OneOperation<ArrayIrType>),
         #[ryft(projected(ArrayType))]
         Array(ValueOnlyArrayOperation),
+    }
+
+    impl ReferenceAccessOperation for ValueOnlyOperation {
+        type Transform = NoReferenceTransform<ArrayType, ArrayIrType>;
+
+        fn base_input_count(&self) -> usize {
+            0
+        }
+
+        fn reference_access_descriptor(
+            &self,
+            _input_index: usize,
+        ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+            None
+        }
+
+        fn with_reference_access_transforms(
+            &self,
+            _input_index: usize,
+            _views: Vec<Self::Transform>,
+        ) -> Result<Self, ProgramError> {
+            Err(ProgramError::UnsupportedOperation {
+                message: "value-only operations have no reference accesses".to_string(),
+            })
+        }
     }
 
     // The member rules stay entirely within ordinary arrays, so the standard projection adapters suffice.
@@ -2740,51 +2606,37 @@ fn test_downstream_reference_universe_batch_through_the_public_boundary() {
 }
 
 #[test]
-fn test_downstream_dynamic_view_jvp_reapplies_the_view_to_the_tangent_reference() {
-    // Forward mode views the tangent reference at the primal index: the primal writes bit 2 of `r = 0b001`, the tangent
-    // writes bit 2 of `ṫ = 0b1000`, and each read returns its own bit. The tangent of the bit index is dropped.
+fn test_downstream_folded_dynamic_view_jvp() {
     let reference = Reference::new(RegisterValue::Register(1)).unwrap();
-    let tangent_reference = Reference::new(RegisterValue::Register(8)).unwrap();
+    let tangent = Reference::new(RegisterValue::Register(8)).unwrap();
     assert_eq!(
         differentiate_at((
             RegisterValue::Reference(reference.clone()),
             RegisterValue::Register(1),
-            RegisterValue::Register(2)
+            RegisterValue::Register(2),
         ))
         .jvp(
-            (
-                RegisterValue::Reference(tangent_reference.clone()),
-                RegisterValue::Register(1),
-                RegisterValue::Register(0)
-            ),
-            write_read_bit,
+            (RegisterValue::Reference(tangent.clone()), RegisterValue::Register(1), RegisterValue::Register(0),),
+            write_read_folded_bit,
         ),
         Ok((RegisterValue::Register(1), RegisterValue::Register(1))),
     );
     assert_eq!(reference.read(), Ok(RegisterValue::Register(5)));
-    assert_eq!(tangent_reference.read(), Ok(RegisterValue::Register(12)));
+    assert_eq!(tangent.read(), Ok(RegisterValue::Register(12)));
 }
 
 #[test]
-fn test_downstream_dynamic_view_vjp_resolves_the_index_of_the_viewed_cotangent_reference() {
-    // Reverse mode reaches the cotangent of the bit through the transposition context: the linear program views the
-    // tangent reference at the residual index, so the transposed program views the destination at that index, which
-    // the context resolves to the transposed-program value of the index input. The read accumulates `ȳ = 1` into
-    // bit 2 of the destination (`0b1000 ↦ 0b1100`), the write's transpose swaps a zero back out of it (`x̄ = 1`, the
-    // destination returns to `0b1000`), and the index receives a zero cotangent.
+fn test_downstream_folded_dynamic_view_vjp() {
     let reference = Reference::new(RegisterValue::Register(1)).unwrap();
     let (value, pullback) = differentiate_at((
         RegisterValue::Reference(reference.clone()),
         RegisterValue::Register(1),
         RegisterValue::Register(2),
     ))
-    .vjp(write_read_bit)
+    .vjp(write_read_folded_bit)
     .unwrap();
     assert_eq!(value, RegisterValue::Register(1));
     assert_eq!(reference.read(), Ok(RegisterValue::Register(5)));
-
-    // The transposed program makes the resolution visible: the cotangent destination is viewed at the residual index
-    // before the read's accumulation and the write's swap act on that view, and it is returned by identity.
     let transposed = pullback
         .linear_program()
         .transpose_with_respect_to(
@@ -2793,15 +2645,20 @@ fn test_downstream_dynamic_view_vjp_resolves_the_index_of_the_viewed_cotangent_r
         )
         .unwrap();
     assert_eq!(
-        transposed.to_string(),
-        indoc! {"
-            lambda %0:register, %1:ref<register>, %2:register .
-            let %3:ref<register> = register.bit %1 %2
-                () = register.add_update %3 %0
-                %4:register = register.zero
-                %5:register = reference_swap %3 %4
-                %6:register = register.zero
-            in (%1, %5, %6)"},
+        transposed
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.operation().name())
+            .collect::<Vec<_>>(),
+        vec!["register.add_update", "register.zero", "reference_swap", "register.zero"],
+    );
+    assert_eq!(
+        transposed.instructions()[0].operation().reference_access_descriptor(0).unwrap().transforms(),
+        &[RegisterTransform::Bit]
+    );
+    assert_eq!(
+        transposed.instructions()[2].operation().reference_access_descriptor(0).unwrap().transforms(),
+        &[RegisterTransform::Bit]
     );
     let destination = Reference::new(RegisterValue::Register(8)).unwrap();
     assert_eq!(
@@ -2819,14 +2676,12 @@ fn test_downstream_dynamic_view_vjp_resolves_the_index_of_the_viewed_cotangent_r
 }
 
 #[test]
-fn test_downstream_dynamic_view_batches_through_the_shared_view_rule() {
-    // The shared view rule binds the batched view on the eager parent with the packed (replicated) index, so the
-    // closure runs once over the packed values exactly as the replicated-only family rule does for the other
-    // operations.
+fn test_downstream_folded_dynamic_view_batch() {
+    // Replicated batching retains the dynamic binding beside the root on each folded access.
     let reference = Reference::new(RegisterValue::Register(1)).unwrap();
     assert_eq!(
         batch(
-            write_read_bit,
+            write_read_folded_bit,
             (RegisterValue::Reference(reference.clone()), RegisterValue::Register(1), RegisterValue::Register(2)),
             BatchAxis::replicated(),
             BatchAxis::replicated(),
@@ -2894,15 +2749,12 @@ fn test_downstream_reference_boundary_accepts_owned_positions() {
 }
 
 #[test]
-fn test_downstream_bit_reference_handle_accesses_one_bit_of_its_root() {
-    // The eager form of a bit view is a handle over the root: it has the root's reference type and identity, reads and
-    // writes bit `index` of the root while preserving the other bits, swaps and accumulates through a read and a write,
-    // and rejects a value other than 0 or 1, an out-of-range index, and consumption (a bit is not a complete handle).
+fn test_downstream_lazy_bit_view_accesses_one_bit_of_its_root() {
     let root = Reference::new(RegisterValue::Register(5)).unwrap();
-    let bit = RegisterValue::BitReference { root: root.clone(), index: 1 };
-    assert_eq!(bit.r#type().into_owned(), RegisterIrType::Reference(ReferenceType::new(RegisterType)));
-    assert_eq!(bit.reference_id(), Some(root.id()));
-    assert_eq!(bit.to_string(), format!("{root}[bit 1]"));
+    let viewed =
+        ViewedReference::<_, RegisterValue, RegisterTransform>::new(RegisterValue::Reference(root.clone())).unwrap();
+    let bit = viewed.clone().with_transform(RegisterTransform::Bit, vec![RegisterValue::Register(1)]).unwrap();
+    assert_eq!(bit.root().reference_id(), Some(root.id()));
     assert_eq!(bit.read(), Ok(RegisterValue::Register(0)));
     assert_eq!(bit.write(&RegisterValue::Register(1)), Ok(()));
     assert_eq!(root.read(), Ok(RegisterValue::Register(7)));
@@ -2910,16 +2762,478 @@ fn test_downstream_bit_reference_handle_accesses_one_bit_of_its_root() {
     assert_eq!(root.read(), Ok(RegisterValue::Register(5)));
     assert_eq!(bit.add_update(&RegisterValue::Register(1)), Ok(()));
     assert_eq!(root.read(), Ok(RegisterValue::Register(7)));
-    assert!(matches!(
-        bit.write(&RegisterValue::Register(2)),
-        Err(ProgramError::InvalidArgument { message })
-            if message == "a register bit holds 0 or 1 but 2 was stored into one",
-    ));
-    assert!(matches!(
-        RegisterValue::BitReference { root: root.clone(), index: 64 }.read(),
-        Err(ProgramError::InvalidArgument { message })
-            if message == "bit index 64 is out of range for a 64-bit register",
-    ));
-    assert!(matches!(bit.freeze(), Err(ProgramError::Type(_))));
+    assert!(matches!(bit.write(&RegisterValue::Register(2)), Err(ProgramError::InvalidArgument { message })
+        if message == "a register bit holds 0 or 1 but 2 was stored into one"));
+    let invalid = viewed.with_transform(RegisterTransform::Bit, vec![RegisterValue::Register(64)]).unwrap();
+    assert!(matches!(invalid.read(), Err(ProgramError::InvalidArgument { message })
+        if message == "bit index 64 is out of range for a 64-bit register"));
     assert_eq!(root.read(), Ok(RegisterValue::Register(7)));
+}
+
+/// A downstream operation family that keeps the existing array type universe while owning its view metadata.
+mod custom_array_views {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use ryft_core::{
+        ArrayIrOperation, ArrayReferenceDischarge, ArrayReferenceTransform, ArrayReferenceTransformIndex,
+        ArrayReferenceTransformOperation, ArrayReferenceTransformPath, DynamicSliceOperation,
+        DynamicUpdateSliceOperation, ReferenceAccumulationPolicy, SliceOperation, UpdateSliceOperation,
+    };
+
+    type ArrayValue = ArrayIrValue<Array>;
+    type CoreOperation = ArrayIrOperation<Array>;
+    type ArrayContext = TracingContext<ArrayValue, CustomOperation>;
+    type ArrayTracer = Tracer<ArrayContext>;
+
+    /// Distinct downstream metadata over the unmodified core array type universe.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct CustomTransform(ArrayReferenceTransform);
+
+    impl Display for CustomTransform {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Display::fmt(&self.0, formatter)
+        }
+    }
+
+    impl ReferenceTransform for CustomTransform {
+        type Type = ArrayIrType;
+        type Referent = ArrayType;
+        fn binding_count(&self) -> usize {
+            self.0.binding_count()
+        }
+        fn validate_bindings(&self, input: &ArrayType, bindings: &[&ArrayIrType]) -> Result<(), TypeError> {
+            self.0.validate_bindings(input, bindings)
+        }
+        fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
+            self.0.output_type(input)
+        }
+        fn overlap(
+            _type: &ArrayIrType,
+            lhs: &[BoundReferenceTransform<Self>],
+            rhs: &[BoundReferenceTransform<Self>],
+        ) -> ReferenceViewOverlap {
+            if lhs == rhs { ReferenceViewOverlap::Same } else { ReferenceViewOverlap::MayOverlap }
+        }
+    }
+
+    impl BatchableReferenceTransform for CustomTransform {
+        fn batch(&self, r#type: &ArrayIrType, axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
+            self.0.batch(r#type, axis).map(|(view, axis)| (Self(view), axis))
+        }
+    }
+
+    /// Core pure operations and allocation lifecycle with downstream-owned accesses.
+    #[derive(Clone, Debug)]
+    enum CustomOperation {
+        Core(CoreOperation),
+        Read(ReferenceReadOperation<ArrayType, ArrayIrType, CustomTransform>),
+        AddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType, CustomTransform>),
+    }
+
+    impl CustomOperation {
+        /// Converts metadata only at the eager execution boundary; staged accesses retain the downstream view type.
+        fn builtin(&self) -> CoreOperation {
+            match self {
+                Self::Core(operation) => operation.clone(),
+                Self::Read(operation) => CoreOperation::ReferenceRead(
+                    ReferenceReadOperation::new()
+                        .with_transforms(operation.transforms().iter().map(|view| view.0.clone()).collect()),
+                ),
+                Self::AddUpdate(operation) => CoreOperation::ReferenceAddUpdate(
+                    ReferenceAddUpdateOperation::new()
+                        .with_transforms(operation.transforms().iter().map(|view| view.0.clone()).collect()),
+                ),
+            }
+        }
+    }
+
+    impl From<ReferenceReadOperation<ArrayType, ArrayIrType, CustomTransform>> for CustomOperation {
+        fn from(operation: ReferenceReadOperation<ArrayType, ArrayIrType, CustomTransform>) -> Self {
+            Self::Read(operation)
+        }
+    }
+    impl From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, CustomTransform>> for CustomOperation {
+        fn from(operation: ReferenceAddUpdateOperation<ArrayType, ArrayIrType, CustomTransform>) -> Self {
+            Self::AddUpdate(operation)
+        }
+    }
+    impl From<ReferenceNewOperation<ArrayType, ArrayIrType>> for CustomOperation {
+        fn from(operation: ReferenceNewOperation<ArrayType, ArrayIrType>) -> Self {
+            Self::Core(operation.into())
+        }
+    }
+    impl From<ReferenceFreezeOperation<ArrayType, ArrayIrType>> for CustomOperation {
+        fn from(operation: ReferenceFreezeOperation<ArrayType, ArrayIrType>) -> Self {
+            Self::Core(operation.into())
+        }
+    }
+    impl From<AddOperation<ArrayIrType>> for CustomOperation {
+        fn from(operation: AddOperation<ArrayIrType>) -> Self {
+            Self::Core(operation.into())
+        }
+    }
+    impl OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>> for CustomOperation {
+        type Operation = Self;
+        fn provide(request: ZeroOperation<ArrayIrType>, inputs: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+            CoreOperation::provide(request, inputs).map(Self::Core)
+        }
+    }
+    impl ResidualZeroProvider<ArrayIrType> for CustomOperation {}
+
+    impl Operation for CustomOperation {
+        type Type = ArrayIrType;
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Core(operation) => operation.name(),
+                Self::Read(operation) => operation.name(),
+                Self::AddUpdate(operation) => operation.name(),
+            }
+        }
+        fn infer_output_types(
+            &self,
+            inputs: &[ArrayIrType],
+            regions: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            match self {
+                Self::Core(operation) => operation.infer_output_types(inputs, regions),
+                Self::Read(operation) => operation.infer_output_types(inputs, regions),
+                Self::AddUpdate(operation) => operation.infer_output_types(inputs, regions),
+            }
+        }
+        fn effects(&self) -> Cow<'_, Effects> {
+            match self {
+                Self::Core(operation) => operation.effects(),
+                Self::Read(operation) => operation.effects(),
+                Self::AddUpdate(operation) => operation.effects(),
+            }
+        }
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            match self {
+                Self::Core(operation) => operation.render(formatter, indentation),
+                Self::Read(operation) => operation.render(formatter, indentation),
+                Self::AddUpdate(operation) => operation.render(formatter, indentation),
+            }
+        }
+    }
+    impl Display for CustomOperation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.render(formatter, 0)
+        }
+    }
+    impl ReferenceAccessOperation for CustomOperation {
+        type Transform = CustomTransform;
+        fn base_input_count(&self) -> usize {
+            match self {
+                Self::Core(operation) => operation.base_input_count(),
+                Self::Read(operation) => operation.base_input_count(),
+                Self::AddUpdate(operation) => operation.base_input_count(),
+            }
+        }
+        fn reference_access_descriptor(&self, input: usize) -> Option<ReferenceAccessDescriptor<'_, CustomTransform>> {
+            match self {
+                Self::Read(operation) => operation.reference_access_descriptor(input),
+                Self::AddUpdate(operation) => operation.reference_access_descriptor(input),
+                Self::Core(CoreOperation::ReferenceFreeze(_)) if input == 0 => {
+                    Some(ReferenceAccessDescriptor::new(&[], 1..1))
+                }
+                _ => None,
+            }
+        }
+        fn with_reference_access_transforms(
+            &self,
+            input: usize,
+            transforms: Vec<CustomTransform>,
+        ) -> Result<Self, ProgramError> {
+            match self {
+                Self::Read(operation) => operation.with_reference_access_transforms(input, transforms).map(Self::Read),
+                Self::AddUpdate(operation) => {
+                    operation.with_reference_access_transforms(input, transforms).map(Self::AddUpdate)
+                }
+                _ if self.reference_access_descriptor(input).is_some() && transforms.is_empty() => Ok(self.clone()),
+                _ => Err(ProgramError::UnsupportedOperation {
+                    message: "custom operation cannot replace this view".to_owned(),
+                }),
+            }
+        }
+    }
+    impl ArrayReferenceTransformOperation for CustomOperation {
+        fn from_reference_reshape(operation: ReshapeOperation) -> Self {
+            Self::Core(CoreOperation::from_reference_reshape(operation))
+        }
+        fn from_reference_slice(operation: SliceOperation) -> Self {
+            Self::Core(CoreOperation::from_reference_slice(operation))
+        }
+        fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
+            Self::Core(CoreOperation::from_reference_update_slice(operation))
+        }
+        fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
+            Self::Core(CoreOperation::from_reference_dynamic_slice(operation))
+        }
+        fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
+            Self::Core(CoreOperation::from_reference_dynamic_update_slice(operation))
+        }
+    }
+    impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for CustomOperation
+    where
+        CoreOperation: InterpretableOperation<C>,
+    {
+        fn interpret<D: InterpretationDriver<C>>(
+            &self,
+            context: &C,
+            driver: &D,
+            inputs: &[C::Value],
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            self.builtin().interpret(context, driver, inputs)
+        }
+    }
+    impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for CustomOperation where
+        C: Context<Operation = CustomOperation>
+    {
+    }
+
+    /// An explicit downstream policy, distinct from ArrayIrType's canonical policy.
+    #[derive(Copy, Clone, Debug)]
+    struct CustomPolicy;
+    impl<C: Context<Type = ArrayIrType, Operation = CustomOperation>> ReferenceDischargePolicy<C> for CustomPolicy {
+        type Referent = ArrayType;
+        type Transform = CustomTransform;
+        type Alias = ArrayReferenceTransformPath<C::Value>;
+        fn compose_transforms(
+            context: &C,
+            alias: &Self::Alias,
+            transforms: &[CustomTransform],
+            bindings: &[C::Value],
+        ) -> Result<Self::Alias, ProgramError> {
+            ArrayReferenceDischarge::compose_transforms(
+                context,
+                alias,
+                &transforms.iter().map(|view| view.0.clone()).collect::<Vec<_>>(),
+                bindings,
+            )
+        }
+        fn storage_alias(_referent: &ArrayType) -> Self::Alias {
+            ArrayReferenceTransformPath::root()
+        }
+        fn read(context: &C, current: &C::Value, alias: &Self::Alias) -> Result<C::Value, ProgramError> {
+            ArrayReferenceDischarge::read(context, current, alias)
+        }
+        fn write(
+            context: &C,
+            current: &C::Value,
+            replacement: C::Value,
+            alias: &Self::Alias,
+        ) -> Result<C::Value, ProgramError> {
+            ArrayReferenceDischarge::write(context, current, replacement, alias)
+        }
+    }
+    impl<C: Context<Type = ArrayIrType, Operation = CustomOperation>> ReferenceAccumulationPolicy<C> for CustomPolicy {
+        fn accumulate(
+            context: &C,
+            current: &C::Value,
+            update: C::Value,
+            alias: &Self::Alias,
+        ) -> Result<C::Value, ProgramError> {
+            ArrayReferenceDischarge::accumulate(context, current, update, alias)
+        }
+    }
+    impl<C: Context<Type = ArrayIrType, Operation = CustomOperation>> ReferenceDischargeableOperation<C, CustomPolicy>
+        for CustomOperation
+    {
+        fn discharge_references<D: ReferenceDischargeDriver<C, CustomPolicy>>(
+            &self,
+            context: &ReferenceDischargeContext<C, CustomPolicy>,
+            driver: &D,
+            inputs: &[ReferenceDischargeValue<C, CustomPolicy>],
+        ) -> Result<Vec<ReferenceDischargeValue<C, CustomPolicy>>, ProgramError> {
+            match self {
+                Self::Read(operation) => operation.discharge_references(context, driver, inputs),
+                Self::AddUpdate(operation) => operation.discharge_references(context, driver, inputs),
+                Self::Core(CoreOperation::ReferenceNew(operation)) => {
+                    operation.discharge_references(context, driver, inputs)
+                }
+                Self::Core(CoreOperation::ReferenceFreeze(operation)) => {
+                    operation.discharge_references(context, driver, inputs)
+                }
+                Self::Core(_) => discharge_reference_free_operation(self, context, driver, inputs),
+            }
+        }
+    }
+    impl<C: Context<Type = ArrayIrType, Operation = CustomOperation> + Zero<C::Value>> DifferentiableOperation<C>
+        for CustomOperation
+    {
+        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            driver: &D,
+            inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            match self {
+                Self::Read(operation) => operation.jvp(context, driver, inputs),
+                Self::AddUpdate(operation) => operation.jvp(context, driver, inputs),
+                Self::Core(CoreOperation::ReferenceNew(operation)) => operation.jvp(context, driver, inputs),
+                Self::Core(CoreOperation::ReferenceFreeze(operation)) => operation.jvp(context, driver, inputs),
+                _ => Err(ProgramError::UnsupportedOperation {
+                    message: "custom fixture only differentiates reference primitives".to_owned(),
+                }
+                .into()),
+            }
+        }
+    }
+    impl TransposableOperation<ArrayValue, CustomOperation> for CustomOperation {
+        fn transpose<D: TranspositionDriver<ArrayValue, CustomOperation>>(
+            &self,
+            context: &mut TranspositionContext<ArrayValue, CustomOperation>,
+            driver: &D,
+            inputs: &[PartialValue<ArrayTracer>],
+            outputs: &[MaybeZero<ArrayTracer>],
+            accumulators: &[CotangentAccumulator],
+        ) -> Result<(), DifferentiationError> {
+            match self {
+                Self::Read(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
+                Self::AddUpdate(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
+                Self::Core(CoreOperation::ReferenceNew(operation)) => {
+                    operation.transpose(context, driver, inputs, outputs, accumulators)
+                }
+                _ => Err(ProgramError::UnsupportedOperation {
+                    message: "custom fixture only transposes allocation and accesses".to_owned(),
+                }
+                .into()),
+            }
+        }
+    }
+    impl<C: Context<Type = ArrayIrType, Operation = CustomOperation>, P: BatchingPolicy<C>> BatchableOperation<C, P>
+        for CustomOperation
+    {
+        fn batch<D: BatchingDriver<C, P>>(
+            &self,
+            context: &BatchingContext<C, P>,
+            driver: &D,
+            inputs: &[P::Batch],
+        ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+            match self {
+                Self::Read(operation) => operation.batch(context, driver, inputs),
+                Self::AddUpdate(operation) => operation.batch(context, driver, inputs),
+                _ => Err(ProgramError::UnsupportedOperation {
+                    message: "custom fixture only batches accesses".to_owned(),
+                }
+                .into()),
+            }
+        }
+    }
+
+    /// Builds one dynamic read after a local allocation; index metadata belongs to the downstream family.
+    fn source() -> Program<ArrayValue, CustomOperation, Vec<ArrayValue>, Vec<ArrayValue>> {
+        let mut builder = ProgramBuilder::<ArrayValue, CustomOperation>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
+        let index = builder.add_constant(ArrayValue::Array(Array::scalar(-1i32).unwrap()));
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(vec![CustomTransform(ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Dynamic,
+                })]),
+                Vec::new(),
+                vec![root, index],
+                None,
+            )
+            .unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    #[test]
+    fn test_downstream_array_view_discharge() {
+        let source = source();
+        let input = ArrayValue::Array(Array::vector(vec![2f32, 3., 5.]).unwrap());
+        let expected = vec![ArrayValue::Array(Array::scalar(5f32).unwrap())];
+        assert_eq!(source.clone().interpret(vec![input.clone()]), Ok(expected.clone()));
+        let discharged = source.discharge_references_with_policy::<CustomPolicy>(0).unwrap();
+        assert_eq!(discharged.program().interpret(vec![input]), Ok(expected));
+    }
+
+    #[test]
+    fn test_downstream_array_view_jvp() {
+        let program = source().jvp_with_respect_to(&[0]).unwrap();
+        let inputs = vec![
+            ArrayValue::Array(Array::vector(vec![2f32, 3., 5.]).unwrap()),
+            ArrayValue::Array(Array::vector(vec![7f32, 11., 13.]).unwrap()),
+        ];
+        let expected =
+            vec![ArrayValue::Array(Array::scalar(5f32).unwrap()), ArrayValue::Array(Array::scalar(13f32).unwrap())];
+        assert_eq!(program.clone().interpret(inputs.clone()), Ok(expected.clone()));
+        let discharged = program.into_flat_program().discharge_references_with_policy::<CustomPolicy>(0).unwrap();
+        assert_eq!(discharged.program().interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_downstream_array_view_transpose() {
+        let program = source().transpose_with_respect_to(&[0], &[]).unwrap();
+        let access = program
+            .instructions()
+            .iter()
+            .find_map(|instruction| match instruction.operation() {
+                CustomOperation::AddUpdate(operation) => Some((operation, instruction)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            access.0.transforms(),
+            &[CustomTransform(ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic
+            })]
+        );
+        assert_eq!(access.1.inputs().len(), 3);
+        let inputs = vec![ArrayValue::Array(Array::scalar(7f32).unwrap())];
+        let expected = vec![ArrayValue::Array(Array::vector(vec![0f32, 0., 7.]).unwrap())];
+        assert_eq!(program.clone().interpret(inputs.clone()), Ok(expected.clone()));
+        let discharged = program.into_flat_program().discharge_references_with_policy::<CustomPolicy>(0).unwrap();
+        assert_eq!(discharged.program().interpret(inputs), Ok(expected));
+    }
+    #[test]
+    fn test_downstream_array_view_batching() {
+        use ryft_core::{
+            ArrayIrBatch, ArrayIrBatchingPolicy, DimensionBounds, DimensionType, DimensionValue, EmptyRegionDriver,
+            StagingContext,
+        };
+        let (_, program) = ArrayContext::trace(
+            |(root, index): (ArrayTracer, ArrayTracer)| {
+                let parent = root.context().clone();
+                let extent = parent.constant(ArrayValue::Dimension(DimensionValue::new(
+                    DimensionType::new("batch", DimensionBounds::unbounded()),
+                    2,
+                )?));
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent, extent);
+                let root = ArrayIrBatch::new(root, BatchAxis::new(0))?;
+                let index = ArrayIrBatch::replicated(index);
+                let operation =
+                    CustomOperation::Read(ReferenceReadOperation::new().with_transforms(vec![CustomTransform(
+                        ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+                    )]));
+                let (outputs, _) = operation.batch(&context, &EmptyRegionDriver, &[root, index])?.into_parts();
+                assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+                Ok(outputs[0].value().clone())
+            },
+            (
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3]))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
+            ),
+        )
+        .unwrap();
+        let operation = program.instructions()[0].operation();
+        assert_eq!(
+            operation.reference_access_descriptor(0).unwrap().transforms(),
+            &[CustomTransform(ArrayReferenceTransform::Index {
+                axis: 1,
+                index: ArrayReferenceTransformIndex::Dynamic
+            },)]
+        );
+        let array = ArrayValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap());
+        let index = ArrayValue::Array(Array::scalar(-1i32).unwrap());
+        let expected = ArrayValue::Array(Array::vector(vec![3f32, 6.]).unwrap());
+        assert_eq!(program.clone().interpret((array.reference_new().unwrap(), index.clone())), Ok(expected.clone()));
+        let discharged = program.into_flat_program().discharge_references_with_policy::<CustomPolicy>(0).unwrap();
+        assert_eq!(discharged.program().interpret(vec![array, index]), Ok(vec![expected]));
+    }
 }

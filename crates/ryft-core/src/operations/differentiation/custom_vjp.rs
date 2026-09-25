@@ -859,8 +859,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceDischarge,
-        ArrayType, DataType, Dimension, Shape, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
+        Dimension, Shape, ShardingDimension,
     };
     use crate::batching::{Batch, BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{Context, EagerContext};
@@ -959,7 +959,6 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_discharges_local_reference_rules() {
-        use crate::arrays::ArrayReferenceDischarge;
         use crate::operations::references::{ReferenceFreezeOperation, ReferenceNewOperation};
 
         // The primal is the identity, but the backward rule deliberately returns three times its cotangent. A local
@@ -999,7 +998,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap()
-            .discharge_references::<ArrayReferenceDischarge>(0)
+            .discharge_references(0)
             .unwrap()
             .into_program_without_external_references()
             .unwrap();
@@ -1081,7 +1080,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            program.discharge_references::<ArrayReferenceDischarge>(0),
+            program.discharge_references(0),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "`custom_vjp` does not thread external references through discharge, but operand 0 is a \
                     reference; pass reference-free operands or discharge external references first",

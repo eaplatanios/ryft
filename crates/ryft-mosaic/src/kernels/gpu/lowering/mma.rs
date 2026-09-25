@@ -9,7 +9,7 @@
 //! must have 256-byte base alignment so the 32-byte swizzle's descriptor base-offset field is zero.
 
 use ryft_core::{
-    ArrayReferenceView, ArraySliceAxis, ArrayType, DataType, DotOperation, Operation as CoreOperation,
+    ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, DotOperation, Operation as CoreOperation,
     ScaledDotOperation,
 };
 use ryft_mlir::dialects::{arith, llvm, memref, nvvm};
@@ -217,13 +217,13 @@ impl<'c, 't> Lowering<'c, 't> {
                 accumulator: output.owner,
                 left: (
                     inputs[0].owner,
-                    ArrayReferenceView::Slice {
+                    ArrayReferenceTransform::Slice {
                         axes: vec![ArraySliceAxis::new(0, 64, 1), ArraySliceAxis::new(group * 16, 16, 1)],
                     },
                 ),
                 right: (
                     inputs[1].owner,
-                    ArrayReferenceView::Slice {
+                    ArrayReferenceTransform::Slice {
                         axes: vec![ArraySliceAxis::new(group * 16, 16, 1), ArraySliceAxis::new(0, columns, 1)],
                     },
                 ),

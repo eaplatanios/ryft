@@ -11,9 +11,10 @@
 //! subtract, multiply, floor division and remainder when canonical reconstruction preserves its complete cached
 //! metadata; scalar conversions, conditions and while loops are also supported. Reference allocation/read/write/swap,
 //! freeze/add-update/atomic-add-update, scratch, tile load, masked load/store/swap and async copy/wait are supported.
-//! Reference views, other operation payloads, distributed metadata and dynamically shaped explicit layouts report
-//! eligibility errors. Sequence sizes are bounded before allocation from size hints; all literal storage together
-//! may consume at most 64 MiB after applying layouts. Diagnostic provenance uses a checked flat arena.
+//! Folded reference paths retain their canonical trailing bindings. Other operation payloads, distributed metadata
+//! and dynamically shaped explicit layouts report eligibility errors. Sequence sizes are bounded before allocation
+//! from size hints; all literal storage together may consume at most 64 MiB after applying layouts. Diagnostic
+//! provenance uses a checked flat arena.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -22,9 +23,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
-    Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Layout,
-    MAX_DIMENSION_EXTENT, Memory, Shape, StridedLayout, Tile, TileDimension, TiledLayout,
+    Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
+    ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation,
+    DimensionType, DimensionValue, DimensionVariable, Layout, MAX_DIMENSION_EXTENT, Memory, Shape, StridedLayout, Tile,
+    TileDimension, TiledLayout,
 };
 use crate::contexts::EagerContext;
 use crate::kernels::calls::{KernelCallOperation, KernelDefinition, KernelError, KernelParameter};
@@ -49,7 +51,7 @@ use crate::operations::{
 use crate::parameters::Placeholder;
 use crate::programs::{
     Atom, AtomId, FlatProgram, Instruction, Operation, Program, ProgramError, Provenance, ProvenanceScope,
-    ReferenceType, Region, RegionId, Typed,
+    ReferenceAccessOperation, ReferenceType, Region, RegionId, Typed, validated_reference_access_descriptors,
 };
 
 /// Errors admitting or reconstructing a portable serialized kernel.
@@ -72,7 +74,7 @@ pub enum KernelSerializationError {
 }
 
 /// Independent transport schema version; it is not the semantic-key encoding version.
-const SOURCE_SCHEMA_VERSION: u32 = 2;
+const SOURCE_SCHEMA_VERSION: u32 = 3;
 
 /// Maximum total physical bytes allocated for decoded literals, including layout padding.
 const MAXIMUM_LITERAL_BYTES: usize = 64 * 1024 * 1024;
@@ -204,11 +206,84 @@ enum WireProvenanceNode {
     Fused(#[serde(deserialize_with = "bounded_records")] Vec<usize>),
 }
 
+/// Canonical path of one reference input; bindings remain in the instruction's ordered input list.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireReferenceAccessDescriptor {
+    input_index: usize,
+    #[serde(deserialize_with = "bounded_records")]
+    transforms: Vec<WireReferenceTransform>,
+}
+
+/// One canonical selection, encoded independently of an operation's number of base inputs.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum WireReferenceTransform {
+    Index {
+        axis: usize,
+        index: usize,
+    },
+    DynamicIndex {
+        axis: usize,
+    },
+    Slice {
+        #[serde(deserialize_with = "bounded_records")]
+        axes: Vec<WireSliceAxis>,
+    },
+}
+
+/// One static slice axis; validation remains owned by the canonical reference view implementation.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireSliceAxis {
+    start: usize,
+    size: usize,
+    stride: usize,
+}
+
+impl WireReferenceTransform {
+    /// Encodes one checked canonical selection with bounded axis records.
+    fn encode(view: &ArrayReferenceTransform) -> Result<Self, KernelSerializationError> {
+        Ok(match view {
+            ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) } => {
+                Self::Index { axis: *axis, index: *index }
+            }
+            ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic } => {
+                Self::DynamicIndex { axis: *axis }
+            }
+            ArrayReferenceTransform::Slice { axes } => {
+                check_records(axes.len())?;
+                Self::Slice {
+                    axes: axes
+                        .iter()
+                        .map(|axis| WireSliceAxis { start: axis.start(), size: axis.size(), stride: axis.stride() })
+                        .collect(),
+                }
+            }
+        })
+    }
+
+    /// Reconstructs a selection whose geometry and binding types are checked when the program is sealed.
+    fn decode(self) -> ArrayReferenceTransform {
+        match self {
+            Self::Index { axis, index } => {
+                ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) }
+            }
+            Self::DynamicIndex { axis } => ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic },
+            Self::Slice { axes } => ArrayReferenceTransform::Slice {
+                axes: axes.into_iter().map(|axis| ArraySliceAxis::new(axis.start, axis.size, axis.stride)).collect(),
+            },
+        }
+    }
+}
+
 /// Instruction indices retain shared region edges without expanding the region graph into a tree.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireInstruction {
     operation: WireOperation,
+    #[serde(deserialize_with = "bounded_records")]
+    reference_transforms: Vec<WireReferenceAccessDescriptor>,
     #[serde(deserialize_with = "bounded_records")]
     inputs: Vec<usize>,
     #[serde(deserialize_with = "bounded_records")]
@@ -687,8 +762,25 @@ impl Encoder {
                     .instructions()
                     .iter()
                     .map(|instruction| {
+                        let operation = lift(instruction.operation())?;
+                        let mut reference_transforms = Vec::new();
+                        let descriptors =
+                            validated_reference_access_descriptors(&operation, instruction.inputs().len())?;
+                        for (input_index, descriptor) in descriptors.iter().enumerate() {
+                            let Some(descriptor) = descriptor else { continue };
+                            check_records(descriptor.transforms().len())?;
+                            reference_transforms.push(WireReferenceAccessDescriptor {
+                                input_index,
+                                transforms: descriptor
+                                    .transforms()
+                                    .iter()
+                                    .map(WireReferenceTransform::encode)
+                                    .collect::<Result<_, _>>()?,
+                            });
+                        }
                         Ok(WireInstruction {
-                            operation: self.operation(&lift(instruction.operation())?)?,
+                            operation: self.operation(&operation)?,
+                            reference_transforms,
                             inputs: instruction.inputs().iter().map(|id| id.index()).collect(),
                             outputs: instruction.outputs().iter().map(|id| id.index()).collect(),
                             regions: instruction.regions().iter().map(|id| id.index()).collect(),
@@ -1117,10 +1209,10 @@ impl Decoder {
             WireOperation::Scratch { referent, alignment } => {
                 ScratchOperation::new(self.array_type(referent)?, alignment).map_err(ProgramError::custom)?.into()
             }
-            WireOperation::MaskedLoad => MaskedLoadOperation.into(),
-            WireOperation::MaskedStore => MaskedStoreOperation.into(),
-            WireOperation::MaskedSwap => MaskedSwapOperation.into(),
-            WireOperation::AsyncCopy => AsyncCopyOperation.into(),
+            WireOperation::MaskedLoad => MaskedLoadOperation::new().into(),
+            WireOperation::MaskedStore => MaskedStoreOperation::new().into(),
+            WireOperation::MaskedSwap => MaskedSwapOperation::new().into(),
+            WireOperation::AsyncCopy => AsyncCopyOperation::new().into(),
             WireOperation::Wait => WaitOperation.into(),
         })
     }
@@ -1168,8 +1260,26 @@ impl Decoder {
                 .instructions
                 .into_iter()
                 .map(|instruction| {
+                    let mut operation = self.operation(instruction.operation)?;
+                    let mut accesses = operation.effects().accesses().map(|(input, _)| input).collect::<Vec<_>>();
+                    accesses.sort_unstable();
+                    if instruction.reference_transforms.iter().map(|path| path.input_index).collect::<Vec<_>>() != accesses {
+                        return Err(invalid("reference view descriptors do not match the operation's access inputs"));
+                    }
+                    for path in instruction.reference_transforms {
+                        operation = operation.with_reference_access_transforms(
+                            path.input_index,
+                            path.transforms.into_iter().map(WireReferenceTransform::decode).collect(),
+                        )?;
+                    }
+                    validated_reference_access_descriptors(&operation, instruction.inputs.len()).map_err(|error| {
+                        match error {
+                            ProgramError::MalformedProgram(message) => invalid(message),
+                            error => error.into(),
+                        }
+                    })?;
                     Ok(Instruction::new(
-                        project(self.operation(instruction.operation)?)?,
+                        project(operation)?,
                         instruction.inputs.into_iter().map(AtomId::new).collect(),
                         instruction.outputs.into_iter().map(AtomId::new).collect(),
                         instruction.regions.into_iter().map(RegionId::new).collect(),
@@ -1393,7 +1503,7 @@ mod tests {
     use crate::kernels::authoring::whole_array_parameter;
     use crate::kernels::interpretation::DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS;
     use crate::operations::{SinOperation, TanhOperation};
-    use crate::programs::TypeIdentityRenaming;
+    use crate::programs::{ProgramBuilder, TypeIdentityRenaming};
 
     use super::*;
 
@@ -1443,6 +1553,28 @@ mod tests {
         .unwrap()
     }
 
+    /// Builds a read-only body whose one access carries the supplied selection and optional scalar binding.
+    fn viewed_read_definition(view: ArrayReferenceTransform, binding: Option<i64>) -> KernelDefinition {
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::I32, [2, 2]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let root = builder.add_input(call.body_input_types()[0].clone());
+        let mut inputs = vec![root];
+        if let Some(binding) = binding {
+            inputs.push(builder.add_constant(ArrayIrValue::Array(Array::scalar(binding).unwrap())));
+        }
+        builder
+            .add_instruction(ReferenceReadOperation::new().with_transforms(vec![view]), vec![], inputs, None)
+            .unwrap();
+        KernelDefinition::new(call, builder.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap()
+    }
+
     #[test]
     fn test_kernel_definition_serialize() {
         let value = Array::scalar(-0.0f32).unwrap();
@@ -1450,6 +1582,141 @@ mod tests {
         let decoded = roundtrip(&definition);
         let output = decoded.interpret(vec![], DEFAULT_KERNEL_INTERPRETATION_MAXIMUM_PROGRAMS).unwrap();
         assert_eq!(output[0].logical_bytes(), value.logical_bytes());
+    }
+
+    #[test]
+    fn test_kernel_definition_serialize_reference_transforms() {
+        let view = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 1, 1), ArraySliceAxis::new(0, 2, 1)] };
+        let definition = viewed_read_definition(view.clone(), None);
+        let decoded = roundtrip(&definition);
+        let operation = decoded.body().entry_region().instructions()[0].operation();
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().transforms(), &[view]);
+    }
+
+    #[test]
+    fn test_kernel_definition_serialize_dynamic_reference_transforms() {
+        let view = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let definition = viewed_read_definition(view.clone(), Some(1));
+        let decoded = roundtrip(&definition);
+        let instruction = &decoded.body().entry_region().instructions()[0];
+        assert_eq!(instruction.operation().reference_access_descriptor(0).unwrap().transforms(), &[view]);
+        assert_eq!(instruction.operation().reference_access_descriptor(0).unwrap().bindings(), 1..2);
+        assert_eq!(instruction.inputs().len(), 2);
+    }
+
+    #[test]
+    fn test_kernel_definition_serialize_shared_region_reference_transforms() {
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::I32, [2, 2]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut branch = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = branch.add_input(call.parameters()[0].body_type());
+        let index = branch.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
+        branch
+            .add_instruction(
+                ReferenceReadOperation::new()
+                    .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }]),
+                vec![],
+                vec![reference, index],
+                None,
+            )
+            .unwrap();
+        let branch = branch
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![], vec![Placeholder; 2], vec![])
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let reference = builder.add_input(call.parameters()[0].body_type());
+        let index = builder.add_constant(ArrayIrValue::Array(Array::scalar(1i64).unwrap()));
+        let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
+        let branch = builder.import_region(branch.entry_region_ref());
+        builder
+            .add_instruction(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                vec![branch, branch],
+                vec![predicate, reference, index],
+                None,
+            )
+            .unwrap();
+        let body = builder.build(vec![], vec![Placeholder], vec![]).unwrap();
+        let definition = KernelDefinition::new(call, body).unwrap();
+        let decoded = roundtrip(&definition);
+        let attached = decoded.body().instructions()[0].regions();
+        assert_eq!(attached.len(), 2);
+        assert_eq!(attached[0], attached[1]);
+        let branch = decoded.body().region_ref(attached[0]).unwrap();
+        let instruction = &branch.instructions()[0];
+        assert_eq!(instruction.inputs()[1], branch.input_ids()[1]);
+        assert_eq!(instruction.operation().reference_access_descriptor(0).unwrap().bindings(), 1..2);
+    }
+
+    #[test]
+    fn test_kernel_definition_serialize_independent_async_copy_transforms() {
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![
+                whole_array_parameter(ArrayType::new_static(DataType::I32, [2, 2]), KernelParameterAccess::ReadOnly)
+                    .unwrap(),
+                whole_array_parameter(ArrayType::new_static(DataType::I32, [3, 2]), KernelParameterAccess::ReadWrite)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+        let roots = call.body_input_types().into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let source_index = builder.add_constant(ArrayIrValue::Array(Array::scalar(1i64).unwrap()));
+        let destination_index = builder.add_constant(ArrayIrValue::Array(Array::scalar(2i64).unwrap()));
+        let operation = AsyncCopyOperation::new()
+            .with_source_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }])
+            .with_destination_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic,
+            }]);
+        let token = builder
+            .add_instruction(operation, vec![], vec![roots[0], roots[1], source_index, destination_index], None)
+            .unwrap()[0];
+        builder.add_instruction(WaitOperation, vec![], vec![token], None).unwrap();
+        let definition =
+            KernelDefinition::new(call, builder.build(vec![], vec![Placeholder; 2], vec![]).unwrap()).unwrap();
+        let decoded = roundtrip(&definition);
+        let instruction = &decoded.body().entry_region().instructions()[0];
+        assert_eq!(instruction.operation().reference_access_descriptor(0).unwrap().bindings(), 2..3);
+        assert_eq!(instruction.operation().reference_access_descriptor(1).unwrap().bindings(), 3..4);
+    }
+
+    #[test]
+    fn test_kernel_definition_deserialize_invalid_reference_binding_count() {
+        let definition = viewed_read_definition(
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+            Some(1),
+        );
+        let mut wire = serde_json::to_value(&definition).unwrap();
+        wire["body"]["regions"][0]["instructions"][0]["inputs"] = serde_json::json!([0]);
+        let error = serde_json::from_value::<KernelDefinition>(wire).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid serialized kernel source: operation `reference_read` reference views require 2 inputs but the \
+             instruction has 1",
+        );
+    }
+
+    #[test]
+    fn test_kernel_definition_deserialize_invalid_reference_descriptor() {
+        let definition = viewed_read_definition(
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            None,
+        );
+        let mut wire = serde_json::to_value(&definition).unwrap();
+        wire["body"]["regions"][0]["instructions"][0]["reference_transforms"][0]["input_index"] = serde_json::json!(1);
+        let error = serde_json::from_value::<KernelDefinition>(wire).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid serialized kernel source: reference view descriptors do not match the operation's access inputs"
+        );
     }
 
     #[test]
@@ -1523,7 +1790,9 @@ mod tests {
         let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let context = references[0].context();
             let scratch = context.bind(ScratchOperation::new(r#type.clone(), 4).unwrap(), vec![], &[])?.remove(0);
-            let token = context.bind(AsyncCopyOperation, vec![], &[references[0].clone(), scratch.clone()])?.remove(0);
+            let token = context
+                .bind(AsyncCopyOperation::new(), vec![], &[references[0].clone(), scratch.clone()])?
+                .remove(0);
             context.bind(WaitOperation, vec![], &[token])?;
             let value = context.bind(ReferenceReadOperation::new(), vec![], &[scratch])?.remove(0);
             context.bind(ReferenceWriteOperation::new(), vec![], &[references[1].clone(), value])?;
@@ -1564,13 +1833,13 @@ mod tests {
                 )?
                 .remove(0);
             let value = context
-                .bind(MaskedLoadOperation, vec![], &[references[0].clone(), mask.clone(), other.clone()])?
+                .bind(MaskedLoadOperation::new(), vec![], &[references[0].clone(), mask.clone(), other.clone()])?
                 .remove(0);
             context.bind(ReferenceAtomicAddUpdateOperation::new(), vec![], &[references[0].clone(), value.clone()])?;
             let old = context
-                .bind(MaskedSwapOperation, vec![], &[references[0].clone(), value, mask.clone(), other])?
+                .bind(MaskedSwapOperation::new(), vec![], &[references[0].clone(), value, mask.clone(), other])?
                 .remove(0);
-            context.bind(MaskedStoreOperation, vec![], &[references[0].clone(), old, mask])?;
+            context.bind(MaskedStoreOperation::new(), vec![], &[references[0].clone(), old, mask])?;
             Ok(())
         })
         .unwrap();
