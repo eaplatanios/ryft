@@ -29,7 +29,6 @@ use crate::macros::{
 use crate::operations::arithmetic::{Mul, Neg};
 use crate::operations::constants::fill::Fill;
 use crate::operations::exponential::Exp;
-use crate::operations::manipulation::conversions::ElementType;
 use crate::programs::{Typed, Value};
 
 /// Canonical operation name for [`ErfOperation`].
@@ -53,12 +52,11 @@ impl_differentiable_elementwise_operation! {
     ErfOperation,
     jvp<C>
     where
-        C::Type: ElementType,
         C::Value: Neg + Mul + Exp,
         <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
     {
         // `d(erf(x)) = (2/√π) · exp(-x²) · dx`, with the coefficient `2/√π` rounded to the aligned input's element
-        // data type and staged as a nullary fill of the aligned input type.
+        // data type. Filling that type stages a scalar constant and broadcasts it when needed.
         |(input, input_tangent)| {
             let input_type = input.r#type().into_owned();
             let coefficient = input.dispatch_domain().fill(&input_type, FRAC_2_SQRT_PI)?;
@@ -96,8 +94,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayType, DataType, f4e2m1fn, f8e8m0fnu};
     use crate::contexts::EagerContext;
+    use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -107,12 +106,6 @@ mod tests {
     use crate::programs::EmptyRegionDriver;
 
     use super::*;
-
-    /// `erf(0.5)`, `erf(1)`, `erf(2)`, and `erf(3)` correctly rounded to `f64`.
-    const ERF_HALF: f64 = 0.5204998778130465;
-    const ERF_ONE: f64 = 0.8427007929497149;
-    const ERF_TWO: f64 = 0.9953222650189527;
-    const ERF_THREE: f64 = 0.9999779095030014;
 
     #[test]
     fn test_erf_type_inference() {
@@ -158,7 +151,7 @@ mod tests {
         check_operation_partial_evaluation!(
             operation = ErfOperation::new(),
             inputs = [Array::scalar(0.5).unwrap()],
-            expected = Array::scalar(ERF_HALF).unwrap(),
+            expected = Array::scalar(0.5204998778130465).unwrap(),
         );
     }
 
@@ -170,7 +163,7 @@ mod tests {
             axis_size = 2,
             cases = [{
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![ERF_HALF, -ERF_ONE]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![0.5204998778130465, -0.8427007929497149]).unwrap())],
             }],
         );
     }
@@ -200,11 +193,28 @@ mod tests {
             }],
         );
         check_gradient!(
-            |x| x.erf().map(|values| values.reduce(&[0], ReductionKind::Sum).unwrap()),
+            |input| input.erf()?.reduce(&[0], ReductionKind::Sum),
             at = Array::vector(vec![-2.5f64, -0.3, 0.0, 0.9, 3.0]).unwrap(),
             step = 1e-6,
             tolerance = 1e-6,
         );
+    }
+
+    #[test]
+    fn test_erf_differentiation_low_precision() {
+        // Form the derivative coefficient before multiplying by the tangent, retaining its accuracy in `f16`.
+        let (_, tangent) = differentiate_at(Array::scalar(f16::from_f32(0.5)).unwrap())
+            .jvp(Array::scalar(f16::from_f32(0.3)).unwrap(), |input| input.erf())
+            .unwrap();
+        assert_eq!(tangent, Array::scalar(f16::from_f64(0.263671875)).unwrap());
+
+        // Exponent-only primals retain their storage type, while the derivative uses signed `f32` arithmetic.
+        let (primal, tangent) = differentiate_at(Array::scalar(f8e8m0fnu::from_f64(0.5).unwrap()).unwrap())
+            .jvp(Array::scalar(1.0f32).unwrap(), |input| input.erf())
+            .unwrap();
+        assert_eq!(primal.elements::<f8e8m0fnu>().unwrap()[0].to_bits(), 0x7e);
+        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 0.8787826, epsilon = 1e-7);
     }
 
     #[test]
@@ -223,35 +233,46 @@ mod tests {
         assert_eq!(Array::scalar(f64::INFINITY).unwrap().erf().unwrap(), Array::scalar(1.0f64).unwrap());
         assert_eq!(Array::scalar(f64::NEG_INFINITY).unwrap().erf().unwrap(), Array::scalar(-1.0f64).unwrap());
         assert_eq!(Array::scalar(1.5f64).unwrap().erf().unwrap(), -Array::scalar(-1.5f64).unwrap().erf().unwrap());
-        assert!(Array::scalar(f64::NAN).unwrap().erf().unwrap().to_f64s()[0].is_nan());
+        assert!(Array::scalar(f64::NAN).unwrap().erf().unwrap().elements::<f64>().unwrap()[0].is_nan());
 
-        // Known values covering every rational-approximation regime of the reference implementation: the small
-        // series (i.e., `|x| < 2⁻²⁸`), the primary interval (i.e., `|x| < 0.84375`), the `[0.84375, 1.25)` interval,
-        // both tail intervals of the complementary-function path, and the saturated `|x| ≥ 6` regime.
-        assert_abs_diff_eq!(
-            Array::scalar(1e-12f64).unwrap().erf().unwrap(),
-            Array::scalar(FRAC_2_SQRT_PI * 1e-12).unwrap(),
+        // Logical element decoding retains signed zeros and the exact low-precision encodings.
+        assert_eq!(
+            Array::scalar(-0.0f64).unwrap().erf().unwrap().elements::<f64>().unwrap()[0].to_bits(),
+            (-0.0f64).to_bits(),
         );
-        assert_eq!(Array::scalar(0.5f64).unwrap().erf().unwrap(), Array::scalar(ERF_HALF).unwrap());
-        assert_eq!(Array::scalar(1.0f64).unwrap().erf().unwrap(), Array::scalar(ERF_ONE).unwrap());
-        assert_eq!(Array::scalar(2.0f64).unwrap().erf().unwrap(), Array::scalar(ERF_TWO).unwrap());
-        assert_eq!(Array::scalar(3.0f64).unwrap().erf().unwrap(), Array::scalar(ERF_THREE).unwrap());
-        assert_eq!(Array::scalar(4.0f64).unwrap().erf().unwrap(), Array::scalar(0.9999999845827421).unwrap());
-        assert_eq!(Array::scalar(6.5f64).unwrap().erf().unwrap(), Array::scalar(1.0f64).unwrap());
-        assert_eq!(Array::scalar(-6.5f64).unwrap().erf().unwrap(), Array::scalar(-1.0f64).unwrap());
+        assert_eq!(
+            Array::scalar(f4e2m1fn::from_f64(-0.0).unwrap())
+                .unwrap()
+                .erf()
+                .unwrap()
+                .elements::<f4e2m1fn>()
+                .unwrap()[0]
+                .to_bits(),
+            0x8,
+        );
+        assert_eq!(
+            Array::scalar(f4e2m1fn::from_f64(0.5).unwrap())
+                .unwrap()
+                .erf()
+                .unwrap()
+                .elements::<f4e2m1fn>()
+                .unwrap()[0]
+                .to_bits(),
+            0x1,
+        );
 
         // The narrower variants round the double-precision evaluation to their own precision.
-        assert_eq!(Array::scalar(0.5f32).unwrap().erf().unwrap(), Array::scalar(ERF_HALF as f32).unwrap());
+        assert_eq!(Array::scalar(0.5f32).unwrap().erf().unwrap(), Array::scalar(0.5204998778130465f64 as f32).unwrap());
         assert_eq!(
             Array::scalar(bf16::from_f32(0.5)).unwrap().erf().unwrap(),
-            Array::scalar(bf16::from_f64(ERF_HALF)).unwrap(),
+            Array::scalar(bf16::from_f64(0.5204998778130465)).unwrap(),
         );
         assert_eq!(
             Array::scalar(f16::from_f32(0.5)).unwrap().erf().unwrap(),
-            Array::scalar(f16::from_f64(ERF_HALF)).unwrap(),
+            Array::scalar(f16::from_f64(0.5204998778130465)).unwrap(),
         );
 
-        assert_eq!(Array::scalar(0.5).unwrap().erf().unwrap(), Array::scalar(ERF_HALF).unwrap());
+        assert_eq!(Array::scalar(0.5).unwrap().erf().unwrap(), Array::scalar(0.5204998778130465).unwrap());
 
         assert_abs_diff_eq!(
             Array::vector(vec![-1.0f64, 0.0, 1.0]).unwrap().erf().unwrap(),

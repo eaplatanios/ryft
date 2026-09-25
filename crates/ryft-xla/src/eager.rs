@@ -665,6 +665,20 @@ mod tests {
     }
 
     #[test]
+    fn test_eager_erf() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // Cover the complete exponent-only encoding domain, including the subnormal input and NaN.
+        let bytes = (0..=255u8).collect::<Vec<_>>();
+        let input_type = replicated_type(&mesh, DataType::F8E8M0FNU, &[256]);
+        let reference = CpuArray::new(input_type.clone(), bytes.clone()).unwrap().erf().unwrap();
+        assert_eq!(&reference.logical_bytes()[..3], &[1, 1, 2]);
+        let input = Array::from_host_buffer(&client, input_type, mesh, bytes).unwrap();
+        let output = input.erf().unwrap();
+        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), reference.logical_bytes(),);
+    }
+
+    #[test]
     fn test_eager_log() {
         let client = execution_client();
         let mesh = cpu_mesh(&client);

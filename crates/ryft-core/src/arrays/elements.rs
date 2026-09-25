@@ -3715,15 +3715,24 @@ mod tests {
 
     #[test]
     fn test_real_floating_point_array_element_erf() {
+        // Fixed points, non-finite values, and signed zero retain their scalar semantics.
         assert_eq!(RealFloatingPointArrayElement::erf(0.0f64), Ok(0.0));
         assert_eq!(RealFloatingPointArrayElement::erf(-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
-        assert!((RealFloatingPointArrayElement::erf(0.5f64).unwrap() - 0.5204998778130465).abs() < 1e-15);
-        assert!((RealFloatingPointArrayElement::erf(2.0f64).unwrap() - 0.9953222650189527).abs() < 1e-15);
-        assert!((RealFloatingPointArrayElement::erf(1.0f64).unwrap() - 0.8427007929497149).abs() < 1e-15);
-        assert_abs_diff_eq!(RealFloatingPointArrayElement::erf(-1.0f32).unwrap(), -0.8427008, epsilon = 1e-7);
         assert_eq!(RealFloatingPointArrayElement::erf(f64::INFINITY), Ok(1.0));
         assert_eq!(RealFloatingPointArrayElement::erf(f64::NEG_INFINITY), Ok(-1.0));
         assert!(RealFloatingPointArrayElement::erf(f64::NAN).unwrap().is_nan());
+
+        // Known values cover the small series, both central rational approximations, both complementary tail
+        // intervals, and saturation. The tiny input uses an exact rounded expectation rather than absolute tolerance.
+        assert_eq!(RealFloatingPointArrayElement::erf(1e-12f64), Ok(1.1283791670955126e-12));
+        assert_eq!(RealFloatingPointArrayElement::erf(0.5f64), Ok(0.5204998778130465));
+        assert_eq!(RealFloatingPointArrayElement::erf(1.0f64), Ok(0.8427007929497149));
+        assert_eq!(RealFloatingPointArrayElement::erf(2.0f64), Ok(0.9953222650189527));
+        assert_eq!(RealFloatingPointArrayElement::erf(3.0f64), Ok(0.9999779095030014));
+        assert_eq!(RealFloatingPointArrayElement::erf(4.0f64), Ok(0.9999999845827421));
+        assert_eq!(RealFloatingPointArrayElement::erf(6.5f64), Ok(1.0));
+        assert_eq!(RealFloatingPointArrayElement::erf(-6.5f64), Ok(-1.0));
+        assert_eq!(RealFloatingPointArrayElement::erf(-1.0f32), Ok(-0.8427008));
     }
 
     #[test]

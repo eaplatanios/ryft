@@ -2165,12 +2165,48 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ErfOperation<ArrayType>
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
+        output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let result = lowerer.block.append_operation(chlo::erf(input_values[0], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("chlo.erf should return one result").as_ref()])
+        let mut input = input_values[0];
+        if output_types[0].data_type() == DataType::F8E8M0FNU {
+            // Both smallest encodings have erf outputs that round to 0x01 under the exponent-only conversion
+            // contract. Raise 0x00 to 0x01 before CHLO's f32 expansion, where 2^-127 can otherwise flush to zero
+            // and produce NaN on conversion back. Integer comparison preserves this distinction even with FTZ.
+            let byte_type = output_types[0].clone().with_data_type(DataType::U8);
+            let byte_tensor_type = lower_tensor_type(&byte_type, lowerer.context, lowerer.location)?;
+            let bits = lowerer.block.append_operation(stable_hlo::bitcast_convert(
+                input,
+                byte_tensor_type,
+                lowerer.location,
+            )?)?;
+            let minimum = lower_f64_constant_splat(
+                1.0,
+                &byte_type,
+                byte_tensor_type,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?;
+            let normalized = lowerer.block.append_operation(stable_hlo::maximum(
+                bits.result(0).unwrap().as_ref(),
+                minimum,
+                lowerer.location,
+            )?)?;
+            input = lowerer
+                .block
+                .append_operation(stable_hlo::bitcast_convert(
+                    normalized.result(0).unwrap().as_ref(),
+                    lower_tensor_type(&output_types[0], lowerer.context, lowerer.location)?,
+                    lowerer.location,
+                )?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+        }
+        let result = lowerer.block.append_operation(chlo::erf(input, lowerer.location)?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 

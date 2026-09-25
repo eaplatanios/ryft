@@ -161,8 +161,6 @@ macro_rules! impl_cos_for_primitive {
 impl_cos_for_primitive!(f32);
 impl_cos_for_primitive!(f64);
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`Atan2Operation`].
 pub const ATAN2_OPERATION_NAME: &str = "atan2";
 
@@ -173,8 +171,10 @@ define_elementwise_operation!(
     /// their element types and broadcasting their shapes. For complex inputs, the principal value is defined as
     /// `-i · log((x + i · y) / sqrt(x² + y²))`. Only floating-point and complex inputs are supported, and array inputs
     /// that still carry partial sums are rejected, with their reduced-axis markers required to agree.
-    Atan2Operation, ATAN2_OPERATION_NAME,
-    Atan2, atan2,
+    Atan2Operation,
+    ATAN2_OPERATION_NAME,
+    Atan2,
+    atan2,
     check_data_types = [@float],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
@@ -193,7 +193,7 @@ impl_differentiable_operation! {
             + ElementwiseDerivativeAlignment<C::Type>,
     {
         |_operation, context, _driver, inputs| {
-            // d(atan2(y, x)) = x / (x² + y²) · dy - y / (x² + y²) · dx. The shared denominator is computed once for
+            // `d(atan2(y, x)) = x / (x² + y²) · dy - y / (x² + y²) · dx`. The shared denominator is computed once for
             // both terms, and each divided coefficient is formed independently, matching the primitive's numerical
             // rule: combining the terms into one numerator can produce `inf - inf` before division for large finite
             // inputs even when the two finite quotient terms cancel. The custom form also computes the shared
@@ -255,8 +255,7 @@ impl_differentiable_operation! {
 define_elementwise_capability!(
     @binary
     /// Represents the ability to compute elementwise two-argument arc tangents. Concrete arrays compute immediately
-    /// while context-carrying values apply [`Atan2Operation`] through their context. Refer to that operation for
-    /// supported types and exceptional-value behavior.
+    /// while context-carrying values apply [`Atan2Operation`] through their context.
     Atan2,
     /// Computes `atan2(self, x)`, with `self` as the vertical coordinate and `x` as the horizontal coordinate,
     /// promoting and broadcasting the inputs. Returns an error if the input types or metadata are unsupported.
@@ -266,7 +265,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @binary
-    Atan2, atan2,
+    Atan2,
+    atan2,
     operation = "atan2",
     inputs = @float,
     checks = [@no_unreduced, @same_reduced_axes],
@@ -275,9 +275,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Atan2`] for one host primitive type.
 macro_rules! impl_atan2_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Atan2 for $type {
+            #[inline]
             fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
                 Ok(<$type>::atan2(*self, *x))
             }
@@ -288,18 +288,18 @@ macro_rules! impl_atan2_for_primitive {
 impl_atan2_for_primitive!(f32);
 impl_atan2_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`TanhOperation`].
 pub const TANH_OPERATION_NAME: &str = "tanh";
 
 define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise hyperbolic tangent of one value (i.e.,
-    /// `x ↦ tanh(x)`, the analytic continuation `tanh(z)` on complex inputs) while preserving its array metadata. Only
-    /// floating-point and complex inputs are supported, and inputs that still carry partial sums are rejected.
-    TanhOperation, TANH_OPERATION_NAME,
-    Tanh, tanh,
+    /// `x ↦ tanh(x)`, the analytic continuation `tanh(z)` on complex inputs) while preserving its array metadata.
+    /// Only floating-point and complex inputs are supported, and inputs that still carry partial sums are rejected.
+    TanhOperation,
+    TANH_OPERATION_NAME,
+    Tanh,
+    tanh,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -320,8 +320,7 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @unary
     /// Represents the ability to compute elementwise hyperbolic tangents. Concrete arrays compute immediately while
-    /// context-carrying values apply [`TanhOperation`] through their context. Refer to that operation for supported
-    /// types and exceptional-value behavior.
+    /// context-carrying values apply [`TanhOperation`] through their context.
     Tanh,
     /// Computes the hyperbolic tangent of each floating-point or complex element. Returns an error if the input types
     /// or metadata are unsupported.
@@ -331,7 +330,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Tanh, tanh,
+    Tanh,
+    tanh,
     operation = "tanh",
     inputs = @float,
     checks = [@no_unreduced],
@@ -340,9 +340,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Tanh`] for one host primitive type.
 macro_rules! impl_tanh_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Tanh for $type {
+            #[inline]
             fn tanh(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::tanh(*self))
             }
@@ -472,6 +472,7 @@ mod tests {
         let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.sin()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
         assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-6);
 
@@ -527,7 +528,6 @@ mod tests {
             .unwrap()[0];
         assert_eq!(extreme.re, 0.0);
         assert!(extreme.im.is_infinite() && extreme.im.is_sign_positive());
-
         assert_eq!(Array::scalar(0.5).unwrap().sin().unwrap(), Array::scalar(0.5f64.sin()).unwrap(),);
     }
 
