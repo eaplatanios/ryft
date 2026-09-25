@@ -42,8 +42,6 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::programs::{MaybeZero, ProgramError, Type, Typed, Value};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`ExpOperation`].
 pub const EXP_OPERATION_NAME: &str = "exp";
 
@@ -52,8 +50,10 @@ define_elementwise_operation!(
     /// [`Operation`](crate::Operation) that computes the elementwise natural exponential of one value (i.e., `x ↦ eˣ`,
     /// the analytic continuation `e^z` on complex inputs) while preserving its array metadata. Only floating-point and
     /// complex inputs are supported, and inputs that still carry partial sums are rejected.
-    ExpOperation, EXP_OPERATION_NAME,
-    Exp, exp,
+    ExpOperation,
+    EXP_OPERATION_NAME,
+    Exp,
+    exp,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -70,8 +70,7 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @unary
     /// Represents the ability to compute elementwise natural exponentials. Concrete arrays compute immediately while
-    /// context-carrying values apply [`ExpOperation`] through their context. Refer to that operation for supported
-    /// types and exceptional-value behavior.
+    /// context-carrying values apply [`ExpOperation`] through their context.
     Exp,
     /// Computes the natural exponential of each floating-point or complex element. Returns an error if the input types
     /// or metadata are unsupported.
@@ -81,7 +80,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Exp, exp,
+    Exp,
+    exp,
     operation = "exp",
     inputs = @float,
     checks = [@no_unreduced],
@@ -90,9 +90,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Exp`] for one host primitive type.
 macro_rules! impl_exp_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Exp for $type {
+            #[inline]
             fn exp(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::exp(*self))
             }
@@ -103,8 +103,6 @@ macro_rules! impl_exp_for_primitive {
 impl_exp_for_primitive!(f32);
 impl_exp_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`LogOperation`].
 pub const LOG_OPERATION_NAME: &str = "log";
 
@@ -113,8 +111,10 @@ define_elementwise_operation!(
     /// [`Operation`](crate::Operation) that computes the elementwise natural logarithm of one value (i.e., `x ↦ ln(x)`,
     /// the principal branch `ln(z)` on complex inputs) while preserving its array metadata. Only floating-point and
     /// complex inputs are supported, and inputs that still carry partial sums are rejected.
-    LogOperation, LOG_OPERATION_NAME,
-    Log, log,
+    LogOperation,
+    LOG_OPERATION_NAME,
+    Log,
+    log,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -131,8 +131,7 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @unary
     /// Represents the ability to compute elementwise natural logarithms. Concrete arrays compute immediately while
-    /// context-carrying values apply [`LogOperation`] through their context. Refer to that operation for supported
-    /// types and exceptional-value behavior.
+    /// context-carrying values apply [`LogOperation`] through their context.
     Log,
     /// Computes the natural logarithm of each element, using the principal branch for complex values. Returns an error
     /// if the input types or metadata are unsupported.
@@ -142,7 +141,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Log, log,
+    Log,
+    log,
     operation = "log",
     inputs = @float,
     checks = [@no_unreduced],
@@ -151,9 +151,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Log`] for one host primitive type.
 macro_rules! impl_log_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Log for $type {
+            #[inline]
             fn log(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::ln(*self))
             }
@@ -164,8 +164,7 @@ macro_rules! impl_log_for_primitive {
 impl_log_for_primitive!(f32);
 impl_log_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
-
+// TODO(eaplatanios): Rename `Log1p` to `Ln1p` and `log1p` to `ln_1p` to match Rust's conventions.
 /// Canonical operation name for [`Log1pOperation`].
 pub const LOG1P_OPERATION_NAME: &str = "log1p";
 
@@ -175,16 +174,18 @@ define_elementwise_operation!(
     /// `x ↦ log(1 + x)`) while preserving its array metadata. The name matches the canonical mathematical spelling that
     /// Rust's own [`f64::ln_1p`] uses.
     ///
-    /// The point of the primitive is accuracy near zero: evaluating `log(1 + x)` by first forming `1 + x` loses
-    /// every bit of `x` below the precision of one, so a small `x` returns a result whose relative error grows
-    /// without bound as `x` shrinks. Computing the composition as a single operation keeps full relative accuracy
-    /// there, which is why `log1p` is the form used by log-likelihood and log-probability code.
+    /// The point of the primitive is accuracy near zero. Evaluating `log(1 + x)` by first forming `1 + x` loses every
+    /// bit of `x` below the precision of one, so a small `x` returns a result whose relative error grows without bound
+    /// as `x` shrinks. Computing the composition as a single operation keeps full relative accuracy there, which is why
+    /// `log1p` is the form used by log-likelihood and log-probability code.
     ///
-    /// Only real floating-point inputs are supported, and inputs that still carry partial sums are rejected.
-    /// Complex support is an explicit non-goal: the complex logarithm needs a different construction (a principal
-    /// branch and a separate accurate magnitude near `-1`), so it is left out rather than approximated here.
-    Log1pOperation, LOG1P_OPERATION_NAME,
-    Log1p, log1p,
+    /// Only real floating-point inputs are supported, and inputs that still carry partial sums are rejected. The
+    /// complex logarithm needs a different construction (i.e., a principal branch and a separate accurate magnitude
+    /// near `-1`), and that is construction is not currently supported here.
+    Log1pOperation,
+    LOG1P_OPERATION_NAME,
+    Log1p,
+    log1p,
     check_data_types = [@float @real],
     check_array_types = [@no_unreduced],
 );
@@ -206,8 +207,7 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @unary
     /// Represents the ability to compute elementwise `log(1 + input)` accurately near zero. Concrete arrays compute
-    /// immediately while context-carrying values apply [`Log1pOperation`] through their context. Refer to that
-    /// operation for supported types and exceptional-value behavior.
+    /// immediately while context-carrying values apply [`Log1pOperation`] through their context.
     Log1p,
     /// Computes `log(1 + input)` for each real floating-point element, retaining accuracy near zero. Returns an error
     /// if the input types or metadata are unsupported.
@@ -217,7 +217,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Log1p, log1p,
+    Log1p,
+    log1p,
     operation = "log1p",
     inputs = @float @real,
     checks = [@no_unreduced],
@@ -226,9 +227,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Log1p`] for one host primitive type.
 macro_rules! impl_log1p_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Log1p for $type {
+            #[inline]
             fn log1p(&self) -> Result<Self, ProgramError> {
                 Ok(self.ln_1p())
             }
@@ -239,8 +240,6 @@ macro_rules! impl_log1p_for_primitive {
 impl_log1p_for_primitive!(f32);
 impl_log1p_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`LogAddExpOperation`].
 pub const LOG_ADD_EXP_OPERATION_NAME: &str = "log_add_exp";
 
@@ -249,28 +248,32 @@ define_elementwise_operation!(
     /// [`Operation`](crate::Operation) that computes the elementwise `log(exp(a) + exp(b))` of its inputs without
     /// forming either exponential, promoting their element types and broadcasting their shapes.
     ///
-    /// The semantics are pinned to JAX's `logaddexp` (`jax/_src/lax/other.py`), which evaluates
+    /// The semantics are:
     ///
     /// ```text
-    /// log_add_exp(a, b) = select(isnan(a - b), a + b, max(a, b) + log1p(exp(-|a - b|)))
+    /// log_add_exp(a, b) = select(is_nan(a - b), a + b, max(a, b) + log1p(exp(-|a - b|)))
     /// ```
     ///
+    /// and are borrowed from JAX's [`logaddexp`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.logaddexp.html).
+    ///
     /// Factoring the larger input out of the sum is what makes the primitive usable across the whole real range:
-    /// `exp(-|a - b|)` never overflows, so `log_add_exp(1000, 1000)` is exactly `1000 + log(2)` where the naive
+    /// `exp(-|a - b|)` never overflows and so `log_add_exp(1000, 1000)` is exactly `1000 + log(2)` where the naive
     /// composition returns infinity.
     ///
-    /// The `isnan(a - b)` arm is the guard for the cases in which the difference itself is undefined, and it fixes
-    /// the following results:
+    /// The `is_nan(a - b)` guard is for the cases in which the difference itself is undefined, and it fixes the
+    /// following cases:
     ///
-    ///   - `(+∞, +∞) ↦ +∞` and `(-∞, -∞) ↦ -∞`, through the `a + b` arm;
-    ///   - any NaN input propagates NaN, also through the `a + b` arm;
-    ///   - mixed infinities return the larger input, through the ordinary arm: `-|a - b|` is `-∞`, so
+    ///   - `(+∞, +∞) ↦ +∞` and `(-∞, -∞) ↦ -∞`, through the `a + b` branch,
+    ///   - any NaN input propagates NaN, also through the `a + b` branch,
+    ///   - mixed infinities return the larger input, through the ordinary branch: `-|a - b|` is `-∞`, so
     ///     `log1p(exp(-∞)) = log1p(0) = 0` and the result is `max(a, b)`.
     ///
-    /// Only real floating-point inputs are supported, and array inputs that still carry partial sums are
-    /// rejected, with their reduced-axis markers required to agree.
-    LogAddExpOperation, LOG_ADD_EXP_OPERATION_NAME,
-    LogAddExp, log_add_exp,
+    /// Only real floating-point inputs are supported, and array inputs that still carry partial sums are rejected,
+    /// with their reduced-axis markers required to agree.
+    LogAddExpOperation,
+    LOG_ADD_EXP_OPERATION_NAME,
+    LogAddExp,
+    log_add_exp,
     check_data_types = [@float @real],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
@@ -281,11 +284,11 @@ impl_differentiable_operation! {
     where
         T: Type,
         C::Type: DifferentiableType,
-        C::Value: LogAddExp
+        C::Value: ZeroLike
+            + Exp
+            + LogAddExp
             + Compare<C::Value>
             + Select
-            + ZeroLike
-            + Exp
             + std::ops::Add<Output = C::Value>
             + std::ops::Sub<Output = C::Value>
             + std::ops::Mul<Output = C::Value>
@@ -293,7 +296,7 @@ impl_differentiable_operation! {
         <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
     {
         |_operation, context, _driver, inputs| {
-            // The partial derivative with respect to each input is the softmax weight `exp(x - log_add_exp(a, b))`,
+            // The partial derivative with respect to each input is the softmax weight `exp(x - log_add_exp(a, b))`, and
             // so the tangent is `w_a · da + w_b · db`. Both weights are formed against the shared primal output, which
             // is therefore computed once. Following JAX's `_logaddexp_jvp`, every input and the primal output pass
             // through a `replace_infinity` guard that rewrites *positive* infinity to zero before the subtraction, so
@@ -309,6 +312,7 @@ impl_differentiable_operation! {
             if !has_left_tangent && !has_right_tangent {
                 return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Zero(target))?]);
             }
+
             if target.is_zero_space() {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
@@ -319,6 +323,7 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
+
             let output_primal = primal;
             let primal = context.primal_to_tangent(output_primal.clone())?;
             let aligned_primal = primal.align_tangent(&target, &primal)?;
@@ -327,6 +332,7 @@ impl_differentiable_operation! {
                 let is_positive_infinity = value.compare(&infinity, ComparisonDirection::Equal)?;
                 Ok(C::Value::select(&is_positive_infinity, &value.zero_like()?, &value)?)
             };
+
             let output_exponent = replace_infinity(aligned_primal)?;
             let left_term = left
                 .tangent()
@@ -364,8 +370,7 @@ impl_differentiable_operation! {
 define_elementwise_capability!(
     @binary
     /// Represents the ability to compute stable elementwise log-sums of exponentials. Concrete arrays compute
-    /// immediately while context-carrying values apply [`LogAddExpOperation`] through their context. Refer to that
-    /// operation for supported types and exceptional-value behavior.
+    /// immediately while context-carrying values apply [`LogAddExpOperation`] through their context.
     LogAddExp,
     /// Computes `log(exp(self) + exp(other))` without forming potentially overflowing exponentials, promoting and
     /// broadcasting the inputs. Returns an error if the input types or metadata are unsupported.
@@ -375,7 +380,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @binary
-    LogAddExp, log_add_exp,
+    LogAddExp,
+    log_add_exp,
     operation = "log_add_exp",
     inputs = @float @real,
     checks = [@no_unreduced, @same_reduced_axes],
@@ -384,7 +390,6 @@ impl_array_elementwise_operation!(
 
 /// Implements [`LogAddExp`] for one host primitive type.
 macro_rules! impl_log_add_exp_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl LogAddExp for $type {
             fn log_add_exp(&self, other: &Self) -> Result<Self, ProgramError> {
@@ -402,18 +407,18 @@ macro_rules! impl_log_add_exp_for_primitive {
 impl_log_add_exp_for_primitive!(f32);
 impl_log_add_exp_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`LogisticOperation`].
 pub const LOGISTIC_OPERATION_NAME: &str = "logistic";
 
 define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise logistic sigmoid of one value (i.e.,
-    /// `x ↦ 1 / (1 + e^{-x})`, the analytic continuation on complex inputs) while preserving its array metadata. Only
-    /// floating-point and complex inputs are supported, and inputs that still carry partial sums are rejected.
-    LogisticOperation, LOGISTIC_OPERATION_NAME,
-    Logistic, logistic,
+    /// `x ↦ 1 / (1 + e^{-x})`, the analytic continuation on complex inputs) while preserving its array metadata.
+    /// Only floating-point and complex inputs are supported, and inputs that still carry partial sums are rejected.
+    LogisticOperation,
+    LOGISTIC_OPERATION_NAME,
+    Logistic,
+    logistic,
     check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
@@ -423,10 +428,10 @@ impl_differentiable_elementwise_operation! {
     LogisticOperation,
     jvp<C>
     where
-        C::Value: OneLike + std::ops::Mul<Output = C::Value> + std::ops::Sub<Output = C::Value>,
+        C::Value: OneLike + std::ops::Sub<Output = C::Value> + std::ops::Mul<Output = C::Value>,
     {
-        // d(logistic(x)) = logistic(x) · (1 - logistic(x)) · dx, reusing the primal output evaluated at the
-        // tangent type.
+        // `d(logistic(x)) = logistic(x) · (1 - logistic(x)) · dx`, reusing the primal output
+        // evaluated at the tangent type.
         |(_, input_tangent) -> output| output.clone() * (output.one_like()? - output) * input_tangent
     },
     transpose = @nonlinear,
@@ -435,8 +440,7 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @unary
     /// Represents the ability to compute the elementwise logistic function. Concrete arrays compute immediately while
-    /// context-carrying values apply [`LogisticOperation`] through their context. Refer to that operation for supported
-    /// types and exceptional-value behavior.
+    /// context-carrying values apply [`LogisticOperation`] through their context.
     Logistic,
     /// Computes `1 / (1 + exp(-input))` elementwise for floating-point or complex values. Returns an error if the input
     /// types or metadata are unsupported.
@@ -446,7 +450,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Logistic, logistic,
+    Logistic,
+    logistic,
     operation = "logistic",
     inputs = @float,
     checks = [@no_unreduced],
@@ -455,9 +460,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Logistic`] for one host primitive type.
 macro_rules! impl_logistic_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Logistic for $type {
+            #[inline]
             fn logistic(&self) -> Result<Self, ProgramError> {
                 Ok(((-*self).exp() + 1.0).recip())
             }
@@ -467,6 +472,8 @@ macro_rules! impl_logistic_for_primitive {
 
 impl_logistic_for_primitive!(f32);
 impl_logistic_for_primitive!(f64);
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns whether the lowest value of `data_type` acts as an identity of [`LogAddExp`]. That sentinel is what the
 /// whole `log(sum(exp(x)))` family writes over the padding of a bounded ragged axis and over an empty accumulation,
