@@ -1424,7 +1424,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayOperation, ArrayType, DataType, Dimension, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension, StridedLayout, f8e3m4, f8e4m3fn, f8e8m0fnu, i2, i4,
+        Sharding, ShardingDimension, StridedLayout, f8e4m3fn, f8e8m0fnu, i2, i4,
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::{
@@ -2523,6 +2523,15 @@ mod tests {
                         in (%3)
                     "},
                 },
+                {
+                    // An integer coefficient remains a primal value despite having a structural-zero tangent type.
+                    inputs = [
+                        (@linear(type = ArrayType::scalar(DataType::F64))),
+                        (@known, Array::scalar(2i32).unwrap()),
+                    ],
+                    output_cotangents = [Array::scalar(4.0f64).unwrap()],
+                    input_cotangents = [Array::scalar(2.0f64).unwrap()],
+                },
             ],
         );
     }
@@ -2535,8 +2544,8 @@ mod tests {
             operation = DivOperation::new(),
             cases = [{
                 inputs = [
-                    (@linear(type = ArrayType::scalar(DataType::F8E3M4))),
-                    (@known, Array::scalar(f8e3m4::from_f64(2.0).unwrap()).unwrap()),
+                    (@linear(type = ArrayType::scalar(DataType::F8E8M0FNU))),
+                    (@known, Array::scalar(f8e8m0fnu::from_f64(2.0).unwrap()).unwrap()),
                 ],
                 output_cotangents = [Array::scalar(4.0f32).unwrap()],
                 input_cotangents = [Array::scalar(2.0f32).unwrap()],
