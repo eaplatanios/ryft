@@ -1,20 +1,22 @@
-//! Elementwise special mathematical functions.
+//! Operations that compute special mathematical functions elementwise. Each operation is defined by an
+//! [`Operation`](crate::Operation) type (e.g., [`ErfOperation`]) together with a value capability trait (e.g., [`Erf`])
+//! whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code executes
+//! immediately or records into a program depending on the value it runs on:
 //!
-//! This module provides:
+//!   - [`Erf`] computes the Gauss error function (i.e., `x ↦ erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt`).
 //!
-//!   - [`ErfOperation`] and [`Erf`] for the Gauss error function on real floating-point values.
-//!
-//! The operation preserves array metadata and rejects inputs with pending partial sums. It supports partial evaluation,
-//! batching, and differentiation. Reverse differentiation transposes its linearized program; the nonlinear primitive
-//! cannot be transposed directly.
+//! Only real floating-point inputs are supported. The output keeps the element type and array metadata of the input,
+//! and inputs that carry partial sums over unreduced mesh axes are rejected. The derivative of the error function is
+//! `2/√π · e^{−x²}`. It is nonlinear, so reverse-mode differentiation transposes its linearization instead.
 //!
 //! # Example
 //!
-//! ```
-//! use ryft_core::{Array, Erf, ProgramError};
-//!
+//! ```rust
+//! # use ryft_core::{Array, Erf, ProgramError};
+//! # fn main() -> Result<(), ProgramError> {
 //! assert_eq!(Array::scalar(0.0f64)?.erf()?, Array::scalar(0.0)?);
-//! # Ok::<(), ProgramError>(())
+//! # Ok(())
+//! # }
 //! ```
 
 use std::f64::consts::FRAC_2_SQRT_PI;
@@ -37,9 +39,9 @@ pub const ERF_OPERATION_NAME: &str = "erf";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise Gauss error function of one value (i.e.,
-    /// `x ↦ erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt`) while preserving its array metadata. Only real floating-point inputs
-    /// are supported, and inputs that still carry partial sums are rejected.
+    /// [`Operation`](crate::Operation) that computes the elementwise Gauss error function of one value (i.e.,
+    /// `x ↦ erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt`) while preserving its array metadata. Only real floating-point inputs are
+    /// supported, and inputs that still carry partial sums are rejected.
     ErfOperation, ERF_OPERATION_NAME,
     Erf, erf,
     check_data_types = [@float @real],

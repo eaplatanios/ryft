@@ -1,23 +1,29 @@
-//! Elementwise rounding of real floating-point values.
+//! Operations that round real floating-point values elementwise to integral values. Each operation is defined by an
+//! [`Operation`](crate::Operation) type (e.g., [`RoundOperation`]) together with a value capability trait (e.g.,
+//! [`Round`]) whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code
+//! executes immediately or records into a program depending on the value it runs on:
 //!
-//! This module provides:
+//!   - [`Ceil`] rounds toward positive infinity (i.e., `x ↦ ⌈x⌉`).
+//!   - [`Floor`] rounds toward negative infinity (i.e., `x ↦ ⌊x⌋`).
+//!   - [`Round`] rounds to the nearest integer, resolving ties toward the even integer (e.g., `2.5 ↦ 2` and
+//!     `3.5 ↦ 4`).
 //!
-//!   - [`CeilOperation`] and [`Ceil`] for rounding toward positive infinity.
-//!   - [`FloorOperation`] and [`Floor`] for rounding toward negative infinity.
-//!   - [`RoundOperation`] and [`Round`] for rounding to the nearest integer, with ties going to the even integer.
-//!
-//! These operations preserve the input's element type and array metadata and reject inputs with pending partial sums.
-//! They support partial evaluation and batching; their differentiation and transposition rules produce zero tangents
-//! and cotangents.
+//! Only real floating-point inputs are supported, as for StableHLO's [`ceil`](https://openxla.org/stablehlo/spec#ceil),
+//! [`floor`](https://openxla.org/stablehlo/spec#floor), and
+//! [`round_nearest_even`](https://openxla.org/stablehlo/spec#round_nearest_even). The output keeps the element type
+//! and array metadata of the input, NaNs and signed zeros pass through unchanged, and inputs that carry partial sums
+//! over unreduced mesh axes are rejected. Every operation is piecewise constant, so its tangents and cotangents are
+//! zero.
 //!
 //! # Example
 //!
-//! ```
-//! use ryft_core::{Array, ProgramError, Round};
-//!
+//! ```rust
+//! # use ryft_core::{Array, ProgramError, Round};
+//! # fn main() -> Result<(), ProgramError> {
 //! let input = Array::vector(vec![1.5f64, 2.5, -1.5])?;
 //! assert_eq!(input.round()?, Array::vector(vec![2.0, 2.0, -2.0])?);
-//! # Ok::<(), ProgramError>(())
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::arrays::RealFloatingPointArrayElement;
@@ -34,10 +40,10 @@ pub const CEIL_OPERATION_NAME: &str = "ceil";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise ceiling of one value (i.e., `x ↦ ⌈x⌉`, rounding toward positive
-    /// infinity) while preserving its array metadata. Matching the input constraints of
-    /// [StableHLO's `ceil`](https://openxla.org/stablehlo/spec#ceil), only real floating-point inputs are
-    /// supported, and inputs that still carry partial sums are rejected.
+    /// [`Operation`](crate::Operation) that computes the elementwise ceiling of one value (i.e., `x ↦ ⌈x⌉`, rounding
+    /// toward positive infinity) while preserving its array metadata. Matching the input constraints of [StableHLO's
+    /// `ceil`](https://openxla.org/stablehlo/spec#ceil), only real floating-point inputs are supported, and inputs that
+    /// still carry partial sums are rejected.
     CeilOperation, CEIL_OPERATION_NAME,
     Ceil, ceil,
     check_data_types = [@float @real],
@@ -89,10 +95,10 @@ pub const FLOOR_OPERATION_NAME: &str = "floor";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise floor of one value (i.e., `x ↦ ⌊x⌋`, rounding toward negative
-    /// infinity) while preserving its array metadata. Matching the input constraints of
-    /// [StableHLO's `floor`](https://openxla.org/stablehlo/spec#floor), only real floating-point inputs are
-    /// supported, and inputs that still carry partial sums are rejected.
+    /// [`Operation`](crate::Operation) that computes the elementwise floor of one value (i.e., `x ↦ ⌊x⌋`, rounding
+    /// toward negative infinity) while preserving its array metadata. Matching the input constraints of [StableHLO's
+    /// `floor`](https://openxla.org/stablehlo/spec#floor), only real floating-point inputs are supported, and inputs
+    /// that still carry partial sums are rejected.
     FloorOperation, FLOOR_OPERATION_NAME,
     Floor, floor,
     check_data_types = [@float @real],
@@ -144,8 +150,8 @@ pub const ROUND_OPERATION_NAME: &str = "round";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that rounds one value elementwise to the nearest integer, with ties resolved toward the nearest
-    /// even integer, while preserving its array metadata. Matching the input constraints of
+    /// [`Operation`](crate::Operation) that rounds one value elementwise to the nearest integer, with ties resolved
+    /// toward the nearest even integer, while preserving its array metadata. Matching the input constraints of
     /// [StableHLO's `round_nearest_even`](https://openxla.org/stablehlo/spec#round_nearest_even), only real
     /// floating-point inputs are supported, and inputs that still carry partial sums are rejected.
     RoundOperation, ROUND_OPERATION_NAME,

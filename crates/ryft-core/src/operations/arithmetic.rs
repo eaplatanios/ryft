@@ -1,25 +1,46 @@
-//! Elementwise arithmetic operations and value capabilities.
+//! Operations that compute elementwise arithmetic on numeric values. Each operation is defined by an [`Operation`]
+//! type (e.g., [`AddOperation`]) together with a value capability trait (e.g., [`Add`]) whose functions apply it to
+//! eager [`Array`]s and traced values alike, so the same code executes immediately or records into a program depending
+//! on the value it runs on. The operations fall into three groups:
 //!
-//! This module provides:
+//!   - **Binary Arithmetic:** [`Add`], [`Sub`], [`Mul`], and [`Div`] compute sums, differences, products, and
+//!     quotients, and [`Rem`] computes remainders that take the sign of the dividend (i.e., truncated division, like
+//!     Rust's `%`).
+//!   - **Sign and Magnitude:** [`Neg`] negates a value, [`Abs`] computes its absolute value (i.e., the real magnitude
+//!     `|z|` for a complex value), and [`Sign`] maps it to `-1`, `0`, or `1` (i.e., `z / |z|` for a nonzero complex
+//!     value).
+//!   - **Powers and Roots:** [`Pow`] raises one value to the power of another (i.e., the principal value
+//!     `exp(y · log(x))` for complex values), and [`Sqrt`] and [`Rsqrt`] compute square roots and reciprocal square
+//!     roots.
 //!
-//!   - [`Add`], [`Sub`], [`Mul`], [`Div`], and [`Rem`] for binary arithmetic.
-//!   - [`Neg`], [`Abs`], and [`Sign`] for negation, magnitude, and sign.
-//!   - [`Pow`], [`Sqrt`], and [`Rsqrt`] for powers and roots.
+//! Binary operations promote their element types and broadcast their shapes, as for StableHLO's
+//! [`add`](https://openxla.org/stablehlo/spec#add), [`subtract`](https://openxla.org/stablehlo/spec#subtract),
+//! [`multiply`](https://openxla.org/stablehlo/spec#multiply), [`divide`](https://openxla.org/stablehlo/spec#divide),
+//! [`remainder`](https://openxla.org/stablehlo/spec#remainder), and
+//! [`power`](https://openxla.org/stablehlo/spec#power).
+//! Array operands that carry partial sums over unreduced mesh axes are accepted only where the result remains a valid
+//! partial sum: negation preserves them, sums and differences require both operands to be unreduced over the same
+//! axes, and products permit one unreduced operand when the other is reduced over those same axes. Every other
+//! operation rejects such operands. Refer to the documentation of each operation for the element types it supports.
+//! [`Add`], [`Sub`], [`Mul`], [`Div`], [`Rem`], and [`Neg`] are the fallible counterparts of the corresponding
+//! [`std::ops`] operators, which values additionally implement as panicking sugar. Eager integer arrays wrap at their
+//! element width, whereas the host integer primitives report overflow as an error.
 //!
-//! Array inputs use the supported element types and broadcasting rules of each operation. Contextual values stage
-//! the same operations for partial evaluation, batching, and differentiation; operation documentation describes
-//! restrictions on differentiation and sharding reduction state. Eager integer arrays wrap at their element width,
-//! whereas host integer capability implementations report overflow.
+//! Negation, addition, and subtraction are linear. Multiplication is linear in either operand when the other one is
+//! known, and division is linear in its numerator when its denominator is known, so all of them can be transposed.
+//! [`Sign`] is piecewise constant and has zero derivatives, and the remaining operations are nonlinear, so reverse-mode
+//! differentiation transposes their linearizations instead.
 //!
 //! # Example
 //!
-//! ```
-//! use ryft_core::{Add, Array, ProgramError, Sqrt};
-//!
+//! ```rust
+//! # use ryft_core::{Add, Array, ProgramError, Sqrt};
+//! # fn main() -> Result<(), ProgramError> {
 //! let input = Array::vector(vec![0.0f64, 3.0, 8.0])?;
 //! let output = input.add(&Array::scalar(1.0f64)?)?.sqrt()?;
 //! assert_eq!(output.elements::<f64>()?, vec![1.0, 2.0, 3.0]);
-//! # Ok::<(), ProgramError>(())
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::BTreeSet;
@@ -54,11 +75,10 @@ pub const ADD_OPERATION_NAME: &str = "add";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that adds two numeric values elementwise, promoting their element
-    /// [`DataType`](crate::arrays::DataType)s and broadcasting their [`Shape`](crate::arrays::Shape)s. Array operands
-    /// that carry partial sums must both be unreduced over exactly the same mesh axes. Mixing an unreduced operand with
-    /// an already reduced operand would duplicate the reduced contribution when the result is subsequently reduced.
-    /// Their reduced-axis markers must likewise agree.
+    /// [`Operation`] that adds two numeric values elementwise, promoting their element [`DataType`]s and broadcasting
+    /// their [`Shape`](crate::arrays::Shape)s. Array operands that carry partial sums must both be unreduced over
+    /// exactly the same mesh axes. Mixing an unreduced operand with an already reduced operand would duplicate the
+    /// reduced contribution when the result is subsequently reduced. Their reduced-axis markers must likewise agree.
     AddOperation,
     ADD_OPERATION_NAME,
     Add,

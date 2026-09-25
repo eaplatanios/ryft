@@ -53,10 +53,10 @@ pub const COMPLEX_OPERATION_NAME: &str = "complex";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that constructs a complex value from its real and imaginary parts (i.e., `(re, im) ↦ re + im·i`,
-    /// with `(f32, f32) ↦ c64` and `(f64, f64) ↦ c128`). This operation is the Ryft analogue of JAX's
-    /// [`lax.complex`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.complex.html) and the inverse of the
-    /// [`RealOperation`] and [`ImaginaryOperation`] pair. The two parts must have identical types. Array shape,
+    /// [`Operation`](crate::Operation) that constructs a complex value from its real and imaginary parts (i.e.,
+    /// `(re, im) ↦ re + im·i`, with `(f32, f32) ↦ c64` and `(f64, f64) ↦ c128`). This operation is the Ryft analogue
+    /// of JAX's [`lax.complex`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.complex.html) and the inverse of
+    /// the [`RealOperation`] and [`ImaginaryOperation`] pair. The two parts must have identical types. Array shape,
     /// sharding, and memory placement are preserved. Note however that byte-strided layouts are cleared because
     /// complex elements are wider.
     ///
@@ -232,8 +232,9 @@ pub const CONJUGATE_OPERATION_NAME: &str = "conjugate";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise complex conjugate of one complex value (i.e., `z ↦ z̄`, negating
-    /// the imaginary part) while preserving its type metadata. Only `c64` and `c128` inputs are supported.
+    /// [`Operation`](crate::Operation) that computes the elementwise complex conjugate of one complex value (i.e.,
+    /// `z ↦ z̄`, negating the imaginary part) while preserving its type metadata. Only `c64` and `c128` inputs are
+    /// supported.
     ///
     /// Conjugation is ℝ-linear but not ℂ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's
     /// transposition uses over complex types, it is self-adjoint (i.e., the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`).
@@ -332,10 +333,10 @@ pub const REAL_OPERATION_NAME: &str = "real";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that extracts the elementwise real part of one complex value (i.e., `z ↦ Re(z)`, with `c64 ↦ f32`
-    /// and `c128 ↦ f64`) while preserving shape, sharding, and memory placement. Note however that byte-strided layouts
-    /// are cleared because the output elements are narrower. This operation is the Ryft analogue of JAX's
-    /// [`lax.real`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.real.html).
+    /// [`Operation`](crate::Operation) that extracts the elementwise real part of one complex value (i.e., `z ↦ Re(z)`,
+    /// with `c64 ↦ f32` and `c128 ↦ f64`) while preserving shape, sharding, and memory placement. Note however that
+    /// byte-strided layouts are cleared because the output elements are narrower. This operation is the Ryft analogue
+    /// of JAX's [`lax.real`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.real.html).
     ///
     /// The extraction is ℝ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses
     /// over complex types, the transpose of `z ↦ Re(z)` is `ȳ ↦ complex(ȳ, 0)`.
@@ -458,10 +459,10 @@ pub const IMAGINARY_OPERATION_NAME: &str = "imaginary";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that extracts the elementwise imaginary part of one complex value (i.e., `z ↦ Im(z)`, with
-    /// `c64 ↦ f32` and `c128 ↦ f64`) while preserving shape, sharding, and memory placement. Note however that
-    /// byte-strided layouts are cleared because the output elements are narrower. This operation is the Ryft analogue
-    /// of JAX's [`lax.imag`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.imag.html).
+    /// [`Operation`](crate::Operation) that extracts the elementwise imaginary part of one complex value (i.e.,
+    /// `z ↦ Im(z)`, with `c64 ↦ f32` and `c128 ↦ f64`) while preserving shape, sharding, and memory placement. Note
+    /// however that byte-strided layouts are cleared because the output elements are narrower. This operation is the
+    /// Ryft analogue of JAX's [`lax.imag`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.imag.html).
     ///
     /// The extraction is ℝ-linear. Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses
     /// over complex types, the transpose of `z ↦ Im(z)` is `ȳ ↦ complex(0, -ȳ)`.

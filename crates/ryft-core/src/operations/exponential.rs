@@ -1,25 +1,33 @@
-//! Elementwise exponential and logarithmic functions.
+//! Operations that compute exponential and logarithmic functions elementwise. Each operation is defined by an
+//! [`Operation`](crate::Operation) type (e.g., [`ExpOperation`]) together with a value capability trait (e.g., [`Exp`])
+//! whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code executes
+//! immediately or records into a program depending on the value it runs on:
 //!
-//! This module provides:
+//!   - [`Exp`] and [`Log`] compute the natural exponential and logarithm (i.e., `x ↦ eˣ` and `x ↦ ln(x)`, with the
+//!     principal branch of the logarithm for complex values).
+//!   - [`Log1p`] computes `log(1 + x)` as a single operation, which keeps full relative accuracy for inputs near zero.
+//!   - [`LogAddExp`] computes `log(exp(a) + exp(b))` without forming either exponential, so that it cannot overflow.
+//!   - [`Logistic`] computes the logistic sigmoid (i.e., `x ↦ 1 / (1 + e^{-x})`).
 //!
-//!   - [`ExpOperation`] and [`Exp`] for the natural exponential.
-//!   - [`LogOperation`] and [`Log`] for the natural logarithm.
-//!   - [`Log1pOperation`] and [`Log1p`] for an accurate `log(1 + input)`.
-//!   - [`LogAddExpOperation`] and [`LogAddExp`] for a stable `log(exp(left) + exp(right))`.
-//!   - [`LogisticOperation`] and [`Logistic`] for the logistic function.
-//!
-//! These functions support partial evaluation, batching, and differentiation. Their nonlinear primitives cannot be
-//! transposed directly; reverse differentiation transposes their linearizations. Axis-wise log-sum-exp belongs to
-//! [`reductions`](crate::operations::reductions), rather than this elementwise family.
+//! [`Exp`], [`Log`], and [`Logistic`] support floating-point and complex values, as for StableHLO's
+//! [`exponential`](https://openxla.org/stablehlo/spec#exponential), [`log`](https://openxla.org/stablehlo/spec#log),
+//! and [`logistic`](https://openxla.org/stablehlo/spec#logistic), whereas [`Log1p`] and [`LogAddExp`] support only
+//! real floating-point values. Unary operations preserve the metadata of their input, and [`LogAddExp`] promotes the
+//! element types and broadcasts the shapes of its inputs. Inputs that carry partial sums over unreduced mesh axes are
+//! rejected. Every operation is nonlinear, so reverse-mode differentiation transposes its linearization instead. The
+//! logarithm of a sum of exponentials along array axes is a reduction (i.e.,
+//! [`ReductionKind::LogSumExp`](crate::operations::reductions::ReductionKind::LogSumExp)) and lives in
+//! [`reductions`](crate::operations::reductions).
 //!
 //! # Example
 //!
-//! ```
-//! use ryft_core::{Array, Exp, Log, ProgramError};
-//!
+//! ```rust
+//! # use ryft_core::{Array, Exp, Log, ProgramError};
+//! # fn main() -> Result<(), ProgramError> {
 //! assert_eq!(Array::scalar(0.0f64)?.exp()?, Array::scalar(1.0)?);
 //! assert_eq!(Array::scalar(1.0f64)?.log()?, Array::scalar(0.0)?);
-//! # Ok::<(), ProgramError>(())
+//! # Ok(())
+//! # }
 //! ```
 
 use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Sub as StandardSub};
@@ -46,9 +54,9 @@ pub const EXP_OPERATION_NAME: &str = "exp";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise natural exponential of one value (i.e.,
-    /// `x ↦ eˣ`, the analytic continuation `e^z` on complex inputs) while preserving its array metadata. Only
-    /// floating-point and complex inputs are supported, and inputs that still carry partial sums are rejected.
+    /// [`Operation`](crate::Operation) that computes the elementwise natural exponential of one value (i.e., `x ↦ eˣ`,
+    /// the analytic continuation `e^z` on complex inputs) while preserving its array metadata. Only floating-point and
+    /// complex inputs are supported, and inputs that still carry partial sums are rejected.
     ExpOperation, EXP_OPERATION_NAME,
     Exp, exp,
     check_data_types = [@float],
@@ -107,9 +115,9 @@ pub const LOG_OPERATION_NAME: &str = "log";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise natural logarithm of one value (i.e.,
-    /// `x ↦ ln(x)`, the principal branch `ln(z)` on complex inputs) while preserving its array metadata. Only
-    /// floating-point and complex inputs are supported, and inputs that still carry partial sums are rejected.
+    /// [`Operation`](crate::Operation) that computes the elementwise natural logarithm of one value (i.e., `x ↦ ln(x)`,
+    /// the principal branch `ln(z)` on complex inputs) while preserving its array metadata. Only floating-point and
+    /// complex inputs are supported, and inputs that still carry partial sums are rejected.
     LogOperation, LOG_OPERATION_NAME,
     Log, log,
     check_data_types = [@float],
@@ -168,9 +176,9 @@ pub const LOG1P_OPERATION_NAME: &str = "log1p";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise natural logarithm of one plus its input (i.e.,
-    /// `x ↦ log(1 + x)`) while preserving its array metadata. The name matches the canonical mathematical spelling
-    /// that Rust's own [`f64::ln_1p`] uses.
+    /// [`Operation`](crate::Operation) that computes the elementwise natural logarithm of one plus its input (i.e.,
+    /// `x ↦ log(1 + x)`) while preserving its array metadata. The name matches the canonical mathematical spelling that
+    /// Rust's own [`f64::ln_1p`] uses.
     ///
     /// The point of the primitive is accuracy near zero: evaluating `log(1 + x)` by first forming `1 + x` loses
     /// every bit of `x` below the precision of one, so a small `x` returns a result whose relative error grows
@@ -243,8 +251,8 @@ pub const LOG_ADD_EXP_OPERATION_NAME: &str = "log_add_exp";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that computes the elementwise `log(exp(a) + exp(b))` of its inputs without forming either
-    /// exponential, promoting their element types and broadcasting their shapes.
+    /// [`Operation`](crate::Operation) that computes the elementwise `log(exp(a) + exp(b))` of its inputs without
+    /// forming either exponential, promoting their element types and broadcasting their shapes.
     ///
     /// The semantics are pinned to JAX's `logaddexp` (`jax/_src/lax/other.py`), which evaluates
     ///
@@ -406,9 +414,9 @@ pub const LOGISTIC_OPERATION_NAME: &str = "logistic";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise logistic sigmoid of one value (i.e., `x ↦ 1 / (1 + e^{-x})`, the
-    /// analytic continuation on complex inputs) while preserving its array metadata. Only floating-point and
-    /// complex inputs are supported, and inputs that still carry partial sums are rejected.
+    /// [`Operation`](crate::Operation) that computes the elementwise logistic sigmoid of one value (i.e.,
+    /// `x ↦ 1 / (1 + e^{-x})`, the analytic continuation on complex inputs) while preserving its array metadata. Only
+    /// floating-point and complex inputs are supported, and inputs that still carry partial sums are rejected.
     LogisticOperation, LOGISTIC_OPERATION_NAME,
     Logistic, logistic,
     check_data_types = [@float],

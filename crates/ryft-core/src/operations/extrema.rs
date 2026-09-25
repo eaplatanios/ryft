@@ -1,24 +1,35 @@
-//! Elementwise extrema and clipping.
+//! Operations that select elementwise minima and maxima of numeric values. Each operation is defined by an
+//! [`Operation`](crate::Operation) type (e.g., [`MinOperation`]) together with a value capability trait (e.g., [`Min`])
+//! whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code executes
+//! immediately or records into a program depending on the value it runs on:
 //!
-//! This module provides:
+//!   - [`Min`] and [`Max`] select the smaller and the larger of two values (i.e., `(a, b) ↦ min(a, b)` and
+//!     `(a, b) ↦ max(a, b)`).
+//!   - [`Clamp`] restricts a value to an inclusive interval as the composition `max(lower, min(input, upper))`, which
+//!     is how StableHLO defines [`clamp`](https://openxla.org/stablehlo/spec#clamp). It is implemented for every value
+//!     that supports [`Min`] and [`Max`] and stages no operation of its own.
 //!
-//!   - [`MinOperation`] and [`Min`] for elementwise minima.
-//!   - [`MaxOperation`] and [`Max`] for elementwise maxima.
-//!   - [`Clamp`] for the composition `max(lower, min(input, upper))`.
+//! Inputs promote to a common numeric element type and broadcast, as for StableHLO's
+//! [`minimum`](https://openxla.org/stablehlo/spec#minimum) and [`maximum`](https://openxla.org/stablehlo/spec#maximum),
+//! and Boolean inputs are rejected. Real floating-point extrema propagate NaNs and order negative zero below positive
+//! zero. Complex extrema compare real parts first and imaginary parts second, selecting one whole input, and ties and
+//! unordered comparisons select the right input. Array inputs that carry partial sums over unreduced mesh axes are
+//! rejected, and the reduced-axis markers of the inputs must agree.
 //!
-//! Inputs promote to a common numeric element type and broadcast. Real floating-point extrema propagate NaNs and
-//! distinguish signed zeros; complex extrema compare real components before imaginary components. The operations
-//! support partial evaluation, batching, and differentiation, with tangents selected from the winning input.
+//! The tangent of an extremum is the tangent of the selected input. Real ties select the tangent of the left input,
+//! whereas complex ties select the tangent of the right input, consistently with the primal selection. Neither
+//! operation is linear, so reverse-mode differentiation transposes its linearization instead.
 //!
 //! # Example
 //!
-//! ```
-//! use ryft_core::{Array, Clamp, ProgramError};
-//!
+//! ```rust
+//! # use ryft_core::{Array, Clamp, ProgramError};
+//! # fn main() -> Result<(), ProgramError> {
 //! let input = Array::vector(vec![-2.0f64, 0.5, 3.0])?;
 //! let output = input.clamp(&Array::scalar(-1.0)?, &Array::scalar(1.0)?)?;
 //! assert_eq!(output, Array::vector(vec![-1.0, 0.5, 1.0])?);
-//! # Ok::<(), ProgramError>(())
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::arrays::ArrayElement;
@@ -39,12 +50,12 @@ pub const MIN_OPERATION_NAME: &str = "min";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that computes the elementwise minimum of two numeric values, promoting their element types and
-    /// broadcasting their shapes. Real floating-point inputs propagate NaNs and order negative zero below positive
-    /// zero. Complex inputs compare real components first, then imaginary components when the real components are
-    /// equal, selecting one whole input. Ties and unordered deciding comparisons select the right complex input.
-    /// Boolean inputs are not supported. Array inputs that still carry partial sums are rejected, and their
-    /// reduced-axis markers must agree.
+    /// [`Operation`](crate::Operation) that computes the elementwise minimum of two numeric values, promoting their
+    /// element types and broadcasting their shapes. Real floating-point inputs propagate NaNs and order negative zero
+    /// below positive zero. Complex inputs compare real components first, then imaginary components when the real
+    /// components are equal, selecting one whole input. Ties and unordered deciding comparisons select the right
+    /// complex input. Boolean inputs are not supported. Array inputs that still carry partial sums are rejected, and
+    /// their reduced-axis markers must agree.
     MinOperation, MIN_OPERATION_NAME,
     Min, min,
     check_data_types = [@numeric],
@@ -167,12 +178,12 @@ pub const MAX_OPERATION_NAME: &str = "max";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that computes the elementwise maximum of two numeric values, promoting their element types and
-    /// broadcasting their shapes. Real floating-point inputs propagate NaNs and order negative zero below positive
-    /// zero. Complex inputs compare real components first, then imaginary components when the real components are
-    /// equal, selecting one whole input. Ties and unordered deciding comparisons select the right complex input.
-    /// Boolean inputs are not supported. Array inputs that still carry partial sums are rejected, and their
-    /// reduced-axis markers must agree.
+    /// [`Operation`](crate::Operation) that computes the elementwise maximum of two numeric values, promoting their
+    /// element types and broadcasting their shapes. Real floating-point inputs propagate NaNs and order negative zero
+    /// below positive zero. Complex inputs compare real components first, then imaginary components when the real
+    /// components are equal, selecting one whole input. Ties and unordered deciding comparisons select the right
+    /// complex input. Boolean inputs are not supported. Array inputs that still carry partial sums are rejected, and
+    /// their reduced-axis markers must agree.
     MaxOperation, MAX_OPERATION_NAME,
     Max, max,
     check_data_types = [@numeric],

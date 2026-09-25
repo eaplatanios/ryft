@@ -1,25 +1,32 @@
-//! Elementwise trigonometric and hyperbolic functions.
+//! Operations that compute trigonometric and hyperbolic functions elementwise. Each operation is defined by an
+//! [`Operation`](crate::Operation) type (e.g., [`SinOperation`]) together with a value capability trait (e.g., [`Sin`])
+//! whose functions apply it to eager [`Array`](crate::Array)s and traced values alike, so the same code executes
+//! immediately or records into a program depending on the value it runs on:
 //!
-//! This module provides:
+//!   - [`Sin`] and [`Cos`] compute the sine and cosine of angles measured in radians.
+//!   - [`Atan2`] computes the two-argument arc tangent (i.e., `(y, x) ↦ atan2(y, x)`, the angle of the point `(x, y)`
+//!     in its correct quadrant), with the principal value `-i · log((x + i · y) / sqrt(x² + y²))` for complex values.
+//!   - [`Tanh`] computes the hyperbolic tangent (i.e., `x ↦ tanh(x)`).
 //!
-//!   - [`SinOperation`] and [`Sin`] for sine.
-//!   - [`CosOperation`] and [`Cos`] for cosine.
-//!   - [`Atan2Operation`] and [`Atan2`] for the two-argument arc tangent.
-//!   - [`TanhOperation`] and [`Tanh`] for the hyperbolic tangent.
-//!
-//! The functions accept floating-point and complex values and reject inputs with pending partial sums. They support
-//! partial evaluation, batching, and differentiation. Their nonlinear primitives cannot be transposed directly;
-//! reverse differentiation transposes the linearized program instead.
+//! Floating-point and complex inputs are supported, as for StableHLO's
+//! [`sine`](https://openxla.org/stablehlo/spec#sine), [`cosine`](https://openxla.org/stablehlo/spec#cosine),
+//! [`atan2`](https://openxla.org/stablehlo/spec#atan2), and [`tanh`](https://openxla.org/stablehlo/spec#tanh). Unary
+//! operations preserve the metadata of their input, and [`Atan2`] promotes the element types and broadcasts the
+//! shapes of its inputs. Inputs that carry partial sums over unreduced mesh axes are rejected. The derivatives of sine,
+//! cosine, and the hyperbolic tangent are the cosine, the negated sine, and `1 - tanh(x)²`, and the derivative of
+//! `atan2(y, x)` is `(x · dy - y · dx) / (x² + y²)`. Every operation is nonlinear, so reverse-mode differentiation
+//! transposes its linearization instead.
 //!
 //! # Example
 //!
-//! ```
-//! use ryft_core::{Array, Cos, ProgramError, Sin};
-//!
+//! ```rust
+//! # use ryft_core::{Array, Cos, ProgramError, Sin};
+//! # fn main() -> Result<(), ProgramError> {
 //! let input = Array::scalar(0.0f64)?;
 //! assert_eq!(input.sin()?, Array::scalar(0.0)?);
 //! assert_eq!(input.cos()?, Array::scalar(1.0)?);
-//! # Ok::<(), ProgramError>(())
+//! # Ok(())
+//! # }
 //! ```
 
 use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg, Sub as StandardSub};
@@ -42,7 +49,7 @@ pub const SIN_OPERATION_NAME: &str = "sin";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise sine of a floating-point or complex value while
+    /// [`Operation`](crate::Operation) that computes the elementwise sine of a floating-point or complex value while
     /// preserving its array metadata. Array inputs that still carry partial sums are rejected.
     SinOperation, SIN_OPERATION_NAME,
     Sin, sin,
@@ -102,7 +109,7 @@ pub const COS_OPERATION_NAME: &str = "cos";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise cosine of a floating-point or complex value while
+    /// [`Operation`](crate::Operation) that computes the elementwise cosine of a floating-point or complex value while
     /// preserving its array metadata. Array inputs that still carry partial sums are rejected.
     CosOperation, COS_OPERATION_NAME,
     Cos, cos,
@@ -162,11 +169,11 @@ pub const ATAN2_OPERATION_NAME: &str = "atan2";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that computes the elementwise two-argument arc tangent of its inputs (i.e.,
+    /// [`Operation`](crate::Operation) that computes the elementwise two-argument arc tangent of its inputs (i.e.,
     /// `(y, x) ↦ atan2(y, x)`, the angle of the point `(x, y)` in the correct quadrant for real inputs), promoting
     /// their element types and broadcasting their shapes. For complex inputs, the principal value is defined as
-    /// `-i · log((x + i · y) / sqrt(x² + y²))`. Only floating-point and complex inputs are supported, and array
-    /// inputs that still carry partial sums are rejected, with their reduced-axis markers required to agree.
+    /// `-i · log((x + i · y) / sqrt(x² + y²))`. Only floating-point and complex inputs are supported, and array inputs
+    /// that still carry partial sums are rejected, with their reduced-axis markers required to agree.
     Atan2Operation, ATAN2_OPERATION_NAME,
     Atan2, atan2,
     check_data_types = [@float],
@@ -289,9 +296,9 @@ pub const TANH_OPERATION_NAME: &str = "tanh";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that computes the elementwise hyperbolic tangent of one value (i.e., `x ↦ tanh(x)`, the analytic
-    /// continuation `tanh(z)` on complex inputs) while preserving its array metadata. Only floating-point and
-    /// complex inputs are supported, and inputs that still carry partial sums are rejected.
+    /// [`Operation`](crate::Operation) that computes the elementwise hyperbolic tangent of one value (i.e.,
+    /// `x ↦ tanh(x)`, the analytic continuation `tanh(z)` on complex inputs) while preserving its array metadata. Only
+    /// floating-point and complex inputs are supported, and inputs that still carry partial sums are rejected.
     TanhOperation, TANH_OPERATION_NAME,
     Tanh, tanh,
     check_data_types = [@float],

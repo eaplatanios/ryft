@@ -1,24 +1,40 @@
-//! Operations that combine array elements along selected axes.
+//! Operations that combine array elements along selected axes. Every reduction is defined by the [`ReduceOperation`]
+//! type together with the [`Reduce`] value capability trait, whose functions apply it to eager [`Array`]s and traced
+//! values alike, so the same code executes immediately or records into a program depending on the value it runs on. A
+//! [`ReductionKind`] selects the computation:
 //!
-//! This module provides:
+//!   - **Numeric Reductions:** [`Sum`](ReductionKind::Sum) adds the reduced elements, and
+//!     [`Mean`](ReductionKind::Mean) additionally divides that sum by the number of reduced elements.
+//!   - **Extrema:** [`Max`](ReductionKind::Max) and [`Min`](ReductionKind::Min) select the largest and smallest
+//!     reduced elements, propagating NaNs, ordering negative zero below positive zero, and comparing complex elements
+//!     by their real parts first and their imaginary parts second.
+//!   - **Logarithmic Sums of Exponentials:** [`LogSumExp`](ReductionKind::LogSumExp) computes `log(sum(exp(x)))`
+//!     without overflowing for large finite inputs. The [`LogSumExp`] value capability provides it as a function of
+//!     its own.
+//!   - **Boolean Reductions:** [`Any`](ReductionKind::Any) and [`All`](ReductionKind::All) compute the disjunction and
+//!     conjunction of Boolean elements.
 //!
-//!   - [`Reduce`] and [`ReduceOperation`] for sums, means, logarithmic sums of exponentials, extrema, and Boolean
-//!     reductions selected by [`ReductionKind`].
-//!   - [`LogSumExp`] as a convenience capability for [`ReductionKind::LogSumExp`].
+//! The reduced axes are removed from the output shape, and the remaining axes keep their order, as for StableHLO's
+//! [`reduce`](https://openxla.org/stablehlo/spec#reduce). Sums, extrema, and Boolean reductions start from the
+//! identity of their combiner (e.g., `0` for sums and the smallest value of the element type for maxima), so reducing
+//! an empty axis produces that identity. Batching also supports reducing bounded ragged axes, whose padding is replaced
+//! by the identity of the reduction before it is applied.
 //!
-//! Reduced axes are removed from the output shape; the remaining axes keep their order. The operation rules support
-//! staging, partial evaluation, and batching, including bounded ragged axes. Differentiation is supported for sums,
-//! means, extrema, and logarithmic sums of exponentials; Boolean reductions do not define derivatives.
+//! Sums and means are linear, and their transposes broadcast the cotangent back over the reduced axes (dividing it by
+//! the number of reduced elements for means). Extrema route the tangent through the positions of the selected
+//! elements, splitting it evenly between ties, and logarithmic sums of exponentials are differentiable as well, but
+//! neither is linear. Boolean reductions are not differentiable.
 //!
 //! # Example
 //!
-//! ```
-//! use ryft_core::{Array, Reduce, ReductionKind};
-//!
+//! ```rust
+//! # use ryft_core::{Array, ProgramError, Reduce, ReductionKind};
+//! # fn main() -> Result<(), ProgramError> {
 //! let input = Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0])?;
 //! let output = input.reduce(&[1], ReductionKind::Sum)?;
 //! assert_eq!(output.elements::<f32>()?, vec![6.0, 15.0]);
-//! # Ok::<(), ryft_core::ProgramError>(())
+//! # Ok(())
+//! # }
 //! ```
 
 use std::fmt::Display;
