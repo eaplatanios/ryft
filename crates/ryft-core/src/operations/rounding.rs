@@ -5,15 +5,14 @@
 //!
 //!   - [`Ceil`] rounds toward positive infinity (i.e., `x ↦ ⌈x⌉`).
 //!   - [`Floor`] rounds toward negative infinity (i.e., `x ↦ ⌊x⌋`).
-//!   - [`Round`] rounds to the nearest integer, resolving ties toward the even integer (e.g., `2.5 ↦ 2` and
-//!     `3.5 ↦ 4`).
+//!   - [`Round`] rounds to the nearest integer, resolving ties toward the even integer (e.g., `2.5 ↦ 2` and `3.5 ↦ 4`).
 //!
-//! Only real floating-point inputs are supported, as for StableHLO's [`ceil`](https://openxla.org/stablehlo/spec#ceil),
-//! [`floor`](https://openxla.org/stablehlo/spec#floor), and
+//! Only real floating-point inputs are supported, similar to StableHLO's
+//! [`ceil`](https://openxla.org/stablehlo/spec#ceil), [`floor`](https://openxla.org/stablehlo/spec#floor), and
 //! [`round_nearest_even`](https://openxla.org/stablehlo/spec#round_nearest_even). The output keeps the element type
 //! and array metadata of the input, NaNs and signed zeros pass through unchanged, and inputs that carry partial sums
 //! over unreduced mesh axes are rejected. Every operation is piecewise constant, so its tangents and cotangents are
-//! zero.
+//! zero/
 //!
 //! # Example
 //!
@@ -33,19 +32,19 @@ use crate::macros::{
 };
 use crate::programs::ProgramError;
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`CeilOperation`].
 pub const CEIL_OPERATION_NAME: &str = "ceil";
 
 define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise ceiling of one value (i.e., `x ↦ ⌈x⌉`, rounding
-    /// toward positive infinity) while preserving its array metadata. Matching the input constraints of [StableHLO's
-    /// `ceil`](https://openxla.org/stablehlo/spec#ceil), only real floating-point inputs are supported, and inputs that
-    /// still carry partial sums are rejected.
-    CeilOperation, CEIL_OPERATION_NAME,
-    Ceil, ceil,
+    /// toward positive infinity) while preserving its array metadata. Matching the input constraints of StableHLO's
+    /// [`ceil`](https://openxla.org/stablehlo/spec#ceil), only real floating-point inputs are supported, and inputs
+    /// that still carry partial sums are rejected.
+    CeilOperation,
+    CEIL_OPERATION_NAME,
+    Ceil,
+    ceil,
     check_data_types = [@float @real],
     check_array_types = [@no_unreduced],
 );
@@ -55,8 +54,7 @@ impl_differentiable_elementwise_operation!(@constant CeilOperation);
 define_elementwise_capability!(
     @unary
     /// Represents the ability to round elementwise toward positive infinity. Concrete arrays compute immediately while
-    /// context-carrying values apply [`CeilOperation`] through their context. Refer to that operation for supported
-    /// types and exceptional-value behavior.
+    /// context-carrying values apply [`CeilOperation`] through their context.
     Ceil,
     /// Rounds each element toward positive infinity, preserving the input type. Returns an error if the input types or
     /// metadata are unsupported.
@@ -66,7 +64,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Ceil, ceil,
+    Ceil,
+    ceil,
     operation = "ceil",
     inputs = @float @real,
     checks = [@no_unreduced],
@@ -75,9 +74,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Ceil`] for one host primitive type.
 macro_rules! impl_ceil_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Ceil for $type {
+            #[inline]
             fn ceil(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::ceil(*self))
             }
@@ -88,19 +87,19 @@ macro_rules! impl_ceil_for_primitive {
 impl_ceil_for_primitive!(f32);
 impl_ceil_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`FloorOperation`].
 pub const FLOOR_OPERATION_NAME: &str = "floor";
 
 define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise floor of one value (i.e., `x ↦ ⌊x⌋`, rounding
-    /// toward negative infinity) while preserving its array metadata. Matching the input constraints of [StableHLO's
-    /// `floor`](https://openxla.org/stablehlo/spec#floor), only real floating-point inputs are supported, and inputs
+    /// toward negative infinity) while preserving its array metadata. Matching the input constraints of StableHLO's
+    /// [`floor`](https://openxla.org/stablehlo/spec#floor), only real floating-point inputs are supported, and inputs
     /// that still carry partial sums are rejected.
-    FloorOperation, FLOOR_OPERATION_NAME,
-    Floor, floor,
+    FloorOperation,
+    FLOOR_OPERATION_NAME,
+    Floor,
+    floor,
     check_data_types = [@float @real],
     check_array_types = [@no_unreduced],
 );
@@ -110,8 +109,7 @@ impl_differentiable_elementwise_operation!(@constant FloorOperation);
 define_elementwise_capability!(
     @unary
     /// Represents the ability to round elementwise toward negative infinity. Concrete arrays compute immediately while
-    /// context-carrying values apply [`FloorOperation`] through their context. Refer to that operation for supported
-    /// types and exceptional-value behavior.
+    /// context-carrying values apply [`FloorOperation`] through their context.
     Floor,
     /// Rounds each element toward negative infinity, preserving the input type. Returns an error if the input types or
     /// metadata are unsupported.
@@ -121,7 +119,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Floor, floor,
+    Floor,
+    floor,
     operation = "floor",
     inputs = @float @real,
     checks = [@no_unreduced],
@@ -130,9 +129,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Floor`] for one host primitive type.
 macro_rules! impl_floor_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Floor for $type {
+            #[inline]
             fn floor(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::floor(*self))
             }
@@ -143,8 +142,6 @@ macro_rules! impl_floor_for_primitive {
 impl_floor_for_primitive!(f32);
 impl_floor_for_primitive!(f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`RoundOperation`].
 pub const ROUND_OPERATION_NAME: &str = "round";
 
@@ -152,10 +149,12 @@ define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that rounds one value elementwise to the nearest integer, with ties resolved
     /// toward the nearest even integer, while preserving its array metadata. Matching the input constraints of
-    /// [StableHLO's `round_nearest_even`](https://openxla.org/stablehlo/spec#round_nearest_even), only real
+    /// StableHLO's [`round_nearest_even`](https://openxla.org/stablehlo/spec#round_nearest_even), only real
     /// floating-point inputs are supported, and inputs that still carry partial sums are rejected.
-    RoundOperation, ROUND_OPERATION_NAME,
-    Round, round,
+    RoundOperation,
+    ROUND_OPERATION_NAME,
+    Round,
+    round,
     check_data_types = [@float @real],
     check_array_types = [@no_unreduced],
 );
@@ -165,8 +164,7 @@ impl_differentiable_elementwise_operation!(@constant RoundOperation);
 define_elementwise_capability!(
     @unary
     /// Represents the ability to round elementwise to the nearest even integer. Concrete arrays compute immediately
-    /// while context-carrying values apply [`RoundOperation`] through their context. Refer to that operation for
-    /// supported types and exceptional-value behavior.
+    /// while context-carrying values apply [`RoundOperation`] through their context.
     Round,
     /// Rounds each element to the nearest integer, resolving ties toward the even integer. Returns an error if the
     /// input types or metadata are unsupported.
@@ -176,7 +174,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Round, round,
+    Round,
+    round,
     operation = "round",
     inputs = @float @real,
     checks = [@no_unreduced],
@@ -185,9 +184,9 @@ impl_array_elementwise_operation!(
 
 /// Implements [`Round`] for one host primitive type.
 macro_rules! impl_round_for_primitive {
-    // Implements the capability for one floating-point primitive.
     ($type:ty) => {
         impl Round for $type {
+            #[inline]
             fn round(&self) -> Result<Self, ProgramError> {
                 Ok(<$type>::round_ties_even(*self))
             }
@@ -234,6 +233,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             @reject @unreduced,
             operation = CeilOperation::<ArrayType>::new(),
@@ -314,6 +314,7 @@ mod tests {
             Array::scalar(f16::from_f32(2.3)).unwrap().ceil().unwrap(),
             Array::scalar(f16::from_f32(2.3f32.ceil())).unwrap(),
         );
+
         // NaNs pass through unchanged.
         assert!(Array::scalar(f64::NAN).unwrap().ceil().unwrap().to_f64s()[0].is_nan());
 
@@ -433,6 +434,7 @@ mod tests {
             Array::scalar(f16::from_f32(2.7)).unwrap().floor().unwrap(),
             Array::scalar(f16::from_f32(2.7f32.floor())).unwrap(),
         );
+
         // NaNs pass through unchanged.
         assert!(Array::scalar(f64::NAN).unwrap().floor().unwrap().to_f64s()[0].is_nan());
 
@@ -555,6 +557,7 @@ mod tests {
             Array::scalar(f16::from_f32(3.5)).unwrap().round().unwrap(),
             Array::scalar(f16::from_f32(4.0)).unwrap()
         );
+
         // NaNs pass through unchanged.
         assert!(Array::scalar(f64::NAN).unwrap().round().unwrap().to_f64s()[0].is_nan());
 
