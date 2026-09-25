@@ -2,8 +2,6 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::LazyLock;
 
-use ryft_macros::Parameter;
-
 use crate::arrays::{
     ArrayIrType, ArrayIrValue, ArrayReferenceView, ArrayReferenceViewIndex, ArrayReferenceViewPath, ArrayType,
 };
@@ -19,7 +17,6 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
-use crate::parameters::Parameter;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     BatchableReferenceView, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, ProgramError,
@@ -34,8 +31,10 @@ use crate::tracing::{Tracer, TracingContext};
 /// Canonical operation name for [`ReferenceIndexOperation`].
 pub const REFERENCE_INDEX_OPERATION_NAME: &str = "reference_index";
 
-/// Pure reference-to-reference operation selecting one element by index and removing its axis.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+/// Pure reference-to-reference operation selecting the hyperplane at a static `index` along `axis` and removing that
+/// axis. For example, index `1` on axis `0` of a `f32[2, 3]` reference selects its second row as a `f32[3]` reference.
+/// The resulting reference aliases the same allocation, and constructing the view does not access its contents.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceIndexOperation {
     /// Axis selected in the input reference view.
     axis: usize,
@@ -191,9 +190,9 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType> + From<AddOp
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // A view is aliasing metadata rather than a linear map of its own: the cotangent of a view operand is reached by
-        // reapplying the view path to its root's cotangent reference inside the transposition context, so the reverse
-        // sweep never needs this rule to run and every operand receives a structural zero.
+        // A view is aliasing metadata rather than a linear map of its own: the cotangent of a view operand is reached
+        // by reapplying the view path to its root's cotangent reference inside the transposition context, so the
+        // reverse sweep never needs this rule to run and every operand receives a structural zero.
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -206,8 +205,19 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType> + From<AddOp
 
 /// Derives an axis-removing indexed view of a reference without accessing its state.
 pub trait ReferenceIndex<Output = Self>: Sized {
-    /// Returns a reference view selecting `index` on `axis`.
+    /// Returns a reference view selecting the hyperplane at `index` along `axis`, removing that axis and sharing the
+    /// original allocation. `index` must be in bounds for `axis`.
     fn reference_index(&self, axis: usize, index: usize) -> Result<Output, ProgramError>;
+}
+
+impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
+    fn reference_index(&self, axis: usize, index: usize) -> Result<Self, ProgramError> {
+        // Projection rejects value operands and `with_transform` validates the transform against the handle's
+        // cached referent type, so a separate operation-level inference pass would only repeat both checks.
+        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
+        let transform = ArrayReferenceView::Index { axis, index: ArrayReferenceViewIndex::Static(index) };
+        Ok(Self::Reference(reference.with_transform(transform)?))
+    }
 }
 
 impl<V: Value<Type = ArrayIrType>> ReferenceIndex<V> for V
@@ -239,16 +249,6 @@ where
     }
 }
 
-impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
-    fn reference_index(&self, axis: usize, index: usize) -> Result<Self, ProgramError> {
-        // Projection rejects value operands and `with_transform` validates the transform against the handle's
-        // cached referent type, so a separate operation-level inference pass would only repeat both checks.
-        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
-        let transform = ArrayReferenceView::Index { axis, index: ArrayReferenceViewIndex::Static(index) };
-        Ok(Self::Reference(reference.with_transform(transform)?))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -259,12 +259,15 @@ mod tests {
         ArraySliceAxis, DataType, DimensionBounds, DimensionType, DimensionValue,
     };
     use crate::batching::{BatchAxis, BatchingTracer};
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::DifferentiationTracer;
-    use crate::operations::references::reference_new::ReferenceNew;
-    use crate::operations::references::reference_read::ReferenceRead;
+    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
+    use crate::operations::references::reference_read::{ReferenceRead, ReferenceReadOperation};
     use crate::operations::references::reference_slice::ReferenceSliceOperation;
-    use crate::programs::EmptyRegionDriver;
+    use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
 
     use super::*;
 
@@ -287,15 +290,44 @@ mod tests {
 
     #[test]
     fn test_reference_index_type_inference() {
-        let allocation_type = ArrayType::new_static(DataType::F32, [3, 4]);
-        let operation = ReferenceIndexOperation::new(0, 1);
-        assert_eq!(
-            operation.infer_output_types(&[ReferenceType::new(allocation_type.clone()).into()], &[]),
-            Ok(vec![ReferenceType::new(ArrayType::new_static(DataType::F32, [4])).into()]),
+        let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 4])));
+        let row = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4])));
+        check_operation_type_inference!(
+            operation = ReferenceIndexOperation::new(0, 1),
+            cases = [
+                {
+                    input_types = [reference.clone()],
+                    output_types = [row],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 4]))],
+                    error = "expected reference type but got array type",
+                },
+            ],
         );
+        check_operation_type_inference!(
+            operation = ReferenceIndexOperation::new(2, 0),
+            cases = [{
+                input_types = [reference.clone()],
+                error = "reference index axis 2 is out of bounds for rank 2",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReferenceIndexOperation::new(0, 3),
+            cases = [{
+                input_types = [reference.clone()],
+                error = "reference index 3 on axis 0 is out of bounds for size 3",
+            }],
+        );
+        let region = RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE);
         assert_eq!(
-            operation.infer_output_types(&[allocation_type.into()], &[]),
-            Err(TypeError::invalid("expected reference type but got array type")),
+            ReferenceIndexOperation::new(0, 1)
+                .infer_output_types(std::slice::from_ref(&reference), std::slice::from_ref(&region)),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
         );
     }
 
@@ -318,6 +350,55 @@ mod tests {
         assert_eq!(
             allocation.reference_index(0, 2),
             Err(TypeError::invalid("reference index 2 on axis 0 is out of bounds for size 2").into()),
+        );
+    }
+
+    #[test]
+    fn test_reference_index_partial_evaluation() {
+        let matrix = || {
+            Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 3]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        };
+        let live = TestValue::Reference(ArrayReference::new(matrix().unwrap()));
+        let reference = PartialEvaluationValue::known(live.clone());
+
+        // Under the default `Execute` placement, a known reference folds the view into a handle that aliases the same
+        // allocation.
+        let executing = PartialEvaluationContext::new(TestDestination::new());
+        let outputs = executing
+            .fold_or_residualize(ReferenceIndexOperation::new(0, 1), Vec::new(), std::slice::from_ref(&reference))
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_known(), Some(&live.reference_index(0, 1).unwrap()));
+
+        // Under the `Stage` placement, the view stays residual regardless of input knowledge, so the residual program
+        // keeps the complete alias chain of every later access.
+        let staging =
+            PartialEvaluationContext::new(TestDestination::new()).with_reference_placement(ReferencePlacement::Stage);
+        let outputs =
+            staging.fold_or_residualize(ReferenceIndexOperation::new(0, 1), Vec::new(), &[reference]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_unknown());
+
+        // Program-level partial evaluation uses the `Stage` placement, so both a known and an unknown reference retain
+        // the view in the residual program and replay it against the runtime reference.
+        let known = TestValue::Reference(ArrayReference::new(matrix().unwrap()));
+        let replay = TestValue::Reference(ArrayReference::new(matrix().unwrap()));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3])));
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = ReferenceIndexOperation::new(0, 1),
+            cases = [
+                {
+                    inputs = [(@known, known.clone())],
+                    outputs = [(@residual, known.reference_index(0, 1).unwrap())],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [(@unknown(type = reference_type, replay = replay.clone()))],
+                    outputs = [(@residual, replay.reference_index(0, 1).unwrap())],
+                    residual_instructions = 1,
+                },
+            ],
         );
     }
 
@@ -443,6 +524,66 @@ mod tests {
             MaybeZero::Zero(r#type)
                 if *r#type == ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))),
         ));
+    }
+
+    #[test]
+    fn test_reference_index_transposition() {
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+
+        // `r = new(x); y = read(index(r))`: the view has no transpose of its own, because the read accumulates `ȳ` into
+        // the indexed row of the cotangent reference of `r`, which the allocation then freezes into `x̄`.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let initial = builder.add_input(ArrayIrType::Array(matrix_type.clone()));
+        let reference = builder
+            .add_instruction(ReferenceNewOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), vec![initial], None)
+            .unwrap()[0];
+        let row = builder
+            .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(ReferenceReadOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), vec![row], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[3] .
+                let %1:f32[2, 3] = zero [type=f32[2, 3]]
+                    %2:ref<f32[2, 3]> = reference_new %1
+                    %3:ref<f32[3]> = reference_index [axis=0, index=1] %2
+                    () = reference_add_update %3 %0
+                    %4:f32[2, 3] = reference_freeze %2
+                in (%4)"},
+        );
+        assert_eq!(
+            transposed.interpret(vec![TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap())]),
+            Ok(vec![TestValue::Array(
+                Array::from_elements::<f32>(matrix_type.clone(), &[0.0, 0.0, 0.0, 1.0, 2.0, 3.0]).unwrap()
+            )]),
+        );
+
+        // The rule itself gives the viewed reference a structural zero whatever its output cotangent is, so it never
+        // stages anything into the transposition context.
+        let inputs = [PartialValue::Unknown(ArrayIrType::Reference(ReferenceType::new(matrix_type)))];
+        let tracing = TracingContext::<TestValue, TestOperation>::new();
+        let cotangent =
+            tracing.input(ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3]))));
+        let mut context = TranspositionContext::new(tracing);
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        assert_eq!(
+            ReferenceIndexOperation::new(0, 1).transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Value(cotangent)],
+                &accumulators,
+            ),
+            Ok(()),
+        );
+        assert!(context.builder().borrow().instructions().is_empty());
     }
 
     #[test]

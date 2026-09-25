@@ -18,8 +18,9 @@
 //! An [`Index`](ArrayReferenceView::Index) transform indexes one array axis using a static index or a
 //! symbolic input position. Analysis binds each position to the [`ValueId`] of the corresponding instruction operand.
 //! Eager handles carry [`NoReferenceViewBinding`] and accept only static transforms. Discharge paths can store context
-//! values as bindings and reconstruct symbolic selections through dynamic slicing and updates. Runtime indices clamp
-//! to the selected axis, following the array dynamic-slicing contract.
+//! values as bindings and reconstruct symbolic selections through dynamic slicing and updates. Following the array
+//! dynamic-slicing contract, a negative runtime index counts from the end of the selected axis once, and the result is
+//! then clamped to that axis.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -538,8 +539,9 @@ enum RootIndexSelection {
         limit: usize,
     },
 
-    /// One index `offset + clamp(symbol, 0, extent - 1)` of the root axis, selected relative to the
-    /// range that earlier steps narrowed the axis to. Clamping depends on this extent, not just the binding.
+    /// One index `offset + clamp(wrap(symbol), 0, extent - 1)` of the root axis, selected relative to the range that
+    /// earlier steps narrowed the axis to, where `wrap(symbol)` is `symbol + extent` for a negative `symbol` and
+    /// `symbol` otherwise. Both wrapping and clamping depend on this extent, not just the binding.
     Symbolic {
         /// Binding of the symbolic index.
         binding: ValueId,
@@ -547,7 +549,7 @@ enum RootIndexSelection {
         /// Start of the narrowed range that the symbolic index is relative to.
         offset: usize,
 
-        /// Size of the narrowed axis against which the runtime index is clamped.
+        /// Size of the narrowed axis against which the runtime index is wrapped and clamped.
         extent: usize,
     },
 }
@@ -1268,8 +1270,8 @@ pub type ArrayReferenceAnalysis = ReferenceViewAnalysis<ArrayReferenceView>;
 /// the context value it selects. Every access therefore reaches its indices through the same view traversal the eager
 /// handles use, which is what keeps staged and eager reference semantics from drifting apart: reading materializes the
 /// allocation-to-handle chain and takes its last snapshot, while a replacement or an accumulation writes the new leaf
-/// back through that chain in reverse. Symbolic indices use dynamic slicing and updates with the same clamping
-/// bounds, so reads and mutations always address the same elements.
+/// back through that chain in reverse. Symbolic indices use dynamic slicing and updates with the same negative-index
+/// and clamping policy, so reads and mutations always address the same elements.
 ///
 /// The reconstruction context is bounded by [`Context`] rather than [`Domain`](crate::Domain) because the view
 /// traversal binds canonical slicing, reshape, and update operations into it. Their value-level capabilities are

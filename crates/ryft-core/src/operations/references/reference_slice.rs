@@ -2,8 +2,6 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::LazyLock;
 
-use ryft_macros::Parameter;
-
 use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceView, ArrayReferenceViewPath, ArraySliceAxis, ArrayType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -17,7 +15,6 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
-use crate::parameters::Parameter;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     BatchableReferenceView, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, ProgramError,
@@ -33,7 +30,7 @@ use crate::tracing::{Tracer, TracingContext};
 pub const REFERENCE_SLICE_OPERATION_NAME: &str = "reference_slice";
 
 /// Pure reference-to-reference operation selecting one static range on every axis.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceSliceOperation {
     /// Per-axis selections in the input reference view.
     axes: Vec<ArraySliceAxis>,
@@ -185,9 +182,9 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType> + From<AddOp
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // A view is aliasing metadata rather than a linear map of its own: the cotangent of a view operand is reached by
-        // reapplying the view path to its root's cotangent reference inside the transposition context, so the reverse
-        // sweep never needs this rule to run and every operand receives a structural zero.
+        // A view is aliasing metadata rather than a linear map of its own: the cotangent of a view operand is reached
+        // by reapplying the view path to its root's cotangent reference inside the transposition context, so the
+        // reverse sweep never needs this rule to run and every operand receives a structural zero.
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -202,6 +199,15 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType> + From<AddOp
 pub trait ReferenceSlice<Output = Self>: Sized {
     /// Returns a reference view selecting `axes`, one static selection per input axis.
     fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<Output, ProgramError>;
+}
+
+impl<A: Value<Type = ArrayType>> ReferenceSlice for ArrayIrValue<A> {
+    fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
+        // Projection rejects value operands and `with_transform` validates the transform against the handle's
+        // cached referent type, so a separate operation-level inference pass would only repeat both checks.
+        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
+        Ok(Self::Reference(reference.with_transform(ArrayReferenceView::Slice { axes: axes.to_vec() })?))
+    }
 }
 
 impl<V: Value<Type = ArrayIrType>> ReferenceSlice<V> for V
@@ -232,32 +238,26 @@ where
     }
 }
 
-impl<A: Value<Type = ArrayType>> ReferenceSlice for ArrayIrValue<A> {
-    fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
-        // Projection rejects value operands and `with_transform` validates the transform against the handle's
-        // cached referent type, so a separate operation-level inference pass would only repeat both checks.
-        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
-        Ok(Self::Reference(reference.with_transform(ArrayReferenceView::Slice { axes: axes.to_vec() })?))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayReferenceDischarge, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayReference, ArrayReferenceDischarge,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::axes::Axis;
     use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::DifferentiationTracer;
-    use crate::operations::references::reference_new::ReferenceNew;
-    use crate::operations::references::reference_read::ReferenceRead;
+    use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::operations::references::reference_new::{ReferenceNew, ReferenceNewOperation};
+    use crate::operations::references::reference_read::{ReferenceRead, ReferenceReadOperation};
     use crate::operations::references::reference_write::ReferenceWrite;
-    use crate::programs::EmptyRegionDriver;
+    use crate::parameters::Placeholder;
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
 
     use super::*;
 
@@ -288,15 +288,47 @@ mod tests {
 
     #[test]
     fn test_reference_slice_type_inference() {
-        let allocation_type = ArrayType::new_static(DataType::F32, [3, 4]);
-        let operation = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)]);
-        assert_eq!(
-            operation.infer_output_types(&[ReferenceType::new(allocation_type.clone()).into()], &[]),
-            Ok(vec![ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3])).into()]),
+        let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 4])));
+        let axes = vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)];
+        check_operation_type_inference!(
+            operation = ReferenceSliceOperation::new(axes.clone()),
+            cases = [
+                {
+                    input_types = [reference.clone()],
+                    output_types = [
+                        ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3]))),
+                    ],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 4]))],
+                    error = "expected reference type but got array type",
+                },
+            ],
         );
+        let vector = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
+        check_operation_type_inference!(
+            operation = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(2, 2, 1)]),
+            cases = [{
+                input_types = [vector.clone()],
+                error = "reference slice on axis 0 with start 2 and size 2 exceeds input size 3",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 2)]),
+            cases = [{
+                input_types = [vector],
+                error = "reference slice axis 0 stride must be 1 until scatter-backed strided updates are supported",
+            }],
+        );
+        let region = RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE);
         assert_eq!(
-            operation.infer_output_types(&[allocation_type.into()], &[]),
-            Err(TypeError::invalid("expected reference type but got array type")),
+            ReferenceSliceOperation::new(axes)
+                .infer_output_types(std::slice::from_ref(&reference), std::slice::from_ref(&region)),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
         );
     }
 
@@ -322,6 +354,59 @@ mod tests {
                 "reference slice axis 0 stride must be 1 until scatter-backed strided updates are supported",
             )
             .into()),
+        );
+    }
+
+    #[test]
+    fn test_reference_slice_partial_evaluation() {
+        let vector = || Array::vector(vec![1.0_f32, 2.0, 3.0]);
+        let live = TestValue::Reference(ArrayReference::new(vector().unwrap()));
+        let reference = PartialEvaluationValue::known(live.clone());
+        let axes = vec![ArraySliceAxis::new(1, 2, 1)];
+
+        // Under the default `Execute` placement, a known reference folds the view into a handle that aliases the same
+        // allocation.
+        let executing = PartialEvaluationContext::new(TestDestination::new());
+        let outputs = executing
+            .fold_or_residualize(
+                ReferenceSliceOperation::new(axes.clone()),
+                Vec::new(),
+                std::slice::from_ref(&reference),
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_known(), Some(&live.reference_slice(&axes).unwrap()));
+
+        // Under the `Stage` placement, the view stays residual regardless of input knowledge, so the residual program
+        // keeps the complete alias chain of every later access.
+        let staging =
+            PartialEvaluationContext::new(TestDestination::new()).with_reference_placement(ReferencePlacement::Stage);
+        let outputs = staging
+            .fold_or_residualize(ReferenceSliceOperation::new(axes.clone()), Vec::new(), &[reference])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_unknown());
+
+        // Program-level partial evaluation uses the `Stage` placement, so both a known and an unknown reference retain
+        // the view in the residual program and replay it against the runtime reference.
+        let known = TestValue::Reference(ArrayReference::new(vector().unwrap()));
+        let replay = TestValue::Reference(ArrayReference::new(vector().unwrap()));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = ReferenceSliceOperation::new(axes.clone()),
+            cases = [
+                {
+                    inputs = [(@known, known.clone())],
+                    outputs = [(@residual, known.reference_slice(&axes).unwrap())],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [(@unknown(type = reference_type, replay = replay.clone()))],
+                    outputs = [(@residual, replay.reference_slice(&axes).unwrap())],
+                    residual_instructions = 1,
+                },
+            ],
         );
     }
 
@@ -448,6 +533,69 @@ mod tests {
             MaybeZero::Zero(r#type)
                 if *r#type == ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [1, 3]))),
         ));
+    }
+
+    #[test]
+    fn test_reference_slice_transposition() {
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+
+        // `r = new(x); y = read(slice(r))`: the view has no transpose of its own, because the read accumulates `ȳ` into
+        // the sliced range of the cotangent reference of `r`, which the allocation then freezes into `x̄`.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let initial = builder.add_input(ArrayIrType::Array(vector_type.clone()));
+        let reference = builder
+            .add_instruction(ReferenceNewOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), vec![initial], None)
+            .unwrap()[0];
+        let sliced = builder
+            .add_instruction(
+                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1)]),
+                Vec::new(),
+                vec![reference],
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(ReferenceReadOperation::<ArrayType, ArrayIrType>::new(), Vec::new(), vec![sliced], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[4] = zero [type=f32[4]]
+                    %2:ref<f32[4]> = reference_new %1
+                    %3:ref<f32[2]> = reference_slice [axes=[ArraySliceAxis { start: 1, size: 2, stride: 1 }]] %2
+                    () = reference_add_update %3 %0
+                    %4:f32[4] = reference_freeze %2
+                in (%4)"},
+        );
+        assert_eq!(
+            transposed.interpret(vec![TestValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap())]),
+            Ok(vec![TestValue::Array(Array::vector(vec![0.0_f32, 1.0, 2.0, 0.0]).unwrap())]),
+        );
+
+        // The rule itself gives the viewed reference a structural zero whatever its output cotangent is, so it never
+        // stages anything into the transposition context.
+        let inputs = [PartialValue::Unknown(ArrayIrType::Reference(ReferenceType::new(vector_type)))];
+        let tracing = TracingContext::<TestValue, TestOperation>::new();
+        let cotangent =
+            tracing.input(ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))));
+        let mut context = TranspositionContext::new(tracing);
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        assert_eq!(
+            ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1)]).transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Value(cotangent)],
+                &accumulators,
+            ),
+            Ok(()),
+        );
+        assert!(context.builder().borrow().instructions().is_empty());
     }
 
     #[test]

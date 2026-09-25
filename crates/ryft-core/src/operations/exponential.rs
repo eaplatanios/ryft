@@ -477,8 +477,6 @@ macro_rules! impl_logistic_for_primitive {
 impl_logistic_for_primitive!(f32);
 impl_logistic_for_primitive!(f64);
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -496,7 +494,7 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypeError, Typed};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypeError};
 
     use super::*;
 
@@ -579,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_exp_differentiation_complex() {
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        let input = ComplexNumber::new(0.7f64, -0.3);
         assert_eq!(
             differentiate_at(Array::scalar(input).unwrap()).holomorphic().gradient(|input| input.exp().unwrap()),
             Ok(Array::scalar(input.exp()).unwrap()),
@@ -588,19 +586,17 @@ mod tests {
 
     #[test]
     fn test_exp_differentiation_low_precision_uses_widened_tangents() {
-        let primal = Array::from_elements::<f8e8m0fnu>(
-            ArrayType::scalar(DataType::F8E8M0FNU),
-            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
+        let primal = Array::scalar(f8e8m0fnu::from_f64(2.0).unwrap()).unwrap();
+        let input_tangent = Array::scalar(3.0f32).unwrap();
         let (primal_output, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.exp()).unwrap();
-        // The primal keeps its exponent-only encoding: `exp(2) ≈ 7.39` rounds to the
-        // nearest representable power of two, `8 = 2^3`, whose biased-exponent encoding is `0x82`.
+
+        // The primal keeps its exponent-only encoding: `exp(2) ≈ 7.39` rounds to the nearest representable power of
+        // two, `8 = 2^3`, whose biased-exponent encoding is `0x82`.
         assert_eq!(primal_output.r#type().as_ref(), &ArrayType::scalar(DataType::F8E8M0FNU));
         assert_eq!(primal_output.logical_bytes(), vec![0x82]);
-        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+
         // The tangent is evaluated in its widened `f32` representation.
+        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 3.0 * 2.0f32.exp(), epsilon = 1e-6);
 
         // The widened staged tangent program recomputes the coefficient in the widened differential representation
@@ -638,56 +634,55 @@ mod tests {
 
     #[test]
     fn test_array_exp() {
-        assert_eq!(Array::scalar(0.5f32).unwrap().exp().unwrap(), Array::scalar(0.5f32.exp()).unwrap());
-        assert_eq!(Array::scalar(0.5f64).unwrap().exp().unwrap(), Array::scalar(0.5f64.exp()).unwrap());
+        // Native and half-precision inputs retain their element types.
+        assert_eq!(Array::scalar(0.5f32).unwrap().exp(), Ok(Array::scalar(0.5f32.exp()).unwrap()));
+        assert_eq!(Array::scalar(0.5f64).unwrap().exp(), Ok(Array::scalar(0.5f64.exp()).unwrap()));
         assert_eq!(
-            Array::scalar(bf16::from_f32(0.5)).unwrap().exp().unwrap(),
-            Array::scalar(bf16::from_f32(0.5f32.exp())).unwrap(),
+            Array::scalar(bf16::from_f32(0.5)).unwrap().exp(),
+            Ok(Array::scalar(bf16::from_f32(0.5f32.exp())).unwrap()),
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(0.5)).unwrap().exp().unwrap(),
-            Array::scalar(f16::from_f32(0.5f32.exp())).unwrap(),
+            Array::scalar(f16::from_f32(0.5)).unwrap().exp(),
+            Ok(Array::scalar(f16::from_f32(0.5f32.exp())).unwrap()),
         );
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
+
+        // Vectors are exponentiated elementwise.
+        assert_eq!(Array::vector(vec![0.0, 1.0]).unwrap().exp(), Ok(Array::vector(vec![1.0, 1.0f64.exp()]).unwrap()),);
+    }
+
+    #[test]
+    fn test_array_exp_complex() {
+        // Complex inputs compute the analytic continuation `e^z`, including Euler's identity `e^{iπ} = -1`.
+        let input = ComplexNumber::new(0.7f64, -0.3);
         assert_abs_diff_eq!(
             Array::scalar(input).unwrap().exp().unwrap(),
             Array::scalar(input.exp()).unwrap(),
             epsilon = 1e-12,
         );
-        // Euler's identity: e^{iπ} = -1.
         assert_abs_diff_eq!(
             Array::scalar(ComplexNumber::new(0.0f64, std::f64::consts::PI)).unwrap().exp().unwrap(),
             Array::scalar(ComplexNumber::new(-1.0f64, 0.0)).unwrap(),
             epsilon = 1e-12,
         );
 
-        let vector = Array::vector(vec![0.0, 1.0]).unwrap();
-        assert_abs_diff_eq!(vector.exp().unwrap(), Array::vector(vec![1.0, 1.0f64.exp()]).unwrap(), epsilon = 1e-12);
-    }
-
-    #[test]
-    fn test_array_exp_complex() {
-        // Elementwise complex math decodes and encodes the complex element types directly.
-        let left = Array::vector(vec![ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)]).unwrap();
-        let left_values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        // Complex vectors retain both components of every element.
+        let values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5, -1.0)];
         assert_abs_diff_eq!(
-            left.exp().unwrap(),
-            Array::vector(vec![left_values[0].exp(), left_values[1].exp()]).unwrap(),
+            Array::vector(values.to_vec()).unwrap().exp().unwrap(),
+            Array::vector(vec![values[0].exp(), values[1].exp()]).unwrap(),
             epsilon = 1e-12,
         );
     }
 
     #[test]
     fn test_array_exp_low_precision() {
-        // Low-precision formats decode, compute, and re-encode without constructing intermediary scalar values.
-        let low_precision = Array::from_elements(
-            ArrayType::new_static(DataType::F8E4M3FN, [2]),
-            &[f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0).unwrap()],
-        )
-        .unwrap();
+        // Low-precision formats compute through decoded values and re-encode the nearest representable result.
         assert_eq!(
-            low_precision.exp().unwrap().elements::<f8e4m3fn>(),
-            Ok(vec![f8e4m3fn::from_f64(1.0).unwrap(), f8e4m3fn::from_bits(0x43)]),
+            Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0).unwrap()])
+                .unwrap()
+                .exp(),
+            Ok(Array::vector(vec![f8e4m3fn::from_f64(1.0).unwrap(), f8e4m3fn::from_f64(1.0f64.exp()).unwrap()])
+                .unwrap()),
         );
     }
 
@@ -777,7 +772,7 @@ mod tests {
     #[test]
     fn test_log_differentiation_complex() {
         // The analytic quotient and the scalar division algorithm may round their intermediate values differently.
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        let input = ComplexNumber::new(0.7f64, -0.3);
         assert_abs_diff_eq!(
             differentiate_at(Array::scalar(input).unwrap())
                 .holomorphic()
@@ -790,18 +785,12 @@ mod tests {
 
     #[test]
     fn test_log_differentiation_low_precision_uses_widened_tangents() {
-        let primal = Array::from_elements::<f8e8m0fnu>(
-            ArrayType::scalar(DataType::F8E8M0FNU),
-            &[2.0].map(|value| f8e8m0fnu::from_f64(value).unwrap()),
-        )
-        .unwrap();
-        let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
+        let primal = Array::scalar(f8e8m0fnu::from_f64(2.0).unwrap()).unwrap();
+        let input_tangent = Array::scalar(3.0f32).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.log()).unwrap();
-        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 1.5, epsilon = 1e-9);
+        assert_eq!(tangent, Array::scalar(1.5f32).unwrap());
 
-        // The widened staged tangent program divides by the input converted to the widened differential
-        // representation.
+        // The widened staged tangent program divides by the input converted to the widened differential representation.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
         let output = builder.add_instruction(LogOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -834,41 +823,62 @@ mod tests {
 
     #[test]
     fn test_array_log() {
-        assert_eq!(Array::scalar(0.5f32).unwrap().log().unwrap(), Array::scalar(0.5f32.ln()).unwrap());
-        assert_eq!(Array::scalar(0.5f64).unwrap().log().unwrap(), Array::scalar(0.5f64.ln()).unwrap());
+        // Native and half-precision inputs retain their element types.
+        assert_eq!(Array::scalar(0.5f32).unwrap().log(), Ok(Array::scalar(0.5f32.ln()).unwrap()));
+        assert_eq!(Array::scalar(0.5f64).unwrap().log(), Ok(Array::scalar(0.5f64.ln()).unwrap()));
         assert_eq!(
-            Array::scalar(bf16::from_f32(0.5)).unwrap().log().unwrap(),
-            Array::scalar(bf16::from_f32(0.5f32.ln())).unwrap(),
+            Array::scalar(bf16::from_f32(0.5)).unwrap().log(),
+            Ok(Array::scalar(bf16::from_f32(0.5f32.ln())).unwrap()),
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(0.5)).unwrap().log().unwrap(),
-            Array::scalar(f16::from_f32(0.5f32.ln())).unwrap(),
+            Array::scalar(f16::from_f32(0.5)).unwrap().log(),
+            Ok(Array::scalar(f16::from_f32(0.5f32.ln())).unwrap()),
         );
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
+
+        // Vectors take logarithms elementwise.
+        assert_eq!(
+            Array::vector(vec![1.0, std::f64::consts::E]).unwrap().log(),
+            Ok(Array::vector(vec![0.0, 1.0]).unwrap()),
+        );
+
+        // The boundary of the real domain maps to negative infinity, and negative inputs have no real logarithm.
+        assert_eq!(Array::scalar(0.0f64).unwrap().log(), Ok(Array::scalar(f64::NEG_INFINITY).unwrap()));
+        assert!(Array::scalar(-1.0f64).unwrap().log().unwrap().elements::<f64>().unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn test_array_log_complex() {
+        // Complex inputs use the principal branch, which maps the negative real axis to `ln|x| + iπ`.
+        let input = ComplexNumber::new(0.7f64, -0.3);
         assert_abs_diff_eq!(
             Array::scalar(input).unwrap().log().unwrap(),
             Array::scalar(input.ln()).unwrap(),
             epsilon = 1e-12,
         );
-        // The principal branch maps the negative real axis to `ln|x| + iπ`.
         assert_abs_diff_eq!(
             Array::scalar(ComplexNumber::new(-1.0f64, 0.0)).unwrap().log().unwrap(),
             Array::scalar(ComplexNumber::new(0.0f64, std::f64::consts::PI)).unwrap(),
             epsilon = 1e-12,
         );
 
-        assert_abs_diff_eq!(
-            Array::vector(vec![1.0, std::f64::consts::E]).unwrap().log().unwrap(),
-            Array::vector(vec![0.0, 1.0]).unwrap(),
-            epsilon = 1e-12,
-        );
-
-        // Complex arrays retain both components throughout elementwise decoding and encoding.
-        let values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
+        // Complex vectors retain both components of every element.
+        let values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5, -1.0)];
         assert_abs_diff_eq!(
             Array::vector(values.to_vec()).unwrap().log().unwrap(),
             Array::vector(vec![values[0].ln(), values[1].ln()]).unwrap(),
             epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_array_log_low_precision() {
+        // Low-precision formats compute through decoded values and re-encode the nearest representable result.
+        assert_eq!(
+            Array::vector(vec![f8e4m3fn::from_f64(1.0).unwrap(), f8e4m3fn::from_f64(2.0).unwrap()])
+                .unwrap()
+                .log(),
+            Ok(Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(2.0f64.ln()).unwrap()])
+                .unwrap()),
         );
     }
 
@@ -963,6 +973,7 @@ mod tests {
 
     #[test]
     fn test_ln_1p_differentiation_complex() {
+        // The derivative is `1 / (1 + z)`, which is `(0.6, -0.2)` at `z = 0.5 + 0.5i`.
         let input = ComplexNumber::new(0.5f64, 0.5);
         assert_abs_diff_eq!(
             differentiate_at(Array::scalar(input).unwrap())
@@ -975,11 +986,43 @@ mod tests {
     }
 
     #[test]
+    fn test_ln_1p_differentiation_low_precision_uses_widened_tangents() {
+        let primal = Array::scalar(f8e8m0fnu::from_f64(2.0).unwrap()).unwrap();
+        let input_tangent = Array::scalar(3.0f32).unwrap();
+        let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.ln_1p()).unwrap();
+        assert_eq!(tangent, Array::scalar(1.0f32).unwrap());
+
+        // The widened staged tangent program forms `1 + x` from the input converted to the widened differential
+        // representation.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
+        let output = builder.add_instruction(Ln1pOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f8e8m0fnu[], %1:f32[] .
+                let %2:f8e8m0fnu[] = ln_1p %0
+                    %3:f32[] = convert_element_type [data_type=f32] %0
+                    %4:f32[] = one_like %3
+                    %5:f32[] = add %4 %3
+                    %6:f32[] = div %1 %5
+                in (%2, %6)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_ln_1p_differentiation_unrepresentable_tangent() {
         // The primal saturates to the finite minimum, but a live zero tangent requires an unrepresentable NaN.
         assert_eq!(
             differentiate_at(Array::scalar(f4e2m1fn::from_f64(-1.0).unwrap()).unwrap())
-                .jvp(Array::scalar(f4e2m1fn::from_f64(0.0).unwrap()).unwrap(), |input| input.ln_1p(),),
+                .jvp(Array::scalar(f4e2m1fn::from_f64(0.0).unwrap()).unwrap(), |input| input.ln_1p()),
             Err(DifferentiationError::Program(TypeError::invalid("data type `f4e2m1fn` cannot represent NaN").into())),
         );
     }
@@ -996,32 +1039,57 @@ mod tests {
     #[test]
     fn test_array_ln_1p() {
         // Native and half-precision inputs retain their element types.
-        assert_eq!(Array::scalar(0.5f32).unwrap().ln_1p().unwrap(), Array::scalar(0.5f32.ln_1p()).unwrap());
-        assert_eq!(Array::scalar(0.5f64).unwrap().ln_1p().unwrap(), Array::scalar(0.5f64.ln_1p()).unwrap());
+        assert_eq!(Array::scalar(0.5f32).unwrap().ln_1p(), Ok(Array::scalar(0.5f32.ln_1p()).unwrap()));
+        assert_eq!(Array::scalar(0.5f64).unwrap().ln_1p(), Ok(Array::scalar(0.5f64.ln_1p()).unwrap()));
         assert_eq!(
-            Array::scalar(bf16::from_f32(0.5)).unwrap().ln_1p().unwrap(),
-            Array::scalar(bf16::from_f32(0.5f32.ln_1p())).unwrap(),
+            Array::scalar(bf16::from_f32(0.5)).unwrap().ln_1p(),
+            Ok(Array::scalar(bf16::from_f32(0.5f32.ln_1p())).unwrap()),
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(0.5)).unwrap().ln_1p().unwrap(),
-            Array::scalar(f16::from_f32(0.5f32.ln_1p())).unwrap(),
+            Array::scalar(f16::from_f32(0.5)).unwrap().ln_1p(),
+            Ok(Array::scalar(f16::from_f32(0.5f32.ln_1p())).unwrap()),
         );
 
         // The fixed point and the boundary values of the real domain.
-        assert_eq!(Array::scalar(0.0f64).unwrap().ln_1p().unwrap(), Array::scalar(0.0f64).unwrap());
-        assert_eq!(Array::scalar(-1.0f64).unwrap().ln_1p().unwrap(), Array::scalar(f64::NEG_INFINITY).unwrap());
+        assert_eq!(Array::scalar(0.0f64).unwrap().ln_1p(), Ok(Array::scalar(0.0f64).unwrap()));
+        assert_eq!(Array::scalar(-1.0f64).unwrap().ln_1p(), Ok(Array::scalar(f64::NEG_INFINITY).unwrap()));
         assert!(Array::scalar(-2.0f64).unwrap().ln_1p().unwrap().elements::<f64>().unwrap()[0].is_nan());
 
         // This input is lost by forming `1 + x`, but its logarithm rounds back to `x` itself.
-        assert_eq!(Array::scalar(1e-20f64).unwrap().ln_1p().unwrap(), Array::scalar(1e-20f64).unwrap());
+        assert_eq!(Array::scalar(1e-20f64).unwrap().ln_1p(), Ok(Array::scalar(1e-20f64).unwrap()));
     }
 
     #[test]
     fn test_array_ln_1p_complex() {
+        // Complex inputs use the principal logarithm of `1 + z`.
         assert_abs_diff_eq!(
             Array::scalar(ComplexNumber::new(0.0f64, 1.0)).unwrap().ln_1p().unwrap(),
             Array::scalar(ComplexNumber::new(std::f64::consts::LN_2 / 2.0, std::f64::consts::FRAC_PI_4)).unwrap(),
             epsilon = 1e-15,
+        );
+
+        // On the branch cut below `-1`, the sign of the imaginary zero selects the side of the cut.
+        assert_abs_diff_eq!(
+            Array::scalar(ComplexNumber::new(-2.0f64, 0.0)).unwrap().ln_1p().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, std::f64::consts::PI)).unwrap(),
+            epsilon = 1e-15,
+        );
+        assert_abs_diff_eq!(
+            Array::scalar(ComplexNumber::new(-2.0f64, -0.0)).unwrap().ln_1p().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, -std::f64::consts::PI)).unwrap(),
+            epsilon = 1e-15,
+        );
+    }
+
+    #[test]
+    fn test_array_ln_1p_low_precision() {
+        // Low-precision formats compute through decoded values and re-encode the nearest representable result.
+        assert_eq!(
+            Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0).unwrap()])
+                .unwrap()
+                .ln_1p(),
+            Ok(Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0f64.ln_1p()).unwrap()])
+                .unwrap()),
         );
     }
 
@@ -1086,6 +1154,7 @@ mod tests {
 
     #[test]
     fn test_log_add_exp_batching() {
+        // Each batch item is `max(a, b) + ln_1p(exp(-|a - b|))` against the replicated input.
         check_operation_batching!(
             @approx(epsilon = 1e-9),
             operation = LogAddExpOperation::new(),
@@ -1097,7 +1166,7 @@ mod tests {
                 ],
                 outputs = [(
                     @mapped(axis = 0),
-                    Array::vector(vec![2.2014132779827524f64, 2.048587351573742f64]).unwrap(),
+                    Array::vector(vec![2.0 + (-1.5f64).exp().ln_1p(), 2.0 + (-3.0f64).exp().ln_1p()]).unwrap(),
                 )],
             }],
         );
@@ -1108,7 +1177,7 @@ mod tests {
         // The tangent is the softmax-weighted combination of the input tangents.
         let (left, right) = (0.7f64, -0.3f64);
         let (left_tangent, right_tangent) = (0.4f64, -0.2f64);
-        let output = 1.0132616875182228f64;
+        let output = left + (right - left).exp().ln_1p();
         let tangent = (left - output).exp() * left_tangent + (right - output).exp() * right_tangent;
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
@@ -1152,48 +1221,70 @@ mod tests {
 
     #[test]
     fn test_log_add_exp_differentiation_exceptional_tangents() {
-        // These five results are conventions of the differentiation rule rather than mathematical extensions of the
+        // These results are conventions of the differentiation rule rather than mathematical extensions of the
         // primal, so they are pinned exactly. They follow from replacing only *positive* infinity with zero before
         // the weight subtraction, exactly as JAX's `_logaddexp_jvp` does.
-        let jvp = |primals: (f64, f64), tangents: (f64, f64)| {
-            differentiate_at((Array::scalar(primals.0).unwrap(), Array::scalar(primals.1).unwrap()))
-                .jvp((Array::scalar(tangents.0).unwrap(), Array::scalar(tangents.1).unwrap()), |(left, right)| {
-                    left.log_add_exp(&right)
-                })
-                .unwrap()
-                .1
-                .elements::<f64>()
-                .unwrap()[0]
-        };
+        let tangents = (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap());
 
         // Both weights become `exp(0 - 0) = 1`, so the tangents simply add.
-        assert_eq!(jvp((f64::INFINITY, f64::INFINITY), (2.0, 3.0)), 5.0);
+        assert_eq!(
+            differentiate_at((Array::scalar(f64::INFINITY).unwrap(), Array::scalar(f64::INFINITY).unwrap()))
+                .jvp(tangents.clone(), |(left, right)| left.log_add_exp(&right))
+                .map(|(_, tangent)| tangent),
+            Ok(Array::scalar(5.0).unwrap()),
+        );
+
         // Negative infinity is not replaced, so both weights are `exp(-∞ - -∞) = exp(NaN)`.
-        assert!(jvp((f64::NEG_INFINITY, f64::NEG_INFINITY), (2.0, 3.0)).is_nan());
+        let (_, tangent) =
+            differentiate_at((Array::scalar(f64::NEG_INFINITY).unwrap(), Array::scalar(f64::NEG_INFINITY).unwrap()))
+                .jvp(tangents.clone(), |(left, right)| left.log_add_exp(&right))
+                .unwrap();
+        assert!(tangent.elements::<f64>().unwrap()[0].is_nan());
+
         // The replaced `+∞` output makes the finite input's weight `exp(a)` instead of zero.
-        assert_eq!(jvp((1.0, f64::INFINITY), (2.0, 3.0)), 1.0f64.exp() * 2.0 + 3.0);
-        // A `-∞` input contributes nothing and the finite input carries the whole tangent.
-        assert_eq!(jvp((1.0, f64::NEG_INFINITY), (2.0, 3.0)), 2.0);
-        // A NaN input propagates through both the primal and the weights.
-        assert!(jvp((f64::NAN, 1.0), (2.0, 3.0)).is_nan());
-        assert!(jvp((1.0, f64::NAN), (2.0, 3.0)).is_nan());
+        assert_eq!(
+            differentiate_at((Array::scalar(1.0).unwrap(), Array::scalar(f64::INFINITY).unwrap()))
+                .jvp(tangents.clone(), |(left, right)| left.log_add_exp(&right))
+                .map(|(_, tangent)| tangent),
+            Ok(Array::scalar(1.0f64.exp() * 2.0 + 3.0).unwrap()),
+        );
+
+        // A `-∞` input contributes nothing, so the finite input carries the whole tangent.
+        assert_eq!(
+            differentiate_at((Array::scalar(1.0).unwrap(), Array::scalar(f64::NEG_INFINITY).unwrap()))
+                .jvp(tangents.clone(), |(left, right)| left.log_add_exp(&right))
+                .map(|(_, tangent)| tangent),
+            Ok(Array::scalar(2.0).unwrap()),
+        );
+
+        // A NaN input propagates through both the primal and the weights, whichever side it is on.
+        let (_, tangent) = differentiate_at((Array::scalar(f64::NAN).unwrap(), Array::scalar(1.0).unwrap()))
+            .jvp(tangents.clone(), |(left, right)| left.log_add_exp(&right))
+            .unwrap();
+        assert!(tangent.elements::<f64>().unwrap()[0].is_nan());
+        let (_, tangent) = differentiate_at((Array::scalar(1.0).unwrap(), Array::scalar(f64::NAN).unwrap()))
+            .jvp(tangents, |(left, right)| left.log_add_exp(&right))
+            .unwrap();
+        assert!(tangent.elements::<f64>().unwrap()[0].is_nan());
     }
 
     #[test]
     fn test_log_add_exp_differentiation_finite_maximum() {
-        // Infinity literals saturate in this format; its finite maximum must retain the finite-input derivative.
+        // Infinity literals saturate in this format, so its finite maximum must retain the finite-input derivative.
         let left = Array::scalar(f4e2m1fn::from_f64(6.0).unwrap()).unwrap();
         let right = Array::scalar(f4e2m1fn::from_f64(0.0).unwrap()).unwrap();
         let tangent = Array::scalar(f4e2m1fn::from_f64(1.0).unwrap()).unwrap();
-        let (output, tangent) = differentiate_at((left.clone(), right.clone()))
-            .jvp((right.clone(), tangent), |(left, right)| left.log_add_exp(&right))
-            .unwrap();
-        assert_eq!(output, left);
-        assert_eq!(tangent, right);
+        assert_eq!(
+            differentiate_at((left.clone(), right.clone()))
+                .jvp((right.clone(), tangent), |(left, right)| left.log_add_exp(&right)),
+            Ok((left, right)),
+        );
     }
 
     #[test]
-    fn test_log_add_exp_differentiation_widened_tangent() {
+    fn test_log_add_exp_differentiation_low_precision_uses_widened_tangents() {
+        // The tangent of the left input is weighted by `exp(a - log_add_exp(a, b)) = 1 / (1 + exp(b - a))`,
+        // evaluated in the widened `f32` representation.
         let left = Array::scalar(f8e8m0fnu::from_f64(1.0).unwrap()).unwrap();
         let right = Array::scalar(f8e8m0fnu::from_f64(0.5).unwrap()).unwrap();
         let (output, tangent) = differentiate_at((left.clone(), right))
@@ -1202,7 +1293,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(output, left);
-        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 0.62245935f32, epsilon = 1e-7);
+        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 1.0 / (1.0 + (-0.5f32).exp()), epsilon = 1e-7);
     }
 
     #[test]
@@ -1234,95 +1325,94 @@ mod tests {
     #[test]
     fn test_array_log_add_exp() {
         // Native and half-precision inputs retain their element types.
+        let expected = 2.0 + (-1.0f64).exp().ln_1p();
         assert_eq!(
-            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(2.0f64).unwrap()).unwrap(),
-            Array::scalar(2.313261687518223f64).unwrap(),
+            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(2.0f64).unwrap()),
+            Ok(Array::scalar(expected).unwrap()),
         );
         assert_eq!(
-            Array::scalar(1.0f32).unwrap().log_add_exp(&Array::scalar(2.0f32).unwrap()).unwrap(),
-            Array::scalar(2.0f32 + (-1.0f32).exp().ln_1p()).unwrap(),
+            Array::scalar(1.0f32).unwrap().log_add_exp(&Array::scalar(2.0f32).unwrap()),
+            Ok(Array::scalar(2.0f32 + (-1.0f32).exp().ln_1p()).unwrap()),
         );
         assert_eq!(
             Array::scalar(bf16::from_f32(1.0))
                 .unwrap()
-                .log_add_exp(&Array::scalar(bf16::from_f32(2.0)).unwrap())
-                .unwrap(),
-            Array::scalar(bf16::from_f32(2.0f32 + (-1.0f32).exp().ln_1p())).unwrap(),
+                .log_add_exp(&Array::scalar(bf16::from_f32(2.0)).unwrap()),
+            Ok(Array::scalar(bf16::from_f32(2.0f32 + (-1.0f32).exp().ln_1p())).unwrap()),
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(1.0))
-                .unwrap()
-                .log_add_exp(&Array::scalar(f16::from_f32(2.0)).unwrap())
-                .unwrap(),
-            Array::scalar(f16::from_f32(2.0f32 + (-1.0f32).exp().ln_1p())).unwrap(),
+            Array::scalar(f16::from_f32(1.0)).unwrap().log_add_exp(&Array::scalar(f16::from_f32(2.0)).unwrap()),
+            Ok(Array::scalar(f16::from_f32(2.0f32 + (-1.0f32).exp().ln_1p())).unwrap()),
         );
 
         // The operation is symmetric, and two equal inputs add exactly `log(2)`.
         assert_eq!(
-            Array::scalar(2.0f64).unwrap().log_add_exp(&Array::scalar(1.0f64).unwrap()).unwrap(),
-            Array::scalar(2.313261687518223f64).unwrap(),
+            Array::scalar(2.0f64).unwrap().log_add_exp(&Array::scalar(1.0f64).unwrap()),
+            Ok(Array::scalar(expected).unwrap()),
         );
         assert_eq!(
-            Array::scalar(0.0f64).unwrap().log_add_exp(&Array::scalar(0.0f64).unwrap()).unwrap(),
-            Array::scalar(std::f64::consts::LN_2).unwrap(),
+            Array::scalar(0.0f64).unwrap().log_add_exp(&Array::scalar(0.0f64).unwrap()),
+            Ok(Array::scalar(std::f64::consts::LN_2).unwrap()),
         );
 
         // The reason the primitive exists: neither exponential is ever formed, so inputs far outside the range of
         // `exp` still produce the exact shifted result instead of infinity.
         assert_eq!(
-            Array::scalar(1000.0f64).unwrap().log_add_exp(&Array::scalar(1000.0f64).unwrap()).unwrap(),
-            Array::scalar(1000.0 + std::f64::consts::LN_2).unwrap(),
+            Array::scalar(1000.0f64).unwrap().log_add_exp(&Array::scalar(1000.0f64).unwrap()),
+            Ok(Array::scalar(1000.0 + std::f64::consts::LN_2).unwrap()),
         );
         assert!((1000.0f64.exp() + 1000.0f64.exp()).ln().is_infinite());
 
-        // The pinned exceptional values: same-sign infinities saturate, mixed infinities return the larger input,
-        // and NaN propagates from either input.
+        // The pinned exceptional values: same-sign infinities saturate, mixed infinities return positive infinity,
+        // an infinite input dominates a finite one, and NaN propagates from either input.
         assert_eq!(
-            Array::scalar(f64::INFINITY).unwrap().log_add_exp(&Array::scalar(f64::INFINITY).unwrap()).unwrap(),
-            Array::scalar(f64::INFINITY).unwrap(),
-        );
-        assert_eq!(
-            Array::scalar(f64::NEG_INFINITY)
-                .unwrap()
-                .log_add_exp(&Array::scalar(f64::NEG_INFINITY).unwrap())
-                .unwrap(),
-            Array::scalar(f64::NEG_INFINITY).unwrap(),
+            Array::scalar(f64::INFINITY).unwrap().log_add_exp(&Array::scalar(f64::INFINITY).unwrap()),
+            Ok(Array::scalar(f64::INFINITY).unwrap()),
         );
         assert_eq!(
-            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(f64::INFINITY).unwrap()).unwrap(),
-            Array::scalar(f64::INFINITY).unwrap(),
+            Array::scalar(f64::NEG_INFINITY).unwrap().log_add_exp(&Array::scalar(f64::NEG_INFINITY).unwrap()),
+            Ok(Array::scalar(f64::NEG_INFINITY).unwrap()),
         );
         assert_eq!(
-            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(f64::NEG_INFINITY).unwrap()).unwrap(),
-            Array::scalar(1.0f64).unwrap(),
+            Array::scalar(f64::INFINITY).unwrap().log_add_exp(&Array::scalar(f64::NEG_INFINITY).unwrap()),
+            Ok(Array::scalar(f64::INFINITY).unwrap()),
         );
-        assert!(
-            Array::scalar(f64::NAN)
-                .unwrap()
-                .log_add_exp(&Array::scalar(1.0f64).unwrap())
-                .unwrap()
-                .elements::<f64>()
-                .unwrap()[0]
-                .is_nan()
+        assert_eq!(
+            Array::scalar(f64::NEG_INFINITY).unwrap().log_add_exp(&Array::scalar(f64::INFINITY).unwrap()),
+            Ok(Array::scalar(f64::INFINITY).unwrap()),
         );
-        assert!(
-            Array::scalar(1.0f64)
-                .unwrap()
-                .log_add_exp(&Array::scalar(f64::NAN).unwrap())
-                .unwrap()
-                .elements::<f64>()
-                .unwrap()[0]
-                .is_nan()
+        assert_eq!(
+            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(f64::INFINITY).unwrap()),
+            Ok(Array::scalar(f64::INFINITY).unwrap()),
         );
+        assert_eq!(
+            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(f64::NEG_INFINITY).unwrap()),
+            Ok(Array::scalar(1.0f64).unwrap()),
+        );
+        let output = Array::scalar(f64::NAN).unwrap().log_add_exp(&Array::scalar(1.0f64).unwrap()).unwrap();
+        assert!(output.elements::<f64>().unwrap()[0].is_nan());
+        let output = Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(f64::NAN).unwrap()).unwrap();
+        assert!(output.elements::<f64>().unwrap()[0].is_nan());
     }
 
     #[test]
     fn test_array_log_add_exp_complex() {
+        // Complex outputs wrap their imaginary part into `[-π, π)`.
         let input = Array::scalar(ComplexNumber::new(1.0f64, 4.0)).unwrap();
         assert_abs_diff_eq!(
             input.log_add_exp(&input).unwrap(),
             Array::scalar(ComplexNumber::new(1.0 + std::f64::consts::LN_2, 4.0 - std::f64::consts::TAU)).unwrap(),
             epsilon = 1e-15,
+        );
+    }
+
+    #[test]
+    fn test_array_log_add_exp_low_precision() {
+        // Low-precision formats compute through `f32` intermediates and round only the final output.
+        let zero = Array::scalar(f8e4m3fn::from_f64(0.0).unwrap()).unwrap();
+        assert_eq!(
+            zero.log_add_exp(&zero),
+            Ok(Array::scalar(f8e4m3fn::from_f64(f64::from(std::f32::consts::LN_2)).unwrap()).unwrap()),
         );
     }
 
@@ -1404,13 +1494,22 @@ mod tests {
                 tangents = [Array::scalar(3.0).unwrap()],
                 primal_outputs = [Array::scalar(logistic).unwrap()],
                 tangent_outputs = [Array::scalar(expected_tangent).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = logistic %0
+                        %3:f64[] = one_like %2
+                        %4:f64[] = sub %3 %2
+                        %5:f64[] = mul %2 %4
+                        %6:f64[] = mul %5 %1
+                    in (%2, %6)
+                "},
             }],
         );
     }
 
     #[test]
     fn test_logistic_differentiation_complex() {
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        let input = ComplexNumber::new(0.7f64, -0.3);
         let expected = {
             let logistic = ComplexNumber::new(1.0, 0.0) / (ComplexNumber::new(1.0, 0.0) + (-input).exp());
             logistic * (ComplexNumber::new(1.0, 0.0) - logistic)
@@ -1426,6 +1525,42 @@ mod tests {
     }
 
     #[test]
+    fn test_logistic_differentiation_low_precision_uses_widened_tangents() {
+        let primal = Array::scalar(f8e8m0fnu::from_f64(2.0).unwrap()).unwrap();
+        let input_tangent = Array::scalar(3.0f32).unwrap();
+        let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.logistic()).unwrap();
+        let logistic = 1.0 / (1.0 + (-2.0f32).exp());
+        assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 3.0 * logistic * (1.0 - logistic), epsilon = 1e-6);
+
+        // The widened staged tangent program recomputes the logistic output in the widened differential
+        // representation instead of converting the narrower primal output.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
+        let output = builder.add_instruction(LogisticOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f8e8m0fnu[], %1:f32[] .
+                let %2:f8e8m0fnu[] = logistic %0
+                    %3:f32[] = convert_element_type [data_type=f32] %0
+                    %4:f32[] = logistic %3
+                    %5:f32[] = one_like %4
+                    %6:f32[] = sub %5 %4
+                    %7:f32[] = mul %4 %6
+                    %8:f32[] = mul %7 %1
+                in (%2, %8)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_logistic_transposition() {
         check_operation_transposition!(
             @rejected,
@@ -1436,28 +1571,53 @@ mod tests {
 
     #[test]
     fn test_array_logistic() {
+        // Native and half-precision inputs retain their element types.
         assert_eq!(
-            Array::scalar(0.5f32).unwrap().logistic().unwrap(),
-            Array::scalar(1.0 / (1.0 + (-0.5f32).exp())).unwrap(),
+            Array::scalar(0.5f32).unwrap().logistic(),
+            Ok(Array::scalar(1.0 / (1.0 + (-0.5f32).exp())).unwrap()),
         );
         assert_eq!(
-            Array::scalar(0.5f64).unwrap().logistic().unwrap(),
-            Array::scalar(1.0 / (1.0 + (-0.5f64).exp())).unwrap(),
+            Array::scalar(0.5f64).unwrap().logistic(),
+            Ok(Array::scalar(1.0 / (1.0 + (-0.5f64).exp())).unwrap()),
         );
         assert_eq!(
-            Array::scalar(bf16::from_f32(0.5)).unwrap().logistic().unwrap(),
-            Array::scalar(bf16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))).unwrap(),
+            Array::scalar(bf16::from_f32(0.5)).unwrap().logistic(),
+            Ok(Array::scalar(bf16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))).unwrap()),
         );
         assert_eq!(
-            Array::scalar(f16::from_f32(0.5)).unwrap().logistic().unwrap(),
-            Array::scalar(f16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))).unwrap(),
+            Array::scalar(f16::from_f32(0.5)).unwrap().logistic(),
+            Ok(Array::scalar(f16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))).unwrap()),
         );
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
+
+        // Extreme inputs saturate to the asymptotes instead of producing NaNs, even when `exp(-x)` overflows.
+        assert_eq!(Array::scalar(-1000.0f64).unwrap().logistic(), Ok(Array::scalar(0.0f64).unwrap()));
+        assert_eq!(Array::scalar(1000.0f64).unwrap().logistic(), Ok(Array::scalar(1.0f64).unwrap()));
+    }
+
+    #[test]
+    fn test_array_logistic_complex() {
+        // Complex inputs compute the analytic continuation `1 / (1 + e^{-z})`.
+        let input = ComplexNumber::new(0.7f64, -0.3);
         let expected = ComplexNumber::new(1.0, 0.0) / (ComplexNumber::new(1.0, 0.0) + (-input).exp());
         assert_abs_diff_eq!(
             Array::scalar(input).unwrap().logistic().unwrap(),
             Array::scalar(expected).unwrap(),
             epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_array_logistic_low_precision() {
+        // Low-precision formats compute through decoded values and re-encode the nearest representable result.
+        assert_eq!(
+            Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0).unwrap()])
+                .unwrap()
+                .logistic(),
+            Ok(Array::vector(vec![
+                f8e4m3fn::from_f64(0.5).unwrap(),
+                f8e4m3fn::from_f64(1.0 / (1.0 + (-1.0f64).exp())).unwrap(),
+            ])
+            .unwrap()),
         );
     }
 
