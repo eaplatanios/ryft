@@ -56,7 +56,6 @@ use crate::macros::{
     dispatch_on_array_element_type, impl_array_elementwise_operation, impl_differentiable_elementwise_operation,
     impl_differentiable_operation,
 };
-use crate::operations::ElementwiseOperation;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
 use crate::operations::constants::one_like::OneLike;
@@ -124,6 +123,7 @@ macro_rules! impl_add_for_primitive {
     // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
     (@integer $type:ty) => {
         impl Add for $type {
+            #[inline]
             fn add(&self, rhs: &Self) -> Result<Self, ProgramError> {
                 self.checked_add(*rhs).ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!("`{}` output does not fit in `{}`", ADD_OPERATION_NAME, stringify!($type)),
@@ -135,6 +135,7 @@ macro_rules! impl_add_for_primitive {
     // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
     (@float $type:ty) => {
         impl Add for $type {
+            #[inline]
             fn add(&self, rhs: &Self) -> Result<Self, ProgramError> {
                 Ok(*self + *rhs)
             }
@@ -216,6 +217,7 @@ macro_rules! impl_sub_for_primitive {
     // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
     (@integer $type:ty) => {
         impl Sub for $type {
+            #[inline]
             fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_sub(*right).ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!("`{}` output does not fit in `{}`", SUB_OPERATION_NAME, stringify!($type)),
@@ -227,6 +229,7 @@ macro_rules! impl_sub_for_primitive {
     // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
     (@float $type:ty) => {
         impl Sub for $type {
+            #[inline]
             fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
                 Ok(*self - *right)
             }
@@ -249,8 +252,6 @@ impl_sub_for_primitive!(@integer usize);
 impl_sub_for_primitive!(@float f32);
 impl_sub_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`MulOperation`].
 pub const MUL_OPERATION_NAME: &str = "mul";
 
@@ -263,13 +264,83 @@ define_elementwise_operation!(
     MUL_OPERATION_NAME,
     Mul,
     mul,
-    infer_array_types = infer_mul_output_array_types,
+    infer_array_types = |input_types: &[ArrayType]| {
+        // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced state by the
+        // bilinear rule rather than the congruent rule used by generic elementwise broadcasting. The reduction state
+        // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
+        // and the recomputed state is reattached afterward.
+        let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
+        let output = MulOperation::<ArrayType>::new().infer_elementwise_broadcast_type(&stripped)?;
+        let left_unreduced = input_types[0].unreduced_axes();
+        let left_reduced = input_types[0].reduced_axes();
+        let right_unreduced = input_types[1].unreduced_axes();
+        let right_reduced = input_types[1].reduced_axes();
+
+        // An operand unreduced over some axes is a partial sum still awaiting an all-reduce over them. The product
+        // of two partial sums is not a partial sum, so at most one operand may be unreduced. The other must then be
+        // reduced over exactly those axes, and the product stays unreduced over them (its matching reduced marker is
+        // consumed when the reduced set is computed below).
+        let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
+            (false, false) => {
+                return Err(TypeError::invalid(format!(
+                    "`{MUL_OPERATION_NAME}` cannot multiply two operands that are both unreduced",
+                )));
+            }
+            (false, true) => {
+                if left_unreduced != right_reduced {
+                    return Err(TypeError::invalid(format!(
+                        "`{MUL_OPERATION_NAME}` requires the second operand to be reduced over the axes \
+                         the first is unreduced over",
+                    )));
+                }
+                left_unreduced.clone()
+            }
+            (true, false) => {
+                if right_unreduced != left_reduced {
+                    return Err(TypeError::invalid(format!(
+                        "`{MUL_OPERATION_NAME}` requires the first operand to be reduced over the axes \
+                         the second is unreduced over",
+                    )));
+                }
+                right_unreduced.clone()
+            }
+            (true, true) => BTreeSet::new(),
+        };
+
+        // Plain reduced axes must agree. The only one-sided reduced marker that is valid is the marker consumed
+        // by the partial-sum-times-reduced case above. A one-sided marker without a matching unreduced operand
+        // would incorrectly propagate reduction state from only one input.
+        let mut output_reduced = if left_reduced == right_reduced {
+            left_reduced.clone()
+        } else if left_reduced.is_empty() && right_reduced == &output_unreduced {
+            right_reduced.clone()
+        } else if right_reduced.is_empty() && left_reduced == &output_unreduced {
+            left_reduced.clone()
+        } else {
+            return Err(TypeError::invalid(format!(
+                "`{MUL_OPERATION_NAME}` operands must be reduced over the same axes",
+            )));
+        };
+        output_reduced.retain(|axis| !output_unreduced.contains(axis));
+
+        // A non-empty result reduction state means some operand was sharded, so the broadcast output (already stripped
+        // of reduction axes) carries a sharding onto which the recomputed state is reattached. Otherwise, it is already
+        // correct as is.
+        if output_unreduced.is_empty() && output_reduced.is_empty() {
+            return Ok(vec![output]);
+        }
+        let sharding = output.sharding().unwrap();
+        let rebuilt = sharding
+            .clone()
+            .with_unreduced_axes(output_unreduced)
+            .map_err(|error| TypeError::invalid(error.to_string()))?
+            .with_reduced_axes(output_reduced)
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError::invalid(error.to_string()))?])
+    },
     check_data_types = [@numeric],
 );
 
-// Transposition accepts exactly one linear operand and scales its output cotangent by the other, known operand. The
-// contribution is unbroadcast to the linear operand's exact cotangent type, while the known operand receives a
-// structural zero.
 impl_differentiable_elementwise_operation! {
     @binary
     MulOperation,
@@ -284,20 +355,26 @@ impl_differentiable_elementwise_operation! {
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
+            // Transposition accepts exactly one linear operand and scales its output cotangent by the other, known
+            // operand. The contribution is unbroadcast to the linear operand's exact cotangent type, while the known
+            // operand receives a structural zero.
             check_count!("input", inputs, 2, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 2, DifferentiationError);
+
             let (linear, known) = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
                 (true, false) => (0, 1),
                 (false, true) => (1, 0),
                 (left_linear, right_linear) => return Err(ProgramError::UnsupportedOperation {
                     message: format!(
-                        "operation `mul` does not support transposition for input pattern [left = {}, right = {}]",
+                        "operation `{}` does not support transposition for input pattern [left = {}, right = {}]",
+                        MUL_OPERATION_NAME,
                         if left_linear { "linear" } else { "known" },
                         if right_linear { "linear" } else { "known" },
                     ),
                 }.into()),
             };
+
             let target = inputs[linear].r#type().cotangent()?;
             let contribution = match &outputs[0] {
                 MaybeZero::Zero(_) => MaybeZero::Zero(target),
@@ -305,12 +382,14 @@ impl_differentiable_elementwise_operation! {
                     if target.is_zero_space() {
                         return Err(ProgramError::UnsupportedOperation {
                             message: format!(
-                                "linear input `{}` of operation `mul` has no cotangent space",
+                                "linear input `{}` of operation `{}` has no cotangent space",
                                 if linear == 0 { "left" } else { "right" },
+                                MUL_OPERATION_NAME,
                             ),
                         }.into());
                     }
-                    // The coefficient is a primal value: keep its reduction state when multiplying the dual
+
+                    // The coefficient is a primal value. Keep its reduction state when multiplying the dual
                     // cotangent. Broadcasting and promotion happen in multiplication's own inference.
                     let coefficient = inputs[known].as_known().unwrap();
                     let mut contribution = context.stage_operation(
@@ -322,6 +401,7 @@ impl_differentiable_elementwise_operation! {
                     MaybeZero::Value(contribution.remove(0).unalign_cotangent(&target)?)
                 }
             };
+
             accumulators[linear].accumulate(context, contribution)
         }
     },
@@ -329,11 +409,8 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @binary
-    /// Value capability for elementwise multiplication.
-    ///
-    /// Eager values compute directly; contextual values bind [`MulOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Value capability for elementwise multiplication. Eager values compute directly while contextual values bind
+    /// [`MulOperation`]. Failures are returned as [`ProgramError`]s.
     Mul,
     /// Multiplies `self` by `right`.
     mul(right),
@@ -366,6 +443,7 @@ impl Mul for Array {
 impl std::ops::Mul for Array {
     type Output = Self;
 
+    #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
         Mul::mul(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
     }
@@ -374,9 +452,9 @@ impl std::ops::Mul for Array {
 impl std::ops::Mul<f64> for Array {
     type Output = Self;
 
-    /// Scales every element by `rhs`, converting `rhs` into this array's element data type first so that scaling
-    /// preserves the array's type (e.g., scaling an `f32` array does not promote it to `f64`).
     fn mul(self, rhs: f64) -> Self::Output {
+        // Scales every element by `rhs`, converting `rhs` into this array's element data type first so that scaling
+        // preserves the array's type (e.g., scaling an `f32` array does not promote it to `f64`).
         let data_type = self.r#type().data_type();
         let factor = dispatch_on_array_element_type!(data_type, |Element| {
             Self::scalar(Element::from_real(rhs).unwrap_or_else(|error| panic!("{error}"))).unwrap()
@@ -384,6 +462,7 @@ impl std::ops::Mul<f64> for Array {
         Mul::mul(&self, &factor).unwrap_or_else(|error| panic!("{error}"))
     }
 }
+
 define_tracer_operator!(@binary std::ops::Mul, mul, capability = Mul, method = mul);
 
 /// Implements [`Mul`] for one host primitive type.
@@ -392,6 +471,7 @@ macro_rules! impl_mul_for_primitive {
     // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
     (@integer $type:ty) => {
         impl Mul for $type {
+            #[inline]
             fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_mul(*right).ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!("`{}` output does not fit in `{}`", MUL_OPERATION_NAME, stringify!($type)),
@@ -403,6 +483,7 @@ macro_rules! impl_mul_for_primitive {
     // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
     (@float $type:ty) => {
         impl Mul for $type {
+            #[inline]
             fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
                 Ok(*self * *right)
             }
@@ -425,81 +506,7 @@ impl_mul_for_primitive!(@integer usize);
 impl_mul_for_primitive!(@float f32);
 impl_mul_for_primitive!(@float f64);
 
-/// Infers multiplication output array types using its bilinear reduction-state rule.
-fn infer_mul_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-    // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced state by the
-    // bilinear rule rather than the congruent rule used by generic elementwise broadcasting. The reduction state
-    // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
-    // and the recomputed state is reattached afterward.
-    let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
-    let output = MulOperation::<ArrayType>::new().infer_elementwise_broadcast_type(&stripped)?;
-    let left_unreduced = input_types[0].unreduced_axes();
-    let left_reduced = input_types[0].reduced_axes();
-    let right_unreduced = input_types[1].unreduced_axes();
-    let right_reduced = input_types[1].reduced_axes();
-
-    // An operand unreduced over some axes is a partial sum still awaiting an all-reduce over them. The product of
-    // two partial sums is not a partial sum, so at most one operand may be unreduced. The other must then be
-    // reduced over exactly those axes, and the product stays unreduced over them (its matching reduced marker is
-    // consumed when the reduced set is computed below).
-    let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
-        (false, false) => {
-            return Err(TypeError::invalid(format!(
-                "`{MUL_OPERATION_NAME}` cannot multiply two operands that are both unreduced",
-            )));
-        }
-        (false, true) => {
-            if left_unreduced != right_reduced {
-                return Err(TypeError::invalid(format!(
-                    "`{MUL_OPERATION_NAME}` requires the second operand to be reduced over the axes \
-                             the first is unreduced over",
-                )));
-            }
-            left_unreduced.clone()
-        }
-        (true, false) => {
-            if right_unreduced != left_reduced {
-                return Err(TypeError::invalid(format!(
-                    "`{MUL_OPERATION_NAME}` requires the first operand to be reduced over the axes \
-                             the second is unreduced over",
-                )));
-            }
-            right_unreduced.clone()
-        }
-        (true, true) => BTreeSet::new(),
-    };
-
-    // Plain reduced axes must agree. The only one-sided reduced marker that is valid is the marker consumed by the
-    // partial-sum-times-reduced case above; a one-sided marker without a matching unreduced operand would
-    // incorrectly propagate reduction state from only one input.
-    let mut output_reduced = if left_reduced == right_reduced {
-        left_reduced.clone()
-    } else if left_reduced.is_empty() && right_reduced == &output_unreduced {
-        right_reduced.clone()
-    } else if right_reduced.is_empty() && left_reduced == &output_unreduced {
-        left_reduced.clone()
-    } else {
-        return Err(TypeError::invalid(format!("`{MUL_OPERATION_NAME}` operands must be reduced over the same axes")));
-    };
-    output_reduced.retain(|axis| !output_unreduced.contains(axis));
-
-    // A non-empty result reduction state means some operand was sharded, so the broadcast output (already stripped
-    // of reduction axes) carries a sharding onto which the recomputed state is reattached; otherwise it is already
-    // correct as is.
-    if output_unreduced.is_empty() && output_reduced.is_empty() {
-        return Ok(vec![output]);
-    }
-    let sharding = output.sharding().unwrap();
-    let rebuilt = sharding
-        .clone()
-        .with_unreduced_axes(output_unreduced)
-        .map_err(|error| TypeError::invalid(error.to_string()))?
-        .with_reduced_axes(output_reduced)
-        .map_err(|error| TypeError::invalid(error.to_string()))?;
-    Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError::invalid(error.to_string()))?])
-}
-
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`DivOperation`].
 pub const DIV_OPERATION_NAME: &str = "div";
