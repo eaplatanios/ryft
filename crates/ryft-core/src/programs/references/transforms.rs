@@ -18,12 +18,6 @@ use crate::programs::references::types::ReferenceType;
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::ValueId;
 
-/// Uninhabited binding of [`ReferenceTransformPath`]s that only ever carry static [`BoundReferenceTransform`]s, such
-/// as the path of an eager array reference handle. Every transform in such paths has empty bindings; consumers must
-/// reject transforms that require dynamic bindings because no binding value can be supplied for them.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub enum NoReferenceTransformBinding {}
-
 /// Represents whether two views of the same reference allocation cover separate parts, exactly the same part, or
 /// potentially overlapping parts, as determined by [`ReferenceTransform::overlap`]. Both paths apply transforms
 /// starting from the complete allocation. For example, `root[0]` and `root[1]` address different elements and are
@@ -43,7 +37,11 @@ pub enum ReferenceViewOverlap {
     MayOverlap,
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Uninhabited binding of [`ReferenceTransformPath`]s that only ever carry static [`BoundReferenceTransform`]s, such
+/// as the path of an eager array reference handle. Every transform in such paths has empty bindings; consumers must
+/// reject transforms that require dynamic bindings because no binding value can be supplied for them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub enum NoReferenceTransformBinding {}
 
 /// Metadata describing one selection applied to a reference allocation, carried by each access operation that applies
 /// it. A transform stores information such as an array axis and a static index, or indicates that a dynamic binding
@@ -67,9 +65,9 @@ pub trait ReferenceTransform: 'static + Clone + Debug + Display + PartialEq + Eq
     /// Returns the number of dynamic inputs consumed by this transform.
     fn binding_count(&self) -> usize;
 
-    /// Validates this transform's dynamic input types against the input referent. Implementations check the binding
-    /// count as well as family-specific requirements, such as scalar integer array indices in the referent's memory
-    /// space. Bindings belong to the input universe and need not themselves have referent types.
+    /// Validates this transform's dynamic input types against the provided input referent. Implementations check the
+    /// binding count as well as family-specific requirements, such as scalar integer array indices in the referent's
+    /// memory space. Bindings belong to the input universe and need not themselves have referent types.
     ///
     /// # Parameters
     ///
@@ -84,17 +82,20 @@ pub trait ReferenceTransform: 'static + Clone + Debug + Display + PartialEq + Eq
     /// Returns the referent type that a read-only access selects by applying this transform to `input`. Unlike
     /// [`output_type`](Self::output_type), this function need not prove that an update through the transform could be
     /// written back to `input`, because a read-only access never writes back. Families whose write-back validation
-    /// is expensive override this function to skip it; the default delegates to [`output_type`](Self::output_type).
+    /// is expensive override this function to skip it. Note that, the default implementation delegates to
+    /// [`output_type`](Self::output_type).
     fn read_type(&self, input: &Self::Referent) -> Result<Self::Referent, TypeError> {
         self.output_type(input)
     }
 
-    /// Returns whether `lhs` and `rhs` address separate parts, exactly the same part, or potentially overlapping parts
-    /// of the same reference allocation, without executing the program. Both paths are assumed to start from the
-    /// complete allocation. For example, views of `reference[0]` and `reference[1]` are disjoint, while views of
-    /// `reference[i]` and `reference[j]` may overlap when their indices are unknown. Equal symbol bindings identify the
-    /// same program value. Different bindings do not prove that the runtime values differ. Comparing symbolic views
-    /// must also account for the transforms themselves, including any clamping.
+    /// Returns whether `lhs` and `rhs` address separate parts, exactly the same part, or potentially overlapping
+    /// parts of the same reference allocation, without executing the program. Both paths must be relative to the
+    /// allocation's root, meaning its entire referenced value, rather than to an intermediate view. For example, an
+    /// access that selects `[2]` through a view of `root[1]` is compared through the full path `root[1][2]`, not `[2]`.
+    /// Views of `root[0]` and `root[1]` are disjoint, while views of `root[i]` and `root[j]` may overlap when their
+    /// indices are unknown. Equal symbol bindings identify the same program value, but different bindings do not prove
+    /// that the runtime values differ. Comparing symbolic views must also account for the transforms themselves,
+    /// including any clamping.
     ///
     /// Note that an empty path covers the complete allocation, two empty paths are considered
     /// [`Same`](ReferenceViewOverlap::Same), and an empty path may overlap with a path covering only part of the
@@ -103,11 +104,9 @@ pub trait ReferenceTransform: 'static + Clone + Debug + Display + PartialEq + Eq
     ///
     /// # Parameters
     ///
-    ///   - `type`: [`Type`] of the complete reference from which both paths start.
-    ///   - `lhs`: [`BoundReferenceTransform`]s describing the first view to compare, starting from the complete
-    ///     reference.
-    ///   - `rhs`: [`BoundReferenceTransform`]s describing the second view to compare, starting from the complete
-    ///     reference.
+    ///   - `type`: [`Type`] of the root reference from which both paths start.
+    ///   - `lhs`: [`BoundReferenceTransform`]s describing the first view to compare, starting from the root.
+    ///   - `rhs`: [`BoundReferenceTransform`]s describing the second view to compare, starting from the root.
     fn overlap(
         r#type: &Self::Type,
         lhs: &[BoundReferenceTransform<Self>],
@@ -115,9 +114,32 @@ pub trait ReferenceTransform: 'static + Clone + Debug + Display + PartialEq + Eq
     ) -> ReferenceViewOverlap;
 }
 
+/// Optional batching capability for a [`ReferenceTransform`]. Implementations adjust a transform when its source
+/// reference gains a batch axis. Reference families that support analysis and discharge without batching need only
+/// implement [`ReferenceTransform`] but batching rules additionally require this trait.
+pub trait BatchableReferenceTransform: ReferenceTransform {
+    /// Moves the batch axis of a source reference through this [`ReferenceTransform`] mapping. The batch axis of a
+    /// reference is an axis of its packed referent that the per-item transform never sees. The batched transform
+    /// therefore addresses the same part of each packed item as the original transform addresses in the unbatched
+    /// input, and the resulting view has its own batch axis. This is pure axis arithmetic; the transform's dynamic
+    /// binding requirements are unchanged, and a replicated `batch_axis` returns the transform unchanged and
+    /// replicated.
+    ///
+    /// # Parameters
+    ///
+    ///   - `type`: Packed reference [`Type`] of the batched source, with the batch axis inserted.
+    ///   - `batch_axis`: Batch axis positioned in the packed referent of `type`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] when this family cannot carry `batch_axis` through the transform (e.g., a family
+    /// without axes rejects every mapped axis, and a static array slice cannot span a dynamically sized batch axis).
+    fn batch(&self, r#type: &Self::Type, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError>;
+}
+
 /// Uninhabited transform type for a referent family `T` in an input universe `U` that supports only whole-root
-/// accesses. Paths containing this type are necessarily empty; the function-pointer marker imposes no thread-safety or
-/// equality requirements on the type descriptors.
+/// accesses. [`ReferenceTransformPath`]s containing this type are necessarily empty; the function-pointer marker
+/// imposes no thread-safety or equality requirements on the type descriptors.
 pub enum NoReferenceTransform<T: Type, U: Type> {
     #[doc(hidden)]
     Never(Infallible, PhantomData<fn() -> (T, U)>),
@@ -126,12 +148,14 @@ pub enum NoReferenceTransform<T: Type, U: Type> {
 impl<T: Type, U: Type> Copy for NoReferenceTransform<T, U> {}
 
 impl<T: Type, U: Type> Clone for NoReferenceTransform<T, U> {
+    #[inline]
     fn clone(&self) -> Self {
         *self
     }
 }
 
 impl<T: Type, U: Type> Debug for NoReferenceTransform<T, U> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Never(never, _) => Debug::fmt(never, formatter),
@@ -140,6 +164,7 @@ impl<T: Type, U: Type> Debug for NoReferenceTransform<T, U> {
 }
 
 impl<T: Type, U: Type> Display for NoReferenceTransform<T, U> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Never(never, _) => Display::fmt(never, formatter),
@@ -148,6 +173,7 @@ impl<T: Type, U: Type> Display for NoReferenceTransform<T, U> {
 }
 
 impl<T: Type, U: Type> PartialEq for NoReferenceTransform<T, U> {
+    #[inline]
     fn eq(&self, _other: &Self) -> bool {
         match self {
             Self::Never(never, _) => match *never {},
@@ -158,6 +184,7 @@ impl<T: Type, U: Type> PartialEq for NoReferenceTransform<T, U> {
 impl<T: Type, U: Type> Eq for NoReferenceTransform<T, U> {}
 
 impl<T: Type, U: Type> Hash for NoReferenceTransform<T, U> {
+    #[inline]
     fn hash<H: Hasher>(&self, _state: &mut H) {
         match self {
             Self::Never(never, _) => match *never {},
@@ -203,6 +230,8 @@ impl<T: 'static + Type, U: 'static + Type> BatchableReferenceTransform for NoRef
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Transforms and dynamic-input positions applied by an access to one reference input. Binding positions follow the
 /// access's base inputs, grouped by reference input in increasing input-index order and then in path order.
@@ -487,29 +516,6 @@ where
     Ok((batched, current_axis))
 }
 
-/// Optional batching capability for a [`ReferenceTransform`]. Implementations adjust a transform when its source
-/// reference gains a batch axis. Reference families that support analysis and discharge without batching need only
-/// implement [`ReferenceTransform`] but batching rules additionally require this trait.
-pub trait BatchableReferenceTransform: ReferenceTransform {
-    /// Moves the batch axis of a source reference through this [`ReferenceTransform`] mapping. The batch axis of a
-    /// reference is an axis of its packed referent that the per-item transform never sees. The batched transform
-    /// therefore addresses the same part of each packed item as the original transform addresses in the unbatched
-    /// input, and the resulting view has its own batch axis. This is pure axis arithmetic: the transform's dynamic
-    /// binding requirements are unchanged, and a replicated `batch_axis` returns the transform unchanged and
-    /// replicated.
-    ///
-    /// # Parameters
-    ///
-    ///   - `type`: Packed reference [`Type`] of the batched source, with the batch axis inserted.
-    ///   - `batch_axis`: Batch axis positioned in the packed referent of `type`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`BatchingError`] when this family cannot carry `batch_axis` through the transform (e.g., a family
-    /// without axes rejects every mapped axis, and a static array slice cannot span a dynamically sized batch axis).
-    fn batch(&self, r#type: &Self::Type, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError>;
-}
-
 /// One transform together with its dynamic bindings. [`ReferenceTransformPath`] applies bound transforms in order from
 /// the complete root. `Transform` owns transform metadata, such as an array axis or static slice; `Binding` supplies
 /// the ordinary values required by [`ReferenceTransform::binding_count`]. Static transforms carry no bindings.
@@ -566,8 +572,8 @@ impl<Transform: ReferenceTransform, Binding> BoundReferenceTransform<Transform, 
 /// or the array elements addressed by different transform sequences.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceTransformPath<Transform: ReferenceTransform, Binding = ValueId> {
-    /// [`BoundReferenceTransform`]s in this [`ReferenceTransformPath`] in the order they are applied,
-    /// starting from the complete reference.
+    /// [`BoundReferenceTransform`]s in this [`ReferenceTransformPath`] in the order they are applied, starting from
+    /// the root.
     bound_transforms: Vec<BoundReferenceTransform<Transform, Binding>>,
 }
 
@@ -620,7 +626,7 @@ impl<Transform: ReferenceTransform, Binding> ReferenceTransformPath<Transform, B
     }
 
     /// Returns the [`BoundReferenceTransform`]s in this [`ReferenceTransformPath`] in the order they are applied,
-    /// starting from the complete reference.
+    /// starting from the root.
     #[inline]
     pub fn bound_transforms(&self) -> &[BoundReferenceTransform<Transform, Binding>] {
         self.bound_transforms.as_slice()
@@ -669,9 +675,9 @@ impl<Transform: ReferenceTransform, Binding> ReferenceTransformPath<Transform, B
 
 impl<Transform: ReferenceTransform> ReferenceTransformPath<Transform, ValueId> {
     /// Returns the [`ReferenceViewOverlap`] between the parts this [`ReferenceTransformPath`] and `other` address
-    /// within one root of type `root`, through [`ReferenceTransform::overlap`]. Both paths must start from the same
-    /// complete reference. Callers resolve allocation roots through [`ReferenceAnalysis`](crate::ReferenceAnalysis)
-    /// before comparing access paths.
+    /// within one root of type `root`, through [`ReferenceTransform::overlap`]. Both paths must be relative to that
+    /// same root rather than to an intermediate view. Callers resolve each access's allocation root through
+    /// [`ReferenceAnalysis`](crate::ReferenceAnalysis) before comparing access paths.
     #[inline]
     pub fn overlap(&self, other: &Self, root: &Transform::Type) -> ReferenceViewOverlap {
         Transform::overlap(root, self.bound_transforms(), other.bound_transforms())
