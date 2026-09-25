@@ -9,12 +9,14 @@ use thiserror::Error;
 use ryft_macros::Parameter;
 
 use crate::contexts::Context;
+use crate::operations::{ReferenceAddUpdate, ReferenceAtomicAddUpdate, ReferenceRead, ReferenceSwap, ReferenceWrite};
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::builders::ProgramBuilderId;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::references::ReferenceError;
+use crate::programs::references::transforms::{ReferenceTransform, ReferenceTransformPath};
 use crate::programs::references::types::ReferenceType;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
@@ -1257,8 +1259,8 @@ enum ReferenceCompletionStorage {
 
 /// Backend implementation stored behind a type-erased [`ReferenceCompletion`]. [`Self::is_ready`] may return
 /// `Ok(false)` before completion. Once either function observes success or failure, that terminal result must never
-/// change, and both functions must agree on it. [`ReferenceCompletion::joined`] relies on this contract when it discards
-/// completed successes.
+/// change, and both functions must agree on it. [`ReferenceCompletion::joined`] relies on this contract when it
+/// discards completed successes.
 pub trait ReferenceCompletionBackend: 'static + Send + Sync {
     /// Blocks until the represented work completes and returns its terminal result.
     fn r#await(&self) -> Result<(), Arc<str>>;
@@ -1672,6 +1674,286 @@ pub fn validate_reference_boundary<'v, V: 'v + Value, I: IntoIterator<Item = &'v
     Ok(())
 }
 
+/// A reference root together with a lazily applied transform path. Constructing or extending a view validates its types
+/// without accessing reference state or binding operations. Dynamic binding values are retained until an access and so
+/// concretization failures and empty-axis indexing errors are reported by that access.
+///
+/// The root and bindings may have different representations. A projected root retains its projected read/write
+/// capabilities while its bindings belong to the enclosing input universe. This wrapper is deliberately neither a
+/// [`Value`] nor a [`Parameter`] as regions capture its root and bindings when accessed, and cannot return a view
+/// as a traced result or consume it through a whole-root freeze.
+///
+/// # Examples
+///
+/// A view of an eager reference reads and updates only the elements it selects, directly in the root's allocation.
+/// Here, one view selects the second row of a matrix and another selects the last element of that row through a
+/// dynamic index of `-1`, which each access resolves by wrapping it once and then clamping it into range:
+///
+/// ```rust
+/// # use ryft_core::{
+/// #     Array, ArrayIrValue, ArrayReferenceTransform, ProgramError, ReferenceFreeze, ReferenceNew, ReferenceRead,
+/// #     ReferenceView, ReferenceWrite,
+/// # };
+/// # fn main() -> Result<(), ProgramError> {
+/// type View = ReferenceView<ArrayIrValue<Array>, ArrayReferenceTransform, ArrayIrValue<Array>>;
+/// let matrix = ArrayIrValue::Array(Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6])?).reference_new()?;
+/// let row = View::new(matrix.clone())?.index(0, 1)?;
+///
+/// let value: ArrayIrValue<Array> = row.read()?;
+/// assert_eq!(value, ArrayIrValue::Array(Array::vector(vec![4i32, 5, 6])?));
+///
+/// let last = row.dynamic_index(0, &ArrayIrValue::Array(Array::scalar(-1i32)?))?;
+/// last.write(&ArrayIrValue::Array(Array::scalar(60i32)?))?;
+/// assert_eq!(matrix.freeze()?, ArrayIrValue::Array(Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 60])?));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Tracing the same code records no instruction for constructing a view. The access that uses it carries the view's
+/// transforms as metadata and receives the root reference and each dynamic index as inputs:
+///
+/// ```rust
+/// # use indoc::indoc;
+/// # use ryft_core::{
+/// #     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType, DataType,
+/// #     ProgramError, ReferenceNew, ReferenceRead, ReferenceView, Trace, Tracer, TracingContext,
+/// # };
+/// # fn main() -> Result<(), ProgramError> {
+/// type C = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+///
+/// let (_, program) = C::trace(
+///     |(input, index): (Tracer<C>, Tracer<C>)| -> Result<Tracer<C>, ProgramError> {
+///         let reference = input.reference_new()?;
+///         ReferenceView::<_, ArrayReferenceTransform, Tracer<C>>::new(reference)?.dynamic_index(0, &index)?.read()
+///     },
+///     (
+///         ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])),
+///         ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
+///     ),
+/// )?;
+/// assert_eq!(
+///     program.to_string(),
+///     indoc! {"
+///         lambda %0:f32[3], %1:i32[] .
+///         let %2:ref<f32[3]> = reference_new %0
+///             %3:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %2 %1
+///         in (%3)"},
+/// );
+///
+/// let output = program.interpret((
+///     ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0])?),
+///     ArrayIrValue::Array(Array::scalar(-1i32)?),
+/// ))?;
+/// assert_eq!(output, ArrayIrValue::Array(Array::scalar(3.0f32)?));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A view cannot be supplied where a traced value is required. For example:
+///
+/// ```compile_fail,E0277
+/// # use ryft_core::{Array, ArrayIrValue, ArrayReferenceTransform, Value, ReferenceView};
+/// fn require_value<V: Value>() {}
+/// require_value::<ReferenceView<ArrayIrValue<Array>, ArrayReferenceTransform, ArrayIrValue<Array>>>();
+/// ```
+///
+/// Returning a view from a trace also fails because program outputs must have a parameter structure. For example:
+///
+/// ```compile_fail,E0277
+/// # use ryft_core::{
+/// #     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType, DataType,
+/// #     ProgramError, ReferenceNew, Trace, Tracer, TracingContext, ReferenceView,
+/// # };
+/// type C = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+/// let view_program = C::trace(
+///     |input: Tracer<C>| -> Result<_, ProgramError> {
+///         Ok(ReferenceView::<_, ArrayReferenceTransform, Tracer<C>>::new(input.reference_new()?)?)
+///     },
+///     ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+/// ).unwrap();
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferenceView<Root: Typed, Transform: ReferenceTransform, Binding: Clone + Typed<Type = Transform::Type>> {
+    /// Refer to the documentation of [`Self::root`].
+    root: Root,
+
+    /// Refer to the documentation of [`Self::path`].
+    path: ReferenceTransformPath<Transform, Binding>,
+
+    /// Reference type of this view, cached so that extending the path validates only its new transform.
+    r#type: ReferenceType<Transform::Referent>,
+}
+
+impl<Root: Typed, Transform: ReferenceTransform, Binding: Clone + Typed<Type = Transform::Type>>
+    ReferenceView<Root, Transform, Binding>
+{
+    /// Creates an empty [`ReferenceView`] of `root`, rejecting a non-reference type. The borrowed conversion also
+    /// accepts projected reference types whose conversion is infallible.
+    #[inline]
+    pub fn new(root: Root) -> Result<Self, ProgramError>
+    where
+        for<'t> &'t ReferenceType<Transform::Referent>: TryFrom<&'t Root::Type>,
+    {
+        let root_type = root.r#type();
+        let referent = <&ReferenceType<Transform::Referent>>::try_from(root_type.as_ref())
+            .map_err(|_| TypeError::invalid(format!("expected a reference root but got `{root_type}`")))?
+            .referent()
+            .clone();
+        Ok(Self { root, path: ReferenceTransformPath::root(), r#type: ReferenceType::new(referent) })
+    }
+
+    /// Extends this [`ReferenceView`] with the provided transform, validating its binding types and resulting referent
+    /// immediately. Construction performs no reference access. The view is consumed so that the transform is appended
+    /// to its existing path without copying it, making a view with `k` transforms cost `O(k)` to construct; clone the
+    /// view first to derive several views from a common prefix.
+    pub fn with_transform(mut self, transform: Transform, bindings: Vec<Binding>) -> Result<Self, ProgramError> {
+        let binding_types = bindings.iter().map(Typed::r#type).collect::<Vec<_>>();
+        let binding_types = binding_types.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+        transform.validate_bindings(self.r#type.referent(), &binding_types)?;
+        let referent = transform.output_type(self.r#type.referent())?;
+        self.path.append(ReferenceTransformPath::root().with_bound_transform(transform, bindings));
+        self.r#type = ReferenceType::new(referent);
+        Ok(self)
+    }
+
+    /// Returns the root that receives this [`ReferenceView`]'s accesses.
+    #[inline]
+    pub fn root(&self) -> &Root {
+        &self.root
+    }
+
+    /// Returns this [`ReferenceView`]'s ordered transforms and their dynamic bindings.
+    #[inline]
+    pub fn path(&self) -> &ReferenceTransformPath<Transform, Binding> {
+        &self.path
+    }
+
+    /// Returns the transforms and bindings that an access through this [`ReferenceView`] forwards to its root. A view
+    /// performs no access of its own. Instead, it prepends its path to whatever the access selects, so that an access
+    /// adding `[2]` through a view of `root[1]` reaches the root as an access to `root[1][2]`. The bindings are
+    /// concatenated in the same order, which keeps each dynamic transform's bindings aligned with that transform.
+    ///
+    /// # Parameters
+    ///
+    ///   - `transforms`: Transforms that the access applies after this view's path. Empty when the access targets
+    ///     exactly the elements of this view.
+    ///   - `bindings`: Dynamic bindings of `transforms`, in the same order.
+    fn root_access_arguments(&self, transforms: &[Transform], bindings: &[Binding]) -> (Vec<Transform>, Vec<Binding>) {
+        let mut combined_transforms = self.path.transforms().cloned().collect::<Vec<_>>();
+        combined_transforms.extend_from_slice(transforms);
+        let mut combined_bindings = self
+            .path
+            .bound_transforms()
+            .iter()
+            .flat_map(|bound_transform| bound_transform.bindings().iter().cloned())
+            .collect::<Vec<_>>();
+        combined_bindings.extend_from_slice(bindings);
+        (combined_transforms, combined_bindings)
+    }
+}
+
+impl<Root: Typed, Transform: ReferenceTransform, Binding: Clone + Typed<Type = Transform::Type>> Typed
+    for ReferenceView<Root, Transform, Binding>
+{
+    type Type = ReferenceType<Transform::Referent>;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, Self::Type> {
+        Cow::Borrowed(&self.r#type)
+    }
+}
+
+impl<
+    Root: Typed + ReferenceRead<Transform, Binding, Output>,
+    Transform: ReferenceTransform,
+    Binding: Clone + Typed<Type = Transform::Type>,
+    Output,
+> ReferenceRead<Transform, Binding, Output> for ReferenceView<Root, Transform, Binding>
+{
+    #[inline]
+    fn read_through(&self, transforms: &[Transform], bindings: &[Binding]) -> Result<Output, ProgramError> {
+        let (transforms, bindings) = self.root_access_arguments(transforms, bindings);
+        self.root.read_through(&transforms, &bindings)
+    }
+}
+
+impl<
+    Root: Typed + ReferenceWrite<Transform, Binding, Replacement>,
+    Transform: ReferenceTransform,
+    Binding: Clone + Typed<Type = Transform::Type>,
+    Replacement,
+> ReferenceWrite<Transform, Binding, Replacement> for ReferenceView<Root, Transform, Binding>
+{
+    #[inline]
+    fn write_through(
+        &self,
+        replacement: &Replacement,
+        transforms: &[Transform],
+        bindings: &[Binding],
+    ) -> Result<(), ProgramError> {
+        let (transforms, bindings) = self.root_access_arguments(transforms, bindings);
+        self.root.write_through(replacement, &transforms, &bindings)
+    }
+}
+
+impl<
+    Root: Typed + ReferenceSwap<Transform, Binding, Replacement, Output>,
+    Transform: ReferenceTransform,
+    Binding: Clone + Typed<Type = Transform::Type>,
+    Replacement,
+    Output,
+> ReferenceSwap<Transform, Binding, Replacement, Output> for ReferenceView<Root, Transform, Binding>
+{
+    #[inline]
+    fn swap_through(
+        &self,
+        replacement: &Replacement,
+        transforms: &[Transform],
+        bindings: &[Binding],
+    ) -> Result<Output, ProgramError> {
+        let (transforms, bindings) = self.root_access_arguments(transforms, bindings);
+        self.root.swap_through(replacement, &transforms, &bindings)
+    }
+}
+
+impl<
+    Root: Typed + ReferenceAddUpdate<Transform, Binding, Update>,
+    Transform: ReferenceTransform,
+    Binding: Clone + Typed<Type = Transform::Type>,
+    Update,
+> ReferenceAddUpdate<Transform, Binding, Update> for ReferenceView<Root, Transform, Binding>
+{
+    #[inline]
+    fn add_update_through(
+        &self,
+        update: &Update,
+        transforms: &[Transform],
+        bindings: &[Binding],
+    ) -> Result<(), ProgramError> {
+        let (transforms, bindings) = self.root_access_arguments(transforms, bindings);
+        self.root.add_update_through(update, &transforms, &bindings)
+    }
+}
+
+impl<
+    Root: Typed + ReferenceAtomicAddUpdate<Transform, Binding, Update>,
+    Transform: ReferenceTransform,
+    Binding: Clone + Typed<Type = Transform::Type>,
+    Update,
+> ReferenceAtomicAddUpdate<Transform, Binding, Update> for ReferenceView<Root, Transform, Binding>
+{
+    #[inline]
+    fn atomic_add_update_through(
+        &self,
+        update: &Update,
+        transforms: &[Transform],
+        bindings: &[Binding],
+    ) -> Result<(), ProgramError> {
+        let (transforms, bindings) = self.root_access_arguments(transforms, bindings);
+        self.root.atomic_add_update_through(update, &transforms, &bindings)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1687,12 +1969,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::{Add, ReferenceIndexOperation};
+    use crate::operations::Add;
     use crate::tracing::{Tracer, TracerState, TracingContext};
 
     use super::*;
@@ -2870,26 +3152,26 @@ mod tests {
     fn test_reference_boundary_validate() {
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let root = context.input(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into());
-        let view = context.bind(ReferenceIndexOperation::new(0, 0), Vec::new(), &[root.clone()]).unwrap().remove(0);
+        let alias = root.clone();
         let boundary = ReferenceBoundary::new(&context, [("original", &root)]).unwrap();
         assert_eq!(
-            boundary.validate(&context, [("later", &view)]),
+            boundary.validate(&context, [("later", &alias)]),
             Err(ReferenceBoundaryError::AliasedRetained { position: "later", other: "original" }),
         );
-        let distinct = context.input(view.r#type().into_owned());
+        let distinct = context.input(alias.r#type().into_owned());
         assert_eq!(boundary.validate(&context, [("later", &distinct)]), Ok(()));
         assert_eq!(
-            boundary.validate(&context, [("first", &distinct), ("second", &distinct), ("third", &view)]),
+            boundary.validate(&context, [("first", &distinct), ("second", &distinct), ("third", &alias)]),
             Err(ReferenceBoundaryError::Aliased { position: "second", other: "first" }),
         );
         let foreign =
-            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().input(view.r#type().into_owned());
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().input(alias.r#type().into_owned());
         assert_eq!(
             boundary.validate(&context, [("later", &foreign)]),
-            Err(ReferenceBoundaryError::MissingIdentity { position: "later", type_name: "ref<f32[]>".to_string() }),
+            Err(ReferenceBoundaryError::MissingIdentity { position: "later", type_name: "ref<f32[2]>".to_string() }),
         );
         assert_eq!(
-            boundary.validate(&context, [("first", &view), ("second", &foreign)]),
+            boundary.validate(&context, [("first", &alias), ("second", &foreign)]),
             Err(ReferenceBoundaryError::AliasedRetained { position: "first", other: "original" }),
         );
     }
@@ -3011,5 +3293,42 @@ mod tests {
                 type_name: "f32[]".to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_reference_view_new() {
+        let root = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1i32, 2, 3]).unwrap()));
+        let viewed = ReferenceView::<_, ArrayReferenceTransform, ArrayIrValue<Array>>::new(root.clone()).unwrap();
+        assert_eq!(viewed.root(), &root);
+        assert!(viewed.path().is_root());
+        assert_eq!(viewed.read(), Ok(ArrayIrValue::Array(Array::vector(vec![1i32, 2, 3]).unwrap())));
+        let error = ReferenceView::<_, ArrayReferenceTransform, ArrayIrValue<Array>>::new(ArrayIrValue::Array(
+            Array::scalar(1i32).unwrap(),
+        ))
+        .unwrap_err();
+        assert_eq!(error, TypeError::invalid("expected a reference root but got `i32[]`").into());
+    }
+
+    #[test]
+    fn test_reference_view_with_transform() {
+        let root = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1i32, 2, 3]).unwrap()));
+        let viewed = ReferenceView::<_, ArrayReferenceTransform, ArrayIrValue<Array>>::new(root.clone()).unwrap();
+        let binding = ArrayIrValue::Array(Array::scalar(-1i32).unwrap());
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let selected = viewed.clone().with_transform(transform.clone(), vec![binding.clone()]).unwrap();
+        assert_eq!(selected.root(), &root);
+        assert_eq!(selected.path(), &ReferenceTransformPath::root().with_bound_transform(transform, vec![binding]));
+        assert!(viewed.path().is_root());
+        assert_eq!(selected.read(), Ok(ArrayIrValue::Array(Array::scalar(3i32).unwrap())));
+        selected.write(&ArrayIrValue::Array(Array::scalar(10i32).unwrap())).unwrap();
+        selected.add_update(&ArrayIrValue::Array(Array::scalar(2i32).unwrap())).unwrap();
+        assert_eq!(root.read(), Ok(ArrayIrValue::Array(Array::vector(vec![1i32, 2, 12]).unwrap())));
+        let error = selected
+            .with_transform(
+                ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) },
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error, TypeError::invalid("reference index axis 0 is out of bounds for rank 0").into());
     }
 }

@@ -1369,7 +1369,7 @@ impl<V: Value<Type = ArrayIrType>> Indexed<'_, '_, '_, V, ArrayIrType> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn view(&self) -> Result<ReferenceView<V, V, ArrayReferenceTransform>, ProgramError> {
+    pub fn view(&self) -> Result<ReferenceView<V, ArrayReferenceTransform, V>, ProgramError> {
         let input_type = self.input.r#type();
         let referent = <&ReferenceType<ArrayType>>::try_from(input_type.as_ref())?.referent();
         let rank = referent.rank();

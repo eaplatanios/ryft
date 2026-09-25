@@ -2753,7 +2753,7 @@ fn test_downstream_reference_boundary_accepts_owned_positions() {
 fn test_downstream_lazy_bit_view_accesses_one_bit_of_its_root() {
     let root = Reference::new(RegisterValue::Register(5)).unwrap();
     let viewed =
-        ReferenceView::<_, RegisterValue, RegisterTransform>::new(RegisterValue::Reference(root.clone())).unwrap();
+        ReferenceView::<_, RegisterTransform, RegisterValue>::new(RegisterValue::Reference(root.clone())).unwrap();
     let bit = viewed.clone().with_transform(RegisterTransform::Bit, vec![RegisterValue::Register(1)]).unwrap();
     assert_eq!(bit.root().reference_id(), Some(root.id()));
     assert_eq!(bit.read(), Ok(RegisterValue::Register(0)));

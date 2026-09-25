@@ -76,7 +76,7 @@ pub enum ArrayReferenceViewError {
     DynamicTransformIndex,
 }
 
-impl<R: Typed, B: Clone + Typed<Type = ArrayIrType>> ReferenceView<R, B, ArrayReferenceTransform> {
+impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root, ArrayReferenceTransform, Binding> {
     /// Selects a static position on `axis`, removing that dimension from the viewed referent.
     pub fn index(self, axis: usize, index: usize) -> Result<Self, ProgramError> {
         self.with_transform(
@@ -92,7 +92,7 @@ impl<R: Typed, B: Clone + Typed<Type = ArrayIrType>> ReferenceView<R, B, ArrayRe
 
     /// Selects a dynamic position on `axis`. Construction validates the scalar integer binding's type and memory
     /// space; concretization and negative-index normalization happen at the eventual access.
-    pub fn dynamic_index(self, axis: usize, index: &B) -> Result<Self, ProgramError> {
+    pub fn dynamic_index(self, axis: usize, index: &Binding) -> Result<Self, ProgramError> {
         self.with_transform(
             ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic },
             vec![index.clone()],
@@ -2483,13 +2483,13 @@ mod tests {
         let initial =
             ArrayIrValue::Array(Array::from_elements::<f32>(matrix_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap());
         let allocation = initial.reference_new().unwrap();
-        let row = ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone())
+        let row = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone())
             .unwrap()
             .index(0, 1)
             .unwrap();
         assert_eq!(row.read(), Ok(ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap())));
 
-        let slice = ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone())
+        let slice = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone())
             .unwrap()
             .slice(&[ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(1, 2, 1)])
             .unwrap();
@@ -2514,7 +2514,7 @@ mod tests {
             Array::from_elements::<f32>(matrix_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
         );
         let allocation = initial.reference_new().unwrap();
-        let row = ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone())
+        let row = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone())
             .unwrap()
             .index(0, 1)
             .unwrap();
@@ -2536,11 +2536,11 @@ mod tests {
     fn test_eager_reference_views_share_overlapping_allocation_state() {
         let allocation =
             ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()).reference_new().unwrap();
-        let left = ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone())
+        let left = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone())
             .unwrap()
             .slice(&[ArraySliceAxis::new(0, 3, 1)])
             .unwrap();
-        let right = ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone())
+        let right = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone())
             .unwrap()
             .slice(&[ArraySliceAxis::new(1, 3, 1)])
             .unwrap();
@@ -2558,21 +2558,21 @@ mod tests {
     fn test_eager_reference_view_validation_and_freeze_invalidation() {
         let allocation = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap()).reference_new().unwrap();
         assert_eq!(
-            ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone()).unwrap().index(1, 0),
+            ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone()).unwrap().index(1, 0),
             Err(TypeError::invalid("reference index axis 1 is out of bounds for rank 1").into()),
         );
         assert_eq!(
-            ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone()).unwrap().index(0, 3),
+            ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone()).unwrap().index(0, 3),
             Err(TypeError::invalid("reference index 3 on axis 0 is out of bounds for size 3").into()),
         );
         assert_eq!(
-            ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone())
+            ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone())
                 .unwrap()
                 .slice(&[ArraySliceAxis::new(2, 2, 1)]),
             Err(TypeError::invalid("reference slice on axis 0 with start 2 and size 2 exceeds input size 3").into()),
         );
         assert_eq!(
-            ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone())
+            ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone())
                 .unwrap()
                 .slice(&[ArraySliceAxis::new(0, 2, 2)]),
             Err(TypeError::invalid(
@@ -2581,15 +2581,15 @@ mod tests {
             .into()),
         );
 
-        let view = ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone())
+        let view = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone())
             .unwrap()
             .slice(&[ArraySliceAxis::new(0, 2, 1)])
             .unwrap();
-        let same_view = ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone())
+        let same_view = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone())
             .unwrap()
             .slice(&[ArraySliceAxis::new(0, 2, 1)])
             .unwrap();
-        let different_view = ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(allocation.clone())
+        let different_view = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(allocation.clone())
             .unwrap()
             .slice(&[ArraySliceAxis::new(1, 2, 1)])
             .unwrap();
@@ -3099,7 +3099,7 @@ mod tests {
     fn test_reference_view_array_selection() {
         let root =
             ArrayIrValue::Reference(ArrayReference::new(Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap()));
-        let viewed = ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(root).unwrap();
+        let viewed = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(root).unwrap();
         let selected = viewed
             .index(0, 1)
             .unwrap()
@@ -3109,7 +3109,7 @@ mod tests {
             .unwrap();
         assert_eq!(selected.read(), Ok(ArrayIrValue::Array(Array::scalar(6i32).unwrap())));
         let empty_root = ArrayIrValue::Reference(ArrayReference::new(Array::vector(Vec::<i32>::new()).unwrap()));
-        let empty = ReferenceView::<_, TestValue, ArrayReferenceTransform>::new(empty_root)
+        let empty = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(empty_root)
             .unwrap()
             .dynamic_index(0, &ArrayIrValue::Array(Array::scalar(0i32).unwrap()))
             .unwrap();
@@ -3123,7 +3123,7 @@ mod tests {
             |(input, index): (TestTracer, TestTracer)| {
                 let input = <TestTracer as ValueProjection<ArrayType>>::into_projected(input)?;
                 let reference = input.reference_new()?;
-                let viewed = ReferenceView::<_, TestTracer, ArrayReferenceTransform>::new(reference)?
+                let viewed = ReferenceView::<_, ArrayReferenceTransform, TestTracer>::new(reference)?
                     .slice(&[ArraySliceAxis::new(1, 2, 1)])?
                     .dynamic_index(0, &index)?;
                 let selected: ProjectedValue<ArrayType, TestTracer> = viewed.read()?;
@@ -3230,18 +3230,18 @@ mod tests {
             |input: TestTracer| {
                 let input = <TestTracer as ValueProjection<ArrayType>>::into_projected(input)?;
                 let reference = input.reference_new()?;
-                let sliced = ReferenceView::<_, TestTracer, ArrayReferenceTransform>::new(reference)?
+                let sliced = ReferenceView::<_, ArrayReferenceTransform, TestTracer>::new(reference)?
                     .slice(&[ArraySliceAxis::new(0, 2, 1)])?;
                 let _: &ReferenceView<
                     ProjectedValue<ReferenceType<ArrayType>, TestTracer>,
-                    TestTracer,
                     ArrayReferenceTransform,
+                    TestTracer,
                 > = &sliced;
                 let indexed = sliced.index(0, 1)?;
                 let _: &ReferenceView<
                     ProjectedValue<ReferenceType<ArrayType>, TestTracer>,
-                    TestTracer,
                     ArrayReferenceTransform,
+                    TestTracer,
                 > = &indexed;
                 let value = indexed.read()?;
                 let _: &ProjectedValue<ArrayType, TestTracer> = &value;
@@ -3292,7 +3292,7 @@ mod tests {
             |input: TestTracer| {
                 let reference = input.reference_new()?;
                 let row =
-                    ReferenceView::<_, TestTracer, ArrayReferenceTransform>::new(reference.clone())?.index(0, 0)?;
+                    ReferenceView::<_, ArrayReferenceTransform, TestTracer>::new(reference.clone())?.index(0, 0)?;
                 reference.freeze()?;
                 row.read()
             },
