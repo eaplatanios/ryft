@@ -45,8 +45,8 @@ use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, Batch
 use crate::contexts::{Context, Domain, ValueResolution};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
-    check_count, dispatch_on_array_element_type, impl_non_differentiable_operation, impl_non_transposable_operation,
-    impl_reference_dischargeable_operation,
+    check_count, check_types, dispatch_on_array_element_type, impl_non_differentiable_operation,
+    impl_non_transposable_operation, impl_reference_dischargeable_operation,
 };
 use crate::operations::ElementwiseOperation;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
@@ -350,8 +350,14 @@ impl ComparisonTypeSemantics for DataType {
                 self, other,
             )));
         }
+
         let broadcasted = DataType::broadcasted(&[self, other])
             .map_err(|_| TypeError::invalid("comparison input types are not broadcast-compatible"))?;
+
+        if matches!(broadcasted, DataType::Token | DataType::Zero) {
+            return Err(TypeError::invalid(format!("cannot compare `{broadcasted}` scalars")));
+        }
+
         Ok(broadcasted.with_element_type(DataType::Boolean))
     }
 }
@@ -367,9 +373,20 @@ impl ComparisonTypeSemantics for ArrayType {
                 self, other,
             )));
         }
+
+        // Comparisons cannot operate on partial sums or implicitly change an input's reduction state.
+        check_types!(@no_unreduced, COMPARE_OPERATION_NAME, [self, other]);
+        check_types!(@same_reduced_axes, COMPARE_OPERATION_NAME, [self, other]);
         ArrayType::check_matching_manual_variation(COMPARE_OPERATION_NAME, &[self, other])?;
+
         let broadcasted = ArrayType::broadcasted(&[self, other])
             .map_err(|_| TypeError::invalid("comparison input types are not broadcast-compatible"))?;
+        let data_type = broadcasted.data_type();
+
+        if matches!(data_type, DataType::Token | DataType::Zero) && broadcasted.shape().element_count()? != Some(0) {
+            return Err(TypeError::invalid(format!("cannot compare `{data_type}` scalars")));
+        }
+
         Ok(broadcasted.with_element_type(DataType::Boolean))
     }
 }
@@ -389,7 +406,9 @@ impl ComparisonTypeSemantics for ArrayIrType {
 /// shape and their element types are promoted before comparison. The output has that shape and [`DataType::Boolean`]
 /// elements. Equality and inequality support complex elements while ordered comparisons reject them. A comparison
 /// involving a floating-point NaN value is false except for inequality. Empty eager arrays perform no element
-/// comparisons and return an empty Boolean array, including for payload-free element types.
+/// comparisons and return an empty Boolean array, including for payload-free element types. Ordered complex comparisons
+/// are rejected even for empty arrays. Inputs carrying unreduced mesh axes are rejected, and both inputs must carry the
+/// same reduced-axis set.
 ///
 /// Concrete arrays compare immediately. Context-carrying values apply [`CompareOperation`] through their context,
 /// aligning manual variation first. First-class dimensions produce rank-zero Boolean arrays, and predicates proved
@@ -460,13 +479,9 @@ impl Compare for Array {
         // Broadcast the input types together (including element-type promotion) so that mixed-precision comparisons
         // mirror the `CompareOperation` type-inference contract, and then compare the promoted elements pairwise.
         // The output type is the Boolean-typed counterpart of the broadcast type.
-        ArrayType::check_matching_manual_variation(
-            COMPARE_OPERATION_NAME,
-            &[self.r#type().as_ref(), other.r#type().as_ref()],
-        )?;
+        let output_type = self.r#type().infer_comparison_output_type(other.r#type().as_ref(), direction)?;
         let (broadcast_type, inputs) = Self::broadcast_promoted(&[self, other])?;
         let data_type = broadcast_type.data_type();
-        let output_type = broadcast_type.with_element_type(DataType::Boolean);
 
         // Empty comparisons inspect no elements, so they succeed vacuously even for payload-free data types.
         if Self::element_count(&output_type) == 0 {
@@ -474,24 +489,11 @@ impl Compare for Array {
             return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
 
-        if data_type == DataType::Token || data_type == DataType::Zero {
-            return Err(TypeError::invalid(format!("cannot compare `{data_type}` scalars")).into());
-        }
-
         // `broadcast_promoted` converts only mismatched inputs, so equal-typed inputs retain their exact physical
         // storage and are decoded one addressed element at a time by the shared binary loop.
         let [left, right] = <[_; 2]>::try_from(inputs).unwrap();
         if data_type.is_complex() {
-            // The unordered complex element types define only the equality comparison directions. The comparison
-            // operation's type inference already rejects ordered complex comparisons, but the direct `Array`
-            // comparison API reaches this kernel without it.
-            if !matches!(direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual) {
-                return Err(TypeError::invalid(format!(
-                    "cannot apply an ordered comparison to unordered complex scalars of data type `{data_type}`",
-                ))
-                .into());
-            }
-
+            // The shared inference rule has already restricted complex comparisons to equality and inequality.
             let equal = matches!(direction, ComparisonDirection::Equal);
             return dispatch_on_array_element_type!(@complex data_type, |Element| {
                 left.map_element_pairs::<Element, bool>(&right, output_type, |left, right| {
@@ -563,18 +565,28 @@ impl<
             Type = ArrayIrType,
             DispatchDomain: Context<
                 Type = ArrayIrType,
-                Constant: TryFrom<bool, Error = ProgramError>,
+                Constant: TryFrom<bool, Error = ProgramError>
+                              + ValueProjection<DimensionType, Projected = DimensionValue>,
                 Operation: From<CompareOperation<V::Type>>,
             >,
         >,
 > Compare<V> for ProjectedValue<DimensionType, V>
 {
     fn compare(&self, other: &Self, direction: ComparisonDirection) -> Result<V, ProgramError> {
-        if let Some(output) =
-            direction.prove_for_dimensions(self.r#type().as_ref(), other.r#type().as_ref(), [None, None])?
-        {
+        // Immediate extents override nominal identity, just as in partial evaluation. Captures remain runtime data.
+        let mut exact = [None, None];
+        for (value, extent) in [self.value(), other.value()].into_iter().zip(exact.iter_mut()) {
+            if let ValueResolution::Constant(value) = value.dispatch_domain().resolve(value)
+                && value.capture_index().is_none()
+            {
+                *extent = Some(value.into_projected()?.extent());
+            }
+        }
+
+        if let Some(output) = direction.prove_for_dimensions(self.r#type().as_ref(), other.r#type().as_ref(), exact)? {
             return self.value().dispatch_domain().lift(<V::DispatchDomain as Domain>::Constant::try_from(output)?);
         }
+
         Ok(self
             .value()
             .dispatch_domain()
@@ -817,6 +829,74 @@ mod tests {
                 &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)]
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+    }
+
+    #[test]
+    fn test_compare_type_inference_reduction_state() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let plain = ArrayType::scalar(DataType::F32);
+        let replicated = plain.clone().with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let unreduced = plain
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_unreduced_axes(["m"]).unwrap())
+            .unwrap();
+        let reduced = plain
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 0).with_reduced_axes(["m"]).unwrap())
+            .unwrap();
+        check_operation_type_inference!(
+            operation = CompareOperation::<ArrayType>::new(ComparisonDirection::Equal),
+            cases = [{
+                input_types = [unreduced.clone(), unreduced.clone()],
+                error = "`compare` does not support unreduced operands",
+            }, {
+                input_types = [unreduced.clone(), plain.clone()],
+                error = "`compare` does not support unreduced operands",
+            }, {
+                input_types = [reduced.clone(), plain.clone()],
+                error = "`compare` operands must be reduced over the same axes",
+            }, {
+                input_types = [plain.clone(), reduced.clone()],
+                error = "`compare` operands must be reduced over the same axes",
+            }, {
+                input_types = [reduced.clone(), replicated],
+                error = "`compare` operands must be reduced over the same axes",
+            }, {
+                input_types = [reduced.clone(), reduced.clone()],
+                output_types = [reduced.with_data_type(DataType::Boolean)],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_compare_type_inference_payload_free() {
+        check_operation_type_inference!(
+            operation = CompareOperation::<DataType>::new(ComparisonDirection::Equal),
+            cases = [{
+                input_types = [DataType::Token, DataType::Token],
+                error = "cannot compare `token` scalars",
+            }, {
+                input_types = [DataType::Zero, DataType::Zero],
+                error = "cannot compare `zero` scalars",
+            }],
+        );
+
+        check_operation_type_inference!(
+            operation = CompareOperation::<ArrayType>::new(ComparisonDirection::Equal),
+            cases = [{
+                input_types = [ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Token)],
+                error = "cannot compare `token` scalars",
+            }, {
+                input_types = [ArrayType::scalar(DataType::Zero), ArrayType::scalar(DataType::Zero)],
+                error = "cannot compare `zero` scalars",
+            }, {
+                input_types = [ArrayType::new_static(DataType::Token, [0]), ArrayType::scalar(DataType::Token)],
+                output_types = [ArrayType::new_static(DataType::Boolean, [0])],
+            }, {
+                input_types = [ArrayType::new_static(DataType::Zero, [0]), ArrayType::scalar(DataType::Zero)],
+                output_types = [ArrayType::new_static(DataType::Boolean, [0])],
+            }],
         );
     }
 
@@ -1097,6 +1177,33 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_for_array_reduction_state() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unreduced_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_unreduced_axes(["m"]).unwrap())
+            .unwrap();
+        let unreduced = Array::from_elements(unreduced_type, &[1f32]).unwrap();
+        assert_eq!(
+            unreduced.equal(&unreduced),
+            Err(TypeError::invalid("`compare` does not support unreduced operands").into()),
+        );
+
+        // A replicated peer cannot acquire another input's reduced state implicitly.
+        let reduced_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh, 0).with_reduced_axes(["m"]).unwrap())
+            .unwrap();
+        let reduced = Array::from_elements(reduced_type.clone(), &[1f32]).unwrap();
+        assert_eq!(
+            reduced.equal(&Array::scalar(1f32).unwrap()),
+            Err(TypeError::invalid("`compare` operands must be reduced over the same axes").into()),
+        );
+        assert_eq!(
+            reduced.equal(&reduced),
+            Array::from_elements(reduced_type.with_data_type(DataType::Boolean), &[true]),
+        );
+    }
+
+    #[test]
     fn test_compare_for_array_manual_variation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant_type = ArrayType::scalar(DataType::F32);
@@ -1178,9 +1285,28 @@ mod tests {
         assert_eq!(
             left.less_than(&right),
             Err(TypeError::invalid(
-                "cannot apply an ordered comparison to unordered complex scalars of data type `c64`",
+                "cannot apply an ordered comparison to unordered complex inputs of types `c64[2]` and `c64[2]`",
             )
             .into()),
+        );
+    }
+
+    #[test]
+    fn test_compare_for_array_complex_empty() {
+        // The element-domain contract applies even when there are no elements to compare.
+        let empty = Array::vector(Vec::<ComplexNumber<f32>>::new()).unwrap();
+        assert_eq!(empty.equal(&empty), Ok(Array::vector(Vec::<bool>::new()).unwrap()));
+        let expected = TypeError::invalid(
+            "cannot apply an ordered comparison to unordered complex inputs of types `c64[0]` and `c64[0]`",
+        );
+        assert_eq!(empty.less_than(&empty), Err(expected.clone().into()));
+        assert_eq!(
+            Operation::infer_output_types(
+                &CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan),
+                &[empty.r#type().into_owned(), empty.r#type().into_owned()],
+                &[],
+            ),
+            Err(expected),
         );
     }
 
@@ -1281,6 +1407,34 @@ mod tests {
             context.resolve(&predicate),
             ValueResolution::Constant(ArrayIrValue::Array(value)) if value == Array::scalar(true).unwrap(),
         ));
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_compare_for_projected_value_constant_dimensions() {
+        // Concrete extents take precedence over a shared symbolic identity during tracing, as they do eagerly.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dimension_type = DimensionType::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let three = context
+            .lift(ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap()))
+            .unwrap();
+        let five = context.lift(ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 5).unwrap())).unwrap();
+        let three = ValueProjection::<DimensionType>::into_projected(three).unwrap();
+        let five = ValueProjection::<DimensionType>::into_projected(five).unwrap();
+        for (direction, expected) in [
+            (ComparisonDirection::Equal, false),
+            (ComparisonDirection::NotEqual, true),
+            (ComparisonDirection::LessThan, true),
+            (ComparisonDirection::LessThanOrEqual, true),
+            (ComparisonDirection::GreaterThan, false),
+            (ComparisonDirection::GreaterThanOrEqual, false),
+        ] {
+            let output = three.compare(&five, direction).unwrap();
+            assert!(matches!(
+                context.resolve(&output),
+                ValueResolution::Constant(ArrayIrValue::Array(value)) if value == Array::scalar(expected).unwrap(),
+            ));
+        }
         assert!(context.builder().borrow().instructions().is_empty());
     }
 
