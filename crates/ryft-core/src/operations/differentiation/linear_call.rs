@@ -519,12 +519,6 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
         }
     }
 
-    #[inline]
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("residual_count", self.residual_count))
-    }
-
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
         Ok(Self {
             residual_count: self.residual_count,
@@ -544,6 +538,12 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
                 }
             },
         })
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?
+            .bracketed(|operation| operation.field("residual_count", self.residual_count))
     }
 }
 

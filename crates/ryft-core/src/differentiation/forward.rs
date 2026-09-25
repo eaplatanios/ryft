@@ -3283,8 +3283,8 @@ mod tests {
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
-        Concretizable, Operation, OperationProvider, ProgramBuilder, ReferenceError, ReferenceType, RegionId,
-        ViewedReference,
+        Concretizable, Operation, OperationProvider, ProgramBuilder, ReferenceError, ReferenceType, ReferenceView,
+        RegionId,
     };
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
@@ -5708,7 +5708,7 @@ mod tests {
         let result = differentiate_at(input).with_captures((reference.clone(), index)).jvp(
             TestValue::Array(Array::scalar(7f32).unwrap()),
             |input, (root, index)| {
-                let viewed = ViewedReference::new(root)?.with_transform(
+                let viewed = ReferenceView::new(root)?.with_transform(
                     ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
                     vec![index],
                 )?;
@@ -6016,7 +6016,7 @@ mod tests {
         let (primal, pushforward) = differentiate_at(input)
             .with_captures((reference.clone(), index))
             .linearize(|input, (root, index)| {
-                let viewed = ViewedReference::new(root)?.with_transform(
+                let viewed = ReferenceView::new(root)?.with_transform(
                     ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
                     vec![index],
                 )?;
