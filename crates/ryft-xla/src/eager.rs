@@ -1662,6 +1662,19 @@ mod tests {
         assert_eq!(read_booleans(&booleans.min(&truth).unwrap()), vec![false, true]);
         assert_eq!(read_booleans(&booleans.max(&truth).unwrap()), vec![true, true]);
 
+        // All three inputs participate in promotion before selection, preserving integers that would round in f32.
+        let input = array(DataType::I64, &[], values_to_bytes(&[16777217i64]).as_slice());
+        let lower = array(DataType::F32, &[], values_to_bytes(&[0f32]).as_slice());
+        let upper = array(DataType::F64, &[], values_to_bytes(&[2e7f64]).as_slice());
+        let output = input.clamp(&lower, &upper).unwrap();
+        let reference = CpuArray::scalar(16777217i64)
+            .unwrap()
+            .clamp(&CpuArray::scalar(0f32).unwrap(), &CpuArray::scalar(2e7f64).unwrap())
+            .unwrap();
+        assert_eq!(output.data_type(), DataType::F64);
+        assert_eq!(reference.elements::<f64>().unwrap(), vec![16777217f64]);
+        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), reference.logical_bytes(),);
+
         // Complex inputs compose the lexicographic extrema, so the imaginary part decides between equal real parts.
         let complex_values = [
             num_complex::Complex::new(1.0f32, -1.0),

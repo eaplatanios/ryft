@@ -15,16 +15,18 @@
 //! shapes. Booleans order `false` below `true`, so their minima and maxima are conjunctions and disjunctions. Real
 //! floating-point values propagate NaNs and order negative zero below positive zero. Complex values compare their real
 //! parts first and their imaginary parts second, and select the right input on exact ties and whenever a NaN makes the
-//! deciding comparison unordered, so a NaN in the left input does not propagate. Array inputs that carry partial sums
-//! over unreduced mesh axes are rejected, and the reduced-axis markers of the inputs must agree.
+//! deciding comparison unordered. Imaginary NaNs do not affect selection between unequal real components and may
+//! therefore remain in the selected input. Array inputs that carry partial sums over unreduced mesh axes are
+//! rejected, and the reduced-axis markers of the inputs must agree.
 //!
-//! Differentiation support follows JAX. The tangent of an extremum weighs each input's tangent by `1` where that input
-//! is strictly selected, by `0.5` where the inputs tie, and by `0` where the other input is selected or either input is
-//! NaN, and complex inputs apply the same weights under their lexicographic ordering. The tangent of a clamp is the
-//! input tangent strictly inside the interval, the lower-bound tangent where the input lies below a lower bound that is
-//! smaller than the upper bound, the upper-bound tangent where the input lies above the upper bound, and zero at the
-//! bounds themselves. None of the operations is linear, so reverse-mode differentiation transposes their linearizations
-//! instead.
+//! The tangent of an extremum weighs each input's tangent by `1` where that input is strictly selected, by `0.5` where
+//! the inputs tie, and by `0` where the other input is selected or the deciding comparison is unordered. Complex inputs
+//! apply the same weights under their lexicographic ordering. The tangent of a clamp is the input tangent strictly
+//! inside the interval, the lower-bound tangent where the input lies below a lower bound that is smaller than the upper
+//! bound, and the upper-bound tangent where the input lies above the upper bound. Other cases give zero, including
+//! equality to either bound when the bounds are ordered. With crossed bounds, equality to the lower bound still passes
+//! the upper-bound tangent. None of the operations is linear, so reverse-mode differentiation transposes their
+//! linearizations instead.
 //!
 //! # Example
 //!
@@ -41,7 +43,7 @@
 use std::marker::PhantomData;
 
 use crate::arrays::{Array, ArrayElement, ArrayType, Broadcastable, DataType};
-use crate::contexts::Context;
+use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -49,15 +51,15 @@ use crate::macros::{
     impl_array_elementwise_operation, impl_differentiable_elementwise_operation, impl_differentiable_operation,
 };
 use crate::operations::ElementwiseOperation;
-use crate::operations::arithmetic::{Add, Mul};
+use crate::operations::arithmetic::{Add, Div, Mul};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::complex::{Imaginary, Real};
-use crate::operations::constants::fill::Fill;
 use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::logical::And;
+use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationProvider, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
@@ -76,8 +78,8 @@ define_elementwise_operation!(
     /// are rejected, and their reduced-axis markers must agree.
     ///
     /// The tangent weighs each input tangent by `1` where that input is strictly smaller, by `0.5` where the inputs
-    /// tie, and by `0` where the other input is smaller or either input is NaN, applying the lexicographic ordering to
-    /// complex inputs.
+    /// tie, and by `0` where the other input is smaller or the deciding comparison is unordered. Complex inputs use
+    /// lexicographic ordering, so imaginary NaNs do not affect comparisons between unequal real components.
     MinOperation,
     MIN_OPERATION_NAME,
     Min,
@@ -91,8 +93,7 @@ impl_differentiable_elementwise_operation! {
     MinOperation,
     jvp<C>
     where
-        C::Value: ZeroLike + OneLike + Mul + Real + Imaginary + And + Compare<C::Value> + Select,
-        <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
+        C::Value: ZeroLike + OneLike + Add + Mul + Div + Real + Imaginary + And + Compare<C::Value> + Select,
     {
         |(left, left_tangent), (right, _)| {
             balanced_extremum_weight(&left, &right, ComparisonDirection::LessThan)?.mul(&left_tangent)?
@@ -196,8 +197,8 @@ define_elementwise_operation!(
     /// rejected, and their reduced-axis markers must agree.
     ///
     /// The tangent weighs each input tangent by `1` where that input is strictly larger, by `0.5` where the inputs
-    /// tie, and by `0` where the other input is larger or either input is NaN, applying the lexicographic ordering to
-    /// complex inputs.
+    /// tie, and by `0` where the other input is larger or the deciding comparison is unordered. Complex inputs use
+    /// lexicographic ordering, so imaginary NaNs do not affect comparisons between unequal real components.
     MaxOperation,
     MAX_OPERATION_NAME,
     Max,
@@ -211,8 +212,7 @@ impl_differentiable_elementwise_operation! {
     MaxOperation,
     jvp<C>
     where
-        C::Value: ZeroLike + OneLike + Mul + Real + Imaginary + And + Compare<C::Value> + Select,
-        <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
+        C::Value: ZeroLike + OneLike + Add + Mul + Div + Real + Imaginary + And + Compare<C::Value> + Select,
     {
         |(left, left_tangent), (right, _)| {
             balanced_extremum_weight(&left, &right, ComparisonDirection::GreaterThan)?.mul(&left_tangent)?
@@ -306,7 +306,7 @@ impl_max_for_primitive!(@float f64);
 /// Canonical operation name for [`ClampOperation`].
 pub const CLAMP_OPERATION_NAME: &str = "clamp";
 
-/// [`Operation`] that clamps its operand elementwise into the interval delimited by a lower and an upper bound
+/// [`Operation`] that clamps its input elementwise into the interval delimited by a lower and an upper bound
 /// (i.e., `(lower, x, upper) ↦ min(max(x, lower), upper)`, same as for StableHLO's
 /// [`clamp`](https://openxla.org/stablehlo/spec#clamp)). The inputs are ordered as `[lower, input, upper]`, like the
 /// operands of StableHLO's `clamp`, and may have any Boolean or numeric element types, which are promoted to a common
@@ -314,10 +314,11 @@ pub const CLAMP_OPERATION_NAME: &str = "clamp";
 /// and the NaN, signed-zero, and complex ordering semantics are those of [`MinOperation`] and [`MaxOperation`].
 /// Array inputs that still carry partial sums are rejected, and their reduced-axis markers must agree.
 ///
-/// The tangent follows [JAX's `clamp`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.clamp.html). It is the
-/// input tangent where `lower < x < upper`, the lower-bound tangent where `x < lower < upper`, the upper-bound tangent
-/// where `upper < x`, and zero everywhere else, including where `x` equals either bound. Complex inputs apply these
-/// comparisons under the lexicographic ordering of the extrema.
+/// For real inputs, the tangent follows JAX's [`clamp`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.clamp.html)
+/// using the input tangent where `lower < x < upper`, the lower-bound tangent where `x < lower < upper`, the
+/// upper-bound tangent where `upper < x`, and zero everywhere else. With ordered bounds, equality to either bound
+/// gives zero. With crossed bounds, equality to the lower bound still passes the upper-bound tangent. Complex
+/// differentiation extends these rules using the lexicographic ordering of the extrema.
 #[derive(Clone)]
 pub struct ClampOperation<T: Type>(PhantomData<fn() -> T>);
 
@@ -414,24 +415,26 @@ impl ElementwiseOperation for ClampOperation<ArrayType> {
     }
 }
 
-impl<C: crate::contexts::Domain<Value: Clamp>> InterpretableOperation<C> for ClampOperation<C::Type>
+impl<D: Domain<Value: Clamp>> InterpretableOperation<D> for ClampOperation<D::Type>
 where
-    ClampOperation<C::Type>: Operation<Type = C::Type>,
+    ClampOperation<D::Type>: Operation<Type = D::Type>,
 {
     #[inline]
-    fn interpret<D: InterpretationDriver<C>>(
+    fn interpret<Driver: InterpretationDriver<D>>(
         &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
+        _context: &D,
+        _driver: &Driver,
+        inputs: &[D::Value],
+    ) -> Result<Vec<D::Value>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
         Ok(vec![inputs[1].clamp(&inputs[0], &inputs[2])?])
     }
 }
 
-impl<C: Context<Operation: From<ClampOperation<C::Type>>>> PartiallyEvaluatableOperation<C> for ClampOperation<C::Type> where
-    ClampOperation<C::Type>: Operation<Type = C::Type>
+impl<C: Context> PartiallyEvaluatableOperation<C> for ClampOperation<C::Type>
+where
+    C::Operation: From<ClampOperation<C::Type>>,
+    ClampOperation<C::Type>: Operation<Type = C::Type>,
 {
 }
 
@@ -453,7 +456,7 @@ impl_differentiable_operation! {
     {
         |_operation, context, _driver, inputs| {
             // Each input contributes its tangent exactly where it determines the output, using strict comparisons
-        // so that no input contributes where `x` equals either bound.
+            // so equality to either bound gives zero when the bounds are ordered.
             check_count!("input", inputs, 3, ProgramError);
             let lower = &inputs[0];
             let input = &inputs[1];
@@ -574,12 +577,17 @@ impl Clamp for Array {
     fn clamp(&self, lower: &Self, upper: &Self) -> Result<Self, ProgramError> {
         // Validate the complete signature first so that diagnostics name `clamp` rather than one of the extrema that
         // compute it, and then evaluate the StableHLO composition with the eager extremum kernels.
-        Operation::infer_output_types(
+        let output_types = Operation::infer_output_types(
             &ClampOperation::<ArrayType>::new(),
             &[lower.r#type().into_owned(), self.r#type().into_owned(), upper.r#type().into_owned()],
             &[],
         )?;
-        self.max(lower)?.min(upper)
+
+        // Promote all three inputs before either selection to avoid rounding through an intermediate element type.
+        let data_type = output_types[0].data_type();
+        self.convert_element_type(data_type)?
+            .max(&lower.convert_element_type(data_type)?)?
+            .min(&upper.convert_element_type(data_type)?)
     }
 }
 
@@ -614,9 +622,10 @@ impl_clamp_for_primitive!(f64);
 /// Returns the weight with which `candidate` receives the tangent of an extremum of `candidate` and `other`, following
 /// JAX's balanced comparison: `1` where `candidate` wins under `direction` (i.e., [`ComparisonDirection::LessThan`]
 /// for minima and [`ComparisonDirection::GreaterThan`] for maxima), `0.5` where the two tie, and `0` where `other`
-/// wins or either input is NaN. The weight has the element type of `candidate` and the broadcast shape of both inputs.
+/// wins or the deciding comparison is unordered. Complex imaginary NaNs do not affect unequal real components.
+/// The weight has the element type of `candidate` and the broadcast shape of both inputs.
 fn balanced_extremum_weight<
-    V: Value<DispatchDomain: Fill<f64, V>> + OneLike + ZeroLike + Real + Imaginary + And + Compare<V> + Select,
+    V: Value + ZeroLike + OneLike + Add + Div + Real + Imaginary + And + Compare<V> + Select,
 >(
     candidate: &V,
     other: &V,
@@ -624,8 +633,11 @@ fn balanced_extremum_weight<
 ) -> Result<V, ProgramError> {
     let wins = lexicographic_comparison(candidate, other, direction)?;
     let ties = lexicographic_comparison(candidate, other, ComparisonDirection::Equal)?;
-    let half = candidate.dispatch_domain().fill(candidate.r#type().as_ref(), 0.5)?;
-    V::select(&wins, &candidate.one_like()?, &V::select(&ties, &half, &candidate.zero_like()?)?)
+
+    // Derive the half-weight from the candidate so runtime dimensions and placement stay in dataflow.
+    let one = candidate.one_like()?;
+    let half = one.div(&one.add(&one)?)?;
+    V::select(&wins, &one, &V::select(&ties, &half, &candidate.zero_like()?)?)
 }
 
 /// Returns the Boolean mask of `left` compared with `right` under `direction`, using the ordering of the extrema. Real
@@ -661,14 +673,18 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{
+        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding,
+    };
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiableOperation, DifferentiationContext, differentiate_at};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::programs::EmptyRegionDriver;
+    use crate::parameters::Placeholder;
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -775,22 +791,24 @@ mod tests {
                         let %4:f64[] = min %0 %1
                             %5:bool[] = compare [direction=LessThan] %0 %1
                             %6:bool[] = compare [direction=Equal] %0 %1
-                            %7:f64[] = constant [value=0.5]
-                            %8:f64[] = one_like %0
-                            %9:f64[] = zero_like %0
-                            %10:f64[] = select %6 %7 %9
-                            %11:f64[] = select %5 %8 %10
-                            %12:f64[] = mul %11 %2
-                            %13:bool[] = compare [direction=LessThan] %1 %0
-                            %14:bool[] = compare [direction=Equal] %1 %0
-                            %15:f64[] = constant [value=0.5]
+                            %7:f64[] = one_like %0
+                            %8:f64[] = add %7 %7
+                            %9:f64[] = div %7 %8
+                            %10:f64[] = zero_like %0
+                            %11:f64[] = select %6 %9 %10
+                            %12:f64[] = select %5 %7 %11
+                            %13:f64[] = mul %12 %2
+                            %14:bool[] = compare [direction=LessThan] %1 %0
+                            %15:bool[] = compare [direction=Equal] %1 %0
                             %16:f64[] = one_like %1
-                            %17:f64[] = zero_like %1
-                            %18:f64[] = select %14 %15 %17
-                            %19:f64[] = select %13 %16 %18
-                            %20:f64[] = mul %19 %3
-                            %21:f64[] = add %12 %20
-                        in (%4, %21)
+                            %17:f64[] = add %16 %16
+                            %18:f64[] = div %16 %17
+                            %19:f64[] = zero_like %1
+                            %20:f64[] = select %15 %18 %19
+                            %21:f64[] = select %14 %16 %20
+                            %22:f64[] = mul %21 %3
+                            %23:f64[] = add %13 %22
+                        in (%4, %23)
                     "},
                 },
                 {
@@ -800,6 +818,33 @@ mod tests {
                     tangent_outputs = [Array::scalar(3.0).unwrap()],
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn test_min_differentiation_dynamic_shape() {
+        let dimension = DimensionVariable::new("n", DimensionBounds::new(1, Some(4)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dimension)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(input_type.clone());
+        let right = builder.add_input(input_type);
+        let output = builder.add_instruction(MinOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Differentiate before specializing so half-weights must inherit the symbolic input shape.
+        let program = program.jvp().unwrap();
+        let runtime_type = ArrayType::new_static(DataType::F64, [3]);
+        let program = program.specialize(&vec![runtime_type; 4]).unwrap();
+        assert_eq!(
+            program.interpret(vec![
+                Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
+                Array::vector(vec![2.0, 2.0, 1.0]).unwrap(),
+                Array::vector(vec![3.0, 3.0, 3.0]).unwrap(),
+                Array::vector(vec![5.0, 5.0, 5.0]).unwrap(),
+            ]),
+            Ok(vec![Array::vector(vec![1.0, 2.0, 1.0]).unwrap(), Array::vector(vec![3.0, 4.0, 5.0]).unwrap()]),
         );
     }
 
@@ -865,6 +910,27 @@ mod tests {
                 Array::scalar(ComplexNumber::new(0.0f64, 0.0)).unwrap(),
             )),
         );
+    }
+
+    #[test]
+    fn test_min_differentiation_complex_non_deciding_nan() {
+        // Unequal real parts decide selection even when the selected imaginary component is NaN.
+        let (primal, tangent) = differentiate_at((
+            Array::scalar(ComplexNumber::new(1.0f64, f64::NAN)).unwrap(),
+            Array::scalar(ComplexNumber::new(2.0f64, 0.0)).unwrap(),
+        ))
+        .jvp(
+            (
+                Array::scalar(ComplexNumber::new(3.0f64, 4.0)).unwrap(),
+                Array::scalar(ComplexNumber::new(5.0f64, 6.0)).unwrap(),
+            ),
+            |(left, right)| left.min(&right),
+        )
+        .unwrap();
+        let primal = primal.elements::<ComplexNumber<f64>>().unwrap()[0];
+        assert_eq!(primal.re, 1.0);
+        assert!(primal.im.is_nan());
+        assert_eq!(tangent, Array::scalar(ComplexNumber::new(3.0f64, 4.0)).unwrap());
     }
 
     #[test]
@@ -990,6 +1056,8 @@ mod tests {
         assert_eq!(Min::min(&3usize, &4), Ok(3));
         assert_eq!(Min::min(&true, &false), Ok(false));
         assert!(Min::min(&1.0f64, &f64::NAN).unwrap().is_nan());
+        assert!(Min::min(&1.0f32, &f32::NAN).unwrap().is_nan());
+        assert_eq!(Min::min(&0.0f32, &-0.0).unwrap().to_bits(), (-0.0f32).to_bits());
         assert_eq!(Min::min(&0.0f64, &-0.0).unwrap().to_bits(), (-0.0f64).to_bits());
     }
 
@@ -1095,22 +1163,24 @@ mod tests {
                         let %4:f64[] = max %0 %1
                             %5:bool[] = compare [direction=GreaterThan] %0 %1
                             %6:bool[] = compare [direction=Equal] %0 %1
-                            %7:f64[] = constant [value=0.5]
-                            %8:f64[] = one_like %0
-                            %9:f64[] = zero_like %0
-                            %10:f64[] = select %6 %7 %9
-                            %11:f64[] = select %5 %8 %10
-                            %12:f64[] = mul %11 %2
-                            %13:bool[] = compare [direction=GreaterThan] %1 %0
-                            %14:bool[] = compare [direction=Equal] %1 %0
-                            %15:f64[] = constant [value=0.5]
+                            %7:f64[] = one_like %0
+                            %8:f64[] = add %7 %7
+                            %9:f64[] = div %7 %8
+                            %10:f64[] = zero_like %0
+                            %11:f64[] = select %6 %9 %10
+                            %12:f64[] = select %5 %7 %11
+                            %13:f64[] = mul %12 %2
+                            %14:bool[] = compare [direction=GreaterThan] %1 %0
+                            %15:bool[] = compare [direction=Equal] %1 %0
                             %16:f64[] = one_like %1
-                            %17:f64[] = zero_like %1
-                            %18:f64[] = select %14 %15 %17
-                            %19:f64[] = select %13 %16 %18
-                            %20:f64[] = mul %19 %3
-                            %21:f64[] = add %12 %20
-                        in (%4, %21)
+                            %17:f64[] = add %16 %16
+                            %18:f64[] = div %16 %17
+                            %19:f64[] = zero_like %1
+                            %20:f64[] = select %15 %18 %19
+                            %21:f64[] = select %14 %16 %20
+                            %22:f64[] = mul %21 %3
+                            %23:f64[] = add %13 %22
+                        in (%4, %23)
                     "},
                 },
                 {
@@ -1120,6 +1190,33 @@ mod tests {
                     tangent_outputs = [Array::scalar(5.0).unwrap()],
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn test_max_differentiation_dynamic_shape() {
+        let dimension = DimensionVariable::new("n", DimensionBounds::new(1, Some(4)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dimension)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(input_type.clone());
+        let right = builder.add_input(input_type);
+        let output = builder.add_instruction(MaxOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Differentiate before specializing so half-weights must inherit the symbolic input shape.
+        let program = program.jvp().unwrap();
+        let runtime_type = ArrayType::new_static(DataType::F64, [3]);
+        let program = program.specialize(&vec![runtime_type; 4]).unwrap();
+        assert_eq!(
+            program.interpret(vec![
+                Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
+                Array::vector(vec![2.0, 2.0, 1.0]).unwrap(),
+                Array::vector(vec![3.0, 3.0, 3.0]).unwrap(),
+                Array::vector(vec![5.0, 5.0, 5.0]).unwrap(),
+            ]),
+            Ok(vec![Array::vector(vec![2.0, 2.0, 3.0]).unwrap(), Array::vector(vec![5.0, 4.0, 3.0]).unwrap()]),
         );
     }
 
@@ -1172,6 +1269,27 @@ mod tests {
                 Array::scalar(ComplexNumber::new(4.0f64, 5.0)).unwrap(),
             )),
         );
+    }
+
+    #[test]
+    fn test_max_differentiation_complex_non_deciding_nan() {
+        // Unequal real parts decide selection even when the selected imaginary component is NaN.
+        let (primal, tangent) = differentiate_at((
+            Array::scalar(ComplexNumber::new(3.0f64, f64::NAN)).unwrap(),
+            Array::scalar(ComplexNumber::new(2.0f64, 0.0)).unwrap(),
+        ))
+        .jvp(
+            (
+                Array::scalar(ComplexNumber::new(3.0f64, 4.0)).unwrap(),
+                Array::scalar(ComplexNumber::new(5.0f64, 6.0)).unwrap(),
+            ),
+            |(left, right)| left.max(&right),
+        )
+        .unwrap();
+        let primal = primal.elements::<ComplexNumber<f64>>().unwrap()[0];
+        assert_eq!(primal.re, 3.0);
+        assert!(primal.im.is_nan());
+        assert_eq!(tangent, Array::scalar(ComplexNumber::new(3.0f64, 4.0)).unwrap());
     }
 
     #[test]
@@ -1277,6 +1395,8 @@ mod tests {
         assert_eq!(Max::max(&3usize, &4), Ok(4));
         assert_eq!(Max::max(&true, &false), Ok(true));
         assert!(Max::max(&1.0f64, &f64::NAN).unwrap().is_nan());
+        assert!(Max::max(&1.0f32, &f32::NAN).unwrap().is_nan());
+        assert_eq!(Max::max(&0.0f32, &-0.0).unwrap().to_bits(), 0.0f32.to_bits());
         assert_eq!(Max::max(&0.0f64, &-0.0).unwrap().to_bits(), 0.0f64.to_bits());
     }
 
@@ -1332,7 +1452,7 @@ mod tests {
             ],
         );
 
-        // Array bounds broadcast against the operand, including scalar bounds.
+        // Array bounds broadcast against the input, including scalar bounds.
         check_operation_type_inference!(
             operation = ClampOperation::<ArrayType>::new(),
             cases = [{
@@ -1356,8 +1476,34 @@ mod tests {
     }
 
     #[test]
+    fn test_clamp_type_inference_mismatched_reduced_axes() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh, vec![]).unwrap();
+        let plain = ArrayType::scalar(DataType::F64).with_sharding(sharding.clone()).unwrap();
+        let reduced =
+            ArrayType::scalar(DataType::F64).with_sharding(sharding.with_reduced_axes(["x"]).unwrap()).unwrap();
+        check_operation_type_inference!(
+            operation = ClampOperation::<ArrayType>::new(),
+            cases = [
+                {
+                    input_types = [reduced.clone(), plain.clone(), plain.clone()],
+                    error = "`clamp` operands must be reduced over the same axes",
+                },
+                {
+                    input_types = [plain.clone(), plain.clone(), reduced.clone()],
+                    error = "`clamp` operands must be reduced over the same axes",
+                },
+                {
+                    input_types = [reduced.clone(), plain, reduced],
+                    error = "`clamp` operands must be reduced over the same axes",
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn test_clamp_interpretation() {
-        // The operand is the second input, between the lower and the upper bound.
+        // The clamped input is the second input, between the lower and the upper bound.
         assert_eq!(
             ClampOperation::<ArrayType>::new().interpret(
                 &EagerContext::<Array>::new(),
@@ -1463,20 +1609,28 @@ mod tests {
     fn test_clamp_differentiation_boundaries() {
         // At either bound no input determines the output alone, so the tangent is zero.
         let tangents = (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap(), Array::scalar(5.0).unwrap());
-        for input in [-1.0, 1.0] {
-            assert_eq!(
-                differentiate_at((
-                    Array::scalar(-1.0).unwrap(),
-                    Array::scalar(input).unwrap(),
-                    Array::scalar(1.0).unwrap()
-                ))
-                .jvp(tangents.clone(), |(lower, input, upper)| input.clamp(&lower, &upper))
-                .map(|(_, tangent)| tangent),
-                Ok(Array::scalar(0.0).unwrap()),
-            );
-        }
+        assert_eq!(
+            differentiate_at((Array::scalar(-1.0).unwrap(), Array::scalar(-1.0).unwrap(), Array::scalar(1.0).unwrap()))
+                .jvp(tangents.clone(), |(lower, input, upper)| input.clamp(&lower, &upper)),
+            Ok((Array::scalar(-1.0).unwrap(), Array::scalar(0.0).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at((Array::scalar(-1.0).unwrap(), Array::scalar(1.0).unwrap(), Array::scalar(1.0).unwrap()))
+                .jvp(tangents.clone(), |(lower, input, upper)| input.clamp(&lower, &upper)),
+            Ok((Array::scalar(1.0).unwrap(), Array::scalar(0.0).unwrap())),
+        );
 
         // Crossed bounds produce the upper bound, whose tangent flows only where it lies below the input.
+        assert_eq!(
+            differentiate_at((Array::scalar(1.0).unwrap(), Array::scalar(1.0).unwrap(), Array::scalar(-1.0).unwrap()))
+                .jvp(tangents.clone(), |(lower, input, upper)| input.clamp(&lower, &upper)),
+            Ok((Array::scalar(-1.0).unwrap(), Array::scalar(5.0).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at((Array::scalar(1.0).unwrap(), Array::scalar(-1.0).unwrap(), Array::scalar(-1.0).unwrap()))
+                .jvp(tangents.clone(), |(lower, input, upper)| input.clamp(&lower, &upper)),
+            Ok((Array::scalar(-1.0).unwrap(), Array::scalar(0.0).unwrap())),
+        );
         assert_eq!(
             differentiate_at((Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap(), Array::scalar(-1.0).unwrap()))
                 .jvp(tangents.clone(), |(lower, input, upper)| input.clamp(&lower, &upper)),
@@ -1538,6 +1692,14 @@ mod tests {
             Ok(Array::vector(vec![1.0f64, 4.0]).unwrap()),
         );
 
+        // All three types promote before either selection, preserving integers beyond `f32`'s exact range.
+        assert_eq!(
+            Array::scalar(16777217i64)
+                .unwrap()
+                .clamp(&Array::scalar(0f32).unwrap(), &Array::scalar(2e7f64).unwrap()),
+            Ok(Array::scalar(16777217f64).unwrap()),
+        );
+
         // Crossed bounds produce the upper bound.
         assert_eq!(
             Array::scalar(0.0f64)
@@ -1595,14 +1757,14 @@ mod tests {
             Array::vector(vec![
                 ComplexNumber::new(1.0f64, -1.0),
                 ComplexNumber::new(1.0, 1.0),
-                ComplexNumber::new(1.0, 3.0)
+                ComplexNumber::new(1.0, 3.0),
             ])
             .unwrap()
             .clamp(&lower, &upper),
             Ok(Array::vector(vec![
                 ComplexNumber::new(1.0f64, 0.0),
                 ComplexNumber::new(1.0, 1.0),
-                ComplexNumber::new(1.0, 2.0)
+                ComplexNumber::new(1.0, 2.0),
             ])
             .unwrap()),
         );
@@ -1611,6 +1773,9 @@ mod tests {
     #[test]
     fn test_clamp_primitives() {
         assert_eq!(Clamp::clamp(&2.5f64, &-1.0, &1.0), Ok(1.0));
+        assert_eq!(Clamp::clamp(&2.5f32, &-1.0, &1.0), Ok(1.0));
+        assert!(Clamp::clamp(&f32::NAN, &-1.0, &1.0).unwrap().is_nan());
+        assert_eq!(Clamp::clamp(&-0.0f32, &-1.0, &1.0).unwrap().to_bits(), (-0.0f32).to_bits());
         assert_eq!(Clamp::clamp(&-3i32, &0, &5), Ok(0));
         assert_eq!(Clamp::clamp(&0.0f64, &1.0, &-1.0), Ok(-1.0));
         assert_eq!(Clamp::clamp(&false, &true, &true), Ok(true));

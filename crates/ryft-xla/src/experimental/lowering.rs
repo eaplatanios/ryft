@@ -17943,6 +17943,51 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_extrema_dynamic_differentiation() {
+        let client = execution_client();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("size", Some(5))]));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let left = builder.add_input(input_type.clone().into());
+        let right = builder.add_input(input_type.into());
+        let minimum = builder.add_instruction(MinOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let maximum = builder.add_instruction(MaxOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![minimum, maximum],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap()
+            .jvp()
+            .unwrap();
+
+        // The fourth element is padding. Both selection and tie weights must preserve the runtime extent.
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &program,
+                &[
+                    MixedValue::Array(vec![1.0, 3.0, 2.0, 0.0], vec![4]),
+                    MixedValue::Array(vec![2.0, 1.0, 2.0, 0.0], vec![4]),
+                    MixedValue::Array(vec![2.0, 4.0, 6.0, 0.0], vec![4]),
+                    MixedValue::Array(vec![8.0, 10.0, 12.0, 0.0], vec![4]),
+                ],
+                &[3, 3, 3, 3],
+            ),
+            Ok(vec![
+                MixedValue::Array(vec![1.0, 1.0, 2.0], vec![3]),
+                MixedValue::Array(vec![2.0, 3.0, 2.0], vec![3]),
+                MixedValue::Array(vec![2.0, 10.0, 9.0], vec![3]),
+                MixedValue::Array(vec![8.0, 4.0, 9.0], vec![3]),
+                MixedValue::Dimension(3),
+                MixedValue::Dimension(3),
+                MixedValue::Dimension(3),
+                MixedValue::Dimension(3),
+            ]),
+        );
+    }
+
+    #[test]
     fn test_to_mlir_module_for_plain_program_lowers_bf16_reduce_sum() {
         assert_eq!(
             lowered_reduce_module(DataType::BF16, ReductionKind::Sum, vec![0], vec![2, 3]).unwrap(),
