@@ -315,7 +315,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Compare, ComparisonDirection, Concatenate,
+        Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Clamp, Compare, ComparisonDirection, Concatenate,
         ConvertElementType, ConvertElementTypeOperation, Cos, CumulativeLogSumExp, CumulativeMax, CumulativeMin,
         CumulativeProduct, CumulativeSum, DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension,
         DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather, GatherDimensionNumbers, GatherMode,
@@ -662,6 +662,103 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(values.iter().copied().map(f8e8m0fnu::is_nan).collect::<Vec<_>>(), [true, true, false, true]);
         assert_eq!(values[2], f8e8m0fnu::from_bits(127));
+    }
+
+    #[test]
+    fn test_eager_sin_complex_large_imaginary() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // Hyperbolic factors need not overflow with their exponential intermediates. A small real factor can
+        // also keep one component finite beyond the range of the hyperbolic factor itself.
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C128, &[3]),
+            mesh.clone(),
+            values_to_bytes::<f64>(&[0.0, 710.0, 0.0, -710.0, 1e-300, 1400.0]),
+        )
+        .unwrap();
+        let output = input.sin().unwrap();
+        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        assert_eq!(values[0], 0.0);
+        assert!((values[1] / 1.1169973830808555e308 - 1.0).abs() < 2e-15);
+        assert_eq!(values[2], 0.0);
+        assert!((values[3] / -1.1169973830808555e308 - 1.0).abs() < 2e-15);
+        assert!((values[4] / 5.143333304259947e307 - 1.0).abs() < 2e-15);
+        assert_eq!(values[5], f64::INFINITY);
+
+        let input = c64_scalar(&client, &mesh, num_complex::Complex::new(0.0, 89.0));
+        let output = input.sin().unwrap();
+        let values = values_from_bytes::<f32>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        assert_eq!(values[0], 0.0);
+        assert!((values[1] / 2.2448064e38 - 1.0).abs() < 2e-7);
+    }
+
+    #[test]
+    fn test_eager_cos_complex_large_imaginary() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C128, &[3]),
+            mesh.clone(),
+            values_to_bytes::<f64>(&[0.0, 710.0, 0.0, -710.0, 1e-300, 1400.0]),
+        )
+        .unwrap();
+        let output = input.cos().unwrap();
+        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        assert!((values[0] / 1.1169973830808555e308 - 1.0).abs() < 2e-15);
+        assert_eq!(values[1], 0.0);
+        assert!((values[2] / 1.1169973830808555e308 - 1.0).abs() < 2e-15);
+        assert_eq!(values[3], 0.0);
+        assert_eq!(values[4], f64::INFINITY);
+        assert!((values[5] / -5.143333304259947e307 - 1.0).abs() < 2e-15);
+
+        let input = c64_scalar(&client, &mesh, num_complex::Complex::new(0.0, 89.0));
+        let output = input.cos().unwrap();
+        let values = values_from_bytes::<f32>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        assert!((values[0] / 2.2448064e38 - 1.0).abs() < 2e-7);
+        assert_eq!(values[1], 0.0);
+    }
+
+    #[test]
+    fn test_eager_atan2_jvp_extreme_magnitudes() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F64, &[2]),
+            mesh.clone(),
+            values_to_bytes::<f64>(&[1e200, 1e-200]),
+        )
+        .unwrap();
+        let (_, tangent) = input
+            .execution_domain()
+            .jvp(
+                |(left, right), ()| left.atan2(&right),
+                (input.clone(), input.clone()),
+                (input.one_like().unwrap(), input.zero_like().unwrap()),
+                (),
+            )
+            .unwrap();
+        let values = values_from_bytes::<f64>(&shard_host_bytes(tangent.addressable_shards().next().unwrap()).unwrap());
+        assert!((values[0] / 5e-201 - 1.0).abs() < 2e-15);
+        assert!((values[1] / 5e199 - 1.0).abs() < 2e-15);
+    }
+
+    #[test]
+    fn test_eager_tanh_complex_large_real() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C128, &[3]),
+            mesh.clone(),
+            values_to_bytes::<f64>(&[400.0, 1.0, f64::INFINITY, 1.0, -400.0, 1.0]),
+        )
+        .unwrap();
+        let output = input.tanh().unwrap();
+        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        assert_eq!(values, [1.0, 0.0, 1.0, 0.0, -1.0, 0.0]);
     }
 
     #[test]
@@ -1504,6 +1601,85 @@ mod tests {
                 .max(&CpuArray::scalar(2.0f64).unwrap())
                 .unwrap()
                 .logical_bytes(),
+        );
+    }
+
+    #[test]
+    fn test_array_clamp() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        let array = |data_type: DataType, dimensions: &[usize], bytes: &[u8]| {
+            Array::from_host_buffer(&client, replicated_type(&mesh, data_type, dimensions), mesh.clone(), bytes)
+                .unwrap()
+        };
+
+        // Floating-point values below, inside, and above the interval and NaN inputs match the reference backend byte
+        // for byte, as do crossed bounds, which produce the upper bound.
+        let input_values = [-2.5f32, 0.5, 2.5, f32::NAN];
+        let input = array(DataType::F32, &[input_values.len()], values_to_bytes(&input_values).as_slice());
+        let lower = array(DataType::F32, &[], values_to_bytes(&[-1.0f32]).as_slice());
+        let upper = array(DataType::F32, &[], values_to_bytes(&[1.0f32]).as_slice());
+        let reference_input = CpuArray::vector(input_values.to_vec()).unwrap();
+        let reference_lower = CpuArray::scalar(-1.0f32).unwrap();
+        let reference_upper = CpuArray::scalar(1.0f32).unwrap();
+        assert_eq!(
+            shard_host_bytes(input.clamp(&lower, &upper).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            reference_input.clamp(&reference_lower, &reference_upper).unwrap().logical_bytes(),
+        );
+        assert_eq!(
+            shard_host_bytes(input.clamp(&upper, &lower).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            reference_input.clamp(&reference_upper, &reference_lower).unwrap().logical_bytes(),
+        );
+
+        // Integer inputs lower to one `stablehlo.clamp` with scalar bounds.
+        let integers = array(DataType::I32, &[3], values_to_bytes(&[-5i32, 2, 9]).as_slice());
+        let integer_lower = array(DataType::I32, &[], values_to_bytes(&[0i32]).as_slice());
+        let integer_upper = array(DataType::I32, &[], values_to_bytes(&[5i32]).as_slice());
+        assert_eq!(
+            shard_host_bytes(
+                integers.clamp(&integer_lower, &integer_upper).unwrap().addressable_shards().next().unwrap()
+            )
+            .unwrap(),
+            values_to_bytes(&[0i32, 2, 5]),
+        );
+
+        // Array bounds broadcast to the result, and Boolean inputs clamp with conjunction and disjunction.
+        let bound_values = [0.0f32, 1.0, 2.0, 3.0];
+        let bounds = array(DataType::F32, &[bound_values.len()], values_to_bytes(&bound_values).as_slice());
+        assert_eq!(
+            shard_host_bytes(input.clamp(&lower, &bounds).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            reference_input
+                .clamp(&reference_lower, &CpuArray::vector(bound_values.to_vec()).unwrap())
+                .unwrap()
+                .logical_bytes(),
+        );
+        let booleans = array(DataType::Boolean, &[2], &[0, 1]);
+        let truth = array(DataType::Boolean, &[], &[1]);
+        assert_eq!(read_booleans(&booleans.clamp(&truth, &truth).unwrap()), vec![true, true]);
+        assert_eq!(read_booleans(&booleans.min(&truth).unwrap()), vec![false, true]);
+        assert_eq!(read_booleans(&booleans.max(&truth).unwrap()), vec![true, true]);
+
+        // Complex inputs compose the lexicographic extrema, so the imaginary part decides between equal real parts.
+        let complex_values = [
+            num_complex::Complex::new(1.0f32, -1.0),
+            num_complex::Complex::new(1.0, 1.0),
+            num_complex::Complex::new(1.0, 3.0),
+        ];
+        let complex = array(DataType::C64, &[complex_values.len()], values_to_bytes(&complex_values).as_slice());
+        let complex_lower =
+            array(DataType::C64, &[], values_to_bytes(&[num_complex::Complex::new(1.0f32, 0.0)]).as_slice());
+        let complex_upper =
+            array(DataType::C64, &[], values_to_bytes(&[num_complex::Complex::new(1.0f32, 2.0)]).as_slice());
+        assert_eq!(
+            read_c64s(&complex.clamp(&complex_lower, &complex_upper).unwrap()),
+            vec![
+                num_complex::Complex::new(1.0, 0.0),
+                num_complex::Complex::new(1.0, 1.0),
+                num_complex::Complex::new(1.0, 2.0),
+            ],
         );
     }
 

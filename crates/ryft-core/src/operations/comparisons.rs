@@ -5,10 +5,11 @@
 //! named function per direction (e.g., [`less_than`](Compare::less_than)). Comparisons apply to two kinds of inputs:
 //!
 //!   - **Arrays:** The inputs are broadcast to a common shape and their element types are promoted before
-//!     they are compared elementwise, producing [`Boolean`](DataType::Boolean) elements, as in StableHLO's
-//!     [`compare`](https://openxla.org/stablehlo/spec#compare). Equality and inequality support complex elements,
-//!     whereas ordered comparisons reject them, and a comparison involving a floating-point NaN is false for every
-//!     direction except [`NotEqual`](ComparisonDirection::NotEqual).
+//!     they are compared elementwise, producing [`Boolean`](DataType::Boolean) elements. Unlike StableHLO's
+//!     [`compare`](https://openxla.org/stablehlo/spec#compare), which requires matching shapes and element types,
+//!     the promotion and broadcasting happen as part of the comparison. Equality and inequality support complex
+//!     elements, whereas ordered comparisons reject them, and a comparison involving a floating-point NaN is false
+//!     for every direction except [`NotEqual`](ComparisonDirection::NotEqual).
 //!   - **Dimensions:** [`DimensionValue`]s and dimension-typed traced values compare their extents and produce
 //!     rank-zero Boolean arrays. Predicates that dimension identities and extent bounds already prove (e.g., that
 //!     a dimension is equal to itself) become Boolean constants without staging an operation, both when tracing

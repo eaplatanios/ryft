@@ -25,7 +25,7 @@ use ryft_core::{
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
     CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME, CUMULATIVE_MIN_OPERATION_NAME,
     CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CUSTOM_JVP_OPERATION_NAME,
-    CUSTOM_VJP_OPERATION_NAME, CaptureReference, CeilOperation, ComparisonDirection, ConstantOperation,
+    CUSTOM_VJP_OPERATION_NAME, CaptureReference, CeilOperation, ClampOperation, ComparisonDirection, ConstantOperation,
     ConvertElementTypeOperation, CosOperation, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation,
     DimensionType, DimensionValue, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass,
     EffectClasses, ErfOperation, ExpOperation, ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation,
@@ -1814,7 +1814,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for NegOperation<ArrayType>
 
 /// Lowers complex sine or cosine through real operations while preserving an exact zero component for a zero real
 /// input. The direct StableHLO complex trigonometric operations can evaluate a mathematically zero product as
-/// `0 * inf`, yielding NaN when the imaginary component is large enough to overflow the hyperbolic factor.
+/// `0 * inf`, yielding NaN when the imaginary component is large enough to overflow the hyperbolic factor. Small
+/// imaginary components use `expm1` to avoid cancellation; large components scale the trigonometric factor before
+/// forming the exponential product to avoid intermediate overflow.
 ///
 /// # Parameters
 ///
@@ -1895,6 +1897,138 @@ where
     let cosh = block.append_operation(stable_hlo::divide(cosh_numerator, two, location)?)?;
     let cosh = cosh.result(0).expect("stablehlo.divide should return one result").as_ref();
 
+    // Scale the trigonometric factor before the second exponential multiplication. This keeps representable
+    // components finite even when `exp(abs(imaginary))`, or the hyperbolic factor itself, would overflow. Above
+    // magnitude twenty, dropping the decaying exponential changes the factor by less than one `f64` ulp.
+    let magnitude = block.append_operation(stable_hlo::abs(imaginary, location)?)?.result(0).unwrap().as_ref();
+    let half = lower_f64_constant_splat(0.5, &part_type, part_tensor_type, block, context, location)?;
+    let threshold = lower_f64_constant_splat(20.0, &part_type, part_tensor_type, block, context, location)?;
+    let infinity = lower_f64_constant_splat(f64::INFINITY, &part_type, part_tensor_type, block, context, location)?;
+    let log_two =
+        lower_f64_constant_splat(std::f64::consts::LN_2, &part_type, part_tensor_type, block, context, location)?;
+    let large = block
+        .append_operation(stable_hlo::compare(
+            magnitude,
+            threshold,
+            stable_hlo::ComparisonDirection::GreaterThan,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let half_magnitude = block
+        .append_operation(stable_hlo::multiply(magnitude, half, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let half_exponential = block
+        .append_operation(stable_hlo::exponential(half_magnitude, Accuracy::Default, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let half_overflows = block
+        .append_operation(stable_hlo::compare(
+            half_exponential,
+            infinity,
+            stable_hlo::ComparisonDirection::Equal,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let negative = block
+        .append_operation(stable_hlo::compare(
+            imaginary,
+            zero,
+            stable_hlo::ComparisonDirection::LessThan,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let mut large_component = |factor: ValueRef<'b, 'c, 't>,
+                               odd: bool|
+     -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+        let factor = if odd {
+            let negated = block.append_operation(stable_hlo::negate(factor, location)?)?.result(0).unwrap().as_ref();
+            block
+                .append_operation(stable_hlo::select(negative, negated, factor, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref()
+        } else {
+            factor
+        };
+        let first = block
+            .append_operation(stable_hlo::multiply(factor, half_exponential, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let first = block.append_operation(stable_hlo::multiply(first, half, location)?)?.result(0).unwrap().as_ref();
+        let scaled = block
+            .append_operation(stable_hlo::multiply(first, half_exponential, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        // Extremely small trigonometric factors can still produce finite components when the half exponential
+        // overflows. Combine exponents for that rare case; retain exact zeros before taking a logarithm.
+        let absolute = block.append_operation(stable_hlo::abs(factor, location)?)?.result(0).unwrap().as_ref();
+        let logarithm = block
+            .append_operation(stable_hlo::log(absolute, Accuracy::Default, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let exponent = block
+            .append_operation(stable_hlo::add(magnitude, logarithm, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let exponent = block
+            .append_operation(stable_hlo::subtract(exponent, log_two, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let fallback = block
+            .append_operation(stable_hlo::exponential(exponent, Accuracy::Default, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let sign = block.append_operation(stable_hlo::sign(factor, location)?)?.result(0).unwrap().as_ref();
+        let fallback =
+            block.append_operation(stable_hlo::multiply(sign, fallback, location)?)?.result(0).unwrap().as_ref();
+        let scaled = block
+            .append_operation(stable_hlo::select(half_overflows, fallback, scaled, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let factor_is_zero = block
+            .append_operation(stable_hlo::compare(
+                factor,
+                zero,
+                stable_hlo::ComparisonDirection::Equal,
+                stable_hlo::ComparisonType::Float,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        Ok(block
+            .append_operation(stable_hlo::select(factor_is_zero, factor, scaled, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref())
+    };
+    let large_real = large_component(if sine { real_sine } else { real_cosine }, false)?;
+    let large_imaginary = large_component(if sine { real_cosine } else { real_sine }, true)?;
+    let large_imaginary = if sine {
+        large_imaginary
+    } else {
+        block.append_operation(stable_hlo::negate(large_imaginary, location)?)?.result(0).unwrap().as_ref()
+    };
+
     let (real_result, imaginary_result) = if sine {
         // Mask the overflowing factor before multiplication as well as selecting the final complex result. Some XLA
         // optimization paths otherwise speculate the unselected `0 * inf` expression and preserve its NaN.
@@ -1920,6 +2054,16 @@ where
             imaginary_result.result(0).expect("stablehlo.multiply should return one result").as_ref();
         (real_result, imaginary_result)
     };
+    let real_result = block
+        .append_operation(stable_hlo::select(large, large_real, real_result, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let imaginary_result = block
+        .append_operation(stable_hlo::select(large, large_imaginary, imaginary_result, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
     let ordinary_result = block.append_operation(stable_hlo::complex(real_result, imaginary_result, location)?)?;
     let ordinary_result = ordinary_result.result(0).expect("stablehlo.complex should return one result").as_ref();
     let zero_real_result = if sine {
@@ -2344,6 +2488,76 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MinOperation<ArrayType>
         }
         let result = lowerer.block.append_operation(stable_hlo::minimum(left, right, lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.minimum should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ClampOperation<ArrayType> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("input", input_values, 3, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let output_type = &output_types[0];
+        let input = normalize_elementwise_operand(
+            input_values[1],
+            output_type,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
+        let data_type = output_type.data_type();
+        if data_type.is_complex() || data_type.is_floating_point() {
+            // Floating-point and complex values compose `min(max(x, lower), upper)` explicitly. XLA's native `clamp`
+            // does not propagate NaN operands on every backend (e.g., the CPU backend returns the lower bound for a
+            // NaN input), and StableHLO leaves the ordering of complex `clamp` unspecified, whereas the extremum
+            // lowerings below propagate NaNs and order complex values lexicographically like the reference backend.
+            let [lower, upper] = [input_values[0], input_values[2]].map(|bound| {
+                normalize_elementwise_operand(bound, output_type, &mut lowerer.block, lowerer.context, lowerer.location)
+            });
+            let (lower, upper) = (lower?, upper?);
+            if data_type.is_floating_point() {
+                let clamped_below =
+                    lowerer.block.append_operation(stable_hlo::maximum(input, lower, lowerer.location)?)?;
+                let clamped_below =
+                    clamped_below.result(0).expect("stablehlo.maximum should return one result").as_ref();
+                let result =
+                    lowerer.block.append_operation(stable_hlo::minimum(clamped_below, upper, lowerer.location)?)?;
+                return Ok(vec![result.result(0).expect("stablehlo.minimum should return one result").as_ref()]);
+            }
+            let clamped_below =
+                lower_extremum_to_mlir(true, data_type, input, lower, &mut lowerer.block, lowerer.location)?;
+            return Ok(vec![lower_extremum_to_mlir(
+                false,
+                data_type,
+                clamped_below,
+                upper,
+                &mut lowerer.block,
+                lowerer.location,
+            )?]);
+        }
+
+        // Integer and Boolean values use one `stablehlo.clamp`, which accepts scalar bounds or bounds with the
+        // operand's shape, so rank-zero bounds keep their rank and only convert their element type, while every other
+        // bound is broadcast to the result type.
+        let mut bounds = [input_values[0], input_values[2]];
+        for bound in &mut bounds {
+            let is_scalar = bound.r#type()?.cast::<TensorTypeRef>().is_some_and(|r#type| r#type.rank() == 0);
+            let bound_type = if is_scalar { ArrayType::scalar(output_type.data_type()) } else { output_type.clone() };
+            *bound = normalize_elementwise_operand(
+                *bound,
+                &bound_type,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?;
+        }
+        let result =
+            lowerer.block.append_operation(stable_hlo::clamp(bounds[0], input, bounds[1], lowerer.location)?)?;
+        Ok(vec![result.result(0).expect("stablehlo.clamp should return one result").as_ref()])
     }
 }
 
@@ -5364,6 +5578,13 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 lowerer,
             ),
             ArrayOperation::Min(operation) => <MinOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Clamp(operation) => <ClampOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
@@ -17654,7 +17875,8 @@ mod tests {
         assert_eq!(stablehlo.matches("stablehlo.real").count(), 2, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.imag").count(), 2, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.exponential_minus_one").count(), 4, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.select").count(), 4, "{stablehlo}");
+        // Select the small-argument, scaled, and logarithmic paths while preserving exact zero components.
+        assert_eq!(stablehlo.matches("stablehlo.select").count(), 18, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.complex").count(), 4, "{stablehlo}");
     }
 

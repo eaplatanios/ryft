@@ -5092,6 +5092,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Round(_)
         | ArrayOperation::Max(_)
         | ArrayOperation::Min(_)
+        | ArrayOperation::Clamp(_)
         | ArrayOperation::Rem(_)
         | ArrayOperation::Not(_)
         | ArrayOperation::And(_)
