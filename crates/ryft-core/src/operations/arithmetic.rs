@@ -100,7 +100,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @binary
-    Add, add,
+    Add,
+    add,
     operation = "add",
     inputs = @numeric,
     checks = [@same_unreduced_axes, @same_reduced_axes],
@@ -194,7 +195,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @binary
-    Sub, sub,
+    Sub,
+    sub,
     operation = "sub",
     inputs = @numeric,
     checks = [@same_unreduced_axes, @same_reduced_axes],
@@ -506,23 +508,21 @@ impl_mul_for_primitive!(@integer usize);
 impl_mul_for_primitive!(@float f32);
 impl_mul_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`DivOperation`].
 pub const DIV_OPERATION_NAME: &str = "div";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that divides two numeric values elementwise, promoting their element types and
-    /// broadcasting their shapes. Array operands that still carry partial sums are rejected, and their reduced-axis
-    /// markers must agree.
-    DivOperation, DIV_OPERATION_NAME,
-    Div, div,
+    /// [`Operation`] that divides two numeric values elementwise, promoting their element types and broadcasting their
+    /// shapes. Array operands that still carry partial sums are rejected, and their reduced-axis markers must agree.
+    DivOperation,
+    DIV_OPERATION_NAME,
+    Div,
+    div,
     check_data_types = [@numeric],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
-// Transposition accepts a linear numerator and a known denominator.
 impl_differentiable_elementwise_operation! {
     @binary
     DivOperation,
@@ -544,6 +544,7 @@ impl_differentiable_elementwise_operation! {
         O: From<DivOperation<V::Type>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
+        // Transposition accepts a linear numerator and a known denominator.
         [numerator = @linear, denominator = @known] =>
             |output_cotangent| output_cotangent.binary(&denominator, DivOperation::new());
     },
@@ -551,11 +552,8 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @binary
-    /// Value capability for elementwise division.
-    ///
-    /// Eager values compute directly; contextual values bind [`DivOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Value capability for elementwise division. Eager values compute directly while contextual values bind
+    /// [`DivOperation`]. Failures are returned as [`ProgramError`]s.
     Div,
     /// Divides this value by `right`.
     div(right),
@@ -564,7 +562,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @binary
-    Div, div,
+    Div,
+    div,
     operation = "div",
     inputs = @numeric,
     checks = [@no_unreduced, @same_reduced_axes],
@@ -574,10 +573,12 @@ impl_array_elementwise_operation!(
 impl std::ops::Div for Array {
     type Output = Self;
 
+    #[inline]
     fn div(self, rhs: Self) -> Self::Output {
         Div::div(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
     }
 }
+
 define_tracer_operator!(@binary std::ops::Div, div, capability = Div, method = div);
 
 /// Implements [`Div`] for one host primitive type.
@@ -586,6 +587,7 @@ macro_rules! impl_div_for_primitive {
     // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
     (@integer $type:ty) => {
         impl Div for $type {
+            #[inline]
             fn div(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_div(*right).ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!(
@@ -601,6 +603,7 @@ macro_rules! impl_div_for_primitive {
     // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
     (@float $type:ty) => {
         impl Div for $type {
+            #[inline]
             fn div(&self, right: &Self) -> Result<Self, ProgramError> {
                 Ok(*self / *right)
             }
@@ -623,21 +626,20 @@ impl_div_for_primitive!(@integer usize);
 impl_div_for_primitive!(@float f32);
 impl_div_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`RemOperation`].
 pub const REM_OPERATION_NAME: &str = "rem";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that computes the elementwise remainder of a dividend (its left operand) and a divisor (its
-    /// right operand), promoting their element types and broadcasting their shapes. The result takes the sign of the
-    /// dividend and has magnitude less than the divisor's (i.e., truncation semantics, matching
-    /// [StableHLO's `remainder`](https://openxla.org/stablehlo/spec#remainder) and Rust's `%`). Only integer and
-    /// floating-point operands are supported. Array operands that still carry partial sums are rejected, and their
+    /// [`Operation`] that computes the elementwise remainder of a dividend (its left operand) and a divisor (its right
+    /// operand), promoting their element types and broadcasting their shapes. The result takes the sign of the dividend
+    /// and has magnitude less than the divisor's (i.e., truncation semantics, matching [`std::ops::Rem`]). Only integer
+    /// and floating-point operands are supported. Array operands that still carry partial sums are rejected, and their
     /// reduced-axis markers must agree.
-    RemOperation, REM_OPERATION_NAME,
-    Rem, rem,
+    RemOperation,
+    REM_OPERATION_NAME,
+    Rem,
+    rem,
     check_data_types = [@numeric @real],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
@@ -648,13 +650,13 @@ impl_differentiable_elementwise_operation! {
     jvp<C>
     where
         C::Value: Rem
-            + std::ops::Div<Output = C::Value>
-            + std::ops::Mul<Output = C::Value>
             + std::ops::Neg<Output = C::Value>
-            + std::ops::Sub<Output = C::Value>,
+            + std::ops::Sub<Output = C::Value>
+            + std::ops::Mul<Output = C::Value>
+            + std::ops::Div<Output = C::Value>,
     {
-        // d(rem(x, y)) = dx - trunc(x / y) · dy away from the discontinuities, with the truncated quotient
-        // recovered exactly as (x - rem(x, y)) / y.
+        // d(rem(x, y)) = dx - trunc(x / y) · dy away from the discontinuities,
+        // with the truncated quotient recovered exactly as (x - rem(x, y)) / y.
         |(_, left_tangent), (_, _)| left_tangent;
         |(left, _), (right, right_tangent)| {
             let truncated_quotient = (left.clone() - left.rem(&right)?) / right;
@@ -666,11 +668,8 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @binary
-    /// Value capability for elementwise remainders with the sign of the dividend.
-    ///
-    /// Eager values compute directly; contextual values bind [`RemOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Value capability for elementwise remainders with the sign of the dividend. Eager values compute directly while
+    /// contextual values bind [`RemOperation`]. Failures are returned as [`ProgramError`]s.
     Rem,
     /// Computes the remainder of dividing this value (the dividend) by `right` (the divisor), with the result taking
     /// the sign of the dividend.
@@ -680,7 +679,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @binary
-    Rem, rem,
+    Rem,
+    rem,
     operation = "rem",
     inputs = @numeric @real,
     checks = [@no_unreduced, @same_reduced_axes],
@@ -700,6 +700,7 @@ macro_rules! impl_rem_for_primitive {
     // arithmetic failures as errors instead of wrapping like the XLA-mirroring reference backends do on devices.
     (@integer $type:ty) => {
         impl Rem for $type {
+            #[inline]
             fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_rem(*right).ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!(
@@ -715,6 +716,7 @@ macro_rules! impl_rem_for_primitive {
     // Floating-point primitives use ordinary IEEE 754 arithmetic, which cannot fail.
     (@float $type:ty) => {
         impl Rem for $type {
+            #[inline]
             fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
                 Ok(*self % *right)
             }
@@ -737,23 +739,26 @@ impl_rem_for_primitive!(@integer usize);
 impl_rem_for_primitive!(@float f32);
 impl_rem_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review this module.
-
+// TODO(eaplatanios): Move this operation, its capability trait and its implementations to before `AddOperation` and
+//  also move its corresponding tests accordingly.
 /// Canonical operation name for [`NegOperation`].
 pub const NEG_OPERATION_NAME: &str = "neg";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that negates one integer, floating-point, or complex value while preserving its array metadata
-    /// and reduction state. Boolean, token, structural-zero, and the unsigned-only `f8e8m0fnu` data types are rejected.
-    NegOperation, NEG_OPERATION_NAME,
-    Neg, neg,
+    /// [`Operation`] that negates one integer, floating-point, or complex value while preserving its array
+    /// metadata and reduction state. Boolean, token, structural-zero, and the unsigned-only data types like
+    /// [`DataType::F8E8M0FNU`] are rejected.
+    NegOperation,
+    NEG_OPERATION_NAME,
+    Neg,
+    neg,
     infer_data_types = |input_types: &[DataType]| {
         check_types!(@numeric, NEG_OPERATION_NAME, input_types);
         let input_type = input_types[0];
         if input_type == DataType::F8E8M0FNU {
             return Err(TypeError::invalid(format!(
-                "`{NEG_OPERATION_NAME}` does not support input data type `f8e8m0fnu`",
+                "`{NEG_OPERATION_NAME}` does not support input data type `{input_type}`",
             )));
         }
         Ok(vec![input_type])
@@ -768,11 +773,8 @@ impl_differentiable_elementwise_operation! {
 
 define_elementwise_capability!(
     @unary
-    /// Value capability for elementwise negation.
-    ///
-    /// Eager values compute directly; contextual values bind [`NegOperation`]. Refer to that operation for
-    /// supported input types, broadcasting, and reduction-state requirements. Failures are returned as
-    /// [`ProgramError`].
+    /// Value capability for elementwise negation. Eager values compute directly while contextual values bind
+    /// [`NegOperation`]. Failures are returned as [`ProgramError`]s.
     Neg,
     /// Negates `self`.
     neg,
@@ -801,10 +803,12 @@ impl Neg for Array {
 impl std::ops::Neg for Array {
     type Output = Self;
 
+    #[inline]
     fn neg(self) -> Self::Output {
         Neg::neg(&self).unwrap_or_else(|error| panic!("{error}"))
     }
 }
+
 define_tracer_operator!(@unary std::ops::Neg, neg, NegOperation, "`neg` operation failed");
 
 /// Implements [`Neg`] for one host primitive type.
@@ -813,6 +817,7 @@ macro_rules! impl_neg_for_primitive {
     // wrapping like the XLA-mirroring reference backends do on devices.
     (@signed $type:ty) => {
         impl Neg for $type {
+            #[inline]
             fn neg(&self) -> Result<Self, ProgramError> {
                 self.checked_neg().ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!("`{}` output does not fit in `{}`", NEG_OPERATION_NAME, stringify!($type)),
@@ -824,6 +829,7 @@ macro_rules! impl_neg_for_primitive {
     // Floating-point primitives use ordinary IEEE 754 negation, which cannot fail.
     (@float $type:ty) => {
         impl Neg for $type {
+            #[inline]
             fn neg(&self) -> Result<Self, ProgramError> {
                 Ok(-*self)
             }
@@ -840,7 +846,7 @@ impl_neg_for_primitive!(@signed isize);
 impl_neg_for_primitive!(@float f32);
 impl_neg_for_primitive!(@float f64);
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &str = "abs";
@@ -1224,7 +1230,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @binary
-    Pow, pow,
+    Pow,
+    pow,
     operation = "pow",
     inputs = @float,
     checks = [@no_unreduced, @same_reduced_axes],
@@ -1287,7 +1294,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Sqrt, sqrt,
+    Sqrt,
+    sqrt,
     operation = "sqrt",
     inputs = @float,
     checks = [@no_unreduced],
@@ -1357,7 +1365,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Rsqrt, rsqrt,
+    Rsqrt,
+    rsqrt,
     operation = "rsqrt",
     inputs = @float,
     checks = [@no_unreduced],
