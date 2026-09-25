@@ -29,8 +29,6 @@
 //! # }
 //! ```
 
-use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg, Sub as StandardSub};
-
 use crate::arrays::FloatingPointArrayElement;
 use crate::differentiation::{
     DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
@@ -60,7 +58,7 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @unary
     SinOperation,
-    jvp<C> where C::Value: Cos + StandardMul<Output = C::Value> {
+    jvp<C> where C::Value: Cos + std::ops::Mul<Output = C::Value> {
         |(input, input_tangent)| input.cos()? * input_tangent
     },
     transpose = @nonlinear,
@@ -120,7 +118,7 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @unary
     CosOperation,
-    jvp<C> where C::Value: Sin + StandardNeg<Output = C::Value> + StandardMul<Output = C::Value> {
+    jvp<C> where C::Value: Sin + std::ops::Neg<Output = C::Value> + std::ops::Mul<Output = C::Value> {
         |(input, input_tangent)| -(input.sin()? * input_tangent)
     },
     transpose = @nonlinear,
@@ -187,10 +185,10 @@ impl_differentiable_operation! {
         T: Type,
         C::Type: DifferentiableType,
         C::Value: Atan2
-            + StandardNeg<Output = C::Value>
-            + StandardAdd<Output = C::Value>
-            + StandardMul<Output = C::Value>
-            + StandardDiv<Output = C::Value>
+            + std::ops::Neg<Output = C::Value>
+            + std::ops::Add<Output = C::Value>
+            + std::ops::Mul<Output = C::Value>
+            + std::ops::Div<Output = C::Value>
             + ElementwiseDerivativeAlignment<C::Type>,
     {
         |_operation, context, _driver, inputs| {
@@ -310,7 +308,7 @@ impl_differentiable_elementwise_operation! {
     TanhOperation,
     jvp<C>
     where
-        C::Value: OneLike + StandardMul<Output = C::Value> + StandardSub<Output = C::Value>,
+        C::Value: OneLike + std::ops::Mul<Output = C::Value> + std::ops::Sub<Output = C::Value>,
     {
         // d(tanh(x)) = (1 - tanh(x)²) · dx, reusing the primal output evaluated at the tangent type.
         |(_, input_tangent) -> output| (output.one_like()? - output.clone() * output) * input_tangent

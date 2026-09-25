@@ -6,8 +6,6 @@
 
 // TODO(eaplatanios): Review this module.
 
-use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg, Sub as StandardSub};
-
 use ryft_macros::Operation;
 
 use crate::arrays::arrays::Array;
@@ -256,8 +254,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 pub trait ArrayOperations:
     Value<Type = ArrayType>
     // Arithmetic, in both the panicking operator sugar and the fallible capability forms.
-    + StandardNeg<Output = Self> + StandardAdd<Output = Self> + StandardSub<Output = Self>
-    + StandardMul<Output = Self> + StandardDiv<Output = Self>
+    + std::ops::Neg<Output = Self> + std::ops::Add<Output = Self> + std::ops::Sub<Output = Self>
+    + std::ops::Mul<Output = Self> + std::ops::Div<Output = Self>
     + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Abs + Sign
     // Elementwise math and logic.
     + Sin + Cos + Atan2 + Exp + Log + Log1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil
@@ -283,8 +281,8 @@ pub trait ArrayOperations:
 impl<V> ArrayOperations for V
 where
     V: Value<Type = ArrayType>,
-    V: StandardNeg<Output = V> + StandardAdd<Output = V> + StandardSub<Output = V> + StandardMul<Output = V>,
-    V: StandardDiv<Output = V> + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Abs + Sign,
+    V: std::ops::Neg<Output = V> + std::ops::Add<Output = V> + std::ops::Sub<Output = V> + std::ops::Mul<Output = V>,
+    V: std::ops::Div<Output = V> + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Abs + Sign,
     V: Sin + Cos + Atan2 + Exp + Log + Log1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf,
     V: Floor + Ceil + Round,
     V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,

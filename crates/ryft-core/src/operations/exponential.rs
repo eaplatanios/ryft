@@ -9,17 +9,14 @@
 //!   - [`LogAddExp`] computes `log(exp(a) + exp(b))` without forming either exponential, so that it cannot overflow.
 //!   - [`Logistic`] computes the logistic sigmoid (i.e., `x ↦ 1 / (1 + e^{-x})`).
 //!
-//! [`Exp`], [`Log`], and [`Logistic`] support floating-point and complex values, as for StableHLO's
+//! [`Exp`], [`Log`], and [`Logistic`] support floating-point and complex values, same as StableHLO's
 //! [`exponential`](https://openxla.org/stablehlo/spec#exponential), [`log`](https://openxla.org/stablehlo/spec#log),
 //! and [`logistic`](https://openxla.org/stablehlo/spec#logistic), whereas [`Log1p`] and [`LogAddExp`] support only
 //! real floating-point values. Unary operations preserve the metadata of their input, and [`LogAddExp`] promotes the
 //! element types and broadcasts the shapes of its inputs. Inputs that carry partial sums over unreduced mesh axes are
-//! rejected. Every operation is nonlinear, so reverse-mode differentiation transposes its linearization instead. The
-//! logarithm of a sum of exponentials along array axes is a reduction (i.e.,
-//! [`ReductionKind::LogSumExp`](crate::operations::reductions::ReductionKind::LogSumExp)) and lives in
-//! [`reductions`](crate::operations::reductions).
+//! rejected. Every operation is nonlinear, so reverse-mode differentiation transposes its linearization instead.
 //!
-//! # Example
+//! # Examples
 //!
 //! ```rust
 //! # use ryft_core::{Array, Exp, Log, ProgramError};
@@ -29,8 +26,6 @@
 //! # Ok(())
 //! # }
 //! ```
-
-use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Sub as StandardSub};
 
 use crate::arrays::{DataType, FloatingPointArrayElement, RealFloatingPointArrayElement};
 use crate::differentiation::{
@@ -66,7 +61,7 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @unary
     ExpOperation,
-    jvp<C> where C::Value: StandardMul<Output = C::Value> {
+    jvp<C> where C::Value: std::ops::Mul<Output = C::Value> {
         |(_, input_tangent) -> output| output * input_tangent
     },
     transpose = @nonlinear,
@@ -127,7 +122,7 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @unary
     LogOperation,
-    jvp<C> where C::Value: StandardDiv<Output = C::Value> {
+    jvp<C> where C::Value: std::ops::Div<Output = C::Value> {
         |(input, input_tangent)| input_tangent / input
     },
     transpose = @nonlinear,
@@ -199,7 +194,7 @@ impl_differentiable_elementwise_operation! {
     Log1pOperation,
     jvp<C>
     where
-        C::Value: OneLike + StandardAdd<Output = C::Value> + StandardDiv<Output = C::Value>,
+        C::Value: OneLike + std::ops::Add<Output = C::Value> + std::ops::Div<Output = C::Value>,
     {
         // d(log1p(x)) = dx / (1 + x). The denominator is formed from the aligned input primal so that it carries the
         // tangent's element data type, and `one_like` supplies the one at exactly that type.
@@ -291,9 +286,9 @@ impl_differentiable_operation! {
             + Select
             + ZeroLike
             + Exp
-            + StandardAdd<Output = C::Value>
-            + StandardSub<Output = C::Value>
-            + StandardMul<Output = C::Value>
+            + std::ops::Add<Output = C::Value>
+            + std::ops::Sub<Output = C::Value>
+            + std::ops::Mul<Output = C::Value>
             + ElementwiseDerivativeAlignment<C::Type>,
         <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
     {
@@ -428,7 +423,7 @@ impl_differentiable_elementwise_operation! {
     LogisticOperation,
     jvp<C>
     where
-        C::Value: OneLike + StandardMul<Output = C::Value> + StandardSub<Output = C::Value>,
+        C::Value: OneLike + std::ops::Mul<Output = C::Value> + std::ops::Sub<Output = C::Value>,
     {
         // d(logistic(x)) = logistic(x) · (1 - logistic(x)) · dx, reusing the primal output evaluated at the
         // tangent type.

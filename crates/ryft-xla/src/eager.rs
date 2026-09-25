@@ -323,7 +323,7 @@ mod tests {
         OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round,
         Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind, Shape, Sharding,
         ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError,
-        UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn,
+        UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -575,6 +575,93 @@ mod tests {
             shard_host_bytes(signed.rem(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
             vec![255, 0],
         );
+    }
+
+    #[test]
+    fn test_eager_floor() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // Compare encodings to distinguish signed zeros as well as the rounding direction at ties.
+        let input = f32_vector(&client, &mesh, &[-0.0, 0.0, -0.25, 0.25, -0.5, 0.5, 1.5, 2.5]);
+        assert_eq!(
+            read_f32s(&input.floor().unwrap()).into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+            [-0.0f32, 0.0, -1.0, 0.0, -1.0, 0.0, 1.0, 2.0].map(f32::to_bits),
+        );
+
+        // Exponent-only floats cannot represent zero; rounding to zero must produce NaN instead of failing.
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F8E8M0FNU, &[4]),
+            mesh.clone(),
+            &[125, 126, 127, 255], // 0.25, 0.5, 1.0, NaN.
+        )
+        .unwrap();
+        let output = input.floor().unwrap();
+        let values = shard_host_bytes(output.addressable_shards().next().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(f8e8m0fnu::from_bits)
+            .collect::<Vec<_>>();
+        assert_eq!(values.iter().copied().map(f8e8m0fnu::is_nan).collect::<Vec<_>>(), [true, true, false, true]);
+        assert_eq!(values[2], f8e8m0fnu::from_bits(127));
+    }
+
+    #[test]
+    fn test_eager_ceil() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // Compare encodings to distinguish signed zeros as well as the rounding direction at ties.
+        let input = f32_vector(&client, &mesh, &[-0.0, 0.0, -0.25, 0.25, -0.5, 0.5, 1.5, 2.5]);
+        assert_eq!(
+            read_f32s(&input.ceil().unwrap()).into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+            [-0.0f32, 0.0, -0.0, 1.0, -0.0, 1.0, 2.0, 3.0].map(f32::to_bits),
+        );
+
+        // Upward rounding stays representable in the exponent-only format, while NaN remains NaN.
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F8E8M0FNU, &[4]),
+            mesh.clone(),
+            &[125, 126, 127, 255], // 0.25, 0.5, 1.0, NaN.
+        )
+        .unwrap();
+        let output = input.ceil().unwrap();
+        let values = shard_host_bytes(output.addressable_shards().next().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(f8e8m0fnu::from_bits)
+            .collect::<Vec<_>>();
+        assert_eq!(&values[..3], &[f8e8m0fnu::from_bits(127); 3]);
+        assert!(values[3].is_nan());
+    }
+
+    #[test]
+    fn test_eager_round() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // Compare encodings to distinguish signed zeros as well as the rounding direction at ties.
+        let input = f32_vector(&client, &mesh, &[-0.0, 0.0, -0.25, 0.25, -0.5, 0.5, 1.5, 2.5]);
+        assert_eq!(
+            read_f32s(&input.round().unwrap()).into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+            [-0.0f32, 0.0, -0.0, 0.0, -0.0, 0.0, 2.0, 2.0].map(f32::to_bits),
+        );
+
+        // Exponent-only floats cannot represent zero; rounding to zero must produce NaN instead of failing.
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F8E8M0FNU, &[4]),
+            mesh.clone(),
+            &[125, 126, 127, 255], // 0.25, 0.5, 1.0, NaN.
+        )
+        .unwrap();
+        let output = input.round().unwrap();
+        let values = shard_host_bytes(output.addressable_shards().next().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(f8e8m0fnu::from_bits)
+            .collect::<Vec<_>>();
+        assert_eq!(values.iter().copied().map(f8e8m0fnu::is_nan).collect::<Vec<_>>(), [true, true, false, true]);
+        assert_eq!(values[2], f8e8m0fnu::from_bits(127));
     }
 
     /// Asserts elementwise value agreement between the XLA-backed eager array backend and the `ryft-core`

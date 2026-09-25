@@ -10,9 +10,9 @@
 //! Only real floating-point inputs are supported, similar to StableHLO's
 //! [`ceil`](https://openxla.org/stablehlo/spec#ceil), [`floor`](https://openxla.org/stablehlo/spec#floor), and
 //! [`round_nearest_even`](https://openxla.org/stablehlo/spec#round_nearest_even). The output keeps the element type
-//! and array metadata of the input, NaNs and signed zeros pass through unchanged, and inputs that carry partial sums
-//! over unreduced mesh axes are rejected. Every operation is piecewise constant, so its tangents and cotangents are
-//! zero/
+//! and array metadata of the input. NaNs remain NaN, signed zeros are preserved, and inputs that carry partial sums
+//! over unreduced mesh axes are rejected. A zero output in [`DataType::F8E8M0FNU`](crate::DataType::F8E8M0FNU), which
+//! has no zero encoding, becomes NaN. Tangents and cotangents are zero everywhere, including at discontinuities.
 //!
 //! # Example
 //!
@@ -38,9 +38,9 @@ pub const CEIL_OPERATION_NAME: &str = "ceil";
 define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise ceiling of one value (i.e., `x ↦ ⌈x⌉`, rounding
-    /// toward positive infinity) while preserving its array metadata. Matching the input constraints of StableHLO's
-    /// [`ceil`](https://openxla.org/stablehlo/spec#ceil), only real floating-point inputs are supported, and inputs
-    /// that still carry partial sums are rejected.
+    /// toward positive infinity) while preserving its array metadata. Only real floating-point inputs are supported,
+    /// and inputs that still carry partial sums are rejected. Refer to the documentation of StableHLO's
+    /// [`ceil`](https://openxla.org/stablehlo/spec#ceil) for the elementwise semantics.
     CeilOperation,
     CEIL_OPERATION_NAME,
     Ceil,
@@ -93,9 +93,9 @@ pub const FLOOR_OPERATION_NAME: &str = "floor";
 define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise floor of one value (i.e., `x ↦ ⌊x⌋`, rounding
-    /// toward negative infinity) while preserving its array metadata. Matching the input constraints of StableHLO's
-    /// [`floor`](https://openxla.org/stablehlo/spec#floor), only real floating-point inputs are supported, and inputs
-    /// that still carry partial sums are rejected.
+    /// toward negative infinity) while preserving its array metadata. Only real floating-point inputs are supported,
+    /// and inputs that still carry partial sums are rejected. Refer to the documentation of StableHLO's
+    /// [`floor`](https://openxla.org/stablehlo/spec#floor) for the elementwise semantics.
     FloorOperation,
     FLOOR_OPERATION_NAME,
     Floor,
@@ -148,9 +148,9 @@ pub const ROUND_OPERATION_NAME: &str = "round";
 define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that rounds one value elementwise to the nearest integer, with ties resolved
-    /// toward the nearest even integer, while preserving its array metadata. Matching the input constraints of
-    /// StableHLO's [`round_nearest_even`](https://openxla.org/stablehlo/spec#round_nearest_even), only real
-    /// floating-point inputs are supported, and inputs that still carry partial sums are rejected.
+    /// toward the even integer, while preserving its array metadata. Only real floating-point inputs are supported,
+    /// and inputs that still carry partial sums are rejected. Refer to the documentation of StableHLO's
+    /// [`round_nearest_even`](https://openxla.org/stablehlo/spec#round_nearest_even) for the elementwise semantics.
     RoundOperation,
     ROUND_OPERATION_NAME,
     Round,
@@ -163,8 +163,11 @@ impl_differentiable_elementwise_operation!(@constant RoundOperation);
 
 define_elementwise_capability!(
     @unary
-    /// Represents the ability to round elementwise to the nearest even integer. Concrete arrays compute immediately
-    /// while context-carrying values apply [`RoundOperation`] through their context.
+    /// Represents the ability to round elementwise to the nearest integer, resolving ties toward even. Concrete arrays
+    /// compute immediately while context-carrying values apply [`RoundOperation`] through their context.
+    ///
+    /// Note that for Rust floating-point primitives, you must use `Round::round(&value)` to select this capability.
+    /// Their inherent `value.round()` function instead resolves ties away from zero.
     Round,
     /// Rounds each element to the nearest integer, resolving ties toward the even integer. Returns an error if the
     /// input types or metadata are unsupported.
@@ -202,8 +205,9 @@ mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayType, DataType, f8e8m0fnu};
     use crate::contexts::EagerContext;
+    use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -290,6 +294,15 @@ mod tests {
     }
 
     #[test]
+    fn test_ceil_differentiation_discontinuity() {
+        // The declared derivative stays zero at jumps, where a finite-difference estimate is not applicable.
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0f64).unwrap()).jvp(Array::scalar(1.0f64).unwrap(), |input| input.ceil()),
+            Ok((Array::scalar(2.0f64).unwrap(), Array::scalar(0.0f64).unwrap())),
+        );
+    }
+
+    #[test]
     fn test_ceil_transposition() {
         check_operation_transposition!(
             @exact,
@@ -308,30 +321,39 @@ mod tests {
         assert_eq!(Array::scalar(-2.7f64).unwrap().ceil().unwrap(), Array::scalar(-2.0f64).unwrap());
         assert_eq!(
             Array::scalar(bf16::from_f32(2.3)).unwrap().ceil().unwrap(),
-            Array::scalar(bf16::from_f32(2.3f32.ceil())).unwrap(),
+            Array::scalar(bf16::from_f32(3.0)).unwrap(),
         );
         assert_eq!(
             Array::scalar(f16::from_f32(2.3)).unwrap().ceil().unwrap(),
-            Array::scalar(f16::from_f32(2.3f32.ceil())).unwrap(),
+            Array::scalar(f16::from_f32(3.0)).unwrap(),
         );
 
-        // NaNs pass through unchanged.
-        assert!(Array::scalar(f64::NAN).unwrap().ceil().unwrap().to_f64s()[0].is_nan());
-
+        // Compare encodings because floating-point equality does not distinguish signed zeros.
+        let output = Array::vector(vec![-1.5f64, -0.25, -0.0, 0.0, 1.0, 2.5, 3.5]).unwrap().ceil().unwrap();
         assert_eq!(
-            Array::vector(vec![0.7, 1.0, -1.5]).unwrap().ceil().unwrap(),
-            Array::vector(vec![1.0, 1.0, -1.0]).unwrap(),
+            output.elements::<f64>().unwrap().into_iter().map(f64::to_bits).collect::<Vec<_>>(),
+            [-1.0f64, -0.0, -0.0, 0.0, 1.0, 3.0, 4.0].map(f64::to_bits).to_vec(),
         );
 
-        assert_eq!(
-            Array::vector(vec![-1.5f64, -0.0, 2.5, 3.5]).unwrap().ceil().unwrap(),
-            Array::vector(vec![-1.0, -0.0, 3.0, 4.0]).unwrap(),
-        );
+        // Both quiet and signaling NaNs remain NaN; their payloads need not be preserved.
+        let output = Array::vector(vec![f64::NAN, f64::from_bits(0x7ff0_0000_0000_0001)]).unwrap().ceil().unwrap();
+        let elements = output.elements::<f64>().unwrap();
+        assert!(elements[0].is_nan());
+        assert!(elements[1].is_nan());
     }
 
     #[test]
-    fn test_ceil_for_primitives() {
-        assert_eq!(Ceil::ceil(&1.25f64), Ok(2.0));
+    fn test_array_ceil_unsigned_float() {
+        // The ceiling is representable even though this format has no zero.
+        let input = Array::scalar(f8e8m0fnu::from_f64(0.25).unwrap()).unwrap();
+        let output = input.ceil().unwrap();
+        assert_eq!(output.elements::<f8e8m0fnu>(), Ok(vec![f8e8m0fnu::from_f64(1.0).unwrap()]));
+    }
+
+    #[test]
+    fn test_ceil_primitives() {
+        assert_eq!(Ceil::ceil(&1.25f32), Ok(2.0));
+        assert_eq!(Ceil::ceil(&-1.25f64), Ok(-1.0));
     }
 
     #[test]
@@ -410,6 +432,15 @@ mod tests {
     }
 
     #[test]
+    fn test_floor_differentiation_discontinuity() {
+        // The declared derivative stays zero at jumps, where a finite-difference estimate is not applicable.
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0f64).unwrap()).jvp(Array::scalar(1.0f64).unwrap(), |input| input.floor()),
+            Ok((Array::scalar(2.0f64).unwrap(), Array::scalar(0.0f64).unwrap())),
+        );
+    }
+
+    #[test]
     fn test_floor_transposition() {
         check_operation_transposition!(
             @exact,
@@ -428,30 +459,39 @@ mod tests {
         assert_eq!(Array::scalar(-2.3f64).unwrap().floor().unwrap(), Array::scalar(-3.0f64).unwrap());
         assert_eq!(
             Array::scalar(bf16::from_f32(2.7)).unwrap().floor().unwrap(),
-            Array::scalar(bf16::from_f32(2.7f32.floor())).unwrap(),
+            Array::scalar(bf16::from_f32(2.0)).unwrap(),
         );
         assert_eq!(
             Array::scalar(f16::from_f32(2.7)).unwrap().floor().unwrap(),
-            Array::scalar(f16::from_f32(2.7f32.floor())).unwrap(),
+            Array::scalar(f16::from_f32(2.0)).unwrap(),
         );
 
-        // NaNs pass through unchanged.
-        assert!(Array::scalar(f64::NAN).unwrap().floor().unwrap().to_f64s()[0].is_nan());
-
+        // Compare encodings because floating-point equality does not distinguish signed zeros.
+        let output = Array::vector(vec![-1.5f64, -0.0, 0.0, 0.25, 1.0, 2.5, 3.5]).unwrap().floor().unwrap();
         assert_eq!(
-            Array::vector(vec![-0.7, 0.0, 2.5]).unwrap().floor().unwrap(),
-            Array::vector(vec![-1.0, 0.0, 2.0]).unwrap(),
+            output.elements::<f64>().unwrap().into_iter().map(f64::to_bits).collect::<Vec<_>>(),
+            [-2.0f64, -0.0, 0.0, 0.0, 1.0, 2.0, 3.0].map(f64::to_bits).to_vec(),
         );
 
-        assert_eq!(
-            Array::vector(vec![-1.5f64, -0.0, 2.5, 3.5]).unwrap().floor().unwrap(),
-            Array::vector(vec![-2.0, -0.0, 2.0, 3.0]).unwrap(),
-        );
+        // Both quiet and signaling NaNs remain NaN; their payloads need not be preserved.
+        let output = Array::vector(vec![f64::NAN, f64::from_bits(0x7ff0_0000_0000_0001)]).unwrap().floor().unwrap();
+        let elements = output.elements::<f64>().unwrap();
+        assert!(elements[0].is_nan());
+        assert!(elements[1].is_nan());
     }
 
     #[test]
-    fn test_floor_for_primitives() {
-        assert_eq!(Floor::floor(&1.75f64), Ok(1.0));
+    fn test_array_floor_unsigned_float() {
+        // Zero has no encoding in this format, so the output is NaN instead of an error.
+        let input = Array::scalar(f8e8m0fnu::from_f64(0.25).unwrap()).unwrap();
+        let output = input.floor().unwrap();
+        assert!(output.elements::<f8e8m0fnu>().unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn test_floor_primitives() {
+        assert_eq!(Floor::floor(&1.75f32), Ok(1.0));
+        assert_eq!(Floor::floor(&-1.75f64), Ok(-2.0));
     }
 
     #[test]
@@ -530,6 +570,15 @@ mod tests {
     }
 
     #[test]
+    fn test_round_differentiation_discontinuity() {
+        // The declared derivative stays zero at jumps, where a finite-difference estimate is not applicable.
+        assert_eq!(
+            differentiate_at(Array::scalar(2.5f64).unwrap()).jvp(Array::scalar(1.0f64).unwrap(), |input| input.round()),
+            Ok((Array::scalar(2.0f64).unwrap(), Array::scalar(0.0f64).unwrap())),
+        );
+    }
+
+    #[test]
     fn test_round_transposition() {
         check_operation_transposition!(
             @exact,
@@ -545,36 +594,42 @@ mod tests {
     #[test]
     fn test_array_round() {
         // Ties resolve toward the nearest even integer.
-        assert_eq!(Array::scalar(2.5f64).unwrap().round().unwrap(), Array::scalar(2.0f64).unwrap());
-        assert_eq!(Array::scalar(3.5f64).unwrap().round().unwrap(), Array::scalar(4.0f64).unwrap());
         assert_eq!(Array::scalar(-2.5f32).unwrap().round().unwrap(), Array::scalar(-2.0f32).unwrap());
         assert_eq!(Array::scalar(2.3f64).unwrap().round().unwrap(), Array::scalar(2.0f64).unwrap());
         assert_eq!(
             Array::scalar(bf16::from_f32(2.5)).unwrap().round().unwrap(),
-            Array::scalar(bf16::from_f32(2.0)).unwrap()
+            Array::scalar(bf16::from_f32(2.0)).unwrap(),
         );
         assert_eq!(
             Array::scalar(f16::from_f32(3.5)).unwrap().round().unwrap(),
-            Array::scalar(f16::from_f32(4.0)).unwrap()
+            Array::scalar(f16::from_f32(4.0)).unwrap(),
         );
 
-        // NaNs pass through unchanged.
-        assert!(Array::scalar(f64::NAN).unwrap().round().unwrap().to_f64s()[0].is_nan());
-
+        // Compare encodings because floating-point equality does not distinguish signed zeros.
+        let output = Array::vector(vec![-2.5f64, -1.5, -0.5, -0.0, 0.0, 0.5, 1.5, 2.5, 3.5]).unwrap().round().unwrap();
         assert_eq!(
-            Array::vector(vec![0.5, 1.5, -2.5]).unwrap().round().unwrap(),
-            Array::vector(vec![0.0, 2.0, -2.0]).unwrap(),
+            output.elements::<f64>().unwrap().into_iter().map(f64::to_bits).collect::<Vec<_>>(),
+            [-2.0f64, -2.0, -0.0, -0.0, 0.0, 0.0, 2.0, 2.0, 4.0].map(f64::to_bits).to_vec(),
         );
 
-        assert_eq!(
-            Array::vector(vec![-1.5f64, -0.0, 2.5, 3.5]).unwrap().round().unwrap(),
-            Array::vector(vec![-2.0, -0.0, 2.0, 4.0]).unwrap(),
-        );
+        // Both quiet and signaling NaNs remain NaN; their payloads need not be preserved.
+        let output = Array::vector(vec![f64::NAN, f64::from_bits(0x7ff0_0000_0000_0001)]).unwrap().round().unwrap();
+        let elements = output.elements::<f64>().unwrap();
+        assert!(elements[0].is_nan());
+        assert!(elements[1].is_nan());
     }
 
     #[test]
-    fn test_round_for_primitives() {
-        assert_eq!(Round::round(&2.5f64), Ok(2.0));
+    fn test_array_round_unsigned_float() {
+        // Zero has no encoding in this format, so the output is NaN instead of an error.
+        let input = Array::scalar(f8e8m0fnu::from_f64(0.25).unwrap()).unwrap();
+        let output = input.round().unwrap();
+        assert!(output.elements::<f8e8m0fnu>().unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn test_round_primitives() {
+        assert_eq!(Round::round(&2.5f32), Ok(2.0));
         assert_eq!(Round::round(&3.5f64), Ok(4.0));
     }
 }

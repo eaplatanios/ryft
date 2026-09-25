@@ -20,7 +20,6 @@
 //! ```
 
 use std::f64::consts::FRAC_2_SQRT_PI;
-use std::ops::{Mul as StandardMul, Neg as StandardNeg};
 
 use crate::arrays::RealFloatingPointArrayElement;
 use crate::macros::{
@@ -54,7 +53,7 @@ impl_differentiable_elementwise_operation! {
     jvp<C>
     where
         C::Type: ElementType,
-        C::Value: Exp + StandardMul<Output = C::Value> + StandardNeg<Output = C::Value>,
+        C::Value: Exp + std::ops::Mul<Output = C::Value> + std::ops::Neg<Output = C::Value>,
         <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
     {
         // d(erf(x)) = (2/√π) · exp(-x²) · dx, with the coefficient `2/√π` rounded to the aligned input's element

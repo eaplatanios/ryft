@@ -288,18 +288,20 @@ pub trait FloatingPointArrayElement: NumericArrayElement {
 
 /// [`NumericArrayElement`] type that supports functions specific to real-valued floating-point elements. This trait
 /// combines [`FloatingPointArrayElement`] with [`RealArrayElement`], excluding both complex elements and integers.
-/// Except for [`erf`](Self::erf), functions use the working precision and result conversion described by
-/// [`FloatingPointArrayElement`].
+/// Functions use the working precision described by [`FloatingPointArrayElement`], except for [`erf`](Self::erf).
+/// Rounding functions convert their outputs numerically using [`ArrayElement::from_real`]. Other functions use the
+/// result conversion described by [`FloatingPointArrayElement`].
 pub trait RealFloatingPointArrayElement: FloatingPointArrayElement + RealArrayElement {
     /// Rounds toward negative infinity, preserving already integral values, signed zeros, infinities, and NaNs
-    /// subject to conversion back to the destination format.
+    /// subject to conversion back to the destination format. An unrepresentable zero becomes NaN for [`f8e8m0fnu`].
     fn floor(self) -> Result<Self, ProgramError>;
 
     /// Rounds toward positive infinity, with the same conversion behavior as [`floor`](Self::floor).
     fn ceil(self) -> Result<Self, ProgramError>;
 
     /// Rounds to the nearest integer, resolving exact half-way cases toward the even integer. Preserves signed
-    /// zero when the rounded value is zero, subject to the destination format's representation.
+    /// zero when the rounded value is zero, subject to the destination format's representation. An unrepresentable
+    /// zero becomes NaN for [`f8e8m0fnu`].
     fn round(self) -> Result<Self, ProgramError>;
 
     /// Computes `log(1 + self)` without first rounding `1 + self`, preserving accuracy near zero. Inputs below
@@ -1784,20 +1786,22 @@ macro_rules! impl_floating_point_array_element_for_real_floating_point_types {
             }
         }
 
+        // Rounded working values widen exactly to `f64`. Numerical conversion, unlike checked literal
+        // construction, maps a zero result to NaN when the destination is the exponent-only format.
         impl RealFloatingPointArrayElement for $type {
             #[inline]
             fn floor(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::floor(($decode)(self)))
+                Self::from_real(<$work>::floor(($decode)(self)) as f64)
             }
 
             #[inline]
             fn ceil(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::ceil(($decode)(self)))
+                Self::from_real(<$work>::ceil(($decode)(self)) as f64)
             }
 
             #[inline]
             fn round(self) -> Result<Self, ProgramError> {
-                ($encode)(<$work>::round_ties_even(($decode)(self)))
+                Self::from_real(<$work>::round_ties_even(($decode)(self)) as f64)
             }
 
             #[inline]
@@ -3568,6 +3572,7 @@ mod tests {
         assert_eq!(RealFloatingPointArrayElement::floor(-0.0f64).unwrap().to_bits(), (-0.0f64).to_bits());
         assert_eq!(RealFloatingPointArrayElement::floor(f64::INFINITY), Ok(f64::INFINITY));
         assert!(RealFloatingPointArrayElement::floor(f64::NAN).unwrap().is_nan());
+        assert_eq!(RealFloatingPointArrayElement::floor(f8e8m0fnu::from_f64(0.25).unwrap()).unwrap().to_bits(), 0xff,);
     }
 
     #[test]
@@ -3578,6 +3583,10 @@ mod tests {
         assert_eq!(RealFloatingPointArrayElement::ceil(-0.5f64).unwrap().to_bits(), (-0.0f64).to_bits());
         assert_eq!(RealFloatingPointArrayElement::ceil(f64::NEG_INFINITY), Ok(f64::NEG_INFINITY));
         assert!(RealFloatingPointArrayElement::ceil(f64::NAN).unwrap().is_nan());
+        assert_eq!(
+            RealFloatingPointArrayElement::ceil(f8e8m0fnu::from_f64(0.25).unwrap()),
+            Ok(f8e8m0fnu::from_f64(1.0).unwrap()),
+        );
     }
 
     #[test]
@@ -3591,6 +3600,7 @@ mod tests {
         assert_eq!(RealFloatingPointArrayElement::round(f4e2m1fn::from_f64(1.5).unwrap()).unwrap().to_bits(), 0x4);
         assert_eq!(RealFloatingPointArrayElement::round(f64::INFINITY), Ok(f64::INFINITY));
         assert!(RealFloatingPointArrayElement::round(f64::NAN).unwrap().is_nan());
+        assert_eq!(RealFloatingPointArrayElement::round(f8e8m0fnu::from_f64(0.5).unwrap()).unwrap().to_bits(), 0xff,);
     }
 
     #[test]
