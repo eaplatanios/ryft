@@ -199,9 +199,9 @@ pub trait NumericArrayElement: ArrayElement {
     /// Multiplies this element by `rhs`, with the same wrapping, rounding, and error rules as [`add`](Self::add).
     fn mul(self, rhs: Self) -> Result<Self, ProgramError>;
 
-    /// Divides this element by `rhs`. Integer division truncates toward zero and returns an error for a zero divisor
-    /// or for signed overflow. Real floating-point division uses IEEE arithmetic followed by the destination format's
-    /// rounding and representability rules. Complex division uses a ratio-based formula to avoid squaring the
+    /// Divides this element by `rhs`. Integer division truncates toward zero, returns all-one bits for a zero divisor,
+    /// and wraps signed overflow. Real floating-point division uses IEEE arithmetic followed by the destination
+    /// format's rounding and representability rules. Complex division uses a ratio-based formula to avoid squaring the
     /// denominator, with explicit recovery for zero divisors and infinite operands when both result components would
     /// otherwise be NaN. Intermediate overflow can still produce NaN components.
     fn div(self, rhs: Self) -> Result<Self, ProgramError>;
@@ -221,8 +221,8 @@ pub trait NumericArrayElement: ArrayElement {
 
 /// [`RealArrayElement`] type that supports arithmetic operations that are specific to real-valued numbers.
 pub trait RealArrayElement: NumericArrayElement {
-    /// Computes the truncating remainder of this element divided by `rhs`. Integer zero divisors return an error. The
-    /// minimum signed integer modulo `-1` is zero. Real floating-point results have the dividend's sign and use the
+    /// Computes the truncating remainder of this element divided by `rhs`. Integer zero divisors return the dividend.
+    /// The minimum signed integer modulo `-1` is zero. Real floating-point results have the dividend's sign and use the
     /// destination format's rounding and representability rules.
     fn rem(self, rhs: Self) -> Result<Self, ProgramError>;
 }
@@ -239,11 +239,13 @@ pub trait FloatingPointArrayElement: NumericArrayElement {
     fn pow(self, exponent: Self) -> Result<Self, ProgramError>;
 
     /// Computes the principal square root. Negative real inputs produce NaN when representable. Complex inputs use
-    /// the principal branch and retain the imaginary component's sign on the negative real axis.
+    /// the principal branch and retain the imaginary component's sign on the negative real axis. Scaling avoids
+    /// overflow when finite complex components have an unrepresentable magnitude.
     fn sqrt(self) -> Result<Self, ProgramError>;
 
     /// Computes the reciprocal of the principal square root, with the same branch as [`sqrt`](Self::sqrt).
-    /// Real zero produces a signed infinity before conversion to the destination format.
+    /// Real zero produces a signed infinity before conversion to the destination format. Complex zero produces
+    /// an infinite real component and a NaN imaginary component; infinite components otherwise produce signed zeros.
     fn rsqrt(self) -> Result<Self, ProgramError>;
 
     /// Computes the sine, with real arguments measured in radians. Complex arguments use the analytic continuation;
@@ -1414,21 +1416,12 @@ macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
             }
 
             fn div(self, rhs: Self) -> Result<Self, ProgramError> {
+                // Integer array arithmetic is total (i.e., zero divisors produce all-one bits and overflow wraps).
                 if rhs.value() == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer scalar of data type `{}` by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
+                    return Self::from_signed(-1);
                 }
-                if self == Self::MIN && rhs.value() == -1 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide the minimum integer scalar of data type `{}` by -1",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(Self::new(self.value() / rhs.value()).unwrap())
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(self.value().wrapping_div(rhs.value()) as u8 & bit_mask).unwrap())
             }
 
             fn abs(self) -> Result<Self, ProgramError> {
@@ -1451,11 +1444,7 @@ macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
         impl RealArrayElement for $type {
             fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
                 if rhs.value() == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot compute the remainder of an integer scalar of data type `{}` with a zero divisor",
-                        Self::data_type(),
-                    ))
-                    .into());
+                    return Ok(self);
                 }
                 let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
                 Ok(Self::from_bits(self.value().wrapping_rem(rhs.value()) as u8 & bit_mask).unwrap())
@@ -1538,11 +1527,7 @@ macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
 
             fn div(self, rhs: Self) -> Result<Self, ProgramError> {
                 if rhs.value() == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer scalar of data type `{}` by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
+                    return Ok(Self::MAX);
                 }
                 Ok(Self::new(self.value() / rhs.value()).unwrap())
             }
@@ -1567,11 +1552,7 @@ macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
         impl RealArrayElement for $type {
             fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
                 if rhs.value() == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot compute the remainder of an integer scalar of data type `{}` with a zero divisor",
-                        Self::data_type(),
-                    ))
-                    .into());
+                    return Ok(self);
                 }
                 Ok(Self::new(self.value() % rhs.value()).unwrap())
             }
@@ -1653,20 +1634,9 @@ macro_rules! impl_array_element_for_integer_types {
 
             fn div(self, rhs: Self) -> Result<Self, ProgramError> {
                 if rhs == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer scalar of data type `{}` by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
+                    return Ok(!0);
                 }
-                if self.checked_div(rhs).is_none() {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide the minimum integer scalar of data type `{}` by -1",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(self / rhs)
+                Ok(self.wrapping_div(rhs))
             }
 
             impl_array_element_for_integer_types!(@$kind);
@@ -1675,11 +1645,7 @@ macro_rules! impl_array_element_for_integer_types {
         impl RealArrayElement for $type {
             fn rem(self, rhs: Self) -> Result<Self, ProgramError> {
                 if rhs == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot compute the remainder of an integer scalar of data type `{}` with a zero divisor",
-                        Self::data_type(),
-                    ))
-                    .into());
+                    return Ok(self);
                 }
                 Ok(self.wrapping_rem(rhs))
             }
@@ -2028,12 +1994,59 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
 
             #[inline]
             fn sqrt(self) -> Result<Self, ProgramError> {
-                Ok(Complex::sqrt(self))
+                // Scale before taking the magnitude as even finite components can have an overflowing norm.
+                if self.im.is_infinite() {
+                    return Ok(Complex::new(<$component>::INFINITY, self.im));
+                }
+
+                if self.re == <$component>::INFINITY {
+                    return Ok(Complex::new(
+                        self.re,
+                        if self.im.is_nan() { self.im } else { (0.0 as $component).copysign(self.im) },
+                    ));
+                }
+
+                if self.re == <$component>::NEG_INFINITY {
+                    return Ok(Complex::new(
+                        if self.im.is_nan() { self.im } else { 0.0 },
+                        <$component>::INFINITY.copysign(self.im),
+                    ));
+                }
+
+                if self.re.is_nan() || self.im.is_nan() {
+                    return Ok(Complex::new(<$component>::NAN, <$component>::NAN));
+                }
+
+                let scale = self.re.abs().max(self.im.abs());
+                if scale == 0.0 {
+                    return Ok(Complex::new(0.0, 0.0));
+                }
+
+                let real = self.re / scale;
+                let imaginary = self.im / scale;
+                let magnitude = scale.sqrt() * ((real.hypot(imaginary) + real.abs()) / 2.0).sqrt();
+                if self.re >= 0.0 {
+                    Ok(Complex::new(magnitude, self.im / (2.0 * magnitude)))
+                } else {
+                    Ok(Complex::new(self.im.abs() / (2.0 * magnitude), magnitude.copysign(self.im)))
+                }
             }
 
             #[inline]
             fn rsqrt(self) -> Result<Self, ProgramError> {
-                Ok(Complex::inv(&Complex::sqrt(self)))
+                // Handle exceptional inputs before division so their defined zeros do not become NaNs.
+                if self.re == 0.0 && self.im == 0.0 {
+                    return Ok(Complex::new(<$component>::INFINITY, <$component>::NAN));
+                }
+
+                if self.re.is_infinite() || (self.im.is_infinite() && self.re.is_nan()) {
+                    return Ok(Complex::new(
+                        (0.0 as $component).copysign(self.re),
+                        -(0.0 as $component).copysign(self.im),
+                    ));
+                }
+
+                NumericArrayElement::div(Complex::new(1.0, 0.0), FloatingPointArrayElement::sqrt(self)?)
             }
 
             fn sin(self) -> Result<Self, ProgramError> {
@@ -2730,7 +2743,7 @@ pub(crate) fn validate_element_bytes(data_type: DataType, element: usize, bytes:
 mod tests {
     use std::collections::HashMap;
 
-    use approx::assert_abs_diff_eq;
+    use approx::{assert_abs_diff_eq, assert_relative_eq};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::types::dimensions::{Dimension, Shape};
@@ -3233,26 +3246,17 @@ mod tests {
 
     #[test]
     fn test_numeric_array_element_div() {
-        // Integer division truncates toward zero and rejects both zero divisors and signed overflow.
+        // Integer division truncates toward zero, returns all-one bits for zero divisors, and wraps overflow.
         assert_eq!(NumericArrayElement::div(-7i32, 2), Ok(-3));
         assert_eq!(NumericArrayElement::div(7u64, 2), Ok(3));
         assert_eq!(NumericArrayElement::div(i4::new(-7).unwrap(), i4::new(2).unwrap()), Ok(i4::new(-3).unwrap()));
         assert_eq!(NumericArrayElement::div(u4::new(7).unwrap(), u4::new(2).unwrap()), Ok(u4::new(3).unwrap()));
-        assert!(matches!(
-            NumericArrayElement::div(1u8, 0),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot divide an integer scalar of data type `u8` by zero",
-        ));
-        assert!(matches!(
-            NumericArrayElement::div(i8::MIN, -1),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot divide the minimum integer scalar of data type `i8` by -1",
-        ));
-        assert!(matches!(
-            NumericArrayElement::div(i1::MIN, i1::MIN),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot divide the minimum integer scalar of data type `i1` by -1",
-        ));
+        assert_eq!(NumericArrayElement::div(1u8, 0), Ok(u8::MAX));
+        assert_eq!(NumericArrayElement::div(1i32, 0), Ok(-1));
+        assert_eq!(NumericArrayElement::div(i8::MIN, -1), Ok(i8::MIN));
+        assert_eq!(NumericArrayElement::div(i1::MIN, i1::MIN), Ok(i1::MIN));
+        assert_eq!(NumericArrayElement::div(i4::one().unwrap(), i4::zero().unwrap()), Ok(i4::new(-1).unwrap()));
+        assert_eq!(NumericArrayElement::div(u4::one().unwrap(), u4::zero().unwrap()), Ok(u4::MAX));
         assert_eq!(NumericArrayElement::div(1.0f32, 0.0), Ok(f32::INFINITY));
         assert_eq!(NumericArrayElement::div(f16::from_f32(3.0), f16::from_f32(2.0)), Ok(f16::from_f32(1.5)));
         assert_eq!(
@@ -3362,11 +3366,10 @@ mod tests {
                 .to_bits(),
             0xa,
         );
-        assert!(matches!(
-            RealArrayElement::rem(1i32, 0),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute the remainder of an integer scalar of data type `i32` with a zero divisor",
-        ));
+        assert_eq!(RealArrayElement::rem(1i32, 0), Ok(1));
+        assert_eq!(RealArrayElement::rem(3u64, 0), Ok(3));
+        assert_eq!(RealArrayElement::rem(i4::MIN, i4::zero().unwrap()), Ok(i4::MIN));
+        assert_eq!(RealArrayElement::rem(u4::MAX, u4::zero().unwrap()), Ok(u4::MAX));
         assert!(matches!(
             RealArrayElement::rem(f4e2m1fn::one().unwrap(), f4e2m1fn::zero().unwrap()),
             Err(ProgramError::Type(TypeError::Invalid { message }))
@@ -3400,6 +3403,33 @@ mod tests {
     }
 
     #[test]
+    fn test_floating_point_array_element_sqrt_complex_extremes() {
+        // These expected values are independently evaluated roots, not calls to the implementation's kernel.
+        let output = FloatingPointArrayElement::sqrt(Complex::new(f64::MAX, f64::MAX)).unwrap();
+        assert_relative_eq!(output.re, 1.4730945569055655e154, epsilon = 0.0, max_relative = 1e-15);
+        assert_relative_eq!(output.im, 6.101757441282702e153, epsilon = 0.0, max_relative = 1e-15);
+        let output = FloatingPointArrayElement::sqrt(Complex::new(f32::MAX, f32::MAX)).unwrap();
+        assert_relative_eq!(output.re, 2.0267144e19, epsilon = 0.0, max_relative = 1e-6);
+        assert_relative_eq!(output.im, 8.3949256e18, epsilon = 0.0, max_relative = 1e-6);
+        let output = FloatingPointArrayElement::sqrt(Complex::new(f64::from_bits(1), 0.0)).unwrap();
+        assert_eq!(output, Complex::new(2.2227587494850775e-162, 0.0));
+        assert_eq!(
+            FloatingPointArrayElement::sqrt(Complex::new(f64::INFINITY, 1.0)),
+            Ok(Complex::new(f64::INFINITY, 0.0)),
+        );
+        assert_eq!(
+            FloatingPointArrayElement::sqrt(Complex::new(f64::NEG_INFINITY, -1.0)),
+            Ok(Complex::new(0.0, f64::NEG_INFINITY)),
+        );
+        assert_eq!(
+            FloatingPointArrayElement::sqrt(Complex::new(f64::NAN, f64::INFINITY)),
+            Ok(Complex::new(f64::INFINITY, f64::INFINITY)),
+        );
+        let output = FloatingPointArrayElement::sqrt(Complex::new(-4.0f64, -0.0)).unwrap();
+        assert_eq!(output, Complex::new(0.0, -2.0));
+    }
+
+    #[test]
     fn test_floating_point_array_element_rsqrt() {
         assert_eq!(FloatingPointArrayElement::rsqrt(4.0f32), Ok(0.5));
         assert_eq!(FloatingPointArrayElement::rsqrt(0.0f64), Ok(f64::INFINITY));
@@ -3407,6 +3437,27 @@ mod tests {
         assert_eq!(FloatingPointArrayElement::rsqrt(f64::INFINITY), Ok(0.0));
         assert!(FloatingPointArrayElement::rsqrt(-1.0f32).unwrap().is_nan());
         assert_eq!(FloatingPointArrayElement::rsqrt(Complex::new(-4.0f64, 0.0)), Ok(Complex::new(0.0, -0.5)));
+    }
+
+    #[test]
+    fn test_floating_point_array_element_rsqrt_complex_extremes() {
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(f64::MAX, f64::MAX)).unwrap();
+        assert_relative_eq!(output.re, 5.79428785879352e-155, epsilon = 0.0, max_relative = 1e-15);
+        assert_relative_eq!(output.im, -2.400072615406037e-155, epsilon = 0.0, max_relative = 1e-15);
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(f32::MAX, f32::MAX)).unwrap();
+        assert_relative_eq!(output.re, 4.211513e-20, epsilon = 0.0, max_relative = 1e-6);
+        assert_relative_eq!(output.im, -1.7444658e-20, epsilon = 0.0, max_relative = 1e-6);
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(f64::from_bits(1), 0.0)).unwrap();
+        assert_eq!(output, Complex::new(4.4989137945431964e161, 0.0));
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(f64::INFINITY, 1.0)).unwrap();
+        assert_eq!(output.re.to_bits(), 0f64.to_bits());
+        assert_eq!(output.im.to_bits(), (-0f64).to_bits());
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(f64::NEG_INFINITY, -1.0)).unwrap();
+        assert_eq!(output.re.to_bits(), (-0f64).to_bits());
+        assert_eq!(output.im.to_bits(), 0f64.to_bits());
+        let output = FloatingPointArrayElement::rsqrt(Complex::new(0.0f64, 0.0)).unwrap();
+        assert_eq!(output.re, f64::INFINITY);
+        assert!(output.im.is_nan());
     }
 
     #[test]

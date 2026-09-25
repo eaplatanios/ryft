@@ -13,17 +13,16 @@
 //!     `exp(y · log(x))` for complex values), and [`Sqrt`] and [`Rsqrt`] compute square roots and reciprocal square
 //!     roots.
 //!
-//! Binary operations promote their element types and broadcast their shapes, same as StableHLO's
-//! [`add`](https://openxla.org/stablehlo/spec#add), [`subtract`](https://openxla.org/stablehlo/spec#subtract),
-//! [`multiply`](https://openxla.org/stablehlo/spec#multiply), [`divide`](https://openxla.org/stablehlo/spec#divide),
-//! [`remainder`](https://openxla.org/stablehlo/spec#remainder), and [`power`](https://openxla.org/stablehlo/spec#power)
-//! operations do. Array operands that carry partial sums over unreduced mesh axes are accepted only where the result
-//! remains a valid partial sum: negation preserves them, sums and differences require both operands to be unreduced
-//! over the same axes, and products permit one unreduced operand when the other is reduced over those same axes.
-//! Every other operation rejects such operands. Refer to the documentation of each operation for the element types
-//! it supports. [`Add`], [`Sub`], [`Mul`], [`Div`], [`Rem`], and [`Neg`] are the fallible counterparts of the
-//! corresponding [`std::ops`] operators, which values additionally implement as panicking sugar. Eager integer
-//! arrays wrap at their element width, whereas the host integer primitives report overflow as an error.
+//! Binary operations promote their element types and broadcast their shapes before applying the corresponding
+//! elementwise arithmetic. Backend operations such as StableHLO's [`add`](https://openxla.org/stablehlo/spec#add)
+//! require these input types and shapes to have already been aligned. Array inputs that carry partial sums over
+//! unreduced mesh axes are accepted only where the output remains a valid partial sum: negation preserves them, sums
+//! and differences require both inputs to be unreduced over the same axes, products permit one unreduced input when the
+//! other is reduced over those same axes, and division permits an unreduced numerator with a denominator reduced over
+//! those axes. Every other operation rejects such inputs. Refer to the documentation of each operation for the element
+//! types it supports. [`Neg`] [`Add`], [`Sub`], [`Mul`], [`Div`], and [`Rem`] are the fallible counterparts of the
+//! corresponding [`std::ops`] operators, which values additionally implement as panicking sugar. Eager integer arrays
+//! wrap at their element width, whereas the host integer primitives report overflow as an error.
 //!
 //! Negation, addition, and subtraction are linear. Multiplication is linear in either operand when the other one is
 //! known, and division is linear in its numerator when its denominator is known, so all of them can be transposed.
@@ -62,6 +61,7 @@ use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::exponential::Log;
+use crate::operations::rounding::Floor;
 use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed};
 use crate::tracing::{Tracer, TracingContext};
 
@@ -93,8 +93,8 @@ define_elementwise_capability!(
     /// Value capability for elementwise addition. Eager values compute directly while contextual values bind
     /// [`AddOperation`]. Failures are returned as [`ProgramError`]s.
     Add,
-    /// Adds `rhs` to this value.
-    add(rhs),
+    /// Adds `right` to this value.
+    add(right),
     AddOperation,
 );
 
@@ -105,14 +105,15 @@ impl_array_elementwise_operation!(
     operation = "add",
     inputs = @numeric,
     checks = [@same_unreduced_axes, @same_reduced_axes],
-    |lhs, rhs| NumericArrayElement::add(lhs, rhs),
+    |left, right| NumericArrayElement::add(left, right),
 );
 
 impl std::ops::Add for Array {
     type Output = Self;
 
-    fn add(self, rhs: Self) -> Self::Output {
-        Add::add(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    #[inline]
+    fn add(self, right: Self) -> Self::Output {
+        Add::add(&self, &right).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -125,8 +126,8 @@ macro_rules! impl_add_for_primitive {
     (@integer $type:ty) => {
         impl Add for $type {
             #[inline]
-            fn add(&self, rhs: &Self) -> Result<Self, ProgramError> {
-                self.checked_add(*rhs).ok_or_else(|| ProgramError::InvalidArgument {
+            fn add(&self, right: &Self) -> Result<Self, ProgramError> {
+                self.checked_add(*right).ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!("`{}` output does not fit in `{}`", ADD_OPERATION_NAME, stringify!($type)),
                 })
             }
@@ -137,8 +138,8 @@ macro_rules! impl_add_for_primitive {
     (@float $type:ty) => {
         impl Add for $type {
             #[inline]
-            fn add(&self, rhs: &Self) -> Result<Self, ProgramError> {
-                Ok(*self + *rhs)
+            fn add(&self, right: &Self) -> Result<Self, ProgramError> {
+                Ok(*self + *right)
             }
         }
     };
@@ -200,14 +201,15 @@ impl_array_elementwise_operation!(
     operation = "sub",
     inputs = @numeric,
     checks = [@same_unreduced_axes, @same_reduced_axes],
-    |lhs, rhs| NumericArrayElement::sub(lhs, rhs),
+    |left, right| NumericArrayElement::sub(left, right),
 );
 
 impl std::ops::Sub for Array {
     type Output = Self;
 
-    fn sub(self, rhs: Self) -> Self::Output {
-        Sub::sub(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    #[inline]
+    fn sub(self, right: Self) -> Self::Output {
+        Sub::sub(&self, &right).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -420,24 +422,21 @@ define_elementwise_capability!(
 );
 
 impl Mul for Array {
-    fn mul(&self, rhs: &Self) -> Result<Self, ProgramError> {
+    fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
         // Multiplication combines reduction states bilinearly rather than requiring congruent operand metadata.
         // Use the operation's inference before evaluating elements so empty inputs obey the same contract.
-        let mut output_types = Operation::infer_output_types(
-            &MulOperation::<ArrayType>::new(),
-            &[self.r#type().into_owned(), rhs.r#type().into_owned()],
-            &[],
-        )?;
-        let output_type = output_types.remove(0);
+        let output_type = MulOperation::<ArrayType>::new()
+            .infer_output_types(&[self.r#type().into_owned(), right.r#type().into_owned()], &[])?
+            .remove(0);
         if Self::element_count(&output_type) == 0 {
             let addressing = ArrayAddressing::new(output_type.clone())?;
             return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
         let data_type = output_type.data_type();
-        let lhs = self.promoted_to(data_type)?;
-        let rhs = rhs.promoted_to(data_type)?;
+        let left = self.promoted_to(data_type)?;
+        let right = right.promoted_to(data_type)?;
         dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            lhs.map_element_pairs::<Element, Element>(&rhs, output_type, NumericArrayElement::mul)
+            left.map_element_pairs::<Element, Element>(&right, output_type, NumericArrayElement::mul)
         })
     }
 }
@@ -446,20 +445,20 @@ impl std::ops::Mul for Array {
     type Output = Self;
 
     #[inline]
-    fn mul(self, rhs: Self) -> Self::Output {
-        Mul::mul(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    fn mul(self, right: Self) -> Self::Output {
+        Mul::mul(&self, &right).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
 impl std::ops::Mul<f64> for Array {
     type Output = Self;
 
-    fn mul(self, rhs: f64) -> Self::Output {
-        // Scales every element by `rhs`, converting `rhs` into this array's element data type first so that scaling
+    fn mul(self, right: f64) -> Self::Output {
+        // Scales every element by `right`, converting `right` into this array's element data type first so that scaling
         // preserves the array's type (e.g., scaling an `f32` array does not promote it to `f64`).
         let data_type = self.r#type().data_type();
         let factor = dispatch_on_array_element_type!(data_type, |Element| {
-            Self::scalar(Element::from_real(rhs).unwrap_or_else(|error| panic!("{error}"))).unwrap()
+            Self::scalar(Element::from_real(right).unwrap_or_else(|error| panic!("{error}"))).unwrap()
         });
         Mul::mul(&self, &factor).unwrap_or_else(|error| panic!("{error}"))
     }
@@ -514,13 +513,48 @@ pub const DIV_OPERATION_NAME: &str = "div";
 define_elementwise_operation!(
     @binary
     /// [`Operation`] that divides two numeric values elementwise, promoting their element types and broadcasting their
-    /// shapes. Array operands that still carry partial sums are rejected, and their reduced-axis markers must agree.
+    /// shapes. Integer division truncates toward zero. A zero integer divisor produces `-1` for signed integers or
+    /// the maximum value for unsigned integers; signed minimum divided by `-1` wraps to itself. A numerator carrying
+    /// partial sums requires a denominator reduced over exactly those axes. Otherwise, reduced-axis markers must agree.
+    /// Denominators carrying partial sums are rejected.
     DivOperation,
     DIV_OPERATION_NAME,
     Div,
     div,
+    infer_array_types = |input_types: &[ArrayType]| {
+        // Division is linear only in its numerator. A partial sum can be divided by a value reduced
+        // over the same axes; the denominator itself must never carry partial sums.
+        let numerator = &input_types[0];
+        let denominator = &input_types[1];
+        if !denominator.unreduced_axes().is_empty() {
+            return Err(TypeError::invalid(format!("`{DIV_OPERATION_NAME}` denominator must not be unreduced")));
+        }
+        let unreduced = numerator.unreduced_axes();
+        if unreduced.is_empty() {
+            check_types!(@same_reduced_axes, DIV_OPERATION_NAME, input_types);
+            return Ok(vec![DivOperation::<ArrayType>::new().infer_elementwise_broadcast_type(input_types)?]);
+        }
+        if unreduced != denominator.reduced_axes() {
+            return Err(TypeError::invalid(format!(
+                "`{DIV_OPERATION_NAME}` requires the denominator to be reduced over the axes the numerator \
+                 is unreduced over",
+            )));
+        }
+        if !numerator.reduced_axes().is_empty() && numerator.reduced_axes() != denominator.reduced_axes() {
+            return Err(TypeError::invalid(format!(
+                "`{DIV_OPERATION_NAME}` inputs must be reduced over the same axes",
+            )));
+        }
+        let stripped = [numerator.without_reduction_axes(), denominator.without_reduction_axes()];
+        let output = DivOperation::<ArrayType>::new().infer_elementwise_broadcast_type(&stripped)?;
+
+        // Non-empty reduction state guarantees that broadcasting retained a mesh.
+        let sharding = output.sharding().unwrap().clone()
+            .with_unreduced_axes(unreduced.clone())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        Ok(vec![output.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?])
+    },
     check_data_types = [@numeric],
-    check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
 impl_differentiable_elementwise_operation! {
@@ -560,22 +594,30 @@ define_elementwise_capability!(
     DivOperation,
 );
 
-impl_array_elementwise_operation!(
-    @binary
-    Div,
-    div,
-    operation = "div",
-    inputs = @numeric,
-    checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| NumericArrayElement::div(lhs, rhs),
-);
+impl Div for Array {
+    fn div(&self, right: &Self) -> Result<Self, ProgramError> {
+        let output_type = DivOperation::<ArrayType>::new()
+            .infer_output_types(&[self.r#type().into_owned(), right.r#type().into_owned()], &[])?
+            .remove(0);
+        if Self::element_count(&output_type) == 0 {
+            let addressing = ArrayAddressing::new(output_type.clone())?;
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
+        }
+        let data_type = output_type.data_type();
+        let left = self.promoted_to(data_type)?;
+        let right = right.promoted_to(data_type)?;
+        dispatch_on_array_element_type!(@numeric data_type, |Element| {
+            left.map_element_pairs::<Element, Element>(&right, output_type, NumericArrayElement::div)
+        })
+    }
+}
 
 impl std::ops::Div for Array {
     type Output = Self;
 
     #[inline]
-    fn div(self, rhs: Self) -> Self::Output {
-        Div::div(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+    fn div(self, right: Self) -> Self::Output {
+        Div::div(&self, &right).unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -632,9 +674,11 @@ pub const REM_OPERATION_NAME: &str = "rem";
 define_elementwise_operation!(
     @binary
     /// [`Operation`] that computes the elementwise remainder of a dividend (its left operand) and a divisor (its right
-    /// operand), promoting their element types and broadcasting their shapes. The result takes the sign of the dividend
-    /// and has magnitude less than the divisor's (i.e., truncation semantics, matching [`std::ops::Rem`]). Only integer
-    /// and floating-point operands are supported. Array operands that still carry partial sums are rejected, and their
+    /// operand), promoting their element types and broadcasting their shapes. For finite inputs with a nonzero divisor,
+    /// the output takes the sign of the dividend and has magnitude less than the divisor's (i.e., truncation semantics,
+    /// matching [`std::ops::Rem`]). Integer arrays return the dividend for a zero divisor and zero for the minimum
+    /// signed value divided by `-1`. Floating-point exceptional inputs follow IEEE arithmetic. Only integer and
+    /// floating-point inputs are supported. Array inputs that still carry partial sums are rejected, and their
     /// reduced-axis markers must agree.
     RemOperation,
     REM_OPERATION_NAME,
@@ -649,17 +693,19 @@ impl_differentiable_elementwise_operation! {
     RemOperation,
     jvp<C>
     where
-        C::Value: Rem
+        C::Value: Abs
+            + Sign
+            + Floor
             + std::ops::Neg<Output = C::Value>
-            + std::ops::Sub<Output = C::Value>
             + std::ops::Mul<Output = C::Value>
             + std::ops::Div<Output = C::Value>,
     {
         // d(rem(x, y)) = dx - trunc(x / y) · dy away from the discontinuities,
-        // with the truncated quotient recovered exactly as (x - rem(x, y)) / y.
+        // using the sign and floor of the floating-point quotient to choose its truncated value.
         |(_, left_tangent), (_, _)| left_tangent;
         |(left, _), (right, right_tangent)| {
-            let truncated_quotient = (left.clone() - left.rem(&right)?) / right;
+            let quotient = left / right;
+            let truncated_quotient = quotient.sign()? * quotient.abs()?.floor()?;
             -(truncated_quotient * right_tangent)
         };
     },
@@ -684,8 +730,17 @@ impl_array_elementwise_operation!(
     operation = "rem",
     inputs = @numeric @real,
     checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| RealArrayElement::rem(lhs, rhs),
+    |left, right| RealArrayElement::rem(left, right),
 );
+
+impl std::ops::Rem for Array {
+    type Output = Self;
+
+    #[inline]
+    fn rem(self, right: Self) -> Self::Output {
+        Rem::rem(&self, &right).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
 
 define_tracer_operator!(
     @binary std::ops::Rem,
@@ -746,9 +801,9 @@ pub const NEG_OPERATION_NAME: &str = "neg";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`] that negates one integer, floating-point, or complex value while preserving its array
-    /// metadata and reduction state. Boolean, token, structural-zero, and the unsigned-only data types like
-    /// [`DataType::F8E8M0FNU`] are rejected.
+    /// [`Operation`] that negates one integer, floating-point, or complex value while preserving its array metadata
+    /// and reduction state. Unsigned integers wrap at their element width. Boolean, token, structural-zero, and the
+    /// unsigned floating-point type [`DataType::F8E8M0FNU`] are rejected.
     NegOperation,
     NEG_OPERATION_NAME,
     Neg,
@@ -783,6 +838,7 @@ define_elementwise_capability!(
 
 impl Neg for Array {
     fn neg(&self) -> Result<Self, ProgramError> {
+        NegOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?;
         if Self::element_count(self.r#type().as_ref()) == 0 {
             let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
             return Ok(Self::new_unchecked(
@@ -791,9 +847,6 @@ impl Neg for Array {
             ));
         }
         let data_type = self.r#type().data_type();
-        if !data_type.is_numeric() {
-            return Err(TypeError::invalid(format!("cannot negate a scalar of data type `{data_type}`")).into());
-        }
         dispatch_on_array_element_type!(@numeric data_type, |Element| {
             self.map_elements::<Element, Element>(self.r#type().into_owned(), <Element as ArrayElement>::neg)
         })
@@ -971,28 +1024,13 @@ define_elementwise_capability!(
 
 impl Abs for Array {
     fn abs(&self) -> Result<Self, ProgramError> {
-        // The absolute value of a complex array is its elementwise magnitude, so the element data type maps to its
-        // real part data type, mirroring the `AbsOperation` type-inference contract.
-        let data_type = match self.r#type().data_type() {
-            DataType::C64 => DataType::F32,
-            DataType::C128 => DataType::F64,
-            other => other,
-        };
-        let output_type = self.r#type().into_owned().with_data_type(data_type);
+        let output_type =
+            AbsOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?.remove(0);
         if Self::element_count(&output_type) == 0 {
             let addressing = ArrayAddressing::new(output_type.clone())?;
             return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
         let input_type = self.r#type().data_type();
-        if !((input_type.is_signed() && input_type != DataType::I1)
-            || input_type.is_floating_point()
-            || input_type.is_complex())
-        {
-            return Err(TypeError::invalid(format!(
-                "cannot compute the absolute value of a scalar of data type `{input_type}`",
-            ))
-            .into());
-        }
         dispatch_on_array_element_type!(@numeric input_type, |Element| {
             self.map_elements::<Element, <Element as NumericArrayElement>::Magnitude>(output_type, |value| {
                 <Element as NumericArrayElement>::abs(value)
@@ -1093,6 +1131,7 @@ define_elementwise_capability!(
 
 impl Sign for Array {
     fn sign(&self) -> Result<Self, ProgramError> {
+        SignOperation::<ArrayType>::new().infer_output_types(&[self.r#type().into_owned()], &[])?;
         if Self::element_count(self.r#type().as_ref()) == 0 {
             let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
             return Ok(Self::new_unchecked(
@@ -1101,11 +1140,6 @@ impl Sign for Array {
             ));
         }
         let data_type = self.r#type().data_type();
-        if !data_type.is_signed() && !data_type.is_floating_point() && !data_type.is_complex() {
-            return Err(
-                TypeError::invalid(format!("cannot compute the sign of a value of data type `{data_type}`")).into()
-            );
-        }
         if data_type.is_signed() {
             dispatch_on_array_element_type!(@signed data_type, |Element| {
                 self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
@@ -1166,12 +1200,12 @@ pub const POW_OPERATION_NAME: &str = "pow";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that raises one value to the power of another elementwise (i.e., `(x, y) ↦ x^y`,
-    /// with the complex power defined as the principal value `exp(y · log(x))`), promoting their element
-    /// types and broadcasting their shapes. Matching the operand constraints of StableHLO's
-    /// [`power`](https://openxla.org/stablehlo/spec#power) for those types, only floating-point and
-    /// complex operands are supported (Ryft restricts the integer forms to keep the operation differentiable).
-    /// Array operands that still carry partial sums are rejected, and their reduced-axis markers must agree.
+    /// [`Operation`] that raises one value to the power of another elementwise (i.e., `(x, y) ↦ x^y`, with the complex
+    /// power defined as the principal value `exp(y · log(x))`), promoting their element types and broadcasting their
+    /// shapes. Only floating-point and complex inputs are supported; integer inputs must first be explicitly converted
+    /// to a supported element type. Refer to the StableHLO [`power`](https://openxla.org/stablehlo/spec#power)
+    /// documentation for the floating-point and complex semantics. Array operands that still carry partial sums
+    /// are rejected, and their reduced-axis markers must agree.
     PowOperation,
     POW_OPERATION_NAME,
     Pow,
@@ -1227,7 +1261,7 @@ impl_array_elementwise_operation!(
     operation = "pow",
     inputs = @float,
     checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| FloatingPointArrayElement::pow(lhs, rhs),
+    |left, right| FloatingPointArrayElement::pow(left, right),
 );
 
 /// Implements [`Pow`] for one host primitive type. Only floating-point primitives are supported, matching the
@@ -1390,7 +1424,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayOperation, ArrayType, DataType, Dimension, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension, StridedLayout, f8e4m3fn, f8e8m0fnu, i2, i4,
+        Sharding, ShardingDimension, StridedLayout, f8e3m4, f8e4m3fn, f8e8m0fnu, i2, i4,
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::{
@@ -1427,30 +1461,27 @@ mod tests {
         );
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let plain = || {
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
-                .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()]).unwrap())
-                .unwrap()
-        };
-        let unreduced = || {
-            plain()
-                .with_sharding(plain().sharding().unwrap().clone().with_unreduced_axes(["x"]).unwrap())
-                .unwrap()
-        };
+        let plain = ArrayType::new_static(DataType::F32, [8])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let unreduced = plain
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
 
         check_operation_type_inference!(
             operation = AddOperation::<ArrayType>::new(),
             cases = [
                 {
-                    input_types = [unreduced(), unreduced()],
-                    output_types = [unreduced()],
+                    input_types = [unreduced.clone(), unreduced.clone()],
+                    output_types = [unreduced.clone()],
                 },
                 {
-                    input_types = [unreduced(), plain()],
+                    input_types = [unreduced.clone(), plain.clone()],
                     error = "`add` operands must be unreduced over the same axes",
                 },
                 {
-                    input_types = [plain(), unreduced()],
+                    input_types = [plain.clone(), unreduced.clone()],
                     error = "`add` operands must be unreduced over the same axes",
                 },
             ],
@@ -1471,7 +1502,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[Array::scalar(2.0f32).unwrap(), Array::scalar(3.5f64).unwrap()],
             ),
-            Ok(vec![Array::scalar(5.5f64).unwrap()])
+            Ok(vec![Array::scalar(5.5f64).unwrap()]),
         );
         assert_eq!(
             AddOperation::<ArrayType>::new().interpret(
@@ -1487,7 +1518,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[
                     Array::scalar(ComplexNumber::new(1.0f64, 2.0)).unwrap(),
-                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap()
+                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap(),
                 ],
             ),
             Ok(vec![Array::scalar(ComplexNumber::new(1.5f64, 1.0)).unwrap()]),
@@ -1667,7 +1698,10 @@ mod tests {
         .unwrap();
         let sum = left.add(&right).unwrap();
         assert_eq!(sum.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2]));
-        assert_eq!(sum.to_f64s(), vec![1.5, 2.25]);
+        assert_eq!(
+            sum.elements::<f8e4m3fn>(),
+            Ok(vec![f8e4m3fn::from_f64(1.5).unwrap(), f8e4m3fn::from_f64(2.25).unwrap()]),
+        );
     }
 
     #[test]
@@ -1722,30 +1756,27 @@ mod tests {
         );
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let plain = || {
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]))
-                .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()]).unwrap())
-                .unwrap()
-        };
-        let unreduced = || {
-            plain()
-                .with_sharding(plain().sharding().unwrap().clone().with_unreduced_axes(["x"]).unwrap())
-                .unwrap()
-        };
+        let plain = ArrayType::new_static(DataType::F32, [8])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let unreduced = plain
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
 
         check_operation_type_inference!(
             operation = SubOperation::<ArrayType>::new(),
             cases = [
                 {
-                    input_types = [unreduced(), unreduced()],
-                    output_types = [unreduced()],
+                    input_types = [unreduced.clone(), unreduced.clone()],
+                    output_types = [unreduced.clone()],
                 },
                 {
-                    input_types = [unreduced(), plain()],
+                    input_types = [unreduced.clone(), plain.clone()],
                     error = "`sub` operands must be unreduced over the same axes",
                 },
                 {
-                    input_types = [plain(), unreduced()],
+                    input_types = [plain.clone(), unreduced.clone()],
                     error = "`sub` operands must be unreduced over the same axes",
                 },
             ],
@@ -1767,7 +1798,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[Array::scalar(2.0f32).unwrap(), Array::scalar(3.5f64).unwrap()],
             ),
-            Ok(vec![Array::scalar(-1.5f64).unwrap()])
+            Ok(vec![Array::scalar(-1.5f64).unwrap()]),
         );
         assert_eq!(
             SubOperation::<ArrayType>::new().interpret(
@@ -1783,7 +1814,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[
                     Array::scalar(ComplexNumber::new(1.0f64, 2.0)).unwrap(),
-                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap()
+                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap(),
                 ],
             ),
             Ok(vec![Array::scalar(ComplexNumber::new(0.5f64, 3.0)).unwrap()]),
@@ -1881,7 +1912,7 @@ mod tests {
         let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(
             vector.sub(&Array::vector(vec![0.5, 1.0, 1.5]).unwrap()).unwrap(),
-            Array::vector(vec![0.5, 1.0, 1.5]).unwrap()
+            Array::vector(vec![0.5, 1.0, 1.5]).unwrap(),
         );
     }
 
@@ -1898,7 +1929,10 @@ mod tests {
             &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();
-        assert_eq!(left.sub(&right).unwrap().to_f64s(), vec![0.5, 1.75]);
+        assert_eq!(
+            left.sub(&right),
+            Array::vector(vec![f8e4m3fn::from_f64(0.5).unwrap(), f8e4m3fn::from_f64(1.75).unwrap()])
+        );
     }
 
     #[test]
@@ -1956,36 +1990,25 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let vector_type = || ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
-        let unreduced = |axis: &str| {
-            vector_type()
-                .with_sharding(
-                    Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
-                        .unwrap()
-                        .with_unreduced_axes([axis])
-                        .unwrap(),
-                )
-                .unwrap()
-        };
-        let reduced = |axis: &str| {
-            vector_type()
-                .with_sharding(
-                    Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
-                        .unwrap()
-                        .with_reduced_axes([axis])
-                        .unwrap(),
-                )
-                .unwrap()
-        };
+        let vector_type = ArrayType::new_static(DataType::F32, [8]);
+        let unreduced_x = vector_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_x = vector_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let reduced_y = vector_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 1).with_reduced_axes(["y"]).unwrap())
+            .unwrap();
 
         // Unreduced over `x` times reduced over `x` is the partial-sum-times-replicated case: the product stays
         // unreduced over `x`, and the reduced marker is cleared.
-        let output = <MulOperation<ArrayType> as Operation>::infer_output_types(
-            &MulOperation::new(),
-            &[unreduced("x"), reduced("x")],
-            &[],
-        )
-        .unwrap();
+        let output = MulOperation::<ArrayType>::new()
+            .infer_output_types(&[unreduced_x.clone(), reduced_x.clone()], &[])
+            .unwrap();
         assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::from(["x".to_string()]));
         assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::new());
 
@@ -1993,7 +2016,7 @@ mod tests {
         check_operation_type_inference!(
             operation = MulOperation::<ArrayType>::new(),
             cases = [{
-                input_types = [unreduced("x"), unreduced("x")],
+                input_types = [unreduced_x.clone(), unreduced_x.clone()],
                 error = format!("`{MUL_OPERATION_NAME}` cannot multiply two operands that are both unreduced"),
             }],
         );
@@ -2002,7 +2025,7 @@ mod tests {
         check_operation_type_inference!(
             operation = MulOperation::<ArrayType>::new(),
             cases = [{
-                input_types = [unreduced("x"), reduced("y")],
+                input_types = [unreduced_x.clone(), reduced_y.clone()],
                 error = format!(
                     "`{MUL_OPERATION_NAME}` requires the second operand to be reduced over the axes the first is \
                      unreduced over",
@@ -2011,12 +2034,9 @@ mod tests {
         );
 
         // Two operands reduced over the same axis multiply to a value reduced over that axis.
-        let output = <MulOperation<ArrayType> as Operation>::infer_output_types(
-            &MulOperation::new(),
-            &[reduced("x"), reduced("x")],
-            &[],
-        )
-        .unwrap();
+        let output = MulOperation::<ArrayType>::new()
+            .infer_output_types(&[reduced_x.clone(), reduced_x.clone()], &[])
+            .unwrap();
         assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::from(["x".to_string()]));
         assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::new());
 
@@ -2025,7 +2045,7 @@ mod tests {
         check_operation_type_inference!(
             operation = MulOperation::<ArrayType>::new(),
             cases = [{
-                input_types = [reduced("x"), vector_type()],
+                input_types = [reduced_x.clone(), vector_type.clone()],
                 error = format!("`{MUL_OPERATION_NAME}` operands must be reduced over the same axes"),
             }],
         );
@@ -2057,15 +2077,10 @@ mod tests {
                 &EmptyRegionDriver,
                 &[
                     Array::scalar(ComplexNumber::new(1.0f64, 2.0)).unwrap(),
-                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap()
+                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap(),
                 ],
             ),
             Ok(vec![Array::scalar(ComplexNumber::new(1.0f64, 2.0) * ComplexNumber::new(0.5f64, -1.0)).unwrap()]),
-        );
-        assert_eq!(Mul::mul(&3usize, &4), Ok(12));
-        assert_eq!(
-            Mul::mul(&usize::MAX, &2),
-            Err(ProgramError::InvalidArgument { message: "`mul` output does not fit in `usize`".to_string() }),
         );
     }
 
@@ -2226,21 +2241,21 @@ mod tests {
         let reduced_type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(sharding.with_reduced_axes(["x"]).unwrap())
             .unwrap();
-        let lhs = Array::from_elements(partial_type.clone(), &[2.0f32, 3.0]).unwrap();
-        let rhs = Array::from_elements(reduced_type, &[4.0f32, 5.0]).unwrap();
+        let left = Array::from_elements(partial_type.clone(), &[2.0f32, 3.0]).unwrap();
+        let right = Array::from_elements(reduced_type, &[4.0f32, 5.0]).unwrap();
         let expected = Array::from_elements(partial_type, &[8.0f32, 15.0]).unwrap();
 
         // A partial sum times an operand reduced over the same mesh axes remains a partial sum in either order.
-        assert_eq!(Mul::mul(&lhs, &rhs), Ok(expected.clone()));
-        assert_eq!(Mul::mul(&rhs, &lhs), Ok(expected));
+        assert_eq!(Mul::mul(&left, &right), Ok(expected.clone()));
+        assert_eq!(Mul::mul(&right, &left), Ok(expected));
 
         // Multiplying two partial sums is invalid, including when no scalar evaluation would occur.
         assert!(matches!(
-            Mul::mul(&lhs, &lhs),
+            Mul::mul(&left, &left),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
                 if message == "`mul` cannot multiply two operands that are both unreduced",
         ));
-        let empty_type = lhs.r#type().into_owned().with_shape(Shape::new(vec![Dimension::Static(0)]));
+        let empty_type = left.r#type().into_owned().with_shape(Shape::new(vec![Dimension::Static(0)]));
         let empty = Array::from_elements(empty_type, &[] as &[f32]).unwrap();
         assert!(matches!(
             Mul::mul(&empty, &empty),
@@ -2262,7 +2277,7 @@ mod tests {
             &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();
-        assert_eq!(Mul::mul(&left, &right).unwrap().to_f64s(), vec![0.5, 0.5]);
+        assert_eq!(Mul::mul(&left, &right), Array::vector(vec![f8e4m3fn::from_f64(0.5).unwrap(); 2]));
     }
 
     #[test]
@@ -2280,6 +2295,10 @@ mod tests {
 
     #[test]
     fn test_mul_primitives() {
+        assert_eq!(
+            Mul::mul(&usize::MAX, &2),
+            Err(ProgramError::InvalidArgument { message: "`mul` output does not fit in `usize`".to_string() }),
+        );
         assert_eq!(Mul::mul(&3usize, &4), Ok(12));
         assert_eq!(
             Mul::mul(&i8::MAX, &2),
@@ -2325,21 +2344,21 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let unreduced_error = || "`div` does not support unreduced operands";
         check_operation_type_inference!(
             operation = DivOperation::<ArrayType>::new(),
             cases = [
                 {
                     input_types = [unreduced.clone(), plain.clone()],
-                    error = unreduced_error(),
+                    error = "`div` requires the denominator to be reduced over the axes \
+                             the numerator is unreduced over",
                 },
                 {
                     input_types = [plain, unreduced.clone()],
-                    error = unreduced_error(),
+                    error = "`div` denominator must not be unreduced",
                 },
                 {
-                    input_types = [unreduced, reduced],
-                    error = unreduced_error(),
+                    input_types = [unreduced.clone(), reduced],
+                    output_types = [unreduced],
                 },
             ],
         );
@@ -2376,7 +2395,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[
                     Array::scalar(ComplexNumber::new(1.0f64, 2.0)).unwrap(),
-                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap()
+                    Array::scalar(ComplexNumber::new(0.5f64, -1.0)).unwrap(),
                 ],
             ) {
                 Ok(outputs) => outputs[0].clone(),
@@ -2509,11 +2528,50 @@ mod tests {
     }
 
     #[test]
+    fn test_div_transposition_low_precision() {
+        // The known denominator must widen explicitly: this format does not implicitly promote with `f32`.
+        check_operation_transposition!(
+            @exact,
+            operation = DivOperation::new(),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::scalar(DataType::F8E3M4))),
+                    (@known, Array::scalar(f8e3m4::from_f64(2.0).unwrap()).unwrap()),
+                ],
+                output_cotangents = [Array::scalar(4.0f32).unwrap()],
+                input_cotangents = [Array::scalar(2.0f32).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_div_transposition_reduced() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let reduced = ArrayType::scalar(DataType::F64)
+            .with_sharding(Sharding::replicated(mesh, 0).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let unreduced = reduced.cotangent().unwrap();
+        // The transpose divides an unreduced output cotangent by the known reduced denominator.
+        check_operation_transposition!(
+            @exact,
+            operation = DivOperation::new(),
+            cases = [{
+                inputs = [
+                    (@linear(type = reduced.clone())),
+                    (@known, Array::from_elements(reduced, &[4.0f64]).unwrap()),
+                ],
+                output_cotangents = [Array::from_elements(unreduced.clone(), &[8.0f64]).unwrap()],
+                input_cotangents = [Array::from_elements(unreduced, &[2.0f64]).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
     fn test_array_div() {
         let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(
             Div::div(&vector, &Array::scalar(2.0).unwrap()).unwrap(),
-            Array::vector(vec![0.5, 1.0, 1.5]).unwrap()
+            Array::vector(vec![0.5, 1.0, 1.5]).unwrap(),
         );
     }
 
@@ -2530,7 +2588,10 @@ mod tests {
             &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();
-        assert_eq!(Div::div(&left, &right).unwrap().to_f64s(), vec![2.0, 8.0]);
+        assert_eq!(
+            Div::div(&left, &right),
+            Array::vector(vec![f8e4m3fn::from_f64(2.0).unwrap(), f8e4m3fn::from_f64(8.0).unwrap()])
+        );
     }
 
     #[test]
@@ -2555,18 +2616,11 @@ mod tests {
 
     #[test]
     fn test_array_div_integers() {
-        // Exceptional integer division inputs return the same structured errors as native-width array
-        // arithmetic rather than panicking.
-        assert!(matches!(
-            Div::div(&Array::vector(vec![1i32]).unwrap(), &Array::vector(vec![0i32]).unwrap()),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot divide an integer scalar of data type `i32` by zero",
-        ));
-        assert!(matches!(
-            Div::div(&Array::vector(vec![i8::MIN]).unwrap(), &Array::vector(vec![-1i8]).unwrap()),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot divide the minimum integer scalar of data type `i8` by -1",
-        ));
+        // Integer quotients truncate toward zero, and exceptional inputs have deterministic wrapped outputs.
+        assert_eq!(Array::scalar(-7i32).unwrap().div(&Array::scalar(2i32).unwrap()), Array::scalar(-3i32));
+        assert_eq!(Array::scalar(1i32).unwrap().div(&Array::scalar(0i32).unwrap()), Array::scalar(-1i32));
+        assert_eq!(Array::scalar(1u8).unwrap().div(&Array::scalar(0u8).unwrap()), Array::scalar(u8::MAX));
+        assert_eq!(Array::scalar(i8::MIN).unwrap().div(&Array::scalar(-1i8).unwrap()), Array::scalar(i8::MIN));
     }
 
     #[test]
@@ -2667,6 +2721,15 @@ mod tests {
     }
 
     #[test]
+    fn test_rem_differentiation_rounded_quotient() {
+        // At a floating-point quotient boundary, the declared derivative uses trunc(x / y), not (x - rem(x, y)) / y.
+        let (_, tangent) = differentiate_at(Array::scalar(0.1f64).unwrap())
+            .jvp(Array::scalar(1.0f64).unwrap(), |divisor| divisor.one_like()?.rem(&divisor))
+            .unwrap();
+        assert_eq!(tangent, Array::scalar(-10.0f64).unwrap());
+    }
+
+    #[test]
     fn test_rem_transposition() {
         check_operation_transposition!(
             @rejected,
@@ -2677,6 +2740,7 @@ mod tests {
 
     #[test]
     fn test_array_rem() {
+        assert_eq!(Array::scalar(7i32).unwrap() % Array::scalar(3i32).unwrap(), Array::scalar(1i32).unwrap());
         assert_eq!(
             Array::scalar(7i32).unwrap().rem(&Array::scalar(3i32).unwrap()).unwrap(),
             Array::scalar(1i32).unwrap(),
@@ -2715,15 +2779,6 @@ mod tests {
             Array::scalar(f16::from_f32(7.5f32 % 2.0f32)).unwrap(),
         );
 
-        // Division by an integer zero reports an error instead of panicking.
-        assert_eq!(
-            Array::scalar(7i32).unwrap().rem(&Array::scalar(0i32).unwrap()),
-            Err(TypeError::invalid(
-                "cannot compute the remainder of an integer scalar of data type `i32` with a zero divisor",
-            )
-            .into()),
-        );
-
         assert_eq!(
             Array::vector(vec![7.5, -7.5]).unwrap().rem(&Array::vector(vec![2.0, 2.0]).unwrap()).unwrap(),
             Array::vector(vec![1.5, -1.5]).unwrap(),
@@ -2743,17 +2798,15 @@ mod tests {
             &[0.5, 0.25].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();
-        assert_eq!(left.rem(&right).unwrap().to_f64s(), vec![0.0, 0.0]);
+        assert_eq!(left.rem(&right), Array::vector(vec![f8e4m3fn::from_f64(0.0).unwrap(); 2]));
     }
 
     #[test]
-    fn test_array_rem_zero_divisor() {
-        // Remainder by zero returns a structured error.
-        assert!(matches!(
-            Array::vector(vec![1u8]).unwrap().rem(&Array::vector(vec![0u8]).unwrap()),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot compute the remainder of an integer scalar of data type `u8` with a zero divisor",
-        ));
+    fn test_array_rem_integers() {
+        // A zero divisor returns the dividend; the minimum signed value is divisible by `-1` without overflowing.
+        assert_eq!(Array::scalar(7i32).unwrap().rem(&Array::scalar(0i32).unwrap()), Array::scalar(7i32));
+        assert_eq!(Array::scalar(1u8).unwrap().rem(&Array::scalar(0u8).unwrap()), Array::scalar(1u8));
+        assert_eq!(Array::scalar(i8::MIN).unwrap().rem(&Array::scalar(-1i8).unwrap()), Array::scalar(0i8));
     }
 
     #[test]
@@ -2778,17 +2831,28 @@ mod tests {
                 output_data_types = [DataType::F64],
             }],
         );
-        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean, DataType::F8E8M0FNU] {
-            let message = format!("`{NEG_OPERATION_NAME}` does not support input data type `{input_type}`");
-            check_operation_type_inference!(
-                @elementwise @unary,
-                operation = NegOperation,
-                cases = [{
-                    input_data_types = [input_type],
-                    error = message,
-                }],
-            );
-        }
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = NegOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::Token],
+                    error = format!("`neg` does not support input data type `{}`", DataType::Token),
+                },
+                {
+                    input_data_types = [DataType::Zero],
+                    error = format!("`neg` does not support input data type `{}`", DataType::Zero),
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = format!("`neg` does not support input data type `{}`", DataType::Boolean),
+                },
+                {
+                    input_data_types = [DataType::F8E8M0FNU],
+                    error = format!("`neg` does not support input data type `{}`", DataType::F8E8M0FNU),
+                },
+            ],
+        );
 
         // Negation is linear, so partial-sum and reduced markers pass through unchanged.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -2916,6 +2980,15 @@ mod tests {
     }
 
     #[test]
+    fn test_array_neg_empty() {
+        // Empty arrays still obey the operation's element-type contract.
+        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
+        assert_eq!(invalid.neg(), Err(TypeError::invalid("`neg` does not support input data type `bool`").into()));
+        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
+        assert_eq!(valid.neg(), Ok(valid));
+    }
+
+    #[test]
     fn test_array_neg_low_precision() {
         // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
         let left = Array::from_elements::<f8e4m3fn>(
@@ -2923,7 +2996,10 @@ mod tests {
             &[1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();
-        assert_eq!(left.neg().unwrap().to_f64s(), vec![-1.0, -2.0]);
+        assert_eq!(
+            left.neg(),
+            Array::vector(vec![f8e4m3fn::from_f64(-1.0).unwrap(), f8e4m3fn::from_f64(-2.0).unwrap()])
+        );
     }
 
     #[test]
@@ -2985,17 +3061,32 @@ mod tests {
             ],
         );
 
-        for input_type in [DataType::Token, DataType::Zero, DataType::Boolean, DataType::I1, DataType::U32] {
-            let message = format!("cannot compute the absolute value of a value of data type `{input_type}`");
-            check_operation_type_inference!(
-                @elementwise @unary,
-                operation = AbsOperation,
-                cases = [{
-                    input_data_types = [input_type],
-                    error = message,
-                }],
-            );
-        }
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = AbsOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::Token],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::Token),
+                },
+                {
+                    input_data_types = [DataType::Zero],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::Zero),
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = "cannot compute the absolute value of a value of data type `bool`",
+                },
+                {
+                    input_data_types = [DataType::I1],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::I1),
+                },
+                {
+                    input_data_types = [DataType::U32],
+                    error = format!("cannot compute the absolute value of a value of data type `{}`", DataType::U32),
+                },
+            ],
+        );
 
         check_operation_type_inference!(
             @reject @unreduced,
@@ -3148,7 +3239,7 @@ mod tests {
         let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.abs()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        assert_eq!(tangent.to_f64s(), vec![3.0]);
+        assert_eq!(tangent.elements::<f32>(), Ok(vec![3.0]));
     }
 
     #[test]
@@ -3169,6 +3260,29 @@ mod tests {
         let magnitude = complex.abs().unwrap();
         assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [1]));
         assert_abs_diff_eq!(magnitude, Array::vector(vec![5.0]).unwrap(), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_array_abs_empty() {
+        // Empty arrays still obey the operation's element-type contract.
+        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
+        assert_eq!(
+            invalid.abs(),
+            Err(TypeError::invalid("cannot compute the absolute value of a value of data type `bool`").into()),
+        );
+        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
+        assert_eq!(valid.abs(), Ok(valid));
+    }
+
+    #[test]
+    fn test_array_abs_unreduced() {
+        // Nonlinear functions cannot preserve a partial sum's meaning by transforming each contribution.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let input = Array::from_elements(input_type, &[-1.0f32]).unwrap();
+        assert_eq!(input.abs(), Err(TypeError::invalid("`abs` does not support unreduced operands").into()));
     }
 
     #[test]
@@ -3327,11 +3441,6 @@ mod tests {
             Array::scalar(f16::from_f32(1.0)).unwrap(),
         );
 
-        // Signed zeros and NaNs pass through unchanged.
-        assert_eq!(Array::scalar(0.0f64).unwrap().sign().unwrap(), Array::scalar(0.0f64).unwrap());
-        assert!(Array::scalar(-0.0f64).unwrap().sign().unwrap().to_f64s()[0].is_sign_negative());
-        assert!(Array::scalar(f64::NAN).unwrap().sign().unwrap().to_f64s()[0].is_nan());
-
         // Complex signs normalize to `z / |z|` and map the origin to itself.
         let input = ComplexNumber::new(3.0f64, -4.0f64);
         assert_abs_diff_eq!(
@@ -3351,7 +3460,30 @@ mod tests {
     }
 
     #[test]
-    fn test_array_sign_typed_storage() {
+    fn test_array_sign_empty() {
+        // Empty arrays still obey the operation's element-type contract.
+        let invalid = Array::from_logical_bytes(ArrayType::new_static(DataType::Boolean, [0]), &[]).unwrap();
+        assert_eq!(
+            invalid.sign(),
+            Err(TypeError::invalid("cannot compute the sign of a value of data type `bool`").into()),
+        );
+        let valid = Array::from_logical_bytes(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap();
+        assert_eq!(valid.sign(), Ok(valid));
+    }
+
+    #[test]
+    fn test_array_sign_unreduced() {
+        // Nonlinear functions cannot preserve a partial sum's meaning by transforming each contribution.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let input = Array::from_elements(input_type, &[-1.0f32]).unwrap();
+        assert_eq!(input.sign(), Err(TypeError::invalid("`sign` does not support unreduced operands").into()));
+    }
+
+    #[test]
+    fn test_array_sign_special_values() {
         // Sign preserves IEEE signed zero and NaN behavior and also covers signed sub-byte integers.
         let signs = Array::from_elements(
             ArrayType::new_static(DataType::F64, [4]),
@@ -3553,7 +3685,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_pow_typed_storage() {
+    fn test_array_pow_promotion_and_broadcasting() {
         // Both inputs promote before broadcasting their independent axes.
         let bases = Array::matrix(2, 1, vec![2.0f32, 3.0]).unwrap();
         let exponents = Array::matrix(1, 3, vec![1.0f64, 2.0, 3.0]).unwrap();
@@ -3650,11 +3782,13 @@ mod tests {
     #[test]
     fn test_sqrt_differentiation_complex() {
         let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_eq!(
+        assert_abs_diff_eq!(
             differentiate_at(Array::scalar(input).unwrap())
                 .holomorphic()
-                .gradient(|input| input.sqrt().unwrap()),
-            Ok(Array::scalar(ComplexNumber::new(1.0, 0.0) / (input.sqrt() + input.sqrt())).unwrap()),
+                .gradient(|input| input.sqrt().unwrap())
+                .unwrap(),
+            Array::scalar(ComplexNumber::new(1.0, 0.0) / (input.sqrt() + input.sqrt())).unwrap(),
+            epsilon = 1e-14,
         );
     }
 
@@ -3670,7 +3804,7 @@ mod tests {
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
 
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
-        assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 / (2.0 * 2.0f64.sqrt()), epsilon = 1e-6);
+        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 3.0 / (2.0 * 2.0f32.sqrt()), epsilon = 1e-6);
 
         // The widened staged tangent program recomputes the denominator in the widened differential representation
         // instead of converting the narrower primal output.
@@ -3712,17 +3846,17 @@ mod tests {
         assert_eq!(Array::scalar(0.25f64).unwrap().sqrt().unwrap(), Array::scalar(0.5f64).unwrap());
         assert_eq!(
             Array::scalar(bf16::from_f32(0.25)).unwrap().sqrt().unwrap(),
-            Array::scalar(bf16::from_f32(0.5)).unwrap()
+            Array::scalar(bf16::from_f32(0.5)).unwrap(),
         );
         assert_eq!(
             Array::scalar(f16::from_f32(0.25)).unwrap().sqrt().unwrap(),
-            Array::scalar(f16::from_f32(0.5)).unwrap()
+            Array::scalar(f16::from_f32(0.5)).unwrap(),
         );
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_abs_diff_eq!(
             Array::scalar(input).unwrap().sqrt().unwrap(),
             Array::scalar(input.sqrt()).unwrap(),
-            epsilon = 1e-12
+            epsilon = 1e-12,
         );
 
         // The principal branch maps the negative real axis to the positive imaginary axis.
@@ -3736,9 +3870,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_sqrt_typed_storage() {
-        assert_eq!(Array::vector(vec![1.0f64, 4.0]).unwrap().sqrt(), Array::vector(vec![1.0f64, 2.0]));
-
+    fn test_array_sqrt_complex() {
         // Complex square roots use the principal branch for each typed element.
         let values = [ComplexNumber::new(1.0f64, 2.0), ComplexNumber::new(0.5f64, -1.0)];
         let input = Array::vector(values.to_vec()).unwrap();
@@ -3868,14 +4000,9 @@ mod tests {
         assert_abs_diff_eq!(
             Array::scalar(input).unwrap().rsqrt().unwrap(),
             Array::scalar(expected).unwrap(),
-            epsilon = 1e-12
+            epsilon = 1e-12,
         );
         assert_eq!(Array::scalar(4.0).unwrap().rsqrt().unwrap(), Array::scalar(0.5).unwrap());
-    }
-
-    #[test]
-    fn test_array_rsqrt_typed_storage() {
-        assert_eq!(Array::vector(vec![1.0f64, 4.0]).unwrap().rsqrt(), Array::vector(vec![1.0f64, 0.5]));
     }
 
     #[test]

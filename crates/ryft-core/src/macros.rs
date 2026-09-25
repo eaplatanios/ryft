@@ -2806,12 +2806,24 @@ macro_rules! impl_differentiable_elementwise_operation {
                             }
                             .into());
                         }
-                        // The checks above guarantee that the right operand is known.
-                        let $transpose_right = $crate::ElementwiseDerivativeAlignment::align_tangent(
-                            inputs[1].as_known().unwrap(),
-                            $crate::Typed::r#type($output_cotangent).as_ref(),
-                            $output_cotangent,
+
+                        // The known coefficient is a primal value: its reduction state need not match the dual
+                        // cotangent's. Let the contribution operation broadcast and promote it without replacing
+                        // that state (e.g., division needs a reduced denominator and an unreduced numerator).
+                        let coefficient = inputs[1].as_known().unwrap();
+                        let coefficient_type = $crate::DifferentiableType::tangent(
+                            $crate::Typed::r#type(coefficient).as_ref(),
                         )?;
+                        let $transpose_right = if $crate::DifferentiableType::is_zero_space(&coefficient_type) {
+                            coefficient.clone()
+                        } else {
+                            // Widen low-precision coefficients in their own geometry and reduction state.
+                            $crate::ElementwiseDerivativeAlignment::align_tangent(
+                                coefficient,
+                                &coefficient_type,
+                                coefficient,
+                            )?
+                        };
                         let contribution = $contribution;
                         $crate::MaybeZero::Value(
                             $crate::ElementwiseDerivativeAlignment::unalign_cotangent(&contribution, &target)?,

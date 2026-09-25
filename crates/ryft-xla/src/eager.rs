@@ -498,6 +498,85 @@ mod tests {
         assert_eq!(cosine.im, 0.0);
     }
 
+    #[test]
+    fn test_eager_arithmetic_one_bit_integers() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // One-bit arithmetic wraps modulo two; StableHLO predicate addition instead performs Boolean OR.
+        for data_type in [DataType::I1, DataType::U1] {
+            let left =
+                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 0, 1, 1])
+                    .unwrap();
+            let right =
+                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 1, 0, 1])
+                    .unwrap();
+            assert_eq!(
+                shard_host_bytes(left.add(&right).unwrap().addressable_shards().next().unwrap()).unwrap(),
+                vec![0, 1, 1, 0],
+            );
+            assert_eq!(
+                shard_host_bytes(left.sub(&right).unwrap().addressable_shards().next().unwrap()).unwrap(),
+                vec![0, 1, 1, 0],
+            );
+            assert_eq!(
+                shard_host_bytes(left.mul(&right).unwrap().addressable_shards().next().unwrap()).unwrap(),
+                vec![0, 0, 0, 1],
+            );
+            assert_eq!(
+                shard_host_bytes(left.neg().unwrap().addressable_shards().next().unwrap()).unwrap(),
+                vec![0, 0, 1, 1],
+            );
+            let divisor =
+                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[]), mesh.clone(), &[1]).unwrap();
+            assert_eq!(
+                shard_host_bytes(left.div(&divisor).unwrap().addressable_shards().next().unwrap()).unwrap(),
+                vec![0, 0, 1, 1],
+            );
+            assert_eq!(
+                shard_host_bytes(left.rem(&divisor).unwrap().addressable_shards().next().unwrap()).unwrap(),
+                vec![0, 0, 0, 0],
+            );
+            // The CPU backend's division-by-zero sentinel also narrows to the single set bit.
+            let zero =
+                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[]), mesh.clone(), &[0]).unwrap();
+            assert_eq!(
+                shard_host_bytes(left.div(&zero).unwrap().addressable_shards().next().unwrap()).unwrap(),
+                vec![1, 1, 1, 1],
+            );
+            assert_eq!(
+                shard_host_bytes(left.rem(&zero).unwrap().addressable_shards().next().unwrap()).unwrap(),
+                vec![0, 0, 1, 1],
+            );
+        }
+        let signed =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::I1, &[2]), mesh.clone(), &[1, 0])
+                .unwrap();
+        assert_eq!(shard_host_bytes(signed.sign().unwrap().addressable_shards().next().unwrap()).unwrap(), vec![1, 0]);
+        // Implicit promotion must interpret a signed set bit as minus one before doing wider arithmetic.
+        let two =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::I8, &[]), mesh.clone(), &[2]).unwrap();
+        assert_eq!(
+            shard_host_bytes(signed.add(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            vec![1, 2],
+        );
+        assert_eq!(
+            shard_host_bytes(signed.sub(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            vec![253, 254],
+        );
+        assert_eq!(
+            shard_host_bytes(signed.mul(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            vec![254, 0],
+        );
+        assert_eq!(
+            shard_host_bytes(signed.div(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            vec![0, 0],
+        );
+        assert_eq!(
+            shard_host_bytes(signed.rem(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            vec![255, 0],
+        );
+    }
+
     /// Asserts elementwise value agreement between the XLA-backed eager array backend and the `ryft-core`
     /// reference array backend ([`CpuArray`]) over a scoped operation list: the elementwise math operations,
     /// element-type conversion, selection, and reduction — including one complex and one `f8` case. This is the
@@ -2251,6 +2330,58 @@ mod tests {
 
         let selected = Array::select(&less_than, &a, &b).unwrap();
         assert_eq!(read_f32s(&selected), vec![1.0, 2.0, 3.0, 8.0]);
+    }
+
+    #[test]
+    fn test_eager_compare_one_bit_integers() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // Every pair of bits is compared in every direction. I1 interprets the set bit as -1; U1 and Boolean
+        // interpret it as +1. These checks exercise compilation and device execution, not just MLIR verification.
+        for data_type in [DataType::Boolean, DataType::I1, DataType::U1] {
+            let left =
+                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 0, 1, 1])
+                    .unwrap();
+            let right =
+                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 1, 0, 1])
+                    .unwrap();
+            let signed = data_type == DataType::I1;
+            for (direction, expected) in [
+                (ComparisonDirection::Equal, vec![true, false, false, true]),
+                (ComparisonDirection::NotEqual, vec![false, true, true, false]),
+                (ComparisonDirection::LessThan, vec![false, !signed, signed, false]),
+                (ComparisonDirection::LessThanOrEqual, vec![true, !signed, signed, true]),
+                (ComparisonDirection::GreaterThan, vec![false, signed, !signed, false]),
+                (ComparisonDirection::GreaterThanOrEqual, vec![true, signed, !signed, true]),
+            ] {
+                assert_eq!(read_booleans(&left.compare(&right, direction).unwrap()), expected);
+            }
+        }
+
+        // Implicit promotion must preserve the signed set bit before comparing against wider numeric inputs.
+        let signed =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::I1, &[2]), mesh.clone(), &[1, 0])
+                .unwrap();
+        for (data_type, bytes) in [
+            (DataType::Boolean, vec![0, 0]),
+            (DataType::U1, vec![0, 0]),
+            (DataType::I8, vec![0, 0]),
+            (DataType::I32, values_to_bytes(&[0i32, 0])),
+            (DataType::F32, values_to_bytes(&[0f32, 0.0])),
+        ] {
+            let zero = Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[2]), mesh.clone(), &bytes)
+                .unwrap();
+            for (direction, expected) in [
+                (ComparisonDirection::Equal, vec![false, true]),
+                (ComparisonDirection::NotEqual, vec![true, false]),
+                (ComparisonDirection::LessThan, vec![true, false]),
+                (ComparisonDirection::LessThanOrEqual, vec![true, true]),
+                (ComparisonDirection::GreaterThan, vec![false, false]),
+                (ComparisonDirection::GreaterThanOrEqual, vec![false, true]),
+            ] {
+                assert_eq!(read_booleans(&signed.compare(&zero, direction).unwrap()), expected);
+            }
+        }
     }
 
     #[test]

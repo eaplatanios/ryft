@@ -835,13 +835,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOpera
             return Ok(vec![input]);
         }
         if input_data_type == DataType::I1 {
-            let signed_type = ArrayType::new(DataType::I8, input_type.shape().clone());
-            let signed_type = lower_tensor_type(&signed_type, lowerer.context, lowerer.location)?;
-            let widened = lowerer.block.append_operation(stable_hlo::convert(input, signed_type, lowerer.location)?)?;
-            let signed = lowerer
-                .block
-                .append_operation(stable_hlo::negate(widened.result(0).unwrap().as_ref(), lowerer.location)?)?;
-            input = signed.result(0).unwrap().as_ref();
+            input = lower_signed_one_bit_to_mlir(input, &mut lowerer.block, lowerer.context, lowerer.location)?;
         }
         if matches!(
             output_data_type,
@@ -1521,6 +1515,26 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
     Ok(result)
 }
 
+/// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
+fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
+    input: ValueRef<'b, 'c, 't>,
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    L: Copy + Location<'c, 't>,
+{
+    let input_type = input.r#type()?.cast::<TensorTypeRef>().unwrap();
+    let dimensions = input_type.dimensions().collect::<Vec<_>>();
+    let signed_type =
+        context.tensor_type(context.signless_integer_type(8), &dimensions, input_type.encoding()?, location)?;
+    let widened = block.append_operation(stable_hlo::convert(input, signed_type, location)?)?;
+    let signed = block.append_operation(stable_hlo::negate(widened.result(0).unwrap().as_ref(), location)?)?;
+    Ok(signed.result(0).unwrap().as_ref())
+}
+
 /// Converts and broadcasts one implicitly compatible elementwise operand to the exact StableHLO result tensor type.
 fn normalize_elementwise_operand<'b, 'c: 'b, 't: 'c, B, L>(
     input: ValueRef<'b, 'c, 't>,
@@ -1667,6 +1681,65 @@ where
     ])
 }
 
+/// Recovers signed one-bit values before promotion and computes one-bit arithmetic in a byte carrier.
+fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c>(
+    input_values: &[ValueRef<'b, 'c, 't>],
+    output_types: &[ArrayType],
+    lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+) -> Result<[ValueRef<'b, 'c, 't>; 2], LoweringError> {
+    check_count!("input", input_values, 2, ProgramError);
+    check_count!("output", output_types, 1, ProgramError);
+    let mut inputs = [input_values[0], input_values[1]];
+    for (input, input_type) in inputs.iter_mut().zip(&lowerer.input_types) {
+        if input_type.data_type() == DataType::I1 {
+            *input = lower_signed_one_bit_to_mlir(*input, &mut lowerer.block, lowerer.context, lowerer.location)?;
+        }
+    }
+    let output_type = match output_types[0].data_type() {
+        DataType::I1 => output_types[0].clone().with_data_type(DataType::I8),
+        DataType::U1 => output_types[0].clone().with_data_type(DataType::U8),
+        _ => output_types[0].clone(),
+    };
+    normalize_binary_elementwise_operands(
+        &inputs,
+        &[output_type],
+        &mut lowerer.block,
+        lowerer.context,
+        lowerer.location,
+    )
+}
+
+/// Restores wrapping one-bit arithmetic by retaining the low bit before converting to the predicate carrier.
+fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c>(
+    output: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    if !matches!(output_type.data_type(), DataType::I1 | DataType::U1) {
+        return Ok(output);
+    }
+    // A direct integer-to-predicate conversion tests nonzero, which would incorrectly turn an even sum into one.
+    let tensor_type = output.r#type()?.cast::<TensorTypeRef>().unwrap();
+    let scalar_type = lowerer.context.tensor_type(tensor_type.element_type()?, &[], None, lowerer.location)?;
+    let data_type = if output_type.data_type() == DataType::I1 { DataType::I8 } else { DataType::U8 };
+    let one = lower_constant_elements_attribute(data_type, scalar_type, 1, lowerer.context)?;
+    let one = lowerer.block.append_operation(stable_hlo::constant(one, lowerer.location)?)?;
+    let one = normalize_binary_elementwise_operands(
+        &[one.result(0).unwrap().as_ref(), output],
+        &[output_type.clone().with_data_type(data_type)],
+        &mut lowerer.block,
+        lowerer.context,
+        lowerer.location,
+    )?[0];
+    let masked = lowerer.block.append_operation(stable_hlo::and(output, one, lowerer.location)?)?;
+    let narrowed = lowerer.block.append_operation(stable_hlo::convert(
+        masked.result(0).unwrap().as_ref(),
+        lower_tensor_type(output_type, lowerer.context, lowerer.location)?,
+        lowerer.location,
+    )?)?;
+    Ok(narrowed.result(0).unwrap().as_ref())
+}
+
 impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AddOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1675,15 +1748,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AddOperation<ArrayType>
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let [left, right] = normalize_binary_elementwise_operands(
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
+        let [left, right] = normalize_arithmetic_inputs(input_values, output_types, lowerer)?;
         let result = lowerer.block.append_operation(stable_hlo::add(left, right, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
+        Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
 }
 
@@ -1695,15 +1762,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SubOperation<ArrayType>
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let [left, right] = normalize_binary_elementwise_operands(
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
+        let [left, right] = normalize_arithmetic_inputs(input_values, output_types, lowerer)?;
         let result = lowerer.block.append_operation(stable_hlo::subtract(left, right, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.subtract should return one result").as_ref()])
+        Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
 }
 
@@ -1715,15 +1776,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for MulOperation<ArrayType>
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let [left, right] = normalize_binary_elementwise_operands(
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
+        let [left, right] = normalize_arithmetic_inputs(input_values, output_types, lowerer)?;
         let result = lowerer.block.append_operation(stable_hlo::multiply(left, right, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
+        Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
 }
 
@@ -1735,15 +1790,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DivOperation<ArrayType>
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let [left, right] = normalize_binary_elementwise_operands(
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
+        let [left, right] = normalize_arithmetic_inputs(input_values, output_types, lowerer)?;
         let result = lowerer.block.append_operation(stable_hlo::divide(left, right, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.divide should return one result").as_ref()])
+        Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
 }
 
@@ -1751,10 +1800,13 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for NegOperation<ArrayType>
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
+        output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        if matches!(output_types[0].data_type(), DataType::I1 | DataType::U1) {
+            return Ok(vec![input_values[0]]);
+        }
         let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
     }
@@ -2130,10 +2182,13 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for SignOperation<ArrayType
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
+        output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        if matches!(output_types[0].data_type(), DataType::I1 | DataType::U1) {
+            return Ok(vec![input_values[0]]);
+        }
         let result = lowerer.block.append_operation(stable_hlo::sign(input_values[0], lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.sign should return one result").as_ref()])
     }
@@ -2248,15 +2303,9 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RemOperation<ArrayType>
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let [left, right] = normalize_binary_elementwise_operands(
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
+        let [left, right] = normalize_arithmetic_inputs(input_values, output_types, lowerer)?;
         let result = lowerer.block.append_operation(stable_hlo::remainder(left, right, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.remainder should return one result").as_ref()])
+        Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
 }
 
@@ -5608,9 +5657,25 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 )
             }
             ArrayOperation::Compare(operation) => {
-                let operand_type = comparison_operand_type(&lowerer.input_types, output_types)?;
+                let mut operand_type = comparison_operand_type(&lowerer.input_types, output_types)?;
+                // StableHLO treats i1 as a predicate, even when its logical dtype is signed. Recover each
+                // signed input before promotion, and compare two I1 inputs in the same signed byte carrier.
+                let mut inputs = [input_values[0], input_values[1]];
+                for (input, input_type) in inputs.iter_mut().zip(&lowerer.input_types) {
+                    if input_type.data_type() == DataType::I1 {
+                        *input = lower_signed_one_bit_to_mlir(
+                            *input,
+                            &mut lowerer.block,
+                            lowerer.context,
+                            lowerer.location,
+                        )?;
+                    }
+                }
+                if operand_type.data_type() == DataType::I1 {
+                    operand_type = operand_type.with_data_type(DataType::I8);
+                }
                 let [left, right] = normalize_binary_elementwise_operands(
-                    input_values,
+                    &inputs,
                     &[operand_type],
                     &mut lowerer.block,
                     lowerer.context,
@@ -9852,10 +9917,9 @@ fn lower_compare_to_mlir<'b, 'c: 'b, 't: 'c>(
 ///
 /// Tensor values are unwrapped to their element type; non-tensor scalar types are inspected
 /// directly. Float-family types route to [`stable_hlo::ComparisonType::Float`]; explicitly
-/// unsigned integers route to [`stable_hlo::ComparisonType::Unsigned`]; everything else
-/// (signless / signed integers, including Boolean as a signless `i1`) routes to
-/// [`stable_hlo::ComparisonType::Signed`], which `stablehlo.compare` interprets sign-aware for
-/// the actual width.
+/// unsigned integers and one-bit predicate carriers route to [`stable_hlo::ComparisonType::Unsigned`]; other
+/// integers route to [`stable_hlo::ComparisonType::Signed`]. Logical signed one-bit inputs must be widened before
+/// calling this function because their MLIR carrier alone cannot distinguish them from Boolean inputs.
 fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stable_hlo::ComparisonType, LoweringError> {
     let element_type = if let Some(tensor) = r#type.cast::<TensorTypeRef>() {
         tensor.element_type().map_err(|error| LoweringError::MlirError(error))?
@@ -9866,7 +9930,7 @@ fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stab
         return Ok(stable_hlo::ComparisonType::Float);
     }
     if let Some(integer) = element_type.cast::<IntegerTypeRef>() {
-        if integer.is_unsigned() {
+        if integer.is_unsigned() || integer.bit_width() == 1 {
             return Ok(stable_hlo::ComparisonType::Unsigned);
         }
         return Ok(stable_hlo::ComparisonType::Signed);
@@ -12420,6 +12484,94 @@ mod tests {
             Err(LoweringError::UnsupportedOp {
                 op: "width-changing bitcast with an unbounded dynamic dimension".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn test_lower_signed_one_bit_to_mlir() {
+        let mut builder = XlaProgramBuilder::new();
+        let input =
+            builder.add_input(ArrayType::new(DataType::I1, Shape::new(vec![dynamic_dimension("size", Some(6))])));
+        let output = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, false),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        // Widening retains the physical bound as well as the runtime dimension before recovering the signed value.
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+        module {
+          func.func @main(%arg0: tensor<?xi1, #stablehlo.bounds<5>>) -> tensor<?xf32, #stablehlo.bounds<5>> {
+            %0 = stablehlo.convert %arg0 : (tensor<?xi1, #stablehlo.bounds<5>>) -> tensor<?xi8, #stablehlo.bounds<5>>
+            %1 = stablehlo.negate %0 : tensor<?xi8, #stablehlo.bounds<5>>
+            %2 = stablehlo.convert %1 : (tensor<?xi8, #stablehlo.bounds<5>>) -> tensor<?xf32, #stablehlo.bounds<5>>
+            return %2 : tensor<?xf32, #stablehlo.bounds<5>>
+          }
+        }
+        "#}
+        );
+    }
+
+    #[test]
+    fn test_normalize_arithmetic_inputs() {
+        let mut builder = XlaProgramBuilder::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::I1));
+        let right = builder.add_input(ArrayType::scalar(DataType::I8));
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<i8>) -> tensor<i8> {
+                    %0 = stablehlo.convert %arg0 : (tensor<i1>) -> tensor<i8>
+                    %1 = stablehlo.negate %0 : tensor<i8>
+                    %2 = stablehlo.add %1, %arg1 : tensor<i8>
+                    return %2 : tensor<i8>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_arithmetic_output() {
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::I1));
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i1>) -> tensor<i1> {
+                    %0 = stablehlo.convert %arg0 : (tensor<i1>) -> tensor<i8>
+                    %1 = stablehlo.negate %0 : tensor<i8>
+                    %2 = stablehlo.convert %arg0 : (tensor<i1>) -> tensor<i8>
+                    %3 = stablehlo.negate %2 : tensor<i8>
+                    %4 = stablehlo.add %1, %3 : tensor<i8>
+                    %c = stablehlo.constant dense<1> : tensor<i8>
+                    %5 = stablehlo.and %4, %c : tensor<i8>
+                    %6 = stablehlo.convert %5 : (tensor<i8>) -> tensor<i1>
+                    return %6 : tensor<i1>
+                  }
+                }
+            "#},
         );
     }
 
