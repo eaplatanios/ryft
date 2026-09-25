@@ -26,6 +26,7 @@ use crate::macros::{
     define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
     impl_differentiable_elementwise_operation,
 };
+use crate::operations::arithmetic::{Mul, Neg};
 use crate::operations::constants::fill::Fill;
 use crate::operations::exponential::Exp;
 use crate::operations::manipulation::conversions::ElementType;
@@ -39,10 +40,12 @@ pub const ERF_OPERATION_NAME: &str = "erf";
 define_elementwise_operation!(
     @unary
     /// [`Operation`](crate::Operation) that computes the elementwise Gauss error function of one value (i.e.,
-    /// `x ↦ erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt`) while preserving its array metadata. Only real floating-point inputs are
-    /// supported, and inputs that still carry partial sums are rejected.
-    ErfOperation, ERF_OPERATION_NAME,
-    Erf, erf,
+    /// `x ↦ erf(x) = 2/√π · ∫₀ˣ e^{−t²} dt`) while preserving its array metadata. Only real floating-point inputs
+    /// are supported, and inputs that still carry partial sums are rejected.
+    ErfOperation,
+    ERF_OPERATION_NAME,
+    Erf,
+    erf,
     check_data_types = [@float @real],
     check_array_types = [@no_unreduced],
 );
@@ -53,15 +56,15 @@ impl_differentiable_elementwise_operation! {
     jvp<C>
     where
         C::Type: ElementType,
-        C::Value: Exp + std::ops::Mul<Output = C::Value> + std::ops::Neg<Output = C::Value>,
+        C::Value: Neg + Mul + Exp,
         <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
     {
-        // d(erf(x)) = (2/√π) · exp(-x²) · dx, with the coefficient `2/√π` rounded to the aligned input's element
+        // `d(erf(x)) = (2/√π) · exp(-x²) · dx`, with the coefficient `2/√π` rounded to the aligned input's element
         // data type and staged as a nullary fill of the aligned input type.
         |(input, input_tangent)| {
             let input_type = input.r#type().into_owned();
             let coefficient = input.dispatch_domain().fill(&input_type, FRAC_2_SQRT_PI)?;
-            coefficient * (-(input.clone() * input)).exp()? * input_tangent
+            coefficient.mul(&input.mul(&input)?.neg()?.exp()?)?.mul(&input_tangent)?
         }
     },
     transpose = @nonlinear,
@@ -70,8 +73,7 @@ impl_differentiable_elementwise_operation! {
 define_elementwise_capability!(
     @unary
     /// Represents the ability to compute the elementwise Gauss error function. Concrete arrays compute immediately
-    /// while context-carrying values apply [`ErfOperation`] through their context. Refer to that operation for
-    /// supported types and exceptional-value behavior.
+    /// while context-carrying values apply [`ErfOperation`] through their context.
     Erf,
     /// Computes the Gauss error function for each real floating-point element. Returns an error if the input types or
     /// metadata are unsupported.
@@ -81,7 +83,8 @@ define_elementwise_capability!(
 
 impl_array_elementwise_operation!(
     @unary
-    Erf, erf,
+    Erf,
+    erf,
     operation = "erf",
     inputs = @float @real,
     checks = [@no_unreduced],

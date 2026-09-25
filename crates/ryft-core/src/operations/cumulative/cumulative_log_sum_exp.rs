@@ -40,29 +40,12 @@ define_cumulative_operation! {
     /// or the stable `log(sum(exp(x)))` of elements `i..` when [`reverse`](Self::reverse) is set. The output type is
     /// the input type, so a `cumulative_log_sum_exp` is a shape-preserving unary primitive.
     ///
-    /// The identity of the combining operator is negative infinity, whose exponential is the inner sum's zero
-    /// identity. That is what a batching rule writes over the padding of a bounded ragged scanned axis so that
-    /// padded positions contribute nothing to a live prefix.
-    ///
-    /// The scanned dimension must be static and unsharded, as documented on [`cumulative_abstract`]. The element data
-    /// type must be real floating-point, matching [`LogAddExp`], and its lowest value must additionally hold as the
-    /// combining operator's identity across every copy of itself that one prefix folds: an implementation neutralizes
-    /// a padded or empty prefix with that value, and `k` copies of it fold to `lowest + ln(k)`, which climbs out of
-    /// the sentinel once `ln(k)` clears half the gap to the sentinel's neighbor. How many copies a prefix folds is
-    /// the padding of a bounded ragged scanned axis, a runtime quantity, so five floating-point formats are rejected
-    /// for holding too few: [`DataType::F8E8M0FNU`](crate::arrays::DataType::F8E8M0FNU), which has no usable sentinel
-    /// at all because it encodes bare positive exponents and its smallest element `2^-127` exponentiates to one, and
-    /// [`DataType::F6E2M3FN`](crate::arrays::DataType::F6E2M3FN),
-    /// [`DataType::F4E2M1FN`](crate::arrays::DataType::F4E2M1FN),
-    /// [`DataType::F8E4M3B11FNUZ`](crate::arrays::DataType::F8E4M3B11FNUZ), and
-    /// [`DataType::F6E3M2FN`](crate::arrays::DataType::F6E3M2FN), whose lowest values hold across one, two, two, and
-    /// seven copies respectively. Those five are rejected outright rather than silently corrupting prefixes, and they
-    /// are exactly the formats that [`ReductionKind::LogSumExp`](crate::operations::reductions::ReductionKind::LogSumExp)
-    /// rejects for the same reason, so the two operations share one element-domain predicate,
-    /// `is_log_add_exp_identity_data_type`, whose documentation tabulates every format's reach. Every other
-    /// floating-point format either has a true `-inf` or, like
-    /// [`DataType::F8E4M3FN`](crate::arrays::DataType::F8E4M3FN) with its lowest value `-448`, holds its sentinel
-    /// across more copies than a prefix will ever fold.
+    /// Padding is filled with the element type's lowest value, which must be an identity of the rounded pairwise
+    /// [`LogAddExp`] operation. True negative infinity satisfies this contract, as do finite sentinels that round
+    /// back to the other input after each pairwise combination. Such sentinels remain neutral for any prefix length.
+    /// [`DataType::F8E8M0FNU`](crate::arrays::DataType::F8E8M0FNU) and
+    /// [`DataType::F6E2M3FN`](crate::arrays::DataType::F6E2M3FN) have no suitable identity and are rejected.
+    /// The scanned dimension must be static and unsharded, as documented on [`cumulative_abstract`].
     ///
     /// Each prefix is accumulated by folding the pairwise [`LogAddExp`] primitive, which is stable over the whole
     /// real range but is a different expression from the max-shifted reduction that
@@ -93,7 +76,7 @@ mod tests {
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
+        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension, f4e2m1fn, f8e4m3fnuz,
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::macros::{check_operation_batching, check_operation_differentiation};
@@ -148,25 +131,25 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(&[ArrayType::new_static(DataType::F8E8M0FNU, [3, 2])], &[]),
             Err(TypeError::invalid(
-                "`cumulative_log_sum_exp` requires a floating-point format that represents zero and negative \
-                 infinity but got `f8e8m0fnu`"
+                "`cumulative_log_sum_exp` requires a floating-point format whose lowest value is a `log_add_exp` \
+                 identity but got `f8e8m0fnu`"
                     .to_string(),
             )),
         );
 
-        // The remaining four rejected formats are finite-only ones whose lowest value does underflow under `exp` but
-        // holds as the combining operator's identity across too few copies of itself for a padded prefix: two
-        // sentinels already move `f6e2m3fn`'s `-7.5` to `-7.0`, three move `f4e2m1fn`'s `-6` to `-4` and
-        // `f8e4m3b11fnuz`'s `-30` to `-28`, and eight move `f6e3m2fn`'s `-28` to `-24`. How many a prefix folds is
-        // the padding of a ragged scanned axis, which type inference cannot see, so all four are rejected by format.
-        for data_type in [DataType::F6E2M3FN, DataType::F4E2M1FN, DataType::F8E4M3B11FNUZ, DataType::F6E3M2FN] {
-            assert_eq!(
-                operation.infer_output_types(&[ArrayType::new_static(data_type, [3, 2])], &[]),
-                Err(TypeError::invalid(format!(
-                    "`cumulative_log_sum_exp` requires a floating-point format whose lowest value is a \
-                     `log_add_exp` identity but got `{data_type}`"
-                ))),
-            );
+        // The lowest `f6e2m3fn` value already changes when combined with one more copy of itself.
+        assert_eq!(
+            operation.infer_output_types(&[ArrayType::new_static(DataType::F6E2M3FN, [3, 2])], &[]),
+            Err(TypeError::invalid(
+                "`cumulative_log_sum_exp` requires a floating-point format whose lowest value is a \
+                 `log_add_exp` identity but got `f6e2m3fn`"
+                    .to_string(),
+            )),
+        );
+        // These finite sentinels are identities after every rounded pairwise combination.
+        for data_type in [DataType::F4E2M1FN, DataType::F8E4M3B11FNUZ, DataType::F6E3M2FN] {
+            let input_type = ArrayType::new_static(data_type, [3, 2]);
+            assert_eq!(operation.infer_output_types(&[input_type.clone()], &[]), Ok(vec![input_type]));
         }
 
         // The geometry rules of the family are enforced against the staged input type.
@@ -250,6 +233,12 @@ mod tests {
             ),
             Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0]).unwrap(),
         );
+
+        // Repeated rounded pairwise identities remain unchanged beyond the former fold-count limits.
+        let input = Array::vector(vec![f4e2m1fn::MIN; 16]).unwrap();
+        assert_eq!(interpret(&CumulativeLogSumExpOperation::new(0), &input), input);
+        let input = Array::vector(vec![f8e4m3fnuz::MIN; 3000]).unwrap();
+        assert_eq!(interpret(&CumulativeLogSumExpOperation::new(0), &input), input);
 
         // A zero-length scanned axis has nothing to accumulate and keeps the operand's exact type.
         let empty = Array::new(ArrayType::new_static(DataType::F32, [0, 2]), Vec::new()).unwrap();

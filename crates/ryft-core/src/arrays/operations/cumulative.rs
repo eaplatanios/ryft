@@ -8,7 +8,7 @@
 // TODO(eaplatanios): Review this module.
 
 use crate::arrays::arrays::Array;
-use crate::arrays::elements::{ArrayElement, NumericArrayElement, RealFloatingPointArrayElement};
+use crate::arrays::elements::{ArrayElement, FloatingPointArrayElement, NumericArrayElement};
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::types::data::DataType;
 use crate::operations::cumulative::cumulative_log_sum_exp::cumulative_log_sum_exp_abstract;
@@ -99,7 +99,7 @@ impl Array {
                 &shape,
                 axis,
                 reverse,
-                <Element as RealFloatingPointArrayElement>::log_add_exp,
+                <Element as FloatingPointArrayElement>::log_add_exp,
             )?;
             Self::from_elements(output_type, scanned.as_slice())
         })

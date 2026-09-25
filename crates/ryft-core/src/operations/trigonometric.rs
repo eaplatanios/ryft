@@ -37,6 +37,7 @@ use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
     impl_differentiable_elementwise_operation, impl_differentiable_operation,
 };
+use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::constants::one_like::OneLike;
 use crate::programs::{MaybeZero, ProgramError, Type, Typed};
 
@@ -58,8 +59,8 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @unary
     SinOperation,
-    jvp<C> where C::Value: Cos + std::ops::Mul<Output = C::Value> {
-        |(input, input_tangent)| input.cos()? * input_tangent
+    jvp<C> where C::Value: Mul + Cos {
+        |(input, input_tangent)| input.cos()?.mul(&input_tangent)?
     },
     transpose = @nonlinear,
 }
@@ -118,8 +119,8 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @unary
     CosOperation,
-    jvp<C> where C::Value: Sin + std::ops::Neg<Output = C::Value> + std::ops::Mul<Output = C::Value> {
-        |(input, input_tangent)| -(input.sin()? * input_tangent)
+    jvp<C> where C::Value: Neg + Mul + Sin {
+        |(input, input_tangent)| input.sin()?.mul(&input_tangent)?.neg()?
     },
     transpose = @nonlinear,
 }
@@ -184,11 +185,11 @@ impl_differentiable_operation! {
     where
         T: Type,
         C::Type: DifferentiableType,
-        C::Value: Atan2
-            + std::ops::Neg<Output = C::Value>
-            + std::ops::Add<Output = C::Value>
-            + std::ops::Mul<Output = C::Value>
-            + std::ops::Div<Output = C::Value>
+        C::Value: Neg
+            + Add
+            + Mul
+            + Div
+            + Atan2
             + ElementwiseDerivativeAlignment<C::Type>,
     {
         |_operation, context, _driver, inputs| {
@@ -221,13 +222,13 @@ impl_differentiable_operation! {
             let primal = context.primal_to_tangent(output_primal.clone())?;
             let x_primal = context.primal_to_tangent(x.primal().clone())?.align_tangent(&target, &primal)?;
             let y_primal = context.primal_to_tangent(y.primal().clone())?.align_tangent(&target, &primal)?;
-            let denominator = x_primal.clone() * x_primal.clone() + y_primal.clone() * y_primal.clone();
+            let denominator = x_primal.mul(&x_primal)?.add(&y_primal.mul(&y_primal)?)?;
             let y_term = y
                 .tangent()
                 .as_value()
                 .map(|tangent| {
                     Ok::<_, DifferentiationError>(
-                        (x_primal.clone() / denominator.clone()) * tangent.align_tangent(&target, &primal)?,
+                        x_primal.div(&denominator)?.mul(&tangent.align_tangent(&target, &primal)?)?,
                     )
                 })
                 .transpose()?;
@@ -236,15 +237,15 @@ impl_differentiable_operation! {
                 .as_value()
                 .map(|tangent| {
                     Ok::<_, DifferentiationError>(
-                        -(y_primal.clone() / denominator.clone()) * tangent.align_tangent(&target, &primal)?,
+                        y_primal.div(&denominator)?.neg()?.mul(&tangent.align_tangent(&target, &primal)?)?,
                     )
                 })
                 .transpose()?;
-            let tangent = y_term
-                .into_iter()
-                .chain(x_term)
-                .reduce(|y_term, x_term| y_term + x_term)
-                .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
+            let tangent = match (y_term, x_term) {
+                (Some(y_term), Some(x_term)) => MaybeZero::Value(y_term.add(&x_term)?),
+                (Some(term), None) | (None, Some(term)) => MaybeZero::Value(term),
+                (None, None) => MaybeZero::Zero(target),
+            };
             Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
         }
     },
@@ -308,10 +309,10 @@ impl_differentiable_elementwise_operation! {
     TanhOperation,
     jvp<C>
     where
-        C::Value: OneLike + std::ops::Mul<Output = C::Value> + std::ops::Sub<Output = C::Value>,
+        C::Value: OneLike + Sub + Mul,
     {
-        // d(tanh(x)) = (1 - tanh(x)²) · dx, reusing the primal output evaluated at the tangent type.
-        |(_, input_tangent) -> output| (output.one_like()? - output.clone() * output) * input_tangent
+        // `d(tanh(x)) = (1 - tanh(x)²) · dx`, reusing the primal output evaluated at the tangent type.
+        |(_, input_tangent) -> output| output.one_like()?.sub(&output.mul(&output)?)?.mul(&input_tangent)?
     },
     transpose = @nonlinear,
 }

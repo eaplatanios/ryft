@@ -1291,6 +1291,14 @@ mod tests {
 
     #[test]
     fn test_array_map_elements() {
+        // Mapping traverses logical elements while retaining a caller-selected physical layout.
+        let input_type =
+            ArrayType::new_static(DataType::F64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16])));
+        let input = Array::from_elements(input_type.clone(), &[0.0f64, 1.0]).unwrap();
+        let output = input.map_elements::<f64, f64>(input_type.clone(), |value| Ok(value + 1.0)).unwrap();
+        assert_eq!(output.r#type().as_ref(), &input_type);
+        assert_eq!(output.elements::<f64>(), Ok(vec![1.0, 2.0]));
+
         // `map_elements` applies a typed elementwise function, allowing input and output element types to differ.
         let integers = Array::vector(vec![1i32, -2, 3]).unwrap();
         let doubled = integers.map_elements::<i32, i32>(integers.r#type().into_owned(), |value| Ok(value * 2)).unwrap();

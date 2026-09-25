@@ -1333,8 +1333,25 @@ impl<'c, 't> Lowering<'c, 't> {
                         } else {
                             append(block, arith::index_cast(value, self.context.index_type(), self.location)?)?
                         };
-                        let nonnegative =
-                            if unsigned { value } else { append(block, arith::maxsi(value, zero, self.location)?)? };
+                        let nonnegative = if unsigned {
+                            value
+                        } else {
+                            // Negative indices count from the end of the axis once before clamping, exactly as the
+                            // dynamic slices that reference discharge stages for this view do.
+                            let extent = self.index(block, source.shape[*axis])?;
+                            let wrapped = append(block, arith::addi(value, extent, self.location)?)?;
+                            let negative = append(
+                                block,
+                                arith::cmpi(
+                                    value,
+                                    zero,
+                                    arith::IntegerComparisonPredicate::SignedLessThan,
+                                    self.location,
+                                )?,
+                            )?;
+                            let value = append(block, arith::select(negative, wrapped, value, self.location)?)?;
+                            append(block, arith::maxsi(value, zero, self.location)?)?
+                        };
                         let maximum = self.index(block, source.shape[*axis].saturating_sub(1))?;
                         append(block, arith::minui(nonnegative, maximum, self.location)?)?
                     }
@@ -1754,16 +1771,27 @@ mod tests {
             module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
                 let name = operation.name();
                 let name = name.as_str().unwrap();
-                if matches!(name, "arith.index_cast" | "arith.index_castui" | "arith.maxsi" | "arith.minui") {
+                if matches!(
+                    name,
+                    "arith.index_cast"
+                        | "arith.index_castui"
+                        | "arith.cmpi"
+                        | "arith.select"
+                        | "arith.maxsi"
+                        | "arith.minui"
+                ) {
                     clamps.push(name.to_owned());
                 }
                 WalkResult::Advance
             });
+            // Signed indices first count negative values from the end of the axis, then clamp to the valid range.
             let mut expected = vec![cast.to_owned()];
             if signed {
-                expected.push("arith.maxsi".to_owned());
+                expected.extend(["arith.cmpi".to_owned(), "arith.select".to_owned(), "arith.maxsi".to_owned()]);
             }
             expected.extend(vec!["arith.minui".to_owned(); 3]);
+            // The window's validity predicate compares the clamped index against the axis extent.
+            expected.push("arith.cmpi".to_owned());
             assert_eq!(clamps, expected);
         }
     }

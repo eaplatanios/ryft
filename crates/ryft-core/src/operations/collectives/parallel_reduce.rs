@@ -18,7 +18,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
-use crate::operations::arithmetic::DivOperation;
+use crate::operations::arithmetic::{DivOperation, Mul};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::manipulation::conversions::ConvertElementType;
@@ -350,7 +350,7 @@ impl<C, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchi
 where
     C: Context<Type = ArrayType> + Fill<f64, C::Value>,
     C::Operation: From<ParallelReduceOperation>,
-    <C as Domain>::Value: Reduce + std::ops::Mul<Output = <C as Domain>::Value>,
+    <C as Domain>::Value: Reduce + Mul,
 {
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
@@ -490,7 +490,7 @@ fn collective_reduce_batch<C, P, MakeParallelMeanFactor>(
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
-    C::Value: Reduce + std::ops::Mul<Output = C::Value>,
+    C::Value: Reduce + Mul,
     P: RaggedArrayExtentBatchingPolicy<C>,
     MakeParallelMeanFactor: FnOnce(ArrayType, f64) -> Result<C::Value, ProgramError>,
 {
@@ -522,7 +522,7 @@ where
         // Mean divides the summed value by the batch size, which must be statically known to scale by `1 / N`.
         let inverse_axis_size = 1.0 / parallel_mean_batch_size(&input)? as f64;
         let factor_type = parallel_mean_factor_type(output_value.r#type().data_type());
-        output_value = make_parallel_mean_factor(factor_type, inverse_axis_size)? * output_value;
+        output_value = make_parallel_mean_factor(factor_type, inverse_axis_size)?.mul(&output_value)?;
     }
     let ragged_axes = input
         .ragged_axes()

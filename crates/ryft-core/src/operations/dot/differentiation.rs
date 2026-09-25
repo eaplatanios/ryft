@@ -1,5 +1,6 @@
 use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::arithmetic::Add;
 
 // TODO(eaplatanios): Review this module.
 
@@ -18,7 +19,7 @@ fn bilinear_array_jvp<C, V, Apply, P: DifferentiationPolicy<C>>(
 ) -> Result<DifferentiationDual<V>, DifferentiationError>
 where
     C: Context<Type = ArrayType, Value = V>,
-    V: Value<Type = ArrayType> + ConvertElementType + std::ops::Add<Output = V>,
+    V: Value<Type = ArrayType> + ConvertElementType + Add,
     Apply: Fn(&V, &V) -> Result<V, DifferentiationError>,
 {
     let tangent_type = primal.r#type().tangent()?;
@@ -46,11 +47,11 @@ where
         .as_value()
         .map(|tangent| apply_tangent(&context.primal_to_tangent(lhs.primal().clone())?, tangent))
         .transpose()?;
-    let tangent = lhs_term
-        .into_iter()
-        .chain(rhs_term)
-        .reduce(|lhs, rhs| lhs + rhs)
-        .map_or_else(|| MaybeZero::Zero(tangent_type), MaybeZero::Value);
+    let tangent = match (lhs_term, rhs_term) {
+        (Some(left), Some(right)) => MaybeZero::Value(left.add(&right)?),
+        (Some(term), None) | (None, Some(term)) => MaybeZero::Value(term),
+        (None, None) => MaybeZero::Zero(tangent_type),
+    };
     DifferentiationDual::new(primal, tangent)
 }
 
@@ -63,7 +64,7 @@ impl_differentiable_operation! {
     where
         C: Context<Type = ArrayType>,
         C::Operation: From<DotOperation>,
-        C::Value: ConvertElementType + Dot + std::ops::Add<Output = C::Value>,
+        C::Value: ConvertElementType + Dot + Add,
     {
         |operation, context, _driver, inputs| {
             check_count!("input", inputs, 2, ProgramError);
@@ -175,7 +176,7 @@ impl_differentiable_operation! {
     where
         C: Context<Type = ArrayType>,
         C::Operation: From<ConvertElementTypeOperation<ArrayType>> + From<RaggedDotOperation>,
-        C::Value: ConvertElementType + RaggedDot + std::ops::Add<Output = C::Value>,
+        C::Value: ConvertElementType + RaggedDot + Add,
     {
         |operation, context, _driver, inputs| {
             check_count!("input", inputs, 3, ProgramError);

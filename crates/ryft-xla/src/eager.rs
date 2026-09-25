@@ -664,6 +664,115 @@ mod tests {
         assert_eq!(values[2], f8e8m0fnu::from_bits(127));
     }
 
+    #[test]
+    fn test_eager_log() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // An exponent-only logarithm of one is an unrepresentable zero and converts to NaN.
+        let input =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[127])
+                .unwrap();
+        let output = input.log().unwrap();
+        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), [255]);
+    }
+
+    #[test]
+    fn test_eager_ln_1p_complex() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // The near-zero input retains both tiny components; the negative-real branch preserves its side.
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C128, &[5]),
+            mesh.clone(),
+            &values_to_bytes::<f64>(&[1e-20, 1e-20, -2.0, 0.0, -2.0, -0.0, -1.0, 1e-300, f64::NAN, 0.0]),
+        )
+        .unwrap();
+        let output = input.ln_1p().unwrap();
+        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        assert!((values[0] - 1e-20).abs() < 1e-35);
+        assert!((values[1] - 1e-20).abs() < 1e-35);
+        assert_eq!(&values[2..6], &[0.0, std::f64::consts::PI, 0.0, -std::f64::consts::PI]);
+        // A tiny displacement from the branch point must not underflow before taking the logarithm.
+        assert!((values[6] + 690.7755278982137).abs() < 1e-12);
+        assert_eq!(values[7], std::f64::consts::FRAC_PI_2);
+        assert!(values[8].is_nan() && values[9].is_nan());
+    }
+
+    #[test]
+    fn test_eager_cumulative_log_sum_exp_finite_identity() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // Every rounded pair returns the finite minimum, even beyond the removed scan-length limit.
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F8E4M3FNUZ, &[3001]),
+            mesh.clone(),
+            vec![0xff; 3001],
+        )
+        .unwrap();
+        let output = input.cumulative_log_sum_exp(0).unwrap();
+        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), vec![0xff; 3001]);
+    }
+
+    #[test]
+    fn test_eager_log_add_exp() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // Keep unsigned exponent-only intermediates and half-precision intermediates in the working type.
+        let left =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[127])
+                .unwrap();
+        let right =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[126])
+                .unwrap();
+        let output = left.log_add_exp(&right).unwrap();
+        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), [127]);
+        let left = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F16, &[2]),
+            mesh.clone(),
+            &values_to_bytes::<f16>(&[f16::from_f32(0.5), f16::from_f32(-5.0)]),
+        )
+        .unwrap();
+        let right = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F16, &[2]),
+            mesh.clone(),
+            &values_to_bytes::<f16>(&[f16::ONE, f16::from_f32(-5.0)]),
+        )
+        .unwrap();
+        let output = left.log_add_exp(&right).unwrap();
+        assert_eq!(
+            values_from_bytes::<f16>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap()),
+            [f16::from_f32(1.4736328125), f16::from_f32(-4.30859375)],
+        );
+
+        // Complex outputs wrap the phase onto the principal logarithm branch.
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C128, &[1]),
+            mesh.clone(),
+            &values_to_bytes::<f64>(&[0.0, 4.0]),
+        )
+        .unwrap();
+        let output = input.log_add_exp(&input).unwrap();
+        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        assert!((values[0] - std::f64::consts::LN_2).abs() < 1e-15);
+        assert!((values[1] - (4.0 - 2.0 * std::f64::consts::PI)).abs() < 1e-15);
+        // Already-principal tiny phases must not disappear through an unnecessary add/subtract of pi.
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[1]),
+            mesh.clone(),
+            &values_to_bytes::<f32>(&[0.0, 1e-20]),
+        )
+        .unwrap();
+        let output = input.log_add_exp(&input).unwrap();
+        let values = values_from_bytes::<f32>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        assert_eq!(values[1], 1e-20);
+    }
+
     /// Asserts elementwise value agreement between the XLA-backed eager array backend and the `ryft-core`
     /// reference array backend ([`CpuArray`]) over a scoped operation list: the elementwise math operations,
     /// element-type conversion, selection, and reduction — including one complex and one `f8` case. This is the

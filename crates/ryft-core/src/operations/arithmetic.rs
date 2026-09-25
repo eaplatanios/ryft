@@ -10,8 +10,8 @@
 //!     quotients, and [`Rem`] computes remainders that take the sign of the dividend (i.e., truncated division,
 //!     like [`std::ops::Rem`]).
 //!   - **Powers and Roots:** [`Pow`] raises one value to the power of another (i.e., the principal value
-//!     `exp(y · log(x))` for complex values), and [`Sqrt`] and [`Rsqrt`] compute square roots and reciprocal square
-//!     roots.
+//!     `exp(y · log(x))` for complex values), and [`Sqrt`] and [`Rsqrt`] compute square roots and reciprocal
+//!     square roots.
 //!
 //! Binary operations promote their element types and broadcast their shapes before applying the corresponding
 //! elementwise arithmetic. Backend operations such as StableHLO's [`add`](https://openxla.org/stablehlo/spec#add)
@@ -451,9 +451,9 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @binary
     MulOperation,
-    jvp<C> where C::Value: std::ops::Mul<Output = C::Value> {
-        |(_, left_tangent), (right, _)| right * left_tangent;
-        |(left, _), (_, right_tangent)| left * right_tangent;
+    jvp<C> where C::Value: Mul {
+        |(_, left_tangent), (right, _)| right.mul(&left_tangent)?;
+        |(left, _), (_, right_tangent)| left.mul(&right_tangent)?;
     },
     transpose<V, O>
     where
@@ -665,14 +665,12 @@ impl_differentiable_elementwise_operation! {
     DivOperation,
     jvp<C>
     where
-        C::Value: std::ops::Neg<Output = C::Value>
-            + std::ops::Mul<Output = C::Value>
-            + std::ops::Div<Output = C::Value>,
+        C::Value: Neg + Mul + Div,
     {
-        |(_, left_tangent), (right, _)| left_tangent / right;
+        |(_, left_tangent), (right, _)| left_tangent.div(&right)?;
         |(left, _), (right, right_tangent)| {
-            let coefficient = -(left / (right.clone() * right));
-            coefficient * right_tangent
+            let coefficient = left.div(&right.mul(&right)?)?.neg()?;
+            coefficient.mul(&right_tangent)?
         };
     },
     transpose<V, O>
@@ -796,20 +794,20 @@ impl_differentiable_elementwise_operation! {
     RemOperation,
     jvp<C>
     where
-        C::Value: Abs
+        C::Value: Neg
+            + Mul
+            + Div
+            + Abs
             + Sign
-            + Floor
-            + std::ops::Neg<Output = C::Value>
-            + std::ops::Mul<Output = C::Value>
-            + std::ops::Div<Output = C::Value>,
+            + Floor,
     {
-        // d(rem(x, y)) = dx - trunc(x / y) · dy away from the discontinuities,
-        // using the sign and floor of the floating-point quotient to choose its truncated value.
+        // `d(rem(x, y)) = dx - trunc(x / y) · dy` away from the discontinuities, using the sign and floor
+        // of the floating-point quotient to choose its truncated value.
         |(_, left_tangent), (_, _)| left_tangent;
         |(left, _), (right, right_tangent)| {
-            let quotient = left / right;
-            let truncated_quotient = quotient.sign()? * quotient.abs()?.floor()?;
-            -(truncated_quotient * right_tangent)
+            let quotient = left.div(&right)?;
+            let truncated_quotient = quotient.sign()?.mul(&quotient.abs()?.floor()?)?;
+            truncated_quotient.mul(&right_tangent)?.neg()?
         };
     },
     transpose = @nonlinear,
@@ -940,6 +938,9 @@ impl_differentiable_operation! {
         C::Type: DifferentiableType,
         C::Value: ZeroLike
             + OneLike
+            + Neg
+            + Mul
+            + Div
             + Abs
             + Complex
             + Conjugate
@@ -947,9 +948,6 @@ impl_differentiable_operation! {
             + Real
             + Compare<C::Value>
             + Select
-            + std::ops::Neg<Output = C::Value>
-            + std::ops::Mul<Output = C::Value>
-            + std::ops::Div<Output = C::Value>
             + ElementwiseDerivativeAlignment<C::Type>,
     {
         |_operation, context, _driver, inputs| {
@@ -988,18 +986,20 @@ impl_differentiable_operation! {
                         // algebraically equivalent but can overflow even when the final directional derivative is
                         // finite.
                         let conjugate = input_primal.conjugate()?;
-                        let real = conjugate.real()? / denominator.clone();
-                        let imaginary = conjugate.imaginary()? / denominator.clone();
+                        let real = conjugate.real()?.div(&denominator)?;
+                        let imaginary = conjugate.imaginary()?.div(&denominator)?;
                         let coefficient = real.complex(&imaginary)?;
                         let input_tangent_type = input.primal().r#type().tangent()?;
                         let tangent = tangent.align_tangent(&input_tangent_type, &input_primal)?;
-                        MaybeZero::Value((tangent * coefficient).real()?.align_tangent(&primal_tangent_type, &primal)?)
+                        MaybeZero::Value(
+                            tangent.mul(&coefficient)?.real()?.align_tangent(&primal_tangent_type, &primal)?,
+                        )
                     } else {
                         let input = input_primal.align_tangent(&primal_tangent_type, &primal)?;
                         let tangent = tangent.align_tangent(&primal_tangent_type, &primal)?;
                         let zero = input.zero_like()?;
                         let non_negative = input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?;
-                        MaybeZero::Value(C::Value::select(&non_negative, &tangent, &-tangent.clone())?)
+                        MaybeZero::Value(C::Value::select(&non_negative, &tangent, &tangent.neg()?)?)
                     }
                 }
             };
@@ -1219,23 +1219,23 @@ impl_differentiable_elementwise_operation! {
     where
         C::Value: ZeroLike
             + OneLike
+            + Sub
+            + Mul
             + Pow
             + Log
             + Compare<C::Value>
-            + Select
-            + std::ops::Sub<Output = C::Value>
-            + std::ops::Mul<Output = C::Value>,
+            + Select,
     {
-        // d(x^y) = y · x^{y-1} · dx + x^y · log(x) · dy, with log(x) evaluated at a base of one when x = 0
-        // so that the exponent contribution vanishes instead of producing log(0) = -∞.
+        // `d(x^y) = y · x^{y-1} · dx + x^y · log(x) · dy`, with `log(x)` evaluated at a base of one when `x = 0`
+        // so that the exponent contribution vanishes instead of producing `log(0) = -∞`.
         |(left, left_tangent), (right, _)| {
-            let exponent = right.clone() - right.one_like()?;
-            right * left.pow(&exponent)? * left_tangent
+            let exponent = right.sub(&right.one_like()?)?;
+            right.mul(&left.pow(&exponent)?)?.mul(&left_tangent)?
         };
         |(left, _), (right, right_tangent)| {
             let base_is_zero = left.compare(&left.zero_like()?, ComparisonDirection::Equal)?;
             let safe_base = C::Value::select(&base_is_zero, &left.one_like()?, &left)?;
-            left.pow(&right)? * safe_base.log()? * right_tangent
+            left.pow(&right)?.mul(&safe_base.log()?)?.mul(&right_tangent)?
         };
     },
     transpose = @nonlinear,
@@ -1298,8 +1298,8 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @unary
     SqrtOperation,
-    jvp<C> where C::Value: std::ops::Add<Output = C::Value> + std::ops::Div<Output = C::Value> {
-        |(_, input_tangent) -> output| input_tangent / (output.clone() + output)
+    jvp<C> where C::Value: Add + Div {
+        |(_, input_tangent) -> output| input_tangent.div(&output.add(&output)?)?
     },
     transpose = @nonlinear,
 }
@@ -1361,14 +1361,11 @@ impl_differentiable_elementwise_operation! {
     RsqrtOperation,
     jvp<C>
     where
-        C::Value: std::ops::Neg<Output = C::Value>
-            + std::ops::Add<Output = C::Value>
-            + std::ops::Mul<Output = C::Value>
-            + std::ops::Div<Output = C::Value>,
+        C::Value: Neg + Add + Mul + Div,
     {
-        // d(rsqrt(x)) = -x^{-3/2} / 2 · dx = -(rsqrt(x) / (x + x)) · dx, reusing the primal output evaluated
+        // `d(rsqrt(x)) = -x^{-3/2} / 2 · dx = -(rsqrt(x) / (x + x)) · dx`, reusing the primal output evaluated
         // at the tangent type.
-        |(input, input_tangent) -> output| -(output / (input.clone() + input)) * input_tangent
+        |(input, input_tangent) -> output| output.div(&input.add(&input)?)?.neg()?.mul(&input_tangent)?
     },
     transpose = @nonlinear,
 }
@@ -1422,11 +1419,11 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayOperation, ArrayType, DataType, Dimension, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension, StridedLayout, f8e4m3fn, f8e8m0fnu, i2, i4,
+        Sharding, ShardingDimension, StridedLayout, f4e2m1fn, f8e4m3fn, f8e8m0fnu, i2, i4,
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::{
-        DifferentiableOperation, DifferentiationContext, DifferentiationDual, differentiate_at,
+        DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError, differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
@@ -3837,6 +3834,17 @@ mod tests {
                 in (%2, %6)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_sqrt_differentiation_unrepresentable_tangent() {
+        // The primal square root is representable, but a live zero tangent at zero requires `0 / 0`.
+        // A format without NaN must return the conversion error rather than panic in the derivative rule.
+        let zero = Array::scalar(f4e2m1fn::from_f64(0.0).unwrap()).unwrap();
+        assert_eq!(
+            differentiate_at(zero.clone()).jvp(zero, |input| input.sqrt()),
+            Err(DifferentiationError::Program(TypeError::invalid("data type `f4e2m1fn` cannot represent NaN").into(),)),
         );
     }
 

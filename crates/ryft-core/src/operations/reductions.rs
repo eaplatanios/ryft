@@ -61,7 +61,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
-use crate::operations::arithmetic::{DivOperation, MulOperation};
+use crate::operations::arithmetic::{Div, DivOperation, Mul, MulOperation, Sub};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::comparisons::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
@@ -70,7 +70,7 @@ use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
-use crate::operations::exponential::{Exp, is_log_add_exp_identity_data_type, log_add_exp_identity_data_type_error};
+use crate::operations::exponential::Exp;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::partial::PartiallyEvaluatableOperation;
@@ -95,8 +95,8 @@ pub enum ReductionKind {
     /// The numeric data type must support division.
     Mean,
 
-    /// Numerically stable logarithm of a sum of exponentials. Only real floating-point formats whose lowest value
-    /// is a padding identity are supported. Refer to [`LogSumExp`] for the guarded computation and data-type limits.
+    /// Numerically stable logarithm of a sum of exponentials. Only real floating-point formats with negative infinity
+    /// are supported. Refer to [`LogSumExp`] for the guarded computation and data-type limits.
     LogSumExp,
 
     /// Maximum reduction. Boolean inputs use disjunction, real numeric inputs propagate NaNs and order negative zero
@@ -345,12 +345,12 @@ impl_differentiable_operation! {
             + From<MulOperation<ArrayType>>,
         C::Value: Reduce
             + Exp
-            + std::ops::Sub<Output = C::Value>
+            + Sub
             + Broadcast
             + Compare<C::Value>
-            + std::ops::Div<Output = C::Value>
+            + Div
             + ElementwiseDerivativeAlignment<ArrayType>
-            + std::ops::Mul<Output = C::Value>,
+            + Mul,
     {
         |operation, context, _driver, inputs| {
             check_count!("input", inputs, 1, ProgramError);
@@ -382,9 +382,9 @@ impl_differentiable_operation! {
                             let input_type = primal_input.r#type().into_owned();
                             let output_axes = output_to_input_axis_map(input_type.rank(), operation.axes.as_slice());
                             let broadcast_primal = tangent_primal.broadcast(input_type, output_axes.as_slice())?;
-                            let weights = (primal_input.clone() - broadcast_primal).exp()?;
+                            let weights = primal_input.sub(&broadcast_primal)?.exp()?;
                             let weights = weights.align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
-                            let weighted = weights * input_tangent.clone();
+                            let weighted = weights.mul(input_tangent)?;
                             MaybeZero::Value(weighted.reduce(operation.axes.as_slice(), ReductionKind::Sum)?)
                         }
                     };
@@ -408,8 +408,10 @@ impl_differentiable_operation! {
                                 .primal_to_tangent(mask.clone())?
                                 .align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
                             let tie_count = numeric_mask.clone().reduce(operation.axes(), ReductionKind::Sum)?;
-                            let masked_tangent = numeric_mask * input_tangent.clone();
-                            MaybeZero::Value(masked_tangent.reduce(operation.axes(), ReductionKind::Sum)? / tie_count)
+                            let masked_tangent = numeric_mask.mul(input_tangent)?;
+                            MaybeZero::Value(
+                                masked_tangent.reduce(operation.axes(), ReductionKind::Sum)?.div(&tie_count)?,
+                            )
                         }
                     };
                     Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -923,16 +925,12 @@ where
 /// there leaves `log(0) + 0 = -∞`, which is the correct value of an empty or all-zero sum of exponentials. A maximum
 /// of `+∞` is guarded the same way, and a NaN input propagates as usual.
 ///
-/// Only real floating-point inputs are supported, and among those only the formats whose lowest value acts as the
-/// identity of the inner sum of exponentials. That sentinel is not merely a kernel detail: the ragged batching rule
-/// below writes it over the padding of a reduced bounded axis, and the padded positions of a slice fold as many
-/// copies of it as the axis is padded by, a count no type carries. [`DataType::F8E8M0FNU`] fails that outright,
-/// having neither the zero the inner sum's identity needs nor a sign at all, and [`DataType::F6E2M3FN`],
-/// [`DataType::F4E2M1FN`], [`DataType::F8E4M3B11FNUZ`], and [`DataType::F6E3M2FN`] fail it by drift, their lowest
-/// values holding across only one, two, two, and seven folded copies. All five are rejected rather than accepted into
-/// a program whose masked slices would quietly read high. This primitive is the *unweighted, unmasked* subset of
-/// [`jax.nn.logsumexp`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.logsumexp.html): the `b` weights, the
-/// `where` mask, the sign return value, and complex inputs are explicit non-goals.
+/// Only real floating-point formats that represent negative infinity are supported. The ragged batching rule fills
+/// padding with negative infinity so its exponential stays zero after subtraction of any finite maximum. A finite
+/// sentinel cannot provide that guarantee, even when it is an identity of rounded pairwise log-add-exp: subtracting
+/// a nearby maximum makes padded entries contribute to the inner sum. This operation is the unweighted, unmasked
+/// subset of [`jax.nn.logsumexp`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.logsumexp.html); weights, masks,
+/// sign outputs, and complex inputs are not supported.
 ///
 /// Reducing no axes returns the input unchanged after validating its element data type.
 pub trait LogSumExp: Sized {
@@ -1542,12 +1540,22 @@ pub fn reduce_evaluate<T: Clone>(
 /// Validates the element data-type domain documented on [`LogSumExp`], which the operation's type
 /// inference and its eager entry points share.
 fn validate_log_sum_exp_data_type(data_type: DataType, operation_name: &str) -> Result<(), TypeError> {
-    // The domain is exactly the one `cumulative_log_sum_exp` accepts, and for the same reason: both operations can be
-    // asked to write the format's lowest value over ragged padding, so both need that sentinel to fold as an
-    // identity. The predicate and its diagnostic are therefore shared rather than restated here.
-    match is_log_add_exp_identity_data_type(data_type) {
-        true => Ok(()),
-        false => Err(TypeError::invalid(log_add_exp_identity_data_type_error(operation_name, data_type))),
+    if !data_type.is_floating_point() {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` requires real floating-point inputs but got `{data_type}`",
+        )));
+    }
+    match data_type {
+        DataType::BF16
+        | DataType::F16
+        | DataType::F32
+        | DataType::F64
+        | DataType::F8E3M4
+        | DataType::F8E4M3
+        | DataType::F8E5M2 => Ok(()),
+        _ => Err(TypeError::invalid(format!(
+            "`{operation_name}` requires a floating-point format that represents negative infinity but got `{data_type}`",
+        ))),
     }
 }
 
@@ -2734,27 +2742,17 @@ mod tests {
             );
         }
 
-        // `f8e8m0fnu` is floating-point but encodes bare positive exponents, so it has neither the zero the inner sum
-        // needs nor the negative infinity an empty reduction returns. It is rejected here rather than in the kernel.
-        assert_eq!(
-            reduce_abstract(
-                &ArrayType::new_static(DataType::F8E8M0FNU, [2, 3]),
-                &[1],
-                ReductionKind::LogSumExp,
-                "reduce_log_sum_exp",
-            ),
-            Err(TypeError::invalid(
-                "`reduce_log_sum_exp` requires a floating-point format that represents zero and negative infinity \
-                 but got `f8e8m0fnu`"
-                    .to_string(),
-            )),
-        );
-
-        // Four more formats do have a sentinel whose exponential underflows to zero, but one that holds across too
-        // few copies of itself: the ragged batching rule below masks padding with the format's lowest value, and a
-        // padded slice folds as many copies as the axis is padded by, which lifts `-7.5` at two copies, `-6` and
-        // `-30` at three, and `-28` at eight.
-        for data_type in [DataType::F6E2M3FN, DataType::F4E2M1FN, DataType::F8E4M3B11FNUZ, DataType::F6E3M2FN] {
+        // Max-shifted padding requires true negative infinity, even for finite pairwise identities.
+        for data_type in [
+            DataType::F8E8M0FNU,
+            DataType::F6E2M3FN,
+            DataType::F4E2M1FN,
+            DataType::F8E4M3B11FNUZ,
+            DataType::F6E3M2FN,
+            DataType::F8E4M3FN,
+            DataType::F8E4M3FNUZ,
+            DataType::F8E5M2FNUZ,
+        ] {
             assert_eq!(
                 reduce_abstract(
                     &ArrayType::new_static(data_type, [2, 3]),
@@ -2763,8 +2761,8 @@ mod tests {
                     "reduce_log_sum_exp",
                 ),
                 Err(TypeError::invalid(format!(
-                    "`reduce_log_sum_exp` requires a floating-point format whose lowest value is a `log_add_exp` \
-                     identity but got `{data_type}`"
+                    "`reduce_log_sum_exp` requires a floating-point format that represents negative infinity but got \
+                     `{data_type}`",
                 ))),
             );
         }

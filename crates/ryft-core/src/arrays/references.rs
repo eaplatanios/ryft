@@ -203,38 +203,38 @@ impl ArrayReferenceView {
         Ok(outputs.remove(0))
     }
 
-    /// Discharges one allocation-preserving view operation that applies this view, by composing this view onto the incoming
-    /// handle's alias.
+    /// Discharges one allocation-preserving view operation that applies this view, by composing this view onto the
+    /// incoming handle's alias.
     ///
-    /// A view creates a narrower alias of the same allocation, so on a discharged allocation the rewrite is metadata only:
-    /// it validates the composed referent type with exactly the eager handle's arithmetic, rejecting an invalid composition
-    /// before any handle exists, and then records the composed chain as the new handle's authoritative alias. Nothing is
-    /// bound into the destination, because the portion this handle selects is materialized at each access rather than at
-    /// the view. The step is closed over destination values: each input index this view reports binds the destination
-    /// value of that operand, so the operands of a view operation are its reference followed by one value per symbol, and a
-    /// static view binds nothing.
+    /// A view creates a narrower alias of the same allocation, so on a discharged allocation the rewrite is metadata
+    /// only: it validates the composed referent type with exactly the eager handle's arithmetic, rejecting an invalid
+    /// composition before any handle exists, and then records the composed chain as the new handle's authoritative
+    /// alias. Nothing is bound into the destination, because the portion this handle selects is materialized at each
+    /// access rather than at the view. The step is closed over destination values: each input index this view reports
+    /// binds the destination value of that operand, so the operands of a view operation are its reference followed by
+    /// one value per symbol, and a static view binds nothing.
     ///
-    /// On an allocation that partial discharge *preserved*, the view is additionally replayed into the destination, and the
-    /// reference it produces becomes the alias handle's own destination value, so that later accesses consume that
+    /// On an allocation that partial discharge *preserved*, the view is additionally replayed into the destination, and
+    /// the reference it produces becomes the alias handle's own destination value, so that later accesses consume that
     /// exact value instead of replaying the chain and duplicating the view operations. The composed alias is recorded
     /// either way, which is what keeps one handle's view chain single-sourced whichever state its allocation is in.
     ///
     /// # Parameters
     ///
-    ///   - `operation`: View operation being discharged, which applies this view to its reference operand and is replayed
-    ///     verbatim on a preserved allocation.
+    ///   - `operation`: View operation being discharged, which applies this view to its reference operand and is
+    ///     replayed verbatim on a preserved allocation.
     ///   - `context`: Active discharge context owning the allocation environment.
     ///   - `inputs`: Carriers supplied as the view operation's operands, in operation-defined order.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::InvalidInputCount`] for an application that does not supply exactly one operand per symbol
-    /// beyond the reference, [`ProgramError::MalformedProgram`] when the first operand is a value rather than a reference
-    /// handle, when a symbol operand is a reference rather than a value, or when a symbol names the reference operand or an
-    /// operand outside the application, and [`ProgramError::InvalidOutputCount`] when replaying a preserved view does not
-    /// produce exactly one value. Propagates the view algebra's [`TypeError`] when this view does not compose onto the
-    /// incoming handle's referent, and [`ProgramError::MalformedProgram`] when the replayed reference does not carry the
-    /// composed type.
+    /// Returns [`ProgramError::InvalidInputCount`] for an application that does not supply exactly one operand per
+    /// symbol beyond the reference, [`ProgramError::MalformedProgram`] when the first operand is a value rather than a
+    /// reference handle, when a symbol operand is a reference rather than a value, or when a symbol names the reference
+    /// operand or an operand outside the application, and [`ProgramError::InvalidOutputCount`] when replaying a
+    /// preserved view does not produce exactly one value. Propagates the view algebra's [`TypeError`] when this view
+    /// does not compose onto the incoming handle's referent, and [`ProgramError::MalformedProgram`] when the replayed
+    /// reference does not carry the composed type.
     pub(crate) fn discharge<C, P, O>(
         &self,
         operation: &O,

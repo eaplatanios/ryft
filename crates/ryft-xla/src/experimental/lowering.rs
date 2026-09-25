@@ -2043,10 +2043,19 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Ln1pOperation<ArrayType
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
+        output_types: &[ArrayType],
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        if output_types[0].data_type().is_complex() {
+            return Ok(vec![lower_complex_ln_1p_to_mlir(
+                input_values[0],
+                &output_types[0],
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?]);
+        }
         let result = lowerer.block.append_operation(stable_hlo::log_plus_one(
             input_values[0],
             Accuracy::Default,
@@ -2073,7 +2082,14 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogAddExpOperation<Arra
             lowerer.context,
             lowerer.location,
         )?;
-        let value = lower_log_add_exp_to_mlir(left, right, &mut lowerer.block, lowerer.location)?;
+        let value = lower_log_add_exp_to_mlir(
+            left,
+            right,
+            &output_types[0],
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
         Ok(vec![value])
     }
 }
@@ -10780,6 +10796,152 @@ fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
 }
 
+/// Lowers a principal complex `ln_1p` without cancellation near zero or magnitude underflow near `-1`.
+/// The ordinary complex logarithm supplies its scaled-magnitude implementation away from zero; near zero,
+/// `ln_1p(real * (2 + real) + imaginary²) / 2` retains the perturbation of the squared magnitude from one.
+fn lower_complex_ln_1p_to_mlir<'b, 'c: 'b, 't: 'c>(
+    input: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let part_type = output_type.clone().with_data_type(if output_type.data_type() == DataType::C64 {
+        DataType::F32
+    } else {
+        DataType::F64
+    });
+    let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+    let one = lower_f64_constant_splat(1.0, &part_type, part_tensor_type, block, context, location)?;
+    let two = lower_f64_constant_splat(2.0, &part_type, part_tensor_type, block, context, location)?;
+    let half = lower_f64_constant_splat(0.5, &part_type, part_tensor_type, block, context, location)?;
+    let nan = lower_f64_constant_splat(f64::NAN, &part_type, part_tensor_type, block, context, location)?;
+    let real = block.append_operation(stable_hlo::real(input, location)?)?.result(0).unwrap().as_ref();
+    let imaginary = block.append_operation(stable_hlo::imag(input, location)?)?.result(0).unwrap().as_ref();
+    let shifted_real = block.append_operation(stable_hlo::add(one, real, location)?)?.result(0).unwrap().as_ref();
+    let shifted = block
+        .append_operation(stable_hlo::complex(shifted_real, imaginary, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let ordinary = block
+        .append_operation(stable_hlo::log(shifted, Accuracy::Default, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let ordinary_real = block.append_operation(stable_hlo::real(ordinary, location)?)?.result(0).unwrap().as_ref();
+
+    // Only the near-zero branch forms the small squared-magnitude perturbation; neither branch divides
+    // by the magnitude, so the logarithmic singularity and signed branch-cut arguments remain well defined.
+    let shifted_two = block.append_operation(stable_hlo::add(two, real, location)?)?.result(0).unwrap().as_ref();
+    let real_term = block
+        .append_operation(stable_hlo::multiply(real, shifted_two, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let imaginary_term = block
+        .append_operation(stable_hlo::multiply(imaginary, imaginary, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let perturbation = block
+        .append_operation(stable_hlo::add(real_term, imaginary_term, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let near_log = block
+        .append_operation(stable_hlo::log_plus_one(perturbation, Accuracy::Default, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let near_real =
+        block.append_operation(stable_hlo::multiply(half, near_log, location)?)?.result(0).unwrap().as_ref();
+    let real_magnitude = block.append_operation(stable_hlo::abs(real, location)?)?.result(0).unwrap().as_ref();
+    let imaginary_magnitude =
+        block.append_operation(stable_hlo::abs(imaginary, location)?)?.result(0).unwrap().as_ref();
+    let near_real_axis = block
+        .append_operation(stable_hlo::compare(
+            real_magnitude,
+            half,
+            stable_hlo::ComparisonDirection::LessThan,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let near_imaginary_axis = block
+        .append_operation(stable_hlo::compare(
+            imaginary_magnitude,
+            half,
+            stable_hlo::ComparisonDirection::LessThan,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let near = block
+        .append_operation(stable_hlo::and(near_real_axis, near_imaginary_axis, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let output_real = block
+        .append_operation(stable_hlo::select(near, near_real, ordinary_real, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let output_imaginary = block
+        .append_operation(stable_hlo::atan2(imaginary, shifted_real, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+
+    // Make NaN propagation explicit even when the other component is infinite.
+    let real_nan = block
+        .append_operation(stable_hlo::compare(
+            real,
+            real,
+            stable_hlo::ComparisonDirection::NotEqual,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let imaginary_nan = block
+        .append_operation(stable_hlo::compare(
+            imaginary,
+            imaginary,
+            stable_hlo::ComparisonDirection::NotEqual,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let is_nan = block
+        .append_operation(stable_hlo::or(real_nan, imaginary_nan, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let output_real = block
+        .append_operation(stable_hlo::select(is_nan, nan, output_real, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let output_imaginary = block
+        .append_operation(stable_hlo::select(is_nan, nan, output_imaginary, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    Ok(block
+        .append_operation(stable_hlo::complex(output_real, output_imaginary, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref())
+}
+
 /// Lowers one elementwise `log(exp(a) + exp(b))` by expanding the guarded construction that `ryft-core`'s
 /// [`LogAddExpOperation`] pins, since StableHLO has no `logaddexp` primitive:
 ///
@@ -10792,12 +10954,137 @@ fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// `(-∞, -∞) ↦ -∞`, and NaN propagation. Both operands must already carry the same tensor type, which is what the
 /// callers guarantee: the elementwise operation normalizes its broadcast operands, and the
 /// `cumulative_log_sum_exp` reducer body applies the same expansion to two scalar block arguments.
+/// Narrow real formats evaluate the entire composition in `f32` before converting back. Complex values use
+/// `max(a, b) + ln_1p(exp(min(a, b) - max(a, b)))`, with lexicographic extrema and an imaginary part wrapped
+/// to `[-pi, pi)`.
 fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     left: ValueRef<'b, 'c, 't>,
     right: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let data_type = output_type.data_type();
+    let narrow = !data_type.is_complex() && !matches!(data_type, DataType::F32 | DataType::F64);
+    let (left, right) = if narrow {
+        // Evaluate the entire composite in one working type, then round only its final output.
+        let working_type = lower_tensor_type(&output_type.clone().with_data_type(DataType::F32), context, location)?;
+        let left = block
+            .append_operation(stable_hlo::convert(left, working_type, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let right = block
+            .append_operation(stable_hlo::convert(right, working_type, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        (left, right)
+    } else {
+        (left, right)
+    };
+    if data_type.is_complex() {
+        let maximum = lower_extremum_to_mlir(true, data_type, left, right, block, location)?;
+        let minimum = lower_extremum_to_mlir(false, data_type, left, right, block, location)?;
+        let difference = block
+            .append_operation(stable_hlo::subtract(minimum, maximum, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let exponential = block
+            .append_operation(stable_hlo::exponential(difference, Accuracy::Default, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let correction = lower_complex_ln_1p_to_mlir(exponential, output_type, block, context, location)?;
+        let output =
+            block.append_operation(stable_hlo::add(maximum, correction, location)?)?.result(0).unwrap().as_ref();
+        let real = block.append_operation(stable_hlo::real(output, location)?)?.result(0).unwrap().as_ref();
+        let imaginary = block.append_operation(stable_hlo::imag(output, location)?)?.result(0).unwrap().as_ref();
+        let part_type =
+            output_type
+                .clone()
+                .with_data_type(if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
+        let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+        let pi =
+            lower_f64_constant_splat(std::f64::consts::PI, &part_type, part_tensor_type, block, context, location)?;
+        let two_pi = lower_f64_constant_splat(
+            2.0 * std::f64::consts::PI,
+            &part_type,
+            part_tensor_type,
+            block,
+            context,
+            location,
+        )?;
+        let zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
+        let shifted = block.append_operation(stable_hlo::add(imaginary, pi, location)?)?.result(0).unwrap().as_ref();
+        let remainder = block
+            .append_operation(stable_hlo::remainder(shifted, two_pi, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let negative = block
+            .append_operation(stable_hlo::compare(
+                remainder,
+                zero,
+                stable_hlo::ComparisonDirection::LessThan,
+                stable_hlo::ComparisonType::Float,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let adjusted =
+            block.append_operation(stable_hlo::add(remainder, two_pi, location)?)?.result(0).unwrap().as_ref();
+        let wrapped = block
+            .append_operation(stable_hlo::select(negative, adjusted, remainder, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let wrapped_imaginary =
+            block.append_operation(stable_hlo::subtract(wrapped, pi, location)?)?.result(0).unwrap().as_ref();
+        // Preserve already-principal phases, particularly tiny phases that adding pi would round away.
+        let negative_pi = block.append_operation(stable_hlo::negate(pi, location)?)?.result(0).unwrap().as_ref();
+        let above_lower = block
+            .append_operation(stable_hlo::compare(
+                imaginary,
+                negative_pi,
+                stable_hlo::ComparisonDirection::GreaterThanOrEqual,
+                stable_hlo::ComparisonType::Float,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let below_upper = block
+            .append_operation(stable_hlo::compare(
+                imaginary,
+                pi,
+                stable_hlo::ComparisonDirection::LessThan,
+                stable_hlo::ComparisonType::Float,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let principal = block
+            .append_operation(stable_hlo::and(above_lower, below_upper, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let imaginary = block
+            .append_operation(stable_hlo::select(principal, imaginary, wrapped_imaginary, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        return Ok(block
+            .append_operation(stable_hlo::complex(real, imaginary, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref());
+    }
     let difference = block.append_operation(stable_hlo::subtract(left, right, location)?)?;
     let difference = difference.result(0).expect("stablehlo.subtract should return one result").as_ref();
     let is_nan = block.append_operation(stable_hlo::compare(
@@ -10825,7 +11112,16 @@ fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     let stable = block.append_operation(stable_hlo::add(shift, correction, location)?)?;
     let stable = stable.result(0).expect("stablehlo.add should return one result").as_ref();
     let result = block.append_operation(stable_hlo::select(is_nan, naive, stable, location)?)?;
-    Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
+    let output = result.result(0).unwrap().as_ref();
+    Ok(if narrow {
+        block
+            .append_operation(stable_hlo::convert(output, output_tensor_type, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref()
+    } else {
+        output
+    })
 }
 
 /// Builds a reduction-body region for [`stable_hlo::reduce`] over the given scalar `element_type`. The generated
@@ -10948,6 +11244,21 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
     let element_type = output_array_type.data_type();
+    if !matches!(
+        element_type,
+        DataType::BF16
+            | DataType::F16
+            | DataType::F32
+            | DataType::F64
+            | DataType::F8E3M4
+            | DataType::F8E4M3
+            | DataType::F8E5M2
+    ) {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("`reduce_log_sum_exp` requires a format with negative infinity but got `{element_type}`"),
+        });
+    }
+
     let input_type = input_value.r#type()?;
     let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| LoweringError::UnsupportedOp {
         op: format!("`reduce_log_sum_exp` input has non-tensor MLIR type `{input_type}`"),
@@ -11052,12 +11363,8 @@ impl CumulativeKind {
             CumulativeKind::Min => {
                 build_reduction_identity_constant(ReductionKind::Min, element_type, block, context, location)
             }
-            // The maximum's identity is exactly the negative infinity this scan needs at `bf16`, `f16`, `f32`, `f64`,
-            // `f8e3m4`, `f8e4m3`, and `f8e5m2`, the formats that have one. The finite-only formats instead get their
-            // lowest representable value, which is the seed only as far as the fold-count reasoning in
-            // [`lower_cumulative_to_mlir`] allows: `f8e8m0fnu`, `f6e2m3fn`, `f4e2m1fn`, `f6e3m2fn`, and
-            // `f8e4m3b11fnuz` are all rejected there outright, and the three that remain reach this arm only at a
-            // scanned extent their lowest value holds across.
+            // Formats with infinity use negative infinity; supported finite-only formats use their lowest value,
+            // which remains an identity after each rounded pairwise combination regardless of prefix length.
             CumulativeKind::LogSumExp => {
                 build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
             }
@@ -11097,7 +11404,14 @@ impl CumulativeKind {
                 .result(0)
                 .expect("stablehlo.multiply should return one result")
                 .as_ref(),
-            CumulativeKind::LogSumExp => lower_log_add_exp_to_mlir(left, right, &mut block_ref, location)?,
+            CumulativeKind::LogSumExp => lower_log_add_exp_to_mlir(
+                left,
+                right,
+                &ArrayType::scalar(element_type),
+                &mut block_ref,
+                context,
+                location,
+            )?,
         };
         block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
         Ok(region)
@@ -11141,48 +11455,14 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
         return Ok(input_value);
     }
     let element_type = output_array_type.data_type();
-    // The `log(sum(exp(x)))` seed only neutralizes the padded positions of a window while it stays the combining
-    // operator's identity across every copy that window folds. A window accumulates one copy to begin with and one
-    // more per padded position, so the widest window of this scan — the one at the leading output position — folds
-    // `extent` of them, and folding `k` copies of the seed `lowest` yields `lowest + ln(k)`. That is the seed again
-    // only while the drift stays inside half the gap to `lowest`'s neighbor, which is what
-    // `log_sum_exp_seed_fold_bound` tabulates for the formats whose lowest value is finite.
-    if matches!(kind, CumulativeKind::LogSumExp) {
-        // Five formats hold their sentinel across too few folds for any useful scan length — `f8e8m0fnu` has no
-        // usable sentinel at all, since it carries bare positive exponents and its lowest value is the *positive*
-        // `2^-127`, while `f6e2m3fn`, `f4e2m1fn`, `f8e4m3b11fnuz`, and `f6e3m2fn` hold theirs across one, two, two,
-        // and seven copies. `ryft-core` type inference rejects all five by format, for the stronger reason that its
-        // own ragged masking folds a number of sentinels no type carries. Checking them again here is defensive: it
-        // keeps the unchecked construction path from seeding a window with a constant that would silently corrupt
-        // every prefix.
-        if matches!(
-            element_type,
-            DataType::F8E8M0FNU
-                | DataType::F6E2M3FN
-                | DataType::F4E2M1FN
-                | DataType::F8E4M3B11FNUZ
-                | DataType::F6E3M2FN
-        ) {
-            return Err(LoweringError::UnsupportedOp {
-                op: format!(
-                    "`{}` over `{element_type}`, whose lowest value holds as a `log_add_exp` identity across too \
-                     few folds to seed a window and which `ryft-core` type inference already rejects",
-                    kind.operation_name(),
-                ),
-            });
-        }
-        if let Some(bound) = log_sum_exp_seed_fold_bound(element_type) {
-            if extent > bound {
-                return Err(LoweringError::UnsupportedOp {
-                    op: format!(
-                        "`{}` over `{element_type}` along an axis of extent {extent}, whose widest window folds \
-                         {extent} seed sentinels but whose lowest value stays a `log_add_exp` identity across only \
-                         {bound}",
-                        kind.operation_name(),
-                    ),
-                });
-            }
-        }
+    // Rounded pairwise identities stay neutral in any binary tree, independent of the window extent.
+    if matches!(kind, CumulativeKind::LogSumExp) && matches!(element_type, DataType::F8E8M0FNU | DataType::F6E2M3FN) {
+        return Err(LoweringError::UnsupportedOp {
+            op: format!(
+                "`{}` over `{element_type}`, whose lowest value is not a `log_add_exp` identity",
+                kind.operation_name(),
+            ),
+        });
     }
     let initial_value = kind.build_initial_value(element_type, block, context, location)?;
     let body_region = kind.build_body_region(element_type, context, location)?;
@@ -11206,46 +11486,6 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     Ok(result.result(0).expect("stablehlo.reduce_window should return one result").as_ref())
-}
-
-/// Returns how many copies of the `cumulative_log_sum_exp` window seed one `stablehlo.reduce_window` window may fold
-/// at the given data type before the folded seed stops being a `log_add_exp` identity, or `None` when no fold count
-/// is too many. `None` is the answer for the floating-point formats whose seed is a true negative infinity —
-/// [`DataType::BF16`], [`DataType::F16`], [`DataType::F32`], [`DataType::F64`], [`DataType::F8E3M4`],
-/// [`DataType::F8E4M3`], and [`DataType::F8E5M2`] — and is also what the catch-all returns for every element type
-/// that has no sentinel to bound at all, none of which reaches this function: [`lower_cumulative_to_mlir`] rejects
-/// the remaining floating-point formats outright before consulting the bound, and a non-floating-point element type
-/// has no `cumulative_log_sum_exp` to lower in the first place.
-///
-/// Folding `k` copies of the seed `lowest` produces `lowest + ln(k)`, which is still exactly `lowest` while the drift
-/// `ln(k)` stays inside half the gap between `lowest` and its neighbor toward zero, so the bound is the largest `k`
-/// with `ln(k) < half gap`, namely `floor(e^(half gap))`:
-///
-/// | data type    |   lowest |  neighbor | half gap | folds held |
-/// | ------------ | -------- | --------- | -------- | ---------- |
-/// | `f8e4m3fn`   |   `-448` |    `-416` |     `16` |  8_886_110 |
-/// | `f8e4m3fnuz` |   `-240` |    `-224` |      `8` |      2_980 |
-/// | `f8e5m2fnuz` | `-57344` |  `-49152` |   `4096` |  unbounded |
-///
-/// The floating-point formats missing from that table are the five that [`lower_cumulative_to_mlir`] rejects outright
-/// by format, having held too few folds for any useful scan length: `f6e3m2fn` (half gap `2`, seven folds),
-/// `f8e4m3b11fnuz` (half gap `1`, two folds), `f4e2m1fn` (half gap `1`, two folds), `f6e2m3fn` (half gap `0.25`, one
-/// fold), and `f8e8m0fnu`, which has no usable sentinel at all. `ryft-core` type inference rejects all five already,
-/// so that guard only catches an unchecked construction.
-fn log_sum_exp_seed_fold_bound(data_type: DataType) -> Option<usize> {
-    let half_gap: f64 = match data_type {
-        DataType::F8E4M3FN => 16.0,
-        DataType::F8E4M3FNUZ => 8.0,
-        DataType::F8E5M2FNUZ => 4096.0,
-        _ => return None,
-    };
-    // `f8e5m2fnuz`'s bound is `e^4096`, which no floating-point or integer width can hold and no window extent can
-    // approach, so it saturates instead of wrapping.
-    let bound = half_gap.exp().floor();
-    Some(match bound < usize::MAX as f64 {
-        true => bound as usize,
-        false => usize::MAX,
-    })
 }
 
 /// Lowers gather with its explicit index-vector axis. Fill mode masks whole out-of-bounds windows, and clip mode
@@ -17722,15 +17962,9 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_rejects_drifting_log_sum_exp_seed_formats() {
-        // Five formats hold their window seed across too few folds for any useful scan length: `f8e8m0fnu` has no
-        // usable sentinel at all, its "lowest" value being the *positive* `2^-127`, while `f6e2m3fn`, `f4e2m1fn`,
-        // `f8e4m3b11fnuz`, and `f6e3m2fn` hold theirs across one, two, two, and seven copies. `ryft-core` type
-        // inference rejects all five by format, so reaching the lowering's own guard takes an unchecked instruction;
-        // the guard is what keeps that path from seeding a window with a constant that drifts as the window folds it.
-        for element_type in
-            [DataType::F8E8M0FNU, DataType::F6E2M3FN, DataType::F4E2M1FN, DataType::F8E4M3B11FNUZ, DataType::F6E3M2FN]
-        {
+    fn test_to_mlir_module_for_plain_program_cumulative_log_sum_exp_identities() {
+        // Invalid unchecked programs still cannot seed a fold with a non-identity value.
+        for element_type in [DataType::F8E8M0FNU, DataType::F6E2M3FN] {
             let array_type = ArrayType::new(element_type, Shape::new(vec![Dimension::Static(4)]));
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(array_type.clone());
@@ -17752,44 +17986,22 @@ mod tests {
                 to_mlir_module_for_plain_program(&program, "main"),
                 Err(LoweringError::UnsupportedOp {
                     op: format!(
-                        "`cumulative_log_sum_exp` over `{element_type}`, whose lowest value holds as a \
-                         `log_add_exp` identity across too few folds to seed a window and which `ryft-core` type \
-                         inference already rejects"
+                        "`cumulative_log_sum_exp` over `{element_type}`, whose lowest value is not a `log_add_exp` \
+                         identity",
                     ),
                 }),
             );
         }
 
-        // The three formats whose lowest value holds across a useful number of folds clear type inference and are
-        // gated by the scanned extent instead, because the widest window of the scan folds exactly `extent` seed
-        // copies. `f8e4m3fnuz` is the tightest of them at `floor(e^8)` folds, so it lowers at any extent through 2980
-        // and is rejected from 2981 on.
-        for extent in [4, 2980] {
-            assert!(
-                lowered_unary_module(
-                    ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
-                    DataType::F8E4M3FNUZ,
-                    vec![extent],
-                )
-                .is_ok(),
-            );
-        }
-        assert_eq!(
-            lowered_unary_module(
-                ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
-                DataType::F8E4M3FNUZ,
-                vec![2981],
-            ),
-            Err(LoweringError::UnsupportedOp {
-                op: "`cumulative_log_sum_exp` over `f8e4m3fnuz` along an axis of extent 2981, whose widest window \
-                     folds 2981 seed sentinels but whose lowest value stays a `log_add_exp` identity across only 2980"
-                    .to_string(),
-            }),
-        );
-
-        // A format with a true negative infinity has no such bound, and neither in practice does `f8e5m2fnuz`, whose
-        // `e^4096` reach no extent can approach.
-        for data_type in [DataType::F32, DataType::F8E5M2FNUZ] {
+        // Finite pairwise identities remain neutral beyond the previously imposed scan-length limits.
+        for data_type in [
+            DataType::F4E2M1FN,
+            DataType::F6E3M2FN,
+            DataType::F8E4M3B11FNUZ,
+            DataType::F8E4M3FNUZ,
+            DataType::F8E5M2FNUZ,
+            DataType::F32,
+        ] {
             assert!(
                 lowered_unary_module(
                     ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
@@ -17799,6 +18011,29 @@ mod tests {
                 .is_ok(),
             );
         }
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_log_sum_exp_requires_negative_infinity() {
+        // A valid pairwise identity is insufficient for max-shifted padding, including in unchecked programs.
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F8E4M3FN, [4]));
+        let output = builder.add_variable(ArrayType::scalar(DataType::F8E4M3FN));
+        builder.add_instruction_unchecked(Instruction::new(
+            ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::LogSumExp)),
+            vec![input],
+            vec![output],
+            Vec::new(),
+        ));
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(LoweringError::UnsupportedOp {
+                op: "`reduce_log_sum_exp` requires a format with negative infinity but got `f8e4m3fn`".to_string(),
+            }),
+        );
     }
 
     #[test]

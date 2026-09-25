@@ -1,5 +1,3 @@
-use std::ops::{Add, Mul};
-
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, Shape, Sharding, ShardingDimension,
 };
@@ -7,8 +5,8 @@ use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPoli
 use crate::contexts::Context;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::operations::{
-    Broadcast, BroadcastOperation, Compare, ComparisonDirection, Fill, Iota, One, Reshape, Select, Slice, Transpose,
-    TransposeOperation, Zero,
+    Add, Broadcast, BroadcastOperation, Compare, ComparisonDirection, Fill, Iota, Mul, One, Reshape, Select, Slice,
+    Transpose, TransposeOperation, Zero,
 };
 use crate::parameters::ParameterPath;
 use crate::programs::{ProgramError, ProvenanceScope, ReferenceType, RegionRef, Type, TypeError, Typed, Value};
@@ -381,14 +379,7 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
 impl<C: Context<Type = ArrayType>> DenseDifferentiableType<C> for ArrayType
 where
     C: One<C::Value> + Zero<C::Value> + Iota<C::Value> + Fill<u64, C::Value>,
-    C::Value: Add<Output = C::Value>
-        + Mul<Output = C::Value>
-        + Compare<C::Value>
-        + Select
-        + Broadcast
-        + Reshape
-        + Slice
-        + Transpose,
+    C::Value: Add + Mul + Compare<C::Value> + Select + Broadcast + Reshape + Slice + Transpose,
     C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
         + From<TransposeOperation>
@@ -520,7 +511,7 @@ where
                                         }
                                     })?;
                                     value_coordinate_index =
-                                        value_coordinate_index + context.fill(&index_type, offset)?;
+                                        value_coordinate_index.add(&context.fill(&index_type, offset)?)?;
                                 }
                                 let selected =
                                     direction_index.compare(&value_coordinate_index, ComparisonDirection::Equal)?;
@@ -534,7 +525,7 @@ where
                                 // directly in the output shape.
                                 let index_type = expected_type.clone().with_data_type(DataType::U64);
                                 let direction_index = context.iota(&index_type, 0)?;
-                                let mut flat_coordinate = None;
+                                let mut flat_coordinate: Option<C::Value> = None;
                                 let mut stride = 1u64;
                                 for (value_axis, dimension_size) in
                                     value_dimensions.dimensions().iter().copied().enumerate().rev()
@@ -543,10 +534,10 @@ where
                                     let coordinate = if stride == 1 {
                                         coordinate
                                     } else {
-                                        coordinate * context.fill(&index_type, stride)?
+                                        coordinate.mul(&context.fill(&index_type, stride)?)?
                                     };
                                     flat_coordinate = Some(match flat_coordinate {
-                                        Some(accumulated) => accumulated + coordinate,
+                                        Some(accumulated) => accumulated.add(&coordinate)?,
                                         None => coordinate,
                                     });
                                     stride = stride
@@ -573,7 +564,7 @@ where
                                             ),
                                         }
                                     })?;
-                                    flat_coordinate = flat_coordinate + context.fill(&index_type, offset)?;
+                                    flat_coordinate = flat_coordinate.add(&context.fill(&index_type, offset)?)?;
                                 }
                                 let selected = direction_index.compare(&flat_coordinate, ComparisonDirection::Equal)?;
                                 let one = context.one(&expected_type)?;

@@ -1783,8 +1783,8 @@ macro_rules! impl_differentiable_operation {
 /// impl_differentiable_elementwise_operation! {
 ///     @unary
 ///     ExpOperation,
-///     jvp<C> where C::Value: std::ops::Mul<Output = C::Value> {
-///         |(_, input_tangent) -> output| output * input_tangent
+///     jvp<C> where C::Value: Mul {
+///         |(_, input_tangent) -> output| output.mul(&input_tangent)?
 ///     },
 ///     transpose = @nonlinear,
 /// }
@@ -1798,9 +1798,9 @@ macro_rules! impl_differentiable_operation {
 /// impl_differentiable_elementwise_operation! {
 ///     @binary
 ///     MulOperation,
-///     jvp<C> where C::Value: std::ops::Mul<Output = C::Value> {
-///         |(_, left_tangent), (right, _)| right * left_tangent;
-///         |(left, _), (_, right_tangent)| left * right_tangent;
+///     jvp<C> where C::Value: Mul {
+///         |(_, left_tangent), (right, _)| right.mul(&left_tangent)?;
+///         |(left, _), (_, right_tangent)| left.mul(&right_tangent)?;
 ///     },
 ///     transpose<V, O>
 ///     where
@@ -2026,7 +2026,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             @linear_unary [negative]
             impl<__C, __R> $operation<__R>
             where {
-                <__C as $crate::Domain>::Value: ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>,
+                <__C as $crate::Domain>::Value: $crate::Neg,
             }
             transpose_type_bound { $crate::DifferentiableType }
             transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation<__T>> }
@@ -2043,7 +2043,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_binary [positive, positive]
             impl<__C, __R> $operation<__R>
-            where { ::std::ops::Add<Output = <__C as $crate::Domain>::Value> }
+            where { $crate::Add }
             transpose_operation_bounds {}
         }
     };
@@ -2059,8 +2059,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             @linear_binary [positive, negative]
             impl<__C, __R> $operation<__R>
             where {
-                ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
-                    + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
+                $crate::Neg + $crate::Sub
             }
             transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation<__T>> }
         }
@@ -2077,8 +2076,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             @linear_binary [negative, positive]
             impl<__C, __R> $operation<__R>
             where {
-                ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
-                    + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
+                $crate::Neg + $crate::Sub
             }
             transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation<__T>> }
         }
@@ -2095,8 +2093,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             @linear_binary [negative, negative]
             impl<__C, __R> $operation<__R>
             where {
-                ::std::ops::Add<Output = <__C as $crate::Domain>::Value>
-                    + ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
+                $crate::Neg + $crate::Add
             }
             transpose_operation_bounds { + ::std::convert::From<$crate::NegOperation<__T>> }
         }
@@ -2407,9 +2404,12 @@ macro_rules! impl_differentiable_elementwise_operation {
                     ::std::slice::from_ref(inputs[0].primal()),
                 )?;
                 $crate::check_count!("output", primals, 1, ProgramError);
-                let tangent = inputs[0].tangent().clone().map(|tangent| {
-                    $crate::impl_differentiable_elementwise_operation!(@apply_tangent_sign $sign, tangent)
-                });
+                let tangent = match inputs[0].tangent() {
+                    $crate::MaybeZero::Zero(target) => $crate::MaybeZero::Zero(target.clone()),
+                    $crate::MaybeZero::Value(tangent) => $crate::MaybeZero::Value(
+                        $crate::impl_differentiable_elementwise_operation!(@apply_tangent_sign $sign, tangent.clone()),
+                    ),
+                };
                 Ok(vec![$crate::DifferentiationDual::new(primals.remove(0), tangent)?])
             }
         }
@@ -2438,7 +2438,11 @@ macro_rules! impl_differentiable_elementwise_operation {
                 if accumulators[0].is_needed() {
                     // Unary linear operations preserve the cotangent type; only their declared sign changes it.
                     let contribution = outputs[0].clone().map(|cotangent| {
-                        $crate::impl_differentiable_elementwise_operation!(@apply_tangent_sign $sign, cotangent)
+                        $crate::impl_differentiable_elementwise_operation!(
+                            @apply_staged_cotangent_sign
+                            $sign,
+                            cotangent,
+                        )
                     });
                     accumulators[0].accumulate(context, contribution)?;
                 }
@@ -2574,19 +2578,21 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     // This internal helper branch combines two positive tangent contributions with addition. A sign-specific expansion
     // keeps the generated program in the operation's natural linear form and requires only `Add` from the value type.
-    (@combine_linear_tangents [positive, positive], $left:expr, $right:expr) => { $left + $right };
+    (@combine_linear_tangents [positive, positive], $left:expr, $right:expr) => { $crate::Add::add(&$left, &$right)? };
 
     // This internal helper branch subtracts a negative right contribution from a positive left contribution. Emitting
     // `Sub` directly preserves the expected staged program instead of rewriting the rule as addition plus negation.
-    (@combine_linear_tangents [positive, negative], $left:expr, $right:expr) => { $left - $right };
+    (@combine_linear_tangents [positive, negative], $left:expr, $right:expr) => { $crate::Sub::sub(&$left, &$right)? };
 
     // This internal helper branch subtracts a negative left contribution from a positive right contribution. The
     // reversed operand order implements `-left + right` directly while retaining the minimal `Sub` requirement.
-    (@combine_linear_tangents [negative, positive], $left:expr, $right:expr) => { $right - $left };
+    (@combine_linear_tangents [negative, positive], $left:expr, $right:expr) => { $crate::Sub::sub(&$right, &$left)? };
 
     // This internal helper branch adds two magnitudes and negates the result when both tangent contributions are
     // negative. Keeping this case explicit avoids imposing subtraction bounds that its formula does not use.
-    (@combine_linear_tangents [negative, negative], $left:expr, $right:expr) => { -($left + $right) };
+    (@combine_linear_tangents [negative, negative], $left:expr, $right:expr) => {
+        $crate::Neg::neg(&$crate::Add::add(&$left, &$right)?)?
+    };
 
     // This internal helper branch applies a positive derivative sign as the identity. It pairs with the negative arm so
     // the shared unary and binary generators can select sign behavior without duplicating their surrounding algorithms.
@@ -2594,7 +2600,16 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     // This internal helper branch applies a negative derivative sign with one negation. It is isolated from the
     // positive arm so positive linear rules do not acquire an unnecessary `Neg` bound or staged negation operation.
-    (@apply_tangent_sign negative, $tangent:expr) => { -$tangent };
+    (@apply_tangent_sign negative, $tangent:expr) => { $crate::Neg::neg(&$tangent)? };
+
+    // This internal helper branch forwards a positive staged cotangent without requiring a negation operation.
+    (@apply_staged_cotangent_sign positive, $cotangent:expr $(,)?) => { $cotangent };
+
+    // This internal helper branch negates a staged cotangent through its tracing context. Tracer unary binding
+    // records any error in the builder instead of panicking, and needs no domain-specific capability provider.
+    (@apply_staged_cotangent_sign negative, $cotangent:expr $(,)?) => {
+        $cotangent.unary($crate::NegOperation::new())
+    };
 
     // This internal helper branch converts one live output cotangent into a signed input contribution for a binary
     // linear rule. It centralizes zero-space validation and broadcast unalignment because both operands require exactly
@@ -2608,7 +2623,9 @@ macro_rules! impl_differentiable_elementwise_operation {
             .into());
         }
         let contribution = $crate::impl_differentiable_elementwise_operation!(
-            @apply_tangent_sign $sign, $cotangent.clone()
+            @apply_staged_cotangent_sign
+            $sign,
+            $cotangent.clone(),
         );
         $crate::MaybeZero::Value($crate::ElementwiseDerivativeAlignment::unalign_cotangent(&contribution, &target)?)
     }};
@@ -2905,7 +2922,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                 $($generic: $crate::Type,)*
                 <$context as $crate::Domain>::Type: $crate::DifferentiableType,
                 <$context as $crate::Domain>::Operation: ::std::convert::From<$operation>,
-                <$context as $crate::Domain>::Value: ::std::ops::Add<Output = <$context as $crate::Domain>::Value>
+                <$context as $crate::Domain>::Value: $crate::Add
                     + $crate::ElementwiseDerivativeAlignment<<$context as $crate::Domain>::Type>,
                 $($bounds)*
             }

@@ -1,7 +1,7 @@
 //! Operations over _references_ (i.e., handles to mutable state that programs allocate, read, update in place, and
-//! finally consume). A reference has a [`ReferenceType`] naming the referent it stores. Reads and updates declare
-//! reference effects, so a program that touches state keeps its accesses in order and its reference discharge can
-//! later turn that state into explicit dataflow for backends without mutable buffers.
+//! finally consume). A reference has a [`ReferenceType`](crate::ReferenceType) naming the referent it stores. Reads
+//! and updates declare reference effects, so a program that touches state keeps its accesses in order and its
+//! reference discharge can later turn that state into explicit dataflow for backends without mutable buffers.
 //!
 //! The core operations are:
 //!
@@ -15,8 +15,8 @@
 //! Array references additionally support _views_, which derive a narrower reference to the same allocation without
 //! accessing its state: [`ReferenceIndex`] and [`ReferenceDynamicIndex`] select one element on an axis (at a static
 //! index and at an index supplied as a value, respectively) and remove that axis, and [`ReferenceSlice`] selects one
-//! static range on every axis. Each view is described by an [`ArrayReferenceView`], and reads and updates through a
-//! view touch only the elements it selects.
+//! static range on every axis. Each array view is described by an [`ArrayReferenceView`](crate::ArrayReferenceView),
+//! and reads and updates through a view touch only the elements it selects.
 //!
 //! Every function is a value capability on the reference handle, so the same code updates eager state immediately
 //! and records reference instructions when the handle is a tracer.

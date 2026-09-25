@@ -501,7 +501,7 @@ impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementw
 ///     tangent target type).
 pub fn binary_elementwise_jvp<
     T: DifferentiableType,
-    V: std::ops::Add<Output = V> + ElementwiseDerivativeAlignment<T>,
+    V: Add + ElementwiseDerivativeAlignment<T>,
     O: Operation<Type = T>,
     C: Context<Type = T, Value = V>,
     P: DifferentiationPolicy<C>,
@@ -550,7 +550,7 @@ pub fn binary_elementwise_jvp<
         .map(|tangent| right_tangent_term_fn(&operands, tangent.align_tangent(&target, &tangent_primal)?))
         .transpose()?;
     let output_tangent = match (left_contribution, right_contribution) {
-        (Some(left), Some(right)) => MaybeZero::Value(left + right),
+        (Some(left), Some(right)) => MaybeZero::Value(left.add(&right)?),
         (Some(term), None) | (None, Some(term)) => MaybeZero::Value(term),
         (None, None) => MaybeZero::Zero(target),
     };
