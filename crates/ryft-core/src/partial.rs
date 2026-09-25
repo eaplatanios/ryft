@@ -1231,7 +1231,7 @@ pub enum ReferencePlacement {
 ///   | Ordered effect with none yet deferred   | Parent context when its operands are known            |
 ///   | Ordered effect after one is deferred    | Residual program, including effects on distinct roots |
 ///   | Any effect in a deferred sibling        | Residual program, even with known operands            |
-///   | Eager reference work with `Stage`       | Residual program, including allocation and views      |
+///   | Eager reference work with `Stage`       | Residual program, including allocation and accesses   |
 ///
 /// [`deferred_sibling`](Self::deferred_sibling) retains every effect in residual execution, including allocations with
 /// known initializers. Pure known computations still fold through the parent. Separately invoked programs require an
@@ -1284,9 +1284,9 @@ pub struct PartialEvaluationContext<C: Context> {
     imported_known_values:
         Rc<RefCell<HashMap<usize, (Rc<Cell<PartialValueMaterialization>>, PartialEvaluationValue<C::Value>)>>>,
 
-    /// Maps materialized reference constants to their identities in the parent context. Residual views of those
-    /// constants must retain the same allocation identity, but constants have no entry in the input descriptors
-    /// from which to recover it. A stored `None` records that the parent identity is unresolved, preventing fallback
+    /// Maps materialized reference constants to their identities in the parent context. Residual uses of those
+    /// constants must retain the same allocation identity, but constants have no entry in the input descriptors from
+    /// which to recover it. A stored [`None`] value records that the parent identity is unresolved, preventing fallback
     /// to a misleading identity in the residual builder. Clones share this map alongside the builder.
     constant_reference_identities: Rc<RefCell<HashMap<AtomId, Option<ReferenceIdentity>>>>,
 
@@ -1376,8 +1376,8 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// and retains every effectful operation in its residual program, even when all operands are known. Each residual
     /// invocation therefore executes its own effects, including fresh reference allocations. The shared parent identity
     /// permits explicit known-value transfers between these contexts without relying on constant-value resolution.
-    /// The sibling preserves this context's reference placement, including staging pure reference views under an eager
-    /// parent.
+    /// The sibling preserves this context's reference placement, including staging folded reference accesses under
+    /// an eager parent.
     #[inline]
     pub fn deferred_sibling(&self) -> Self {
         Self::from_shared_parent(self.parent.clone())
@@ -1577,8 +1577,8 @@ impl<C: Context> PartialEvaluationContext<C> {
             .classes();
 
         // Check reference placement only if the cheaper conditions have not already required residual execution.
-        // Under eager specialization, even pure reference views must remain residual so they do not observe live
-        // state before the specialized program runs. Dormant rule regions do not execute with this operation.
+        // Under eager specialization, reference accesses and root forwarding must remain residual so they do not
+        // observe live state before the specialized program runs. Dormant rule regions do not execute here.
         let must_defer_references = || {
             self.reference_placement == ReferencePlacement::Stage
                 && self.parent.is_eager()
@@ -2887,15 +2887,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArrayType, DataType,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, StagingContext};
     use crate::interpretation::InterpretationDriver;
     use crate::operations::{
         AddOperation, ConditionOperation, LinearCallOperation, MulOperation, NegOperation, PrintOperation,
-        ReferenceAddUpdateOperation, ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSwapOperation, ReferenceWriteOperation, SubOperation, Zero,
+        ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
+        ReferenceWriteOperation, SubOperation, Zero,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
@@ -3135,7 +3136,7 @@ mod tests {
     #[test]
     fn test_effects_summary_effect_ordering() {
         assert!(EffectsSummary::PURE.effect_ordering([0]).is_empty());
-        let read = ReferenceReadOperation::<ArrayType, ArrayIrType>::new().effects().summary();
+        let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new().effects().summary();
         assert!(
             matches!(read.effect_ordering([0, 1]), EffectOrdering::PerReference(roots) if roots == HashSet::from([0, 1])),
         );
@@ -3190,7 +3191,10 @@ mod tests {
         );
 
         // Inline reference constants are not input feeders, on either side of the partition.
-        let mut builder = ProgramBuilder::<TestCapture, ReferenceWriteOperation<ArrayType, ArrayIrType>>::new();
+        let mut builder = ProgramBuilder::<
+            TestCapture,
+            ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
+        >::new();
         let value = builder.add_input(scalar_type);
         let captured = builder.add_constant(CaptureReference::new(0, reference_type));
         builder
@@ -3365,7 +3369,16 @@ mod tests {
         let reference = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let source_reference = source.lift(TestValue::Reference(reference)).unwrap();
         let target_reference = target.import_known(&source_reference).unwrap();
-        let viewed = target.bind(ReferenceIndexOperation::new(0, 0), Vec::new(), &[target_reference]).unwrap();
+        let viewed = target
+            .bind(
+                ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Static(0),
+                }]),
+                Vec::new(),
+                &[target_reference],
+            )
+            .unwrap();
         assert!(viewed[0].value().unwrap().is_unknown());
         assert_eq!(target.builder.borrow().instructions().len(), 1);
     }
@@ -3572,7 +3585,7 @@ mod tests {
 
         // A failed effectful execution cannot be retried later because it might have already performed effects.
         let effectful = UnavailableOperation {
-            effects: Effects::new(EffectClasses::single(EffectClass::OrderedIo), Vec::new(), Vec::new()).unwrap(),
+            effects: Effects::new(EffectClasses::single(EffectClass::OrderedIo), Vec::new()).unwrap(),
             ..operation.clone()
         };
         let context = PartialEvaluationContext::new(EagerContext::<Array, UnavailableOperation>::new());
@@ -4333,12 +4346,14 @@ mod tests {
         let original = PartialTracer::new(context.clone(), known.clone());
         assert_eq!(context.reference_identity(&original), Ok(expected));
 
-        // A residual view of a known feeder must retain its parent's root identity rather than acquire the residual
-        // builder's namespace. An unknown reference input does belong to that separate namespace.
-        let operation = TestOperation::ReferenceIndex(ReferenceIndexOperation::new(0, 0));
-        let viewed = context.residualize(operation, Vec::new(), &[known]).unwrap();
-        let viewed = PartialTracer::new(context.clone(), viewed[0].clone());
-        assert_eq!(context.reference_identity(&viewed), Ok(expected));
+        // A folded access keeps the known root's parent identity. An unknown reference input belongs to the
+        // residual builder's separate namespace.
+        let operation = TestOperation::ReferenceRead(ReferenceReadOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) },
+        ]));
+        let read = context.residualize(operation, Vec::new(), &[known]).unwrap();
+        assert_eq!(read[0].r#type().as_ref(), &ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        assert_eq!(context.reference_identity(&original), Ok(expected));
         let unknown = PartialTracer::new(context.clone(), context.unknown_input(reference_type, 0));
         assert!(matches!(context.reference_identity(&unknown), Ok(Some(ReferenceIdentity::Staged { .. }))));
         assert_ne!(context.reference_identity(&unknown).unwrap(), expected);
@@ -4349,24 +4364,47 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_evaluation_context_reference_identity_for_captured_views() {
-        let outer = TracingContext::<TestCapture, ReferenceIndexOperation>::new();
+    fn test_partial_evaluation_context_reference_identity_for_captured_accesses() {
+        let outer = TracingContext::<
+            TestCapture,
+            ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
+        >::new();
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
         let capture = outer.constant(CaptureReference::new(0, reference_type.clone()));
         let expected = outer.reference_identity(&capture).unwrap();
         let context = PartialEvaluationContext::new(outer.clone());
         let captured = PartialEvaluationValue::known_constant(capture);
         let view = context
-            .residualize(ReferenceIndexOperation::new(0, 0), Vec::new(), &[captured.clone()])
+            .residualize(
+                ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Static(0),
+                }]),
+                Vec::new(),
+                std::slice::from_ref(&captured),
+            )
             .unwrap()
             .remove(0);
         let original = PartialTracer::new(context.clone(), captured);
         let view = PartialTracer::new(context.clone(), view);
         let parent_atom_count = outer.builder().borrow().atoms().len();
         assert_eq!(context.reference_identity(&original), Ok(expected));
-        assert_eq!(context.reference_identity(&view), Ok(expected));
-        assert_eq!(context.clone().reference_identity(&view), Ok(expected));
+        assert_eq!(context.reference_identity(&view), Ok(None));
         assert_eq!(outer.builder().borrow().atoms().len(), parent_atom_count);
+
+        // The residualized access materialized the capture as a residual constant and recorded its parent identity
+        // in state that clones share, so a residual variable naming that constant resolves through a clone.
+        let PartialValueMaterialization::Constant { residual_atom: Some(residual_atom) } =
+            original.value().unwrap().materialization()
+        else {
+            panic!("residualizing the access must materialize the captured reference as a residual constant");
+        };
+        let residual = PartialTracer::new(
+            context.clone(),
+            PartialEvaluationValue::variable(reference_type.clone(), residual_atom),
+        );
+        assert_eq!(context.clone().reference_identity(&residual), Ok(expected));
+
         let other = context.lift(CaptureReference::new(1, reference_type)).unwrap();
         assert_ne!(context.reference_identity(&other).unwrap(), expected);
         assert_eq!(
@@ -4378,7 +4416,10 @@ mod tests {
     #[test]
     fn test_partial_evaluation_context_reference_identity_for_unresolved_inherited_capture() {
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
-        let outer = TracingContext::<TestCapture, ReferenceIndexOperation>::new();
+        let outer = TracingContext::<
+            TestCapture,
+            ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
+        >::new();
         let context = PartialEvaluationContext::new(outer.clone());
 
         // Inherited constants enter the residual builder without being materialized through the parent context.
@@ -4602,7 +4643,10 @@ mod tests {
 
     #[test]
     fn test_region_partition_with_configuration_repeated_residual_preserves_reference_constant_order() {
-        let mut builder = ProgramBuilder::<TestCapture, ReferenceReadOperation<ArrayType, ArrayIrType>>::new();
+        let mut builder = ProgramBuilder::<
+            TestCapture,
+            ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>,
+        >::new();
         let source = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
         let captured =
             builder.add_constant(CaptureReference::new(0, ReferenceType::new(ArrayType::scalar(DataType::F32)).into()));
@@ -5098,6 +5142,58 @@ mod tests {
                 in (%2)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_partially_evaluate_with_known_root_and_unknown_transform_binding() {
+        let root_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let index_type = ArrayType::scalar(DataType::I32);
+        let transforms = vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ];
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let root = builder.add_input(ReferenceType::new(root_type).into());
+        let index = builder.add_input(index_type.clone().into());
+        let output = builder
+            .add_instruction(
+                ReferenceReadOperation::new().with_transforms(transforms),
+                Vec::new(),
+                vec![root, index],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let live = ArrayReference::new(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap());
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Known(TestValue::Reference(live.clone())),
+                PartialValue::Unknown(index_type.into()),
+            ])
+            .unwrap();
+        assert_eq!(
+            evaluation.inputs(),
+            &[PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(TestValue::Reference(live.clone())),],
+        );
+        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:i32[], %1:ref<f32[2, 3]> .
+                let %2:f32[] = reference_read [transforms=[index(axis=0, index=1), dynamic_index(axis=0)]] %1 %0
+                in (%2)"},
+        );
+        assert_eq!(live.read(), Ok(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap()));
+        assert_eq!(
+            evaluation.interpret(
+                &EagerContext::<TestValue, TestOperation>::new(),
+                &[TestValue::Array(Array::scalar(2i32).unwrap())]
+            ),
+            Ok(vec![TestValue::Array(Array::scalar(6f32).unwrap())]),
         );
     }
 

@@ -2319,8 +2319,8 @@ mod tests {
     #[test]
     fn test_condition_transposition_reference_access_with_enclosing_binding() {
         // Each branch accesses the reference root through a dynamic index that the enclosing region computes. The
-        // transposed branches apply the same view to the root's cotangent reference, so the index reaches them as an
-        // ordinary known input recomputed in the enclosing region: `add_update(r[i], x)` transposes into
+        // transposed branches apply the same transforms to the root's cotangent reference, so the index reaches them as
+        // an ordinary known input recomputed in the enclosing region: `add_update(r[i], x)` transposes into
         // `x̄ = read(r̄[i])`, and `write(r[i], x)` additionally clears `r̄[i]`.
         let vector_reference_type = ArrayIrType::from(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
@@ -2947,7 +2947,7 @@ mod tests {
     #[test]
     fn test_condition_reference_discharge_selecting_nothing_is_the_identity_on_a_structured_program() {
         // Preserving every allocation is the opposite extreme from full discharge, and it must be the identity: every
-        // access, every view, and every structured boundary replays exactly as the source declared it. This is the
+        // access, every transform, and every structured boundary replays exactly as the source declared it. This is the
         // sharpest statement of what "preserved" means, and it holds through a condition's attached regions.
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let mut branch_builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -3409,7 +3409,7 @@ mod tests {
     #[test]
     fn test_condition_captures_a_lazy_view_root_and_dynamic_binding() {
         // Branches traced as nested regions read a captured root through lazy views. The views are not program values,
-        // so the regions capture only the root and the dynamic index, and each access re-applies its own view.
+        // so the regions capture only the root and the dynamic index, and each access re-applies its own transforms.
         let context = TracingContext::<DischargeCapture, TestOperation, TestValue>::new();
         let predicate = context.input(ArrayType::scalar(DataType::Boolean).into());
         let offset = context.input(ArrayType::scalar(DataType::F32).into());

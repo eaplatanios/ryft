@@ -266,18 +266,18 @@ impl<V> ShardMapOperation<V> {
         OperationFormatter::new(formatter, indentation, SHARD_MAP_OPERATION_NAME)?.bracketed(|operation| {
             // The mesh is redundant with any rendered sharding, which embeds it, but a boundary may have no
             // shardings at all, so it is rendered unconditionally.
-            operation.field("mesh", render_sequence(mesh_axes))?;
-            operation.field("in_shardings", render_sequence(self.shard_map.in_shardings()))?;
-            operation.field("out_shardings", render_sequence(self.shard_map.out_shardings()))?;
-            operation.field("manual_axes", render_sequence(manual_axes))?;
-            operation.field("global_input_types", render_sequence(self.input_types.as_slice()))?;
-            operation.field("global_output_types", render_sequence(self.output_types.as_slice()))?;
+            operation.list("mesh", mesh_axes)?;
+            operation.list("in_shardings", self.shard_map.in_shardings())?;
+            operation.list("out_shardings", self.shard_map.out_shardings())?;
+            operation.list("manual_axes", manual_axes)?;
+            operation.list("global_input_types", &self.input_types)?;
+            operation.list("global_output_types", &self.output_types)?;
             if self.output_forwarding.iter().any(Option::is_some) {
                 let forwarding = self.output_forwarding.iter().map(|forwarded| match forwarded {
                     Some(input_index) => input_index.to_string(),
                     None => "_".to_string(),
                 });
-                operation.field("output_forwarding", render_sequence(forwarding))?;
+                operation.list("output_forwarding", forwarding)?;
             }
             Ok(())
         })
@@ -290,17 +290,11 @@ impl<V> ShardMapOperation<V> {
 /// Mesh axis names are arbitrary nonempty strings, so rendering them verbatim is not injective: the two-name list
 /// `["a", "b"]` and the one-name list `["a', 'b"]` would both render as `['a', 'b']`. Because
 /// [`ShardMapOperation::render_operation`] is the metadata fingerprint that the debug transform-cache diagnostic
-/// compares programs by, such a collision would hide a genuinely different manual SPMD boundary. Escaped names
-/// contain neither an unescaped quote nor an unescaped backslash, so no name can imitate the surrounding quoting or
-/// the `, ` separator that [`render_sequence`] joins items with, and distinct name lists always render distinctly.
+/// compares programs by, such a collision would hide a genuinely different manual SPMD boundary. Escaped names contain
+/// neither an unescaped quote nor an unescaped backslash, so no name can imitate the surrounding quoting or the `, `
+/// separator that [`OperationFormatter::list`] joins items with, and distinct name lists always render distinctly.
 fn render_axis_name(name: &str) -> String {
     format!("'{}'", name.chars().flat_map(char::escape_debug).collect::<String>())
-}
-
-/// Renders one shard-map metadata sequence as a bracketed, comma-separated list. Items that embed mesh axis names
-/// must render those names through [`render_axis_name`] for the result to remain injective.
-fn render_sequence<I: IntoIterator<Item: Display>>(items: I) -> String {
-    format!("[{}]", items.into_iter().map(|item| item.to_string()).collect::<Vec<_>>().join(", "))
 }
 
 impl<V> Display for ShardMapOperation<V> {

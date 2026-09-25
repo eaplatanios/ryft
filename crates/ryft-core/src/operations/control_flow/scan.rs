@@ -84,11 +84,11 @@ pub const SCAN_OPERATION_NAME: &str = "scan";
 /// require a static length. Composite [`ArrayIrType`] scans may use a dynamic dimension identity and consume its
 /// matching first-class dimension value as a trailing runtime operand.
 ///
-/// A composite body receiving `ref<[length, t]>` selects its current slice by attaching a leading dynamic index view
-/// to each access, with the body's index input as the first view binding. Reference operations and their transforms
-/// preserve that access path. The root parameter must not be consumed or frozen inside the body. Stacked reference
-/// outputs remain unsupported: a scan cannot assemble a reference value from per-iteration handles. Discharge can
-/// replace accesses confined to the current slice with ordinary stacked array inputs and updated slice outputs,
+/// A composite body receiving `ref<[length, t]>` selects its current slice by attaching a leading dynamic index
+/// transform to each access, with the body's index input as the first transform binding. Reference operations and their
+/// transforms preserve that access path. The root parameter must not be consumed or frozen inside the body. Stacked
+/// reference outputs remain unsupported: a scan cannot assemble a reference value from per-iteration handles. Discharge
+/// can replace accesses confined to the current slice with ordinary stacked array inputs and updated slice outputs,
 /// preserving slice-sized state without exposing a second reference-body interface.
 ///
 /// The optional [`unroll`](Self::unroll) factor (attached via [`with_unroll`](Self::with_unroll)) is a
@@ -781,7 +781,7 @@ where
 // replicated. Stacked inputs are arrays or references and stacked outputs are arrays, never first-class dimensions,
 // because one shared dimension value cannot represent a different stacked extent for each batch item. A reference
 // stack keeps the batch axis fixed by its referent (which must lie behind the leading scan axis). The body receives
-// the whole packed root, and each access adjusts its folded views through `batch_reference_transforms`.
+// the whole packed root, and each access adjusts its folded transforms through `batch_reference_transforms`.
 impl<Capture, C> BatchableOperation<C, ArrayIrBatchingPolicy> for ScanOperation<Capture>
 where
     Capture: Value<Type = ArrayIrType>,
@@ -2124,7 +2124,7 @@ where
             .map(|(position, allocation)| match *allocation {
                 None => ReferenceDischargeRegionInput::Value,
                 Some(allocation) if viewed_inputs.contains(&position) => {
-                    ReferenceDischargeRegionInput::Transform(allocation)
+                    ReferenceDischargeRegionInput::View(allocation)
                 }
                 Some(allocation) => ReferenceDischargeRegionInput::Allocation(allocation),
             })
@@ -2137,7 +2137,7 @@ where
             .filter_map(|(position, allocation)| {
                 allocation
                     .filter(|allocation| viewed_inputs.contains(&position) && widening.published().contains(allocation))
-                    .map(|_| ReferenceDischargeRegionOutput::Transform(position))
+                    .map(|_| ReferenceDischargeRegionOutput::View(position))
             })
             .collect();
         let mut state_allocations = entering.clone();
@@ -2184,7 +2184,7 @@ where
             .iter()
             .flat_map(|group| group.sources())
             .filter_map(|output| match output {
-                ReferenceDischargeRegionOutput::Transform(position) => Some(*position),
+                ReferenceDischargeRegionOutput::View(position) => Some(*position),
                 ReferenceDischargeRegionOutput::Allocation(_) => None,
             })
             .collect::<Vec<_>>();
@@ -5677,7 +5677,7 @@ mod tests {
     #[test]
     fn test_scan_captures_a_lazy_view_root_and_dynamic_binding() {
         // A body traced as a nested region reads a captured root through a lazy view. The view is not a program
-        // value, so the region captures only its root and dynamic index, and the access re-applies the view.
+        // value, so the region captures only its root and dynamic index, and the access re-applies its transforms.
         let context = TracingContext::<DischargeCapture, TestIrOperation, TestIrValue>::new();
         let stack = TestIrValue::Reference(ArrayReference::new(Array::vector(vec![10f32, 20., 30.]).unwrap()));
         let index = TestIrValue::Array(Array::scalar(2i32).unwrap());

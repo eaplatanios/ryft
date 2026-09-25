@@ -903,7 +903,28 @@ impl ReferenceLifetimes {
         }
     }
 
-    /// Records a complete-root alias and resolves its allocation identity.
+    /// Records `output` as an alias of `input`, resolving the family root eagerly so that every alias of an alias
+    /// records the original root rather than a chain of edges. Every alias edge denotes the complete referenced value:
+    /// narrowing to a part of a reference happens only at access sites, through the transforms that an access applies,
+    /// never through an alias. Consequently, consuming any member of an alias family consumes its root and invalidates
+    /// the whole family.
+    ///
+    /// # Examples
+    ///
+    /// Consider a reference atom `root` that refers to an entire matrix, an atom `whole_alias` produced by an operation
+    /// whose output is an identity alias of `root` (i.e., one for which [`Operation::reference_output_identity_input`]
+    /// names `root`'s input), and an atom `alias_alias` produced the same way from `whole_alias`. In the following
+    /// listing, each line names an atom, the arrow points to what that atom refers to or aliases, and the parenthetical
+    /// shows the family root that this function records for it:
+    ///
+    /// ```text
+    /// root        -> entire matrix
+    /// whole_alias -> root          (records `root`)
+    /// alias_alias -> whole_alias   (records `root`, not `whole_alias`)
+    /// ```
+    ///
+    /// Because both aliases record `root` directly, resolving either one takes a single lookup, and all three atoms
+    /// denote the entire matrix. Consuming `alias_alias` therefore consumes `root` and invalidates `whole_alias` too.
     fn alias(&mut self, output: AtomId, input: AtomId) {
         let source = self.aliases.get(&input).copied();
         let edge = ResolvedReferenceAlias { root: source.map_or(input, |source| source.root) };

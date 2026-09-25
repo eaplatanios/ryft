@@ -26,8 +26,8 @@ pub use arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIndexRange,
     ArrayIndexRanges, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrOperations, ArrayIrType,
     ArrayIrTypeRefinements, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReference, ArrayReferenceAnalysis,
-    ArrayReferenceDischarge, ArrayReferenceView, ArrayReferenceViewError, ArrayReferenceViewIndex,
-    ArrayReferenceViewOperation, ArrayReferenceViewPath, ArraySliceAxis, ArrayTracingContext, ArrayType,
+    ArrayReferenceDischarge, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayReferenceTransformOperation,
+    ArrayReferenceTransformPath, ArrayReferenceViewError, ArraySliceAxis, ArrayTracingContext, ArrayType,
     ArrayTypeRefinements, Broadcastable, BroadcastingError, Complex, DataType, DataTypeError, Device, DeviceId,
     DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionOperations, DimensionSource,
     DimensionTracingContext, DimensionType, DimensionValue, DimensionVariable, ExactShape, ExactShapeDimension, Layout,
@@ -115,28 +115,26 @@ pub use operations::{
     OrOperation, PAD_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad,
     PadOperation, ParallelReduce, ParallelReduceOperation, ParallelReductionKind, ParallelVary, ParallelVaryOperation,
     Permutation, Pow, PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME,
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_DYNAMIC_INDEX_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
-    REFERENCE_INDEX_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME,
-    REFERENCE_SLICE_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME,
+    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
+    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME,
     RESHAPE_OPERATION_NAME, RESHARD_OPERATION_NAME, REVERSE_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME,
     RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReduceOperation, ReductionKind,
     ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
-    ReferenceDynamicIndex, ReferenceDynamicIndexOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndex,
-    ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-    ReferenceSlice, ReferenceSliceOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
-    ReferenceWriteOperation, Rem, RemOperation, Reshape, ReshapeOperation, Reshard, ReshardOperation, Reverse,
-    ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME,
-    SCATTER_OPERATION_NAME, SELECT_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME,
-    SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, ScaledDot, ScaledDotOperation,
-    ScanOperation, ScanReferenceDischarge, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
-    ScatterOptions, ScatterReductionKind, Select, SelectOperation, Sign, SignOperation, Sin, SinOperation, Slice,
-    SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, StopGradients, Sub, SubOperation,
-    TAG_OPERATION_NAME, TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag,
-    TagOperation, Tanh, TanhOperation, Tolerance, TransferToMemory, TransferToMemoryOperation, Transpose,
-    TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME,
-    WhileOperation, WhilePredicate, WhileTypeSemantics, XOR_OPERATION_NAME, Xor, XorOperation,
-    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, custom_jvp,
-    custom_vjp, forward_collective_to_parent, transpose_primal_condition, transpose_primal_scan,
+    ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem,
+    RemOperation, Reshape, ReshapeOperation, Reshard, ReshardOperation, Reverse, ReverseOperation, Round,
+    RoundOperation, Rsqrt, RsqrtOperation, SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME,
+    SELECT_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME, SQRT_OPERATION_NAME,
+    STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, ScaledDot, ScaledDotOperation, ScanOperation,
+    ScanReferenceDischarge, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
+    ScatterReductionKind, Select, SelectOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt,
+    SqrtOperation, StopGradient, StopGradientOperation, StopGradients, Sub, SubOperation, TAG_OPERATION_NAME,
+    TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tanh,
+    TanhOperation, Tolerance, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
+    UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WhileOperation,
+    WhilePredicate, WhileTypeSemantics, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME,
+    ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, custom_jvp, custom_vjp,
+    forward_collective_to_parent, transpose_primal_condition, transpose_primal_scan,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -149,17 +147,17 @@ pub use partial::{
     PartiallyEvaluatableOperation, PartitionedProgram,
 };
 pub use programs::{
-    Atom, AtomId, AttachedRegionStatistics, BatchableReferenceView, BindingRegionDriver, CalleeRegionDriver,
-    Concretizable, EffectClass, EffectClassOccurrence, EffectClasses, Effects, EffectsSummary, EmptyRegionDriver,
-    ExternalReferenceBinding, FlatProgram, InputRegionProvenance, Instruction, InstructionId, MaybeZero,
-    MemberOperation, NoIdentity, NoReferenceViewBinding, NoReferent, Operation, OperationFoldOutput,
-    OperationFoldReplacement, OperationFormatter, OperationProjection, OperationProvider, OutputRegionProvenance,
-    ParameterProjection, PartialReferenceDischargeResult, PreparedReferenceReplacement, Program, ProgramBuilder,
-    ProgramBuilderId, ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics, ProjectedValue,
-    Provenance, ProvenanceScope, ProvenanceState, ReadyOrPendingReferenceGuard, ReadyReferenceGuard,
-    RecursiveReferenceDischargeDriver, Reference, ReferenceAccess, ReferenceAccessMode, ReferenceAccumulationPolicy,
-    ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAnalysis, ReferenceAnalysisError,
-    ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion,
+    Atom, AtomId, AttachedRegionStatistics, BatchableReferenceTransform, BindingRegionDriver, BoundReferenceTransform,
+    CalleeRegionDriver, Concretizable, EffectClass, EffectClassOccurrence, EffectClasses, Effects, EffectsSummary,
+    EmptyRegionDriver, ExternalReferenceBinding, FlatProgram, InputRegionProvenance, Instruction, InstructionId,
+    MaybeZero, MemberOperation, NoIdentity, NoReferenceTransform, NoReferenceTransformBinding, NoReferent, Operation,
+    OperationFoldOutput, OperationFoldReplacement, OperationFormatter, OperationProjection, OperationProvider,
+    OutputRegionProvenance, ParameterProjection, PartialReferenceDischargeResult, PreparedReferenceReplacement,
+    Program, ProgramBuilder, ProgramBuilderId, ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics,
+    ProjectedValue, Provenance, ProvenanceScope, ProvenanceState, ReadyOrPendingReferenceGuard, ReadyReferenceGuard,
+    RecursiveReferenceDischargeDriver, Reference, ReferenceAccess, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceAccumulationPolicy, ReferenceAliasEdge, ReferenceAnalysis,
+    ReferenceAnalysisError, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion,
     ReferenceCompletionBackend, ReferenceDischargeAllocationId, ReferenceDischargeBoundaryWidening,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
     ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeRegionInput,
@@ -167,16 +165,17 @@ pub use programs::{
     ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
     ReferenceDischargeableType, ReferenceEffect, ReferenceError, ReferenceGeneration, ReferenceId, ReferenceIdentity,
     ReferenceMemberType, ReferenceObservation, ReferenceRegionInputBinding, ReferenceReplacementPreparation,
-    ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceTransitiveAccess, ReferenceType,
-    ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
-    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, Region, RegionArena,
-    RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole,
-    RegionSlot, RegionStatistics, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact,
-    TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature,
-    TypeRefinements, Typed, ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection,
-    discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
-    fold_projected_operation, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
-    validate_reference_boundary,
+    ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceTransform, ReferenceTransformPath,
+    ReferenceTransitiveAccess, ReferenceType, ReferenceTypeRefinements, ReferenceViewAnalysis,
+    ReferenceViewAnalysisError, ReferenceViewOverlap, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId,
+    RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, ReplayRegionDriver,
+    TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity,
+    TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
+    ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection, ViewedReference,
+    batch_reference_transforms, discharge_local_reference_operation, discharge_positional_region_operation,
+    discharge_reference_free_operation, fold_projected_operation, infer_projected_operation_output_types,
+    infer_projected_operation_region_input_types, infer_reference_view_type, rewrite_reference_access_transforms,
+    validate_reference_boundary, validated_reference_access_descriptors,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,
@@ -201,7 +200,7 @@ pub(crate) mod tests {
 
     use ryft_macros::Operation;
 
-    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, ArrayType};
+    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{
         CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext,
@@ -220,8 +219,9 @@ pub(crate) mod tests {
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
     use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
     use crate::programs::{
-        EffectClass, EffectClasses, Effects, MaybeZero, NoIdentity, Operation, OperationProjection, OperationProvider,
-        Program, ProgramError, Region, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, Type,
+        EffectClass, EffectClasses, Effects, MaybeZero, NoIdentity, NoReferenceTransform, NoReferent, Operation,
+        OperationProjection, OperationProvider, Program, ProgramError, ReferenceAccessDescriptor,
+        ReferenceAccessOperation, Region, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, Type,
         TypeError, Typed, Value, ValueProjection,
     };
     use crate::specialization::SpecializationCacheStatistics;
@@ -258,6 +258,32 @@ pub(crate) mod tests {
         Compare(CompareOperation<ArrayType>),
     }
 
+    // Like `ArrayOperation`, this reference-free family declares no access layout, but reverse-mode differentiation
+    // and the `reference_freeze` transpose name its transform type to select the reference cotangent accumulation,
+    // which resolves to the reference-free `reference_add_update` provider.
+    impl ReferenceAccessOperation for TestArrayOperation {
+        type Transform = NoReferenceTransform<NoReferent, ArrayType>;
+
+        fn base_input_count(&self) -> usize {
+            0
+        }
+
+        fn reference_access_descriptor(
+            &self,
+            _input_index: usize,
+        ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+            None
+        }
+
+        fn with_reference_access_transforms(
+            &self,
+            _input_index: usize,
+            _transforms: Vec<Self::Transform>,
+        ) -> Result<Self, ProgramError> {
+            Err(ProgramError::MalformedProgram("array-only operations have no reference inputs".to_owned()))
+        }
+    }
+
     impl OperationProvider<ArrayType, ParallelVaryOperation> for TestArrayOperation {
         type Operation = Self;
 
@@ -284,8 +310,8 @@ pub(crate) mod tests {
         Constant(Box<ConstantOperation<ArrayIrValue<Array>>>),
         #[ryft(projected(ArrayType))]
         Array(Box<TestArrayOperation>),
-        ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType>),
-        ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType>),
+        ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
+        ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
     }
 
     /// Eager context for mixed array/reference boundary tests using the small mixed operation family.

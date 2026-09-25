@@ -51,7 +51,6 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
     }
 
     /// Renders the provided field name-value pair.
-    #[inline]
     pub fn field<V: std::fmt::Display>(&mut self, name: &str, value: V) -> std::fmt::Result {
         if self.is_multiline {
             write!(self.formatter, "\n{:indentation$}{name}={value},", "", indentation = self.indentation + 4)
@@ -61,13 +60,29 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
         }
     }
 
+    /// Renders the provided list-valued field as `name=[first, second, ...]`, using each element's
+    /// [`Display`](std::fmt::Display) rendering and joining elements with `, `. `values` can be any iterable
+    /// collection, such as a slice or a lazily mapped iterator. Like [`field`](Self::field), the field renders
+    /// inline unless the bracketed section becomes too long. An element's rendering is not escaped, so elements
+    /// whose rendering can contain `, ` or `]` must escape it themselves if distinct lists need to render distinctly.
+    pub fn list<I: IntoIterator<Item: std::fmt::Display>>(&mut self, name: &str, values: I) -> std::fmt::Result {
+        let mut rendered = String::from("[");
+        for (index, value) in values.into_iter().enumerate() {
+            if index > 0 {
+                rendered.push_str(", ");
+            }
+            rendered.push_str(&value.to_string());
+        }
+        rendered.push(']');
+        self.field(name, rendered)
+    }
+
     /// Renders the provided nested field name-[`Program`] pair. This must be used for [`Program`]-valued metadata
     /// fields; attached [`Region`](crate::Region)s render through the contextual program renderer instead. Nested
     /// program metadata always renders semantically: [`Operation::render`] carries no [`ProgramRenderingMode`], and
     /// the instruction-level provenance suffix is owned by the contextual [`Program`] renderer. If a metadata
     /// program's own provenance ever needs to render, reintroduce a mode-carrying operation rendering path instead
     /// of changing this canonical output.
-    #[inline]
     pub fn program<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         name: &str,
@@ -87,7 +102,6 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
     }
 
     /// Renders a bracketed section (using square brackets) using the provided closure for rendering its contents.
-    #[inline]
     pub fn bracketed(mut self, render_contents: impl FnOnce(&mut Self) -> std::fmt::Result) -> std::fmt::Result {
         write!(self.formatter, " [")?;
         render_contents(&mut self)?;
@@ -785,19 +799,19 @@ pub trait Operation: Clone {
     }
 
     /// Returns the complete operation-local effect declaration of this [`Operation`] that contains its explicit
-    /// [`EffectClass`](crate::EffectClass)es, its [`ReferenceEffect`](crate::ReferenceEffect)s (allocations and
-    /// accesses), and its [`ReferenceAlias`](crate::ReferenceAlias)es, all expressed in this operation's operand/result
-    /// index space. Refer to the documentation of [`Effects`] for the semantics and per-operation examples. This is
-    /// the single declaration from which the aggregate [`EffectClasses`](crate::EffectClasses) consumed by transforms
-    /// and lowering (via [`Effects::classes`]), the reference facts consumed by reference analysis and discharge, and
-    /// the retention decision of dead-code elimination are derived.
+    /// [`EffectClass`](crate::EffectClass)es and its [`ReferenceEffect`](crate::ReferenceEffect)s (allocations and
+    /// accesses), all expressed in this operation's input/output index space. Refer to the documentation of [`Effects`]
+    /// for the semantics and per-operation examples. This is the single declaration from which the aggregate
+    /// [`EffectClasses`](crate::EffectClasses) consumed by transforms and lowering (via [`Effects::classes`]),
+    /// the reference facts consumed by reference analysis and discharge, and the retention decision of dead-code
+    /// elimination are derived.
     ///
-    /// The empty default is correct for pure operations that do not themselves create, alias, or access references.
-    /// This declaration describes only effects produced directly by the operation; it does not include effects from
-    /// attached [`Region`](crate::Region)s. Region sealing incorporates effects from attached computation regions into
-    /// region metadata, which is what [`Program::effects`] reports, while program-level reference analysis traverses
-    /// attached regions directly. Consequently, region-bearing operations such as loops and conditionals can keep the
-    /// empty default even when their nested programs are effectful or access references.
+    /// The empty default is correct for pure operations that do not themselves create or access references. This
+    /// declaration describes only effects produced directly by the operation; it does not include effects from attached
+    /// [`Region`](crate::Region)s. Region sealing incorporates effects from attached computation regions into region
+    /// metadata, which is what [`Program::effects`] reports, while program-level reference analysis traverses attached
+    /// regions directly. Consequently, region-bearing operations such as loops and conditionals can keep the empty
+    /// default even when their nested programs are effectful or access references.
     ///
     /// Contracts describing how references cross an operation's region boundaries are also separate from this effect
     /// declaration. Use [`Self::region_capture_input_count`] to establish a region's capture namespace,
@@ -1326,7 +1340,6 @@ mod tests {
                 Effects::new(
                     EffectClasses::single(EffectClass::OrderedIo),
                     vec![ReferenceEffect::Allocate { output_index: 0 }],
-                    Vec::new(),
                 )
                 .unwrap(),
             )

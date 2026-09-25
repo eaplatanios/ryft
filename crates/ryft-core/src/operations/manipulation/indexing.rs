@@ -2050,7 +2050,7 @@ enum OutputAxis {
 
 /// Per-axis outcome of resolving a selection against a reference's referent shape.
 enum ReferenceAxisSelection<'i, V> {
-    /// The axis is selected in full and needs no view transform.
+    /// The axis is selected in full and needs no transform.
     Full,
 
     /// A static unit-stride window that keeps the axis.
@@ -3255,7 +3255,7 @@ mod tests {
         let view = buffer.at(&index![..., -1]).view().unwrap();
         assert_eq!(view.read(), Ok(ArrayIrValue::Array(Array::vector(vec![3.0_f32, 6.0]).unwrap())));
 
-        // Full selections derive no view transform and hand back the input allocation.
+        // Full selections derive no transform and hand back the input allocation.
         let view = buffer.at(&index![.., 0..3]).view().unwrap();
         assert_eq!(view.r#type().as_ref(), <&ReferenceType<ArrayType>>::try_from(buffer.r#type().as_ref()).unwrap());
         assert_eq!(view.read(), buffer.read());

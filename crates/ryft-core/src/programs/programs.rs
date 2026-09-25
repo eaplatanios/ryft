@@ -2055,8 +2055,8 @@ mod tests {
     use crate::macros::check_count;
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, MulOperation, NegOperation,
-        PrintOperation, ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceWriteOperation, ScanOperation, WhileOperation,
+        PrintOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, ScanOperation,
+        WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
@@ -3041,8 +3041,7 @@ mod tests {
     #[test]
     fn test_program_simplified_roots_reference_accesses_but_not_allocations() {
         // Dead-code elimination roots an output-dead instruction exactly when its effect summary has an observable
-        // consequence when unused. Allocations and aliases do not (i.e., the allocation nothing touches and the
-        // allocation whose only user is a dead view disappear together with that view). Accesses do, whatever their
+        // consequence when unused. Untouched scalar and vector allocations disappear. Accesses remain, whatever their
         // mode (i.e., the unused read and the write, which has no outputs at all, are retained, and each keeps the
         // allocation it accesses alive as its dependency). A live allocation is retained by ordinary liveness.
         let build_program = || {
@@ -3050,9 +3049,7 @@ mod tests {
             let scalar = builder.add_input(ArrayType::scalar(DataType::F32).into());
             let vector = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![scalar], None).unwrap();
-            let viewed =
-                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![vector], None).unwrap()[0];
-            builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![viewed], None).unwrap();
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![vector], None).unwrap();
             let read =
                 builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![scalar], None).unwrap()[0];
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![read], None).unwrap();
@@ -3131,12 +3128,7 @@ mod tests {
                     Self::Native(operation) => operation.effects(),
                     Self::Effectful(effect) => Cow::Owned(Effects::explicit(EffectClasses::single(*effect))),
                     Self::AllocateWith(_) => Cow::Owned(
-                        Effects::new(
-                            EffectClasses::NONE,
-                            vec![ReferenceEffect::Allocate { output_index: 0 }],
-                            Vec::new(),
-                        )
-                        .unwrap(),
+                        Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap(),
                     ),
                 }
             }
@@ -4090,8 +4082,8 @@ mod tests {
             .trim_end(),
         );
 
-        // EffectClasses in transform-only rule regions are dormant during ordinary execution and therefore do not make the
-        // containing instruction or program effectful.
+        // Effect classes in transform-only rule regions are dormant during ordinary execution and therefore
+        // do not make the containing instruction or program effectful.
         let mut rule_builder = ProgramBuilder::<Array, DormantRegionOperation>::new();
         let rule_input = rule_builder.add_input(ArrayType::scalar(DataType::F64));
         let rule_output = rule_builder

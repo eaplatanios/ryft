@@ -971,10 +971,9 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.contains_atom_in_closure(|atom| predicate(atom.r#type().as_ref()))
     }
 
-    /// Returns whether this [`Region`]'s complete attached region closure contains a reference-typed [`Atom`]
-    /// or an [`Operation`] whose effects declare at least one [`ReferenceEffect`](crate::ReferenceEffect) or
-    /// [`ReferenceAlias`](crate::ReferenceAlias). Every attached region is traversed regardless of [`RegionRole`],
-    /// and shared descendants are visited once.
+    /// Returns whether this [`Region`]'s complete attached region closure contains a reference-typed [`Atom`] or an
+    /// [`Operation`] whose effects declare at least one [`ReferenceEffect`](crate::ReferenceEffect). Every attached
+    /// region is traversed regardless of [`RegionRole`], and shared descendants are visited once.
     #[inline]
     pub fn contains_references_in_closure(self) -> bool {
         self.contains_atom_type_in_closure(Type::is_reference)
