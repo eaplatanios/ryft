@@ -5348,7 +5348,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_linearize_retains_known_view_binding_as_residual() {
+    fn test_program_linearize_retains_known_transform_binding_as_residual() {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let root = builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])).into());
         let index = builder.add_input(ArrayType::scalar(DataType::I32).into());

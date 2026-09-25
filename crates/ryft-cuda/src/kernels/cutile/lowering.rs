@@ -5,10 +5,10 @@
 
 use ryft_core::kernels::{GridExecution, KernelOperation, KernelSchedule, NoKernelExtension, VerifiedKernel};
 use ryft_core::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-    ArrayType, Atom, ComparisonDirection, DataType, Dimension, DimensionOperation, DimensionValue, DotDimensionNumbers,
-    Operation, ProgramError, ReductionKind, ReferenceAccessOperation, RegionRef, Typed,
-    validated_reference_access_descriptors,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
+    ArrayReferenceTransformIndex, ArrayType, Atom, ComparisonDirection, DataType, Dimension, DimensionOperation,
+    DimensionValue, DotDimensionNumbers, Operation, ProgramError, ReductionKind, ReferenceAccessOperation, RegionRef,
+    Typed, validated_reference_access_descriptors,
 };
 
 use crate::kernels::cutile::{Error, Options, Parameter, data_type_name, launch_grid};
@@ -240,8 +240,8 @@ impl Lowering {
             let operation = instruction.operation();
             let descriptors = validated_reference_access_descriptors(operation, instruction.inputs().len())?;
             for (input_index, descriptor) in descriptors.iter().enumerate() {
-                for view in descriptor.iter().flat_map(|descriptor| descriptor.transforms()) {
-                    self.reference_view(&mut inputs[input_index], view, operation.name())?;
+                for transform in descriptor.iter().flat_map(|descriptor| descriptor.transforms()) {
+                    self.apply_transform(&mut inputs[input_index], transform, operation.name())?;
                 }
             }
             if descriptors.iter().any(Option::is_some) {
@@ -455,18 +455,18 @@ impl Lowering {
         Ok(self.assign(format!("ct.broadcast_to({scalar}, {})", physical_shape(&shape))))
     }
 
-    /// Applies one supported reference view while preserving enclosing-window bounds.
-    fn reference_view(
+    /// Applies one supported reference transform while preserving enclosing-window bounds.
+    fn apply_transform(
         &mut self,
         reference: &mut Value,
-        view: &ArrayReferenceTransform,
+        transform: &ArrayReferenceTransform,
         operation: &'static str,
     ) -> Result<(), Error> {
         self.charge(1)?;
         let Value::Reference { starts, shape, limits, axes, fixed, validity, .. } = reference else {
             return Err(unsupported(operation, "expected a global reference"));
         };
-        match view {
+        match transform {
             ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) } => {
                 let coordinate = format!("({} + {index})", starts.remove(*axis));
                 validity.push(format!("({coordinate} < {})", limits.remove(*axis)));
@@ -475,7 +475,7 @@ impl Lowering {
             }
             ArrayReferenceTransform::Slice { axes: selections } => {
                 if selections.iter().any(|selection| selection.stride() != 1) {
-                    return Err(unsupported(operation, "strided reference views are unsupported"));
+                    return Err(unsupported(operation, "strided reference transforms are unsupported"));
                 }
                 for (axis, selection) in selections.iter().enumerate() {
                     starts[axis] = format!("({} + {})", starts[axis], selection.start());
@@ -484,9 +484,9 @@ impl Lowering {
                 }
             }
             ArrayReferenceTransform::Index { .. } => {
-                return Err(unsupported(operation, "dynamic reference views are unsupported"));
+                return Err(unsupported(operation, "dynamic reference transforms are unsupported"));
             }
-            _ => return Err(unsupported(operation, "reference view is outside the supported subset")),
+            _ => return Err(unsupported(operation, "reference transform is outside the supported subset")),
         }
         Ok(())
     }
@@ -905,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lowering_reference_view() {
+    fn test_lowering_apply_transform() {
         let mut lowering = Lowering { code: String::new(), indentation: 0, next: 0, remaining: 10 };
         let mut reference = Value::Reference {
             parameter: 0,
@@ -917,14 +917,14 @@ mod tests {
             validity: vec![],
         };
         lowering
-            .reference_view(
+            .apply_transform(
                 &mut reference,
                 &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] },
                 "reference_read",
             )
             .unwrap();
         lowering
-            .reference_view(
+            .apply_transform(
                 &mut reference,
                 &ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
                 "reference_read",
@@ -934,14 +934,14 @@ mod tests {
         assert_eq!((starts.len(), shape.len(), limits.len(), axes.len()), (0, 0, 0, 0));
         assert_eq!(fixed, &vec![Some("((8 + 1) + 1)".to_owned())]);
         assert_eq!(validity, &vec!["(((8 + 1) + 1) < ct.minimum(12, ((8 + 1) + 2)))".to_owned()]);
-        assert!(matches!(lowering.reference_view(&mut reference, &ArrayReferenceTransform::Index {
+        assert!(matches!(lowering.apply_transform(&mut reference, &ArrayReferenceTransform::Index {
             axis: 0, index: ArrayReferenceTransformIndex::Dynamic,
         }, "reference_read"), Err(Error::Unsupported { operation: "reference_read", reason })
-            if reason == "dynamic reference views are unsupported"));
-        assert!(matches!(lowering.reference_view(&mut reference, &ArrayReferenceTransform::Slice {
+            if reason == "dynamic reference transforms are unsupported"));
+        assert!(matches!(lowering.apply_transform(&mut reference, &ArrayReferenceTransform::Slice {
             axes: vec![ArraySliceAxis::new(0, 1, 2)],
         }, "reference_read"), Err(Error::Unsupported { operation: "reference_read", reason })
-            if reason == "strided reference views are unsupported"));
+            if reason == "strided reference transforms are unsupported"));
     }
 
     #[test]

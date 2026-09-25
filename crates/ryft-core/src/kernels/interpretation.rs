@@ -154,7 +154,7 @@ pub struct KernelTraceEntry {
     pub pending_copies: Vec<usize>,
 }
 
-/// A reference access in a [`KernelTraceEntry`], with its canonical view and invocation-local root identity.
+/// A reference access in a [`KernelTraceEntry`], with its canonical transform path and invocation-local root identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KernelTraceAccess {
     /// Input position of the accessed reference.
@@ -163,15 +163,15 @@ pub struct KernelTraceAccess {
     pub mode: ReferenceAccessMode,
     /// Allocation number assigned on first observation during this invocation.
     pub root: usize,
-    /// Canonical view transformations from this allocation to the selected elements.
-    pub view: String,
+    /// Canonical transform path from this allocation to the selected elements, rendered as `/`-prefixed transforms.
+    pub path: String,
 }
 
 impl Display for KernelTraceEntry {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{:?} {}", self.coordinate, self.operation)?;
         for access in &self.accesses {
-            write!(formatter, " input[{}]={}(root[{}]{})", access.input, access.mode, access.root, access.view)?;
+            write!(formatter, " input[{}]={}(root[{}]{})", access.input, access.mode, access.root, access.path)?;
         }
         write!(formatter, " pending={:?}", self.pending_copies)?;
         if !self.provenance.is_unknown() {
@@ -675,8 +675,8 @@ impl<Extension: Operation<Type = ArrayIrType>> QualifiedKernelContext<Extension>
             return Ok(None);
         };
         let mut selected = validity.clone();
-        for view in reference.path().transforms() {
-            selected = selected.with_transform(view.clone())?;
+        for transform in reference.path().transforms() {
+            selected = selected.with_transform(transform.clone())?;
         }
         selected.read().map(Some)
     }
@@ -714,8 +714,10 @@ where
             else {
                 continue;
             };
-            selected_references
-                .insert(input_index, reference.with_transforms(descriptor.transforms(), &inputs[descriptor.bindings()])?);
+            selected_references.insert(
+                input_index,
+                reference.with_transforms(descriptor.transforms(), &inputs[descriptor.bindings()])?,
+            );
         }
         if let Some(trace) = &self.trace {
             let mut trace = trace.borrow_mut();
@@ -724,8 +726,8 @@ where
                 if let Some(reference) = selected_references.get(&input) {
                     let next = trace.roots.len();
                     let root = *trace.roots.entry(reference.id()).or_insert(next);
-                    let view = reference.path().transforms().map(|view| format!("/{view:?}")).collect();
-                    accesses.push(KernelTraceAccess { input, mode, root, view });
+                    let path = reference.path().transforms().map(|transform| format!("/{transform:?}")).collect();
+                    accesses.push(KernelTraceAccess { input, mode, root, path });
                 }
             }
             let mut pending_copies = Vec::new();
@@ -1058,7 +1060,7 @@ mod tests {
                 input: 0,
                 mode: ReferenceAccessMode::Read,
                 root: 1,
-                view: "/slice[0:2]".to_owned(),
+                path: "/slice[0:2]".to_owned(),
             }],
             pending_copies: vec![4],
         };
@@ -1168,8 +1170,10 @@ mod tests {
                 .bind(ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation), vec![], &coordinates)?
                 .remove(0);
             context.bind(
-                ReferenceWriteOperation::new()
-                    .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]),
+                ReferenceWriteOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Static(0),
+                }]),
                 vec![],
                 &[references[0].clone(), value],
             )?;
@@ -1676,7 +1680,10 @@ mod tests {
         let source = ArrayReference::new(Array::matrix(2, 2, vec![1i32, 2, 11, 13]).unwrap());
         let destination = ArrayReference::new(Array::matrix(3, 2, vec![0i32; 6]).unwrap());
         let operation = AsyncCopyOperation::new()
-            .with_source_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }])
+            .with_source_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic,
+            }])
             .with_destination_transforms(vec![ArrayReferenceTransform::Index {
                 axis: 0,
                 index: ArrayReferenceTransformIndex::Dynamic,
@@ -1713,8 +1720,10 @@ mod tests {
             trace: None,
             pending_copies: Rc::new(RefCell::new(BTreeMap::new())),
         };
-        let operation = MaskedLoadOperation::new()
-            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }]);
+        let operation = MaskedLoadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+            axis: 0,
+            index: ArrayReferenceTransformIndex::Static(1),
+        }]);
         assert_eq!(
             context.bind(
                 operation,

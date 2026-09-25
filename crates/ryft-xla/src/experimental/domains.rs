@@ -6255,9 +6255,9 @@ mod tests {
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
-        AddOperation, AndOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayOperation, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArraySliceAxis, Assert, AssertOperation, Atan2Operation, BatchAxis,
-        BatchableOperation, BatchingContext, CalleeRegionDriver, CaptureReference, CompareOperation,
+        AddOperation, AndOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayOperation,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, Assert, AssertOperation, Atan2Operation,
+        BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver, CaptureReference, CompareOperation,
         ComparisonDirection, CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher,
         ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
         CotangentDestinationKind, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
@@ -12716,8 +12716,10 @@ mod tests {
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let indexed_snapshot = builder
             .add_instruction(
-                ReferenceReadOperation::new()
-                    .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(3) }]),
+                ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Static(3),
+                }]),
                 Vec::new(),
                 vec![reference],
                 None,
@@ -12873,7 +12875,8 @@ mod tests {
         let update = builder.add_input(scalar_type.into());
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }];
+        let transforms =
+            vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }];
         let old = builder
             .add_instruction(
                 ReferenceSwapOperation::new().with_transforms(transforms.clone()),

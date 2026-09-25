@@ -8,7 +8,7 @@ use crate::macros::check_count;
 use crate::parameters::{Parameter, Parameterized};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
-use crate::programs::effects::{ReferenceAccessMode, ReferenceAliasKind};
+use crate::programs::effects::ReferenceAccessMode;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::{Operation, OperationFoldReplacement};
@@ -185,13 +185,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         // Without region forwarding, use the operation's alias declaration. This also covers unchecked appends,
         // which do not populate the builder's incremental alias topology. Otherwise, the result starts a new root.
         if provenance.is_empty() {
-            if let Some(alias) =
-                operation.effects().reference_aliases().iter().find(|alias| alias.output_index() == output_index)
-            {
-                let input = instruction.inputs().get(alias.input_index()).ok_or_else(|| {
+            if let Some(input_index) = operation.reference_output_identity_input(output_index) {
+                let input = instruction.inputs().get(input_index).ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
-                        "operation `{}` has an out-of-range reference alias input",
-                        operation.name(),
+                        "operation `{}` has an out-of-range reference identity input",
+                        operation.name()
                     ))
                 })?;
                 return self.resolve_reference(*input);
@@ -313,17 +311,26 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// from this builder's sealed arena on the spot (i.e., [`RegionInterface`]s are never stored).
     ///
     /// This checked "append" also enforces reference lifetimes across the region under construction. An application
-    /// that accesses a reference whose alias family an earlier instruction consumed, or that consumes a derived view
-    /// rather than a whole root, is rejected at the "append" that performs it. Construction is the earliest point at
-    /// which such a misuse can be reported against the call that caused it (the eager runtime invalidates a frozen
-    /// reference's complete alias family and discharge reports what its own environment observes, but a program under
-    /// construction could otherwise record the misuse and surface it only much later). Replay and rebuild paths that
-    /// re-append instructions already accepted once use [`add_instruction_unchecked`](Self::add_instruction_unchecked)
-    /// instead, which is also the hatch for tests that deliberately construct malformed programs for testing validation
-    /// checks. This validation is structural. It sees atoms and declared reference effects, never live values, so it
-    /// cannot detect two inputs or captures bound to the same runtime allocation. That runtime aliasing is rejected by
+    /// that accesses a reference whose alias family an earlier instruction consumed is rejected at the "append" that
+    /// performs it. Construction is the earliest point at which such a misuse can be reported against the call that
+    /// caused it (the eager runtime invalidates a frozen reference's complete alias family and discharge reports what
+    /// its own environment observes, but a program under construction could otherwise record the misuse and surface it
+    /// only much later). Replay and rebuild paths that re-append instructions already accepted once use
+    /// [`add_instruction_unchecked`](Self::add_instruction_unchecked) instead, which is also the hatch for tests that
+    /// deliberately construct malformed programs for testing validation checks. This validation is structural. It sees
+    /// atoms and declared reference effects, never live values, so it cannot detect two inputs or captures bound to the
+    /// same runtime allocation. That runtime aliasing is rejected by
     /// [`validate_reference_boundary`](crate::validate_reference_boundary) at the public transform boundaries that bind
     /// concrete values.
+    ///
+    /// Because this builder is generic over every [`Operation`] family, it does not validate the access descriptors of
+    /// [`ReferenceAccessOperation`](crate::ReferenceAccessOperation)s. Built-in access operations type-check their
+    /// transform bindings through [`Operation::infer_output_types`], while the canonical descriptor layout (including
+    /// the rule that consuming accesses apply no transforms) is validated by
+    /// [`validated_reference_access_descriptors`](crate::validated_reference_access_descriptors),
+    /// which [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis),
+    /// [`rewrite_reference_access_transforms`](crate::rewrite_reference_access_transforms),
+    /// and every other descriptor consumer apply before reading any descriptor.
     ///
     /// The recorded [`Instruction`] carries the provided non-semantic [`Provenance`], with [`None`] recording
     /// unknown provenance.
@@ -750,7 +757,6 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         if !regions.is_empty() {
             for (output_index, output_type) in output_types.iter().enumerate() {
                 let declared = effects.allocation_output_indices().any(|index| index == output_index)
-                    || effects.reference_aliases().iter().any(|alias| alias.output_index() == output_index)
                     || operation.reference_output_identity_input(output_index).is_some()
                     || !operation.output_region_provenance(output_index).is_empty();
                 if output_type.is_reference() && !declared {
@@ -826,8 +832,8 @@ struct CalleeInstantiation<V: Typed + Parameter, O> {
 /// [`Reference`](crate::Reference) alias topology and consumption state of a [`Region`] under construction. The
 /// legality of one checked instruction append depends on every earlier checked instruction append, so this is the
 /// incrementally maintained fold owned by the [`ProgramBuilder`] that spans them. Consumption applies to a complete
-/// alias family: each derived handle is resolved to its root, and narrowing view chains are distinguished from
-/// identity-preserving aliases. [`ProgramBuilder::add_instruction_unchecked`] deliberately bypasses this state.
+/// alias family: each identity-preserving alias is resolved to its root. [`ProgramBuilder::add_instruction_unchecked`]
+/// deliberately bypasses this state.
 #[derive(Clone, Debug, Default)]
 struct ReferenceLifetimes {
     /// Name of the consuming [`Operation`], per consumed alias-family root.
@@ -844,7 +850,7 @@ impl ReferenceLifetimes {
         self.aliases.get(&atom).map_or(atom, |edge| edge.root)
     }
 
-    /// Rejects an access to a consumed family or consumption through a narrowing view.
+    /// Rejects an access to a consumed alias family.
     fn validate<O: Operation>(&self, operation: &O, inputs: &[AtomId]) -> Result<(), ProgramError> {
         if self.consumed.is_empty() && self.aliases.is_empty() {
             return Ok(());
@@ -856,12 +862,6 @@ impl ReferenceLifetimes {
                 continue;
             };
             let edge = self.aliases.get(atom);
-            if mode.is_consuming() && edge.is_some_and(|edge| edge.narrows) {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "`{name}` consumes a derived reference view, but consumption invalidates the whole alias \
-                     family; consume the root handle instead",
-                )));
-            }
             let root = edge.map_or(*atom, |edge| edge.root);
             if let Some(consumer) = self.consumed.get(&root) {
                 return Err(ProgramError::MalformedProgram(format!(
@@ -898,41 +898,15 @@ impl ReferenceLifetimes {
                 continue;
             };
             if let Some(input_atom) = inputs.get(input_index) {
-                self.alias(output_atom, *input_atom, false);
-            }
-        }
-        for alias in effects.reference_aliases() {
-            if let (Some(output_atom), Some(input_atom)) =
-                (outputs.get(alias.output_index()), inputs.get(alias.input_index()))
-            {
-                self.alias(*output_atom, *input_atom, alias.kind() == ReferenceAliasKind::View);
+                self.alias(output_atom, *input_atom);
             }
         }
     }
 
-    /// Records `output` as an alias of `input`, resolving the family root eagerly. `narrows` is `true` when this edge
-    /// makes `output` a derived view of `input`, such as an indexed row or slice, rather than another handle to the
-    /// entire referenced value. Narrowing is _transitive_ meaning that an identity alias of a narrowed input still
-    /// represents only that view. A narrowed alias can access its view, but cannot consume the reference because
-    /// consumption invalidates the complete alias family and must use a handle representing the entire root value.
-    ///
-    /// # Examples
-    ///
-    /// For a root referencing an entire matrix, a whole-value alias does not narrow, while selecting a row does. An
-    /// identity alias subsequently derived from that row remains narrowed even though its own edge does not narrow:
-    ///
-    /// ```text
-    /// root        -> entire matrix
-    /// whole_alias -> root          (narrows = false; represents the entire matrix)
-    /// row         -> root[2, :]    (narrows = true; represents only one row)
-    /// row_alias   -> row           (narrows = false; remains narrowed through `row`)
-    /// ```
-    fn alias(&mut self, output: AtomId, input: AtomId, narrows: bool) {
+    /// Records a complete-root alias and resolves its allocation identity.
+    fn alias(&mut self, output: AtomId, input: AtomId) {
         let source = self.aliases.get(&input).copied();
-        let edge = ResolvedReferenceAlias {
-            root: source.map_or(input, |source| source.root),
-            narrows: narrows || source.is_some_and(|source| source.narrows),
-        };
+        let edge = ResolvedReferenceAlias { root: source.map_or(input, |source| source.root) };
         self.aliases.insert(output, edge);
     }
 }
@@ -942,9 +916,6 @@ impl ReferenceLifetimes {
 struct ResolvedReferenceAlias {
     /// Alias-family root this atom belongs to.
     root: AtomId,
-
-    /// Whether the chain from the root to this atom narrows the referent.
-    narrows: bool,
 }
 
 #[cfg(test)]
@@ -965,7 +936,7 @@ mod tests {
         NegOperation,
     };
     use crate::parameters::{Parameter, Placeholder};
-    use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceAlias, ReferenceEffect};
+    use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceEffect};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::InstructionId;
     use crate::programs::operations::OperationFoldOutput;
@@ -1043,7 +1014,6 @@ mod tests {
                     Effects::new(
                         EffectClasses::NONE,
                         vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-                        Vec::new(),
                     )
                     .unwrap(),
                 ),
@@ -2075,7 +2045,6 @@ mod tests {
             Effects::new(
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index, mode: ReferenceAccessMode::Read }],
-                Vec::new(),
             )
             .unwrap()
         };
@@ -2112,24 +2081,11 @@ mod tests {
             )),
         );
         let allocation =
-            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new()).unwrap();
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
         assert_eq!(
             builder.add_instruction(InvalidReferenceOperation(allocation), Vec::new(), vec![array], None),
             Err(ProgramError::MalformedProgram(
                 "operation `test.invalid_reference` classifies output 0 but it has non-reference type `f32[]`"
-                    .to_string(),
-            )),
-        );
-        let alias = Effects::new(
-            EffectClasses::NONE,
-            Vec::new(),
-            vec![ReferenceAlias::new(0, 1, ReferenceAliasKind::Identity)],
-        )
-        .unwrap();
-        assert_eq!(
-            builder.add_instruction(InvalidReferenceOperation(alias), Vec::new(), vec![reference, array], None),
-            Err(ProgramError::MalformedProgram(
-                "operation `test.invalid_reference` names an aliased input 1 but it has non-reference type `f32[]`"
                     .to_string(),
             )),
         );
@@ -2241,12 +2197,7 @@ mod tests {
             fn effects(&self) -> Cow<'_, Effects> {
                 match self {
                     Self::Allocate => Cow::Owned(
-                        Effects::new(
-                            EffectClasses::NONE,
-                            vec![ReferenceEffect::Allocate { output_index: 0 }],
-                            Vec::new(),
-                        )
-                        .unwrap(),
+                        Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap(),
                     ),
                     Self::Region { .. } | Self::ForwardingRegion => Cow::Borrowed(Effects::empty()),
                 }
@@ -2383,23 +2334,13 @@ mod tests {
 
         let access = |name, mode| TestReferenceOperation {
             name,
-            effects: Effects::new(
-                EffectClasses::NONE,
-                vec![ReferenceEffect::Access { input_index: 0, mode }],
-                Vec::new(),
-            )
-            .unwrap(),
+            effects: Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Access { input_index: 0, mode }]).unwrap(),
             forwarded: None,
         };
-        let alias = |name, kind| TestReferenceOperation {
-            name,
-            effects: Effects::new(EffectClasses::NONE, Vec::new(), vec![ReferenceAlias::new(0, 0, kind)]).unwrap(),
-            forwarded: None,
-        };
+        let alias = |name| TestReferenceOperation { name, effects: Effects::empty().clone(), forwarded: Some((0, 0)) };
         let allocation = TestReferenceOperation {
             name: "reference_new",
-            effects: Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new())
-                .unwrap(),
+            effects: Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap(),
             forwarded: None,
         };
         let read = access("reference_read", ReferenceAccessMode::Read);
@@ -2408,54 +2349,45 @@ mod tests {
         let accumulate = access("reference_add_update", ReferenceAccessMode::Accumulate);
         let freeze = access("reference_freeze", ReferenceAccessMode::Consume);
 
-        // Allocation records no alias edge. View narrowing remains transitive across later identity aliases,
-        // while identity aliases of the root remain valid consumption handles.
+        // Allocation records no alias edge. Identity aliases share one root and remain valid consumption handles.
         let root = AtomId::new(1);
-        let view = AtomId::new(2);
-        let renamed_view = AtomId::new(3);
-        let renamed_root = AtomId::new(4);
+        let root_alias = AtomId::new(2);
+        let nested_alias = AtomId::new(3);
+        let sibling_alias = AtomId::new(4);
         let mut lifetimes = ReferenceLifetimes::default();
         assert_eq!(lifetimes.validate(&read, &[root]), Ok(()));
         lifetimes.record(&allocation, &[AtomId::new(0)], &[root]);
         assert_eq!(lifetimes.validate(&freeze, &[root]), Ok(()));
-        lifetimes.record(&alias("reference_slice", ReferenceAliasKind::View), &[root], &[view]);
-        lifetimes.record(&alias("rename", ReferenceAliasKind::Identity), &[view], &[renamed_view]);
-        lifetimes.record(&alias("rename", ReferenceAliasKind::Identity), &[root], &[renamed_root]);
-        assert_eq!(lifetimes.validate(&read, &[renamed_view]), Ok(()));
-        let narrowed = "`reference_freeze` consumes a derived reference view, but consumption invalidates the whole \
-                        alias family; consume the root handle instead";
-        assert!(matches!(
-            lifetimes.validate(&freeze, &[view]),
-            Err(ProgramError::MalformedProgram(message)) if message == narrowed,
-        ));
-        assert!(matches!(
-            lifetimes.validate(&freeze, &[renamed_view]),
-            Err(ProgramError::MalformedProgram(message)) if message == narrowed,
-        ));
-        assert_eq!(lifetimes.validate(&freeze, &[renamed_root]), Ok(()));
+        lifetimes.record(&alias("rename"), &[root], &[root_alias]);
+        lifetimes.record(&alias("rename"), &[root_alias], &[nested_alias]);
+        lifetimes.record(&alias("rename"), &[root], &[sibling_alias]);
+        assert_eq!(lifetimes.validate(&read, &[nested_alias]), Ok(()));
+        assert_eq!(lifetimes.validate(&freeze, &[root_alias]), Ok(()));
+        assert_eq!(lifetimes.validate(&freeze, &[nested_alias]), Ok(()));
+        assert_eq!(lifetimes.validate(&freeze, &[sibling_alias]), Ok(()));
         assert_eq!(lifetimes.validate(&freeze, &[AtomId::new(9)]), Ok(()));
 
         // Consumption invalidates every handle in the family and diagnostics name both the invalid access and the
-        // consuming operation. Narrowing misuse takes precedence over the resulting dead-family diagnostic.
+        // consuming operation.
         let consumed = |name, action| {
             format!("`{name}` {action} a reference whose alias family `reference_freeze` already consumed")
         };
-        lifetimes.record(&freeze, &[renamed_root], &[]);
+        lifetimes.record(&freeze, &[sibling_alias], &[]);
         assert!(matches!(
             lifetimes.validate(&read, &[root]),
             Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_read", "reads"),
         ));
         assert!(matches!(
-            lifetimes.validate(&write, &[view]),
+            lifetimes.validate(&write, &[root_alias]),
             Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_write", "writes"),
         ));
         assert!(matches!(
-            lifetimes.validate(&swap, &[view]),
+            lifetimes.validate(&swap, &[root_alias]),
             Err(ProgramError::MalformedProgram(message))
                 if message == consumed("reference_swap", "reads and writes"),
         ));
         assert!(matches!(
-            lifetimes.validate(&accumulate, &[view]),
+            lifetimes.validate(&accumulate, &[root_alias]),
             Err(ProgramError::MalformedProgram(message))
                 if message == consumed("reference_add_update", "accumulates into"),
         ));
@@ -2464,8 +2396,8 @@ mod tests {
             Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_freeze", "consumes"),
         ));
         assert!(matches!(
-            lifetimes.validate(&freeze, &[renamed_view]),
-            Err(ProgramError::MalformedProgram(message)) if message == narrowed,
+            lifetimes.validate(&freeze, &[nested_alias]),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_freeze", "consumes"),
         ));
 
         // Structured identity forwarding joins the output to its operand's family without declaring reference

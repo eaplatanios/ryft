@@ -6431,8 +6431,8 @@ mod tests {
         assert_eq!(
             operation.discharge_references(&context, &EmptyRegionDriver, &[reference.into(), inputs[0].clone()]),
             Err(ProgramError::UnsupportedOperation {
-                message: "`test_binary` does not thread external references through discharge, but operand 0 is a \
-                          reference; pass reference-free operands or discharge external references first"
+                message: "`test_binary` does not thread external references through discharge, but input 0 is a \
+                          reference; pass reference-free inputs or discharge external references first"
                     .to_string(),
             }),
         );

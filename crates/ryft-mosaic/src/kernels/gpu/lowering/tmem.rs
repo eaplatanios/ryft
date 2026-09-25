@@ -669,7 +669,7 @@ impl<'c, 't> Lowering<'c, 't> {
                     thread,
                     SynchronizationEvent::LoadTensorMemory {
                         value: source.owner,
-                        view: ArrayReferenceTransform::Slice {
+                        transform: ArrayReferenceTransform::Slice {
                             axes: vec![
                                 ArraySliceAxis::new(rank * 128 + thread as usize, 1, 1),
                                 ArraySliceAxis::new(0, source.columns, 1),

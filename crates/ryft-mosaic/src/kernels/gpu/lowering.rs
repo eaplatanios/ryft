@@ -5,9 +5,10 @@ use std::num::NonZeroU32;
 
 use ryft_core::kernels::{GridExecution, KernelExtension, KernelOperation, KernelSchedule, VerifiedKernel};
 use ryft_core::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-    ArraySliceAxis, ArrayType, Atom, AtomId, ConstantOperation, DataType, InstructionId, Operation as CoreOperation,
-    ReferenceAccessOperation, ReferenceTransform, RegionRef, Typed, ValueId, validated_reference_access_descriptors,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
+    ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, Atom, AtomId, ConstantOperation, DataType, InstructionId,
+    Operation as CoreOperation, ReferenceAccessOperation, ReferenceTransform, RegionRef, Typed, ValueId,
+    validated_reference_access_descriptors,
 };
 use ryft_mlir::dialects::{arith, gpu, llvm, memref, nvvm, scf};
 use ryft_mlir::{
@@ -277,7 +278,7 @@ impl<'c, 't> Lowering<'c, 't> {
         for cta in 0..2 {
             for thread in 0..participants {
                 let row = (1 - cta) * rows_per_cta + thread as usize;
-                let view = ArrayReferenceTransform::Slice {
+                let transform = ArrayReferenceTransform::Slice {
                     axes: vec![ArraySliceAxis::new(row, 1, 1), ArraySliceAxis::new(0, columns, 1)],
                 };
                 self.record_synchronization(
@@ -285,8 +286,8 @@ impl<'c, 't> Lowering<'c, 't> {
                     thread,
                     SynchronizationEvent::DistributedCopy {
                         source_block: (1 - cta) as u32,
-                        source: (buffer.owner, view.clone()),
-                        destination: (buffer.owner, view),
+                        source: (buffer.owner, transform.clone()),
+                        destination: (buffer.owner, transform),
                     },
                 )?;
             }
@@ -381,8 +382,9 @@ fn shape(r#type: &ArrayType) -> Result<Vec<usize>, Error> {
     })
 }
 
-/// Returns whether `axes` select all of a reference with the logical `shape`. Such identity slices are the only views
-/// that native asynchronous copies accept, because they preserve the whole-root proof that those copies require.
+/// Returns whether `axes` select all of a reference with the logical `shape`. Such identity slices are the only
+/// transforms that native asynchronous copies accept, because they preserve the whole-root proof that those copies
+/// require.
 fn is_whole_slice(axes: &[ArraySliceAxis], shape: &[usize]) -> bool {
     axes.len() == shape.len()
         && axes
@@ -463,8 +465,9 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
             | KernelOperation::MaskedStore(_)
             | KernelOperation::MaskedSwap(_) => true,
             KernelOperation::AsyncCopy(operation) => {
-                // Native copies address whole roots. Reject partial views here, before any artifact lookup, instead
-                // of leaving them to fail during lowering; full identity slices keep the whole root selected.
+                // Native copies address whole roots. Reject partial transforms (views that select less than the whole
+                // root) here, before any artifact lookup, instead of leaving them to fail during lowering; full
+                // identity slices keep the whole root selected.
                 let atoms = kernel.definition().body().regions().get(instruction_id.region()).unwrap().atoms();
                 for (input, transforms) in [
                     (instruction.inputs()[0], operation.source_transforms()),
@@ -474,14 +477,14 @@ pub(super) fn validate<Extension: KernelExtension + Into<GpuOperation>>(
                         ArrayIrType::Reference(reference) => reference.referent().static_shape(),
                         _ => None,
                     };
-                    let whole = transforms.iter().all(|view| {
-                        matches!(view, ArrayReferenceTransform::Slice { axes }
+                    let whole = transforms.iter().all(|transform| {
+                        matches!(transform, ArrayReferenceTransform::Slice { axes }
                             if shape.as_ref().is_some_and(|shape| is_whole_slice(axes, shape.dimensions())))
                     });
                     if !whole {
                         return Err(Error::Unsupported {
                             operation: operation.name(),
-                            reason: "native async copies require views that select whole references".to_owned(),
+                            reason: "native async copies require transforms that select whole references".to_owned(),
                         });
                     }
                 }
@@ -950,10 +953,14 @@ impl<'c, 't> Lowering<'c, 't> {
                     }
                     let mut reference = inputs[input_index].reference().clone();
                     let mut binding_index = descriptor.bindings().start;
-                    for view in descriptor.transforms() {
-                        let count = view.binding_count();
-                        reference =
-                            self.view(block, &reference, view, &inputs[binding_index..binding_index + count])?;
+                    for transform in descriptor.transforms() {
+                        let count = transform.binding_count();
+                        reference = self.apply_transform(
+                            block,
+                            &reference,
+                            transform,
+                            &inputs[binding_index..binding_index + count],
+                        )?;
                         binding_index += count;
                     }
                     inputs[input_index] = Lowered::Reference(reference);
@@ -1365,7 +1372,8 @@ impl<'c, 't> Lowering<'c, 't> {
         match transform {
             ArrayReferenceTransform::Slice { axes } => {
                 // A full slice leaves the address and validity unchanged. Preserve the whole-root proof needed by
-                // asynchronous copies instead of routing this identity view through the general window calculation.
+                // asynchronous copies instead of routing this identity transform through the general window
+                // calculation.
                 if is_whole_slice(axes, &source.shape) {
                     return Ok(source.clone());
                 }
@@ -1389,7 +1397,7 @@ impl<'c, 't> Lowering<'c, 't> {
                             value
                         } else {
                             // Negative indices count from the end of the axis once before clamping, exactly as the
-                            // dynamic slices that reference discharge stages for this view do.
+                            // dynamic slices that reference discharge stages for this transform do.
                             let extent = self.index(block, source.shape[*axis])?;
                             let wrapped = append(block, arith::addi(value, extent, self.location)?)?;
                             let negative = append(
@@ -1429,8 +1437,8 @@ impl<'c, 't> Lowering<'c, 't> {
                 Ok(result)
             }
             _ => Err(Error::Unsupported {
-                operation: "reference view",
-                reason: "view has no baseline GPU lowering".to_owned(),
+                operation: "reference transform",
+                reason: "transform has no baseline GPU lowering".to_owned(),
             }),
         }
     }
@@ -1517,8 +1525,8 @@ mod tests {
 
     #[test]
     fn test_module_async_copy_reference_transforms() {
-        // Full identity slices keep the whole-root proof, so they are admitted and lower to the same native copy as an
-        // unviewed copy.
+        // Full identity slices keep the whole-root proof, so they are admitted and lower to the same native copy as a
+        // copy without transforms.
         let r#type = ArrayType::new_static(DataType::F32, [3]);
         let operation = KernelCallOperation::new(
             Grid::new(vec![]).unwrap(),
@@ -1526,7 +1534,9 @@ mod tests {
         )
         .unwrap();
         let transforms = vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 3, 1)] }];
-        let copy = AsyncCopyOperation::new().with_source_transforms(transforms.clone()).with_destination_transforms(transforms);
+        let copy = AsyncCopyOperation::new()
+            .with_source_transforms(transforms.clone())
+            .with_destination_transforms(transforms);
         let scratch = ScratchOperation::new(r#type, 16).unwrap();
         let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
             let context = references[0].context();
@@ -1784,7 +1794,9 @@ mod tests {
             )
             .unwrap();
             let transforms = vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 2, 1)] }];
-            let copy = AsyncCopyOperation::new().with_source_transforms(transforms.clone()).with_destination_transforms(transforms);
+            let copy = AsyncCopyOperation::new()
+                .with_source_transforms(transforms.clone())
+                .with_destination_transforms(transforms);
             let scratch =
                 ScratchOperation::new(ArrayType::new_static(DataType::F32, [destination_extent]), 16).unwrap();
             let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
@@ -1799,7 +1811,7 @@ mod tests {
             assert!(matches!(
                 validate(&verified, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default()),
                 Err(Error::Unsupported { operation: "async_copy", reason })
-                    if reason == "native async copies require views that select whole references",
+                    if reason == "native async copies require transforms that select whole references",
             ));
         }
     }
@@ -1831,7 +1843,7 @@ mod tests {
         }
     }
     #[test]
-    fn test_lowering_view_dynamic_indices() {
+    fn test_lowering_apply_transform_dynamic_indices() {
         use ryft_core::{ArrayReferenceTransformIndex, RegionId};
         for (data_type, cast, signed) in [
             (DataType::I32, "arith.index_cast", true),
@@ -1881,7 +1893,7 @@ mod tests {
                         value: globals[1],
                         r#type: index_type.clone(),
                     });
-                    let view = lowering.view(
+                    let view = lowering.apply_transform(
                         block,
                         &source,
                         &ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
@@ -1924,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lowering_view_masked_scalar_preserves_predicate() {
+    fn test_lowering_apply_transform_masked_scalar_preserves_predicate() {
         use ryft_core::{ArrayReferenceTransformIndex, RegionId};
         let context = Context::new();
         let source_type = ArrayType::new_static(DataType::F32, [3]);
@@ -1963,7 +1975,7 @@ mod tests {
                 )?;
                 let zero = lowering.index(block, 0)?;
                 let window = lowering.window(block, &source, &[zero], &[8])?;
-                let scalar = lowering.view(
+                let scalar = lowering.apply_transform(
                     block,
                     &window,
                     &ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(7) },

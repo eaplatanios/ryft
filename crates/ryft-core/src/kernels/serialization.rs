@@ -232,7 +232,7 @@ enum WireReferenceTransform {
     },
 }
 
-/// One static slice axis; validation remains owned by the canonical reference view implementation.
+/// One static slice axis; validation remains owned by the canonical reference transform implementation.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireSliceAxis {
@@ -243,8 +243,8 @@ struct WireSliceAxis {
 
 impl WireReferenceTransform {
     /// Encodes one checked canonical selection with bounded axis records.
-    fn encode(view: &ArrayReferenceTransform) -> Result<Self, KernelSerializationError> {
-        Ok(match view {
+    fn encode(transform: &ArrayReferenceTransform) -> Result<Self, KernelSerializationError> {
+        Ok(match transform {
             ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) } => {
                 Self::Index { axis: *axis, index: *index }
             }
@@ -269,7 +269,9 @@ impl WireReferenceTransform {
             Self::Index { axis, index } => {
                 ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) }
             }
-            Self::DynamicIndex { axis } => ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic },
+            Self::DynamicIndex { axis } => {
+                ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic }
+            }
             Self::Slice { axes } => ArrayReferenceTransform::Slice {
                 axes: axes.into_iter().map(|axis| ArraySliceAxis::new(axis.start, axis.size, axis.stride)).collect(),
             },
@@ -1263,8 +1265,12 @@ impl Decoder {
                     let mut operation = self.operation(instruction.operation)?;
                     let mut accesses = operation.effects().accesses().map(|(input, _)| input).collect::<Vec<_>>();
                     accesses.sort_unstable();
-                    if instruction.reference_transforms.iter().map(|path| path.input_index).collect::<Vec<_>>() != accesses {
-                        return Err(invalid("reference view descriptors do not match the operation's access inputs"));
+                    if instruction.reference_transforms.iter().map(|path| path.input_index).collect::<Vec<_>>()
+                        != accesses
+                    {
+                        return Err(invalid(
+                            "reference transform descriptors do not match the operation's access inputs",
+                        ));
                     }
                     for path in instruction.reference_transforms {
                         operation = operation.with_reference_access_transforms(
@@ -1554,7 +1560,7 @@ mod tests {
     }
 
     /// Builds a read-only body whose one access carries the supplied selection and optional scalar binding.
-    fn viewed_read_definition(view: ArrayReferenceTransform, binding: Option<i64>) -> KernelDefinition {
+    fn viewed_read_definition(transform: ArrayReferenceTransform, binding: Option<i64>) -> KernelDefinition {
         let call = KernelCallOperation::new(
             Grid::new(vec![]).unwrap(),
             vec![
@@ -1570,7 +1576,7 @@ mod tests {
             inputs.push(builder.add_constant(ArrayIrValue::Array(Array::scalar(binding).unwrap())));
         }
         builder
-            .add_instruction(ReferenceReadOperation::new().with_transforms(vec![view]), vec![], inputs, None)
+            .add_instruction(ReferenceReadOperation::new().with_transforms(vec![transform]), vec![], inputs, None)
             .unwrap();
         KernelDefinition::new(call, builder.build(vec![], vec![Placeholder], vec![]).unwrap()).unwrap()
     }
@@ -1586,20 +1592,21 @@ mod tests {
 
     #[test]
     fn test_kernel_definition_serialize_reference_transforms() {
-        let view = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 1, 1), ArraySliceAxis::new(0, 2, 1)] };
-        let definition = viewed_read_definition(view.clone(), None);
+        let transform =
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 1, 1), ArraySliceAxis::new(0, 2, 1)] };
+        let definition = viewed_read_definition(transform.clone(), None);
         let decoded = roundtrip(&definition);
         let operation = decoded.body().entry_region().instructions()[0].operation();
-        assert_eq!(operation.reference_access_descriptor(0).unwrap().transforms(), &[view]);
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().transforms(), &[transform]);
     }
 
     #[test]
     fn test_kernel_definition_serialize_dynamic_reference_transforms() {
-        let view = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let definition = viewed_read_definition(view.clone(), Some(1));
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let definition = viewed_read_definition(transform.clone(), Some(1));
         let decoded = roundtrip(&definition);
         let instruction = &decoded.body().entry_region().instructions()[0];
-        assert_eq!(instruction.operation().reference_access_descriptor(0).unwrap().transforms(), &[view]);
+        assert_eq!(instruction.operation().reference_access_descriptor(0).unwrap().transforms(), &[transform]);
         assert_eq!(instruction.operation().reference_access_descriptor(0).unwrap().bindings(), 1..2);
         assert_eq!(instruction.inputs().len(), 2);
     }
@@ -1619,8 +1626,10 @@ mod tests {
         let index = branch.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
         branch
             .add_instruction(
-                ReferenceReadOperation::new()
-                    .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }]),
+                ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Dynamic,
+                }]),
                 vec![],
                 vec![reference, index],
                 None,
@@ -1671,7 +1680,10 @@ mod tests {
         let source_index = builder.add_constant(ArrayIrValue::Array(Array::scalar(1i64).unwrap()));
         let destination_index = builder.add_constant(ArrayIrValue::Array(Array::scalar(2i64).unwrap()));
         let operation = AsyncCopyOperation::new()
-            .with_source_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }])
+            .with_source_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic,
+            }])
             .with_destination_transforms(vec![ArrayReferenceTransform::Index {
                 axis: 0,
                 index: ArrayReferenceTransformIndex::Dynamic,
@@ -1699,8 +1711,8 @@ mod tests {
         let error = serde_json::from_value::<KernelDefinition>(wire).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "invalid serialized kernel source: operation `reference_read` reference views require 2 inputs but the \
-             instruction has 1",
+            "invalid serialized kernel source: operation `reference_read` reference transforms require 2 inputs but \
+             the instruction has 1",
         );
     }
 
@@ -1715,7 +1727,8 @@ mod tests {
         let error = serde_json::from_value::<KernelDefinition>(wire).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "invalid serialized kernel source: reference view descriptors do not match the operation's access inputs"
+            "invalid serialized kernel source: reference transform descriptors do not match the operation's access \
+             inputs",
         );
     }
 

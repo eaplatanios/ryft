@@ -4,10 +4,10 @@ use std::collections::HashMap;
 
 use ryft_core::kernels::{GridExecution, KernelOperation, KernelSchedule, VerifiedKernel};
 use ryft_core::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-    ArrayType, Atom, ComparisonDirection, DataType, Dimension, DimensionOperation, DimensionValue, DotDimensionNumbers,
-    Layout, Memory, Operation as CoreOperation, ReductionKind, ReferenceAccessOperation, RegionRef, Typed,
-    validated_reference_access_descriptors,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform,
+    ArrayReferenceTransformIndex, ArrayType, Atom, ComparisonDirection, DataType, Dimension, DimensionOperation,
+    DimensionValue, DotDimensionNumbers, Layout, Memory, Operation as CoreOperation, ReductionKind,
+    ReferenceAccessOperation, RegionRef, Typed, validated_reference_access_descriptors,
 };
 use ryft_mlir::dialects::{arith, scf, triton::tt};
 use ryft_mlir::{
@@ -562,17 +562,17 @@ impl<'c, 't> Lowering<'c, 't> {
         Ok(())
     }
 
-    /// Applies one supported reference view while retaining physical coordinates and enclosing validity.
-    fn reference_view(
+    /// Applies one supported reference transform while retaining physical coordinates and enclosing validity.
+    fn apply_transform(
         &mut self,
         block: &mut DetachedBlock<'c, 't>,
         reference: &mut Reference<'c, 't>,
-        view: &ArrayReferenceTransform,
+        transform: &ArrayReferenceTransform,
         operation: &'static str,
     ) -> Result<(), Error> {
         self.charge(1)?;
         let location = self.location;
-        match view {
+        match transform {
             ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) } => {
                 let axis = *axis;
                 let index = self.integer(block, *index as i64)?;
@@ -594,7 +594,7 @@ impl<'c, 't> Lowering<'c, 't> {
             }
             ArrayReferenceTransform::Slice { axes } => {
                 if axes.iter().any(|axis| axis.stride() != 1) {
-                    return Err(unsupported(operation, "strided reference views are unsupported"));
+                    return Err(unsupported(operation, "strided reference transforms are unsupported"));
                 }
                 for (axis, selection) in axes.iter().enumerate() {
                     let offset = self.integer(block, selection.start() as i64)?;
@@ -607,9 +607,9 @@ impl<'c, 't> Lowering<'c, 't> {
                 }
             }
             ArrayReferenceTransform::Index { .. } => {
-                return Err(unsupported(operation, "dynamic reference views are unsupported"));
+                return Err(unsupported(operation, "dynamic reference transforms are unsupported"));
             }
-            _ => return Err(unsupported(operation, "reference view is outside the supported subset")),
+            _ => return Err(unsupported(operation, "reference transform is outside the supported subset")),
         }
         Ok(())
     }
@@ -641,7 +641,7 @@ impl<'c, 't> Lowering<'c, 't> {
         // A folded path may be repeated by many accesses. Cache only its immutable address calculations, never the
         // loaded value or memory effect. Atom and binding identities are local to this region, and the complete
         // ordered path is part of the key; separate region invocations construct independent caches and native SSA.
-        let mut reference_transforms = HashMap::<_, Reference<'c, 't>>::new();
+        let mut views = HashMap::<_, Reference<'c, 't>>::new();
         for instruction in region.instructions() {
             self.charge(1)?;
             let mut inputs =
@@ -658,14 +658,14 @@ impl<'c, 't> Lowering<'c, 't> {
                     descriptor.transforms(),
                     &instruction.inputs()[descriptor.bindings()],
                 );
-                let reference = if let Some(reference) = reference_transforms.get(&key) {
+                let reference = if let Some(reference) = views.get(&key) {
                     reference.clone()
                 } else {
                     let mut reference = inputs[input_index].reference()?.clone();
-                    for view in descriptor.transforms() {
-                        self.reference_view(block, &mut reference, view, operation.name())?;
+                    for transform in descriptor.transforms() {
+                        self.apply_transform(block, &mut reference, transform, operation.name())?;
                     }
-                    reference_transforms.insert(key, reference.clone());
+                    views.insert(key, reference.clone());
                     reference
                 };
                 inputs[input_index] = LoweringValue::Reference(reference);
@@ -1460,7 +1460,7 @@ mod tests {
         let repeated = lower_paths(&[(0, 0), (0, 0), (0, 0)]);
         let different_path = lower_paths(&[(0, 0), (0, 0), (0, 1)]);
         let different_root = lower_paths(&[(0, 0), (0, 0), (1, 0)]);
-        // Each load retains its own pointer arithmetic and memory effect; only the two view steps are shared.
+        // Each load retains its own pointer arithmetic and memory effect; only the two applied transforms are shared.
         assert_eq!(repeated.matches("tt.load").count(), 3);
         assert_eq!(repeated.matches("arith.addi").count(), single.matches("arith.addi").count() + 4);
         assert_eq!(different_path.matches("tt.load").count(), 3);
@@ -1470,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lowering_reference_view() {
+    fn test_lowering_apply_transform() {
         let context = Context::new();
         context.load_dialect(DialectHandle::arith().unwrap()).unwrap();
         let mut lowering = Lowering {
@@ -1494,7 +1494,7 @@ mod tests {
             valid,
         };
         lowering
-            .reference_view(
+            .apply_transform(
                 &mut block,
                 &mut reference,
                 &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] },
@@ -1503,7 +1503,7 @@ mod tests {
             .unwrap();
         assert_eq!(reference.shape, vec![2]);
         lowering
-            .reference_view(
+            .apply_transform(
                 &mut block,
                 &mut reference,
                 &ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
@@ -1515,14 +1515,14 @@ mod tests {
             (0, 0, 0, 0)
         );
         assert!(reference.fixed[0].is_some());
-        assert!(matches!(lowering.reference_view(&mut block, &mut reference, &ArrayReferenceTransform::Index {
+        assert!(matches!(lowering.apply_transform(&mut block, &mut reference, &ArrayReferenceTransform::Index {
             axis: 0, index: ArrayReferenceTransformIndex::Dynamic,
         }, "reference_read"), Err(Error::Unsupported { operation: "reference_read", reason })
-            if reason == "dynamic reference views are unsupported"));
-        assert!(matches!(lowering.reference_view(&mut block, &mut reference, &ArrayReferenceTransform::Slice {
+            if reason == "dynamic reference transforms are unsupported"));
+        assert!(matches!(lowering.apply_transform(&mut block, &mut reference, &ArrayReferenceTransform::Slice {
             axes: vec![ArraySliceAxis::new(0, 1, 2)],
         }, "reference_read"), Err(Error::Unsupported { operation: "reference_read", reason })
-            if reason == "strided reference views are unsupported"));
+            if reason == "strided reference transforms are unsupported"));
     }
 
     #[test]

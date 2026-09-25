@@ -151,7 +151,7 @@ impl ReferenceAccessOperation for NoKernelExtension {
     fn with_reference_access_transforms(
         &self,
         _input_index: usize,
-        _views: Vec<ArrayReferenceTransform>,
+        _transforms: Vec<ArrayReferenceTransform>,
     ) -> Result<Self, ProgramError> {
         match *self {}
     }
@@ -553,19 +553,31 @@ where
         transforms: Vec<ArrayReferenceTransform>,
     ) -> Result<Self, ProgramError> {
         Ok(match self {
-            Self::Portable(operation) => Self::Portable(operation.with_reference_access_transforms(input_index, transforms)?),
-            Self::TileLoad(operation) => Self::TileLoad(operation.with_reference_access_transforms(input_index, transforms)?),
-            Self::AsyncCopy(operation) => Self::AsyncCopy(operation.with_reference_access_transforms(input_index, transforms)?),
-            Self::MaskedLoad(operation) => Self::MaskedLoad(operation.with_reference_access_transforms(input_index, transforms)?),
+            Self::Portable(operation) => {
+                Self::Portable(operation.with_reference_access_transforms(input_index, transforms)?)
+            }
+            Self::TileLoad(operation) => {
+                Self::TileLoad(operation.with_reference_access_transforms(input_index, transforms)?)
+            }
+            Self::AsyncCopy(operation) => {
+                Self::AsyncCopy(operation.with_reference_access_transforms(input_index, transforms)?)
+            }
+            Self::MaskedLoad(operation) => {
+                Self::MaskedLoad(operation.with_reference_access_transforms(input_index, transforms)?)
+            }
             Self::MaskedStore(operation) => {
                 Self::MaskedStore(operation.with_reference_access_transforms(input_index, transforms)?)
             }
-            Self::MaskedSwap(operation) => Self::MaskedSwap(operation.with_reference_access_transforms(input_index, transforms)?),
-            Self::Extension(operation) => Self::Extension(operation.with_reference_access_transforms(input_index, transforms)?),
+            Self::MaskedSwap(operation) => {
+                Self::MaskedSwap(operation.with_reference_access_transforms(input_index, transforms)?)
+            }
+            Self::Extension(operation) => {
+                Self::Extension(operation.with_reference_access_transforms(input_index, transforms)?)
+            }
             Self::Wait(_) if input_index == 0 && transforms.is_empty() => self.clone(),
             _ => {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "operation `{}` does not support the requested views at input {input_index}",
+                    "operation `{}` does not support the requested transforms at input {input_index}",
                     self.name(),
                 )));
             }
@@ -782,10 +794,11 @@ mod tests {
 
     #[test]
     fn test_kernel_operation_reference_access_descriptor() {
-        let view = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) };
-        let canonical = ArrayIrOperation::<Array>::from(ReferenceReadOperation::new().with_transforms(vec![view.clone()]));
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) };
+        let canonical =
+            ArrayIrOperation::<Array>::from(ReferenceReadOperation::new().with_transforms(vec![transform.clone()]));
         let operation: KernelOperation = KernelOperation::from(canonical.clone());
-        assert_eq!(operation.reference_access_descriptor(0).unwrap().transforms(), &[view]);
+        assert_eq!(operation.reference_access_descriptor(0).unwrap().transforms(), &[transform]);
         assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 1..1);
         assert!(operation.reference_access_descriptor(1).is_none());
         assert_eq!(operation.effects(), canonical.effects());
@@ -803,7 +816,8 @@ mod tests {
         reference.swap(&value).unwrap();
         let builder = context.builder().borrow();
         let swap = builder.instructions()[1].operation();
-        let projected = <&ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>::try_from(swap).unwrap();
+        let projected =
+            <&ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>::try_from(swap).unwrap();
         assert_eq!(projected.name(), "reference_swap");
         assert!(matches!(swap, KernelOperation::Portable(ArrayIrOperation::ReferenceSwap(_))));
         assert_eq!(swap.effects(), projected.effects());
@@ -859,7 +873,7 @@ mod tests {
             fn with_reference_access_transforms(
                 &self,
                 _input_index: usize,
-                _views: Vec<ArrayReferenceTransform>,
+                _transforms: Vec<ArrayReferenceTransform>,
             ) -> Result<Self, ProgramError> {
                 Err(ProgramError::UnsupportedOperation { message: "extension has no reference accesses".to_owned() })
             }

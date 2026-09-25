@@ -266,7 +266,8 @@ impl Display for ReferenceAccessMode {
 /// Every reference effect is an occurrence of [`EffectClass::OrderedState`]: [`Effects::classes`] derives that class
 /// from the presence of any reference effect, and so reference operations never declare it separately. Aliasing is
 /// deliberately _not_ a reference effect, because creating a new handle onto an existing allocation has no observable
-/// behavior. Refer to [`ReferenceAlias`] for the alias declaration that lives beside reference effects.
+/// behavior. Whole-root forwarding is described by
+/// [`Operation::reference_output_identity_input`](crate::Operation::reference_output_identity_input).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceEffect {
     /// The output at `output_index` allocates a fresh reference and defines a new canonical allocation. Allocation is
@@ -293,76 +294,11 @@ pub enum ReferenceEffect {
     },
 }
 
-/// Declaration that the [`Reference`](crate::Reference)-valued output of an [`Operation`](crate::Operation) at
-/// `output_index` is an alias of the canonical allocation of its reference-valued input at `input_index`. An alias
-/// carries exactly one `input_index` because every reference operand must resolve to exactly one canonical allocation,
-/// so multi-source aliases (e.g., a hypothetical `select_reference(a, b)`) are structurally unrepresentable rather than
-/// merely rejected. [`ReferenceAliasKind`] distinguishes an identity-preserving edge from an operation-owned view edge.
-/// Generic allocation analysis needs only that marker, and the value family's discharge policy obtains and validates
-/// the exact view metadata through the operation family's view-operation contract.
-///
-/// Aliases are declared beside [`ReferenceEffect`]s in [`Effects`] because reference effects cannot be resolved to
-/// allocations without them, but an alias is reference identity/dataflow rather than an effect (i.e., it contributes
-/// no [`EffectClass`], and an operation that only aliases like a static view, for example, remains pure).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ReferenceAlias {
-    /// Index of the [`Operation`](crate::Operation) output producing the alias.
-    output_index: usize,
-
-    /// [`Operation`](crate::Operation) input index whose canonical allocation is preserved.
-    input_index: usize,
-
-    /// [`ReferenceAliasKind`] specifying whether this alias preserves the exact handle or adds an
-    /// [`Operation`](crate::Operation)-owned view mapping.
-    kind: ReferenceAliasKind,
-}
-
-impl ReferenceAlias {
-    /// Creates a new [`ReferenceAlias`].
-    pub const fn new(output_index: usize, input_index: usize, kind: ReferenceAliasKind) -> Self {
-        Self { output_index, input_index, kind }
-    }
-
-    /// Returns the index of the [`Operation`](crate::Operation) output producing the alias.
-    pub const fn output_index(self) -> usize {
-        self.output_index
-    }
-
-    /// Returns the [`Operation`](crate::Operation) input index whose canonical allocation is preserved.
-    pub const fn input_index(self) -> usize {
-        self.input_index
-    }
-
-    /// Returns the [`ReferenceAliasKind`] of this [`ReferenceAlias`].
-    pub const fn kind(self) -> ReferenceAliasKind {
-        self.kind
-    }
-}
-
-/// Kind of an allocation-preserving [`ReferenceAlias`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ReferenceAliasKind {
-    /// The alias preserves the input handle's exact referent type and mapping.
-    Identity,
-
-    /// The alias selects a view of the input handle's allocation, and the aliasing operation itself carries the
-    /// metadata that maps the new handle's coordinates onto that allocation. The generic program layer records only
-    /// that the output aliases the input's allocation; interpreting and validating the operation-owned metadata is the
-    /// job of the value family's reference discharge policy, which obtains it through the operation family's reference
-    /// view contract.
-    ///
-    /// For example, [`ReferenceSliceOperation`](crate::ReferenceSliceOperation) declares
-    /// `ReferenceAlias::new(0, 0, ReferenceAliasKind::View)` specifying that its result is a handle onto the same
-    /// allocation whose referent is the sliced window, the slice axes live on the operation, and the array discharge
-    /// policy reads those axes to materialize or reconstruct the selected coordinates during discharge.
-    View,
-}
-
 /// Complete operation-local effect declaration of an [`Operation`](crate::Operation) that contains its explicitly
-/// declared effect classes, its [`ReferenceEffect`]s, and its [`ReferenceAlias`]es. This is the single authoritative
-/// declaration from which the aggregate [`EffectClasses`] consumed by transforms and lowering, the reference facts
-/// consumed by [`ReferenceAnalysis`](crate::ReferenceAnalysis) and discharge, and the retention decision of dead-code
-/// elimination are all derived.
+/// declared effect classes and its [`ReferenceEffect`]s. This is the single authoritative declaration from which the
+/// aggregate [`EffectClasses`] consumed by transforms and lowering, the reference facts consumed by
+/// [`ReferenceAnalysis`](crate::ReferenceAnalysis) and discharge, and the retention decision of
+/// dead-code elimination are all derived.
 ///
 /// The declaration is _intrinsic_ to the operation and expressed in its own input/operand and output/result index
 /// space. [`Region`](crate::Region)-bearing operations (e.g., loops and conditionals) declare only what they do
@@ -375,9 +311,8 @@ pub enum ReferenceAliasKind {
 /// constraints that analysis applies only to reference-typed positions; this declaration never restates them.
 ///
 /// Declarations are stored in canonical order regardless of the order in which they were constructed. Specifically,
-/// accesses are sorted by input index, then allocations are sorted by output index, and finally aliases are sorted by
-/// output index. Two declarations with the same facts therefore compare equal, and iteration order is deterministic
-/// for diagnostics and analysis records.
+/// accesses are sorted by input index, then allocations are sorted by output index. Two declarations with the same
+/// facts therefore compare equal, and iteration order is deterministic for diagnostics and analysis records.
 ///
 /// # Declared Effect Classes
 ///
@@ -392,8 +327,8 @@ pub enum ReferenceAliasKind {
 ///
 /// # Examples
 ///
-/// Reference operations declare no explicit effect classes. Each of the six primitives declares one [`ReferenceEffect`]
-/// and no aliases:
+/// Reference operations declare no explicit effect classes. Each of the six primitives
+/// declares one [`ReferenceEffect`]:
 ///
 ///   | Operation                          | Reference Effect                              |
 ///   | ---------------------------------- | --------------------------------------------- |
@@ -404,13 +339,14 @@ pub enum ReferenceAliasKind {
 ///   | `reference_add_update(r, x) -> ()` | `Access { input_index: 0, mode: Accumulate }` |
 ///   | `reference_freeze(r) -> x`         | `Access { input_index: 0, mode: Consume }`    |
 ///
-/// The two view operations, `reference_index(r, axis, index) -> view` and `reference_slice(r, axes) -> view`, declare
-/// only `ReferenceAlias { output_index: 0, input_index: 0, kind: View }`. By contrast, `print(x) -> ()` declares only
-/// the explicit class [`EffectClass::OrderedIo`], with no reference effects or aliases.
+/// A folded access carries its transforms on the access operation and declares the same root access effect
+/// as a whole-reference access. Complete-root forwarding is declared through
+/// [`Operation::reference_output_identity_input`](crate::Operation::reference_output_identity_input) and carries no
+/// effect. An operation such as `print(x) -> ()` declares the explicit class [`EffectClass::OrderedIo`] without
+/// reference effects.
 ///
-/// Their derived [`classes`](Self::classes) are `{OrderedState}` for the six primitive reference operations, `NONE` for
-/// the two views, and `{OrderedIo}` for the `print` operation. Of these, only the unused `reference_new` and the views
-/// are eliminated by dead-code elimination.
+/// The derived [`classes`](Self::classes) are `{OrderedState}` for primitive reference operations, `NONE` for identity
+/// aliases, and `{OrderedIo}` for `print`. An unused allocation or identity alias can be eliminated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Effects {
     /// Aggregate [`EffectClass`]es, observability, and explicit state derived once from the declaration.
@@ -419,35 +355,24 @@ pub struct Effects {
     /// [`ReferenceEffect`]s in canonical order. Single Static Assignment (SSA) value (i.e., non-reference) inputs and
     /// outputs are omitted from this list.
     reference_effects: Vec<ReferenceEffect>,
-
-    /// [`ReferenceAlias`]es in canonical order. Single Static Assignment (SSA) value (i.e., non-reference) outputs are
-    /// omitted from this list.
-    reference_aliases: Vec<ReferenceAlias>,
 }
 
 impl Effects {
-    /// Creates a new [`Effects`] declaration from its components, canonicalizing the order of the provided
-    /// `reference_effects` and `reference_aliases`.
+    /// Creates a new [`Effects`] declaration from its components, canonicalizing the order
+    /// of the provided `reference_effects`.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::InvalidArgument`] when one input index receives two accesses or one output index
-    /// receives two classifications (i.e., two allocations, two aliases, or an allocation and an alias). Each position
-    /// must appear at most once so reference analysis can trust that every output is either a fresh allocation or
-    /// exactly one alias. Index ranges cannot be checked here because the declaration carries no arity information;
-    /// the [`ProgramBuilder`](crate::ProgramBuilder) validates them against each instruction's actual operand/result
-    /// arity.
-    pub fn new(
-        declared: EffectClasses,
-        mut reference_effects: Vec<ReferenceEffect>,
-        mut reference_aliases: Vec<ReferenceAlias>,
-    ) -> Result<Self, ProgramError> {
+    /// receives two allocations. Each position must appear at most once. The declaration carries no arity information,
+    /// so [`ProgramBuilder`](crate::ProgramBuilder) validates index ranges against each instruction's actual
+    /// input/output arity.
+    pub fn new(declared: EffectClasses, mut reference_effects: Vec<ReferenceEffect>) -> Result<Self, ProgramError> {
         // Accesses precede allocations so that the canonical order reads inputs first and then outputs.
         reference_effects.sort_by_key(|effect| match effect {
             ReferenceEffect::Access { input_index, .. } => (0, *input_index),
             ReferenceEffect::Allocate { output_index } => (1, *output_index),
         });
-        reference_aliases.sort_by_key(|alias| alias.output_index);
 
         // Canonical ordering places duplicate input accesses and output allocations next to one another.
         for pair in reference_effects.windows(2) {
@@ -470,21 +395,6 @@ impl Effects {
                 _ => {}
             }
         }
-        for (index, alias) in reference_aliases.iter().enumerate() {
-            let output_index = alias.output_index;
-            if (index > 0 && reference_aliases[index - 1].output_index == output_index)
-                || reference_effects.iter().any(|effect| {
-                    matches!(
-                        effect,
-                        ReferenceEffect::Allocate { output_index: allocated } if *allocated == output_index,
-                    )
-                })
-            {
-                return Err(ProgramError::InvalidArgument {
-                    message: format!("output {output_index} received two reference classifications"),
-                });
-            }
-        }
 
         let has_access = reference_effects.iter().any(|effect| matches!(effect, ReferenceEffect::Access { .. }));
         let classes = if reference_effects.is_empty() {
@@ -492,27 +402,29 @@ impl Effects {
         } else {
             declared.union(EffectClasses::single(EffectClass::OrderedState))
         };
+
         let summary = EffectsSummary {
             classes,
             has_observable_effects_when_unused: !declared.is_empty() || has_access,
             has_explicit_ordered_state: declared.contains(EffectClass::OrderedState),
         };
-        Ok(Self { summary, reference_effects, reference_aliases })
+
+        Ok(Self { summary, reference_effects })
     }
 
     /// Returns the shared empty [`Effects`] declaration of pure [`Operation`](crate::Operation)s that neither
-    /// create, alias, nor access [`Reference`](crate::Reference)s.
+    /// create nor access [`Reference`](crate::Reference)s.
     #[inline]
     pub fn empty() -> &'static Self {
         &EMPTY_EFFECTS
     }
 
     /// Creates a new [`Effects`] declaration that consists only of the provided directly declared effect classes,
-    /// which is the declaration of assertion, I/O, and opaque-state operations that neither create, alias, nor access
+    /// which is the declaration of assertion, I/O, and opaque-state operations that neither create nor access
     /// references.
     #[inline]
     pub fn explicit(classes: EffectClasses) -> Self {
-        Self::new(classes, Vec::new(), Vec::new()).unwrap()
+        Self::new(classes, Vec::new()).unwrap()
     }
 
     /// Returns the [`EffectsSummary`] derived from this declaration.
@@ -554,14 +466,7 @@ impl Effects {
         self.reference_effects.as_slice()
     }
 
-    /// Returns the [`ReferenceAlias`]es of the declaring [`Operation`](crate::Operation) in canonical order
-    /// (i.e., sorted by output index).
-    #[inline]
-    pub fn reference_aliases(&self) -> &[ReferenceAlias] {
-        self.reference_aliases.as_slice()
-    }
-
-    /// Returns `true` if this [`Effects`] declaration names at least one reference access. Allocations, aliases,
+    /// Returns `true` if this [`Effects`] declaration names at least one reference access. Allocations,
     /// reference-typed boundaries, and reference-typed constants are not considered accesses.
     #[inline]
     pub fn has_accesses(&self) -> bool {
@@ -588,19 +493,19 @@ impl Effects {
         })
     }
 
-    /// Returns `true` if this declaration names at least one [`ReferenceEffect`] or [`ReferenceAlias`] (i.e., if the
-    /// declaring [`Operation`](crate::Operation) creates, aliases, or accesses references). This is intentionally not
-    /// called `is_empty` because an operation with ordered I/O and no reference declarations is far from effect-free.
+    /// Returns `true` if this declaration names at least one [`ReferenceEffect`] (i.e., if the declaring
+    /// [`Operation`](crate::Operation) creates or accesses references). This is intentionally not called `is_empty`
+    /// because an operation with ordered I/O and no reference declarations is far from effect-free.
     #[inline]
     pub fn has_reference_declarations(&self) -> bool {
-        !self.reference_effects.is_empty() || !self.reference_aliases.is_empty()
+        !self.reference_effects.is_empty()
     }
 
     /// Validates this [`Effects`] declaration against one [`Operation`](crate::Operation) application. For validation
     /// to succeed, every named input and output position must exist in the application, and every named position must
-    /// be reference-typed, because reference effects and aliases describe reference allocations and a declaration on a
-    /// non-reference operand or result could never be resolved by reference analysis. Opaque state on non-reference
-    /// values is declared through an explicit [`EffectClass::OrderedState`] instead.
+    /// be reference-typed, because reference effects describe reference allocations and a declaration on a
+    /// non-reference operand or result could never be resolved by reference analysis. Opaque state on
+    /// non-reference values is declared through an explicit [`EffectClass::OrderedState`] instead.
     ///
     /// # Parameters
     ///
@@ -647,19 +552,13 @@ impl Effects {
             }
         }
 
-        for alias in &self.reference_aliases {
-            validate_output(alias.output_index)?;
-            validate_input(alias.input_index, "an aliased")?;
-        }
-
         Ok(())
     }
 }
 
 // Shared empty declaration returned by `Effects::empty` so that the `Operation` trait default can hand out a borrow
 // without allocating (`Vec::new` is `const`, so this static needs no lazy initialization).
-static EMPTY_EFFECTS: Effects =
-    Effects { summary: EffectsSummary::PURE, reference_effects: Vec::new(), reference_aliases: Vec::new() };
+static EMPTY_EFFECTS: Effects = Effects { summary: EffectsSummary::PURE, reference_effects: Vec::new() };
 
 /// Aggregate summary of [`Effects`] that survives union across [`Instruction`](crate::Instruction)s and
 /// [`Region`](crate::Region)s without index translation. It records the aggregate [`EffectClasses`], whether unused
@@ -677,7 +576,7 @@ pub struct EffectsSummary {
 
     /// Whether an application with no live output still has an observable consequence and must be retained by
     /// dead-code elimination. Explicit nonempty [`EffectClasses`] and reference accesses set this flag, while
-    /// allocations and aliases do not.
+    /// allocations do not.
     has_observable_effects_when_unused: bool,
 
     /// Whether an operation directly declares [`EffectClass::OrderedState`], independently of its reference effects.
@@ -878,17 +777,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_alias() {
-        let alias = ReferenceAlias::new(2, 1, ReferenceAliasKind::View);
-        assert_eq!(alias.output_index(), 2);
-        assert_eq!(alias.input_index(), 1);
-        assert_eq!(alias.kind(), ReferenceAliasKind::View);
-        assert_eq!(alias, ReferenceAlias::new(2, 1, ReferenceAliasKind::View));
-        assert_ne!(alias, ReferenceAlias::new(2, 1, ReferenceAliasKind::Identity));
-        assert_ne!(alias, ReferenceAlias::new(1, 2, ReferenceAliasKind::View));
-    }
-
-    #[test]
     fn test_effects() {
         // The shared empty declaration is pure, declares nothing, and equals a freshly constructed empty declaration.
         let empty = Effects::empty();
@@ -896,13 +784,12 @@ mod tests {
         assert!(empty.is_pure());
         assert!(!empty.declares(EffectClass::OrderedState));
         assert_eq!(empty.reference_effects(), &[]);
-        assert_eq!(empty.reference_aliases(), &[]);
         assert_eq!(empty.accesses().collect::<Vec<_>>(), Vec::<(usize, ReferenceAccessMode)>::new());
         assert!(!empty.has_accesses());
         assert_eq!(empty.allocation_output_indices().collect::<Vec<_>>(), Vec::<usize>::new());
         assert!(!empty.has_reference_declarations());
         assert_eq!(empty.summary(), EffectsSummary::PURE);
-        assert_eq!(empty, &Effects::new(EffectClasses::NONE, vec![], vec![]).unwrap());
+        assert_eq!(empty, &Effects::new(EffectClasses::NONE, vec![]).unwrap());
         assert_eq!(empty, &Effects::explicit(EffectClasses::NONE));
 
         // Directly declared classes are also part of the aggregate, and any nonempty directly declared class set is
@@ -917,7 +804,7 @@ mod tests {
 
         // An allocation derives `OrderedState` without the author listing it, but is not observable when unused.
         let allocation =
-            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], vec![]).unwrap();
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
         assert_eq!(allocation.classes(), EffectClasses::single(EffectClass::OrderedState));
         assert!(!allocation.is_pure());
         assert!(!allocation.declares(EffectClass::OrderedState));
@@ -933,7 +820,6 @@ mod tests {
         let read = Effects::new(
             EffectClasses::NONE,
             vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-            vec![],
         )
         .unwrap();
         assert_eq!(read.classes(), EffectClasses::single(EffectClass::OrderedState));
@@ -944,25 +830,12 @@ mod tests {
         assert_eq!(read.allocation_output_indices().collect::<Vec<_>>(), Vec::<usize>::new());
         assert!(read.summary().has_observable_effects_when_unused());
 
-        // An alias contributes no class: a view operation remains pure and discardable while still declaring
-        // references.
-
-        let view = Effects::new(EffectClasses::NONE, vec![], vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)])
-            .unwrap();
-        assert_eq!(view.classes(), EffectClasses::NONE);
-        assert!(view.is_pure());
-        assert_eq!(view.reference_effects(), &[]);
-        assert_eq!(view.reference_aliases(), &[ReferenceAlias::new(0, 0, ReferenceAliasKind::View)]);
-        assert!(view.has_reference_declarations());
-        assert_eq!(view.summary(), EffectsSummary::PURE);
-
         // A mixed declaration composes conservatively: directly declared opaque state stays distinguishable from the
         // derived class, and one observable component retains the whole application.
         let mixed = Effects::new(
             EffectClasses::single(EffectClass::OrderedState)
                 .union(EffectClasses::single(EffectClass::OrderedAssertion)),
             vec![ReferenceEffect::Allocate { output_index: 1 }],
-            vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::Identity)],
         )
         .unwrap();
         assert_eq!(
@@ -983,8 +856,8 @@ mod tests {
 
     #[test]
     fn test_effects_canonical_order() {
-        // Author order is not significant: accesses sort by input index and precede allocations, which sort by output
-        // index, and aliases sort by output index. Distinct output aliases may share the same source input.
+        // Author order is not significant: accesses sort by input index and precede allocations,
+        // which sort by output index.
         let effects = Effects::new(
             EffectClasses::NONE,
             vec![
@@ -992,10 +865,6 @@ mod tests {
                 ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
                 ReferenceEffect::Allocate { output_index: 1 },
                 ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read },
-            ],
-            vec![
-                ReferenceAlias::new(2, 0, ReferenceAliasKind::View),
-                ReferenceAlias::new(0, 0, ReferenceAliasKind::Identity),
             ],
         )
         .unwrap();
@@ -1006,13 +875,6 @@ mod tests {
                 ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
                 ReferenceEffect::Allocate { output_index: 1 },
                 ReferenceEffect::Allocate { output_index: 3 },
-            ],
-        );
-        assert_eq!(
-            effects.reference_aliases(),
-            &[
-                ReferenceAlias::new(0, 0, ReferenceAliasKind::Identity),
-                ReferenceAlias::new(2, 0, ReferenceAliasKind::View)
             ],
         );
         assert_eq!(
@@ -1030,10 +892,6 @@ mod tests {
                     ReferenceEffect::Allocate { output_index: 1 },
                     ReferenceEffect::Allocate { output_index: 3 },
                 ],
-                vec![
-                    ReferenceAlias::new(0, 0, ReferenceAliasKind::Identity),
-                    ReferenceAlias::new(2, 0, ReferenceAliasKind::View),
-                ],
             )
             .unwrap(),
         );
@@ -1049,7 +907,6 @@ mod tests {
                     ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read },
                     ReferenceEffect::Access { input_index: 2, mode: ReferenceAccessMode::Write },
                 ],
-                vec![],
             ),
             Err(ProgramError::InvalidArgument { message }) if message == "input 2 received two reference accesses",
         ));
@@ -1065,43 +922,9 @@ mod tests {
                     ReferenceEffect::Allocate { output_index: 1 },
                     ReferenceEffect::Allocate { output_index: 3 },
                 ],
-                vec![],
             ),
             Err(ProgramError::InvalidArgument { message })
                 if message == "output 3 received two reference classifications",
-        ));
-    }
-
-    #[test]
-    fn test_effects_rejects_two_aliases_for_one_output() {
-        assert!(matches!(
-            Effects::new(
-                EffectClasses::NONE,
-                vec![],
-                vec![
-                    ReferenceAlias::new(2, 0, ReferenceAliasKind::Identity),
-                    ReferenceAlias::new(0, 0, ReferenceAliasKind::Identity),
-                    ReferenceAlias::new(2, 1, ReferenceAliasKind::View),
-                ],
-            ),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "output 2 received two reference classifications",
-        ));
-    }
-
-    #[test]
-    fn test_effects_rejects_allocation_and_alias_for_one_output() {
-        assert!(matches!(
-            Effects::new(
-                EffectClasses::NONE,
-                vec![ReferenceEffect::Allocate { output_index: 0 }],
-                vec![
-                    ReferenceAlias::new(2, 0, ReferenceAliasKind::View),
-                    ReferenceAlias::new(0, 0, ReferenceAliasKind::Identity),
-                ],
-            ),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "output 0 received two reference classifications",
         ));
     }
 
@@ -1117,20 +940,15 @@ mod tests {
                     ReferenceEffect::Allocate { output_index: 0 },
                     ReferenceEffect::Access { input_index: 3, mode: ReferenceAccessMode::Write },
                 ],
-                vec![],
             ),
             Err(ProgramError::InvalidArgument { message }) if message == "input 3 received two reference accesses",
         ));
 
-        // Duplicate allocations precede alias conflicts, even when the aliases have smaller output indices.
+        // Duplicate allocations are rejected after access positions have been validated.
         assert!(matches!(
             Effects::new(
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Allocate { output_index: 7 }, ReferenceEffect::Allocate { output_index: 7 }],
-                vec![
-                    ReferenceAlias::new(0, 0, ReferenceAliasKind::Identity),
-                    ReferenceAlias::new(0, 1, ReferenceAliasKind::View),
-                ],
             ),
             Err(ProgramError::InvalidArgument { message })
                 if message == "output 7 received two reference classifications",
@@ -1144,21 +962,13 @@ mod tests {
         let read = Effects::new(
             EffectClasses::NONE,
             vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-            vec![],
         )
         .unwrap();
-        let alias =
-            Effects::new(EffectClasses::NONE, vec![], vec![ReferenceAlias::new(0, 1, ReferenceAliasKind::Identity)])
-                .unwrap();
         let allocation =
-            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], vec![]).unwrap();
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
 
         // Well-typed declarations on existing positions are accepted, and so is the empty declaration on anything.
         assert_eq!(read.validate_application("test.read", &[reference.clone()], &[array.clone()]), Ok(()));
-        assert_eq!(
-            alias.validate_application("test.alias", &[array.clone(), reference.clone()], &[reference.clone()]),
-            Ok(())
-        );
         assert_eq!(
             allocation.validate_application("test.reference_new", &[array.clone()], &[reference.clone()]),
             Ok(())
@@ -1173,41 +983,17 @@ mod tests {
             )),
         );
         assert_eq!(
-            alias.validate_application("test.alias", &[reference.clone()], &[reference.clone()]),
-            Err(ProgramError::MalformedProgram(
-                "operation `test.alias` names an aliased input 1 but the application input count is 1".to_string(),
-            )),
-        );
-        assert_eq!(
-            alias.validate_application("test.alias", &[array.clone(), reference.clone()], &[]),
-            Err(ProgramError::MalformedProgram(
-                "operation `test.alias` classifies output 0 but the application output count is 0".to_string(),
-            )),
-        );
-        assert_eq!(
             allocation.validate_application("test.reference_new", &[array.clone()], &[]),
             Err(ProgramError::MalformedProgram(
                 "operation `test.reference_new` classifies output 0 but the application output count is 0".to_string(),
             )),
         );
 
-        // Non-reference endpoints are rejected for accesses, aliased inputs, alias outputs, and allocations alike.
+        // Non-reference endpoints are rejected for accesses and allocations alike.
         assert_eq!(
             read.validate_application("test.read", &[array.clone()], &[array.clone()]),
             Err(ProgramError::MalformedProgram(
                 "operation `test.read` names an accessed input 0 but it has non-reference type `f32[]`".to_string(),
-            )),
-        );
-        assert_eq!(
-            alias.validate_application("test.alias", &[reference.clone(), array.clone()], &[reference.clone()]),
-            Err(ProgramError::MalformedProgram(
-                "operation `test.alias` names an aliased input 1 but it has non-reference type `f32[]`".to_string(),
-            )),
-        );
-        assert_eq!(
-            alias.validate_application("test.alias", &[array.clone(), reference.clone()], &[array.clone()]),
-            Err(ProgramError::MalformedProgram(
-                "operation `test.alias` classifies output 0 but it has non-reference type `f32[]`".to_string(),
             )),
         );
         assert_eq!(
@@ -1221,11 +1007,10 @@ mod tests {
     #[test]
     fn test_effects_summary() {
         let allocation =
-            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], vec![]).unwrap();
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
         let read = Effects::new(
             EffectClasses::NONE,
             vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-            vec![],
         )
         .unwrap();
         let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo));
@@ -1259,13 +1044,11 @@ mod tests {
         let read = Effects::new(
             EffectClasses::NONE,
             vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-            Vec::new(),
         )
         .unwrap();
         let mixed = Effects::new(
             EffectClasses::single(EffectClass::OrderedState),
             vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::ReadWrite }],
-            Vec::new(),
         )
         .unwrap();
         let explicit = Effects::explicit(EffectClasses::single(EffectClass::OrderedState));

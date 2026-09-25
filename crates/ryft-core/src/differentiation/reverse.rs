@@ -545,10 +545,10 @@ impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O> {
 ///
 /// # Reference Accesses
 ///
-/// A reference rule receives its root's cotangent buffer. The operation carries its own view path and ordinary dynamic
-/// bindings, and applies that same selection to the cotangent access. The reverse sweep materializes known primal
-/// inputs before invoking the rule, so dynamic indices follow the ordinary residual-value path. Root buffers are shared
-/// by all accesses and allocated only when needed.
+/// A reference rule receives its root's cotangent buffer. The operation carries its own transform path and ordinary
+/// dynamic bindings, and applies that same selection to the cotangent access. The reverse sweep materializes known
+/// primal inputs before invoking the rule, so dynamic indices follow the ordinary residual-value path. Root buffers
+/// are shared by all accesses and allocated only when needed.
 ///
 /// # Nested Regions
 ///
@@ -3884,7 +3884,7 @@ pub(crate) mod tests {
         fn with_reference_access_transforms(
             &self,
             _input_index: usize,
-            _views: Vec<Self::Transform>,
+            _transforms: Vec<Self::Transform>,
         ) -> Result<Self, ProgramError> {
             Err(ProgramError::MalformedProgram("test linear operations have no reference inputs".to_owned()))
         }

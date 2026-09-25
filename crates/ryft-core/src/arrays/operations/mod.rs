@@ -458,19 +458,21 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Creates a new whole-array reference root.
     ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
 
-    /// Reads the array value addressed by a reference and the operation's views.
+    /// Reads the array value addressed by a reference and the operation's transforms.
     ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Replaces the array value addressed by a reference and the operation's views without reading its previous value.
+    /// Replaces the array value addressed by a reference and the operation's transforms without reading its previous
+    /// value.
     ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Replaces the array value addressed by a reference and the operation's views and returns its previous value.
+    /// Replaces the array value addressed by a reference and the operation's transforms and returns its previous
+    /// value.
     ReferenceSwap(ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Adds an array update through the operation's views of a reference, in program order.
+    /// Adds an array update through the operation's transforms of a reference, in program order.
     ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Atomically adds an array update through the operation's views of a reference.
+    /// Atomically adds an array update through the operation's transforms of a reference.
     ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
     /// Consumes a whole-array reference and returns its final value.
@@ -676,9 +678,10 @@ pub type ArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
 pub type DimensionTracingContext = TracingContext<DimensionValue, DimensionOperation<DimensionValue>>;
 
 // The array-only family has no reference inputs and therefore declares no access layout. It still implements the
-// trait because reverse-mode differentiation and the `reference_freeze` transpose name the family's view type (i.e.,
-// `ReferenceAccessOperation::Transform`) to select the `reference_add_update` that accumulates reference cotangents. For
-// this family, that selection resolves to the reference-free provider, which ordinary array gradients never invoke.
+// trait because reverse-mode differentiation and the `reference_freeze` transpose name the family's transform type
+// (i.e., `ReferenceAccessOperation::Transform`) to select the `reference_add_update` that accumulates reference
+// cotangents. For this family, that selection resolves to the reference-free provider, which ordinary array gradients
+// never invoke.
 impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayOperation<A> {
     type Transform = NoReferenceTransform<NoReferent, ArrayType>;
 
@@ -696,7 +699,7 @@ impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayOperation<A> 
     fn with_reference_access_transforms(
         &self,
         _input_index: usize,
-        _views: Vec<Self::Transform>,
+        _transforms: Vec<Self::Transform>,
     ) -> Result<Self, ProgramError> {
         Err(ProgramError::MalformedProgram("array-only operations have no reference inputs".to_owned()))
     }

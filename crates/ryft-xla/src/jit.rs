@@ -35,7 +35,7 @@
 //! single-process mesh: static references may be replicated or sharded with identical input/final-state sharding;
 //! finite bounded-dynamic references are read-only and replicated. Zero-space, host-memory, unbounded-dynamic,
 //! dynamic nonreplicated, input-bucketed, foreign/non-addressable-mesh, multi-host, and bounded-dynamic mutation cases
-//! are rejected. Reference arguments must be distinct root handles. Internal accesses carry view paths and dynamic
+//! are rejected. Reference arguments must be distinct root handles. Internal accesses carry transform paths and dynamic
 //! indices, which discharge rewrites as array operations before compilation. Views are not separate program values
 //! and cannot cross this boundary.
 //!
@@ -1855,18 +1855,18 @@ mod tests {
     use ryft_core::operations::sort::{ArgMax, TopK};
     use ryft_core::{
         Add, AddOperation, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference,
-        Compare, ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind, CumulativeLogSumExp,
-        CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
-        DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
-        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
-        LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation,
-        Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
-        StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
-        ZeroLike, differentiate_at,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver,
+        CaptureReference, Compare, ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind,
+        CumulativeLogSumExp, CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension,
+        DimensionBounds, DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers,
+        DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian,
+        LogSumExp, LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike,
+        ParallelVaryOperation, Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Reduce, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend,
+        ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin,
+        StopGradient, StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection,
+        WhileOperation, ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 

@@ -1,9 +1,9 @@
 //! Array reference handles, index mappings, analysis, and discharge for the array IR.
 //!
-//! [`ArrayReferenceTransform`] describes array indexing and slicing. [`ArrayReferenceTransformPath`] composes those transforms
-//! into a mapping from a root array to a selected view, and [`ArrayReference`] pairs a static mapping with an eager
-//! reference allocation. Reads select the elements at the mapped indices; mutations reconstruct the root through the
-//! same transforms in reverse order, preserving values outside the view.
+//! [`ArrayReferenceTransform`] describes array indexing and slicing. [`ArrayReferenceTransformPath`] composes those
+//! transforms into a mapping from a root array to a selected view, and [`ArrayReference`] pairs a static mapping with
+//! an eager reference allocation. Reads select the elements at the mapped indices; mutations reconstruct the root
+//! through the same transforms in reverse order, preserving values outside the view.
 //!
 //! [`ArrayReferenceAnalysis`] specializes the generic view analysis for these mappings. [`ArrayReferenceDischarge`]
 //! uses the same traversal as eager handles to express reads and updates as immutable array operations in a context.
@@ -15,12 +15,12 @@
 //!
 //! # Symbolic Indices
 //!
-//! An [`Index`](ArrayReferenceTransform::Index) transform indexes one array axis using a static index or a dynamic binding.
-//! Each dynamic step consumes the next ordinary input in the access's binding group; analysis records its [`ValueId`]
-//! in the corresponding path step. Eager handles carry [`NoReferenceTransformBinding`] and accept only static transforms.
-//! Discharge paths store context values as bindings and reconstruct dynamic views through dynamic slicing and updates.
-//! Following the array dynamic-slicing contract, a negative runtime index counts from the end of the selected axis
-//! once, and the result is then clamped to that axis.
+//! An [`Index`](ArrayReferenceTransform::Index) transform indexes one array axis using a static index or a dynamic
+//! binding. Each dynamic transform consumes the next ordinary input in the access's binding group; analysis records its
+//! [`ValueId`] in the corresponding bound transform. Eager handles carry [`NoReferenceTransformBinding`] and accept
+//! only static transforms. Discharge paths store context values as bindings and reconstruct dynamically indexed views
+//! through dynamic slicing and updates. Following the array dynamic-slicing contract, a negative runtime index counts
+//! from the end of the selected axis once, and the result is then clamped to that axis.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -71,8 +71,8 @@ pub enum ArrayReferenceViewError {
     #[error("reference runtime transactions require an unrenamed root handle")]
     InvalidRuntimeRoot,
 
-    /// A view with a dynamic index was composed onto an eager handle, whose path carries only static steps.
-    #[error("eager reference handles carry only static views; dynamic indices are resolved by each access")]
+    /// A transform with a dynamic index was composed onto an eager handle, whose path carries only static transforms.
+    #[error("eager reference handles carry only static transforms; dynamic indices are resolved by each access")]
     DynamicTransformIndex,
 }
 
@@ -102,7 +102,7 @@ impl<R: Typed, B: Clone + Typed<Type = ArrayIrType>> ViewedReference<R, B, Array
 
 /// One validated index transform in an [`ArrayReferenceTransformPath`]'s root-to-handle mapping.
 ///
-/// A transform describes both directions of one view step: applying it extracts a selected child value from its
+/// A transform describes both directions of one selection: applying it extracts a selected child value from its
 /// parent, while replacing that child reconstructs a value with exactly the parent's original type. This
 /// bidirectional contract lets reference reads operate on the selected value and lets write-only replacements, swaps,
 /// or additive updates reconstruct the shared root without changing its declared type. A write-only traversal
@@ -110,10 +110,10 @@ impl<R: Typed, B: Clone + Typed<Type = ArrayIrType>> ViewedReference<R, B, Array
 ///
 /// Transforms are interpreted in order from the root outward. [`Index`](Self::Index) removes one axis at a static or
 /// dynamic index; [`Slice`](Self::Slice) preserves rank and selects one static unit-stride range per axis. A dynamic
-/// index is supplied by a binding input of the access that carries the view. For example, the built-in scan binds its
-/// explicit body index to a leading dynamic index on each access to a stacked reference. Eager handles resolve dynamic
-/// indices into static views when an access applies its path. Discharge reconstructs dynamic indices with dynamic
-/// slicing; strided slicing remains unsupported.
+/// index is supplied by a binding input of the access that carries the transform. For example, the built-in scan binds
+/// its explicit body index to a leading dynamic index on each access to a stacked reference. Eager handles resolve
+/// dynamic indices into static transforms when an access applies its path. Discharge reconstructs dynamic indices with
+/// dynamic slicing; strided slicing remains unsupported.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 #[non_exhaustive]
 pub enum ArrayReferenceTransform {
@@ -136,7 +136,7 @@ pub enum ArrayReferenceTransform {
 /// Index selected by an [`Index`](ArrayReferenceTransform::Index) transform.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayReferenceTransformIndex {
-    /// An index known when the view is described.
+    /// An index known when the transform is described.
     Static(usize),
 
     /// An index supplied by the next ordinary input in the access's binding sequence.
@@ -145,8 +145,8 @@ pub enum ArrayReferenceTransformIndex {
 
 impl ArrayReferenceTransform {
     /// Returns the exact canonical array type produced from `input`. A symbolic index removes its axis exactly like a
-    /// static one, without the static bounds check and reconstruction proof, because the index it selects is only known
-    /// to the access that applies the view.
+    /// static one, without the static bounds check and reconstruction proof, because the index it selects is only
+    /// known to the access that applies the transform.
     pub fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
         let (output, selection) = self.selected_type(input)?;
         if let Some(selection) = selection {
@@ -198,7 +198,7 @@ impl ArrayReferenceTransform {
                     ArrayReferenceTransformIndex::Static(index) => *index,
                     ArrayReferenceTransformIndex::Dynamic => {
                         return Err(TypeError::invalid(
-                            "a dynamic index has no static view; apply its binding at the reference access",
+                            "a dynamic index has no static selection; apply its binding at the reference access",
                         ));
                     }
                 };
@@ -260,8 +260,8 @@ impl ArrayReferenceTransform {
         }
     }
 
-    /// Applies this transform to one carried parent value. A symbolic index is resolved by the carrier from the
-    /// one value the step's `bindings` close it over; a symbolic step that binds no value (an eager path, or a
+    /// Applies this transform to one carried parent value. A symbolic index is resolved by the carrier from the one
+    /// value the transform's `bindings` close it over; a symbolic transform that binds no value (an eager path, or a
     /// malformed closure) has no selection and is rejected by [`selection`](Self::selection).
     fn apply_in<C: TransformReadCarrier>(
         &self,
@@ -328,7 +328,7 @@ impl ArrayReferenceTransform {
             return Ok(());
         }
         Err(TypeError::invalid(format!(
-            "reference view reconstruction changes root type from `{input}` to `{reconstructed}`",
+            "reference transform reconstruction changes root type from `{input}` to `{reconstructed}`",
         )))
     }
 }
@@ -376,12 +376,12 @@ impl ReferenceTransform for ArrayReferenceTransform {
             let index = <&ArrayType>::try_from(bindings[0])?;
             if index.rank() != 0 || !index.data_type().is_integer() {
                 return Err(TypeError::invalid(format!(
-                    "reference view requires a scalar integer index but received `{index}`",
+                    "reference transform requires a scalar integer index but received `{index}`",
                 )));
             }
             if index.memory() != input.memory() {
                 return Err(TypeError::invalid(format!(
-                    "reference view and index must share one memory space but index resides in {} \
+                    "reference transform and index must share one memory space but index resides in {} \
                      and reference resides in {}",
                     index.memory(),
                     input.memory(),
@@ -432,12 +432,12 @@ impl ReferenceTransform for ArrayReferenceTransform {
 }
 
 impl BatchableReferenceTransform for ArrayReferenceTransform {
-    // The batch axis of a reference is an axis of its packed referent that the per-item view never sees. Indexing
-    // removes one per-item axis, so the packed view cannot keep both axis positions unchanged: a batch axis at or
-    // before the indexed axis shifts the packed indexed axis one position later while the output keeps the batch axis,
-    // and a batch axis after the indexed axis leaves the packed indexed axis alone while the output's batch axis moves
-    // one position earlier. Slicing preserves rank, so the packed view selects the complete batch axis through an
-    // identity selection inserted at the batch axis position and the output keeps the batch axis.
+    // The batch axis of a reference is an axis of its packed referent that the per-item transform never sees.
+    // Indexing removes one per-item axis, so the packed transform cannot keep both axis positions unchanged: a batch
+    // axis at or before the indexed axis shifts the packed indexed axis one position later while the output keeps the
+    // batch axis, and a batch axis after the indexed axis leaves the packed indexed axis alone while the output's batch
+    // axis moves one position earlier. Slicing preserves rank, so the packed transform selects the complete batch axis
+    // through an identity selection inserted at the batch axis position and the output keeps the batch axis.
     fn batch(&self, r#type: &ArrayIrType, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
         let Some(axis) = batch_axis.axis() else {
             return Ok((self.clone(), batch_axis));
@@ -482,7 +482,7 @@ impl BatchableReferenceTransform for ArrayReferenceTransform {
 /// [`ReferenceTransform::overlap`] to compare two paths of one root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RootIndexSelection {
-    /// A static unit-stride range `[start, limit)` of the root axis. Before any step touches the axis this is the
+    /// A static unit-stride range `[start, limit)` of the root axis. Before any transform touches the axis this is the
     /// complete axis, a slice narrows it, and a static index collapses it to one index.
     Range {
         /// Inclusive start of the range.
@@ -493,7 +493,7 @@ enum RootIndexSelection {
     },
 
     /// One index `offset + clamp(wrap(symbol), 0, extent - 1)` of the root axis, selected relative to the range that
-    /// earlier steps narrowed the axis to, where `wrap(symbol)` is `symbol + extent` for a negative `symbol` and
+    /// earlier transforms narrowed the axis to, where `wrap(symbol)` is `symbol + extent` for a negative `symbol` and
     /// `symbol` otherwise. Both wrapping and clamping depend on this extent, not just the binding.
     Symbolic {
         /// Binding of the symbolic index.
@@ -508,16 +508,19 @@ enum RootIndexSelection {
 }
 
 impl RootIndexSelection {
-    /// Folds the closed `steps` of a path over a root of static shape `shape` into one range or symbolic index per root
-    /// axis, or [`None`] when the path is malformed for that root (an axis, index, binding, or stride that the
-    /// derivation would have rejected).
-    fn fold(shape: &StaticShape, steps: &[BoundReferenceTransform<ArrayReferenceTransform>]) -> Option<Vec<Self>> {
+    /// Folds the closed `bound_transforms` of a path over a root of static shape `shape` into one range or symbolic
+    /// index per root axis, or [`None`] when the path is malformed for that root (an axis, index, binding, or stride
+    /// that the derivation would have rejected).
+    fn fold(
+        shape: &StaticShape,
+        bound_transforms: &[BoundReferenceTransform<ArrayReferenceTransform>],
+    ) -> Option<Vec<Self>> {
         let mut indices =
             shape.dimensions().iter().map(|size| Self::Range { start: 0, limit: *size }).collect::<Vec<_>>();
-        // Root axes that the folded steps have not indexed away yet, in view axis order.
+        // Root axes that the folded transforms have not indexed away yet, in view axis order.
         let mut remaining = (0..shape.rank()).collect::<Vec<_>>();
-        for step in steps {
-            match step.view() {
+        for bound_transform in bound_transforms {
+            match bound_transform.transform() {
                 ArrayReferenceTransform::Index { axis, index } => {
                     if *axis >= remaining.len() {
                         return None;
@@ -536,7 +539,8 @@ impl RootIndexSelection {
                             Self::Range { start: index, limit: index + 1 }
                         }
                         ArrayReferenceTransformIndex::Dynamic => {
-                            Self::Symbolic { binding: *step.bindings().first()?, offset: start, extent: limit - start }
+                            let binding = *bound_transform.bindings().first()?;
+                            Self::Symbolic { binding, offset: start, extent: limit - start }
                         }
                     };
                 }
@@ -616,8 +620,8 @@ impl TransformSelection {
     }
 }
 
-/// Immutable index mapping between a shared array-reference root and one derived handle: the array
-/// specialization of the generic [`ReferenceTransformPath`], whose views are [`ArrayReferenceTransform`]s.
+/// Immutable index mapping between a shared array-reference root and one derived handle: the array specialization of
+/// the generic [`ReferenceTransformPath`], whose transforms are [`ArrayReferenceTransform`]s.
 ///
 /// The mapping stores validated transforms in root-to-handle order. The empty mapping ([`root`](Self::root)) is the
 /// identity view and denotes the complete root. Each additional transform is applied to the preceding view, so
@@ -632,17 +636,18 @@ impl TransformSelection {
 /// and observe one another's ordered mutations, while equality and hashing distinguish different transform sequences.
 ///
 /// `Binding` supplies dynamic indices: [`ValueId`] identifies program values, the uninhabited
-/// [`NoReferenceTransformBinding`] restricts eager handles to static steps, and `C::Value` binds discharge indices directly
-/// to context values. Supported index transforms are described by [`ArrayReferenceTransform`]. Attached-region and external
-/// runtime boundaries pass complete root handles, and each access inside the receiving scope carries its own path. For
-/// example, each access in a scan body selects one item of a stacked reference through a dynamic index bound to the
-/// body's explicit index input.
+/// [`NoReferenceTransformBinding`] restricts eager handles to static transforms, and `C::Value` binds discharge indices
+/// directly to context values. Supported index transforms are described by [`ArrayReferenceTransform`]. Attached-region
+/// and external runtime boundaries pass complete root handles, and each access inside the receiving scope carries its
+/// own path. For example, each access in a scan body selects one item of a stacked reference through a dynamic index
+/// bound to the body's explicit index input.
 pub type ArrayReferenceTransformPath<Binding = ValueId> = ReferenceTransformPath<ArrayReferenceTransform, Binding>;
 
 impl ArrayReferenceTransformPath {
     /// Returns a static, rank-preserving slice of the root selecting the same elements as this path. Indexed axes
     /// become size-one ranges. Symbolic indices, dynamic root shapes, and invalid compositions return `None` rather
-    /// than claiming a definite selection. The returned view describes root coordinates, not the path's result rank.
+    /// than claiming a definite selection. The returned transform describes root coordinates, not the path's result
+    /// rank.
     pub fn root_slice(&self, root_type: &ArrayType) -> Option<ArrayReferenceTransform> {
         let indices = RootIndexSelection::fold(&root_type.static_shape()?, self.bound_transforms())?;
         let axes = indices
@@ -662,9 +667,9 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
         self.transforms().try_fold(root_type.clone(), |r#type, transform| transform.output_type(&r#type))
     }
 
-    /// Returns the root followed by each selected child, ending with this view's value. An empty path returns only
-    /// the root. Each step's bindings are handed to `carrier`, which resolves symbolic indices; reconstruction uses
-    /// every snapshot except the final child as its strict parents.
+    /// Returns the root followed by each selected child, ending with the value this path selects. An empty path returns
+    /// only the root. The bindings of each bound transform are handed to `carrier`, which resolves symbolic indices;
+    /// reconstruction uses every snapshot except the final child as its strict parents.
     fn intermediates_in<C: TransformReadCarrier<Binding = Binding>>(
         &self,
         carrier: &mut C,
@@ -672,8 +677,9 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
     ) -> Result<Vec<C::Value>, ProgramError> {
         let mut intermediates = Vec::with_capacity(self.bound_transforms().len() + 1);
         intermediates.push(root);
-        for step in self.bound_transforms() {
-            let child = step.view().apply_in(carrier, intermediates.last().unwrap(), step.bindings())?;
+        for bound_transform in self.bound_transforms() {
+            let parent = intermediates.last().unwrap();
+            let child = bound_transform.transform().apply_in(carrier, parent, bound_transform.bindings())?;
             intermediates.push(child);
         }
         Ok(intermediates)
@@ -693,17 +699,18 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
         intermediates: &[C::Value],
         replacement: C::Value,
     ) -> Result<C::Value, ProgramError> {
-        let steps = self.bound_transforms();
-        if intermediates.len() != steps.len() {
+        let bound_transforms = self.bound_transforms();
+        if intermediates.len() != bound_transforms.len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "reference view reconstruction requires {} parent snapshots but received {}",
-                steps.len(),
+                "reference transform path reconstruction requires {} parent snapshots but received {}",
+                bound_transforms.len(),
                 intermediates.len(),
             )));
         }
         let mut reconstructed = replacement;
-        for (step, intermediate) in steps.iter().zip(intermediates).rev() {
-            reconstructed = step.view().replace_in(carrier, intermediate, &reconstructed, step.bindings())?;
+        for (bound_transform, intermediate) in bound_transforms.iter().zip(intermediates).rev() {
+            let bindings = bound_transform.bindings();
+            reconstructed = bound_transform.transform().replace_in(carrier, intermediate, &reconstructed, bindings)?;
         }
         Ok(reconstructed)
     }
@@ -742,8 +749,9 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
         };
         let mut intermediates = Vec::with_capacity(self.bound_transforms().len());
         intermediates.push(root);
-        for step in parents {
-            let child = step.view().apply_in(carrier, intermediates.last().unwrap(), step.bindings())?;
+        for bound_transform in parents {
+            let parent = intermediates.last().unwrap();
+            let child = bound_transform.transform().apply_in(carrier, parent, bound_transform.bindings())?;
             intermediates.push(child);
         }
         self.reconstruct_in(carrier, intermediates.as_slice(), replacement)
@@ -757,12 +765,12 @@ impl ArrayReferenceTransformPath<NoReferenceTransformBinding> {
         A: Value<Type = ArrayType> + Reshape + Slice,
     {
         let mut carrier = EagerTransformCarrier(PhantomData);
-        self.bound_transforms()
-            .iter()
-            .try_fold(root.clone(), |value, step| step.view().apply_in(&mut carrier, &value, step.bindings()))
+        self.bound_transforms().iter().try_fold(root.clone(), |value, bound_transform| {
+            bound_transform.transform().apply_in(&mut carrier, &value, bound_transform.bindings())
+        })
     }
 
-    /// Replaces this static view and returns the reconstructed root plus its old view snapshot.
+    /// Replaces the elements this static path selects and returns the reconstructed root plus their old snapshot.
     fn swap<A>(&self, root: &A, replacement: &A) -> Result<(A, A), ProgramError>
     where
         A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice,
@@ -773,7 +781,8 @@ impl ArrayReferenceTransformPath<NoReferenceTransformBinding> {
     }
 }
 
-/// Operation-family constructors for the canonical array operations that one array-reference view traversal stages.
+/// Operation-family constructors for the canonical array operations that one array-reference transform path traversal
+/// stages.
 ///
 /// Mapping between a reference root and one derived handle's selected elements uses static or dynamic slices,
 /// reshapes, and corresponding updates. Both eager handles and the
@@ -781,16 +790,16 @@ impl ArrayReferenceTransformPath<NoReferenceTransformBinding> {
 /// contract lets the staging consumer construct those operations in a closed operation family, so core array IR and
 /// backend-owned supersets share one traversal without matching operation names.
 ///
-/// Per-access view metadata is exposed through [`ReferenceAccessOperation`]. These constructors stage
+/// Per-access transform metadata is exposed through [`ReferenceAccessOperation`]. These constructors stage
 /// array-valued operations over discharged immutable state.
 pub trait ArrayReferenceTransformOperation: Operation<Type = ArrayIrType> {
-    /// Wraps a canonical homogeneous array reshape for reference-view staging.
+    /// Wraps a canonical homogeneous array reshape for reference-transform staging.
     fn from_reference_reshape(operation: ReshapeOperation) -> Self;
 
-    /// Wraps a canonical homogeneous array slice for reference-view staging.
+    /// Wraps a canonical homogeneous array slice for reference-transform staging.
     fn from_reference_slice(operation: SliceOperation) -> Self;
 
-    /// Wraps a canonical homogeneous array update-slice for reference-view staging.
+    /// Wraps a canonical homogeneous array update-slice for reference-transform staging.
     fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
 
     /// Wraps a dynamic slice over discharged reference state.
@@ -853,7 +862,7 @@ impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayIrOperation<A
                 .map(Self::ReferenceAtomicAddUpdate),
             _ if self.reference_access_descriptor(input_index).is_some() && transforms.is_empty() => Ok(self.clone()),
             _ => Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` cannot replace the reference view at input {input_index}", self.name()),
+                message: format!("`{}` cannot replace the reference transforms at input {input_index}", self.name()),
             }),
         }
     }
@@ -881,13 +890,13 @@ impl<A: Value<Type = ArrayType>> ArrayReferenceTransformOperation for ArrayIrOpe
     }
 }
 
-/// One value carrier through which a reference view maps between a shared root and one derived handle.
+/// One value carrier through which a reference transform path maps between a shared root and one derived handle.
 ///
 /// Reading the selected view and reconstructing the root with update-slice each exist exactly once, on
-/// [`ArrayReferenceTransformPath`], generically over this carrier: the eager carrier operates on concrete values with the
-/// array-manipulation capabilities, while reference discharge binds the identical operation sequence through its
-/// context. Keeping one traversal guarantees the staged and eager semantics cannot drift apart. Static steps lower to
-/// the carrier's slice and reshape; a symbolic index step hands the carrier its index through the path's
+/// [`ArrayReferenceTransformPath`], generically over this carrier: the eager carrier operates on concrete values with
+/// the array-manipulation capabilities, while reference discharge binds the identical operation sequence through its
+/// context. Keeping one traversal guarantees the staged and eager semantics cannot drift apart. Static transforms lower
+/// to the carrier's slice and reshape; a symbolic index transform hands the carrier its index through the path's
 /// [`Binding`](Self::Binding).
 trait TransformReadCarrier {
     /// Value representation carried through the traversal.
@@ -940,7 +949,7 @@ trait TransformWriteCarrier: TransformReadCarrier {
     ) -> Result<Self::Value, ProgramError>;
 }
 
-/// Stateless eager carrier over one concrete array value family. Eager paths carry only static steps, so the
+/// Stateless eager carrier over one concrete array value family. Eager paths carry only static transforms, so the
 /// symbolic-index hooks are unreachable by type.
 struct EagerTransformCarrier<A>(PhantomData<A>);
 
@@ -986,7 +995,7 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> TransformWriteC
     }
 }
 
-/// Eager array-reference handle pairing one shared root allocation with handle-local view metadata.
+/// Eager array-reference handle pairing one shared root allocation with a handle-local transform path.
 ///
 /// Equality and hashing identify the mutable location and structural view, not the handle-local type-identity
 /// namespace. Renaming type identities therefore preserves equality with the original handle when its view is
@@ -995,12 +1004,12 @@ pub struct ArrayReference<A: Value<Type = ArrayType>> {
     /// Handle to the shared root allocation.
     root: Reference<A>,
 
-    /// Ordered mapping from the shared root to this handle's referent. Eager handles only ever carry static steps,
-    /// so no symbol is ever bound on this path.
-    view: ArrayReferenceTransformPath<NoReferenceTransformBinding>,
+    /// Ordered mapping from the shared root to this handle's referent. Eager handles only ever carry static
+    /// transforms, so no symbol is ever bound on this path.
+    path: ArrayReferenceTransformPath<NoReferenceTransformBinding>,
 
-    /// Exact handle type derived once from the root type and view, so that repeated [`Typed::r#type`] calls
-    /// borrow the cached type instead of re-deriving the complete transform chain.
+    /// Exact handle type derived once from the root type and path, so that repeated [`Typed::r#type`] calls borrow the
+    /// cached type instead of re-deriving the complete transform path.
     r#type: ReferenceType<ArrayType>,
 }
 
@@ -1012,7 +1021,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         // referent rejection is unreachable for this specialized constructor.
         let root = Reference::new(value).unwrap();
         let r#type = root.r#type().into_owned();
-        Self { root, view: ArrayReferenceTransformPath::root(), r#type }
+        Self { root, path: ArrayReferenceTransformPath::root(), r#type }
     }
 
     /// Returns this shared reference allocation's process-local identity.
@@ -1022,15 +1031,15 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     }
 
     /// Returns the canonical transforms selecting this handle's elements from its shared root allocation.
-    pub fn view(&self) -> &ArrayReferenceTransformPath<NoReferenceTransformBinding> {
-        &self.view
+    pub fn path(&self) -> &ArrayReferenceTransformPath<NoReferenceTransformBinding> {
+        &self.path
     }
 
     /// Returns whether this is an unrenamed root handle accepted at a backend runtime state boundary.
     #[doc(hidden)]
     #[inline]
     pub fn is_runtime_root_handle(&self) -> bool {
-        self.view.is_root() && self.root.uses_storage_type_identities()
+        self.path.is_root() && self.root.uses_storage_type_identities()
     }
 
     /// Locks an unrenamed root for one backend-owned state transaction.
@@ -1042,9 +1051,10 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         self.root.lock().map_err(ProgramError::custom)
     }
 
-    /// Returns a copy of this handle with `transform` appended to its view, sharing the same root allocation. A
-    /// dynamic index is rejected with [`ArrayReferenceViewError::DynamicTransformIndex`]: an eager handle's path carries
-    /// only static steps. [`Self::with_transforms`] resolves dynamic bindings while applying an access's path.
+    /// Returns a copy of this handle with `transform` appended to its path, sharing the same root allocation. A
+    /// dynamic index is rejected with [`ArrayReferenceViewError::DynamicTransformIndex`]: an eager handle's path
+    /// carries only static transforms. [`Self::with_transforms`] resolves dynamic bindings while applying an access's
+    /// path.
     pub fn with_transform(&self, transform: ArrayReferenceTransform) -> Result<Self, ProgramError> {
         if transform.binding_count() != 0 {
             return Err(ProgramError::custom(ArrayReferenceViewError::DynamicTransformIndex));
@@ -1053,14 +1063,14 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         // incrementally instead of re-folding the complete chain from the root type. Derivation is purely structural:
         // holder liveness is checked only when the resulting handle accesses state.
         let referent = transform.output_type(self.r#type.referent())?;
-        let view = self.view.with_transform(transform);
-        Ok(Self { root: self.root.clone(), view, r#type: ReferenceType::new(referent) })
+        let path = self.path.with_transform(transform);
+        Ok(Self { root: self.root.clone(), path, r#type: ReferenceType::new(referent) })
     }
 
-    /// Returns a shared handle after applying an access's ordered views and dynamic bindings. Dynamic indices count
-    /// negative values from the end of their current axis once, then clamp to its valid range. Each dynamic step
-    /// consumes the next binding. No state is read until the returned handle is accessed. Empty axes and failures to
-    /// concretize dynamic bindings are rejected here.
+    /// Returns a shared handle after applying an access's ordered transforms and dynamic bindings. Dynamic indices
+    /// count negative values from the end of their current axis once, then clamp to its valid range. Each dynamic
+    /// transform consumes the next binding. No state is read until the returned handle is accessed. Empty axes and
+    /// failures to concretize dynamic bindings are rejected here.
     pub fn with_transforms(
         &self,
         transforms: &[ArrayReferenceTransform],
@@ -1069,16 +1079,16 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     where
         A: Concretizable<i128>,
     {
-        // Validate and resolve every step in one pass against the running referent, then append the resolved steps
-        // to one copy of this handle's path, rather than copying the growing path once per step.
-        let mut path = self.view.clone();
+        // Validate and resolve every transform in one pass against the running referent, then append the resolved
+        // transforms to one copy of this handle's path, rather than copying the growing path once per transform.
+        let mut path = self.path.clone();
         let mut referent = self.r#type.referent().clone();
         let mut remaining = bindings;
-        for view in transforms {
-            let count = view.binding_count();
+        for transform in transforms {
+            let count = transform.binding_count();
             if count > remaining.len() {
                 return Err(TypeError::invalid(format!(
-                    "reference view requires {count} bindings but only {} remain",
+                    "reference transform requires {count} bindings but only {} remain",
                     remaining.len(),
                 ))
                 .into());
@@ -1086,12 +1096,12 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
             let (current, rest) = remaining.split_at(count);
             remaining = rest;
             let binding_types = current.iter().map(Typed::r#type).collect::<Vec<_>>();
-            view.validate_bindings(&referent, &binding_types.iter().map(AsRef::as_ref).collect::<Vec<_>>())?;
-            let view = match (view, current) {
+            transform.validate_bindings(&referent, &binding_types.iter().map(AsRef::as_ref).collect::<Vec<_>>())?;
+            let transform = match (transform, current) {
                 (ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic }, [index]) => {
-                    // Binding validation has checked the scalar integer index; the view's own validation checks the
-                    // shape and axis.
-                    view.read_type(&referent)?;
+                    // Binding validation has checked the scalar integer index; the transform's own validation checks
+                    // the shape and axis.
+                    transform.read_type(&referent)?;
                     let extent = referent.static_shape().unwrap()[*axis] as i128;
                     if extent == 0 {
                         return Err(TypeError::invalid("cannot dynamically index an empty reference axis").into());
@@ -1102,17 +1112,17 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
                     let index = index.clamp(0, extent - 1) as usize;
                     ArrayReferenceTransform::Index { axis: *axis, index: ArrayReferenceTransformIndex::Static(index) }
                 }
-                _ => view.clone(),
+                _ => transform.clone(),
             };
-            referent = view.output_type(&referent)?;
-            path.append(ReferenceTransformPath::root().with_transform(view));
+            referent = transform.output_type(&referent)?;
+            path.append(ReferenceTransformPath::root().with_transform(transform));
         }
         if !remaining.is_empty() {
             return Err(
-                TypeError::invalid(format!("reference view path has {} extra bindings", remaining.len())).into()
+                TypeError::invalid(format!("reference transform path has {} extra bindings", remaining.len())).into()
             );
         }
-        Ok(Self { root: self.root.clone(), view: path, r#type: ReferenceType::new(referent) })
+        Ok(Self { root: self.root.clone(), path, r#type: ReferenceType::new(referent) })
     }
 
     /// Returns an immutable snapshot of this handle's selected elements.
@@ -1120,12 +1130,12 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     where
         A: Reshape + Slice,
     {
-        self.view.apply(&self.root.read().map_err(ProgramError::custom)?)
+        self.path.apply(&self.root.read().map_err(ProgramError::custom)?)
     }
 
     /// Returns an immutable root snapshot without requiring array-manipulation capabilities.
     pub fn read_root(&self) -> Result<A, ProgramError> {
-        if !self.view.is_root() {
+        if !self.path.is_root() {
             return Err(ProgramError::custom(ArrayReferenceViewError::CannotReadRootThroughView));
         }
         self.root.read().map_err(ProgramError::custom)
@@ -1139,14 +1149,14 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     where
         A: Reshape + Slice + UpdateSlice,
     {
-        if self.view.is_root() {
+        if self.path.is_root() {
             return self.root.swap(replacement).map_err(ProgramError::custom);
         }
         // Validating inside the update keeps holder-state errors (frozen, poisoned, mid-transaction) ahead of the
         // replacement-type diagnostic, matching the root path.
         self.root.update(|current| {
             self.validate_view_referent_type(&replacement)?;
-            self.view.swap(current, &replacement)
+            self.path.swap(current, &replacement)
         })
     }
 
@@ -1158,14 +1168,14 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     where
         A: Reshape + Slice + UpdateSlice,
     {
-        if self.view.is_root() {
+        if self.path.is_root() {
             return self.root.write(replacement).map_err(ProgramError::custom);
         }
         // Validation remains inside the holder transaction so frozen, poisoned, and leased-state diagnostics retain
         // precedence over replacement-type errors, matching the root write and swap paths.
         self.root.update(|current| {
             self.validate_view_referent_type(&replacement)?;
-            self.view
+            self.path
                 .write_in(&mut EagerTransformCarrier(PhantomData), current.clone(), replacement)
                 .map(|updated| (updated, ()))
         })
@@ -1176,16 +1186,16 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     where
         A: Add + Reshape + Slice + UpdateSlice,
     {
-        if self.view.is_root() {
+        if self.path.is_root() {
             return self.root.update(|current| current.add(update).map(|updated| (updated, ())));
         }
         self.root.update(|current| {
             let mut carrier = EagerTransformCarrier(PhantomData);
-            let intermediates = self.view.intermediates_in(&mut carrier, current.clone())?;
+            let intermediates = self.path.intermediates_in(&mut carrier, current.clone())?;
             let updated_view = intermediates.last().unwrap().add(update)?;
             self.validate_view_referent_type(&updated_view)?;
-            self.view
-                .reconstruct_in(&mut carrier, &intermediates[..self.view.bound_transforms().len()], updated_view)
+            self.path
+                .reconstruct_in(&mut carrier, &intermediates[..self.path.bound_transforms().len()], updated_view)
                 .map(|updated| (updated, ()))
         })
     }
@@ -1198,7 +1208,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     /// implementation reaches this handle through a projection of its owned value, which yields a borrow, and the
     /// linearity the capability enforces is already enforced one layer up.
     pub fn freeze(&self) -> Result<A, ProgramError> {
-        if !self.view.is_root() {
+        if !self.path.is_root() {
             return Err(ProgramError::custom(ArrayReferenceViewError::CannotFreezeView));
         }
         self.root.freeze().map_err(ProgramError::custom)
@@ -1210,8 +1220,8 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
         let root = self.root.rename_type_identities(renaming)?;
-        let referent = self.view.output_type(root.r#type().referent())?;
-        Ok(Self { root, view: self.view.clone(), r#type: ReferenceType::new(referent) })
+        let referent = self.path.output_type(root.r#type().referent())?;
+        Ok(Self { root, path: self.path.clone(), r#type: ReferenceType::new(referent) })
     }
 
     /// Validates that `value` exactly matches this handle's derived referent type. Root-handle mutations inherit this
@@ -1233,13 +1243,13 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
 impl<A: Value<Type = ArrayType>> Clone for ArrayReference<A> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { root: self.root.clone(), view: self.view.clone(), r#type: self.r#type.clone() }
+        Self { root: self.root.clone(), path: self.path.clone(), r#type: self.r#type.clone() }
     }
 }
 
 impl<A: Value<Type = ArrayType>> Debug for ArrayReference<A> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ArrayReference").field("id", &self.id()).field("view", &self.view).finish()
+        formatter.debug_struct("ArrayReference").field("id", &self.id()).field("path", &self.path).finish()
     }
 }
 
@@ -1253,7 +1263,7 @@ impl<A: Value<Type = ArrayType>> Display for ArrayReference<A> {
 impl<A: Value<Type = ArrayType>> PartialEq for ArrayReference<A> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.root == other.root && self.view == other.view
+        self.root == other.root && self.path == other.path
     }
 }
 
@@ -1263,14 +1273,14 @@ impl<A: Value<Type = ArrayType>> Hash for ArrayReference<A> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.root.hash(state);
-        self.view.hash(state);
+        self.path.hash(state);
     }
 }
 
 impl<A: Value<Type = ArrayType>> Parameter for ArrayReference<A> {}
 
-// The cached type is derived deterministically from the root type and view at construction, so equality and hashing
-// over `(root, view)` remain consistent with it.
+// The cached type is derived deterministically from the root type and path at construction, so equality and hashing
+// over `(root, path)` remain consistent with it.
 impl<A: Value<Type = ArrayType>> Typed for ArrayReference<A> {
     type Type = ReferenceType<ArrayType>;
 
@@ -1291,17 +1301,17 @@ pub type ArrayReferenceAnalysis = ReferenceViewAnalysis<ArrayReferenceTransform>
 /// [`ReferenceDischargePolicy`] of the array reference universe.
 ///
 /// An array reference's referent is an ordinary [`ArrayType`]-typed array, and the alias one flowing handle carries is
-/// the composed [`ArrayReferenceTransformPath`] mapping its allocation to its own indices, with every symbolic index closed over
-/// the context value it selects. Every access therefore reaches its indices through the same view traversal the eager
-/// handles use, which is what keeps staged and eager reference semantics from drifting apart: reading materializes the
-/// allocation-to-handle chain and takes its last snapshot, while a replacement or an accumulation writes the new leaf
-/// back through that chain in reverse. Symbolic indices use dynamic slicing and updates with the same negative-index
-/// and clamping policy, so reads and mutations always address the same elements.
+/// the composed [`ArrayReferenceTransformPath`] mapping its allocation to its own indices, with every symbolic index
+/// closed over the context value it selects. Every access therefore reaches its indices through the same transform path
+/// traversal the eager handles use, which is what keeps staged and eager reference semantics from drifting apart:
+/// reading materializes the allocation-to-handle chain and takes its last snapshot, while a replacement or an
+/// accumulation writes the new leaf back through that chain in reverse. Symbolic indices use dynamic slicing and
+/// updates with the same negative-index and clamping policy, so reads and mutations always address the same elements.
 ///
-/// The reconstruction context is bounded by [`Context`] rather than [`Domain`](crate::Domain) because the view
-/// traversal binds canonical slicing, reshape, and update operations into it. Their value-level capabilities are
-/// stated over [`ArrayType`]-typed values rather than the composite array IR, so the policy
-/// constructs them through the context's operation family.
+/// The reconstruction context is bounded by [`Context`] rather than [`Domain`](crate::Domain) because the transform
+/// path traversal binds canonical slicing, reshape, and update operations into it. Their value-level capabilities are
+/// stated over [`ArrayType`]-typed values rather than the composite array IR, so the policy constructs them through the
+/// context's operation family.
 #[derive(Copy, Clone, Debug)]
 pub struct ArrayReferenceDischarge;
 
@@ -1386,22 +1396,23 @@ where
     }
 }
 
-/// Transform carrier that binds the canonical slice, reshape, and update-slice operations of one array reference view into
-/// a reference discharge context, sharing the single [`ArrayReferenceTransformPath`] traversal with the eager value carrier,
-/// which keeps staged and eager reference semantics consistent. Symbolic indices arrive closed over context values
-/// and select a size-one dynamic slice; updates restore the removed axis before replacing that slice.
+/// Transform carrier that binds the canonical slice, reshape, and update-slice operations of one array reference
+/// transform path into a reference discharge context, sharing the single [`ArrayReferenceTransformPath`] traversal with
+/// the eager value carrier, which keeps staged and eager reference semantics consistent. Symbolic indices arrive closed
+/// over context values and select a size-one dynamic slice; updates restore the removed axis before replacing that
+/// slice.
 struct ContextTransformCarrier<'c, C>(
     /// Context in which the slice, reshape, and update-slice operations are bound.
     &'c C,
 );
 
 impl<C: Context<Type = ArrayIrType>> ContextTransformCarrier<'_, C> {
-    /// Binds one single-result view operation into the context and returns its result.
+    /// Binds one single-result operation of the traversal into the context and returns its result.
     ///
     /// # Parameters
     ///
     ///   - `operation`: Context-family operation to bind.
-    ///   - `inputs`: Operands of the application, in operation-defined order.
+    ///   - `inputs`: Inputs of the application, in operation-defined order.
     fn bind(&self, operation: C::Operation, inputs: &[&C::Value]) -> Result<C::Value, ProgramError> {
         let inputs = inputs.iter().map(|input| (*input).clone()).collect::<Vec<_>>();
         let mut outputs = self.0.bind(operation, Vec::new(), inputs.as_slice())?;
@@ -1472,7 +1483,7 @@ where
         let rank = dimensions.len();
         let update = self.reshape(update, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))?;
         // Restore the indexed axis before writing back. Full-size axes clamp to zero just as in the read path,
-        // while the selected axis uses the same runtime index and clamping extent as the original view.
+        // while the selected axis uses the same runtime index and clamping extent as the original index transform.
         let mut inputs = vec![target, &update];
         inputs.extend(std::iter::repeat_n(binding, rank));
         self.bind(C::Operation::from_reference_dynamic_update_slice(DynamicUpdateSliceOperation::new()), &inputs)
@@ -1550,7 +1561,7 @@ mod tests {
             ),
             (
                 ArrayReferenceViewError::DynamicTransformIndex,
-                "eager reference handles carry only static views; dynamic indices are resolved by each access",
+                "eager reference handles carry only static transforms; dynamic indices are resolved by each access",
             ),
         ] {
             assert_eq!(error.to_string(), message);
@@ -1582,12 +1593,12 @@ mod tests {
     fn test_array_reference_transform_read_type() {
         // Read-only accesses derive the same types as `output_type`; they only skip its write-back proof.
         let input = ArrayType::new_static(DataType::F32, [3, 4]);
-        for view in [
+        for transform in [
             ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
             ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Dynamic },
             ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)] },
         ] {
-            assert_eq!(ReferenceTransform::read_type(&view, &input), view.output_type(&input));
+            assert_eq!(ReferenceTransform::read_type(&transform, &input), transform.output_type(&input));
         }
         assert_eq!(
             ReferenceTransform::read_type(
@@ -1716,26 +1727,26 @@ mod tests {
 
     #[test]
     fn test_array_reference_transform_validate_bindings() {
-        let view = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
         let input = ArrayType::new_static(DataType::F32, [3]);
         let integer = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
         let floating = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let vector = ArrayIrType::Array(ArrayType::new_static(DataType::I32, [1]));
         let host = ArrayIrType::Array(ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: false }));
-        assert_eq!(view.validate_bindings(&input, &[&integer]), Ok(()));
-        assert_eq!(view.validate_bindings(&input, &[]), Err(TypeError::invalid("expected 1 binding but got 0")));
+        assert_eq!(transform.validate_bindings(&input, &[&integer]), Ok(()));
+        assert_eq!(transform.validate_bindings(&input, &[]), Err(TypeError::invalid("expected 1 binding but got 0")));
         assert_eq!(
-            view.validate_bindings(&input, &[&floating]),
-            Err(TypeError::invalid("reference view requires a scalar integer index but received `f32[]`")),
+            transform.validate_bindings(&input, &[&floating]),
+            Err(TypeError::invalid("reference transform requires a scalar integer index but received `f32[]`")),
         );
         assert_eq!(
-            view.validate_bindings(&input, &[&vector]),
-            Err(TypeError::invalid("reference view requires a scalar integer index but received `i32[1]`")),
+            transform.validate_bindings(&input, &[&vector]),
+            Err(TypeError::invalid("reference transform requires a scalar integer index but received `i32[1]`")),
         );
         assert_eq!(
-            view.validate_bindings(&input, &[&host]),
+            transform.validate_bindings(&input, &[&host]),
             Err(TypeError::invalid(
-                "reference view and index must share one memory space but index resides in Host[Unpinned] \
+                "reference transform and index must share one memory space but index resides in Host[Unpinned] \
                  and reference resides in Device",
             )),
         );
@@ -1773,7 +1784,7 @@ mod tests {
         assert_eq!(row_1.overlap(&rows_2_3, &root), ReferenceViewOverlap::Disjoint);
 
         // Rank changes are tracked while folding: an index removes its axis, so a slice that follows it addresses the
-        // remaining root axes, and different step sequences that select the same indices are the same.
+        // remaining root axes, and different transform sequences that select the same indices are the same.
         let row_1_columns_1_2 =
             row_1.with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
         let row_1_column_1 = row_1
@@ -1839,7 +1850,7 @@ mod tests {
             ReferenceViewOverlap::Disjoint,
         );
 
-        // A path or root that cannot be folded (an out-of-bounds axis or index, a symbolic step without its
+        // A path or root that cannot be folded (an out-of-bounds axis or index, a symbolic transform without its
         // binding, a non-reference root, or a root without a static shape) is conservatively reported as possibly
         // overlapping rather than failing.
         let out_of_bounds = empty
@@ -1876,14 +1887,14 @@ mod tests {
     #[test]
     fn test_array_reference_transform_overlap_overflow() {
         let root = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
-        let view: ArrayReferenceTransformPath = ArrayReferenceTransformPath::root()
+        let path: ArrayReferenceTransformPath = ArrayReferenceTransformPath::root()
             .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
             .with_transform(ArrayReferenceTransform::Index {
                 axis: 0,
                 index: ArrayReferenceTransformIndex::Static(usize::MAX),
             });
         // Malformed relative indices cannot wrap around to become valid root indices.
-        assert_eq!(view.overlap(&ArrayReferenceTransformPath::root(), &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(path.overlap(&ArrayReferenceTransformPath::root(), &root), ReferenceViewOverlap::MayOverlap);
     }
 
     #[test]
@@ -2046,13 +2057,13 @@ mod tests {
 
     #[test]
     fn test_array_reference_transform_path_intermediates_in() {
-        let view: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
+        let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
             .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
         let root = Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap();
         let mut carrier = EagerTransformCarrier::<Array>(PhantomData);
         assert_eq!(
-            view.intermediates_in(&mut carrier, root.clone()),
+            path.intermediates_in(&mut carrier, root.clone()),
             Ok(vec![root.clone(), Array::vector(vec![2.0_f32, 3.0]).unwrap(), Array::scalar(3.0_f32).unwrap(),]),
         );
         assert_eq!(ArrayReferenceTransformPath::root().intermediates_in(&mut carrier, root.clone()), Ok(vec![root]));
@@ -2060,13 +2071,13 @@ mod tests {
 
     #[test]
     fn test_array_reference_transform_path_reconstruct_in() {
-        let view: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
+        let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
             .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
         let mut carrier = EagerTransformCarrier::<Array>(PhantomData);
         // Reconstruction consumes strict parents in reverse order; the old selected scalar is unnecessary.
         assert_eq!(
-            view.reconstruct_in(
+            path.reconstruct_in(
                 &mut carrier,
                 &[Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap(), Array::vector(vec![2.0_f32, 3.0]).unwrap(),],
                 Array::scalar(7.0_f32).unwrap()
@@ -2081,23 +2092,23 @@ mod tests {
 
     #[test]
     fn test_array_reference_transform_path_reconstruct_in_rejects_invalid_parent_count() {
-        let view: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
+        let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) });
         let mut carrier = EagerTransformCarrier::<Array>(PhantomData);
         assert_eq!(
-            view.reconstruct_in(&mut carrier, &[], Array::scalar(1.0_f32).unwrap()),
+            path.reconstruct_in(&mut carrier, &[], Array::scalar(1.0_f32).unwrap()),
             Err(ProgramError::MalformedProgram(
-                "reference view reconstruction requires 1 parent snapshots but received 0".to_string(),
+                "reference transform path reconstruction requires 1 parent snapshots but received 0".to_string(),
             )),
         );
         assert_eq!(
-            view.reconstruct_in(
+            path.reconstruct_in(
                 &mut carrier,
                 &[Array::vector(vec![1.0_f32]).unwrap(), Array::scalar(1.0_f32).unwrap()],
                 Array::scalar(1.0_f32).unwrap(),
             ),
             Err(ProgramError::MalformedProgram(
-                "reference view reconstruction requires 1 parent snapshots but received 2".to_string(),
+                "reference transform path reconstruction requires 1 parent snapshots but received 2".to_string(),
             )),
         );
     }
@@ -2119,7 +2130,7 @@ mod tests {
         assert_eq!(references.get(&alias), Some(&"root"));
         assert_eq!(references.get(&view), Some(&"view"));
         assert_eq!(root.to_string(), "ref<f32[2]>");
-        assert_eq!(format!("{root:?}"), format!("ArrayReference {{ id: {:?}, view: {:?} }}", root.id(), root.view));
+        assert_eq!(format!("{root:?}"), format!("ArrayReference {{ id: {:?}, path: {:?} }}", root.id(), root.path));
     }
 
     #[test]
@@ -2134,12 +2145,12 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_view() {
+    fn test_array_reference_path() {
         let root = ArrayReference::new(Array::vector(vec![1i32, 2, 3]).unwrap());
-        assert!(root.view().is_root());
+        assert!(root.path().is_root());
         let transform = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] };
         let view = root.with_transform(transform.clone()).unwrap();
-        assert_eq!(view.view().transforms().cloned().collect::<Vec<_>>(), vec![transform]);
+        assert_eq!(view.path().transforms().cloned().collect::<Vec<_>>(), vec![transform]);
     }
 
     #[test]
@@ -2194,12 +2205,14 @@ mod tests {
         // An unresolved dynamic index cannot enter a static eager path. The access must supply its binding through
         // `with_transforms`, which resolves the index before extending the handle.
         let symbolic = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let view: ArrayReferenceTransformPath<NoReferenceTransformBinding> =
+        let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> =
             ArrayReferenceTransformPath::root().with_transform(symbolic.clone());
         assert_eq!(
-            view.apply(&Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap()),
-            Err(TypeError::invalid("a dynamic index has no static view; apply its binding at the reference access",)
-                .into()),
+            path.apply(&Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap()),
+            Err(TypeError::invalid(
+                "a dynamic index has no static selection; apply its binding at the reference access",
+            )
+            .into()),
         );
         let root = ArrayReference::new(Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap());
         let error = root.with_transform(symbolic).unwrap_err();
@@ -2209,7 +2222,7 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "eager reference handles carry only static views; dynamic indices are resolved by each access",
+            "eager reference handles carry only static transforms; dynamic indices are resolved by each access",
         );
     }
 
@@ -2287,11 +2300,11 @@ mod tests {
         let transforms = [ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
         assert_eq!(
             root.with_transforms(&transforms, &[]),
-            Err(TypeError::invalid("reference view requires 1 bindings but only 0 remain").into()),
+            Err(TypeError::invalid("reference transform requires 1 bindings but only 0 remain").into()),
         );
         assert_eq!(
             root.with_transforms(&transforms, &[ArrayIrValue::Array(Array::scalar(1f32).unwrap())]),
-            Err(TypeError::invalid("reference view requires a scalar integer index but received `f32[]`").into()),
+            Err(TypeError::invalid("reference transform requires a scalar integer index but received `f32[]`").into()),
         );
         let empty = ArrayReference::new(Array::vector(Vec::<i32>::new()).unwrap());
         assert_eq!(
@@ -2604,11 +2617,11 @@ mod tests {
         let handle = root.with_transform(slice.clone()).unwrap().with_transform(index.clone()).unwrap();
 
         // Composition derives each handle type incrementally, which must agree with folding the complete mapping
-        // over the root type in one step.
-        let view: ArrayReferenceTransformPath =
+        // over the root type in one pass.
+        let path: ArrayReferenceTransformPath =
             ArrayReferenceTransformPath::root().with_transform(slice).with_transform(index);
         assert_eq!(root.r#type().as_ref(), &ReferenceType::new(root_type.clone()));
-        assert_eq!(handle.r#type().as_ref(), &ReferenceType::new(view.output_type(&root_type).unwrap()));
+        assert_eq!(handle.r#type().as_ref(), &ReferenceType::new(path.output_type(&root_type).unwrap()));
         assert_eq!(handle.clone().r#type(), handle.r#type());
         assert_eq!(handle.to_string(), "ref<f32[2]>");
         assert_eq!(root.to_string(), "ref<f32[2, 3]>");
@@ -2657,9 +2670,10 @@ mod tests {
         let index = ArrayIrValue::Array(Array::scalar(1i32).unwrap());
         let alias = ArrayReferenceTransformPath::root()
             .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
-        let view = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let composed = ArrayReferenceDischarge::compose_transforms(&context, &alias, &[view.clone()], &[index.clone()]);
-        assert_eq!(composed, Ok(alias.with_bound_transform(view, vec![index])));
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let composed =
+            ArrayReferenceDischarge::compose_transforms(&context, &alias, &[transform.clone()], &[index.clone()]);
+        assert_eq!(composed, Ok(alias.with_bound_transform(transform, vec![index])));
         let current = ArrayIrValue::Array(Array::vector(vec![1i32, 2, 3, 4]).unwrap());
         assert_eq!(
             ArrayReferenceDischarge::read(&context, &current, &composed.unwrap()),
@@ -2745,8 +2759,9 @@ mod tests {
 
     #[test]
     fn test_array_reference_discharge_swap_reconstructs_composed_view() {
-        // Swapping through an index composed onto a slice must write back through both steps in reverse order, so the
-        // discharged program reconstructs the sliced block from the squeezed row before writing it into the allocation.
+        // Swapping through an index composed onto a slice must write back through both transforms in reverse order, so
+        // the discharged program reconstructs the sliced block from the squeezed row before writing it into the
+        // allocation.
         let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(3)]));
         let row_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -3146,7 +3161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repeated_folded_view_metadata_cost() {
+    fn test_repeated_folded_transform_metadata_cost() {
         for accesses in [1, 8, 64] {
             let mut builder = TestBuilder::new();
             let root = builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [8])).into());
@@ -3194,11 +3209,11 @@ mod tests {
 
     #[test]
     fn test_array_ir_operation_reference_access_descriptor() {
-        let view = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let operation = TestOperation::ReferenceRead(TestRead::new().with_transforms(vec![view.clone()]));
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let operation = TestOperation::ReferenceRead(TestRead::new().with_transforms(vec![transform.clone()]));
         assert_eq!(operation.base_input_count(), 1);
         let descriptor = operation.reference_access_descriptor(0).unwrap();
-        assert_eq!(descriptor.transforms(), &[view]);
+        assert_eq!(descriptor.transforms(), &[transform]);
         assert_eq!(descriptor.bindings(), 1..2);
         assert_eq!(operation.reference_access_descriptor(1), None);
         let replaced = operation.with_reference_access_transforms(0, Vec::new()).unwrap();

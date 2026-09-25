@@ -1,8 +1,6 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-// TODO(eaplatanios): Review this module.
-
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
     ProgramBatchingOutputAxesPolicy,
@@ -24,6 +22,8 @@ use crate::programs::{
     RegionInterface, RegionSlot, TypeError, Value,
 };
 use crate::tracing::{DomainTracer, Trace};
+
+// TODO(eaplatanios): Review from here onwards.
 
 use super::{
     validate_custom_derivative_reference_boundary, validate_custom_derivative_replay, validate_non_differentiated_count,

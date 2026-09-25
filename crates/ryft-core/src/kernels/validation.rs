@@ -1,7 +1,7 @@
 //! Backend-independent validation of preserved-reference kernel bodies.
 //!
 //! A kernel's array operands enter as reference-typed region inputs. Its body reads and mutates them through ordinary
-//! reference operations and views, then publishes updated arrays at its outer, array-typed boundary. This module
+//! reference operations and transforms, then publishes updated arrays at its outer, array-typed boundary. This module
 //! validates those reference accesses using the [`ArrayReferenceAnalysis`] retained on the body region through
 //! [`RegionRef::reference_view_analysis`]. A [`KernelBoundaryContract`] declares one [`KernelParameterAccess`] per
 //! reference-typed input. These analyses run explicitly for kernel validation; neither is a standing lint on ordinary
@@ -31,7 +31,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::arrays::{
-    ArrayIrOperation, ArrayIrType, ArrayReferenceAnalysis, ArrayReferenceTransform, ArrayReferenceTransformPath, ArrayType,
+    ArrayIrOperation, ArrayIrType, ArrayReferenceAnalysis, ArrayReferenceTransform, ArrayReferenceTransformPath,
+    ArrayType,
 };
 use crate::programs::{
     AtomId, InstructionId, Operation, ReferenceAccessMode, ReferenceAccessOperation, ReferenceRoot,
@@ -113,7 +114,9 @@ pub enum KernelValidationError {
 /// Operation-local reference semantics used by kernel boundary validation. Implementations identify an old-value
 /// result only for a swap whose first reference operand is read and replaced; the result index must exist and denote
 /// exactly that previous value. Ordinary read-write operations and unrecognized extensions return `None`.
-pub trait KernelReferenceOperation: ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform> {
+pub trait KernelReferenceOperation:
+    ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform>
+{
     /// Returns the old-value output of a swap, allowing dead results to be classified as stores.
     fn swap_output_index(&self) -> Option<usize> {
         None
@@ -279,8 +282,8 @@ impl KernelReferenceSummary {
         self.parameters.as_slice()
     }
 
-    /// Returns the [`ArrayReferenceTransformPath`] selected by the reference access at `input_index` of `instruction`, or
-    /// [`None`] when that input is not a reference access or the instruction is outside the body closure. Empty
+    /// Returns the [`ArrayReferenceTransformPath`] selected by the reference access at `input_index` of `instruction`,
+    /// or [`None`] when that input is not a reference access or the instruction is outside the body closure. Empty
     /// paths select complete roots. Refer to the documentation of [`ArrayReferenceAnalysis::path`] for more
     /// information.
     #[inline]
@@ -448,7 +451,9 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayReferenceTransformIndex, ArraySliceAxis, DataType};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, ArrayReferenceTransformIndex, ArraySliceAxis, DataType,
+    };
     use crate::captures::CaptureReference;
     use crate::operations::{
         ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
@@ -511,8 +516,10 @@ mod tests {
             .unwrap()[0];
         builder
             .add_instruction(
-                ReferenceWriteOperation::new()
-                    .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]),
+                ReferenceWriteOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Static(0),
+                }]),
                 Vec::new(),
                 vec![write_only, scalar],
                 None,
@@ -577,10 +584,10 @@ mod tests {
             KernelValidationError::from(ReferenceViewAnalysisError::InvalidAccess {
                 instruction: id(0, 1),
                 input_index: 0,
-                message: "missing view descriptor".to_owned(),
+                message: "missing transform descriptor".to_owned(),
             })
             .to_string(),
-            "invalid reference access at ^0[1] input 0: missing view descriptor",
+            "invalid reference access at ^0[1] input 0: missing transform descriptor",
         );
         assert_eq!(
             KernelValidationError::ParameterCountMismatch { expected: 3, actual: 2 }.to_string(),
@@ -737,16 +744,16 @@ mod tests {
     }
 
     #[test]
-    fn test_kernel_reference_summary_view() {
+    fn test_kernel_reference_summary_path() {
         let (program, contract) = accepted_body();
         let summary = validate_kernel_body(program.entry_region_ref(), &contract).unwrap();
         assert_eq!(summary.path(id(0, 2), 0), Some(&ArrayReferenceTransformPath::root()));
         assert_eq!(
-            summary.path(id(0, 0), 0).map(|view| view.transforms().cloned().collect::<Vec<_>>()),
+            summary.path(id(0, 0), 0).map(|path| path.transforms().cloned().collect::<Vec<_>>()),
             Some(vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1)] }]),
         );
         assert_eq!(
-            summary.path(id(0, 1), 0).map(|view| view.transforms().cloned().collect::<Vec<_>>()),
+            summary.path(id(0, 1), 0).map(|path| path.transforms().cloned().collect::<Vec<_>>()),
             Some(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]),
         );
         assert_eq!(summary.path(id(0, 1), 1), None);
@@ -754,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn test_kernel_reference_summary_view_folded_accesses() {
+    fn test_kernel_reference_summary_path_folded_accesses() {
         let mut builder = TestBuilder::new();
         let reference = builder.add_input(reference_type([2, 3]));
         let index = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));

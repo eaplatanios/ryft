@@ -32,8 +32,8 @@ use crate::macros::check_count;
 use crate::operations::{Pad, PadOperation};
 use crate::programs::{
     EffectClasses, Effects, Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect, ReferenceTransform, RegionInterface, TypeError, Typed,
-    infer_reference_view_type,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect, ReferenceTransform, RegionInterface, TypeError,
+    Typed, infer_reference_view_type,
 };
 
 /// Canonical operation name for [`TileLoadOperation`].
@@ -71,7 +71,7 @@ impl TileLoadOperation {
         &self.block_shape
     }
 
-    /// Returns the views applied to the source reference before the tile window.
+    /// Returns the transforms applied to the source reference before the tile window.
     pub fn transforms(&self) -> &[ArrayReferenceTransform] {
         &self.transforms
     }
@@ -107,7 +107,7 @@ impl Operation for TileLoadOperation {
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
         let rank = self.block_shape.len();
-        let binding_count = self.transforms.iter().map(|view| view.binding_count()).sum::<usize>();
+        let binding_count = self.transforms.iter().map(|transform| transform.binding_count()).sum::<usize>();
         check_count!("input", input_types, rank + 2 + binding_count, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let ArrayIrType::Reference(reference) = &input_types[0] else {
@@ -180,7 +180,7 @@ impl ReferenceAccessOperation for TileLoadOperation {
             let start = self.base_input_count();
             ReferenceAccessDescriptor::new(
                 &self.transforms,
-                start..start + self.transforms.iter().map(|view| view.binding_count()).sum::<usize>(),
+                start..start + self.transforms.iter().map(|transform| transform.binding_count()).sum::<usize>(),
             )
         })
     }
@@ -412,7 +412,8 @@ mod tests {
     #[test]
     fn test_tile_load_operation_with_transforms() {
         let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
-        let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap().with_transforms(transforms.clone());
+        let operation =
+            TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap().with_transforms(transforms.clone());
         assert_eq!(operation.transforms(), transforms);
         assert_eq!(operation.reference_access_descriptor(0).unwrap().bindings(), 3..4);
         assert!(operation.reference_access_descriptor(1).is_none());
@@ -473,9 +474,9 @@ mod tests {
     fn test_tile_load_operation_interpretation_transforms() {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let source = ArrayReference::new(Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap());
-        let operation = TileLoadOperation::new(vec![3], BoundaryPolicy::Masked)
-            .unwrap()
-            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }]);
+        let operation = TileLoadOperation::new(vec![3], BoundaryPolicy::Masked).unwrap().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
         assert_eq!(
             context.bind(
                 operation,
@@ -591,8 +592,10 @@ mod tests {
     fn test_tile_load_operation_render() {
         let operation = TileLoadOperation::new(vec![2], BoundaryPolicy::Masked).unwrap();
         assert_eq!(operation.to_string(), "tile_load [block_shape=[2], boundary=Masked]");
-        let operation = operation
-            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }]);
+        let operation = operation.with_transforms(vec![ArrayReferenceTransform::Index {
+            axis: 0,
+            index: ArrayReferenceTransformIndex::Static(1),
+        }]);
         assert_eq!(
             operation.to_string(),
             "tile_load [block_shape=[2], boundary=Masked, transforms=[index(axis=0, index=1)]]",

@@ -242,7 +242,7 @@ impl BlockMapping {
     }
 
     /// Interprets dimension bindings and intersects the resulting block with the concrete operand shape. The returned
-    /// view describes only valid memory; the original starts remain available for constructing explicit masks.
+    /// valid transform selects only valid memory; the original starts remain available for constructing explicit masks.
     ///
     /// # Parameters
     ///
@@ -308,7 +308,7 @@ impl BlockWindow {
         &self.starts
     }
 
-    /// Returns the canonical view of the valid intersection, which may be empty.
+    /// Returns the canonical transform that selects the valid intersection, which may be empty.
     pub fn valid_transform(&self) -> &ArrayReferenceTransform {
         &self.valid_transform
     }
@@ -620,7 +620,10 @@ mod tests {
             assert!(window.requires_mask());
         }
         let empty = mapping.evaluate(&inputs(&mapping, &[0]), &[0]).unwrap();
-        assert_eq!(empty.valid_transform(), &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 0, 1)] });
+        assert_eq!(
+            empty.valid_transform(),
+            &ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 0, 1)] }
+        );
     }
 
     #[test]
@@ -692,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_window_valid_view() {
+    fn test_block_window_valid_transform() {
         let mapping = BlockMapping::new(identity_program(2), vec![4, 8], BoundaryPolicy::Masked).unwrap();
         assert_eq!(
             mapping.evaluate(&inputs(&mapping, &[2, 4]), &[5, 7]).unwrap().valid_transform(),

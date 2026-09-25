@@ -66,7 +66,7 @@ pub enum SynchronizationError {
     #[error("cta memory event names unknown storage {value:?}")]
     Storage { value: ValueId },
 
-    /// The baseline requires statically resolved canonical views.
+    /// The baseline requires statically resolved canonical transforms.
     #[error("cta storage {value:?} has an unsupported static selection")]
     Selection { value: ValueId },
 
@@ -141,8 +141,8 @@ pub enum SynchronizationError {
 /// One communication operation emitted for a particular CTA thread.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SynchronizationEvent {
-    /// Read or write through a canonical static view of a lowering-owned buffer.
-    Access { value: ValueId, view: ArrayReferenceTransform, mode: ReferenceAccessMode },
+    /// Read or write through a canonical static transform of a lowering-owned buffer.
+    Access { value: ValueId, transform: ArrayReferenceTransform, mode: ReferenceAccessMode },
 
     /// One native `cp.async` transfer, pending until its committed group is waited.
     AsyncCopy { source: (ValueId, ArrayReferenceTransform), destination: (ValueId, ArrayReferenceTransform) },
@@ -160,7 +160,11 @@ pub enum SynchronizationEvent {
     WgmmaFence { accumulator: ValueId },
 
     /// Issues one collective matrix operation using the canonical operands and accumulator owner.
-    WgmmaIssue { accumulator: ValueId, left: (ValueId, ArrayReferenceTransform), right: (ValueId, ArrayReferenceTransform) },
+    WgmmaIssue {
+        accumulator: ValueId,
+        left: (ValueId, ArrayReferenceTransform),
+        right: (ValueId, ArrayReferenceTransform),
+    },
 
     /// Commits preceding collectively issued matrix operations as one FIFO group.
     WgmmaCommit,
@@ -207,7 +211,7 @@ pub enum SynchronizationEvent {
     WaitTensorMemory { token: ValueId },
 
     /// Reads the actual thread-owned tensor-memory selection as part of one uniform full-CTA load.
-    LoadTensorMemory { value: ValueId, view: ArrayReferenceTransform },
+    LoadTensorMemory { value: ValueId, transform: ArrayReferenceTransform },
 
     /// Releases a completed allocation collectively in lanes zero through 31.
     ReleaseTensorMemory { value: ValueId },
@@ -219,7 +223,11 @@ pub enum SynchronizationEvent {
     ArriveExpectTransaction { barrier: ValueId, bytes: usize },
 
     /// Issues a TMA transfer tracked by the current transaction-barrier generation; completion is simulated internally.
-    TmaCopy { barrier: ValueId, source: (ValueId, ArrayReferenceTransform), destination: (ValueId, ArrayReferenceTransform) },
+    TmaCopy {
+        barrier: ValueId,
+        source: (ValueId, ArrayReferenceTransform),
+        destination: (ValueId, ArrayReferenceTransform),
+    },
 
     /// Acquires one completed generation for this thread. Native parity is the low bit of `generation`.
     WaitBarrier { barrier: ValueId, generation: u64 },
@@ -498,8 +506,8 @@ impl CtaSynchronization {
                         reason: "allocation and release require the first warp",
                     });
                 }
-                if let SynchronizationEvent::LoadTensorMemory { view, .. } = &event {
-                    self.access(*value, view, false)?;
+                if let SynchronizationEvent::LoadTensorMemory { transform, .. } = &event {
+                    self.access(*value, transform, false)?;
                 }
             }
             SynchronizationEvent::IssueTensorMemory { token, destination, left, right, scales, .. } => {
@@ -569,11 +577,11 @@ impl CtaSynchronization {
                     reason: "issue, commit, and wait require the elected cta thread",
                 });
             }
-            SynchronizationEvent::Access { value, view, mode } => {
+            SynchronizationEvent::Access { value, transform, mode } => {
                 if !matches!(mode, ReferenceAccessMode::Read | ReferenceAccessMode::Write) {
                     return Err(SynchronizationError::AccessMode { mode: *mode });
                 }
-                self.access(*value, view, *mode == ReferenceAccessMode::Write)?;
+                self.access(*value, transform, *mode == ReferenceAccessMode::Write)?;
             }
             SynchronizationEvent::AsyncCopy { source, destination } => {
                 let source = self.access(source.0, &source.1, false)?;
@@ -706,13 +714,13 @@ impl CtaSynchronization {
                             let dimensions = plan.storage[&value].static_shape().unwrap();
                             let rows = dimensions.dimensions()[0] / 2;
                             for thread in 0..participants {
-                                let (_, SynchronizationEvent::LoadTensorMemory { view, .. }) =
+                                let (_, SynchronizationEvent::LoadTensorMemory { transform, .. }) =
                                     &plan.events[thread][state.positions[thread]]
                                 else {
                                     unreachable!()
                                 };
                                 let Some(ArrayReferenceTransform::Slice { axes }) = ArrayReferenceTransformPath::root()
-                                    .with_transform(view.clone())
+                                    .with_transform(transform.clone())
                                     .root_slice(&plan.storage[&value])
                                 else {
                                     unreachable!()
@@ -954,10 +962,15 @@ impl CtaSynchronization {
         }
     }
 
-    /// Resolves a static view through the canonical root-selection and addressing implementations.
-    fn access(&self, value: ValueId, view: &ArrayReferenceTransform, writes: bool) -> Result<Access, SynchronizationError> {
+    /// Resolves a static transform through the canonical root-selection and addressing implementations.
+    fn access(
+        &self,
+        value: ValueId,
+        transform: &ArrayReferenceTransform,
+        writes: bool,
+    ) -> Result<Access, SynchronizationError> {
         let r#type = self.storage.get(&value).ok_or(SynchronizationError::Storage { value })?;
-        let path = ArrayReferenceTransformPath::root().with_transform(view.clone());
+        let path = ArrayReferenceTransformPath::root().with_transform(transform.clone());
         let Some(ArrayReferenceTransform::Slice { axes }) = path.root_slice(r#type) else {
             return Err(SynchronizationError::Selection { value });
         };
@@ -1080,7 +1093,7 @@ impl TensorOperation {
                     return Err(error("scale initialization is not published to the cta"));
                 }
                 let r#type = &plan.storage[value];
-                let view = ArrayReferenceTransform::Slice {
+                let transform = ArrayReferenceTransform::Slice {
                     axes: r#type
                         .shape()
                         .dimensions()
@@ -1091,7 +1104,7 @@ impl TensorOperation {
                         })
                         .collect(),
                 };
-                sources.push(plan.access(*value, &view, false)?);
+                sources.push(plan.access(*value, &transform, false)?);
             }
         }
         tensor_memory.get_mut(destination).unwrap().pending = Some(*token);
@@ -1350,8 +1363,8 @@ impl CtaState {
                     groups[thread].clear();
                     vec![]
                 }
-                SynchronizationEvent::Access { value, view, mode } => {
-                    vec![plan.access(*value, view, *mode == ReferenceAccessMode::Write)?]
+                SynchronizationEvent::Access { value, transform, mode } => {
+                    vec![plan.access(*value, transform, *mode == ReferenceAccessMode::Write)?]
                 }
                 SynchronizationEvent::AsyncCopy { source, destination } => {
                     vec![plan.access(source.0, &source.1, false)?, plan.access(destination.0, &destination.1, true)?]
@@ -1508,10 +1521,10 @@ impl CtaState {
                     let sources = [plan.access(left.0, &left.1, false)?, plan.access(right.0, &right.1, false)?];
                     let r#type = &plan.storage[accumulator];
                     let shape = r#type.static_shape().ok_or(SynchronizationError::Selection { value: *accumulator })?;
-                    let view = ArrayReferenceTransform::Slice {
+                    let transform = ArrayReferenceTransform::Slice {
                         axes: shape.dimensions().iter().map(|extent| ArraySliceAxis::new(0, *extent, 1)).collect(),
                     };
-                    let destination = plan.access(*accumulator, &view, true)?;
+                    let destination = plan.access(*accumulator, &transform, true)?;
                     if sources.iter().any(|source| source.overlaps(&destination)) {
                         return Err(error("operand aliases the matrix accumulator"));
                     }
@@ -1849,7 +1862,7 @@ mod tests {
     }
 
     /// Selects an exact byte interval in the fixture's byte-valued buffers.
-    fn view(start: usize, size: usize) -> ArrayReferenceTransform {
+    fn transform(start: usize, size: usize) -> ArrayReferenceTransform {
         ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(start, size, 1)] }
     }
 
@@ -1880,8 +1893,8 @@ mod tests {
             instruction(3),
             SynchronizationEvent::TmaCopy {
                 barrier: value(2),
-                source: (value(0), view(0, 16)),
-                destination: (value(1), view(0, 16)),
+                source: (value(0), transform(0, 16)),
+                destination: (value(1), transform(0, 16)),
             },
         )
         .unwrap();
@@ -1906,8 +1919,8 @@ mod tests {
             2,
             SynchronizationEvent::WgmmaIssue {
                 accumulator: value(2),
-                left: (value(0), view(0, 16)),
-                right: (value(1), view(0, 16)),
+                left: (value(0), transform(0, 16)),
+                right: (value(1), transform(0, 16)),
             },
         );
         collective(&mut plan, 3, SynchronizationEvent::WgmmaCommit);
@@ -1934,8 +1947,8 @@ mod tests {
             SynchronizationEvent::IssueTensorMemory {
                 token,
                 destination: value(2),
-                left: (value(0), view(0, 16)),
-                right: (value(1), view(0, 16)),
+                left: (value(0), transform(0, 16)),
+                right: (value(1), transform(0, 16)),
                 accumulate,
                 scales: vec![],
             },
@@ -1980,7 +1993,11 @@ mod tests {
             .record(
                 0,
                 instruction(1),
-                SynchronizationEvent::Access { value: value(2), view: view(0, 4), mode: ReferenceAccessMode::Read },
+                SynchronizationEvent::Access {
+                    value: value(2),
+                    transform: transform(0, 4),
+                    mode: ReferenceAccessMode::Read,
+                },
             )
             .unwrap_err();
         assert_eq!(error, SynchronizationError::Storage { value: value(2) });
@@ -1990,7 +2007,7 @@ mod tests {
                 instruction(1),
                 SynchronizationEvent::Access {
                     value: value(0),
-                    view: view(0, 4),
+                    transform: transform(0, 4),
                     mode: ReferenceAccessMode::AtomicAccumulate,
                 },
             )
@@ -2006,8 +2023,8 @@ mod tests {
                     0,
                     instruction(0),
                     SynchronizationEvent::AsyncCopy {
-                        source: (value(0), view(0, width)),
-                        destination: (value(1), view(0, width)),
+                        source: (value(0), transform(0, width)),
+                        destination: (value(1), transform(0, width)),
                     }
                 ),
                 Ok(())
@@ -2019,8 +2036,8 @@ mod tests {
                     0,
                     instruction(0),
                     SynchronizationEvent::AsyncCopy {
-                        source: (value(0), view(start, source_width)),
-                        destination: (value(1), view(0, destination_width)),
+                        source: (value(0), transform(start, source_width)),
+                        destination: (value(1), transform(0, destination_width)),
                     },
                 )
                 .unwrap_err();
@@ -2053,8 +2070,8 @@ mod tests {
                     instruction(0),
                     SynchronizationEvent::TmaCopy {
                         barrier: value(2),
-                        source: (value(0), view(0, 16)),
-                        destination: (value(1), view(0, size)),
+                        source: (value(0), transform(0, 16)),
+                        destination: (value(1), transform(0, size)),
                     }
                 ),
                 Err(SynchronizationError::TransactionBarrier {
@@ -2115,8 +2132,8 @@ mod tests {
                 thread,
                 instruction(0),
                 SynchronizationEvent::AsyncCopy {
-                    source: (value(0), view(thread as usize * 4, 4)),
-                    destination: (value(1), view(thread as usize * 4, 4)),
+                    source: (value(0), transform(thread as usize * 4, 4)),
+                    destination: (value(1), transform(thread as usize * 4, 4)),
                 },
             )
             .unwrap();
@@ -2126,7 +2143,11 @@ mod tests {
             plan.record(
                 thread,
                 instruction(4),
-                SynchronizationEvent::Access { value: value(1), view: view(0, 8), mode: ReferenceAccessMode::Read },
+                SynchronizationEvent::Access {
+                    value: value(1),
+                    transform: transform(0, 8),
+                    mode: ReferenceAccessMode::Read,
+                },
             )
             .unwrap();
         }
@@ -2142,11 +2163,18 @@ mod tests {
             plan.record(
                 0,
                 instruction(0),
-                SynchronizationEvent::AsyncCopy { source: (value(0), view(0, 4)), destination: (value(1), view(0, 4)) },
+                SynchronizationEvent::AsyncCopy {
+                    source: (value(0), transform(0, 4)),
+                    destination: (value(1), transform(0, 4)),
+                },
             )
             .unwrap();
-            plan.record(0, instruction(1), SynchronizationEvent::Access { value: owner, view: view(0, 4), mode })
-                .unwrap();
+            plan.record(
+                0,
+                instruction(1),
+                SynchronizationEvent::Access { value: owner, transform: transform(0, 4), mode },
+            )
+            .unwrap();
             assert_eq!(
                 plan.simulate(),
                 Err(SynchronizationError::PendingAccess { thread: 0, instruction: instruction(1), value: owner })
@@ -2161,7 +2189,10 @@ mod tests {
             .record(
                 0,
                 instruction(0),
-                SynchronizationEvent::AsyncCopy { source: (value(0), view(0, 4)), destination: (value(1), view(0, 4)) },
+                SynchronizationEvent::AsyncCopy {
+                    source: (value(0), transform(0, 4)),
+                    destination: (value(1), transform(0, 4)),
+                },
             )
             .unwrap();
         uncommitted.record(0, instruction(1), SynchronizationEvent::WaitGroup).unwrap();
@@ -2172,7 +2203,10 @@ mod tests {
             .record(
                 0,
                 instruction(0),
-                SynchronizationEvent::AsyncCopy { source: (value(0), view(0, 4)), destination: (value(1), view(0, 4)) },
+                SynchronizationEvent::AsyncCopy {
+                    source: (value(0), transform(0, 4)),
+                    destination: (value(1), transform(0, 4)),
+                },
             )
             .unwrap();
         unsynchronized.record(0, instruction(1), SynchronizationEvent::CommitGroup).unwrap();
@@ -2183,7 +2217,11 @@ mod tests {
             .record(
                 1,
                 instruction(5),
-                SynchronizationEvent::Access { value: value(1), view: view(0, 4), mode: ReferenceAccessMode::Read },
+                SynchronizationEvent::Access {
+                    value: value(1),
+                    transform: transform(0, 4),
+                    mode: ReferenceAccessMode::Read,
+                },
             )
             .unwrap();
         assert_eq!(
@@ -2204,7 +2242,10 @@ mod tests {
         plan.record(
             0,
             instruction(0),
-            SynchronizationEvent::AsyncCopy { source: (value(0), view(0, 4)), destination: (value(1), view(0, 4)) },
+            SynchronizationEvent::AsyncCopy {
+                source: (value(0), transform(0, 4)),
+                destination: (value(1), transform(0, 4)),
+            },
         )
         .unwrap();
         plan.record(0, instruction(1), SynchronizationEvent::Barrier { site: 0 }).unwrap();
@@ -2242,7 +2283,11 @@ mod tests {
         plan.record(
             1,
             instruction(8),
-            SynchronizationEvent::Access { value: value(1), view: view(0, 16), mode: ReferenceAccessMode::Read },
+            SynchronizationEvent::Access {
+                value: value(1),
+                transform: transform(0, 16),
+                mode: ReferenceAccessMode::Read,
+            },
         )
         .unwrap();
         let expected = vec![
@@ -2275,8 +2320,8 @@ mod tests {
             instruction(6),
             SynchronizationEvent::TmaCopy {
                 barrier: value(2),
-                source: (value(0), view(0, 16)),
-                destination: (value(1), view(0, 16)),
+                source: (value(0), transform(0, 16)),
+                destination: (value(1), transform(0, 16)),
             },
         )
         .unwrap();
@@ -2400,8 +2445,12 @@ mod tests {
     fn test_cta_synchronization_simulate_transaction_reservations() {
         for (owner, mode) in [(value(0), ReferenceAccessMode::Write), (value(1), ReferenceAccessMode::Read)] {
             let mut plan = transaction_plan(1);
-            plan.record(0, instruction(4), SynchronizationEvent::Access { value: owner, view: view(0, 16), mode })
-                .unwrap();
+            plan.record(
+                0,
+                instruction(4),
+                SynchronizationEvent::Access { value: owner, transform: transform(0, 16), mode },
+            )
+            .unwrap();
             assert_eq!(
                 plan.simulate(),
                 Err(SynchronizationError::PendingAccess { thread: 0, instruction: instruction(4), value: owner })
@@ -2411,7 +2460,10 @@ mod tests {
         plan.record(
             0,
             instruction(4),
-            SynchronizationEvent::AsyncCopy { source: (value(0), view(0, 4)), destination: (value(0), view(8, 4)) },
+            SynchronizationEvent::AsyncCopy {
+                source: (value(0), transform(0, 4)),
+                destination: (value(0), transform(8, 4)),
+            },
         )
         .unwrap();
         assert_eq!(
@@ -2472,7 +2524,10 @@ mod tests {
         plan.record(
             0,
             instruction(4),
-            SynchronizationEvent::AsyncCopy { source: (value(0), view(0, 4)), destination: (value(3), view(0, 4)) },
+            SynchronizationEvent::AsyncCopy {
+                source: (value(0), transform(0, 4)),
+                destination: (value(3), transform(0, 4)),
+            },
         )
         .unwrap();
         plan.record(0, instruction(5), SynchronizationEvent::CommitGroup).unwrap();
@@ -2488,7 +2543,11 @@ mod tests {
         plan.record(
             1,
             instruction(5),
-            SynchronizationEvent::Access { value: value(2), view: view(0, 16), mode: ReferenceAccessMode::Read },
+            SynchronizationEvent::Access {
+                value: value(2),
+                transform: transform(0, 16),
+                mode: ReferenceAccessMode::Read,
+            },
         )
         .unwrap();
         let mut expected = (0..5)
@@ -2506,8 +2565,8 @@ mod tests {
             4,
             SynchronizationEvent::WgmmaIssue {
                 accumulator: value(2),
-                left: (value(0), view(0, 16)),
-                right: (value(1), view(0, 16)),
+                left: (value(0), transform(0, 16)),
+                right: (value(1), transform(0, 16)),
             },
         );
         collective(&mut plan, 5, SynchronizationEvent::WgmmaCommit);
@@ -2518,7 +2577,11 @@ mod tests {
         plan.record(
             0,
             instruction(7),
-            SynchronizationEvent::Access { value: value(0), view: view(0, 16), mode: ReferenceAccessMode::Write },
+            SynchronizationEvent::Access {
+                value: value(0),
+                transform: transform(0, 16),
+                mode: ReferenceAccessMode::Write,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -2614,7 +2677,10 @@ mod tests {
         plan.record(
             0,
             instruction(4),
-            SynchronizationEvent::AsyncCopy { source: (value(0), view(0, 4)), destination: (value(3), view(0, 4)) },
+            SynchronizationEvent::AsyncCopy {
+                source: (value(0), transform(0, 4)),
+                destination: (value(3), transform(0, 4)),
+            },
         )
         .unwrap();
         plan.record(0, instruction(5), SynchronizationEvent::CommitGroup).unwrap();
@@ -2633,7 +2699,7 @@ mod tests {
                 instruction(10),
                 SynchronizationEvent::LoadTensorMemory {
                     value: value(2),
-                    view: ArrayReferenceTransform::Slice {
+                    transform: ArrayReferenceTransform::Slice {
                         axes: vec![ArraySliceAxis::new(thread as usize, 1, 1), ArraySliceAxis::new(0, 8, 1)],
                     },
                 },
@@ -2664,7 +2730,7 @@ mod tests {
             2,
             SynchronizationEvent::LoadTensorMemory {
                 value: value(2),
-                view: ArrayReferenceTransform::Slice {
+                transform: ArrayReferenceTransform::Slice {
                     axes: vec![ArraySliceAxis::new(0, 128, 1), ArraySliceAxis::new(0, 8, 1)],
                 },
             },
@@ -2709,8 +2775,8 @@ mod tests {
                 SynchronizationEvent::IssueTensorMemory {
                     token: value(3),
                     destination: value(2),
-                    left: (value(0), view(0, 16)),
-                    right: (value(1), view(0, 16)),
+                    left: (value(0), transform(0, 16)),
+                    right: (value(1), transform(0, 16)),
                     accumulate: false,
                     scales: vec![],
                 },
@@ -2751,8 +2817,8 @@ mod tests {
             SynchronizationEvent::IssueTensorMemory {
                 token: value(3),
                 destination: value(2),
-                left: (value(0), view(0, 16)),
-                right: (value(1), view(0, 16)),
+                left: (value(0), transform(0, 16)),
+                right: (value(1), transform(0, 16)),
                 accumulate: false,
                 scales: vec![],
             },
@@ -2763,7 +2829,11 @@ mod tests {
             .record(
                 0,
                 instruction(3),
-                SynchronizationEvent::Access { value: value(0), view: view(0, 16), mode: ReferenceAccessMode::Write },
+                SynchronizationEvent::Access {
+                    value: value(0),
+                    transform: transform(0, 16),
+                    mode: ReferenceAccessMode::Write,
+                },
             )
             .unwrap();
         assert_eq!(
@@ -2816,7 +2886,7 @@ mod tests {
             instruction(4),
             SynchronizationEvent::CopyTensorMemory {
                 token: value(5),
-                source: (value(0), view(0, 16)),
+                source: (value(0), transform(0, 16)),
                 destination: value(4),
             },
         )
@@ -2831,8 +2901,8 @@ mod tests {
             SynchronizationEvent::IssueTensorMemory {
                 token: value(6),
                 destination: value(2),
-                left: (value(0), view(0, 16)),
-                right: (value(1), view(0, 16)),
+                left: (value(0), transform(0, 16)),
+                right: (value(1), transform(0, 16)),
                 accumulate: false,
                 scales: vec![value(4), value(4)],
             },
@@ -2859,7 +2929,7 @@ mod tests {
                 instruction(9),
                 SynchronizationEvent::CopyTensorMemory {
                     token: value(7),
-                    source: (value(0), view(0, 16)),
+                    source: (value(0), transform(0, 16)),
                     destination: value(4),
                 },
             )
@@ -2901,8 +2971,8 @@ mod tests {
             SynchronizationEvent::IssueTensorMemory {
                 token: value(6),
                 destination: value(2),
-                left: (value(0), view(0, 16)),
-                right: (value(1), view(0, 16)),
+                left: (value(0), transform(0, 16)),
+                right: (value(1), transform(0, 16)),
                 accumulate: false,
                 scales: vec![value(4), value(4)],
             },
@@ -2928,14 +2998,22 @@ mod tests {
         left.record(
             0,
             instruction(2),
-            SynchronizationEvent::Access { value: value(0), view: view(0, 16), mode: ReferenceAccessMode::Write },
+            SynchronizationEvent::Access {
+                value: value(0),
+                transform: transform(0, 16),
+                mode: ReferenceAccessMode::Write,
+            },
         )
         .unwrap();
         right
             .record(
                 1,
                 instruction(2),
-                SynchronizationEvent::Access { value: value(0), view: view(0, 16), mode: ReferenceAccessMode::Write },
+                SynchronizationEvent::Access {
+                    value: value(0),
+                    transform: transform(0, 16),
+                    mode: ReferenceAccessMode::Write,
+                },
             )
             .unwrap();
         assert_eq!(
@@ -2995,7 +3073,7 @@ mod tests {
             collective(plan, 0, SynchronizationEvent::Barrier { site: 0 });
             collective(plan, 1, SynchronizationEvent::ClusterBarrier { site: 1 });
             for thread in 0..2 {
-                let selected = view((1 - block) * 8 + thread as usize * 4, 4);
+                let selected = transform((1 - block) * 8 + thread as usize * 4, 4);
                 plan.record(
                     thread,
                     instruction(2),
@@ -3020,7 +3098,7 @@ mod tests {
         let SynchronizationEvent::DistributedCopy { destination, .. } = &mut raced.events[0][2].1 else {
             unreachable!()
         };
-        destination.1 = view(8, 4);
+        destination.1 = transform(8, 4);
         assert_eq!(
             left.simulate_cluster(&raced),
             Err(SynchronizationError::ClusterRace {
@@ -3120,7 +3198,7 @@ mod tests {
                     instruction(8),
                     SynchronizationEvent::LoadTensorMemory {
                         value: value(2),
-                        view: ArrayReferenceTransform::Slice {
+                        transform: ArrayReferenceTransform::Slice {
                             axes: vec![
                                 ArraySliceAxis::new(block * 128 + thread as usize, 1, 1),
                                 ArraySliceAxis::new(0, 16, 1),
@@ -3143,14 +3221,15 @@ mod tests {
             vec![(0, 0, instruction(4))]
         );
         let mut wrong_rows = plans[1].clone();
-        let (_, SynchronizationEvent::LoadTensorMemory { view, .. }) = wrong_rows.events[0]
+        let (_, SynchronizationEvent::LoadTensorMemory { transform, .. }) = wrong_rows.events[0]
             .iter_mut()
             .find(|(_, event)| matches!(event, SynchronizationEvent::LoadTensorMemory { .. }))
             .unwrap()
         else {
             unreachable!()
         };
-        *view = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 16, 1)] };
+        *transform =
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 16, 1)] };
         assert_eq!(
             plans[0].simulate_cluster(&wrong_rows),
             Err(SynchronizationError::TensorMemory {

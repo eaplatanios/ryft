@@ -183,8 +183,8 @@ impl<V> ShardMapOperation<V> {
 
     /// Returns, for each global output, the input whose reference the output forwards by identity, or [`None`] for a
     /// value output. Every reference output must name its forwarded input here: the body's reference outputs can only
-    /// forward the body's reference inputs; a reference allocated inside the body cannot escape. Transform paths belong to
-    /// accesses and produce no reference outputs. The forwarded input's sharding must equal the output's sharding.
+    /// forward the body's reference inputs; a reference allocated inside the body cannot escape. Transform paths belong
+    /// to accesses and produce no reference outputs. The forwarded input's sharding must equal the output's sharding.
     #[inline]
     pub(crate) fn output_forwarding(&self) -> &[Option<usize>] {
         &self.output_forwarding

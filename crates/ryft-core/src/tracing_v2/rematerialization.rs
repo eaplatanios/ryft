@@ -82,8 +82,8 @@ use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
     Atom, AtomId, EffectClass, EffectClasses, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
     OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode,
-    ReferenceAccessOperation, ReferenceAnalysis, ReferenceMemberType, ReferenceRoot, ReferenceTransform, Region, RegionId,
-    RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
+    ReferenceAccessOperation, ReferenceAnalysis, ReferenceMemberType, ReferenceRoot, ReferenceTransform, Region,
+    RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -102,38 +102,38 @@ pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
 /// around rematerialized tangent/pullback outputs so compiler common-subexpression elimination does not undo the
 /// requested memory/computation tradeoff.
 ///
-/// The leading [`non_differentiated_count`](Self::non_differentiated_count) operands parameterize the call without
+/// The leading [`non_differentiated_count`](Self::non_differentiated_count) inputs parameterize the call without
 /// being differentiated: the primal and forward regions receive them in their own leading positions, the backward and
 /// tangent regions receive them ahead of the forward tail, and they receive neither a tangent nor a cotangent. This is
-/// the same operand split [`LinearCallOperation`] draws with its residual count, and the direct analogue of JAX's
+/// the same input split [`LinearCallOperation`] draws with its residual count, and the direct analogue of JAX's
 /// `nondiff_argnums`. Batching is its canonical producer: a policy that threads batching state through a structurally
 /// batched region's boundary (e.g., a composite universe's first-class mapped extent) reintroduces that state as
-/// additional leading non-differentiated operands of the batched call.
+/// additional leading non-differentiated inputs of the batched call.
 ///
-/// The forward region maps the operands to the primal outputs followed by the *forward tail*: the region inputs and
+/// The forward region maps the inputs to the primal outputs followed by the *forward tail*: the region inputs and
 /// then the saved residuals. The tangent region maps `(non_differentiated..., forward_tail..., tangents...)`, with one
-/// tangent per differentiated operand (a tangent reference for a reference-typed operand), to one tangent per primal
+/// tangent per differentiated input (a tangent reference for a reference-typed input), to one tangent per primal
 /// output. The backward region maps `(non_differentiated..., forward_tail..., lead...)` to one cotangent per
-/// differentiated operand, where `lead` is one cotangent per non-reference primal output followed by one cotangent
-/// destination reference per differentiated reference-typed operand, in operand order: exactly the boundary that
+/// differentiated input, where `lead` is one cotangent per non-reference primal output followed by one cotangent
+/// destination reference per differentiated reference-typed input, in input order: exactly the boundary that
 /// [`Program::transpose_with_respect_to`] gives the transposed tangent program under the default destination kinds. A
 /// reference-typed primal output forwards an input root and therefore has no cotangent slot, and a differentiated
-/// reference-typed operand's cotangent output is its destination reference returned by identity. The operands are
-/// forwarded positionally into the primal and forward regions and, for the leading non-differentiated operands, into
+/// reference-typed input's cotangent output is its destination reference returned by identity. The inputs are
+/// forwarded positionally into the primal and forward regions and, for the leading non-differentiated inputs, into
 /// the backward and tangent regions; the primal outputs forward the primal region's outputs.
 ///
 /// The `T` parameter fixes the type universe of every attached region and the call boundary. Each concrete payload
 /// therefore has exactly one [`Operation<Type = T>`](Operation) contract, while the rematerialization algorithm remains one
 /// shared implementation for all type universes. The universe must be [`DifferentiableType`], because the backward and
 /// tangent boundaries are stated in terms of the tangent and cotangent representations of the primal types (e.g., the
-/// cotangent destination of a `ref<T>` operand is a `ref<cotangent(T)>`), which coincide with the primal types only
+/// cotangent destination of a `ref<T>` input is a `ref<cotangent(T)>`), which coincide with the primal types only
 /// for self-dual universes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RematerializeOperation<T: DifferentiableType> {
     /// Backend lowering hint requesting an optimization barrier around rematerialized backward/tangent outputs.
     prevent_cse: bool,
 
-    /// Number of leading operands that parameterize the call without being differentiated.
+    /// Number of leading inputs that parameterize the call without being differentiated.
     non_differentiated_count: usize,
 
     /// Type universe in which the attached rematerialization regions operate.
@@ -153,7 +153,7 @@ impl<T: DifferentiableType> RematerializeOperation<T> {
         Self { prevent_cse: false, non_differentiated_count: 0, marker: PhantomData }
     }
 
-    /// Sets the number of leading operands that parameterize this call without being differentiated. Refer to the
+    /// Sets the number of leading inputs that parameterize this call without being differentiated. Refer to the
     /// documentation of [`RematerializeOperation`] for the resulting region interfaces.
     #[inline]
     pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Self {
@@ -161,7 +161,7 @@ impl<T: DifferentiableType> RematerializeOperation<T> {
         self
     }
 
-    /// Returns the number of leading operands that parameterize this call without being differentiated.
+    /// Returns the number of leading inputs that parameterize this call without being differentiated.
     #[inline]
     pub fn non_differentiated_count(&self) -> usize {
         self.non_differentiated_count
@@ -188,7 +188,7 @@ impl<T: DifferentiableType> RematerializeOperation<T> {
         let input_count = values.len();
         if self.non_differentiated_count > input_count {
             return Err(TypeError::invalid(format!(
-                "{} non-differentiated operand count {} exceeds input count {}",
+                "{} non-differentiated input count {} exceeds input count {}",
                 self.name(),
                 self.non_differentiated_count,
                 input_count,
@@ -199,13 +199,13 @@ impl<T: DifferentiableType> RematerializeOperation<T> {
 
     /// Returns the input types of the four attached regions (`["primal", "forward", "backward", "tangent"]` region
     /// order) for a call over `input_types` whose primal produces `output_types` and whose forward tail saves
-    /// `residual_types`. The primal and forward regions receive the operands; the backward region receives the
-    /// non-differentiated operands, the residuals, one cotangent per non-reference primal output, and one cotangent
-    /// destination reference per differentiated reference-typed operand; and the tangent region receives the
-    /// non-differentiated operands, the residuals, and one tangent per differentiated operand. Derivative positions
+    /// `residual_types`. The primal and forward regions receive the inputs; the backward region receives the
+    /// non-differentiated inputs, the residuals, one cotangent per non-reference primal output, and one cotangent
+    /// destination reference per differentiated reference-typed input; and the tangent region receives the
+    /// non-differentiated inputs, the residuals, and one tangent per differentiated input. Derivative positions
     /// carry the [`DifferentiableType::tangent`] and [`DifferentiableType::cotangent`] representations of their primal
     /// types, which is what [`Program::transpose_with_respect_to`] and the linearization tangent program expose
-    /// (e.g., `ref<cotangent(T)>` for the destination of a `ref<T>` operand). Refer to the documentation of
+    /// (e.g., `ref<cotangent(T)>` for the destination of a `ref<T>` input). Refer to the documentation of
     /// [`RematerializeOperation`] for the complete contract.
     fn region_input_types(
         &self,
@@ -378,9 +378,9 @@ impl<T: DifferentiableType> Operation for RematerializeOperation<T> {
 
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
-        // The primal and forward regions receive the operands positionally. The backward and tangent regions receive
-        // only the leading non-differentiated operands positionally; the rest of their boundaries is bound by the
-        // forward tail and by the transform that consumes the rule, not by the operands directly.
+        // The primal and forward regions receive the inputs positionally. The backward and tangent regions receive
+        // only the leading non-differentiated inputs positionally; the rest of their boundaries is bound by the
+        // forward tail and by the transform that consumes the rule, not by the inputs directly.
         match region_index {
             0 | 1 => InputRegionProvenance::Input { index: input_index },
             2 | 3 => {
@@ -402,7 +402,7 @@ impl<T: DifferentiableType> Operation for RematerializeOperation<T> {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        // A call whose operands are all differentiated and that carries no optimization barrier renders as a bare name,
+        // A call whose inputs are all differentiated and that carries no optimization barrier renders as a bare name,
         // so the non-differentiated split and the barrier appear in rendered programs exactly where they exist. Both
         // are invisible to the types, and the barrier changes how a backend lowers this call.
         let operation = OperationFormatter::new(formatter, indentation, self.name())?;
@@ -422,10 +422,10 @@ impl<T: DifferentiableType> Operation for RematerializeOperation<T> {
     }
 }
 
-// Rematerialization discharges each of its four regions independently. Reference operands are rejected: the derived
-// rule regions bind a reference operand through the forward tail and through cotangent destinations rather than
+// Rematerialization discharges each of its four regions independently. Reference inputs are rejected: the derived
+// rule regions bind a reference input through the forward tail and through cotangent destinations rather than
 // positionally, so discharge has no state boundary through which to thread caller state, and a caller that needs a
-// discharged program discharges before rematerializing. Without reference operands no caller allocation enters any
+// discharged program discharges before rematerializing. Without reference inputs no caller allocation enters any
 // region, so a local lifecycle inside a region discharges within that region, and every region summary must report
 // that no caller allocation is reached, including through a capture constant.
 impl_reference_dischargeable_operation!(@local_reference <T> RematerializeOperation<T> where T: DifferentiableType);
@@ -442,7 +442,7 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for Remateri
 }
 
 // Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate` for a
-// `RematerializeOperation`: a call with all-known operands folds by interpreting its primal, and otherwise
+// `RematerializeOperation`: a call with all-known inputs folds by interpreting its primal, and otherwise
 // residualizes unchanged.
 impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::Type> where
     C::Operation: From<RematerializeOperation<C::Type>>
@@ -473,8 +473,8 @@ where
 
         // Replay the forward region on the dual primals, recovering the primal outputs followed by the forward tail
         // (region inputs plus policy-saved residuals) that the tangent region consumes.
-        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut forward_outputs = forward_region.interpret_in_context(context.primal(), primal_operands)?;
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let mut forward_outputs = forward_region.interpret_in_context(context.primal(), primal_inputs)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "{} forward region produced {} outputs which is fewer than its {} primal output(s)",
@@ -495,7 +495,7 @@ where
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "{} cannot propagate the nonzero tangent of type `{}` supplied for one of its {} leading \
-                     non-differentiated operands, because its rule has no tangent slot for them",
+                     non-differentiated inputs, because its rule has no tangent slot for them",
                     self.name(),
                     input.tangent().r#type(),
                     non_differentiated_inputs.len(),
@@ -506,23 +506,23 @@ where
 
         // Replay the tangent region on `(non_differentiated..., forward_tail..., differentiated_input_tangents...)`,
         // yielding one output tangent per primal output.
-        let mut tangent_operands =
+        let mut tangent_inputs =
             non_differentiated_inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        tangent_operands.extend(forward_tail);
-        let primal_residuals = tangent_operands.clone();
-        let mut tangent_operands = tangent_operands
+        tangent_inputs.extend(forward_tail);
+        let primal_residuals = tangent_inputs.clone();
+        let mut tangent_inputs = tangent_inputs
             .into_iter()
             .map(|value| context.primal_to_tangent(value))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let residual_count = tangent_operands.len();
+        let residual_count = tangent_inputs.len();
 
-        // The rematerialize call takes every differentiated input tangent as a real operand, so materialize structural
+        // The rematerialize call takes every differentiated input tangent as a real input, so materialize structural
         // zeros against their own primal, which names every runtime quantity a reference-bearing tangent type omits;
         // static inputs keep the nullary zero.
         for input in differentiated_inputs {
             let source = context.primal_to_tangent(input.primal().clone())?;
-            tangent_operands.push(C::Operation::materialize_zero_from_residual_sources(
+            tangent_inputs.push(C::Operation::materialize_zero_from_residual_sources(
                 context.tangent(),
                 input.tangent().clone(),
                 std::iter::once(&source),
@@ -533,15 +533,15 @@ where
             // Reference cotangents use explicit destination arguments, so this boundary cannot use the ordinary
             // linear-call transpose signature. Partition recomputation from the live tangent-reference work instead.
             let mut known = vec![true; residual_count];
-            known.resize(tangent_operands.len(), false);
-            tangent_operands[..residual_count].clone_from_slice(&primal_residuals);
+            known.resize(tangent_inputs.len(), false);
+            tangent_inputs[..residual_count].clone_from_slice(&primal_residuals);
             let partition = driver.partition_jvp_program(tangent_region, &known, &[])?;
-            partition.interpret_in_context(context, &tangent_operands, 0)?
+            partition.interpret_in_context(context, &tangent_inputs, 0)?
         } else {
             context.tangent().bind(
                 LinearCallOperation::new(residual_count),
                 vec![tangent_region.to_program(), driver.region(2)?.to_program()],
-                &tangent_operands,
+                &tangent_inputs,
             )?
         };
         check_count!("output", tangent_outputs, output_count, ProgramError);
@@ -556,9 +556,9 @@ where
 
 crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: DifferentiableType);
 
-// Batching rule for [`RematerializeOperation`]. The primal and forward regions receive the wrapper operands' existing
+// Batching rule for [`RematerializeOperation`]. The primal and forward regions receive the wrapper inputs' existing
 // axes, forward-tail residuals retain their natural axes, and the tangent region receives the non-differentiated
-// operands' axes, those residual axes, and the differentiated operands' tangent axes. Corresponding primal, forward,
+// inputs' axes, those residual axes, and the differentiated inputs' tangent axes. Corresponding primal, forward,
 // and tangent outputs are reconciled to one axis. The backward region receives the non-differentiated, residual, and
 // reconciled output-cotangent axes, and mapped cotangents for replicated primal inputs are summed back to
 // replication. Rebuilding all four regions keeps the rematerialization boundary and its `prevent_cse` policy intact
@@ -569,8 +569,8 @@ crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: D
 // region back to the plain rematerialization region boundary, and any
 // [`BatchingPolicy::boundary_operands`](crate::BatchingPolicy::boundary_operands) (e.g., a composite program's
 // first-class mapped extent) become additional leading
-// [non-differentiated](RematerializeOperation::non_differentiated_count) operands of the batched call, which is
-// precisely the operand role those bookkeeping values play: every region consumes them and none of them carries a
+// [non-differentiated](RematerializeOperation::non_differentiated_count) inputs of the batched call, which is
+// precisely the input role those bookkeeping values play: every region consumes them and none of them carries a
 // derivative.
 impl<T: DifferentiableType, C: Context<Type = T>, P: CotangentBatchingPolicy<C>> BatchableOperation<C, P>
     for RematerializeOperation<T>
@@ -617,7 +617,7 @@ where
         let (forward_primal_output_axes, residual_axes) = forward_output_axes.split_at(primal_output_axes.len());
         let residual_axes = residual_axes.to_vec();
 
-        // The tangent region consumes the leading non-differentiated operands and the exact forward tail, followed by
+        // The tangent region consumes the leading non-differentiated inputs and the exact forward tail, followed by
         // one tangent per differentiated wrapper input. Its natural output axes participate in the same boundary
         // decision as the ordinary primal and forward-prefix outputs.
         let tangent_input_axes = non_differentiated_axes
@@ -695,9 +695,9 @@ where
             });
         }
 
-        let boundary_operands = P::boundary_operands(context.axis_extent());
-        let non_differentiated_count = self.non_differentiated_count + boundary_operands.len();
-        let mut packed_inputs = boundary_operands;
+        let boundary_inputs = P::boundary_operands(context.axis_extent());
+        let non_differentiated_count = self.non_differentiated_count + boundary_inputs.len();
+        let mut packed_inputs = boundary_inputs;
         packed_inputs.extend(inputs.iter().map(P::value).cloned());
         let outputs = context.parent().bind(
             self.with_non_differentiated_count(non_differentiated_count),
@@ -798,7 +798,7 @@ pub struct RematerializationProducer<'a, T: Type, O: Operation<Type = T>> {
     /// instruction (not the outer boundary output index).
     output_index: usize,
 
-    /// Abstract operand types at the producer's application site.
+    /// Abstract input types at the producer's application site.
     input_types: Vec<T>,
 
     /// Abstract result types at the producer's application site.
@@ -819,7 +819,7 @@ impl<'a, T: Type, O: Operation<Type = T>> RematerializationProducer<'a, T, O> {
         self.output_index
     }
 
-    /// Returns the abstract operand types at the producer's application site.
+    /// Returns the abstract input types at the producer's application site.
     #[inline]
     pub fn input_types(&self) -> &[T] {
         self.input_types.as_slice()
@@ -947,7 +947,7 @@ impl<'a, T: Type, O: Operation<Type = T>> RematerializationCandidate<'a, T, O> {
                 }
             })?;
             // A reconstructed region may forward a coefficient instead of producing it again. Follow its declared
-            // operand provenance back to the caller, including scan slices whose enclosing output is stacked again.
+            // input provenance back to the caller, including scan slices whose enclosing output is stacked again.
             // A caller input still has no producer and remains unclassified.
             let source = if let Some(input_index) = region.input_ids().iter().position(|input| *input == atom)
                 && let InputRegionProvenance::Input { index: input_index } =
@@ -956,7 +956,7 @@ impl<'a, T: Type, O: Operation<Type = T>> RematerializationCandidate<'a, T, O> {
                 let atom = instruction.inputs().get(input_index).copied().ok_or_else(|| {
                     RematerializationError::UnsupportedProvenance {
                         message: format!(
-                            "operation `{}` reported provenance selecting operand {input_index} from {} operands",
+                            "operation `{}` reported provenance selecting input {input_index} from {} inputs",
                             instruction.operation().name(),
                             instruction.inputs().len(),
                         ),
@@ -1061,7 +1061,7 @@ impl Display for RematerializationRejection {
 /// [`jax.checkpoint`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html).
 ///
 /// A residual is a value captured during linearization as a coefficient of the staged linear (tangent) map — for
-/// example, `cos(x)` for `sin`, or the operand values for `mul`. Saved residuals are emitted as extra outputs of the
+/// example, `cos(x)` for `sin`, or the input values for `mul`. Saved residuals are emitted as extra outputs of the
 /// rematerialized region's forward program and consumed directly by its backward and tangent programs; unsaved
 /// residuals are recomputed there from the region inputs. Residuals that are region inputs or constants are never
 /// presented to policies: the backward and tangent programs always receive the region inputs, and constants are
@@ -2495,7 +2495,7 @@ where
         // transformation. A reference-typed residual is a primal reference threaded by identity and is never saved: an
         // external root's residual is the input reference itself, which the derived programs reach through the region
         // inputs, while a local root's residual would carry a handle out of the recomputed lifecycle and is rejected.
-        // Access views never produce reference values, so their dynamic bindings are ordinary residuals.
+        // Access transforms never produce reference values, so their dynamic bindings are ordinary residuals.
         let mut decisions = Vec::with_capacity(residual_count);
         for index in 0..residual_count {
             if residual_types[index].is_reference() {
@@ -4843,13 +4843,13 @@ mod tests {
             /// Allocates a fresh local reference.
             Allocate,
 
-            /// Accesses its reference operand and independently performs opaque state effects.
+            /// Accesses its reference input and independently performs opaque state effects.
             Mixed,
 
             /// Executes an attached computation region.
             Call,
 
-            /// Reads its reference operand while retaining a dormant derivative region.
+            /// Reads its reference input while retaining a dormant derivative region.
             ReadWithRule,
         }
 
@@ -5263,7 +5263,7 @@ mod tests {
         );
         assert_eq!(discharged.interpret(vec![reference_test_scalar(0.5)]), Ok(vec![reference_test_scalar(0.5625)]));
 
-        // A reference operand is rejected because discharge does not thread caller state through the rematerialized
+        // A reference input is rejected because discharge does not thread caller state through the rematerialized
         // call's derived rule regions.
         let function = rematerialize::<ReferenceTestContext, _, _, _>(external_read_body);
         let (_, program) = ReferenceTestContext::trace(
@@ -5274,11 +5274,11 @@ mod tests {
         assert!(matches!(
             program.to_flat_program().discharge_references(0),
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "`rematerialize` does not thread external references through discharge, but operand 0 \
-                    is a reference; pass reference-free operands or discharge external references first",
+                if message == "`rematerialize` does not thread external references through discharge, but input 0 \
+                    is a reference; pass reference-free inputs or discharge external references first",
         ));
 
-        // A hand-built call over reference-free operands whose forward tail carries a reference it allocates declares
+        // A hand-built call over reference-free inputs whose forward tail carries a reference it allocates declares
         // reference inputs on its backward and tangent rules. Nothing can bind those inputs during discharge, so the
         // call is rejected with the same diagnostic rather than failing the rule rebuild internally.
         let scalar_type = reference_test_scalar_type();
@@ -5336,7 +5336,7 @@ mod tests {
             program.discharge_references(0),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "`rematerialize` does not thread external references through discharge, but input 0 of \
-                    region 2 is a reference; pass reference-free operands or discharge external references first",
+                    region 2 is a reference; pass reference-free inputs or discharge external references first",
         ));
     }
 

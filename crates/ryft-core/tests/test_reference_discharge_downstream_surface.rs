@@ -408,12 +408,13 @@ impl ReferenceDischargeableType for RegisterIrType {
     type Policy = RegisterReferenceDischarge;
 }
 
-/// Returns the destination value bound to one bit step, rejecting the static half descriptions reserved for analysis.
-fn bit_coordinate<V>(step: &BoundReferenceTransform<RegisterTransform, V>) -> Result<&V, ProgramError> {
-    match step.view() {
+/// Returns the destination value bound to one bit transform, rejecting the static half descriptions reserved for
+/// analysis.
+fn bit_coordinate<V>(bound_transform: &BoundReferenceTransform<RegisterTransform, V>) -> Result<&V, ProgramError> {
+    match bound_transform.transform() {
         RegisterTransform::Bit => {
-            check_count!("input", step.bindings(), 1, ProgramError);
-            Ok(&step.bindings()[0])
+            check_count!("input", bound_transform.bindings(), 1, ProgramError);
+            Ok(&bound_transform.bindings()[0])
         }
         RegisterTransform::Half(_) => Err(ProgramError::UnsupportedOperation {
             message: "static half descriptions support analysis only".to_string(),
@@ -421,19 +422,19 @@ fn bit_coordinate<V>(step: &BoundReferenceTransform<RegisterTransform, V>) -> Re
     }
 }
 
-/// Returns `current` with the bit that `steps` select replaced by `replacement`, binding the family's bit operations
-/// on `context`. Nested bit steps recurse: the bit each non-final step selects is extracted, rewritten through the
-/// remaining steps, and inserted back.
+/// Returns `current` with the bit that `bound_transforms` select replaced by `replacement`, binding the family's bit
+/// operations on `context`. Nested bit transforms recurse: the bit each non-final transform selects is extracted,
+/// rewritten through the remaining transforms, and inserted back.
 fn insert_bits<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>>(
     context: &C,
     current: C::Value,
     replacement: C::Value,
-    steps: &[BoundReferenceTransform<RegisterTransform, C::Value>],
+    bound_transforms: &[BoundReferenceTransform<RegisterTransform, C::Value>],
 ) -> Result<C::Value, ProgramError> {
-    let Some((step, rest)) = steps.split_first() else {
+    let Some((bound_transform, rest)) = bound_transforms.split_first() else {
         return Ok(replacement);
     };
-    let coordinate = bit_coordinate(step)?.clone();
+    let coordinate = bit_coordinate(bound_transform)?.clone();
     let selected = if rest.is_empty() {
         replacement
     } else {
@@ -445,10 +446,10 @@ fn insert_bits<C: Context<Type = RegisterIrType, Operation: From<RegisterOperati
 }
 
 // The policy is generic over the destination context rather than pinned to `RegisterValue`, which is what lets one
-// implementation serve an eager destination and a staging destination alike. Its alias is the view path closed over
-// destination values, so a bit step carries the destination value of its index and the policy reads and writes through
-// it by binding the family's bit operations on the destination, with no environment lookup. The policy declines
-// accumulation entirely by not implementing `ReferenceAccumulationPolicy`.
+// implementation serve an eager destination and a staging destination alike. Its alias is the transform path closed
+// over destination values, so a bit transform carries the destination value of its index and the policy reads and
+// writes through it by binding the family's bit operations on the destination, with no environment lookup. The policy
+// declines accumulation entirely by not implementing `ReferenceAccumulationPolicy`.
 impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>> ReferenceDischargePolicy<C>
     for RegisterReferenceDischarge
 {
@@ -464,8 +465,8 @@ impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>> Refe
     ) -> Result<Self::Alias, ProgramError> {
         let suffix = ReferenceTransformPath::from_transforms(transforms, bindings)?;
         let mut composed = alias.clone();
-        for step in suffix.bound_transforms() {
-            composed = composed.with_bound_transform(*step.view(), step.bindings().to_vec());
+        for bound_transform in suffix.bound_transforms() {
+            composed = composed.with_bound_transform(*bound_transform.transform(), bound_transform.bindings().to_vec());
         }
         Ok(composed)
     }
@@ -480,8 +481,8 @@ impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>> Refe
         alias: &ReferenceTransformPath<RegisterTransform, C::Value>,
     ) -> Result<C::Value, ProgramError> {
         let mut selected = current.clone();
-        for step in alias.bound_transforms() {
-            let coordinate = bit_coordinate(step)?.clone();
+        for bound_transform in alias.bound_transforms() {
+            let coordinate = bit_coordinate(bound_transform)?.clone();
             selected = bind_register_output(context, RegisterOperation::BitExtract, &[selected, coordinate])?;
         }
         Ok(selected)
@@ -501,7 +502,7 @@ impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>> Refe
 /// their type inference, reference semantics, effects, and eager interpretation are the canonical ones; the additive
 /// update is the family's own because the generic primitive requires an [`Operation`] implementation for
 /// `AddOperation<RegisterType>` that only `ryft-core` can provide. Static half and dynamic bit descriptions are the
-/// family's static and dynamic views (refer to the module documentation), and `register.bit_extract` and
+/// family's static and dynamic transforms (refer to the module documentation), and `register.bit_extract` and
 /// `register.bit_insert` are the value-level bit operations through which the discharge policy reads and writes a bit
 /// view.
 #[derive(Clone, Debug)]
@@ -818,7 +819,7 @@ impl ReferenceAccessOperation for RegisterOperation {
             Self::AddUpdate(_) if input_index == 0 => Ok(Self::AddUpdate(transforms)),
             _ if self.reference_access_descriptor(input_index).is_some() && transforms.is_empty() => Ok(self.clone()),
             _ => Err(ProgramError::UnsupportedOperation {
-                message: "register operation does not support replacing these access views".to_string(),
+                message: "register operation does not support replacing these access transforms".to_string(),
             }),
         }
     }
@@ -945,10 +946,10 @@ enum RegisterTransform {
     Bit,
 }
 
-// A half is a static description while a bit consumes one dynamic index binding. Paths are compared step
-// by step: two static halves are disjoint as soon as they differ, two bits are the same index iff their
-// bindings are equal and may otherwise overlap, a bit and a half may overlap, and paths that agree on every shared step
-// are the same when they have the same length and otherwise one is a strict prefix that contains the other.
+// A half is a static description while a bit consumes one dynamic index binding. Paths are compared transform by
+// transform: two static halves are disjoint as soon as they differ, two bits are the same index iff their bindings are
+// equal and may otherwise overlap, a bit and a half may overlap, and paths that agree on every shared transform are the
+// same when they have the same length and otherwise one is a strict prefix that contains the other.
 impl Display for RegisterTransform {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -985,7 +986,7 @@ impl ReferenceTransform for RegisterTransform {
         rhs: &[BoundReferenceTransform<Self>],
     ) -> ReferenceViewOverlap {
         for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
-            match (lhs.view(), rhs.view()) {
+            match (lhs.transform(), rhs.transform()) {
                 (Self::Half(lhs_half), Self::Half(rhs_half)) if lhs_half != rhs_half => {
                     return ReferenceViewOverlap::Disjoint;
                 }
@@ -1003,7 +1004,7 @@ impl BatchableReferenceTransform for RegisterTransform {
     fn batch(&self, _type: &RegisterIrType, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
         if !batch_axis.is_replicated() {
             return Err(BatchingError::UnsupportedOperation {
-                message: "a register view cannot carry a mapped batch axis; registers have no axes".to_string(),
+                message: "a register transform cannot carry a mapped batch axis; registers have no axes".to_string(),
             });
         }
         Ok((*self, batch_axis))
@@ -1092,7 +1093,7 @@ impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>> Part
 }
 
 // Generic reference primitives provide their own forward rules at every context. Only the family-owned numerical
-// operations, additive update, and view need rules here.
+// operations and additive update need rules here.
 impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::Value>> DifferentiableOperation<C>
     for RegisterOperation
 {
@@ -1243,7 +1244,7 @@ impl TransposableOperation<RegisterValue, RegisterOperation> for RegisterOperati
                         for binding in &inputs[2..] {
                             access_inputs.push(binding.as_known().cloned().ok_or_else(|| {
                                 ProgramError::UnsupportedOperation {
-                                    message: "register view bindings must be known during transposition".to_string(),
+                                    message: "register transform bindings must be known during transposition".into(),
                                 }
                             })?);
                         }
@@ -1967,10 +1968,10 @@ where
 }
 
 #[test]
-fn test_downstream_view_description_overlap_and_batch() {
-    // The family's overlap rule compares paths step by step: the two halves are disjoint, a path is the same as itself,
-    // the complete root or a shorter prefix contains what it narrows to, two bits are the same index exactly when their
-    // bindings agree and may otherwise overlap, and a bit may overlap with a half.
+fn test_downstream_transform_overlap_and_batch() {
+    // The family's overlap rule compares paths transform by transform: the two halves are disjoint, a path is the same
+    // as itself, the complete root or a shorter prefix contains what it narrows to, two bits are the same index exactly
+    // when their bindings agree and may otherwise overlap, and a bit may overlap with a half.
     let root = RegisterIrType::Reference(ReferenceType::new(RegisterType));
     let value = |atom: usize| ValueId::new(RegionId::new(0), AtomId::new(atom));
     let empty = ReferenceTransformPath::<RegisterTransform>::root();
@@ -2006,7 +2007,7 @@ fn test_downstream_view_description_overlap_and_batch() {
     assert!(matches!(
         RegisterTransform::Half(RegisterHalf::High).batch(&root, BatchAxis::new(0)),
         Err(BatchingError::UnsupportedOperation { message })
-            if message == "a register view cannot carry a mapped batch axis; registers have no axes",
+            if message == "a register transform cannot carry a mapped batch axis; registers have no axes",
     ));
 }
 
@@ -2196,9 +2197,9 @@ fn test_downstream_dynamic_view_discharges_through_a_value_bound_alias() {
         )
         .unwrap();
 
-    // Eager execution accesses the bit through the view path: `r = 0b101`, bit 1 was `0`, becomes `1`, and the register
-    // ends at `0b111`. Discharge into the eager destination reaches the same values through the value-bound alias,
-    // whose bit step the policy reads and writes with the family's bit operations.
+    // Eager execution accesses the bit through the transform path: `r = 0b101`, bit 1 was `0`, becomes `1`, and the
+    // register ends at `0b111`. Discharge into the eager destination reaches the same values through the value-bound
+    // alias, whose bit transform the policy reads and writes with the family's bit operations.
     let inputs = vec![RegisterValue::Register(5), RegisterValue::Register(1), RegisterValue::Register(1)];
     let expected = vec![RegisterValue::Register(0), RegisterValue::Register(1), RegisterValue::Register(7)];
     assert_eq!(source.interpret(inputs.clone()), Ok(expected.clone()));
@@ -2433,7 +2434,7 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         fn with_reference_access_transforms(
             &self,
             _input_index: usize,
-            _views: Vec<Self::Transform>,
+            _transforms: Vec<Self::Transform>,
         ) -> Result<Self, ProgramError> {
             Err(ProgramError::UnsupportedOperation {
                 message: "value-only operations have no reference accesses".to_string(),
@@ -2770,8 +2771,8 @@ fn test_downstream_lazy_bit_view_accesses_one_bit_of_its_root() {
     assert_eq!(root.read(), Ok(RegisterValue::Register(7)));
 }
 
-/// A downstream operation family that keeps the existing array type universe while owning its view metadata.
-mod custom_array_views {
+/// A downstream operation family that keeps the existing array type universe while owning its transform metadata.
+mod custom_array_transforms {
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -2819,7 +2820,7 @@ mod custom_array_views {
 
     impl BatchableReferenceTransform for CustomTransform {
         fn batch(&self, r#type: &ArrayIrType, axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
-            self.0.batch(r#type, axis).map(|(view, axis)| (Self(view), axis))
+            self.0.batch(r#type, axis).map(|(transform, axis)| (Self(transform), axis))
         }
     }
 
@@ -2832,17 +2833,18 @@ mod custom_array_views {
     }
 
     impl CustomOperation {
-        /// Converts metadata only at the eager execution boundary; staged accesses retain the downstream view type.
+        /// Converts metadata only at the eager execution boundary; staged accesses retain the downstream transform
+        /// type.
         fn builtin(&self) -> CoreOperation {
             match self {
                 Self::Core(operation) => operation.clone(),
                 Self::Read(operation) => CoreOperation::ReferenceRead(
                     ReferenceReadOperation::new()
-                        .with_transforms(operation.transforms().iter().map(|view| view.0.clone()).collect()),
+                        .with_transforms(operation.transforms().iter().map(|transform| transform.0.clone()).collect()),
                 ),
                 Self::AddUpdate(operation) => CoreOperation::ReferenceAddUpdate(
                     ReferenceAddUpdateOperation::new()
-                        .with_transforms(operation.transforms().iter().map(|view| view.0.clone()).collect()),
+                        .with_transforms(operation.transforms().iter().map(|transform| transform.0.clone()).collect()),
                 ),
             }
         }
@@ -2952,7 +2954,7 @@ mod custom_array_views {
                 }
                 _ if self.reference_access_descriptor(input).is_some() && transforms.is_empty() => Ok(self.clone()),
                 _ => Err(ProgramError::UnsupportedOperation {
-                    message: "custom operation cannot replace this view".to_owned(),
+                    message: "custom operation cannot replace these transforms".to_owned(),
                 }),
             }
         }
@@ -3008,7 +3010,7 @@ mod custom_array_views {
             ArrayReferenceDischarge::compose_transforms(
                 context,
                 alias,
-                &transforms.iter().map(|view| view.0.clone()).collect::<Vec<_>>(),
+                &transforms.iter().map(|transform| transform.0.clone()).collect::<Vec<_>>(),
                 bindings,
             )
         }

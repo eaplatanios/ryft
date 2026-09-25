@@ -1,4 +1,4 @@
-//! Scoped scratch allocation and masked memory access using canonical array types, views, and reference lifetimes.
+//! Scoped scratch allocation and masked memory access using canonical array types, transforms, and reference lifetimes.
 
 use std::borrow::Cow;
 use std::fmt::Display;
@@ -7,8 +7,8 @@ use std::sync::LazyLock;
 use thiserror::Error;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceTransform, ArraySliceAxis, ArrayType,
-    DataType, DimensionVariable,
+    Array, ArrayAddressing, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceTransform, ArraySliceAxis,
+    ArrayType, DataType, DimensionVariable,
 };
 use crate::contexts::{Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -16,7 +16,7 @@ use crate::macros::check_count;
 use crate::operations::references::render_reference_access;
 use crate::programs::{
     EffectClasses, Effects, Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect, ReferenceType, ReferenceTransform, RegionInterface,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceEffect, ReferenceTransform, ReferenceType, RegionInterface,
     Type, TypeError, TypeIdentityRenaming, Typed, infer_reference_view_type,
 };
 
@@ -123,13 +123,13 @@ impl Operation for ScratchOperation {
 pub const MASKED_LOAD_OPERATION_NAME: &str = "masked_load";
 
 /// Loads active reference lanes and returns `other` for inactive lanes.
-/// Base inputs are `(reference, mask, other)`, followed by the view bindings. The Boolean mask has the selected
+/// Base inputs are `(reference, mask, other)`, followed by the transform bindings. The Boolean mask has the selected
 /// referent's exact shape; the remaining array values have its exact type. Broadcasting and padding must be explicit.
 /// The reference itself must be valid: a mask does not authorize an out-of-bounds reference view, and inactive lanes
 /// never access storage.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaskedLoadOperation {
-    /// Refer to the documentation of [`Self::views`].
+    /// Refer to the documentation of [`Self::transforms`].
     transforms: Vec<ArrayReferenceTransform>,
 }
 
@@ -139,12 +139,12 @@ impl MaskedLoadOperation {
         Self::default()
     }
 
-    /// Returns the views applied to the reference input.
+    /// Returns the transforms applied to the reference input.
     pub fn transforms(&self) -> &[ArrayReferenceTransform] {
         &self.transforms
     }
 
-    /// Returns a copy with the provided views applied before the access.
+    /// Returns a copy with the provided transforms applied before the access.
     pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.transforms = transforms;
         self
@@ -204,7 +204,7 @@ impl ReferenceAccessOperation for MaskedLoadOperation {
         (input_index == 0).then(|| {
             ReferenceAccessDescriptor::new(
                 &self.transforms,
-                3..3 + self.transforms.iter().map(|view| view.binding_count()).sum::<usize>(),
+                3..3 + self.transforms.iter().map(|transform| transform.binding_count()).sum::<usize>(),
             )
         })
     }
@@ -248,13 +248,13 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<Array
 pub const MASKED_STORE_OPERATION_NAME: &str = "masked_store";
 
 /// Writes active reference lanes, preserving every inactive lane.
-/// Base inputs are `(reference, value, mask)`, followed by the view bindings. The Boolean mask has the selected
+/// Base inputs are `(reference, value, mask)`, followed by the transform bindings. The Boolean mask has the selected
 /// referent's exact shape; the remaining array values have its exact type. Broadcasting and padding must be explicit.
 /// The reference itself must be valid: a mask does not authorize an out-of-bounds reference view, and inactive lanes
 /// never access storage.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaskedStoreOperation {
-    /// Refer to the documentation of [`Self::views`].
+    /// Refer to the documentation of [`Self::transforms`].
     transforms: Vec<ArrayReferenceTransform>,
 }
 
@@ -264,12 +264,12 @@ impl MaskedStoreOperation {
         Self::default()
     }
 
-    /// Returns the views applied to the reference input.
+    /// Returns the transforms applied to the reference input.
     pub fn transforms(&self) -> &[ArrayReferenceTransform] {
         &self.transforms
     }
 
-    /// Returns a copy with the provided views applied before the access.
+    /// Returns a copy with the provided transforms applied before the access.
     pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.transforms = transforms;
         self
@@ -328,7 +328,7 @@ impl ReferenceAccessOperation for MaskedStoreOperation {
         (input_index == 0).then(|| {
             ReferenceAccessDescriptor::new(
                 &self.transforms,
-                3..3 + self.transforms.iter().map(|view| view.binding_count()).sum::<usize>(),
+                3..3 + self.transforms.iter().map(|transform| transform.binding_count()).sum::<usize>(),
             )
         })
     }
@@ -372,13 +372,13 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<EagerContext<Array
 pub const MASKED_SWAP_OPERATION_NAME: &str = "masked_swap";
 
 /// Replaces active reference lanes and returns their old values, using `other` for inactive lanes.
-/// Base inputs are `(reference, value, mask, other)`, followed by the view bindings. The Boolean mask has the
+/// Base inputs are `(reference, value, mask, other)`, followed by the transform bindings. The Boolean mask has the
 /// selected referent's exact shape; the remaining array values have its exact type. Broadcasting and padding must be
 /// explicit. The reference itself must be valid: a mask does not authorize an out-of-bounds reference view, and
 /// inactive lanes never access storage.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaskedSwapOperation {
-    /// Refer to the documentation of [`Self::views`].
+    /// Refer to the documentation of [`Self::transforms`].
     transforms: Vec<ArrayReferenceTransform>,
 }
 
@@ -388,12 +388,12 @@ impl MaskedSwapOperation {
         Self::default()
     }
 
-    /// Returns the views applied to the reference input.
+    /// Returns the transforms applied to the reference input.
     pub fn transforms(&self) -> &[ArrayReferenceTransform] {
         &self.transforms
     }
 
-    /// Returns a copy with the provided views applied before the access.
+    /// Returns a copy with the provided transforms applied before the access.
     pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.transforms = transforms;
         self
@@ -418,8 +418,14 @@ impl Operation for MaskedSwapOperation {
         input_types: &[ArrayIrType],
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
-        let referent =
-            validate_masked_types(input_types, region_interfaces, 4, 2, &self.transforms, ReferenceAccessMode::ReadWrite)?;
+        let referent = validate_masked_types(
+            input_types,
+            region_interfaces,
+            4,
+            2,
+            &self.transforms,
+            ReferenceAccessMode::ReadWrite,
+        )?;
         Ok(vec![referent.into()])
     }
 
@@ -453,7 +459,7 @@ impl ReferenceAccessOperation for MaskedSwapOperation {
         (input_index == 0).then(|| {
             ReferenceAccessDescriptor::new(
                 &self.transforms,
-                4..4 + self.transforms.iter().map(|view| view.binding_count()).sum::<usize>(),
+                4..4 + self.transforms.iter().map(|transform| transform.binding_count()).sum::<usize>(),
             )
         })
     }
@@ -504,7 +510,7 @@ pub const ASYNC_COPY_OPERATION_NAME: &str = "async_copy";
 /// Starts copying the first reference's selected elements into the second reference. Shapes, element types, and
 /// sharding must match exactly, while canonical layouts and memory placement may differ. The returned scalar token
 /// reference is a scoped completion resource: only [`WaitOperation`] may consume it, in the same region as this
-/// operation. Source view bindings trail the two references, followed by destination view bindings.
+/// operation. Source transform bindings trail the two references, followed by destination transform bindings.
 ///
 /// Until that wait, the source may be read but not changed and the destination may not be accessed. Destination
 /// initialization becomes available only after the wait. Qualification rejects overlapping source and destination
@@ -525,23 +531,23 @@ impl AsyncCopyOperation {
         Self::default()
     }
 
-    /// Returns the views applied to the source reference.
+    /// Returns the transforms applied to the source reference.
     pub fn source_transforms(&self) -> &[ArrayReferenceTransform] {
         &self.source_transforms
     }
 
-    /// Returns the views applied to the destination reference.
+    /// Returns the transforms applied to the destination reference.
     pub fn destination_transforms(&self) -> &[ArrayReferenceTransform] {
         &self.destination_transforms
     }
 
-    /// Returns a copy with the provided views applied to the source reference.
+    /// Returns a copy with the provided transforms applied to the source reference.
     pub fn with_source_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.source_transforms = transforms;
         self
     }
 
-    /// Returns a copy with the provided views applied to the destination reference.
+    /// Returns a copy with the provided transforms applied to the destination reference.
     pub fn with_destination_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.destination_transforms = transforms;
         self
@@ -566,8 +572,9 @@ impl Operation for AsyncCopyOperation {
         input_types: &[ArrayIrType],
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
-        let source_count = self.source_transforms.iter().map(|view| view.binding_count()).sum::<usize>();
-        let destination_count = self.destination_transforms.iter().map(|view| view.binding_count()).sum::<usize>();
+        let source_count = self.source_transforms.iter().map(|transform| transform.binding_count()).sum::<usize>();
+        let destination_count =
+            self.destination_transforms.iter().map(|transform| transform.binding_count()).sum::<usize>();
         check_count!("input", input_types, 2 + source_count + destination_count, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let source = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
@@ -647,12 +654,14 @@ impl ReferenceAccessOperation for AsyncCopyOperation {
         &self,
         input_index: usize,
     ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
-        let source_end = 2 + self.source_transforms.iter().map(|view| view.binding_count()).sum::<usize>();
+        let source_end = 2 + self.source_transforms.iter().map(|transform| transform.binding_count()).sum::<usize>();
         match input_index {
             0 => Some(ReferenceAccessDescriptor::new(&self.source_transforms, 2..source_end)),
             1 => Some(ReferenceAccessDescriptor::new(
                 &self.destination_transforms,
-                source_end..source_end + self.destination_transforms.iter().map(|view| view.binding_count()).sum::<usize>(),
+                source_end
+                    ..source_end
+                        + self.destination_transforms.iter().map(|transform| transform.binding_count()).sum::<usize>(),
             )),
             _ => None,
         }
@@ -753,7 +762,7 @@ fn validate_masked_types(
     transforms: &[ArrayReferenceTransform],
     mode: ReferenceAccessMode,
 ) -> Result<ArrayType, TypeError> {
-    let binding_count = transforms.iter().map(|view| view.binding_count()).sum::<usize>();
+    let binding_count = transforms.iter().map(|transform| transform.binding_count()).sum::<usize>();
     check_count!("input", input_types, input_count + binding_count, TypeError);
     check_count!("region", region_interfaces, 0, TypeError);
     let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
@@ -1070,8 +1079,10 @@ mod tests {
     #[test]
     fn test_masked_store_operation_render() {
         assert_eq!(MaskedStoreOperation::new().to_string(), "masked_store");
-        let operation = MaskedStoreOperation::new()
-            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Static(2) }]);
+        let operation = MaskedStoreOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+            axis: 1,
+            index: ArrayReferenceTransformIndex::Static(2),
+        }]);
         assert_eq!(operation.to_string(), "masked_store [transforms=[index(axis=1, index=2)]]");
     }
 
@@ -1144,8 +1155,10 @@ mod tests {
     #[test]
     fn test_masked_swap_operation_render() {
         assert_eq!(MaskedSwapOperation::new().to_string(), "masked_swap");
-        let operation = MaskedSwapOperation::new()
-            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }]);
+        let operation = MaskedSwapOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+            axis: 0,
+            index: ArrayReferenceTransformIndex::Dynamic,
+        }]);
         assert_eq!(operation.to_string(), "masked_swap [transforms=[dynamic_index(axis=0)]]");
     }
 
@@ -1185,8 +1198,10 @@ mod tests {
     fn test_masked_swap_operation_interpret_transforms() {
         let context = EagerContext::<ArrayIrValue<Array>, KernelOperation>::new();
         let reference = ArrayReference::new(Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap());
-        let operation = MaskedSwapOperation::new()
-            .with_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }]);
+        let operation = MaskedSwapOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+            axis: 0,
+            index: ArrayReferenceTransformIndex::Dynamic,
+        }]);
         assert_eq!(
             context.bind(
                 operation,
@@ -1223,8 +1238,9 @@ mod tests {
     #[test]
     fn test_async_copy_operation_with_destination_transforms() {
         let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
-        let operation =
-            AsyncCopyOperation::new().with_source_transforms(transforms.clone()).with_destination_transforms(transforms.clone());
+        let operation = AsyncCopyOperation::new()
+            .with_source_transforms(transforms.clone())
+            .with_destination_transforms(transforms.clone());
         assert_eq!(operation.destination_transforms(), transforms);
         assert_eq!(operation.reference_access_descriptor(1).unwrap().bindings(), 3..4);
         let replaced = operation.with_reference_access_transforms(0, vec![]).unwrap();
@@ -1256,8 +1272,13 @@ mod tests {
     #[test]
     fn test_async_copy_operation_infer_output_types_transforms() {
         let operation = AsyncCopyOperation::new()
-            .with_source_transforms(vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }])
-            .with_destination_transforms(vec![ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] }]);
+            .with_source_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic,
+            }])
+            .with_destination_transforms(vec![ArrayReferenceTransform::Slice {
+                axes: vec![ArraySliceAxis::new(1, 3, 1)],
+            }]);
         let inputs = vec![
             ReferenceType::new(ArrayType::new_static(DataType::I32, [2, 3])).into(),
             ReferenceType::new(ArrayType::new_static(DataType::I32, [5])).into(),
@@ -1294,7 +1315,10 @@ mod tests {
 
         // Long metadata wraps one field per line, indented relative to the owning instruction.
         assert_eq!(
-            AsyncCopyOperation::new().with_source_transforms(source).with_destination_transforms(destination).to_string(),
+            AsyncCopyOperation::new()
+                .with_source_transforms(source)
+                .with_destination_transforms(destination)
+                .to_string(),
             indoc! {"
                 async_copy [
                     source_transforms=[dynamic_index(axis=0)],

@@ -119,7 +119,7 @@ fn tma_error(reason: &str) -> Error {
 }
 
 /// Rejects instructions whose cooperative lowering would rendezvous before pending copies have been completed.
-/// Pure dimension arithmetic and view construction may occur between issue and wait; copying itself also remains
+/// Pure dimension arithmetic and transform application may occur between issue and wait; copying itself also remains
 /// asynchronous. This conservative baseline deliberately excludes overlapping unrelated cooperative array work.
 pub(super) fn validate_async_copies<'o, Extension: 'o + KernelExtension>(
     operations: impl IntoIterator<Item = &'o KernelOperation<Extension>>,
@@ -180,14 +180,14 @@ impl<'c, 't> Lowering<'c, 't> {
         }
         for reference in [source, destination] {
             let root_shape = reference.buffer.r#type.static_shape().unwrap();
-            let full_view = ArrayReferenceTransform::Slice {
+            let full_transform = ArrayReferenceTransform::Slice {
                 axes: root_shape.dimensions().iter().map(|extent| ArraySliceAxis::new(0, *extent, 1)).collect(),
             };
             let expected_strides = (0..reference.shape.len())
                 .map(|axis| reference.shape[axis + 1..].iter().product::<usize>())
                 .collect::<Vec<_>>();
             if reference.shape != root_shape.dimensions()
-                || reference.static_transform.as_ref() != Some(&full_view)
+                || reference.static_transform.as_ref() != Some(&full_transform)
                 || reference.strides != expected_strides
                 || reference.predicate.is_some()
             {
@@ -210,13 +210,13 @@ impl<'c, 't> Lowering<'c, 't> {
                     axes[axis] = ArraySliceAxis::new(remaining % source.shape[axis], 1, 1);
                     remaining /= source.shape[axis];
                 }
-                let view = ArrayReferenceTransform::Slice { axes };
+                let transform = ArrayReferenceTransform::Slice { axes };
                 self.record_synchronization(
                     None,
                     thread,
                     SynchronizationEvent::AsyncCopy {
-                        source: (source.buffer.owner, view.clone()),
-                        destination: (destination.buffer.owner, view),
+                        source: (source.buffer.owner, transform.clone()),
+                        destination: (destination.buffer.owner, transform),
                     },
                 )?;
             }

@@ -166,7 +166,8 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
                         instruction.operation().name(),
                     ))
                 })?;
-                let mut transforms = vec![ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(0) }];
+                let mut transforms =
+                    vec![ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(0) }];
                 transforms.extend_from_slice(descriptor.transforms());
                 let bindings = rewritten.inputs()[descriptor.bindings()].to_vec();
                 rewritten = rewrite_reference_access_transforms(&rewritten, input_index, transforms, bindings)
@@ -365,7 +366,10 @@ mod tests {
         let operation = batched.body().instructions()[0].operation();
         assert_eq!(
             operation.reference_access_descriptor(0).unwrap().transforms(),
-            &[ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }, selection.clone(),],
+            &[
+                ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) },
+                selection.clone(),
+            ],
         );
         assert_eq!(
             operation.reference_access_descriptor(1).unwrap().transforms(),

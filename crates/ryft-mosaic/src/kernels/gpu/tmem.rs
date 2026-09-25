@@ -357,7 +357,10 @@ impl ReferenceAccessOperation for TmemOperation {
         }
     }
 
-    fn reference_access_descriptor(&self, input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+    fn reference_access_descriptor(
+        &self,
+        input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
         // Tensor-memory accesses take whole references, so every access has an empty path and no bindings.
         let count = self.base_input_count();
         self.effects()
@@ -366,7 +369,11 @@ impl ReferenceAccessOperation for TmemOperation {
             .then(|| ReferenceAccessDescriptor::new(&[], count..count))
     }
 
-    fn with_reference_access_transforms(&self, input_index: usize, transforms: Vec<Self::Transform>) -> Result<Self, ProgramError> {
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<Self::Transform>,
+    ) -> Result<Self, ProgramError> {
         if transforms.is_empty() && self.reference_access_descriptor(input_index).is_some() {
             return Ok(*self);
         }

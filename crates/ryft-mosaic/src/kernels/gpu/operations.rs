@@ -5,8 +5,9 @@ use std::fmt::{Display, Formatter};
 
 use ryft_core::kernels::{KernelExtension, KernelExtensionMemory, NoKernelExtension};
 use ryft_core::{
-    ArrayIrType, ArrayReferenceTransform, ArrayType, DataType, DotOperation, EffectClass, EffectClasses, Effects, Operation,
-    OperationFormatter, ProgramError, ReferenceAccessDescriptor, ReferenceAccessOperation, RegionInterface, TypeError,
+    ArrayIrType, ArrayReferenceTransform, ArrayType, DataType, DotOperation, EffectClass, EffectClasses, Effects,
+    Operation, OperationFormatter, ProgramError, ReferenceAccessDescriptor, ReferenceAccessOperation, RegionInterface,
+    TypeError,
 };
 
 use crate::kernels::gpu::tmem::TmemOperation;
@@ -221,16 +222,25 @@ impl ReferenceAccessOperation for GpuOperation {
         }
     }
 
-    fn reference_access_descriptor(&self, input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+    fn reference_access_descriptor(
+        &self,
+        input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
         match self {
             Self::Tmem(operation) => operation.reference_access_descriptor(input_index),
             _ => None,
         }
     }
 
-    fn with_reference_access_transforms(&self, input_index: usize, transforms: Vec<Self::Transform>) -> Result<Self, ProgramError> {
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<Self::Transform>,
+    ) -> Result<Self, ProgramError> {
         match self {
-            Self::Tmem(operation) => operation.with_reference_access_transforms(input_index, transforms).map(Self::Tmem),
+            Self::Tmem(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::Tmem)
+            }
             _ => Err(ProgramError::UnsupportedOperation {
                 message: "GPU array operations have no reference inputs".to_owned(),
             }),

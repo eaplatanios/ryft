@@ -91,18 +91,25 @@ impl ReferenceAccessOperation for XlaKernelExtension {
         }
     }
 
-    fn reference_access_descriptor(&self, _input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+    fn reference_access_descriptor(
+        &self,
+        _input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
             Self::Mosaic(ref operation) => operation.reference_access_descriptor(_input_index),
         }
     }
 
-    fn with_reference_access_transforms(&self, _input_index: usize, _views: Vec<Self::Transform>) -> Result<Self, ProgramError> {
+    fn with_reference_access_transforms(
+        &self,
+        _input_index: usize,
+        _transforms: Vec<Self::Transform>,
+    ) -> Result<Self, ProgramError> {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
             Self::Mosaic(ref operation) => {
-                operation.with_reference_access_transforms(_input_index, _views).map(Self::Mosaic)
+                operation.with_reference_access_transforms(_input_index, _transforms).map(Self::Mosaic)
             }
         }
     }

@@ -437,16 +437,16 @@ where
     /// Unresolved whole-array reference allocation retained until reference discharge.
     ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
 
-    /// Unresolved read through an optional folded view path retained until reference discharge.
+    /// Unresolved read through an optional folded transform path retained until reference discharge.
     ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Unresolved write-only replacement through an optional folded view path retained until reference discharge.
+    /// Unresolved write-only replacement through an optional folded transform path retained until reference discharge.
     ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Unresolved replacement through an optional folded view path retained until reference discharge.
+    /// Unresolved replacement through an optional folded transform path retained until reference discharge.
     ReferenceSwap(ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Unresolved additive update through an optional folded view path retained until reference discharge.
+    /// Unresolved additive update through an optional folded transform path retained until reference discharge.
     ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
     /// Unresolved atomic additive update retained until sequential reference discharge or a supporting kernel lowering.
@@ -549,7 +549,10 @@ where
         }
     }
 
-    fn reference_access_descriptor(&self, input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+    fn reference_access_descriptor(
+        &self,
+        input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
         match self {
             Self::Kernel(operation) => operation.operation().reference_access_descriptor(input_index),
             Self::ReferenceRead(operation) => operation.reference_access_descriptor(input_index),
@@ -562,7 +565,11 @@ where
         }
     }
 
-    fn with_reference_access_transforms(&self, input_index: usize, transforms: Vec<Self::Transform>) -> Result<Self, ProgramError> {
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<Self::Transform>,
+    ) -> Result<Self, ProgramError> {
         match self {
             Self::Kernel(operation) => operation
                 .operation()
@@ -580,12 +587,12 @@ where
             Self::ReferenceAddUpdate(operation) => {
                 operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceAddUpdate)
             }
-            Self::ReferenceAtomicAddUpdate(operation) => {
-                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceAtomicAddUpdate)
-            }
+            Self::ReferenceAtomicAddUpdate(operation) => operation
+                .with_reference_access_transforms(input_index, transforms)
+                .map(Self::ReferenceAtomicAddUpdate),
             Self::ReferenceFreeze(_) if input_index == 0 && transforms.is_empty() => Ok(self.clone()),
             _ => Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` cannot replace the reference view at input {input_index}", self.name()),
+                message: format!("`{}` cannot replace the reference transforms at input {input_index}", self.name()),
             }),
         }
     }
@@ -2073,11 +2080,12 @@ mod tests {
 
     #[test]
     fn test_xla_operation_reference_access_descriptor() {
-        let view = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let operation =
-            XlaOperation::<XlaConstant>::ReferenceRead(ReferenceReadOperation::new().with_transforms(vec![view.clone()]));
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let operation = XlaOperation::<XlaConstant>::ReferenceRead(
+            ReferenceReadOperation::new().with_transforms(vec![transform.clone()]),
+        );
         let descriptor = operation.reference_access_descriptor(0).unwrap();
-        assert_eq!(descriptor.transforms(), &[view]);
+        assert_eq!(descriptor.transforms(), &[transform]);
         assert_eq!(descriptor.bindings(), 1..2);
         assert_eq!(operation.reference_access_descriptor(1), None);
         let root = ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])).into();

@@ -11,8 +11,8 @@ use std::fmt::{Display, Write};
 use thiserror::Error;
 
 use crate::arrays::{
-    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArraySliceAxis, ArrayType,
-    ArrayTypeRefinements, Dimension, DimensionBounds, DimensionType, DimensionVariable,
+    Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArraySliceAxis,
+    ArrayType, ArrayTypeRefinements, Dimension, DimensionBounds, DimensionType, DimensionVariable,
 };
 use crate::contexts::EagerContext;
 use crate::kernels::grids::{Grid, GridError, GridExecution};
@@ -112,13 +112,13 @@ pub struct KernelParameter {
     /// Pure grid-to-window mapping and explicit boundary policy.
     mapping: BlockMapping,
 
-    /// Canonical reference type derived from the full array and logical block by the array view implementation.
+    /// Canonical reference type derived from the full array and logical block by the array slice transform rules.
     body_type: ArrayIrType,
 }
 
 impl KernelParameter {
     /// Creates a parameter whose block rank agrees with its full array rank. The reference type is derived by the
-    /// canonical array slice/view rules, preserving whole-window layout and validating partial-window sharding.
+    /// canonical array slice transform rules, preserving whole-window layout and validating partial-window sharding.
     /// Masked windows have a fixed logical block type derived by slicing the valid origin window and applying the
     /// canonical padding type rules. Their private tile storage has no required physical layout. Invalid lanes are
     /// accessible only through masked memory operations with an explicit fallback; padding does not initialize them.
@@ -139,10 +139,10 @@ impl KernelParameter {
                 .zip(shape.dimensions())
                 .map(|(&block, &extent)| block.min(extent))
                 .collect::<Vec<_>>();
-            let view = ArrayReferenceTransform::Slice {
+            let transform = ArrayReferenceTransform::Slice {
                 axes: valid_shape.iter().map(|&extent| ArraySliceAxis::new(0, extent, 1)).collect(),
             };
-            let valid_type = view.output_type(&r#type)?;
+            let valid_type = transform.output_type(&r#type)?;
             let padding = PadOperation::<ArrayType>::new(
                 vec![0; r#type.rank()],
                 mapping
@@ -161,10 +161,10 @@ impl KernelParameter {
                 .remove(0)
                 .with_layout(None)
         } else {
-            let view = ArrayReferenceTransform::Slice {
+            let transform = ArrayReferenceTransform::Slice {
                 axes: mapping.block_shape().iter().map(|&extent| ArraySliceAxis::new(0, extent, 1)).collect(),
             };
-            view.output_type(&r#type)?
+            transform.output_type(&r#type)?
         };
         let body_type = ArrayIrType::Reference(ReferenceType::new(referent));
         Ok(Self { r#type, access, mapping, body_type })
@@ -1488,10 +1488,11 @@ mod tests {
             BlockMapping::new(program, vec![1, 3], BoundaryPolicy::InBounds).unwrap(),
         )
         .unwrap();
-        let view = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)] };
+        let transform =
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)] };
         assert_eq!(
             partial.body_type(),
-            ArrayIrType::Reference(ReferenceType::new(view.output_type(&full_type).unwrap()))
+            ArrayIrType::Reference(ReferenceType::new(transform.output_type(&full_type).unwrap()))
         );
     }
 
@@ -2216,7 +2217,7 @@ mod tests {
         fn with_reference_access_transforms(
             &self,
             _input_index: usize,
-            _views: Vec<ArrayReferenceTransform>,
+            _transforms: Vec<ArrayReferenceTransform>,
         ) -> Result<Self, ProgramError> {
             Err(ProgramError::UnsupportedOperation { message: "hidden extension has no reference accesses".to_owned() })
         }
