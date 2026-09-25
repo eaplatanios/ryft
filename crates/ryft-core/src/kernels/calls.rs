@@ -1029,6 +1029,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Iota(_)
                 | ArrayOperation::Min(_)
                 | ArrayOperation::Max(_)
+                | ArrayOperation::Clamp(_)
                 | ArrayOperation::Neg(_)
                 | ArrayOperation::Add(_)
                 | ArrayOperation::Sub(_)

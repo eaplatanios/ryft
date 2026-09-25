@@ -76,7 +76,10 @@ pub use exponential::{
     LOGISTIC_OPERATION_NAME, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
     LogisticOperation,
 };
-pub use extrema::{Clamp, MAX_OPERATION_NAME, MIN_OPERATION_NAME, Max, MaxOperation, Min, MinOperation};
+pub use extrema::{
+    CLAMP_OPERATION_NAME, Clamp, ClampOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, Max, MaxOperation, Min,
+    MinOperation,
+};
 pub use logical::*;
 pub use manipulation::*;
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};

@@ -399,6 +399,7 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
+    use crate::operations::constants::one_like::OneLikeOperation;
     use crate::operations::manipulation::conversions::ConvertElementType;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypeError, Typed};
@@ -920,6 +921,30 @@ mod tests {
     }
 
     #[test]
+    fn test_atan2_differentiation_second_derivative() {
+        // The normalization scale must cancel even when differentiating at a tie in its maximum.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(Atan2Operation::new(), Vec::new(), vec![input, one], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let outputs = program
+            .jvp()
+            .unwrap()
+            .jvp()
+            .unwrap()
+            .interpret(vec![
+                Array::scalar(1.0f64).unwrap(),
+                Array::scalar(1.0f64).unwrap(),
+                Array::scalar(1.0f64).unwrap(),
+                Array::scalar(0.0f64).unwrap(),
+            ])
+            .unwrap();
+        assert_eq!(outputs[3], Array::scalar(-0.5f64).unwrap());
+    }
+
+    #[test]
     fn test_atan2_differentiation_complex() {
         let y = ComplexNumber::new(0.7f64, -0.2);
         let x = ComplexNumber::new(-0.3f64, 0.4);
@@ -1102,10 +1127,24 @@ mod tests {
     #[test]
     fn test_tanh_differentiation_near_zero_and_saturation() {
         // A plain factored coefficient loses this small second derivative by subtracting nearly equal terms.
-        let second = differentiate_at(Array::scalar(1e-20f64).unwrap())
-            .gradient(|input| differentiate_at(input).gradient(|input| input.tanh()).map_err(Into::into))
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(TanhOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let outputs = program
+            .jvp()
+            .unwrap()
+            .jvp()
+            .unwrap()
+            .interpret(vec![
+                Array::scalar(1e-20f64).unwrap(),
+                Array::scalar(1.0f64).unwrap(),
+                Array::scalar(1.0f64).unwrap(),
+                Array::scalar(0.0f64).unwrap(),
+            ])
             .unwrap();
-        assert_abs_diff_eq!(second.elements::<f64>().unwrap()[0] / -2e-20, 1.0, epsilon = 1e-15);
+        assert_abs_diff_eq!(outputs[3].elements::<f64>().unwrap()[0] / -2e-20, 1.0, epsilon = 1e-15);
         let (_, tangent) = differentiate_at(Array::scalar(f16::from_f32(3.0)).unwrap())
             .jvp(Array::scalar(f16::from_f32(1.0)).unwrap(), |input| input.tanh())
             .unwrap();

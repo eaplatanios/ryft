@@ -37,8 +37,8 @@ use crate::kernels::memory::{
 use crate::kernels::operations::KernelOperation;
 use crate::kernels::validation::KernelParameterAccess;
 use crate::operations::{
-    AbsOperation, AddOperation, AndOperation, CompareOperation, ComparisonDirection, ConditionOperation,
-    ConstantOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
+    AbsOperation, AddOperation, AndOperation, ClampOperation, CompareOperation, ComparisonDirection,
+    ConditionOperation, ConstantOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
     DimensionMulOperation, DimensionRemOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
     DotDimensionNumbers, DotOperation, ExpOperation, LogOperation, MaxOperation, MinOperation, MulOperation,
     NegOperation, NotOperation, OrOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
@@ -450,6 +450,7 @@ enum WireOperation {
     Abs,
     Min,
     Max,
+    Clamp,
     Exp,
     Log,
     Sqrt,
@@ -774,6 +775,7 @@ impl Encoder {
                     ArrayOperation::Abs(_) => WireOperation::Abs,
                     ArrayOperation::Min(_) => WireOperation::Min,
                     ArrayOperation::Max(_) => WireOperation::Max,
+                    ArrayOperation::Clamp(_) => WireOperation::Clamp,
                     ArrayOperation::Exp(_) => WireOperation::Exp,
                     ArrayOperation::Log(_) => WireOperation::Log,
                     ArrayOperation::Sqrt(_) => WireOperation::Sqrt,
@@ -1051,6 +1053,7 @@ impl Decoder {
             WireOperation::Abs => ArrayIrOperation::Array(ArrayOperation::Abs(AbsOperation::new())).into(),
             WireOperation::Min => ArrayIrOperation::Array(ArrayOperation::Min(MinOperation::new())).into(),
             WireOperation::Max => ArrayIrOperation::Array(ArrayOperation::Max(MaxOperation::new())).into(),
+            WireOperation::Clamp => ArrayIrOperation::Array(ArrayOperation::Clamp(ClampOperation::new())).into(),
             WireOperation::Exp => ArrayIrOperation::Array(ArrayOperation::Exp(ExpOperation::new())).into(),
             WireOperation::Log => ArrayIrOperation::Array(ArrayOperation::Log(LogOperation::new())).into(),
             WireOperation::Sqrt => ArrayIrOperation::Array(ArrayOperation::Sqrt(SqrtOperation::new())).into(),
