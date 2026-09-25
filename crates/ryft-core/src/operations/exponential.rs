@@ -5,16 +5,15 @@
 //!
 //!   - [`Exp`] and [`Log`] compute the natural exponential and logarithm (i.e., `x ↦ eˣ` and `x ↦ ln(x)`, with the
 //!     principal branch of the logarithm for complex values).
-//!   - [`Ln1p`] computes `log(1 + x)` as a single operation, which keeps full relative accuracy for inputs near zero.
-//!   - [`LogAddExp`] computes `log(exp(a) + exp(b))` without forming either exponential, so that it cannot overflow.
+//!   - [`Ln1p`] computes `ln(1 + x)` accurately near zero.
+//!   - [`LogAddExp`] computes `log(exp(a) + exp(b))` without forming potentially overflowing exponentials.
 //!   - [`Logistic`] computes the logistic sigmoid (i.e., `x ↦ 1 / (1 + e^{-x})`).
 //!
-//! [`Exp`], [`Log`], and [`Logistic`] support floating-point and complex values, same as StableHLO's
-//! [`exponential`](https://openxla.org/stablehlo/spec#exponential), [`log`](https://openxla.org/stablehlo/spec#log),
-//! and [`logistic`](https://openxla.org/stablehlo/spec#logistic), whereas [`Ln1p`] and [`LogAddExp`] support only
-//! real floating-point values. Unary operations preserve the metadata of their input, and [`LogAddExp`] promotes the
-//! element types and broadcasts the shapes of its inputs. Inputs that carry partial sums over unreduced mesh axes are
-//! rejected. Every operation is nonlinear, so reverse-mode differentiation transposes its linearization instead.
+//! All operations support real floating-point and complex inputs. Complex logarithms use principal branches.
+//! Unary operations preserve input metadata. [`LogAddExp`] promotes element types and broadcasts shapes. Its
+//! low-precision real inputs use `f32` intermediates before conversion back to the output type. Inputs that carry
+//! partial sums over unreduced mesh axes are rejected. These operations are nonlinear, so reverse-mode
+//! differentiation transposes their linearizations.
 //!
 //! # Examples
 //!
@@ -27,7 +26,7 @@
 //! # }
 //! ```
 
-use crate::arrays::{DataType, FloatingPointArrayElement, RealFloatingPointArrayElement};
+use crate::arrays::{DataType, FloatingPointArrayElement};
 use crate::differentiation::{
     DifferentiableType, DifferentiationDual, DifferentiationError, ElementwiseDerivativeAlignment,
 };
@@ -35,11 +34,14 @@ use crate::macros::{
     check_count, define_elementwise_capability, define_elementwise_operation, impl_array_elementwise_operation,
     impl_differentiable_elementwise_operation, impl_differentiable_operation,
 };
+use crate::operations::arithmetic::{Add, Div, Mul, Sub};
 use crate::operations::comparisons::{Compare, ComparisonDirection};
+use crate::operations::complex::Real;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
+use crate::operations::logical::And;
 use crate::programs::{MaybeZero, ProgramError, Type, Typed, Value};
 
 /// Canonical operation name for [`ExpOperation`].
@@ -61,8 +63,8 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @unary
     ExpOperation,
-    jvp<C> where C::Value: std::ops::Mul<Output = C::Value> {
-        |(_, input_tangent) -> output| output * input_tangent
+    jvp<C> where C::Value: Mul {
+        |(_, input_tangent) -> output| output.mul(&input_tangent)?
     },
     transpose = @nonlinear,
 }
@@ -122,8 +124,8 @@ define_elementwise_operation!(
 impl_differentiable_elementwise_operation! {
     @unary
     LogOperation,
-    jvp<C> where C::Value: std::ops::Div<Output = C::Value> {
-        |(input, input_tangent)| input_tangent / input
+    jvp<C> where C::Value: Div {
+        |(input, input_tangent)| input_tangent.div(&input)?
     },
     transpose = @nonlinear,
 }
@@ -169,23 +171,16 @@ pub const LN_1P_OPERATION_NAME: &str = "ln_1p";
 
 define_elementwise_operation!(
     @unary
-    /// [`Operation`](crate::Operation) that computes the elementwise natural logarithm of one plus its input (i.e.,
-    /// `x ↦ log(1 + x)`) while preserving its array metadata. The name matches the canonical mathematical spelling that
-    /// Rust's own [`f64::ln_1p`] uses.
-    ///
-    /// The point of the primitive is accuracy near zero. Evaluating `log(1 + x)` by first forming `1 + x` loses every
-    /// bit of `x` below the precision of one, so a small `x` returns a result whose relative error grows without bound
-    /// as `x` shrinks. Computing the composition as a single operation keeps full relative accuracy there, which is why
-    /// `ln_1p` is the form used by log-likelihood and log-probability code.
-    ///
-    /// Only real floating-point inputs are supported, and inputs that still carry partial sums are rejected. The
-    /// complex logarithm needs a different construction (i.e., a principal branch and a separate accurate magnitude
-    /// near `-1`), and that is construction is not currently supported here.
+    /// [`Operation`](crate::Operation) that computes `ln(1 + x)` elementwise while retaining accuracy near zero
+    /// and preserving input metadata. Real inputs below `-1` produce NaN, and `-1` produces negative infinity,
+    /// subject to the output format's representation. Complex inputs use the principal logarithm of `1 + x`,
+    /// with a branch cut on the real axis below `-1` and signed imaginary zeros selecting the side of the cut.
+    /// Only floating-point and complex inputs are supported; inputs that carry partial sums are rejected.
     Ln1pOperation,
     LN_1P_OPERATION_NAME,
     Ln1p,
     ln_1p,
-    check_data_types = [@float @real],
+    check_data_types = [@float],
     check_array_types = [@no_unreduced],
 );
 
@@ -194,21 +189,22 @@ impl_differentiable_elementwise_operation! {
     Ln1pOperation,
     jvp<C>
     where
-        C::Value: OneLike + std::ops::Add<Output = C::Value> + std::ops::Div<Output = C::Value>,
+        C::Value: OneLike + Add + Div,
     {
-        // `d(ln_1p(x)) = dx / (1 + x)`. The denominator is formed from the aligned input primal so that it carries the
-        // tangent's element data type, and `one_like` supplies the one at exactly that type.
-        |(input, input_tangent)| input_tangent / (input.one_like()? + input)
+        // `d(ln_1p(x)) = dx / (1 + x)`. The denominator is formed from the aligned input primal so that it carries
+        // the tangent's element data type, and `one_like` supplies the one at exactly that type.
+        |(input, input_tangent)| input_tangent.div(&input.one_like()?.add(&input)?)?
     },
     transpose = @nonlinear,
 }
 
 define_elementwise_capability!(
     @unary
-    /// Represents the ability to compute elementwise `log(1 + input)` accurately near zero. Concrete arrays compute
+    /// Represents the ability to compute elementwise `ln(1 + input)` accurately near zero. Concrete arrays compute
     /// immediately while context-carrying values apply [`Ln1pOperation`] through their context.
     Ln1p,
-    /// Computes `log(1 + input)` for each real floating-point element, retaining accuracy near zero. Returns an error
+    /// Computes `ln(1 + input)` elementwise, retaining accuracy near zero and using the principal branch for complex
+    /// inputs. Returns an error
     /// if the input types or metadata are unsupported.
     ln_1p,
     Ln1pOperation,
@@ -219,9 +215,9 @@ impl_array_elementwise_operation!(
     Ln1p,
     ln_1p,
     operation = "ln_1p",
-    inputs = @float @real,
+    inputs = @float,
     checks = [@no_unreduced],
-    |input| RealFloatingPointArrayElement::ln_1p(input),
+    |input| FloatingPointArrayElement::ln_1p(input),
 );
 
 /// Implements [`Ln1p`] for one host primitive type.
@@ -244,36 +240,22 @@ pub const LOG_ADD_EXP_OPERATION_NAME: &str = "log_add_exp";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`](crate::Operation) that computes the elementwise `log(exp(a) + exp(b))` of its inputs without
-    /// forming either exponential, promoting their element types and broadcasting their shapes.
+    /// [`Operation`](crate::Operation) that computes `log(exp(a) + exp(b))` elementwise, promoting element types
+    /// and broadcasting shapes. Factoring out the larger input avoids overflow in the intermediate exponentials.
+    /// Output overflow still follows the element format's numerical conversion rules.
     ///
-    /// The semantics are:
+    /// Real inputs use `max(a, b) + ln_1p(exp(-abs(a - b)))`. Equal-sign infinities return that infinity, mixed
+    /// infinities return positive infinity, and NaNs propagate. Half-precision and smaller formats use `f32`
+    /// intermediates and round only the final output back to their element type.
     ///
-    /// ```text
-    /// log_add_exp(a, b) = select(is_nan(a - b), a + b, max(a, b) + ln_1p(exp(-|a - b|)))
-    /// ```
-    ///
-    /// and are borrowed from JAX's [`logaddexp`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.logaddexp.html).
-    ///
-    /// Factoring the larger input out of the sum is what makes the primitive usable across the whole real range:
-    /// `exp(-|a - b|)` never overflows and so `log_add_exp(1000, 1000)` is exactly `1000 + log(2)` where the naive
-    /// composition returns infinity.
-    ///
-    /// The `is_nan(a - b)` guard is for the cases in which the difference itself is undefined, and it fixes the
-    /// following cases:
-    ///
-    ///   - `(+∞, +∞) ↦ +∞` and `(-∞, -∞) ↦ -∞`, through the `a + b` branch,
-    ///   - any NaN input propagates NaN, also through the `a + b` branch,
-    ///   - mixed infinities return the larger input, through the ordinary branch: `-|a - b|` is `-∞`,
-    ///     so `ln_1p(exp(-∞)) = ln_1p(0) = 0` and the result is `max(a, b)`.
-    ///
-    /// Only real floating-point inputs are supported, and array inputs that still carry partial sums are rejected,
-    /// with their reduced-axis markers required to agree.
+    /// Complex inputs factor out the lexicographically larger input, evaluate the correction in component precision,
+    /// and wrap the imaginary output into `[-π, π)`. This selects a principal logarithm branch; derivatives apply
+    /// away from its cut. Inputs that carry partial sums are rejected, and reduced-axis markers must agree.
     LogAddExpOperation,
     LOG_ADD_EXP_OPERATION_NAME,
     LogAddExp,
     log_add_exp,
-    check_data_types = [@float @real],
+    check_data_types = [@float],
     check_array_types = [@no_unreduced, @same_reduced_axes],
 );
 
@@ -284,13 +266,15 @@ impl_differentiable_operation! {
         T: Type,
         C::Type: DifferentiableType,
         C::Value: ZeroLike
+            + Add
+            + Sub
+            + Mul
+            + Real
             + Exp
             + LogAddExp
+            + And
             + Compare<C::Value>
             + Select
-            + std::ops::Add<Output = C::Value>
-            + std::ops::Sub<Output = C::Value>
-            + std::ops::Mul<Output = C::Value>
             + ElementwiseDerivativeAlignment<C::Type>,
         <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
     {
@@ -325,41 +309,62 @@ impl_differentiable_operation! {
 
             let output_primal = primal;
             let primal = context.primal_to_tangent(output_primal.clone())?;
-            let aligned_primal = primal.align_tangent(&target, &primal)?;
-            let infinity = aligned_primal.dispatch_domain().fill(&target, f64::INFINITY)?;
-            let replace_infinity = |value: C::Value| -> Result<C::Value, DifferentiationError> {
-                let is_positive_infinity = value.compare(&infinity, ComparisonDirection::Equal)?;
+
+            // As with unary derivatives, evaluate coefficients in the differential representation
+            // instead of converting an already rounded output from a narrower primal format.
+            let aligned_primal = if output_primal.r#type().as_ref() == &target {
+                primal.align_tangent(&target, &primal)?
+            } else {
+                let left = context.primal_to_tangent(left.primal().clone())?.align_tangent(&target, &primal)?;
+                let right = context.primal_to_tangent(right.primal().clone())?.align_tangent(&target, &primal)?;
+                left.log_add_exp(&right)?
+            };
+
+            // Inspect the real component for complex values. A literal infinity saturates in finite-only
+            // formats, so first check that halving this constant actually leaves it infinite. This prevents
+            // a representable finite maximum from being mistaken for positive infinity.
+            let real = |value: &C::Value| {
+                if target.is_complex() { value.real() } else { Ok(value.clone()) }
+            };
+            let real_output = real(&aligned_primal)?;
+            let real_type = real_output.r#type().into_owned();
+            let infinity = aligned_primal.dispatch_domain().fill(&real_type, f64::INFINITY)?;
+            let half = aligned_primal.dispatch_domain().fill(&real_type, 0.5)?;
+            let has_infinity = infinity.compare(&infinity.mul(&half)?, ComparisonDirection::Equal)?;
+            let replace_infinity = |value: C::Value, component: C::Value| -> Result<C::Value, DifferentiationError> {
+                let is_positive_infinity = component.compare(&infinity, ComparisonDirection::Equal)?;
+                let is_positive_infinity = is_positive_infinity.and(&has_infinity)?;
                 Ok(C::Value::select(&is_positive_infinity, &value.zero_like()?, &value)?)
             };
 
-            let output_exponent = replace_infinity(aligned_primal)?;
+            let output_exponent = replace_infinity(aligned_primal, real_output)?;
             let left_term = left
                 .tangent()
                 .as_value()
                 .map(|tangent| {
-                    let input = replace_infinity(
-                        context.primal_to_tangent(left.primal().clone())?.align_tangent(&target, &primal)?,
-                    )?;
-                    let weight = (input - output_exponent.clone()).exp()?;
-                    Ok::<_, DifferentiationError>(weight * tangent.align_tangent(&target, &primal)?)
+                    let input = context.primal_to_tangent(left.primal().clone())?.align_tangent(&target, &primal)?;
+                    let component = real(&input)?;
+                    let input = replace_infinity(input, component)?;
+                    let weight = input.sub(&output_exponent)?.exp()?;
+                    Ok::<_, DifferentiationError>(weight.mul(&tangent.align_tangent(&target, &primal)?)?)
                 })
                 .transpose()?;
             let right_term = right
                 .tangent()
                 .as_value()
                 .map(|tangent| {
-                    let input = replace_infinity(
-                        context.primal_to_tangent(right.primal().clone())?.align_tangent(&target, &primal)?,
-                    )?;
-                    let weight = (input - output_exponent.clone()).exp()?;
-                    Ok::<_, DifferentiationError>(weight * tangent.align_tangent(&target, &primal)?)
+                    let input = context.primal_to_tangent(right.primal().clone())?.align_tangent(&target, &primal)?;
+                    let component = real(&input)?;
+                    let input = replace_infinity(input, component)?;
+                    let weight = input.sub(&output_exponent)?.exp()?;
+                    Ok::<_, DifferentiationError>(weight.mul(&tangent.align_tangent(&target, &primal)?)?)
                 })
                 .transpose()?;
-            let tangent = left_term
-                .into_iter()
-                .chain(right_term)
-                .reduce(|left_term, right_term| left_term + right_term)
-                .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
+            let tangent = match (left_term, right_term) {
+                (Some(left), Some(right)) => MaybeZero::Value(left.add(&right)?),
+                (Some(value), None) | (None, Some(value)) => MaybeZero::Value(value),
+                (None, None) => MaybeZero::Zero(target),
+            };
             Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
         }
     },
@@ -382,9 +387,9 @@ impl_array_elementwise_operation!(
     LogAddExp,
     log_add_exp,
     operation = "log_add_exp",
-    inputs = @float @real,
+    inputs = @float,
     checks = [@no_unreduced, @same_reduced_axes],
-    |lhs, rhs| RealFloatingPointArrayElement::log_add_exp(lhs, rhs),
+    |left, right| FloatingPointArrayElement::log_add_exp(left, right),
 );
 
 /// Implements [`LogAddExp`] for one host primitive type.
@@ -427,11 +432,11 @@ impl_differentiable_elementwise_operation! {
     LogisticOperation,
     jvp<C>
     where
-        C::Value: OneLike + std::ops::Sub<Output = C::Value> + std::ops::Mul<Output = C::Value>,
+        C::Value: OneLike + Sub + Mul,
     {
         // `d(logistic(x)) = logistic(x) · (1 - logistic(x)) · dx`, reusing the primal output
         // evaluated at the tangent type.
-        |(_, input_tangent) -> output| output.clone() * (output.one_like()? - output) * input_tangent
+        |(_, input_tangent) -> output| output.mul(&output.one_like()?.sub(&output)?)?.mul(&input_tangent)?
     },
     transpose = @nonlinear,
 }
@@ -474,69 +479,17 @@ impl_logistic_for_primitive!(f64);
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Returns whether the lowest value of `data_type` acts as an identity of [`LogAddExp`]. That sentinel is what the
-/// whole `log(sum(exp(x)))` family writes over the padding of a bounded ragged axis and over an empty accumulation,
-/// so an operation that can be asked to write it accepts exactly the element types for which this returns `true`.
-///
-/// One accumulation folds one copy of the sentinel per padded position it covers, and folding `k` copies of the
-/// lowest value `lowest` yields `lowest + ln(k)`, which is still exactly `lowest` only while the drift `ln(k)` stays
-/// inside half the gap between `lowest` and its neighbor toward zero. Every format whose lowest value is finite
-/// therefore holds its sentinel across a bounded number of copies, `floor(e^(half gap))`, called its *reach* below,
-/// while a format with a true `-inf` has unbounded reach:
-///
-/// | data type       |   lowest |  neighbor | half gap |     reach |
-/// | --------------- | -------- | --------- | -------- | --------- |
-/// | `f8e8m0fnu`     | `2^-127` |         — |        — |      none |
-/// | `f6e2m3fn`      |   `-7.5` |      `-7` |   `0.25` |         1 |
-/// | `f4e2m1fn`      |     `-6` |      `-4` |      `1` |         2 |
-/// | `f8e4m3b11fnuz` |    `-30` |     `-28` |      `1` |         2 |
-/// | `f6e3m2fn`      |    `-28` |     `-24` |      `2` |         7 |
-/// | `f8e4m3fnuz`    |   `-240` |    `-224` |      `8` |     2_980 |
-/// | `f8e4m3fn`      |   `-448` |    `-416` |     `16` | 8_886_110 |
-/// | `f8e5m2fnuz`    | `-57344` |  `-49152` |   `4096` |  `e^4096` |
-///
-/// A type-level predicate cannot compare a reach against the count an accumulation will actually fold, because that
-/// count is the difference between a ragged axis's bound and its per-item extent, which is a runtime quantity. The
-/// line this predicate draws is therefore reach alone: a format is rejected when its reach is short enough that any
-/// ragged mask worth writing exceeds it, which is the case for the first five rows of the table.
-///
-/// [`DataType::F8E8M0FNU`] has no sentinel to begin with: it encodes bare positive exponents, so it has neither a
-/// zero nor a sign, and its lowest value `2^-127` exponentiates to one rather than to zero. The other four rejected
-/// formats do have a lowest value whose exponential underflows to zero in their own format, and three of them —
-/// [`DataType::F4E2M1FN`], [`DataType::F8E4M3B11FNUZ`], and [`DataType::F6E3M2FN`] — even keep it a *pairwise*
-/// identity, in that `log_add_exp(x, lowest)` returns `x` for every `x` they represent. What they lack is reach: two
-/// sentinels are already enough to move [`DataType::F6E2M3FN`]'s `-7.5` to `-7.0` (`-7.5 + ln(2) = -6.807`), three
-/// move [`DataType::F4E2M1FN`]'s `-6` to `-4` (`-6 + ln(3) = -4.901`) and [`DataType::F8E4M3B11FNUZ`]'s `-30` to
-/// `-28`, and eight move [`DataType::F6E3M2FN`]'s `-28` to `-24`.
-///
-/// The three accepted finite-lowest formats carry a documented quantitative limit rather than a check, because there
-/// is no count for this predicate to check against: an accumulation folding more than 2_980 sentinels in
-/// [`DataType::F8E4M3FNUZ`], or more than 8_886_110 in [`DataType::F8E4M3FN`], reads high, and `f8e5m2fnuz`'s reach
-/// exceeds every representable count. A consumer that does know the count checks it — the `stablehlo.reduce_window`
-/// lowering of a `cumulative_log_sum_exp` seeds one window per output position and rejects a scanned extent past the
-/// reach of these same three formats.
+/// Returns whether the lowest value of `data_type` is an identity of the rounded pairwise [`LogAddExp`].
+/// A binary fold rounds after every pair: once combining two sentinel values returns the sentinel, an all-sentinel
+/// subtree of any size does too. There is therefore no scan-length bound. This contract does not apply to a
+/// max-shifted sum, whose padding must remain neutral after subtraction of an arbitrary maximum.
 pub(crate) fn is_log_add_exp_identity_data_type(data_type: DataType) -> bool {
-    data_type.is_floating_point()
-        && !matches!(
-            data_type,
-            DataType::F8E8M0FNU
-                | DataType::F6E2M3FN
-                | DataType::F4E2M1FN
-                | DataType::F8E4M3B11FNUZ
-                | DataType::F6E3M2FN
-        )
+    data_type.is_floating_point() && !matches!(data_type, DataType::F8E8M0FNU | DataType::F6E2M3FN)
 }
 
-/// Returns the diagnostic that `operation_name` reports for an element type rejected by
-/// [`is_log_add_exp_identity_data_type`]. The three cases are named apart: an element type that is not real
-/// floating-point at all, the one floating-point format that represents neither zero nor negative infinity, and the
-/// formats whose lowest value is representable but stops being an identity within a handful of folds.
+/// Returns the diagnostic for a type whose lowest value cannot seed a rounded pairwise [`LogAddExp`] fold.
 pub(crate) fn log_add_exp_identity_data_type_error(operation_name: &str, data_type: DataType) -> String {
     match data_type {
-        DataType::F8E8M0FNU => format!(
-            "`{operation_name}` requires a floating-point format that represents zero and negative infinity but got \
-             `{data_type}`"
-        ),
         _ if data_type.is_floating_point() => format!(
             "`{operation_name}` requires a floating-point format whose lowest value is a `log_add_exp` identity but \
              got `{data_type}`"
@@ -553,7 +506,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Layout, StridedLayout, f8e4m3fn, f8e8m0fnu};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, f4e2m1fn, f8e4m3fn, f8e8m0fnu};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
@@ -562,15 +515,9 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypeError, Typed};
 
     use super::*;
-
-    /// Evaluates the pinned primal construction in double precision, for use as the tests' expected value.
-    fn expected_log_add_exp(left: f64, right: f64) -> f64 {
-        let delta = left - right;
-        if delta.is_nan() { left + right } else { left.max(right) + (-delta.abs()).exp().ln_1p() }
-    }
 
     #[test]
     fn test_exp_type_inference() {
@@ -667,13 +614,13 @@ mod tests {
         .unwrap();
         let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
         let (primal_output, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.exp()).unwrap();
-        // The primal output stays genuinely `f8e8m0fnu`-encoded (not an `f64` pun): `exp(2) ≈ 7.39` rounds to the
+        // The primal keeps its exponent-only encoding: `exp(2) ≈ 7.39` rounds to the
         // nearest representable power of two, `8 = 2^3`, whose biased-exponent encoding is `0x82`.
         assert_eq!(primal_output.r#type().as_ref(), &ArrayType::scalar(DataType::F8E8M0FNU));
         assert_eq!(primal_output.logical_bytes(), vec![0x82]);
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
-        assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 * 2.0f64.exp(), epsilon = 1e-6);
+        // The tangent is evaluated in its widened `f32` representation.
+        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 3.0 * 2.0f32.exp(), epsilon = 1e-6);
 
         // The widened staged tangent program recomputes the coefficient in the widened differential representation
         // instead of converting the narrower primal output.
@@ -733,11 +680,6 @@ mod tests {
             epsilon = 1e-12,
         );
 
-        assert_eq!(Array::scalar(0.7).unwrap().exp().unwrap(), Array::scalar(0.7f64.exp()).unwrap(),);
-    }
-
-    #[test]
-    fn test_array_exp_vector() {
         let vector = Array::vector(vec![0.0, 1.0]).unwrap();
         assert_abs_diff_eq!(vector.exp().unwrap(), Array::vector(vec![1.0, 1.0f64.exp()]).unwrap(), epsilon = 1e-12);
     }
@@ -755,17 +697,6 @@ mod tests {
     }
 
     #[test]
-    fn test_array_exp_layout() {
-        // Unary kernels preserve arbitrary physical layouts while traversing elements in logical order.
-        let input_type =
-            ArrayType::new_static(DataType::F64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16])));
-        let input = Array::from_elements(input_type.clone(), &[0.0f64, 1.0]).unwrap();
-        let exponential = input.exp().unwrap();
-        assert_eq!(exponential.r#type().as_ref(), &input_type);
-        assert_eq!(exponential.elements::<f64>(), Ok(vec![1.0, 1.0f64.exp()]));
-    }
-
-    #[test]
     fn test_array_exp_low_precision() {
         // Low-precision formats decode, compute, and re-encode without constructing intermediary scalar values.
         let low_precision = Array::from_elements(
@@ -774,13 +705,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            low_precision.exp().unwrap().to_f64s(),
-            vec![1.0, f8e4m3fn::from_f64(1.0f64.exp()).unwrap().to_f64()],
+            low_precision.exp().unwrap().elements::<f8e4m3fn>(),
+            Ok(vec![f8e4m3fn::from_f64(1.0).unwrap(), f8e4m3fn::from_bits(0x43)]),
         );
     }
 
     #[test]
-    fn test_exp_for_primitives() {
+    fn test_exp_primitives() {
+        assert_eq!(Exp::exp(&0.0f32), Ok(1.0));
         assert_eq!(Exp::exp(&0.0f64), Ok(1.0));
     }
 
@@ -885,7 +817,7 @@ mod tests {
         let input_tangent = Array::from_elements::<f32>(ArrayType::scalar(DataType::F32), &[3.0]).unwrap();
         let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.log()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
-        assert_abs_diff_eq!(tangent.to_f64s()[0], 1.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 1.5, epsilon = 1e-9);
 
         // The widened staged tangent program divides by the input converted to the widened differential
         // representation.
@@ -944,8 +876,6 @@ mod tests {
             epsilon = 1e-12,
         );
 
-        assert_eq!(Array::scalar(0.7).unwrap().log().unwrap(), Array::scalar(0.7f64.ln()).unwrap(),);
-
         assert_abs_diff_eq!(
             Array::vector(vec![1.0, std::f64::consts::E]).unwrap().log().unwrap(),
             Array::vector(vec![0.0, 1.0]).unwrap(),
@@ -962,7 +892,8 @@ mod tests {
     }
 
     #[test]
-    fn test_log_for_primitives() {
+    fn test_log_primitives() {
+        assert_eq!(Log::log(&1.0f32), Ok(0.0));
         assert_eq!(Log::log(&1.0f64), Ok(0.0));
     }
 
@@ -978,7 +909,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64],
-                    error = "`ln_1p` does not support input data type `c64`",
+                    output_data_types = [DataType::C64],
                 },
                 {
                     input_data_types = [DataType::I32],
@@ -1050,6 +981,29 @@ mod tests {
     }
 
     #[test]
+    fn test_ln_1p_differentiation_complex() {
+        let input = ComplexNumber::new(0.5f64, 0.5);
+        assert_abs_diff_eq!(
+            differentiate_at(Array::scalar(input).unwrap())
+                .holomorphic()
+                .gradient(|input| input.ln_1p())
+                .unwrap(),
+            Array::scalar(ComplexNumber::new(0.6, -0.2)).unwrap(),
+            epsilon = 1e-15,
+        );
+    }
+
+    #[test]
+    fn test_ln_1p_differentiation_unrepresentable_tangent() {
+        // The primal saturates to the finite minimum, but a live zero tangent requires an unrepresentable NaN.
+        assert_eq!(
+            differentiate_at(Array::scalar(f4e2m1fn::from_f64(-1.0).unwrap()).unwrap())
+                .jvp(Array::scalar(f4e2m1fn::from_f64(0.0).unwrap()).unwrap(), |input| input.ln_1p(),),
+            Err(DifferentiationError::Program(TypeError::invalid("data type `f4e2m1fn` cannot represent NaN").into())),
+        );
+    }
+
+    #[test]
     fn test_ln_1p_transposition() {
         check_operation_transposition!(
             @rejected,
@@ -1060,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_array_ln_1p() {
-        // Ordinary values in every supported floating-point width, each evaluated in its own precision.
+        // Native and half-precision inputs retain their element types.
         assert_eq!(Array::scalar(0.5f32).unwrap().ln_1p().unwrap(), Array::scalar(0.5f32.ln_1p()).unwrap());
         assert_eq!(Array::scalar(0.5f64).unwrap().ln_1p().unwrap(), Array::scalar(0.5f64.ln_1p()).unwrap());
         assert_eq!(
@@ -1069,25 +1023,29 @@ mod tests {
         );
         assert_eq!(
             Array::scalar(f16::from_f32(0.5)).unwrap().ln_1p().unwrap(),
-            Array::scalar(f16::from_f32(0.5f32.ln_1p())).unwrap()
+            Array::scalar(f16::from_f32(0.5f32.ln_1p())).unwrap(),
         );
 
         // The fixed point and the boundary values of the real domain.
         assert_eq!(Array::scalar(0.0f64).unwrap().ln_1p().unwrap(), Array::scalar(0.0f64).unwrap());
         assert_eq!(Array::scalar(-1.0f64).unwrap().ln_1p().unwrap(), Array::scalar(f64::NEG_INFINITY).unwrap());
-        assert!(Array::scalar(-2.0f64).unwrap().ln_1p().unwrap().to_f64s()[0].is_nan());
+        assert!(Array::scalar(-2.0f64).unwrap().ln_1p().unwrap().elements::<f64>().unwrap()[0].is_nan());
 
-        // The accuracy the primitive exists for: near zero, `ln_1p` keeps full relative precision while the naive
-        // composition through `1 + x` has already lost most of it.
-        assert_eq!(Array::scalar(1e-10f64).unwrap().ln_1p().unwrap(), Array::scalar(1e-10f64.ln_1p()).unwrap());
-        assert_ne!(1e-10f64.ln_1p(), (1.0f64 + 1e-10).ln());
-        assert!((1e-10f64.ln_1p() - 1e-10).abs() < 1e-20);
-
-        assert_eq!(Array::scalar(0.5).unwrap().ln_1p().unwrap(), Array::scalar(0.5f64.ln_1p()).unwrap());
+        // This input is lost by forming `1 + x`, but its logarithm rounds back to `x` itself.
+        assert_eq!(Array::scalar(1e-20f64).unwrap().ln_1p().unwrap(), Array::scalar(1e-20f64).unwrap());
     }
 
     #[test]
-    fn test_ln_1p_for_primitives() {
+    fn test_array_ln_1p_complex() {
+        assert_abs_diff_eq!(
+            Array::scalar(ComplexNumber::new(0.0f64, 1.0)).unwrap().ln_1p().unwrap(),
+            Array::scalar(ComplexNumber::new(std::f64::consts::LN_2 / 2.0, std::f64::consts::FRAC_PI_4)).unwrap(),
+            epsilon = 1e-15,
+        );
+    }
+
+    #[test]
+    fn test_ln_1p_primitives() {
         assert_eq!(Ln1p::ln_1p(&0.0f64), Ok(0.0));
         assert_eq!(Ln1p::ln_1p(&0.0f32), Ok(0.0));
     }
@@ -1104,7 +1062,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64, DataType::C64],
-                    error = "`log_add_exp` does not support input data type `c64`",
+                    output_data_types = [DataType::C64],
                 },
                 {
                     input_data_types = [DataType::I32, DataType::F32],
@@ -1140,8 +1098,8 @@ mod tests {
     fn test_log_add_exp_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = LogAddExpOperation::new(),
-            inputs = [Array::scalar(0.5).unwrap(), Array::scalar(-0.25).unwrap()],
-            expected = Array::scalar(expected_log_add_exp(0.5, -0.25)).unwrap(),
+            inputs = [Array::scalar(0.0f64).unwrap(), Array::scalar(0.0f64).unwrap()],
+            expected = Array::scalar(std::f64::consts::LN_2).unwrap(),
         );
     }
 
@@ -1158,7 +1116,7 @@ mod tests {
                 ],
                 outputs = [(
                     @mapped(axis = 0),
-                    Array::vector(vec![expected_log_add_exp(0.5, 2.0), expected_log_add_exp(-1.0, 2.0)]).unwrap(),
+                    Array::vector(vec![2.2014132779827524f64, 2.048587351573742f64]).unwrap(),
                 )],
             }],
         );
@@ -1166,10 +1124,10 @@ mod tests {
 
     #[test]
     fn test_log_add_exp_differentiation() {
-        // The tangent is the softmax-weighted combination of the operand tangents.
+        // The tangent is the softmax-weighted combination of the input tangents.
         let (left, right) = (0.7f64, -0.3f64);
         let (left_tangent, right_tangent) = (0.4f64, -0.2f64);
-        let output = expected_log_add_exp(left, right);
+        let output = 1.0132616875182228f64;
         let tangent = (left - output).exp() * left_tangent + (right - output).exp() * right_tangent;
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
@@ -1183,23 +1141,29 @@ mod tests {
                     lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
                     let %4:f64[] = log_add_exp %0 %1
                         %5:f64[] = constant [value=inf]
-                        %6:bool[] = compare [direction=Equal] %4 %5
-                        %7:f64[] = zero_like %4
-                        %8:f64[] = select %6 %7 %4
-                        %9:bool[] = compare [direction=Equal] %0 %5
-                        %10:f64[] = zero_like %0
-                        %11:f64[] = select %9 %10 %0
-                        %12:f64[] = sub %11 %8
-                        %13:f64[] = exp %12
-                        %14:f64[] = mul %13 %2
-                        %15:bool[] = compare [direction=Equal] %1 %5
-                        %16:f64[] = zero_like %1
-                        %17:f64[] = select %15 %16 %1
-                        %18:f64[] = sub %17 %8
-                        %19:f64[] = exp %18
-                        %20:f64[] = mul %19 %3
-                        %21:f64[] = add %14 %20
-                    in (%4, %21)
+                        %6:f64[] = constant [value=0.5]
+                        %7:f64[] = mul %5 %6
+                        %8:bool[] = compare [direction=Equal] %5 %7
+                        %9:bool[] = compare [direction=Equal] %4 %5
+                        %10:bool[] = and %9 %8
+                        %11:f64[] = zero_like %4
+                        %12:f64[] = select %10 %11 %4
+                        %13:bool[] = compare [direction=Equal] %0 %5
+                        %14:bool[] = and %13 %8
+                        %15:f64[] = zero_like %0
+                        %16:f64[] = select %14 %15 %0
+                        %17:f64[] = sub %16 %12
+                        %18:f64[] = exp %17
+                        %19:f64[] = mul %18 %2
+                        %20:bool[] = compare [direction=Equal] %1 %5
+                        %21:bool[] = and %20 %8
+                        %22:f64[] = zero_like %1
+                        %23:f64[] = select %21 %22 %1
+                        %24:f64[] = sub %23 %12
+                        %25:f64[] = exp %24
+                        %26:f64[] = mul %25 %3
+                        %27:f64[] = add %19 %26
+                    in (%4, %27)
                 "},
             }],
         );
@@ -1217,20 +1181,64 @@ mod tests {
                 })
                 .unwrap()
                 .1
-                .to_f64s()[0]
+                .elements::<f64>()
+                .unwrap()[0]
         };
 
         // Both weights become `exp(0 - 0) = 1`, so the tangents simply add.
         assert_eq!(jvp((f64::INFINITY, f64::INFINITY), (2.0, 3.0)), 5.0);
         // Negative infinity is not replaced, so both weights are `exp(-∞ - -∞) = exp(NaN)`.
         assert!(jvp((f64::NEG_INFINITY, f64::NEG_INFINITY), (2.0, 3.0)).is_nan());
-        // The replaced `+∞` output makes the finite operand's weight `exp(a)` instead of zero.
+        // The replaced `+∞` output makes the finite input's weight `exp(a)` instead of zero.
         assert_eq!(jvp((1.0, f64::INFINITY), (2.0, 3.0)), 1.0f64.exp() * 2.0 + 3.0);
-        // A `-∞` operand contributes nothing and the finite operand carries the whole tangent.
+        // A `-∞` input contributes nothing and the finite input carries the whole tangent.
         assert_eq!(jvp((1.0, f64::NEG_INFINITY), (2.0, 3.0)), 2.0);
-        // A NaN operand propagates through both the primal and the weights.
+        // A NaN input propagates through both the primal and the weights.
         assert!(jvp((f64::NAN, 1.0), (2.0, 3.0)).is_nan());
         assert!(jvp((1.0, f64::NAN), (2.0, 3.0)).is_nan());
+    }
+
+    #[test]
+    fn test_log_add_exp_differentiation_finite_maximum() {
+        // Infinity literals saturate in this format; its finite maximum must retain the finite-input derivative.
+        let left = Array::scalar(f4e2m1fn::from_f64(6.0).unwrap()).unwrap();
+        let right = Array::scalar(f4e2m1fn::from_f64(0.0).unwrap()).unwrap();
+        let tangent = Array::scalar(f4e2m1fn::from_f64(1.0).unwrap()).unwrap();
+        let (output, tangent) = differentiate_at((left.clone(), right.clone()))
+            .jvp((right.clone(), tangent), |(left, right)| left.log_add_exp(&right))
+            .unwrap();
+        assert_eq!(output, left);
+        assert_eq!(tangent, right);
+    }
+
+    #[test]
+    fn test_log_add_exp_differentiation_widened_tangent() {
+        let left = Array::scalar(f8e8m0fnu::from_f64(1.0).unwrap()).unwrap();
+        let right = Array::scalar(f8e8m0fnu::from_f64(0.5).unwrap()).unwrap();
+        let (output, tangent) = differentiate_at((left.clone(), right))
+            .jvp((Array::scalar(1.0f32).unwrap(), Array::scalar(0.0f32).unwrap()), |(left, right)| {
+                left.log_add_exp(&right)
+            })
+            .unwrap();
+        assert_eq!(output, left);
+        assert_abs_diff_eq!(tangent.elements::<f32>().unwrap()[0], 0.62245935f32, epsilon = 1e-7);
+    }
+
+    #[test]
+    fn test_log_add_exp_differentiation_complex() {
+        // Equal complex inputs have two coefficients of one half, away from the principal branch cut.
+        let input = Array::scalar(ComplexNumber::new(1.0f64, 0.5)).unwrap();
+        let zero = Array::scalar(ComplexNumber::new(0.0f64, 0.0)).unwrap();
+        let two = Array::scalar(ComplexNumber::new(2.0f64, 0.0)).unwrap();
+        let (output, tangent) = differentiate_at((input.clone(), input))
+            .jvp((two, zero), |(left, right)| left.log_add_exp(&right))
+            .unwrap();
+        assert_abs_diff_eq!(
+            output,
+            Array::scalar(ComplexNumber::new(1.0 + std::f64::consts::LN_2, 0.5)).unwrap(),
+            epsilon = 1e-15,
+        );
+        assert_abs_diff_eq!(tangent, Array::scalar(ComplexNumber::new(1.0, 0.0)).unwrap(), epsilon = 1e-15);
     }
 
     #[test]
@@ -1244,10 +1252,10 @@ mod tests {
 
     #[test]
     fn test_array_log_add_exp() {
-        // Ordinary values in every supported floating-point width, each evaluated in its own precision.
+        // Native and half-precision inputs retain their element types.
         assert_eq!(
             Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(2.0f64).unwrap()).unwrap(),
-            Array::scalar(expected_log_add_exp(1.0, 2.0)).unwrap(),
+            Array::scalar(2.313261687518223f64).unwrap(),
         );
         assert_eq!(
             Array::scalar(1.0f32).unwrap().log_add_exp(&Array::scalar(2.0f32).unwrap()).unwrap(),
@@ -1268,17 +1276,17 @@ mod tests {
             Array::scalar(f16::from_f32(2.0f32 + (-1.0f32).exp().ln_1p())).unwrap(),
         );
 
-        // The operation is symmetric, and two equal operands add exactly `log(2)`.
+        // The operation is symmetric, and two equal inputs add exactly `log(2)`.
         assert_eq!(
             Array::scalar(2.0f64).unwrap().log_add_exp(&Array::scalar(1.0f64).unwrap()).unwrap(),
-            Array::scalar(expected_log_add_exp(1.0, 2.0)).unwrap(),
+            Array::scalar(2.313261687518223f64).unwrap(),
         );
         assert_eq!(
             Array::scalar(0.0f64).unwrap().log_add_exp(&Array::scalar(0.0f64).unwrap()).unwrap(),
             Array::scalar(std::f64::consts::LN_2).unwrap(),
         );
 
-        // The reason the primitive exists: neither exponential is ever formed, so operands far outside the range of
+        // The reason the primitive exists: neither exponential is ever formed, so inputs far outside the range of
         // `exp` still produce the exact shifted result instead of infinity.
         assert_eq!(
             Array::scalar(1000.0f64).unwrap().log_add_exp(&Array::scalar(1000.0f64).unwrap()).unwrap(),
@@ -1286,8 +1294,8 @@ mod tests {
         );
         assert!((1000.0f64.exp() + 1000.0f64.exp()).ln().is_infinite());
 
-        // The pinned exceptional values: same-sign infinities saturate, mixed infinities return the larger operand,
-        // and NaN propagates from either operand.
+        // The pinned exceptional values: same-sign infinities saturate, mixed infinities return the larger input,
+        // and NaN propagates from either input.
         assert_eq!(
             Array::scalar(f64::INFINITY).unwrap().log_add_exp(&Array::scalar(f64::INFINITY).unwrap()).unwrap(),
             Array::scalar(f64::INFINITY).unwrap(),
@@ -1308,22 +1316,37 @@ mod tests {
             Array::scalar(1.0f64).unwrap(),
         );
         assert!(
-            Array::scalar(f64::NAN).unwrap().log_add_exp(&Array::scalar(1.0f64).unwrap()).unwrap().to_f64s()[0]
+            Array::scalar(f64::NAN)
+                .unwrap()
+                .log_add_exp(&Array::scalar(1.0f64).unwrap())
+                .unwrap()
+                .elements::<f64>()
+                .unwrap()[0]
                 .is_nan()
         );
         assert!(
-            Array::scalar(1.0f64).unwrap().log_add_exp(&Array::scalar(f64::NAN).unwrap()).unwrap().to_f64s()[0]
+            Array::scalar(1.0f64)
+                .unwrap()
+                .log_add_exp(&Array::scalar(f64::NAN).unwrap())
+                .unwrap()
+                .elements::<f64>()
+                .unwrap()[0]
                 .is_nan()
-        );
-
-        assert_eq!(
-            Array::scalar(1.0).unwrap().log_add_exp(&Array::scalar(2.0).unwrap()).unwrap(),
-            Array::scalar(expected_log_add_exp(1.0, 2.0)).unwrap()
         );
     }
 
     #[test]
-    fn test_log_add_exp_for_primitives() {
+    fn test_array_log_add_exp_complex() {
+        let input = Array::scalar(ComplexNumber::new(1.0f64, 4.0)).unwrap();
+        assert_abs_diff_eq!(
+            input.log_add_exp(&input).unwrap(),
+            Array::scalar(ComplexNumber::new(1.0 + std::f64::consts::LN_2, 4.0 - std::f64::consts::TAU)).unwrap(),
+            epsilon = 1e-15,
+        );
+    }
+
+    #[test]
+    fn test_log_add_exp_primitives() {
         assert_eq!(LogAddExp::log_add_exp(&0.0f64, &0.0), Ok(std::f64::consts::LN_2));
         assert_eq!(LogAddExp::log_add_exp(&0.0f32, &0.0), Ok(std::f32::consts::LN_2));
     }
@@ -1382,7 +1405,7 @@ mod tests {
                 inputs = [(@mapped(axis = 0), Array::vector(vec![0.5, -1.0]).unwrap())],
                 outputs = [(
                     @mapped(axis = 0),
-                    Array::vector(vec![1.0 / (1.0 + (-0.5f64).exp()), 1.0 / (1.0 + 1.0f64.exp())]).unwrap()
+                    Array::vector(vec![1.0 / (1.0 + (-0.5f64).exp()), 1.0 / (1.0 + 1.0f64.exp())]).unwrap(),
                 )],
             }],
         );
@@ -1412,11 +1435,11 @@ mod tests {
             logistic * (ComplexNumber::new(1.0, 0.0) - logistic)
         };
         assert_abs_diff_eq!(
-            Array::scalar(expected).unwrap(),
             differentiate_at(Array::scalar(input).unwrap())
                 .holomorphic()
-                .gradient(|input| { input.logistic().unwrap() })
+                .gradient(|input| input.logistic())
                 .unwrap(),
+            Array::scalar(expected).unwrap(),
             epsilon = 1e-12,
         );
     }
@@ -1455,15 +1478,11 @@ mod tests {
             Array::scalar(expected).unwrap(),
             epsilon = 1e-12,
         );
-
-        assert_eq!(
-            Array::scalar(0.7).unwrap().logistic().unwrap(),
-            Array::scalar(1.0 / (1.0 + (-0.7f64).exp())).unwrap(),
-        );
     }
 
     #[test]
-    fn test_logistic_for_primitives() {
+    fn test_logistic_primitives() {
+        assert_eq!(Logistic::logistic(&0.0f32), Ok(0.5));
         assert_eq!(Logistic::logistic(&0.0f64), Ok(0.5));
     }
 
@@ -1472,7 +1491,10 @@ mod tests {
         assert!(is_log_add_exp_identity_data_type(DataType::F32));
         assert!(is_log_add_exp_identity_data_type(DataType::F8E4M3FN));
         assert!(!is_log_add_exp_identity_data_type(DataType::F8E8M0FNU));
-        assert!(!is_log_add_exp_identity_data_type(DataType::F4E2M1FN));
+        assert!(is_log_add_exp_identity_data_type(DataType::F4E2M1FN));
+        assert!(is_log_add_exp_identity_data_type(DataType::F6E3M2FN));
+        assert!(is_log_add_exp_identity_data_type(DataType::F8E4M3B11FNUZ));
+        assert!(!is_log_add_exp_identity_data_type(DataType::F6E2M3FN));
         assert!(!is_log_add_exp_identity_data_type(DataType::I32));
         assert!(!is_log_add_exp_identity_data_type(DataType::C64));
     }
@@ -1481,13 +1503,13 @@ mod tests {
     fn test_log_add_exp_identity_data_type_error() {
         assert_eq!(
             log_add_exp_identity_data_type_error("reduce_log_sum_exp", DataType::F8E8M0FNU),
-            "`reduce_log_sum_exp` requires a floating-point format that represents zero and negative infinity but got \
+            "`reduce_log_sum_exp` requires a floating-point format whose lowest value is a `log_add_exp` identity but got \
              `f8e8m0fnu`",
         );
         assert_eq!(
-            log_add_exp_identity_data_type_error("reduce_log_sum_exp", DataType::F4E2M1FN),
+            log_add_exp_identity_data_type_error("reduce_log_sum_exp", DataType::F6E2M3FN),
             "`reduce_log_sum_exp` requires a floating-point format whose lowest value is a `log_add_exp` identity but got \
-             `f4e2m1fn`",
+             `f6e2m3fn`",
         );
         assert_eq!(
             log_add_exp_identity_data_type_error("reduce_log_sum_exp", DataType::I32),
