@@ -727,11 +727,10 @@ impl ArrayReferenceTransform {
         // selection and inverse update do not round-trip on that metadata. The proof runs when a view is constructed
         // and when an access that writes back derives its path type. Read-only accesses derive their path types
         // through `ReferenceTransform::read_type`, which skips it.
-        let update = match selection.squeezed_output_shape {
-            Some(_) => {
-                output.reshape(selection.update_shape()).map_err(|error| TypeError::invalid(error.to_string()))?
-            }
-            None => output.clone(),
+        let update = if selection.removed_axis.is_some() {
+            output.reshape(selection.update_shape()).map_err(|error| TypeError::invalid(error.to_string()))?
+        } else {
+            output.clone()
         };
 
         let reconstructed = input
@@ -759,9 +758,10 @@ impl ArrayReferenceTransform {
         let sliced = input
             .slice(selection.starts.as_slice(), selection.limits.as_slice(), &vec![1; selection.starts.len()])
             .map_err(|error| TypeError::invalid(error.to_string()))?;
-        let output = match &selection.squeezed_output_shape {
-            Some(shape) => sliced.reshape(shape.clone()).map_err(|error| TypeError::invalid(error.to_string()))?,
-            None => sliced,
+        let output = if selection.removed_axis.is_some() {
+            sliced.reshape(selection.output_shape()).map_err(|error| TypeError::invalid(error.to_string()))?
+        } else {
+            sliced
         };
         Ok((output, Some(selection)))
     }
@@ -807,15 +807,7 @@ impl ArrayReferenceTransform {
                 starts[*axis] = index;
                 let mut limits = shape.dimensions().to_vec();
                 limits[*axis] = index + 1;
-                let output_shape = Shape::new(
-                    shape
-                        .dimensions()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(candidate, size)| (candidate != *axis).then_some(Dimension::Static(*size)))
-                        .collect(),
-                );
-                Ok(TransformSelection { starts, limits, squeezed_output_shape: Some(output_shape) })
+                Ok(TransformSelection { starts, limits, removed_axis: Some(*axis) })
             }
             Self::Slice { axes } => {
                 let shape = input.static_shape().ok_or_else(|| {
@@ -852,7 +844,7 @@ impl ArrayReferenceTransform {
                     starts.push(slice_axis.start());
                     limits.push(limit);
                 }
-                Ok(TransformSelection { starts, limits, squeezed_output_shape: None })
+                Ok(TransformSelection { starts, limits, removed_axis: None })
             }
         }
     }
@@ -871,7 +863,8 @@ impl ArrayReferenceTransform {
         }
         let selection = self.selection(carrier.array_type(input)?.as_ref())?;
         let sliced = carrier.slice(input, selection.starts, selection.limits)?;
-        match selection.squeezed_output_shape {
+        let output_shape = selection.removed_axis.map(|_| selection.output_shape());
+        match output_shape {
             Some(shape) => carrier.reshape(&sliced, shape),
             None => Ok(sliced),
         }
@@ -890,12 +883,11 @@ impl ArrayReferenceTransform {
             return carrier.update_index_symbolic(input, replacement, *axis, binding);
         }
         let selection = self.selection(carrier.array_type(input)?.as_ref())?;
-        match selection.squeezed_output_shape {
-            Some(_) => {
-                let update = carrier.reshape(replacement, selection.update_shape())?;
-                carrier.update_slice(input, &update, selection.starts)
-            }
-            None => carrier.update_slice(input, replacement, selection.starts),
+        if selection.removed_axis.is_some() {
+            let update = carrier.reshape(replacement, selection.update_shape())?;
+            carrier.update_slice(input, &update, selection.starts)
+        } else {
+            carrier.update_slice(input, replacement, selection.starts)
         }
     }
 }
@@ -1297,9 +1289,9 @@ struct TransformSelection {
     /// Exclusive slice limit per input axis.
     limits: Vec<usize>,
 
-    /// Exact static output shape after squeezing the indexed axis. [`Some`] for [`ArrayReferenceTransform::Index`]
-    /// transforms only and [`None`] for rank-preserving slices, whose output shape is exactly [`Self::update_shape`].
-    squeezed_output_shape: Option<Shape>,
+    /// Axis that an [`ArrayReferenceTransform::Index`] transform removes from the output after slicing it to size one,
+    /// or [`None`] for a rank-preserving [`ArrayReferenceTransform::Slice`].
+    removed_axis: Option<usize>,
 }
 
 impl TransformSelection {
@@ -1311,6 +1303,20 @@ impl TransformSelection {
                 .iter()
                 .zip(self.limits.iter())
                 .map(|(start, limit)| Dimension::Static(limit - start))
+                .collect(),
+        )
+    }
+
+    /// Returns the static shape of the value that the transform selects: [`Self::update_shape`] without
+    /// [`Self::removed_axis`], or exactly [`Self::update_shape`] when the transform removes no axis.
+    fn output_shape(&self) -> Shape {
+        Shape::new(
+            self.starts
+                .iter()
+                .zip(self.limits.iter())
+                .enumerate()
+                .filter(|(axis, _)| Some(*axis) != self.removed_axis)
+                .map(|(_, (start, limit))| Dimension::Static(limit - start))
                 .collect(),
         )
     }
