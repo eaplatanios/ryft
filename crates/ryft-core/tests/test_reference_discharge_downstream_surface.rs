@@ -1975,11 +1975,11 @@ fn test_downstream_transform_overlap_and_batch() {
     let root = RegisterIrType::Reference(ReferenceType::new(RegisterType));
     let value = |atom: usize| ValueId::new(RegionId::new(0), AtomId::new(atom));
     let empty = ReferenceTransformPath::<RegisterTransform>::root();
-    let low = empty.with_transform(RegisterTransform::Half(RegisterHalf::Low));
-    let high = empty.with_transform(RegisterTransform::Half(RegisterHalf::High));
-    let low_high = low.with_transform(RegisterTransform::Half(RegisterHalf::High));
-    let bit_of_1 = empty.with_bound_transform(RegisterTransform::Bit, vec![value(1)]);
-    let bit_of_2 = empty.with_bound_transform(RegisterTransform::Bit, vec![value(2)]);
+    let low = empty.clone().with_transform(RegisterTransform::Half(RegisterHalf::Low));
+    let high = empty.clone().with_transform(RegisterTransform::Half(RegisterHalf::High));
+    let low_high = low.clone().with_transform(RegisterTransform::Half(RegisterHalf::High));
+    let bit_of_1 = empty.clone().with_bound_transform(RegisterTransform::Bit, vec![value(1)]);
+    let bit_of_2 = empty.clone().with_bound_transform(RegisterTransform::Bit, vec![value(2)]);
     assert_eq!(low.overlap(&high, &root), ReferenceViewOverlap::Disjoint);
     assert_eq!(low.overlap(&low, &root), ReferenceViewOverlap::Same);
     assert_eq!(empty.overlap(&empty, &root), ReferenceViewOverlap::Same);
@@ -2754,7 +2754,10 @@ fn test_downstream_lazy_bit_view_accesses_one_bit_of_its_root() {
     let root = Reference::new(RegisterValue::Register(5)).unwrap();
     let viewed =
         ReferenceView::<_, RegisterTransform, RegisterValue>::new(RegisterValue::Reference(root.clone())).unwrap();
-    let bit = viewed.clone().with_transform(RegisterTransform::Bit, vec![RegisterValue::Register(1)]).unwrap();
+    let bit = viewed
+        .clone()
+        .with_bound_transform(RegisterTransform::Bit, vec![RegisterValue::Register(1)])
+        .unwrap();
     assert_eq!(bit.root().reference_id(), Some(root.id()));
     assert_eq!(bit.read(), Ok(RegisterValue::Register(0)));
     assert_eq!(bit.write(&RegisterValue::Register(1)), Ok(()));
@@ -2765,7 +2768,7 @@ fn test_downstream_lazy_bit_view_accesses_one_bit_of_its_root() {
     assert_eq!(root.read(), Ok(RegisterValue::Register(7)));
     assert!(matches!(bit.write(&RegisterValue::Register(2)), Err(ProgramError::InvalidArgument { message })
         if message == "a register bit holds 0 or 1 but 2 was stored into one"));
-    let invalid = viewed.with_transform(RegisterTransform::Bit, vec![RegisterValue::Register(64)]).unwrap();
+    let invalid = viewed.with_bound_transform(RegisterTransform::Bit, vec![RegisterValue::Register(64)]).unwrap();
     assert!(matches!(invalid.read(), Err(ProgramError::InvalidArgument { message })
         if message == "bit index 64 is out of range for a 64-bit register"));
     assert_eq!(root.read(), Ok(RegisterValue::Register(7)));

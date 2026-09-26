@@ -73,8 +73,6 @@ pub trait ReferenceAccessOperation: Operation {
     ) -> Result<Self, ProgramError>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns the validated access descriptor of each input of an instruction that applies `operation` to `input_count`
 /// inputs, indexed by input position. Accesses map to their [`ReferenceAccessDescriptor`] while ordinary inputs,
 /// including the trailing transform bindings, map to [`None`].
@@ -103,10 +101,16 @@ pub fn validated_reference_access_descriptors<O: ReferenceAccessOperation>(
     reference_access_layout(operation, input_count).map_err(|(_, message)| ProgramError::MalformedProgram(message))
 }
 
-/// Replaces one reference input's path and consecutive dynamic bindings while preserving instruction outputs,
-/// attached regions, and provenance. Later binding groups shift automatically because their ranges are derived from
-/// the updated operation. Binding atom identifiers stay in the instruction's region namespace. The caller validates
-/// the resulting input and output types when adding the returned instruction to its destination builder.
+/// Returns a copy of `instruction` whose reference access at `input_index` applies `transforms`, with `bindings` as
+/// their dynamic inputs, in place of its current transforms and bindings. Everything else (i.e., the other inputs,
+/// including the binding groups of other accesses which shift as needed, outputs, attached regions, and provenance)
+/// is preserved.
+///
+/// Use this when a program transformation changes what an existing access selects, rather than rebuilding the
+/// operation by hand (e.g., prepending an index for a newly mapped batch axis, or dropping a leading index that
+/// a region boundary already applies). `bindings` are atoms of the instruction's own region, like the rest of its
+/// inputs. Note that this function validates only the input layout. Input and output types are checked when the
+/// returned instruction is added to a [`ProgramBuilder`](crate::ProgramBuilder).
 pub fn rewrite_reference_access_transforms<O: ReferenceAccessOperation>(
     instruction: &Instruction<O>,
     input_index: usize,

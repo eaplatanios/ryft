@@ -19,10 +19,9 @@
 //!
 //! A program value of reference type is also a handle. Several values may name the same allocation,
 //! so their distinct [`ValueId`](crate::ValueId)s do not establish that their state is independent.
-//! [`ReferenceAlias`](crate::ReferenceAlias) declares that an operation output aliases one of its inputs. An alias
-//! preserves that allocation, either exposing its complete value or forming a view of part of it, as distinguished by
-//! [`ReferenceAliasKind`](crate::ReferenceAliasKind). Each handle resolves to one allocation; aliases do not combine
-//! multiple independent allocations.
+//! [`Operation::reference_output_identity_input`](crate::Operation::reference_output_identity_input) identifies outputs
+//! that preserve an input's complete allocation. Each handle resolves to one allocation (i.e., aliases do not combine
+//! multiple independent allocations).
 //!
 //! A _local_ allocation is created inside the program. An *external* allocation enters through an input or capture and
 //! belongs to the caller. [`ReferenceSource`] records this distinction during discharge. It determines whether state
@@ -43,14 +42,14 @@
 //! Each operation owns its type inference, effects, interpretation, and transform rules. Reference accesses and
 //! lifetime changes are declared through [`ReferenceEffect`](crate::ReferenceEffect), allowing program analyses to
 //! preserve state dependencies even when an instruction's outputs are unused. Numeric operations act on values read
-//! from references, rather than implicitly reading reference operands.
+//! from references, rather than implicitly reading reference inputs.
 //!
 //! # Views and Program Analysis
 //!
-//! A view is an alias that exposes part of an allocation's value. For example, an array reference slice can expose
-//! elements `2..5`. Writing through it updates those elements in the original allocation. The view and the complete
-//! reference share one lifetime. Consuming through a narrowing view is rejected because consumption invalidates the
-//! whole allocation, including handles that expose other elements.
+//! A view addresses part of an allocation for one access and is obtained by applying a path of reference transforms to
+//! the complete root. For example, an array slice can address elements `2..5`. Writing through the resulting view
+//! updates those elements in the original allocation. The access names the complete root, so every view shares the
+//! root's lifetime. Consuming accesses require an empty transform path.
 //!
 //! [`ReferenceAnalysis`] identifies allocations as [`ReferenceRoot`]s and records aliases, accesses, and reference
 //! relationships across region boundaries. It validates reference lifetimes and provides transitive access summaries
@@ -58,30 +57,27 @@
 //! [`RegionRef::reference_analysis`](crate::RegionRef::reference_analysis), supplying the capture information required
 //! by that boundary. It is an explicitly requested analysis, not a validation pass automatically run on every program.
 //!
-//! [`ReferenceView`] represents one view step, such as an array index or slice. [`ReferenceViewOperation`]
-//! associates views with operation outputs and defines how to validate and reapply them to transformed references.
-//! [`ReferenceViewAnalysis`] combines those steps into a [`ReferenceViewPath`] for each reference value, alongside the
-//! structural reference analysis. This lets transforms reconstruct a view without matching array operation variants.
+//! [`ReferenceTransform`] represents one transform, such as an array index or slice. [`ReferenceAccessOperation`]
+//! associates ordered transforms and binding ranges with each access input. [`ReferenceViewAnalysis`] validates those
+//! paths and records one [`ReferenceTransformPath`] per instruction and input, alongside structural root analysis.
 //!
-//! A static slice stores its bounds in the view. A dynamic index instead depends on an instruction input:
-//! [`ReferenceView::symbols`] lists that input's position, and analysis binds it to the corresponding
-//! [`ValueId`](crate::ValueId) in a [`ReferenceViewStep`]. A path's binding type depends on its consumer: analysis
-//! uses program [`ValueId`](crate::ValueId)s, discharge can use transformed values, and eager static paths use
-//! [`NoReferenceViewBinding`]. [`ReferenceViewOverlap`] distinguishes identical views, provably disjoint views, and
-//! views that may overlap. Disjoint views still share an allocation and its lifetime; the overlap result alone does
-//! not establish independent mutable state.
+//! A static slice stores its bounds in the transform. A dynamic transform consumes ordinary inputs according
+//! to [`ReferenceTransform::binding_count`] and analysis binds them to [`ValueId`](crate::ValueId)s in
+//! [`BoundReferenceTransform`]s. Discharge instead binds values in its reconstruction context, while eager static
+//! paths use [`NoReferenceTransformBinding`]. [`ReferenceViewOverlap`] distinguishes identical, disjoint, and
+//! potentially overlapping views. Disjoint views still share an allocation and its lifetime (i.e., overlap alone
+//! does not establish independent mutable state).
 //!
-//! Attached regions receive complete reference handles and construct their views with instructions inside the region.
-//! Any required index is an ordinary region input or computed value. For example, a
-//! [`ScanOperation`](crate::ScanOperation) body receives an explicit iteration index and can use it to index a
-//! reference passed to the body. The generic view analysis needs no scan-specific symbol or implicit boundary view.
+//! Attached regions receive complete reference handles. Their access instructions carry transform paths and receive
+//! any required indices as ordinary inputs or computed values. For example, a [`ScanOperation`](crate::ScanOperation)
+//! body receives an explicit iteration index that can bind a dynamic transform. Analysis needs no scan-specific symbol.
 //!
 //! # Discharging Mutable State
 //!
 //! Reference discharge rewrites mutable state into explicit immutable values. For example, a write followed by a read
 //! of a local reference becomes a direct use of the written value. Branches and loops thread the current state through
-//! their inputs and outputs. [`ReferenceDischargeReference`] is the transform's temporary handle for an allocation and
-//! its policy-defined view metadata; it is distinct from an eager reference.
+//! their inputs and outputs. [`ReferenceDischargeReference`] is the transform's temporary root handle for an allocation
+//! and it is distinct from an eager reference. Accesses supply their transforms and bindings to the discharge policy.
 //!
 //! [`Program::discharge_references`](crate::Program::discharge_references) returns a [`ReferenceDischargeResult`] whose
 //! program contains no surviving reference types or operations, including in attached regions. Local allocations are
@@ -100,8 +96,8 @@
 //!
 //! Different layers enforce the constraints for which they have enough information:
 //!
-//!   - [`ProgramBuilder::add_instruction`](crate::ProgramBuilder::add_instruction) tracks declared aliases and lifetime
-//!     changes in the region being built, rejecting accesses after consumption and consumption through a view.
+//!   - [`ProgramBuilder::add_instruction`](crate::ProgramBuilder::add_instruction) tracks identity forwarding and
+//!     lifetime changes in the region being built, rejecting accesses after consumption.
 //!   - Eager references validate their runtime state, including frozen or poisoned allocations and conflicting
 //!     accesses. [`ReferenceGeneration`] and [`ReferenceCompletion`] support updates whose backend work completes
 //!     asynchronously. [`ReferenceObservation`] provides a coherent observation of that state.
@@ -120,10 +116,12 @@
 //!
 //! # Extending the Reference Model
 //!
-//! A downstream value family defines its views through [`ReferenceView`] and [`ReferenceViewOperation`].
-//! Batching is optional and requires the separate [`BatchableReferenceView`] capability. Discharge uses a
-//! [`ReferenceDischargePolicy`], selected through [`ReferenceDischargeableType`], to read and replace values
-//! through that family's reference handles; additive updates also use [`ReferenceAccumulationPolicy`].
+//! A downstream value family defines its reference transforms through [`ReferenceTransform`] and
+//! [`ReferenceAccessOperation`]. Batching is optional and requires the separate [`BatchableReferenceTransform`]
+//! capability. Discharge uses a [`ReferenceDischargePolicy`] to read and replace values through that family's reference
+//! handles. Additive updates also use [`ReferenceAccumulationPolicy`]. [`ReferenceDischargeableType`] names the type
+//! family's default policy, while explicitly parameterized program discharge functions accept a downstream operation
+//! family's own policy.
 //!
 //! Operations participate through [`ReferenceDischargeableOperation`]. Structured operations own their branch or loop
 //! boundary rewrites, while [`ReferenceDischargeContext`] and [`ReferenceDischargeDriver`] provide state tracking,
@@ -185,11 +183,7 @@ pub enum ReferenceError {
     #[error(transparent)]
     Analysis(#[from] Box<ReferenceAnalysisError>),
 
-    /// A reference view description is invalid for its source or declared output type.
-    #[error(transparent)]
-    ViewValidation(#[from] ReferenceViewValidationError),
-
-    /// Reference view analysis rejects a program's view descriptions or paths. Note that the underlying
+    /// Reference view analysis rejects a program's access descriptors or transform paths. Note that the underlying
     /// [`ReferenceViewAnalysisError`] is boxed in order to not unnecessarily increase the size of [`ReferenceError`].
     #[error(transparent)]
     ViewAnalysis(#[from] Box<ReferenceViewAnalysisError>),
@@ -211,13 +205,14 @@ impl From<ReferenceViewAnalysisError> for ReferenceError {
 
 mod analysis;
 mod discharge;
+mod operations;
+mod transforms;
 mod types;
 mod values;
-mod views;
 
 pub use analysis::{
     ReferenceAccess, ReferenceAliasEdge, ReferenceAnalysis, ReferenceAnalysisError, ReferenceRegionInputBinding,
-    ReferenceRoot, ReferenceTransitiveAccess,
+    ReferenceRoot, ReferenceTransitiveAccess, ReferenceViewAnalysis, ReferenceViewAnalysisError,
 };
 pub use discharge::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
@@ -229,17 +224,22 @@ pub use discharge::{
     ReferenceDischargeableType, ReferenceSource, discharge_local_reference_operation,
     discharge_positional_region_operation, discharge_reference_free_operation,
 };
+pub use operations::{
+    ReferenceAccessDescriptor, ReferenceAccessOperation, rewrite_reference_access_transforms,
+    validated_reference_access_descriptors,
+};
+pub use transforms::{
+    BatchableReferenceTransform, BoundReferenceTransform, NoReferenceTransform, NoReferenceTransformBinding,
+    ReferenceTransform, ReferenceTransformPath, ReferenceViewOverlap, batch_reference_transforms,
+    infer_reference_view_type,
+};
 pub use types::{NoReferent, ReferenceMemberType, ReferenceType, ReferenceTypeRefinements};
 pub use values::{
     PreparedReferenceReplacement, ReadyOrPendingReferenceGuard, ReadyReferenceGuard, Reference, ReferenceBoundary,
     ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion, ReferenceCompletionBackend,
     ReferenceGeneration, ReferenceId, ReferenceIdentity, ReferenceObservation, ReferenceReplacementPreparation,
-    ReferenceReplacementTransaction, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
+    ReferenceReplacementTransaction, ReferenceView, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
     validate_reference_boundary,
-};
-pub use views::{
-    BatchableReferenceView, NoReferenceViewBinding, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError,
-    ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError,
 };
 
 #[cfg(test)]
@@ -299,29 +299,14 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_error_from_reference_view_validation_error() {
-        let validation_error =
-            ReferenceViewValidationError::TypeMismatch { expected: "f32[3]".to_string(), actual: "f32[2]".to_string() };
-        let error = ReferenceError::from(validation_error.clone());
-        assert_eq!(error, ReferenceError::ViewValidation(validation_error));
-        assert_eq!(
-            error.to_string(),
-            "view declares referent type `f32[2]` but derives referent type `f32[3]` from its source",
-        );
-    }
-
-    #[test]
     fn test_reference_error_from_reference_view_analysis_error() {
-        let analysis_error = ReferenceViewAnalysisError::MissingView {
-            operation: "view",
+        let analysis_error = ReferenceViewAnalysisError::InvalidAccess {
             instruction: InstructionId::new(RegionId::new(0), 1),
-            output_index: 0,
+            input_index: 0,
+            message: "invalid binding".to_string(),
         };
         let error = ReferenceError::from(analysis_error.clone());
         assert_eq!(error, ReferenceError::ViewAnalysis(Box::new(analysis_error)));
-        assert_eq!(
-            error.to_string(),
-            "operation `view` at ^0[1] declares a reference view at output 0 but describes no view",
-        );
+        assert_eq!(error.to_string(), "invalid reference access at ^0[1] input 0: invalid binding",);
     }
 }

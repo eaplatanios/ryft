@@ -79,7 +79,7 @@ pub enum ArrayReferenceViewError {
 impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root, ArrayReferenceTransform, Binding> {
     /// Selects a static position on `axis`, removing that dimension from the viewed referent.
     pub fn index(self, axis: usize, index: usize) -> Result<Self, ProgramError> {
-        self.with_transform(
+        self.with_bound_transform(
             ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) },
             Vec::new(),
         )
@@ -87,13 +87,13 @@ impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root
 
     /// Selects the supplied static unit-stride ranges from the currently viewed referent.
     pub fn slice(self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
-        self.with_transform(ArrayReferenceTransform::Slice { axes: axes.to_vec() }, Vec::new())
+        self.with_bound_transform(ArrayReferenceTransform::Slice { axes: axes.to_vec() }, Vec::new())
     }
 
     /// Selects a dynamic position on `axis`. Construction validates the scalar integer binding's type and memory
     /// space; concretization and negative-index normalization happen at the eventual access.
     pub fn dynamic_index(self, axis: usize, index: &Binding) -> Result<Self, ProgramError> {
-        self.with_transform(
+        self.with_bound_transform(
             ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic },
             vec![index.clone()],
         )
@@ -1063,7 +1063,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         // incrementally instead of re-folding the complete chain from the root type. Derivation is purely structural:
         // holder liveness is checked only when the resulting handle accesses state.
         let referent = transform.output_type(self.r#type.referent())?;
-        let path = self.path.with_transform(transform);
+        let path = self.path.clone().with_transform(transform);
         Ok(Self { root: self.root.clone(), path, r#type: ReferenceType::new(referent) })
     }
 
@@ -1115,7 +1115,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
                 _ => transform.clone(),
             };
             referent = transform.output_type(&referent)?;
-            path.append(ReferenceTransformPath::root().with_transform(transform));
+            path.push_transform(transform);
         }
         if !remaining.is_empty() {
             return Err(
@@ -1756,18 +1756,20 @@ mod tests {
     fn test_array_reference_transform_overlap() {
         let root = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4, 3])));
         let empty: ArrayReferenceTransformPath = ArrayReferenceTransformPath::root();
-        let rows_0_1 = empty.with_transform(ArrayReferenceTransform::Slice {
+        let rows_0_1 = empty.clone().with_transform(ArrayReferenceTransform::Slice {
             axes: vec![ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(0, 3, 1)],
         });
-        let rows_1_2 = empty.with_transform(ArrayReferenceTransform::Slice {
+        let rows_1_2 = empty.clone().with_transform(ArrayReferenceTransform::Slice {
             axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)],
         });
-        let rows_2_3 = empty.with_transform(ArrayReferenceTransform::Slice {
+        let rows_2_3 = empty.clone().with_transform(ArrayReferenceTransform::Slice {
             axes: vec![ArraySliceAxis::new(2, 2, 1), ArraySliceAxis::new(0, 3, 1)],
         });
         let row_1 = empty
+            .clone()
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
         let column_0 = empty
+            .clone()
             .with_transform(ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Static(0) });
 
         // Static indices fold to one range per root axis: disjoint ranges on any axis make the paths disjoint,
@@ -1785,11 +1787,14 @@ mod tests {
 
         // Rank changes are tracked while folding: an index removes its axis, so a slice that follows it addresses the
         // remaining root axes, and different transform sequences that select the same indices are the same.
-        let row_1_columns_1_2 =
-            row_1.with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
+        let row_1_columns_1_2 = row_1
+            .clone()
+            .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
         let row_1_column_1 = row_1
+            .clone()
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
         let rows_1_columns_1_2_row_0 = empty
+            .clone()
             .with_transform(ArrayReferenceTransform::Slice {
                 axes: vec![ArraySliceAxis::new(1, 1, 1), ArraySliceAxis::new(1, 2, 1)],
             })
@@ -1802,7 +1807,7 @@ mod tests {
 
         // The complete root is the same as itself and as a slice spanning every axis, and may overlap with any
         // narrowing path.
-        let complete = empty.with_transform(ArrayReferenceTransform::Slice {
+        let complete = empty.clone().with_transform(ArrayReferenceTransform::Slice {
             axes: vec![ArraySliceAxis::new(0, 4, 1), ArraySliceAxis::new(0, 3, 1)],
         });
         assert_eq!(empty.overlap(&empty, &root), ReferenceViewOverlap::Same);
@@ -1816,12 +1821,12 @@ mod tests {
         let first = ValueId::new(RegionId::new(0), AtomId::new(1));
         let second = ValueId::new(RegionId::new(0), AtomId::new(2));
         let other_region = ValueId::new(RegionId::new(1), AtomId::new(1));
-        let row_first = empty.with_bound_transform(symbolic.clone(), vec![first]);
-        let row_second = empty.with_bound_transform(symbolic.clone(), vec![second]);
-        let row_other_region = empty.with_bound_transform(symbolic.clone(), vec![other_region]);
+        let row_first = empty.clone().with_bound_transform(symbolic.clone(), vec![first]);
+        let row_second = empty.clone().with_bound_transform(symbolic.clone(), vec![second]);
+        let row_other_region = empty.clone().with_bound_transform(symbolic.clone(), vec![other_region]);
         let shifted_row_first = rows_1_2.with_bound_transform(symbolic.clone(), vec![first]);
         assert_eq!(
-            row_first.overlap(&empty.with_bound_transform(symbolic.clone(), vec![first]), &root),
+            row_first.overlap(&empty.clone().with_bound_transform(symbolic.clone(), vec![first]), &root),
             ReferenceViewOverlap::Same
         );
         assert_eq!(row_first.overlap(&row_second, &root), ReferenceViewOverlap::MayOverlap);
@@ -1832,7 +1837,7 @@ mod tests {
         assert_eq!(row_first.overlap(&shifted_row_first, &root), ReferenceViewOverlap::MayOverlap);
         // Equal offsets with different extents also clamp differently: a large index selects row 3 in the
         // whole root but row 1 in its first two rows.
-        let shortened_row_first = rows_0_1.with_bound_transform(symbolic.clone(), vec![first]);
+        let shortened_row_first = rows_0_1.clone().with_bound_transform(symbolic.clone(), vec![first]);
         assert_eq!(row_first.overlap(&shortened_row_first, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(
             row_first
@@ -1854,8 +1859,9 @@ mod tests {
         // binding, a non-reference root, or a root without a static shape) is conservatively reported as possibly
         // overlapping rather than failing.
         let out_of_bounds = empty
+            .clone()
             .with_transform(ArrayReferenceTransform::Index { axis: 2, index: ArrayReferenceTransformIndex::Static(0) });
-        let unbound = empty.with_transform(symbolic);
+        let unbound = empty.clone().with_transform(symbolic);
         assert_eq!(out_of_bounds.overlap(&rows_2_3, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(
             empty
@@ -2050,7 +2056,7 @@ mod tests {
             ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)] };
         let index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) };
         let sliced = root.with_transform(slice);
-        let indexed = sliced.with_transform(index);
+        let indexed = sliced.clone().with_transform(index);
         assert_eq!(sliced.output_type(&root_type), Ok(ArrayType::new_static(DataType::F32, [2, 3])));
         assert_eq!(indexed.output_type(&root_type), Ok(ArrayType::new_static(DataType::F32, [3])));
     }

@@ -54,9 +54,9 @@ pub use control_flow::*;
 pub use cumulative::*;
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::{
-    CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME, CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation,
-    LINEAR_CALL_OPERATION_NAME, LinearCallOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation,
-    StopGradients, custom_jvp, custom_vjp,
+    CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME, CustomDerivativeBuilder, CustomJvp, CustomJvpOperation,
+    CustomVjp, CustomVjpOperation, LINEAR_CALL_OPERATION_NAME, LinearCallOperation, STOP_GRADIENT_OPERATION_NAME,
+    StopGradient, StopGradientOperation, StopGradients, custom_derivative_at, custom_jvp, custom_vjp,
 };
 pub use dimensions::{
     ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME,

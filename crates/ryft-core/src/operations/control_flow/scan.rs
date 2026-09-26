@@ -2011,7 +2011,15 @@ where
             for (instruction_index, input_position) in selections {
                 let normalized = normalized.get_or_insert_with(|| source_body.region().clone());
                 let instruction = &normalized.instructions[instruction_index];
-                let descriptor = instruction.operation().reference_access_descriptor(input_position).unwrap();
+
+                // The selection pass above found a descriptor at this position, and rewriting another access of the
+                // same instruction keeps this access's descriptor, so the lookup cannot fail.
+                let descriptor =
+                    validated_reference_access_descriptors(instruction.operation(), instruction.inputs().len())?
+                        .into_iter()
+                        .nth(input_position)
+                        .flatten()
+                        .unwrap();
                 let bindings = instruction.inputs()[descriptor.bindings()].iter().skip(1).copied().collect();
                 normalized.instructions[instruction_index] = rewrite_reference_access_transforms(
                     instruction,

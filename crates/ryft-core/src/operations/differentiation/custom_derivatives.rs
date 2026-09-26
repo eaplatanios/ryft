@@ -266,7 +266,7 @@ mod tests {
         assert_eq!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| {
                 custom_derivative_at(x).jvp(
-                    |x| Ok(x.sin()?),
+                    |x| x.sin(),
                     |x, tangent| {
                         let tangent = x.cos()? * tangent;
                         Ok((x.sin()?, tangent.clone() + tangent))
@@ -279,7 +279,7 @@ mod tests {
             differentiate_at(Array::scalar(3.0).unwrap()).value_and_gradient(|x| {
                 custom_derivative_at(x)
                     .jvp(
-                        |x| Ok(x.sin()?),
+                        |x| x.sin(),
                         |x, tangent| {
                             let tangent = x.cos()? * tangent;
                             Ok((x.sin()?, tangent.clone() + tangent))

@@ -6,6 +6,8 @@
 
 **Architecture review:** 2026-09-10; includes a targeted substrate and primary-source refresh
 
+**Targeted research update:** 2026-09-25; SkySynth shared-prefix specialization and ZML/LLMD
+
 **Scope:** one inference system for agentic/RL rollouts, embedded use, and production online serving
 
 ## 1. Executive decision
@@ -88,6 +90,29 @@ universal winner.
 | MLC-LLM | Compiler-generated model libraries, JIT/AOT packaging, one portable runtime across server and local platforms, and programmable sub-request orchestration. | Strong portability precedent; less complete as a large distributed serving control plane. |
 | TGI | Rust request router, explicit router/model-server split, streaming, batching, metrics, and a clean production API boundary. | The project is now in maintenance mode and recommends engines such as vLLM/SGLang for new deployments. |
 | llama.cpp | Dependency-light embedding, simple server APIs, broad local hardware support, GGUF, aggressive weight/KV quantization, prompt caching, grammars, and CPU/GPU hybrid placement. | Optimize Ryft's ergonomics against it, but do not copy a local-first execution architecture for cluster serving. |
+
+### SkySynth and ZML/LLMD: implications for this plan
+
+SkySynth is a synthesis workflow, not a released general-purpose inference runtime. Its reported 2.2x result concerns
+Qwen3-4B on one L4 with heavily shared long prefixes. The inspected public example pins two 24,576-token roots with
+32 branches each, warms the roots outside timing, and uses random token prompts. Its published evaluator and task
+specification do not include the generated engine or sufficient baseline artifacts to reproduce the headline result.
+Treat this as motivation for shared-prefix decode experiments, not a Ryft target or evidence of general superiority.
+
+The important mechanism is grouped cascade attention: prefix caching avoids repeated prefill and duplicate storage,
+whereas grouping queries can also avoid repeatedly reading shared prefix KV during decode. Hydragen explains this
+mechanism; FlashInfer already exposes cascade primitives. Baselines must enable their applicable optimized paths.
+SkySynth's reported evaluator failures also motivate correctness tests on the actual long-context optimized path and
+independent checks of token accounting and first-token delivery.
+
+ZML/LLMD is a close compiler-backed architectural peer. Its alpha advertises five accelerator targets, Gemma DFlash,
+and direct remote model loading. These are useful directions, but neither platform coverage nor its up-to-10x per-user
+DFlash claim establishes comparative SLO goodput. The launch tables lack a matched non-speculative comparison and a
+complete workload/configuration manifest. Add it as an optional measured peer when a pinned artifact supports our
+contract; retain the established baselines. The concrete additions below are parallel-draft capability, bounded model
+loading, deployment artifacts, and startup/streaming measurements. They do not expand the initial hardware scope.
+The inspected ZML source revision contains compiler and loading infrastructure, but no LLMD server or DFlash
+implementation; its LLM CLI is not evidence for the server's scheduling or feature-combination correctness.
 
 ### Durable conclusions
 
@@ -526,12 +551,23 @@ determinism mode, compiler identity, and relevant XLA flags.
 Start with a small geometric profile family. Collect misses and padding waste, then tune bucket boundaries from traces.
 Do not compile an unbounded Cartesian product.
 
+Record each optimized profile's validity assumptions and measured performance envelope: model/numerical semantics,
+shared-prefix length, group occupancy, suffix lengths, and supported masks/layouts. Group membership, page addresses,
+and logical lengths remain runtime metadata within bounded capacities; request identities and prefix contents do not
+become compilation keys. Choose among warmed variants and ordinary paged fallback as traffic changes. Charge grouping,
+provider planning, scratch space, and metadata upload to the optimization; reject per-prefix or per-token compilation.
+
 ### Command buffers/graphs
 
 XLA already performs command-buffer/CUDA-graph extraction for supported thunks. Ryft must verify, per profile, that the
 whole step—including custom calls, collectives, cache mutation, and sampler—is capture-safe. The kernel registry records
 graph safety and stable workspace requirements. A profile that cannot capture remains correct but is not accepted for a
 latency target until measured.
+
+Where tensor parallelism is enabled, stress captured collectives under allocator pressure, weight refits, and buffer
+retirement/reallocation. Stable virtual addresses alone do not establish that captured communication registrations or
+mappings remain valid. Verify the actual backend's lifetime requirements and invalidate/rebuild captures when needed;
+do not transplant another runtime's compiler flags without reproducing its failure case.
 
 ## 11. Kernel subsystem
 
@@ -567,6 +603,21 @@ Separate provider selection from per-batch kernel planning. A selected provider 
 metadata, split choices, or workspace initialization based on actual lengths. Specify that work, its host/device
 placement, capture compatibility, and cost explicitly; compile-time selection must not conceal a synchronizing
 `plan` call on every token. Validate reuse across length distributions and profile changes with the actual provider.
+
+### Shared-prefix decode attention
+
+In Phase 2, evaluate grouped cascade attention using a validated provider before implementing a native kernel. Start
+with independent shared-prefix groups and private suffixes; add hierarchical groups only when traces justify them.
+Compute attention for disjoint prefix/suffix partitions and merge their outputs using their log-sum-exp normalizers.
+This preserves the mathematical softmax result; floating-point agreement still requires explicit tolerance tests.
+Never reuse query-dependent attention outputs across requests or average partition outputs without normalization.
+
+The scheduler supplies group-to-query mappings and partition/page boundaries from valid, version-compatible cache
+entries. Locality remains subordinate to deadlines and bounded starvation. Validate positions, causal/window masks,
+GQA, softcapping, and Gemma's different layer attention patterns; only genuinely common visible KV regions qualify.
+Retain ordinary paged attention for unsupported semantics or unfavorable occupancy/suffix lengths. Include empty and
+fully masked partitions in correctness coverage. Measure KV traffic and complete step latency alongside serving
+outcomes: fewer prefix reads do not guarantee a win when weight traffic or dense computation dominates.
 
 ### Fallback order
 
@@ -623,13 +674,26 @@ accounts for their state/pages exactly like speculative work.
 
 Use a protocol, not one draft-model flag:
 
-- proposer: n-gram, prompt lookup, draft model, Medusa/EAGLE/MTP, or user tokens;
+- proposer: n-gram, prompt lookup, draft model, Medusa/EAGLE/MTP, block diffusion such as DFlash, or user tokens;
 - proposal shape: chain or tree;
 - verifier: target-model acceptance policy;
 - state checkpoint: fork, commit accepted prefix, roll back remainder;
 - adaptive controller: enablement and depth from acceptance, concurrency, and memory cost.
 
 Speculation is allowed to turn itself off. It often helps low-concurrency latency and can hurt saturated throughput.
+
+Represent parallel block drafting without forcing it through an autoregressive draft loop. DFlash conditions a separate
+drafter on target-model features and proposes a block in one forward pass. Provide optional, explicitly selected target
+feature outputs, bounded feature buffers, and draft state in the existing execution/state contracts. Ordinary decoding
+must not materialize these features. Feature buffers follow the same accepted-frontier, rollback, and completion-safe
+reclamation rules as draft state. Pin draft/target checkpoint compatibility and invalidate stale features on weight
+changes; an RL update may require disabling or recalibrating the drafter.
+
+After basic speculative rollback works, compare a compatible Gemma DFlash checkpoint with MTP and no speculation.
+Prove the verifier's declared greedy or stochastic distribution contract, including grammar/logits processing; do not
+infer stochastic exactness from greedy agreement or from a method's headline claim. Charge feature extraction,
+draft weights/state, verification, rejected work, and reduced serving capacity to effective speedup. Adapt block size
+and enablement using measured latency, acceptance, concurrency, and memory limits.
 
 ## 13. RL and agentic integration
 
@@ -718,6 +782,20 @@ workload demonstrate better SLO goodput.
 - Health/liveness/readiness, graceful drain, rolling model/adapter update, and reproducible configuration snapshots.
 - Tokenizer/chat-template adapters are CPU components and can scale separately from GPU workers.
 - Python bindings wrap the Rust API; they do not become an internal execution plane.
+
+### Model loading and deployment artifacts
+
+Use a small model-source interface for local files and later Hugging Face/object-store range reads. Resolve immutable
+checkpoint/tokenizer revisions before loading; verify tensor names, shapes, dtypes, and shard completeness before
+publication. Bound host staging and concurrent reads, load required shards directly where supported, and make partial
+loads cancellable and reclaimable. Remote access still transfers bytes; distinguish avoided intermediate copies from
+network, host-to-device, resharding, and conversion costs. Reuse the existing versioned weight-publication protocol.
+
+Ship target-specific runtime/provider artifacts with pinned compiler, PJRT, kernel, and driver compatibility metadata.
+Document compilation and warmup requirements separately from binary packaging; a self-contained server does not imply
+all model profiles are precompiled. Readiness requires loaded weights and validated warmed profiles. Keep the initial
+NVIDIA package small and reproducible; expand accelerator support through a model/feature/dtype/topology capability
+matrix with numerical, mutation, capture, and completion tests on each claimed platform.
 
 ### Metrics and traces
 
@@ -854,12 +932,16 @@ Deliverables:
       cache writes, device sampling, persistent state, fixed-capacity outputs, and real per-batch planning metadata.
 - [ ] Prove repeated calls and profile changes preserve state addresses without pool-sized copies or hidden host waits.
       Validate graph capture/replay, workspace lifetime, future-token feedback, and bounded metadata-buffer reuse.
+      For tensor-parallel probes, include captured collectives under memory pressure and buffer retirement/reallocation.
 - [ ] Exercise outstanding launches touching disjoint pages in one pool and dependent launches touching shared state.
       Identify whole-buffer serialization; prove safe access and measure whether the design meets overlap budgets.
 - [ ] Inject cancellation after submission, partial writes, asynchronous failure, and delayed completion; verify no
       premature publication or reclamation. Define quarantine/recovery when device quiescence cannot be established.
 - [ ] Define Gemma numerical oracles against the official JAX implementation and an external serving engine. Build
       minimal trace replay and reporting for controlled and quality-constrained baseline comparisons.
+- [ ] Add adversarial harness checks: real first-token delivery, independently reconciled generated token IDs/counts,
+      long-prefix information dependence, and optimized-path numerical checks. Freeze correctness requirements separately
+      from tuning objectives; include dynamic arrivals, growing suffixes, cancellation, and weight-version changes.
 
 Exit gate: the actual-provider probe proves the state/graph/overlap mechanism on the declared topology, or the design
 is revised and retested before engine interfaces stabilize. Keep HLO/buffer-assignment evidence, address checks, device
@@ -910,12 +992,16 @@ advanced policy, and the complete lifecycle matrix are not prerequisites for thi
 Deliverables:
 
 - [ ] Add prefix publication/indexing, partial-page COW, eviction, preemption/replay, and completion-safe reclamation.
+- [ ] Evaluate grouped cascade decode attention with reusable runtime group metadata, ordinary paged fallback, and
+      deadline/fairness bounds. Start with independent groups; gate hierarchy on measured benefit.
 - [ ] Tune chunked prefill and mixed `extend` execution against homogeneous profiles using token and state budgets.
       Add deadlines/slack, fairness/starvation bounds, and deterministic scheduler decision replay.
 - [ ] Add session pause/resume, retention/expiry, and cost-aware admission for tool-paused and bursty workloads.
 - [ ] Extend conformance coverage for each feature, including hybrid checkpoint validity and shared-prefix cancellation.
 - [ ] Run controlled ablations for prefix retention, mixed execution, and lookahead, including cold-cache and hostile
-      reuse distributions. Diagnose padding, launch, kernel, and state-memory costs against the registered budgets.
+      reuse distributions. Separately ablate cascade attention with prefix storage reuse held constant; vary group size,
+      prefix/suffix lengths, and independent/nested roots. Charge grouping/planning costs and measure KV traffic.
+      Diagnose padding, launch, kernel, and state-memory costs against the registered budgets.
 
 Phase exit: the first full Gemma workload/SLO envelope is reproducible against pinned baselines with bounded starvation,
 stable memory, and attributable latency and goodput. State and request invariants remain shared across executors.
@@ -952,7 +1038,8 @@ Deliverables:
 - [ ] Add sleep/offload/wake, colocated role arbitration, and collective/RDMA weight transfer where measured demand
       justifies them. Complete conformance coverage alongside each feature.
 - [ ] Add grammar compilation/masking and deterministic-span fast forwarding.
-- [ ] Add n-gram speculation, then enable Gemma's MTP proposer with adaptive depth/enablement.
+- [ ] Add n-gram speculation, then compare compatible Gemma MTP and DFlash proposers with adaptive enablement/depth
+      or block size. Validate feature-buffer ownership, target/draft compatibility, and sampling semantics before use.
 - [ ] Add quantized weights/KV and adapter/LoRA registry based on measured demand.
 - [ ] Bring up Qwen3.6 27B as the second model, including hybrid recurrent/attention state behind the existing
       `SequenceState` and scheduler contracts.
@@ -969,6 +1056,8 @@ Deliverables:
 - [ ] Hot model/adapter load, rolling update, overload/load-shed policy, and operational runbooks.
 - [ ] Production trace capture/replay, capacity estimator, and configuration advisor.
 - [ ] Security review of model files, grammars, request limits, FFI plugins, and multi-tenant state isolation.
+- [ ] Add bounded remote checkpoint loading and target-specific runtime packages using the same weight publication path.
+      Measure cold/warm startup, host-memory peaks, cache hits, and failures before expanding storage/platform support.
 - [ ] Soak, chaos, restart, fragmentation, and long-context tests.
 
 Exit gate: production SLOs, recovery, observability, and operations are demonstrated under representative failure and
@@ -1003,12 +1092,13 @@ sampling and quality policy, TTFT/ITL/E2E SLOs, fairness bound, and memory limit
 maximum policy lag, retained-version count, and trainer/transfer topology. Hardware and absolute latency values remain
 unselected in this proposal; choose and record them before implementation tuning, not after seeing favorable results.
 
-Register and test three mechanisms independently and together:
+Register and test four mechanisms independently and together:
 
 | Hypothesis | Mechanism and comparison | Success measure |
 |---|---|---|
 | Overlap reduces host-induced GPU idle time. | Device token feedback, metadata lookahead, and graph replay; compare the same engine with lookahead enabled/disabled. | Lower idle gaps and better SLO goodput or ITL without increased cancellation errors or unacceptable wasted work. |
 | State-aware scheduling improves agent serving. | Prefix/session retention and mixed token execution; independently disable retention and mixed execution under the same memory budget. | More completed requests meeting all SLOs, bounded starvation, and improved end-to-end agent latency where reuse exists. |
+| Grouped prefix attention reduces decode state traffic. | Hold prefix storage reuse constant and toggle cascade attention; sweep group occupancy, prefix/suffix lengths, and unrelated traffic. | Lower KV bytes read and better full-step latency/SLO goodput after grouping overhead, with numerical and fairness contracts preserved. |
 | Shared model and weight lifecycle improves rollout turnaround. | Reuse model/score semantics and resident profile families; compare a mature rollout integration under the same training, memory, and lag constraints. | Lower snapshot-to-accepted-rollout time and higher useful rollout yield after charging transfer, retention, and prefix rebuild. |
 
 ### Quantitative targets and cost budgets
@@ -1063,7 +1153,11 @@ Kernel microbenchmarks and a complete model-step trace must agree with the end-t
 - prompt/output/total tokens per GPU-second and per dollar;
 - HBM usage, page fragmentation, prefix hit, COW, eviction/recall, and transferred bytes;
 - host CPU, scheduler time, launch overhead, graph/profile hit rate, and compilation misses;
-- speculative acceptance/effective speedup;
+- speculative acceptance/effective speedup, feature/draft/verify costs, and accepted tokens per target verification;
+- streaming burst size and inter-burst stall percentiles in addition to per-token ITL; tokens delivered together must
+  not turn near-zero within-burst intervals into a claim of uniformly low user-visible latency;
+- artifact pull, checkpoint fetch, deserialization/conversion/resharding, compilation, warmup, and time-to-ready;
+  report cold/warm caches, peak host/device memory, temporary storage, and bytes transferred separately;
 - weight-update pause, transfer, publish, old-version drain, prefix rebuild, and snapshot-to-accepted-rollout time;
 - useful completed rollouts per GPU-second, discarded/stale rollout fraction, and end-to-end agent completion latency;
 - metadata-ring occupancy, GPU idle gaps, lookahead work discarded after stop/cancellation, and per-profile memory;
@@ -1088,6 +1182,12 @@ Kernel microbenchmarks and a complete model-step trace must agree with the end-t
   SLO goodput as completions satisfying all registered request SLOs, not merely accepted load or average token rate.
 - Repeat experiments with declared seeds and run durations, report uncertainty, and hold trace splits for final
   validation. Include cold/low-reuse controls and component ablations so benchmark-specific tuning is visible.
+- Independently validate output counts; SSE chunks and server-reported usage alone are not token oracles. TTFT starts
+  at request submission and ends at delivery of a real accepted output token. Count unfinished and failed work.
+- A Qwen3-4B/L4 SkySynth-shaped reproduction is optional diagnostic work, separate from Gemma acceptance. Random-token
+  shared-prefix bursts complement held-out real agent traces; they cannot replace semantic or realistic workload tests.
+- For DFlash/MTP, compare no-speculation and optimized baselines across concurrency and block sizes under the same
+  total device-memory budget. Measure streaming stalls and SLO goodput, not only acceptance or average tokens/user.
 - Treat project-reported numbers as hypotheses until reproduced in this harness.
 
 ## 19. Risks and explicit mitigations
@@ -1235,3 +1335,17 @@ faster, more complete, and more production-proven is not.
 - [PJRT concepts and async execution](https://openxla.org/xla/pjrt/cpp_api_overview)
 - [StableHLO dynamism](https://openxla.org/stablehlo/dynamism)
 - [JAX Pallas kernel language](https://docs.jax.dev/en/latest/pallas/index.html)
+
+### Targeted SkySynth and ZML/LLMD research
+
+- [SkySynth release and evaluator lessons](https://skydiscover-ai.github.io/blog-skysynth.html)
+- [SkySynth pinned inference example](https://github.com/skydiscover-ai/skydiscover/tree/c30ca1907b0084c7ef2d2ed4b6398d181a3fad0c/skydiscover/synthesize/examples/inference-engine)
+- [Hydragen: shared-prefix attention decomposition](https://arxiv.org/abs/2402.05099)
+- [FlashInfer cascade attention](https://docs.flashinfer.ai/api/cascade.html)
+- [ZML/LLMD product and platform overview](https://zml.ai/llmd/)
+- [ZML/LLMD alpha announcement and performance tables](https://zml.ai/posts/llmd/)
+- [ZML inspected source revision](https://github.com/zml/zml/tree/c6530f08d39d9c502bd2b3c7035d73bbaf7196c9)
+- [ZML bounded, shard-aware loading](https://github.com/zml/zml/blob/c6530f08d39d9c502bd2b3c7035d73bbaf7196c9/zml/io.zig)
+- [ZML backend compilation policy](https://github.com/zml/zml/blob/c6530f08d39d9c502bd2b3c7035d73bbaf7196c9/zml/Compiler.zig)
+- [DFlash paper](https://arxiv.org/abs/2602.06036)
+- [DFlash implementation and supported draft checkpoints](https://github.com/z-lab/dflash)
