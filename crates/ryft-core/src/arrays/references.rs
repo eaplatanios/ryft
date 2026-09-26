@@ -467,6 +467,13 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayReference<A> {
 /// bound to the body's explicit index input.
 pub type ArrayReferenceTransformPath<Binding = ValueId> = ReferenceTransformPath<ArrayReferenceTransform, Binding>;
 
+/// Array specialization of [`ReferenceViewAnalysis`], associating each reference access with its ordered
+/// [`ArrayReferenceTransformPath`]. Allocation roots and lifetimes come from the shared structural analysis.
+/// Dynamic bindings name ordinary values in the access instruction's own region. The generic
+/// [`references`](crate::programs::references) module owns allocation identity, lifetime and alias validation,
+/// transform path storage, and analysis while this specialization supplies array shapes and indexing semantics.
+pub type ArrayReferenceAnalysis = ReferenceViewAnalysis<ArrayReferenceTransform>;
+
 impl ArrayReferenceTransformPath {
     /// Returns the part of a root of type `root_type` that this path selects, as one [`ArraySliceAxis`] per root axis.
     ///
@@ -1105,6 +1112,215 @@ impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root
 
 // TODO(eaplatanios): Review from here onwards.
 
+/// Operation-family constructors for the canonical array operations that one array-reference transform path traversal
+/// stages.
+///
+/// Mapping between a reference root and the elements that one of its views selects uses static or dynamic slices,
+/// reshapes, and corresponding updates. Both eager handles and the
+/// [`ArrayReferenceDischarge`] policy walk the same [`ArrayReferenceTransformPath`]. This
+/// contract lets the staging consumer construct those operations in a closed operation family, so core array IR and
+/// backend-owned supersets share one traversal without matching operation names.
+///
+/// Per-access transform metadata is exposed through [`ReferenceAccessOperation`]. These constructors stage
+/// array-valued operations over discharged immutable state.
+pub trait ArrayReferenceTransformOperation: Operation<Type = ArrayIrType> {
+    /// Wraps a canonical homogeneous array reshape for reference-transform staging.
+    fn from_reference_reshape(operation: ReshapeOperation) -> Self;
+
+    /// Wraps a canonical homogeneous array slice for reference-transform staging.
+    fn from_reference_slice(operation: SliceOperation) -> Self;
+
+    /// Wraps a canonical homogeneous array update-slice for reference-transform staging.
+    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
+
+    /// Wraps a dynamic slice over discharged reference state.
+    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self;
+
+    /// Wraps a dynamic update over discharged reference state.
+    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self;
+}
+
+impl<A: Value<Type = ArrayType>> ArrayReferenceTransformOperation for ArrayIrOperation<A> {
+    fn from_reference_reshape(operation: ReshapeOperation) -> Self {
+        Self::Array(ArrayOperation::Reshape(operation))
+    }
+
+    fn from_reference_slice(operation: SliceOperation) -> Self {
+        Self::Array(ArrayOperation::Slice(operation))
+    }
+
+    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
+        Self::Array(ArrayOperation::UpdateSlice(operation))
+    }
+
+    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
+        Self::Array(ArrayOperation::DynamicSlice(operation))
+    }
+
+    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
+        Self::Array(ArrayOperation::DynamicUpdateSlice(operation))
+    }
+}
+
+/// [`ReferenceDischargePolicy`] of the array reference universe.
+///
+/// An array reference's referent is an [`ArrayType`]-typed array. Each access applies an
+/// [`ArrayReferenceTransformPath`] to its allocation, with dynamic indices bound to context values. The policy uses
+/// the same transform traversal as [`ArrayReference`]: reads extract the viewed array, while replacements and
+/// accumulations reconstruct the root through the transforms in reverse order, preserving values outside the view.
+/// Dynamic indices use dynamic slicing and updates with the negative-index and clamping behavior described by
+/// [`ArrayReferenceTransform`], so eager and discharged accesses address the same elements.
+///
+/// The generic [program reference module](crate::programs::references) owns discharge and state threading. This
+/// policy supplies array-IR reconstruction operations rather than a separate state interpreter.
+///
+/// The reconstruction context is bounded by [`Context`] rather than [`Domain`](crate::Domain) because the transform
+/// path traversal binds canonical slicing, reshape, and update operations into it. Their value-level capabilities are
+/// stated over [`ArrayType`]-typed values rather than the composite array IR, so the policy constructs them through the
+/// context's operation family.
+#[derive(Copy, Clone, Debug)]
+pub struct ArrayReferenceDischarge;
+
+impl<C: Context<Type = ArrayIrType>> ReferenceDischargePolicy<C> for ArrayReferenceDischarge
+where
+    C::Operation: ArrayReferenceTransformOperation,
+{
+    type Referent = ArrayType;
+    type Transform = ArrayReferenceTransform;
+    type Alias = ArrayReferenceTransformPath<C::Value>;
+
+    fn storage_alias(_referent: &ArrayType) -> ArrayReferenceTransformPath<C::Value> {
+        ArrayReferenceTransformPath::root()
+    }
+
+    fn apply_transforms(
+        _context: &C,
+        alias: &Self::Alias,
+        transforms: &[ArrayReferenceTransform],
+        bindings: &[C::Value],
+    ) -> Result<Self::Alias, ProgramError> {
+        let mut composed = alias.clone();
+        composed.append(ArrayReferenceTransformPath::from_transforms(transforms, bindings)?);
+        Ok(composed)
+    }
+
+    fn read(
+        context: &C,
+        current: &C::Value,
+        alias: &ArrayReferenceTransformPath<C::Value>,
+    ) -> Result<C::Value, ProgramError> {
+        let mut intermediates = alias.intermediates_in(&ContextTransformCarrier(context), current.clone())?;
+
+        // The traversal starts with the complete allocation, so the chain is nonempty and its final value is the part
+        // selected by this handle.
+        Ok(intermediates.pop().unwrap())
+    }
+
+    fn write(
+        context: &C,
+        current: &C::Value,
+        replacement: C::Value,
+        alias: &ArrayReferenceTransformPath<C::Value>,
+    ) -> Result<C::Value, ProgramError> {
+        alias.write_in(&ContextTransformCarrier(context), current.clone(), replacement)
+    }
+
+    fn swap(
+        context: &C,
+        current: &C::Value,
+        replacement: C::Value,
+        alias: &ArrayReferenceTransformPath<C::Value>,
+    ) -> Result<(C::Value, C::Value), ProgramError> {
+        alias.swap_in(&ContextTransformCarrier(context), current.clone(), replacement)
+    }
+}
+
+// Composite array-IR values deliberately expose no value-level addition: the composite family carries array payloads
+// through `ArrayIrOperation::Array` and lifts the type-generic `AddOperation<ArrayIrType>` into that member instead,
+// which is the same seam generic reverse mode uses to accumulate cotangents. Accumulation therefore binds the lifted
+// addition through the context, requiring nothing beyond the conversion the operation family already provides.
+impl<C: Context<Type = ArrayIrType>> ReferenceAccumulationPolicy<C> for ArrayReferenceDischarge
+where
+    C::Operation: ArrayReferenceTransformOperation + From<AddOperation<ArrayIrType>>,
+{
+    fn accumulate(
+        context: &C,
+        current: &C::Value,
+        update: C::Value,
+        alias: &ArrayReferenceTransformPath<C::Value>,
+    ) -> Result<C::Value, ProgramError> {
+        let carrier = ContextTransformCarrier(context);
+        let intermediates = alias.intermediates_in(&carrier, current.clone())?;
+        // Add at the selected leaf, then rebuild each enclosing slice without reading the leaf a second time.
+        let selected = intermediates.last().unwrap().clone();
+        let accumulated = carrier.bind(C::Operation::from(AddOperation::new()), &[&selected, &update])?;
+        alias.reconstruct_in(&carrier, &intermediates[..alias.transforms().len()], accumulated)
+    }
+}
+
+impl ReferenceDischargeableType for ArrayIrType {
+    type Policy = ArrayReferenceDischarge;
+}
+
+impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayIrOperation<A> {
+    type Transform = ArrayReferenceTransform;
+
+    fn base_input_count(&self) -> usize {
+        match self {
+            Self::ReferenceRead(operation) => operation.base_input_count(),
+            Self::ReferenceWrite(operation) => operation.base_input_count(),
+            Self::ReferenceAddUpdate(operation) => operation.base_input_count(),
+            Self::ReferenceSwap(operation) => operation.base_input_count(),
+            Self::ReferenceAtomicAddUpdate(operation) => operation.base_input_count(),
+            Self::ReferenceFreeze(_) => 1,
+            _ => 0,
+        }
+    }
+
+    fn reference_access_descriptor(
+        &self,
+        input_index: usize,
+    ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
+        match self {
+            Self::ReferenceRead(operation) => operation.reference_access_descriptor(input_index),
+            Self::ReferenceWrite(operation) => operation.reference_access_descriptor(input_index),
+            Self::ReferenceAddUpdate(operation) => operation.reference_access_descriptor(input_index),
+            Self::ReferenceSwap(operation) => operation.reference_access_descriptor(input_index),
+            Self::ReferenceAtomicAddUpdate(operation) => operation.reference_access_descriptor(input_index),
+            Self::ReferenceFreeze(_) if input_index == 0 => Some(ReferenceAccessDescriptor::new(&[], 1..1)),
+            _ => None,
+        }
+    }
+
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<ArrayReferenceTransform>,
+    ) -> Result<Self, ProgramError> {
+        match self {
+            Self::ReferenceRead(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceRead)
+            }
+            Self::ReferenceWrite(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceWrite)
+            }
+            Self::ReferenceAddUpdate(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceAddUpdate)
+            }
+            Self::ReferenceSwap(operation) => {
+                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceSwap)
+            }
+            Self::ReferenceAtomicAddUpdate(operation) => operation
+                .with_reference_access_transforms(input_index, transforms)
+                .map(Self::ReferenceAtomicAddUpdate),
+            _ if self.reference_access_descriptor(input_index).is_some() && transforms.is_empty() => Ok(self.clone()),
+            _ => Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` cannot replace the reference transforms at input {input_index}", self.name()),
+            }),
+        }
+    }
+}
+
 /// Normalized indices of one [`ArrayReferenceTransform`] applied to one statically shaped input.
 ///
 /// Both transform kinds reduce to taking one static unit-stride slice of the input, optionally followed by squeezing
@@ -1247,115 +1463,6 @@ impl RootIndexSelection {
     }
 }
 
-/// Operation-family constructors for the canonical array operations that one array-reference transform path traversal
-/// stages.
-///
-/// Mapping between a reference root and the elements that one of its views selects uses static or dynamic slices,
-/// reshapes, and corresponding updates. Both eager handles and the
-/// [`ArrayReferenceDischarge`] policy walk the same [`ArrayReferenceTransformPath`]. This
-/// contract lets the staging consumer construct those operations in a closed operation family, so core array IR and
-/// backend-owned supersets share one traversal without matching operation names.
-///
-/// Per-access transform metadata is exposed through [`ReferenceAccessOperation`]. These constructors stage
-/// array-valued operations over discharged immutable state.
-pub trait ArrayReferenceTransformOperation: Operation<Type = ArrayIrType> {
-    /// Wraps a canonical homogeneous array reshape for reference-transform staging.
-    fn from_reference_reshape(operation: ReshapeOperation) -> Self;
-
-    /// Wraps a canonical homogeneous array slice for reference-transform staging.
-    fn from_reference_slice(operation: SliceOperation) -> Self;
-
-    /// Wraps a canonical homogeneous array update-slice for reference-transform staging.
-    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
-
-    /// Wraps a dynamic slice over discharged reference state.
-    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self;
-
-    /// Wraps a dynamic update over discharged reference state.
-    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self;
-}
-
-impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayIrOperation<A> {
-    type Transform = ArrayReferenceTransform;
-
-    fn base_input_count(&self) -> usize {
-        match self {
-            Self::ReferenceRead(operation) => operation.base_input_count(),
-            Self::ReferenceWrite(operation) => operation.base_input_count(),
-            Self::ReferenceAddUpdate(operation) => operation.base_input_count(),
-            Self::ReferenceSwap(operation) => operation.base_input_count(),
-            Self::ReferenceAtomicAddUpdate(operation) => operation.base_input_count(),
-            Self::ReferenceFreeze(_) => 1,
-            _ => 0,
-        }
-    }
-
-    fn reference_access_descriptor(
-        &self,
-        input_index: usize,
-    ) -> Option<ReferenceAccessDescriptor<'_, ArrayReferenceTransform>> {
-        match self {
-            Self::ReferenceRead(operation) => operation.reference_access_descriptor(input_index),
-            Self::ReferenceWrite(operation) => operation.reference_access_descriptor(input_index),
-            Self::ReferenceAddUpdate(operation) => operation.reference_access_descriptor(input_index),
-            Self::ReferenceSwap(operation) => operation.reference_access_descriptor(input_index),
-            Self::ReferenceAtomicAddUpdate(operation) => operation.reference_access_descriptor(input_index),
-            Self::ReferenceFreeze(_) if input_index == 0 => Some(ReferenceAccessDescriptor::new(&[], 1..1)),
-            _ => None,
-        }
-    }
-
-    fn with_reference_access_transforms(
-        &self,
-        input_index: usize,
-        transforms: Vec<ArrayReferenceTransform>,
-    ) -> Result<Self, ProgramError> {
-        match self {
-            Self::ReferenceRead(operation) => {
-                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceRead)
-            }
-            Self::ReferenceWrite(operation) => {
-                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceWrite)
-            }
-            Self::ReferenceAddUpdate(operation) => {
-                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceAddUpdate)
-            }
-            Self::ReferenceSwap(operation) => {
-                operation.with_reference_access_transforms(input_index, transforms).map(Self::ReferenceSwap)
-            }
-            Self::ReferenceAtomicAddUpdate(operation) => operation
-                .with_reference_access_transforms(input_index, transforms)
-                .map(Self::ReferenceAtomicAddUpdate),
-            _ if self.reference_access_descriptor(input_index).is_some() && transforms.is_empty() => Ok(self.clone()),
-            _ => Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` cannot replace the reference transforms at input {input_index}", self.name()),
-            }),
-        }
-    }
-}
-
-impl<A: Value<Type = ArrayType>> ArrayReferenceTransformOperation for ArrayIrOperation<A> {
-    fn from_reference_reshape(operation: ReshapeOperation) -> Self {
-        Self::Array(ArrayOperation::Reshape(operation))
-    }
-
-    fn from_reference_slice(operation: SliceOperation) -> Self {
-        Self::Array(ArrayOperation::Slice(operation))
-    }
-
-    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
-        Self::Array(ArrayOperation::UpdateSlice(operation))
-    }
-
-    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
-        Self::Array(ArrayOperation::DynamicSlice(operation))
-    }
-
-    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
-        Self::Array(ArrayOperation::DynamicUpdateSlice(operation))
-    }
-}
-
 /// One value carrier through which a reference transform path maps between a shared root and one of its views.
 ///
 /// Reading the selected value and reconstructing the root with update-slice each exist exactly once, on
@@ -1453,113 +1560,6 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> TransformWriteC
         binding: &NoReferenceTransformBinding,
     ) -> Result<A, ProgramError> {
         match *binding {}
-    }
-}
-
-/// Array specialization of [`ReferenceViewAnalysis`], associating each reference access with its ordered
-/// [`ArrayReferenceTransformPath`]. Allocation roots and lifetimes come from the shared structural analysis. Dynamic
-/// bindings name ordinary values in the access instruction's own region. The generic
-/// [program reference module](crate::programs::references) owns allocation identity, lifetime and alias validation,
-/// transform path storage, and analysis; this specialization supplies array shapes and indexing semantics.
-pub type ArrayReferenceAnalysis = ReferenceViewAnalysis<ArrayReferenceTransform>;
-
-/// [`ReferenceDischargePolicy`] of the array reference universe.
-///
-/// An array reference's referent is an [`ArrayType`]-typed array. Each access applies an
-/// [`ArrayReferenceTransformPath`] to its allocation, with dynamic indices bound to context values. The policy uses
-/// the same transform traversal as [`ArrayReference`]: reads extract the viewed array, while replacements and
-/// accumulations reconstruct the root through the transforms in reverse order, preserving values outside the view.
-/// Dynamic indices use dynamic slicing and updates with the negative-index and clamping behavior described by
-/// [`ArrayReferenceTransform`], so eager and discharged accesses address the same elements.
-///
-/// The generic [program reference module](crate::programs::references) owns discharge and state threading. This
-/// policy supplies array-IR reconstruction operations rather than a separate state interpreter.
-///
-/// The reconstruction context is bounded by [`Context`] rather than [`Domain`](crate::Domain) because the transform
-/// path traversal binds canonical slicing, reshape, and update operations into it. Their value-level capabilities are
-/// stated over [`ArrayType`]-typed values rather than the composite array IR, so the policy constructs them through the
-/// context's operation family.
-#[derive(Copy, Clone, Debug)]
-pub struct ArrayReferenceDischarge;
-
-impl ReferenceDischargeableType for ArrayIrType {
-    type Policy = ArrayReferenceDischarge;
-}
-
-impl<C: Context<Type = ArrayIrType>> ReferenceDischargePolicy<C> for ArrayReferenceDischarge
-where
-    C::Operation: ArrayReferenceTransformOperation,
-{
-    type Referent = ArrayType;
-    type Transform = ArrayReferenceTransform;
-    type Alias = ArrayReferenceTransformPath<C::Value>;
-
-    fn storage_alias(_referent: &ArrayType) -> ArrayReferenceTransformPath<C::Value> {
-        ArrayReferenceTransformPath::root()
-    }
-
-    fn apply_transforms(
-        _context: &C,
-        alias: &Self::Alias,
-        transforms: &[ArrayReferenceTransform],
-        bindings: &[C::Value],
-    ) -> Result<Self::Alias, ProgramError> {
-        let mut composed = alias.clone();
-        composed.append(ArrayReferenceTransformPath::from_transforms(transforms, bindings)?);
-        Ok(composed)
-    }
-
-    fn read(
-        context: &C,
-        current: &C::Value,
-        alias: &ArrayReferenceTransformPath<C::Value>,
-    ) -> Result<C::Value, ProgramError> {
-        let mut intermediates = alias.intermediates_in(&ContextTransformCarrier(context), current.clone())?;
-
-        // The traversal starts with the complete allocation, so the chain is nonempty and its final value is the part
-        // selected by this handle.
-        Ok(intermediates.pop().unwrap())
-    }
-
-    fn write(
-        context: &C,
-        current: &C::Value,
-        replacement: C::Value,
-        alias: &ArrayReferenceTransformPath<C::Value>,
-    ) -> Result<C::Value, ProgramError> {
-        alias.write_in(&ContextTransformCarrier(context), current.clone(), replacement)
-    }
-
-    fn swap(
-        context: &C,
-        current: &C::Value,
-        replacement: C::Value,
-        alias: &ArrayReferenceTransformPath<C::Value>,
-    ) -> Result<(C::Value, C::Value), ProgramError> {
-        alias.swap_in(&ContextTransformCarrier(context), current.clone(), replacement)
-    }
-}
-
-// Composite array-IR values deliberately expose no value-level addition: the composite family carries array payloads
-// through `ArrayIrOperation::Array` and lifts the type-generic `AddOperation<ArrayIrType>` into that member instead,
-// which is the same seam generic reverse mode uses to accumulate cotangents. Accumulation therefore binds the lifted
-// addition through the context, requiring nothing beyond the conversion the operation family already provides.
-impl<C: Context<Type = ArrayIrType>> ReferenceAccumulationPolicy<C> for ArrayReferenceDischarge
-where
-    C::Operation: ArrayReferenceTransformOperation + From<AddOperation<ArrayIrType>>,
-{
-    fn accumulate(
-        context: &C,
-        current: &C::Value,
-        update: C::Value,
-        alias: &ArrayReferenceTransformPath<C::Value>,
-    ) -> Result<C::Value, ProgramError> {
-        let carrier = ContextTransformCarrier(context);
-        let intermediates = alias.intermediates_in(&carrier, current.clone())?;
-        // Add at the selected leaf, then rebuild each enclosing slice without reading the leaf a second time.
-        let selected = intermediates.last().unwrap().clone();
-        let accumulated = carrier.bind(C::Operation::from(AddOperation::new()), &[&selected, &update])?;
-        alias.reconstruct_in(&carrier, &intermediates[..alias.transforms().len()], accumulated)
     }
 }
 
@@ -2829,43 +2829,6 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_analysis_new() {
-        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let mut builder = TestBuilder::new();
-        let matrix = builder.add_input(ReferenceType::new(matrix_type.clone()).into());
-        let row_transforms = vec![
-            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)] },
-            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) },
-        ];
-        let column_transforms =
-            vec![ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Static(2) }];
-        let row = builder
-            .add_instruction(TestRead::new().with_transforms(row_transforms.clone()), Vec::new(), vec![matrix], None)
-            .unwrap()[0];
-        let column = builder
-            .add_instruction(TestRead::new().with_transforms(column_transforms.clone()), Vec::new(), vec![matrix], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![row, column], vec![Placeholder], vec![Placeholder; 2])
-            .unwrap();
-        let region = program.entry_region_ref();
-        let analysis = ArrayReferenceAnalysis::new(region, 0).unwrap();
-        let row_path = ArrayReferenceTransformPath::from_transforms(&row_transforms, &[]).unwrap();
-        let column_path = ArrayReferenceTransformPath::from_transforms(&column_transforms, &[]).unwrap();
-        let row_access = crate::programs::InstructionId::new(region.id(), 0);
-        let column_access = crate::programs::InstructionId::new(region.id(), 1);
-        assert_eq!(analysis.path(row_access, 0), Some(&row_path));
-        assert_eq!(analysis.path(column_access, 0), Some(&column_path));
-        assert_eq!(analysis.path(row_access, 1), None);
-        assert_eq!(row_path.output_type(&matrix_type), Ok(ArrayType::new_static(DataType::F32, [3])));
-        assert_eq!(column_path.output_type(&matrix_type), Ok(ArrayType::new_static(DataType::F32, [2])));
-        assert_eq!(
-            analysis.overlap(region, (row_access, 0), (column_access, 0)),
-            Some(ReferenceViewOverlap::MayOverlap)
-        );
-    }
-
-    #[test]
     fn test_array_reference_discharge_apply_transforms() {
         let context = EagerContext::<TestValue, TestOperation>::new();
         let index = ArrayIrValue::Array(Array::scalar(1i32).unwrap());
@@ -3301,6 +3264,61 @@ mod tests {
     }
 
     #[test]
+    fn test_array_ir_operation_reference_access_descriptor() {
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let operation = TestOperation::ReferenceRead(TestRead::new().with_transforms(vec![transform.clone()]));
+        assert_eq!(operation.base_input_count(), 1);
+        let descriptor = operation.reference_access_descriptor(0).unwrap();
+        assert_eq!(descriptor.transforms(), &[transform]);
+        assert_eq!(descriptor.bindings(), 1..2);
+        assert_eq!(operation.reference_access_descriptor(1), None);
+        let replaced = operation.with_reference_access_transforms(0, Vec::new()).unwrap();
+        assert_eq!(replaced.reference_access_descriptor(0).unwrap().bindings(), 1..1);
+        assert!(matches!(
+            operation.with_reference_access_transforms(1, Vec::new()),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "`reference_read` has no reference access at input 1",
+        ));
+    }
+
+    #[test]
+    fn test_array_reference_analysis_new() {
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let mut builder = TestBuilder::new();
+        let matrix = builder.add_input(ReferenceType::new(matrix_type.clone()).into());
+        let row_transforms = vec![
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)] },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) },
+        ];
+        let column_transforms =
+            vec![ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Static(2) }];
+        let row = builder
+            .add_instruction(TestRead::new().with_transforms(row_transforms.clone()), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+        let column = builder
+            .add_instruction(TestRead::new().with_transforms(column_transforms.clone()), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![row, column], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let region = program.entry_region_ref();
+        let analysis = ArrayReferenceAnalysis::new(region, 0).unwrap();
+        let row_path = ArrayReferenceTransformPath::from_transforms(&row_transforms, &[]).unwrap();
+        let column_path = ArrayReferenceTransformPath::from_transforms(&column_transforms, &[]).unwrap();
+        let row_access = crate::programs::InstructionId::new(region.id(), 0);
+        let column_access = crate::programs::InstructionId::new(region.id(), 1);
+        assert_eq!(analysis.path(row_access, 0), Some(&row_path));
+        assert_eq!(analysis.path(column_access, 0), Some(&column_path));
+        assert_eq!(analysis.path(row_access, 1), None);
+        assert_eq!(row_path.output_type(&matrix_type), Ok(ArrayType::new_static(DataType::F32, [3])));
+        assert_eq!(column_path.output_type(&matrix_type), Ok(ArrayType::new_static(DataType::F32, [2])));
+        assert_eq!(
+            analysis.overlap(region, (row_access, 0), (column_access, 0)),
+            Some(ReferenceViewOverlap::MayOverlap)
+        );
+    }
+
+    #[test]
     fn test_repeated_folded_transform_metadata_cost() {
         for accesses in [1, 8, 64] {
             let mut builder = TestBuilder::new();
@@ -3345,24 +3363,6 @@ mod tests {
                 accesses
             );
         }
-    }
-
-    #[test]
-    fn test_array_ir_operation_reference_access_descriptor() {
-        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let operation = TestOperation::ReferenceRead(TestRead::new().with_transforms(vec![transform.clone()]));
-        assert_eq!(operation.base_input_count(), 1);
-        let descriptor = operation.reference_access_descriptor(0).unwrap();
-        assert_eq!(descriptor.transforms(), &[transform]);
-        assert_eq!(descriptor.bindings(), 1..2);
-        assert_eq!(operation.reference_access_descriptor(1), None);
-        let replaced = operation.with_reference_access_transforms(0, Vec::new()).unwrap();
-        assert_eq!(replaced.reference_access_descriptor(0).unwrap().bindings(), 1..1);
-        assert!(matches!(
-            operation.with_reference_access_transforms(1, Vec::new()),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "`reference_read` has no reference access at input 1",
-        ));
     }
 
     #[test]
