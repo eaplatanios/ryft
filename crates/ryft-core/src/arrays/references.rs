@@ -512,24 +512,23 @@ impl ArrayReferenceTransform {
         Ok((output, Some(selection)))
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Validates the axis of an [`Index`](Self::Index) transform against `input` and returns the static shape of
-    /// `input`.
+    /// Validates the axis of an [`Index`](Self::Index) transform against `input`
+    /// and returns the [`StaticShape`] of `input`.
     fn indexed_shape(axis: usize, input: &ArrayType) -> Result<StaticShape, TypeError> {
         let shape = input.static_shape().ok_or_else(|| {
             TypeError::invalid(format!("reference indexing requires a static referent type but got `{input}`"))
         })?;
         if axis >= shape.rank() {
             return Err(TypeError::invalid(format!(
-                "reference index axis {axis} is out of bounds for rank {}",
+                "reference index axis {} is out of bounds for rank {}",
+                axis,
                 shape.rank(),
             )));
         }
         Ok(shape)
     }
 
-    /// Validates this transform against `input` and returns its normalized selection indices.
+    /// Validates this transform against `input` and returns its normalized [`TransformSelection`].
     fn selection(&self, input: &ArrayType) -> Result<TransformSelection, TypeError> {
         match self {
             Self::Index { axis, index } => {
@@ -544,7 +543,9 @@ impl ArrayReferenceTransform {
                 };
                 if index >= shape.dimension(*axis) {
                     return Err(TypeError::invalid(format!(
-                        "reference index {index} on axis {axis} is out of bounds for size {}",
+                        "reference index {} on axis {} is out of bounds for size {}",
+                        index,
+                        axis,
                         shape.dimension(*axis),
                     )));
                 }
@@ -587,9 +588,11 @@ impl ArrayReferenceTransform {
                     })?;
                     if limit > *input_size {
                         return Err(TypeError::invalid(format!(
-                            "reference slice on axis {axis} with start {} and size {} exceeds input size {input_size}",
+                            "reference slice on axis {} with start {} and size {} exceeds input size {}",
+                            axis,
                             selection.start(),
                             selection.size(),
+                            input_size,
                         )));
                     }
                     starts.push(selection.start());
@@ -599,6 +602,8 @@ impl ArrayReferenceTransform {
             }
         }
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Applies this transform to one carried parent value. A symbolic index is resolved by the carrier from the one
     /// value the transform's `bindings` close it over; a symbolic transform that binds no value (an eager path, or a
