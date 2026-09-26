@@ -114,6 +114,14 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
     }
 
     #[inline]
+    fn is_zero(&self) -> bool {
+        match self {
+            Self::Array(value) => value.is_zero(),
+            Self::Dimension(_) | Self::Reference(_) => false,
+        }
+    }
+
+    #[inline]
     fn singleton(r#type: &ArrayIrType) -> Option<Self> {
         // Only the dimension member has singleton types. Array types describe geometry rather than contents,
         // and a reference type never determines the allocation that it names.

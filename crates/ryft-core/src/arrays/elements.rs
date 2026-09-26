@@ -2581,12 +2581,12 @@ macro_rules! impl_array_element_for_complex_types {
 
             #[inline]
             fn min_identity() -> Self {
-                Self::new(<$component>::INFINITY, 0.0)
+                Self::new(<$component>::INFINITY, <$component>::INFINITY)
             }
 
             #[inline]
             fn max_identity() -> Self {
-                Self::new(<$component>::NEG_INFINITY, 0.0)
+                Self::new(<$component>::NEG_INFINITY, <$component>::NEG_INFINITY)
             }
 
             #[inline]
@@ -3165,13 +3165,13 @@ mod tests {
         assert_eq!(f32::min_identity(), f32::INFINITY);
         assert_eq!(f64::min_identity(), f64::INFINITY);
 
-        // Complex identities place infinity in the real component and positive zero in the imaginary component.
+        // Both components must bound lexicographic comparisons, including ties at an infinite real component.
         let complex32 = Complex::<f32>::min_identity();
         assert_eq!(complex32.re, f32::INFINITY);
-        assert_eq!(complex32.im.to_bits(), 0);
+        assert_eq!(complex32.im, f32::INFINITY);
         let complex64 = Complex::<f64>::min_identity();
         assert_eq!(complex64.re, f64::INFINITY);
-        assert_eq!(complex64.im.to_bits(), 0);
+        assert_eq!(complex64.im, f64::INFINITY);
     }
 
     #[test]
@@ -3215,10 +3215,10 @@ mod tests {
 
         let complex32 = Complex::<f32>::max_identity();
         assert_eq!(complex32.re, f32::NEG_INFINITY);
-        assert_eq!(complex32.im.to_bits(), 0);
+        assert_eq!(complex32.im, f32::NEG_INFINITY);
         let complex64 = Complex::<f64>::max_identity();
         assert_eq!(complex64.re, f64::NEG_INFINITY);
-        assert_eq!(complex64.im.to_bits(), 0);
+        assert_eq!(complex64.im, f64::NEG_INFINITY);
     }
 
     #[test]
