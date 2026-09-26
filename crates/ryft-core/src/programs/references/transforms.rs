@@ -231,41 +231,45 @@ impl<T: 'static + Type, U: 'static + Type> BatchableReferenceTransform for NoRef
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Transforms and dynamic-input positions applied by an access to one reference input. Binding positions follow the
-/// access's base inputs, grouped by reference input in increasing input-index order and then in path order.
+/// [`ReferenceTransform`]s and dynamic-input positions applied by an access to one reference input. Binding positions
+/// follow the access's base inputs, grouped by reference input in increasing input-index order and then in path order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReferenceAccessDescriptor<'o, Transform: ReferenceTransform> {
+pub struct ReferenceAccessDescriptor<'t, Transform: ReferenceTransform> {
     /// Ordered transforms, empty for an access to the complete root.
-    transforms: &'o [Transform],
+    transforms: &'t [Transform],
 
     /// Consecutive input positions supplying this path's dynamic inputs.
     bindings: Range<usize>,
 }
 
-impl<'o, Transform: ReferenceTransform> ReferenceAccessDescriptor<'o, Transform> {
-    /// Describes the transforms and binding range of one reference input. The owning operation derives `bindings`
-    /// from its base input count and the paths on preceding reference inputs.
+impl<'t, Transform: ReferenceTransform> ReferenceAccessDescriptor<'t, Transform> {
+    /// Creates a new [`ReferenceAccessDescriptor`] that describes the transforms and binding range of one reference
+    /// input. The owning operation derives `bindings` from its base input count and the paths on preceding reference
+    /// inputs.
     ///
     /// # Parameters
     ///
     ///   - `transforms`: Transforms applied in order from the reference input.
     ///   - `bindings`: Consecutive instruction input positions supplying those transforms' dynamic inputs.
-    pub fn new(transforms: &'o [Transform], bindings: Range<usize>) -> Self {
+    #[inline]
+    pub fn new(transforms: &'t [Transform], bindings: Range<usize>) -> Self {
         Self { transforms, bindings }
     }
 
     /// Returns the ordered transforms applied by this access.
-    pub fn transforms(&self) -> &'o [Transform] {
+    #[inline]
+    pub fn transforms(&self) -> &'t [Transform] {
         self.transforms
     }
 
     /// Returns the consecutive input positions supplying this path's dynamic inputs.
+    #[inline]
     pub fn bindings(&self) -> Range<usize> {
         self.bindings.clone()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Operation family whose reference accesses expose the transform paths applied to their root inputs. Every input
 /// declared by a [`ReferenceEffect::Access`](crate::ReferenceEffect::Access) must have a descriptor, including
