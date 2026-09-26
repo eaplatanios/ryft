@@ -282,7 +282,9 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         // precedence over replacement-type errors, matching the root write and swap paths.
         self.root.update(|current| {
             self.validate_view_referent_type(&replacement)?;
-            self.path.swap(current, &replacement)
+            let (previous, updated) =
+                self.path.swap_in(&EagerTransformCarrier(PhantomData), current.clone(), replacement)?;
+            Ok((updated, previous))
         })
     }
 
@@ -305,7 +307,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         self.root.update(|current| {
             self.validate_view_referent_type(&replacement)?;
             self.path
-                .write_in(&mut EagerTransformCarrier(PhantomData), current.clone(), replacement)
+                .write_in(&EagerTransformCarrier(PhantomData), current.clone(), replacement)
                 .map(|updated| (updated, ()))
         })
     }
@@ -326,12 +328,12 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         }
 
         self.root.update(|current| {
-            let mut carrier = EagerTransformCarrier(PhantomData);
-            let intermediates = self.path.intermediates_in(&mut carrier, current.clone())?;
+            let carrier = EagerTransformCarrier(PhantomData);
+            let intermediates = self.path.intermediates_in(&carrier, current.clone())?;
             let updated_view = intermediates.last().unwrap().add(update)?;
             self.validate_view_referent_type(&updated_view)?;
             self.path
-                .reconstruct_in(&mut carrier, &intermediates[..self.path.bound_transforms().len()], updated_view)
+                .reconstruct_in(&carrier, &intermediates[..self.path.bound_transforms().len()], updated_view)
                 .map(|updated| (updated, ()))
         })
     }
@@ -632,7 +634,7 @@ impl ArrayReferenceTransform {
     /// malformed closure) has no selection and is rejected by [`selection`](Self::selection).
     fn apply_in<C: TransformReadCarrier>(
         &self,
-        carrier: &mut C,
+        carrier: &C,
         input: &C::Value,
         bindings: &[C::Binding],
     ) -> Result<C::Value, ProgramError> {
@@ -651,7 +653,7 @@ impl ArrayReferenceTransform {
     /// a symbolic index exactly as [`apply_in`](Self::apply_in) does.
     fn replace_in<C: TransformWriteCarrier>(
         &self,
-        carrier: &mut C,
+        carrier: &C,
         input: &C::Value,
         replacement: &C::Value,
         bindings: &[C::Binding],
@@ -670,8 +672,6 @@ impl ArrayReferenceTransform {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Display for ArrayReferenceTransform {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -679,6 +679,7 @@ impl Display for ArrayReferenceTransform {
                 write!(formatter, "index(axis={axis}, index={index})")
             }
             Self::Index { axis, index: ArrayReferenceTransformIndex::Dynamic } => {
+                // TODO(eaplatanios): Should this be rendered as write!(formatter, "index(axis={axis}, index=dynamic)")?
                 write!(formatter, "dynamic_index(axis={axis})")
             }
             Self::Slice { axes } => {
@@ -705,6 +706,7 @@ impl ReferenceTransform for ArrayReferenceTransform {
     type Type = ArrayIrType;
     type Referent = ArrayType;
 
+    #[inline]
     fn binding_count(&self) -> usize {
         usize::from(matches!(self, Self::Index { index: ArrayReferenceTransformIndex::Dynamic, .. }))
     }
@@ -730,34 +732,38 @@ impl ReferenceTransform for ArrayReferenceTransform {
         Ok(())
     }
 
+    #[inline]
     fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
         self.output_type(input)
     }
 
+    #[inline]
     fn read_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
         // Reads never write back through the view, so they skip the reconstruction proof of `output_type`.
         Ok(self.selected_type(input)?.0)
     }
 
-    // Both paths fold to one range or symbolic index per root axis. Nonintersecting static ranges prove disjointness;
-    // identical static ranges or symbolic indices with equal bindings, offsets, and clamping extents prove equality.
-    // Everything else may overlap. A malformed path cannot be folded and is treated as
-    // possibly overlapping, because paths are validated when they are derived and this query must not fail.
     fn overlap(
         r#type: &ArrayIrType,
         lhs: &[BoundReferenceTransform<Self>],
         rhs: &[BoundReferenceTransform<Self>],
     ) -> ReferenceViewOverlap {
+        // Both paths fold to one range or symbolic index per root axis. Non-intersecting static ranges prove
+        // disjointness; identical static ranges or symbolic indices with equal bindings, offsets, and clamping extents
+        // prove equality. Everything else may overlap. A malformed path cannot be folded and is treated as possibly
+        // overlapping, because paths are validated when they are derived and this query must not fail.
         let Some(shape) = <&ReferenceType<ArrayType>>::try_from(r#type)
             .ok()
             .and_then(|r#type| r#type.referent().static_shape())
         else {
             return ReferenceViewOverlap::MayOverlap;
         };
+
         let (Some(lhs), Some(rhs)) = (RootIndexSelection::fold(&shape, lhs), RootIndexSelection::fold(&shape, rhs))
         else {
             return ReferenceViewOverlap::MayOverlap;
         };
+
         let mut overlap = ReferenceViewOverlap::Same;
         for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
             match lhs.overlap(rhs) {
@@ -766,23 +772,26 @@ impl ReferenceTransform for ArrayReferenceTransform {
                 ReferenceViewOverlap::MayOverlap => overlap = ReferenceViewOverlap::MayOverlap,
             }
         }
+
         overlap
     }
 }
 
 impl BatchableReferenceTransform for ArrayReferenceTransform {
-    // The batch axis of a reference is an axis of its packed referent that the per-item transform never sees.
-    // Indexing removes one per-item axis, so the packed transform cannot keep both axis positions unchanged: a batch
-    // axis at or before the indexed axis shifts the packed indexed axis one position later while the output keeps the
-    // batch axis, and a batch axis after the indexed axis leaves the packed indexed axis alone while the output's batch
-    // axis moves one position earlier. Slicing preserves rank, so the packed transform selects the complete batch axis
-    // through an identity selection inserted at the batch axis position and the output keeps the batch axis.
     fn batch(&self, r#type: &ArrayIrType, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
+        // The batch axis of a reference is an axis of its packed referent that the per-item transform never sees.
+        // Indexing removes one per-item axis, so the packed transform cannot keep both axis positions unchanged: a
+        // batch axis at or before the indexed axis shifts the packed indexed axis one position later while the output
+        // keeps the batch axis, and a batch axis after the indexed axis leaves the packed indexed axis alone while the
+        // output's batch axis moves one position earlier. Slicing preserves rank, so the packed transform selects the
+        // complete batch axis through an identity selection inserted at the batch axis position and the output keeps
+        // the batch axis.
         let Some(axis) = batch_axis.axis() else {
             return Ok((self.clone(), batch_axis));
         };
         let referent = <&ReferenceType<ArrayType>>::try_from(r#type)?.referent();
         let position = axis.normalize(referent.rank())?;
+
         // Normalizing the batch axis proves that the packed rank is nonzero. Validate the descriptor's per-item
         // axes before shifting an index or inserting a slice axis, so malformed public descriptors cannot panic.
         let rank = referent.rank() - 1;
@@ -792,8 +801,9 @@ impl BatchableReferenceTransform for ArrayReferenceTransform {
             ))
             .into()),
             Self::Slice { axes } if axes.len() != rank => Err(TypeError::invalid(format!(
-                "reference slice has {} axes but its input has rank {rank}",
+                "reference slice has {} axes but its input has rank {}",
                 axes.len(),
+                rank,
             ))
             .into()),
             Self::Index { axis: indexed_axis, index } if position <= *indexed_axis => {
@@ -816,6 +826,8 @@ impl BatchableReferenceTransform for ArrayReferenceTransform {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root, ArrayReferenceTransform, Binding> {
     /// Selects a static position on `axis`, removing that dimension from the viewed referent.
@@ -1043,17 +1055,10 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
     /// reconstruction uses every snapshot except the final child as its strict parents.
     fn intermediates_in<C: TransformReadCarrier<Binding = Binding>>(
         &self,
-        carrier: &mut C,
+        carrier: &C,
         root: C::Value,
     ) -> Result<Vec<C::Value>, ProgramError> {
-        let mut intermediates = Vec::with_capacity(self.bound_transforms().len() + 1);
-        intermediates.push(root);
-        for bound_transform in self.bound_transforms() {
-            let parent = intermediates.last().unwrap();
-            let child = bound_transform.transform().apply_in(carrier, parent, bound_transform.bindings())?;
-            intermediates.push(child);
-        }
-        Ok(intermediates)
+        Self::intermediates_through(carrier, root, self.bound_transforms())
     }
 
     /// Reconstructs the root after replacing the selected leaf, working from the innermost view back to the root.
@@ -1066,7 +1071,7 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
     ///   - `replacement`: new selected value.
     fn reconstruct_in<C: TransformWriteCarrier<Binding = Binding>>(
         &self,
-        carrier: &mut C,
+        carrier: &C,
         intermediates: &[C::Value],
         replacement: C::Value,
     ) -> Result<C::Value, ProgramError> {
@@ -1090,7 +1095,7 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
     /// reconstructed root, so that the eager swap and the discharge-time replacement share one traversal.
     fn swap_in<C: TransformWriteCarrier<Value: Clone, Binding = Binding>>(
         &self,
-        carrier: &mut C,
+        carrier: &C,
         root: C::Value,
         replacement: C::Value,
     ) -> Result<(C::Value, C::Value), ProgramError> {
@@ -1111,21 +1116,32 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
     /// write-only semantics must not observe. An identity view therefore returns `replacement` directly.
     fn write_in<C: TransformWriteCarrier<Binding = Binding>>(
         &self,
-        carrier: &mut C,
+        carrier: &C,
         root: C::Value,
         replacement: C::Value,
     ) -> Result<C::Value, ProgramError> {
         let Some((_, parents)) = self.bound_transforms().split_last() else {
             return Ok(replacement);
         };
-        let mut intermediates = Vec::with_capacity(self.bound_transforms().len());
+        let intermediates = Self::intermediates_through(carrier, root, parents)?;
+        self.reconstruct_in(carrier, intermediates.as_slice(), replacement)
+    }
+
+    /// Returns `root` followed by the child that each of `bound_transforms` selects from the preceding value, which is
+    /// [`intermediates_in`](Self::intermediates_in) for a prefix of this path's transforms.
+    fn intermediates_through<C: TransformReadCarrier<Binding = Binding>>(
+        carrier: &C,
+        root: C::Value,
+        bound_transforms: &[BoundReferenceTransform<ArrayReferenceTransform, Binding>],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        let mut intermediates = Vec::with_capacity(bound_transforms.len() + 1);
         intermediates.push(root);
-        for bound_transform in parents {
+        for bound_transform in bound_transforms {
             let parent = intermediates.last().unwrap();
             let child = bound_transform.transform().apply_in(carrier, parent, bound_transform.bindings())?;
             intermediates.push(child);
         }
-        self.reconstruct_in(carrier, intermediates.as_slice(), replacement)
+        Ok(intermediates)
     }
 }
 
@@ -1136,20 +1152,10 @@ impl ArrayReferenceTransformPath<NoReferenceTransformBinding> {
     where
         A: Value<Type = ArrayType> + Reshape + Slice,
     {
-        let mut carrier = EagerTransformCarrier(PhantomData);
+        let carrier = EagerTransformCarrier(PhantomData);
         self.bound_transforms().iter().try_fold(root, |value, bound_transform| {
-            bound_transform.transform().apply_in(&mut carrier, &value, bound_transform.bindings())
+            bound_transform.transform().apply_in(&carrier, &value, bound_transform.bindings())
         })
-    }
-
-    /// Replaces the elements this static path selects and returns the reconstructed root plus their old snapshot.
-    fn swap<A>(&self, root: &A, replacement: &A) -> Result<(A, A), ProgramError>
-    where
-        A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice,
-    {
-        let (old, reconstructed) =
-            self.swap_in(&mut EagerTransformCarrier(PhantomData), root.clone(), replacement.clone())?;
-        Ok((reconstructed, old))
     }
 }
 
@@ -1281,19 +1287,14 @@ trait TransformReadCarrier {
     fn array_type<'c>(&'c self, value: &'c Self::Value) -> Result<Cow<'c, ArrayType>, ProgramError>;
 
     /// Takes one unit-stride slice of `input`, from the inclusive `starts` to the exclusive `limits`.
-    fn slice(
-        &mut self,
-        input: &Self::Value,
-        starts: Vec<usize>,
-        limits: Vec<usize>,
-    ) -> Result<Self::Value, ProgramError>;
+    fn slice(&self, input: &Self::Value, starts: Vec<usize>, limits: Vec<usize>) -> Result<Self::Value, ProgramError>;
 
     /// Reshapes `input` to `shape`.
-    fn reshape(&mut self, input: &Self::Value, shape: Shape) -> Result<Self::Value, ProgramError>;
+    fn reshape(&self, input: &Self::Value, shape: Shape) -> Result<Self::Value, ProgramError>;
 
     /// Selects the index that `binding` closes over on `axis` of `input` and removes that axis.
     fn index_symbolic(
-        &mut self,
+        &self,
         input: &Self::Value,
         axis: usize,
         binding: &Self::Binding,
@@ -1304,7 +1305,7 @@ trait TransformReadCarrier {
 trait TransformWriteCarrier: TransformReadCarrier {
     /// Returns `target` with `update` written at `starts`.
     fn update_slice(
-        &mut self,
+        &self,
         target: &Self::Value,
         update: &Self::Value,
         starts: Vec<usize>,
@@ -1313,7 +1314,7 @@ trait TransformWriteCarrier: TransformReadCarrier {
     /// Returns `target` with `update` written at the index that `binding` closes over on `axis`, the inverse of
     /// [`index_symbolic`](TransformReadCarrier::index_symbolic).
     fn update_index_symbolic(
-        &mut self,
+        &self,
         target: &Self::Value,
         update: &Self::Value,
         axis: usize,
@@ -1333,16 +1334,16 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice> TransformReadCarrier for Eage
         Ok(value.r#type())
     }
 
-    fn slice(&mut self, input: &A, starts: Vec<usize>, limits: Vec<usize>) -> Result<A, ProgramError> {
+    fn slice(&self, input: &A, starts: Vec<usize>, limits: Vec<usize>) -> Result<A, ProgramError> {
         input.slice(starts.as_slice(), limits.as_slice(), &vec![1; starts.len()])
     }
 
-    fn reshape(&mut self, input: &A, shape: Shape) -> Result<A, ProgramError> {
+    fn reshape(&self, input: &A, shape: Shape) -> Result<A, ProgramError> {
         input.reshape(shape)
     }
 
     fn index_symbolic(
-        &mut self,
+        &self,
         _input: &A,
         _axis: usize,
         binding: &NoReferenceTransformBinding,
@@ -1352,12 +1353,12 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice> TransformReadCarrier for Eage
 }
 
 impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> TransformWriteCarrier for EagerTransformCarrier<A> {
-    fn update_slice(&mut self, target: &A, update: &A, starts: Vec<usize>) -> Result<A, ProgramError> {
+    fn update_slice(&self, target: &A, update: &A, starts: Vec<usize>) -> Result<A, ProgramError> {
         target.update_slice(update, starts.as_slice())
     }
 
     fn update_index_symbolic(
-        &mut self,
+        &self,
         _target: &A,
         _update: &A,
         _axis: usize,
@@ -1425,7 +1426,7 @@ where
         current: &C::Value,
         alias: &ArrayReferenceTransformPath<C::Value>,
     ) -> Result<C::Value, ProgramError> {
-        let mut intermediates = alias.intermediates_in(&mut ContextTransformCarrier(context), current.clone())?;
+        let mut intermediates = alias.intermediates_in(&ContextTransformCarrier(context), current.clone())?;
 
         // The traversal starts with the complete allocation, so the chain is nonempty and its final value is the part
         // selected by this handle.
@@ -1438,7 +1439,7 @@ where
         replacement: C::Value,
         alias: &ArrayReferenceTransformPath<C::Value>,
     ) -> Result<C::Value, ProgramError> {
-        alias.write_in(&mut ContextTransformCarrier(context), current.clone(), replacement)
+        alias.write_in(&ContextTransformCarrier(context), current.clone(), replacement)
     }
 
     fn swap(
@@ -1447,7 +1448,7 @@ where
         replacement: C::Value,
         alias: &ArrayReferenceTransformPath<C::Value>,
     ) -> Result<(C::Value, C::Value), ProgramError> {
-        alias.swap_in(&mut ContextTransformCarrier(context), current.clone(), replacement)
+        alias.swap_in(&ContextTransformCarrier(context), current.clone(), replacement)
     }
 }
 
@@ -1465,12 +1466,12 @@ where
         update: C::Value,
         alias: &ArrayReferenceTransformPath<C::Value>,
     ) -> Result<C::Value, ProgramError> {
-        let mut carrier = ContextTransformCarrier(context);
-        let intermediates = alias.intermediates_in(&mut carrier, current.clone())?;
+        let carrier = ContextTransformCarrier(context);
+        let intermediates = alias.intermediates_in(&carrier, current.clone())?;
         // Add at the selected leaf, then rebuild each enclosing slice without reading the leaf a second time.
         let selected = intermediates.last().unwrap().clone();
         let accumulated = carrier.bind(C::Operation::from(AddOperation::new()), &[&selected, &update])?;
-        alias.reconstruct_in(&mut carrier, &intermediates[..alias.transforms().len()], accumulated)
+        alias.reconstruct_in(&carrier, &intermediates[..alias.transforms().len()], accumulated)
     }
 }
 
@@ -1513,15 +1514,15 @@ where
         }
     }
 
-    fn slice(&mut self, input: &C::Value, starts: Vec<usize>, limits: Vec<usize>) -> Result<C::Value, ProgramError> {
+    fn slice(&self, input: &C::Value, starts: Vec<usize>, limits: Vec<usize>) -> Result<C::Value, ProgramError> {
         self.bind(C::Operation::from_reference_slice(SliceOperation::new(starts, limits)), &[input])
     }
 
-    fn reshape(&mut self, input: &C::Value, shape: Shape) -> Result<C::Value, ProgramError> {
+    fn reshape(&self, input: &C::Value, shape: Shape) -> Result<C::Value, ProgramError> {
         self.bind(C::Operation::from_reference_reshape(ReshapeOperation::new(shape)), &[input])
     }
 
-    fn index_symbolic(&mut self, input: &C::Value, axis: usize, binding: &C::Value) -> Result<C::Value, ProgramError> {
+    fn index_symbolic(&self, input: &C::Value, axis: usize, binding: &C::Value) -> Result<C::Value, ProgramError> {
         let input_type = self.array_type(input)?.into_owned();
         let mut sizes = ArrayReferenceTransform::indexed_shape(axis, &input_type)?.dimensions().to_vec();
         sizes[axis] = 1;
@@ -1539,17 +1540,12 @@ impl<C: Context<Type = ArrayIrType>> TransformWriteCarrier for ContextTransformC
 where
     C::Operation: ArrayReferenceTransformOperation,
 {
-    fn update_slice(
-        &mut self,
-        target: &C::Value,
-        update: &C::Value,
-        starts: Vec<usize>,
-    ) -> Result<C::Value, ProgramError> {
+    fn update_slice(&self, target: &C::Value, update: &C::Value, starts: Vec<usize>) -> Result<C::Value, ProgramError> {
         self.bind(C::Operation::from_reference_update_slice(UpdateSliceOperation::new(starts)), &[target, update])
     }
 
     fn update_index_symbolic(
-        &mut self,
+        &self,
         target: &C::Value,
         update: &C::Value,
         axis: usize,
@@ -2694,12 +2690,12 @@ mod tests {
             .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
         let root = Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap();
-        let mut carrier = EagerTransformCarrier::<Array>(PhantomData);
+        let carrier = EagerTransformCarrier::<Array>(PhantomData);
         assert_eq!(
-            path.intermediates_in(&mut carrier, root.clone()),
+            path.intermediates_in(&carrier, root.clone()),
             Ok(vec![root.clone(), Array::vector(vec![2.0_f32, 3.0]).unwrap(), Array::scalar(3.0_f32).unwrap(),]),
         );
-        assert_eq!(ArrayReferenceTransformPath::root().intermediates_in(&mut carrier, root.clone()), Ok(vec![root]));
+        assert_eq!(ArrayReferenceTransformPath::root().intermediates_in(&carrier, root.clone()), Ok(vec![root]));
     }
 
     #[test]
@@ -2707,18 +2703,18 @@ mod tests {
         let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
             .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
-        let mut carrier = EagerTransformCarrier::<Array>(PhantomData);
+        let carrier = EagerTransformCarrier::<Array>(PhantomData);
         // Reconstruction consumes strict parents in reverse order; the old selected scalar is unnecessary.
         assert_eq!(
             path.reconstruct_in(
-                &mut carrier,
+                &carrier,
                 &[Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap(), Array::vector(vec![2.0_f32, 3.0]).unwrap(),],
                 Array::scalar(7.0_f32).unwrap()
             ),
             Ok(Array::vector(vec![1.0_f32, 2.0, 7.0, 4.0]).unwrap()),
         );
         assert_eq!(
-            ArrayReferenceTransformPath::root().reconstruct_in(&mut carrier, &[], Array::scalar(7.0_f32).unwrap()),
+            ArrayReferenceTransformPath::root().reconstruct_in(&carrier, &[], Array::scalar(7.0_f32).unwrap()),
             Ok(Array::scalar(7.0_f32).unwrap()),
         );
     }
@@ -2727,16 +2723,16 @@ mod tests {
     fn test_array_reference_transform_path_reconstruct_in_rejects_invalid_parent_count() {
         let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) });
-        let mut carrier = EagerTransformCarrier::<Array>(PhantomData);
+        let carrier = EagerTransformCarrier::<Array>(PhantomData);
         assert_eq!(
-            path.reconstruct_in(&mut carrier, &[], Array::scalar(1.0_f32).unwrap()),
+            path.reconstruct_in(&carrier, &[], Array::scalar(1.0_f32).unwrap()),
             Err(ProgramError::MalformedProgram(
                 "reference transform path reconstruction requires 1 parent snapshots but received 0".to_string(),
             )),
         );
         assert_eq!(
             path.reconstruct_in(
-                &mut carrier,
+                &carrier,
                 &[Array::vector(vec![1.0_f32]).unwrap(), Array::scalar(1.0_f32).unwrap()],
                 Array::scalar(1.0_f32).unwrap(),
             ),
