@@ -3,7 +3,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
-use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType};
+use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
@@ -17,43 +17,81 @@ use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
 use crate::operations::references::reference_swap::ReferenceSwapOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ProjectedValue, ReferenceAccessMode,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
-    TypeError, Typed, Value, ValueProjection,
+    BatchableReferenceTransform, Concretizable, EffectClasses, Effects, MaybeZero, NoReferenceTransform, Operation,
+    OperationFormatter, ProgramError, ProjectedValue, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceTransform, ReferenceType,
+    RegionInterface, Type, TypeError, Typed, Value, ValueProjection, batch_reference_transforms,
+    infer_reference_view_type,
 };
 
 /// Canonical operation name for [`ReferenceWriteOperation`].
 pub const REFERENCE_WRITE_OPERATION_NAME: &str = "reference_write";
 
-/// Replaces a reference's stored value with an exactly matching referent without observing the old value.
+/// Replaces the selected reference state with an exactly matching value without observing its previous contents.
+/// The root and replacement are the first two inputs. Dynamic bindings follow them in transform order and the path is
+/// stored in `Transform` metadata. An empty path accesses the complete referent.
 #[derive(Clone, Debug)]
-pub struct ReferenceWriteOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
+pub struct ReferenceWriteOperation<
+    T: Type,
+    U: Type,
+    Transform: ReferenceTransform<Type = U, Referent = T> = NoReferenceTransform<T, U>,
+> {
+    /// Refer to the documentation of [`Self::transforms`].
+    transforms: Vec<Transform>,
 
-impl<T: Type, U: Type> ReferenceWriteOperation<T, U> {
+    /// [`PhantomData`] marker tying this [`Operation`] to its referent [`Type`] `T` and to the [`Type`] universe `U`
+    /// in which it is valid.
+    marker: PhantomData<fn() -> (T, U)>,
+}
+
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>> ReferenceWriteOperation<T, U, Transform> {
     /// Creates a new [`ReferenceWriteOperation`].
     pub const fn new() -> Self {
-        Self(PhantomData)
+        Self { transforms: Vec::new(), marker: PhantomData }
+    }
+
+    /// Returns a copy of this [`ReferenceWriteOperation`] with the provided transforms applied to the reference input.
+    #[inline]
+    pub fn with_transforms(mut self, transforms: Vec<Transform>) -> Self {
+        self.transforms = transforms;
+        self
+    }
+
+    /// Returns the transforms applied to the reference input.
+    #[inline]
+    pub fn transforms(&self) -> &[Transform] {
+        &self.transforms
+    }
+
+    /// Returns the number of dynamic inputs supplied after the base inputs for this [`ReferenceWriteOperation`].
+    fn binding_count(&self) -> usize {
+        self.transforms.iter().map(ReferenceTransform::binding_count).sum()
     }
 }
 
-impl<T: Type, U: Type> Default for ReferenceWriteOperation<T, U> {
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>> Default
+    for ReferenceWriteOperation<T, U, Transform>
+{
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Type, U: Type> Copy for ReferenceWriteOperation<T, U> {}
-
-impl<T: Type, U: Type> Display for ReferenceWriteOperation<T, U> {
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>> Display
+    for ReferenceWriteOperation<T, U, Transform>
+where
+    Self: Operation,
+{
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(REFERENCE_WRITE_OPERATION_NAME)
+        self.render(formatter, 0)
     }
 }
 
-impl<T: Type, U: Type> Operation for ReferenceWriteOperation<T, U>
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>> Operation
+    for ReferenceWriteOperation<T, U, Transform>
 where
     for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
     for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
@@ -70,16 +108,21 @@ where
         input_types: &[U],
         region_interfaces: &[RegionInterface<U>],
     ) -> Result<Vec<U>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
+        check_count!("input", input_types, 2 + self.binding_count(), TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let reference = <&ReferenceType<T>>::try_from(&input_types[0])?;
+        let binding_types = input_types[2..].iter().collect::<Vec<_>>();
+        let referent = infer_reference_view_type(
+            reference.referent(),
+            &self.transforms,
+            &binding_types,
+            ReferenceAccessMode::Write,
+        )?;
         let replacement = <&T>::try_from(&input_types[1])?;
-        if replacement != reference.referent() {
+        if replacement != &referent {
             return Err(TypeError::invalid(format!(
                 "`{}` replacement type `{}` must exactly match reference referent type `{}`",
-                REFERENCE_WRITE_OPERATION_NAME,
-                replacement,
-                reference.referent(),
+                REFERENCE_WRITE_OPERATION_NAME, replacement, referent,
             )));
         }
         Ok(Vec::new())
@@ -92,22 +135,63 @@ where
             Effects::new(
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Write }],
-                Vec::new(),
             )
             .unwrap()
         });
         Cow::Borrowed(&EFFECTS)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        // An empty transform path accesses the complete referent, so it renders as just the operation name.
+        let operation = OperationFormatter::new(formatter, indentation, self.name())?;
+        if self.transforms.is_empty() {
+            return Ok(());
+        }
+        operation.bracketed(|operation| operation.list("transforms", &self.transforms))
+    }
+}
+
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>> ReferenceAccessOperation
+    for ReferenceWriteOperation<T, U, Transform>
+where
+    ReferenceWriteOperation<T, U, Transform>: Operation<Type = U>,
+{
+    type Transform = Transform;
+
+    #[inline]
+    fn base_input_count(&self) -> usize {
+        2
+    }
+
+    #[inline]
+    fn reference_access_descriptor(&self, input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Transform>> {
+        (input_index == 0).then(|| ReferenceAccessDescriptor::new(&self.transforms, 2..2 + self.binding_count()))
+    }
+
+    #[inline]
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<Transform>,
+    ) -> Result<Self, ProgramError> {
+        if input_index != 0 {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("`{}` has no reference access at input {}", self.name(), input_index),
+            });
+        }
+        Ok(self.clone().with_transforms(transforms))
     }
 }
 
 impl<
     T: Type,
     U: Type + From<T> + From<ReferenceType<T>>,
-    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>,
-    P: ReferenceDischargePolicy<C, Referent = T>,
-> ReferenceDischargeableOperation<C, P> for ReferenceWriteOperation<T, U>
+    Transform: ReferenceTransform<Type = U, Referent = T>,
+    C: Context<Type = U>,
+    P: ReferenceDischargePolicy<C, Referent = T, Transform = Transform>,
+> ReferenceDischargeableOperation<C, P> for ReferenceWriteOperation<T, U, Transform>
 where
-    ReferenceWriteOperation<T, U>: Operation<Type = U>,
+    ReferenceWriteOperation<T, U, Transform>: Operation<Type = U>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -115,44 +199,63 @@ where
         _driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
+        check_count!("input", inputs, 2 + self.binding_count(), ProgramError);
         let reference = inputs[0].try_as_reference("a reference to write")?;
+        let bindings = inputs[2..]
+            .iter()
+            .map(|input| input.try_as_value("a reference transform binding").cloned())
+            .collect::<Result<Vec<_>, _>>()?;
         let replacement = inputs[1].try_as_value("a replacement value")?.clone();
 
         // Rules can be called outside a validated program, so check the input types before changing reference state.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(&input_types, &[])?;
-        context.write(reference, replacement)?;
+        context.write_through(reference, replacement, &self.transforms, &bindings)?;
         Ok(Vec::new())
     }
 }
 
-impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceWrite<C::Value>>> InterpretableOperation<C>
-    for ReferenceWriteOperation<T, U>
+impl<
+    T: Type,
+    U: Type,
+    Transform: ReferenceTransform<Type = U, Referent = T>,
+    C: Domain<Type = U, Value: ReferenceWrite<Transform, C::Value, C::Value>>,
+> InterpretableOperation<C> for ReferenceWriteOperation<T, U, Transform>
 where
-    ReferenceWriteOperation<T, U>: Operation<Type = U>,
+    ReferenceWriteOperation<T, U, Transform>: Operation<Type = U>,
 {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        inputs[0].write(&inputs[1])?;
+        check_count!("input", inputs, 2 + self.binding_count(), ProgramError);
+        inputs[0].write_through(&inputs[1], &self.transforms, &inputs[2..])?;
         Ok(Vec::new())
     }
 }
 
-impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>>
-    PartiallyEvaluatableOperation<C> for ReferenceWriteOperation<T, U>
+impl<
+    T: Type,
+    U: Type,
+    Transform: ReferenceTransform<Type = U, Referent = T>,
+    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U, Transform>>>,
+> PartiallyEvaluatableOperation<C> for ReferenceWriteOperation<T, U, Transform>
 {
 }
 
-impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>, P: BatchingPolicy<C>>
-    BatchableOperation<C, P> for ReferenceWriteOperation<T, U>
+impl<
+    T: Type,
+    U: Type + From<ReferenceType<T>>,
+    Transform: BatchableReferenceTransform<Type = U, Referent = T>,
+    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U, Transform>>>,
+    P: BatchingPolicy<C>,
+> BatchableOperation<C, P> for ReferenceWriteOperation<T, U, Transform>
 where
-    ReferenceWriteOperation<T, U>: Operation<Type = U>,
+    for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
+    ReferenceWriteOperation<T, U, Transform>: Operation<Type = U>,
 {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
@@ -160,9 +263,17 @@ where
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        check_count!("input", inputs, 2, ProgramError);
-        // The reference's batch axis is fixed. Broadcast or move the stored value to match it.
-        let replacement = match (P::batch_axis(&inputs[0]).axis(), P::batch_axis(&inputs[1]).axis()) {
+        check_count!("input", inputs, 2 + self.binding_count(), ProgramError);
+        let binding_axes = inputs[2..].iter().map(P::batch_axis).collect::<Vec<_>>();
+        let (transforms, output_axis) = batch_reference_transforms(
+            P::value(&inputs[0]).r#type().as_ref(),
+            P::batch_axis(&inputs[0]),
+            &self.transforms,
+            &binding_axes,
+        )?;
+
+        // Broadcast or move the stored value to the final selected referent's batch axis.
+        let replacement = match (output_axis.axis(), P::batch_axis(&inputs[1]).axis()) {
             (Some(axis), _) => driver.align_batch_axis(context, inputs[1].clone(), axis)?,
             (None, None) => inputs[1].clone(),
             (None, Some(_)) => {
@@ -174,27 +285,30 @@ where
                 });
             }
         };
-        context
-            .parent()
-            .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&replacement).clone()])?;
+
+        let mut values = vec![P::value(&inputs[0]).clone(), P::value(&replacement).clone()];
+        values.extend(inputs[2..].iter().map(|input| P::value(input).clone()));
+        context.parent().bind(self.clone().with_transforms(transforms), Vec::new(), &values)?;
         Ok(Vec::new().into())
     }
 }
 
 impl_differentiable_operation! {
-    <T, U> ReferenceWriteOperation<T, U>,
+    <T, U, Transform> ReferenceWriteOperation<T, U, Transform>,
     jvp<C>
     where
         T: Type,
         U: DifferentiableType,
+        Transform: ReferenceTransform<Type = U, Referent = T>,
         C: Context<
             Type = U,
-            Operation: From<ReferenceWriteOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
+            Operation: From<ReferenceWriteOperation<T, U, Transform>>
+                + ResidualZeroProvider<U, Operation = C::Operation>,
         > + Zero<C::Value>,
     {
         |operation, context, _driver, inputs| {
             // Store the replacement tangent alongside the primal replacement.
-            check_count!("input", inputs, 2, ProgramError);
+            check_count!("input", inputs, 2 + operation.binding_count(), ProgramError);
             // Reject a live tangent without tangent storage before either reference can be changed.
             let stored = match (inputs[0].tangent(), inputs[1].tangent()) {
                 (MaybeZero::Value(reference), tangent) => Some((reference, tangent.clone())),
@@ -209,24 +323,19 @@ impl_differentiable_operation! {
                     .into());
                 }
             };
-            context
-                .primal()
-                .bind(*operation, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?;
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            context.primal().bind(operation.clone(), Vec::new(), &primal_inputs)?;
             if let Some((tangent_reference, tangent)) = stored {
                 // A zero replacement tangent is instantiated because the tangent reference must observe the store.
                 let source = context.primal_to_tangent(inputs[1].primal().clone())?;
-                context.tangent().bind(
-                    *operation,
-                    Vec::new(),
-                    &[
-                        tangent_reference.clone(),
-                        C::Operation::materialize_zero_from_residual_sources(
-                            context.tangent(),
-                            tangent,
-                            std::iter::once(&source),
-                        )?,
-                    ],
+                let tangent = C::Operation::materialize_zero_from_residual_sources(
+                    context.tangent(), tangent, std::iter::once(&source),
                 )?;
+                let mut tangent_inputs = vec![tangent_reference.clone(), tangent];
+                for input in &inputs[2..] {
+                    tangent_inputs.push(context.primal_to_tangent(input.primal().clone())?);
+                }
+                context.tangent().bind(operation.clone(), Vec::new(), &tangent_inputs)?;
             }
             Ok(Vec::new())
         }
@@ -235,21 +344,22 @@ impl_differentiable_operation! {
     where
         T: Type,
         U: DifferentiableType,
+        Transform: ReferenceTransform<Type = U, Referent = T>,
         V: Value<Type = U>,
-        O: ReferenceViewOperation<Type = U>
+        O: Operation<Type = U>
             + ResidualZeroProvider<U, Operation = O>
-            + From<ReferenceSwapOperation<T, U>>,
-        ReferenceSwapOperation<T, U>: Operation<Type = U>,
+            + From<ReferenceSwapOperation<T, U, Transform>>,
+        ReferenceSwapOperation<T, U, Transform>: Operation<Type = U>,
     {
-        |_operation, context, driver, inputs, outputs, accumulators| {
+        |operation, context, driver, inputs, outputs, accumulators| {
             // A write is a swap whose previous contents are discarded, so its transpose is the swap transpose with a
             // zero output cotangent: the cotangent reference is reset to zero (the pre-execution state no longer flows
             // into anything) and its previous contents become the cotangent of the stored value. An accumulator that
             // nothing has reached yet already holds zero, so nothing is staged and the stored value's cotangent stays
             // symbolic.
-            check_count!("input", inputs, 2, ProgramError);
+            check_count!("input", inputs, 2 + operation.binding_count(), ProgramError);
             check_count!("output", outputs, 0, ProgramError);
-            check_count!("accumulator", accumulators, 2, DifferentiationError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
             let value_cotangent_type = inputs[1].r#type().cotangent()?;
             let Some(accumulator) = context.cotangent_reference_if_allocated(driver, 0)? else {
                 return Ok(());
@@ -262,64 +372,108 @@ impl_differentiable_operation! {
                     .chain(inputs.iter().filter_map(PartialValue::as_known))
                     .chain(std::iter::once(&accumulator)),
             )?;
-            let previous = context.bind(ReferenceSwapOperation::new(), Vec::new(), &[accumulator, zero])?.remove(0);
+            let mut adjoint_inputs = vec![accumulator, zero];
+            for input in &inputs[2..] {
+                adjoint_inputs.push(input.as_known().cloned().ok_or_else(|| ProgramError::UnsupportedOperation {
+                    message: "reference transform bindings must be known when transposing an access".to_string(),
+                })?);
+            }
+            let previous = context.bind(
+                ReferenceSwapOperation::<T, U, Transform>::new().with_transforms(operation.transforms.clone()),
+                Vec::new(), &adjoint_inputs,
+            )?.remove(0);
             accumulators[1].accumulate(context, MaybeZero::Value(previous))
         }
     },
 }
 
 /// Capability to replace the value stored by a reference without observing the previous value.
-pub trait ReferenceWrite<Replacement = Self>: Sized {
-    /// Replaces the stored value with `replacement` in program order.
-    fn write(&self, replacement: &Replacement) -> Result<(), ProgramError>;
-}
+pub trait ReferenceWrite<Transform: ReferenceTransform, Binding = Self, Replacement = Self>: Sized {
+    /// Replaces the state selected by the supplied transforms with `replacement` in program order, without observing
+    /// the previous value.
+    ///
+    /// # Parameters
+    ///
+    ///   - `replacement`: Value stored into the viewed reference state, whose type must exactly match the selected
+    ///     referent type.
+    ///   - `transforms`: Transforms applied in order to the reference.
+    ///   - `bindings`: Dynamic inputs in transform order.
+    fn write_through(
+        &self,
+        replacement: &Replacement,
+        transforms: &[Transform],
+        bindings: &[Binding],
+    ) -> Result<(), ProgramError>;
 
-impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ReferenceWrite for ArrayIrValue<A> {
-    fn write(&self, replacement: &Self) -> Result<(), ProgramError> {
-        let operation = ReferenceWriteOperation::<ArrayType, ArrayIrType>::new();
-        operation.infer_output_types(&[self.r#type().into_owned(), replacement.r#type().into_owned()], &[])?;
-        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
-        let replacement = <Self as ValueProjection<ArrayType>>::projected(replacement)?.clone();
-        reference.write(replacement)
+    /// Replaces the complete referent with `replacement` in program order, without observing the previous value.
+    #[inline]
+    fn write(&self, replacement: &Replacement) -> Result<(), ProgramError> {
+        self.write_through(replacement, &[], &[])
     }
 }
 
-impl<
+impl<A: Value<Type = ArrayType> + Concretizable<i128> + Reshape + Slice + UpdateSlice>
+    ReferenceWrite<ArrayReferenceTransform> for ArrayIrValue<A>
+{
+    fn write_through(
+        &self,
+        replacement: &Self,
+        transforms: &[ArrayReferenceTransform],
+        bindings: &[Self],
+    ) -> Result<(), ProgramError> {
+        let operation = ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+        let operation = operation.with_transforms(transforms.to_vec());
+        let mut input_types = vec![self.r#type().into_owned(), replacement.r#type().into_owned()];
+        input_types.extend(bindings.iter().map(|value| value.r#type().into_owned()));
+        operation.infer_output_types(&input_types, &[])?;
+        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
+        let reference = reference.with_transforms(transforms, bindings)?;
+        let replacement = <Self as ValueProjection<ArrayType>>::projected(replacement)?;
+        reference.write(replacement.clone())
+    }
+}
+
+impl<Transform, V> ReferenceWrite<Transform, V, V> for V
+where
+    Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
     V: Value<
             Type = ArrayIrType,
-            DispatchDomain: Context<
-                Type = ArrayIrType,
-                Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
-            >,
+            DispatchDomain: Context<Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType, Transform>>>,
         >,
-> ReferenceWrite<V> for V
 {
-    fn write(&self, replacement: &V) -> Result<(), ProgramError> {
-        self.dispatch_domain().bind(
-            ReferenceWriteOperation::new(),
-            Vec::new(),
-            &[self.clone(), replacement.clone()],
-        )?;
+    fn write_through(
+        &self,
+        replacement: &Self,
+        transforms: &[Transform],
+        bindings: &[Self],
+    ) -> Result<(), ProgramError> {
+        let mut inputs = vec![self.clone(), replacement.clone()];
+        inputs.extend_from_slice(bindings);
+        let operation = ReferenceWriteOperation::new().with_transforms(transforms.to_vec());
+        self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
         Ok(())
     }
 }
 
-impl<
+impl<Transform, V> ReferenceWrite<Transform, V, ProjectedValue<ArrayType, V>>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
     V: Value<
             Type = ArrayIrType,
-            DispatchDomain: Context<
-                Type = ArrayIrType,
-                Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
-            >,
+            DispatchDomain: Context<Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType, Transform>>>,
         >,
-> ReferenceWrite<ProjectedValue<ArrayType, V>> for ProjectedValue<ReferenceType<ArrayType>, V>
 {
-    fn write(&self, replacement: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
-        self.value().dispatch_domain().bind(
-            ReferenceWriteOperation::new(),
-            Vec::new(),
-            &[self.value().clone(), replacement.value().clone()],
-        )?;
+    fn write_through(
+        &self,
+        replacement: &ProjectedValue<ArrayType, V>,
+        transforms: &[Transform],
+        bindings: &[V],
+    ) -> Result<(), ProgramError> {
+        let mut inputs = vec![self.value().clone(), replacement.value().clone()];
+        inputs.extend_from_slice(bindings);
+        let operation = ReferenceWriteOperation::new().with_transforms(transforms.to_vec());
+        self.value().dispatch_domain().bind(operation, Vec::new(), &inputs)?;
         Ok(())
     }
 }
@@ -330,8 +484,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayReference, ArrayType,
-        DataType, DimensionBounds, DimensionType, DimensionValue,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayReference,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, DataType, DimensionBounds, DimensionType,
+        DimensionValue,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
@@ -354,7 +509,7 @@ mod tests {
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
     type TestIrContext = EagerContext<TestIrValue, TestIrOperation>;
-    type TestIrReferenceWriteOperation = ReferenceWriteOperation<ArrayType, ArrayIrType>;
+    type TestIrReferenceWriteOperation = ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>;
 
     #[test]
     fn test_reference_write() {
@@ -364,7 +519,10 @@ mod tests {
         assert_eq!(operation.to_string(), REFERENCE_WRITE_OPERATION_NAME);
         assert_eq!(
             format!("{operation:?}"),
-            format!("ReferenceWriteOperation({:?})", PhantomData::<fn() -> (TestReferent, TestType)>),
+            format!(
+                "ReferenceWriteOperation {{ transforms: [], marker: {:?} }}",
+                PhantomData::<fn() -> (TestReferent, TestType)>
+            ),
         );
 
         // A write orders against other state effects, accesses its reference input for writing, and aliases nothing.
@@ -373,7 +531,6 @@ mod tests {
             operation.effects().reference_effects(),
             &[ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Write }]
         );
-        assert_eq!(operation.effects().reference_aliases(), &[]);
     }
 
     #[test]
@@ -457,6 +614,40 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_write_type_inference_transforms() {
+        let operation = TestIrReferenceWriteOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3])));
+        let scalar = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let index = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                { input_types = [reference.clone(), scalar.clone(), index.clone()], output_types = [], },
+                {
+                    input_types = [reference.clone(), scalar.clone(), scalar.clone()],
+                    error = "reference transform requires a scalar integer index but received `f32[]`",
+                },
+                { input_types = [reference.clone(), scalar.clone()], error = "expected 3 inputs but got 2", },
+                {
+                    input_types = [reference, scalar, index.clone(), index],
+                    error = "expected 3 inputs but got 4",
+                },
+            ],
+        );
+        assert_eq!(
+            operation.to_string(),
+            "reference_write [transforms=[index(axis=0, index=1), dynamic_index(axis=0)]]",
+        );
+        let descriptor = operation.reference_access_descriptor(0).unwrap();
+        assert_eq!(descriptor.transforms(), operation.transforms());
+        assert_eq!(descriptor.bindings(), 2..3);
+        assert!(operation.reference_access_descriptor(1).is_none());
+    }
+
+    #[test]
     fn test_reference_write_interpretation() {
         let live = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let reference = TestIrValue::Reference(live.clone());
@@ -509,6 +700,30 @@ mod tests {
             Err(TypeError::invalid("expected array type but got reference type").into()),
         );
         assert_eq!(live.read(), Ok(Array::vector(vec![3.0_f32, 4.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_reference_write_interpretation_transforms() {
+        let context = EagerContext::<TestIrValue, TestIrOperation>::new();
+        let reference =
+            TestIrValue::Reference(ArrayReference::new(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap()));
+        let index = TestIrValue::Array(Array::scalar(-1i32).unwrap());
+        let operation = TestIrReferenceWriteOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        assert_eq!(
+            operation.interpret(
+                &context,
+                &EmptyRegionDriver,
+                &[reference.clone(), TestIrValue::Array(Array::scalar(9f32).unwrap()), index]
+            ),
+            Ok(Vec::new()),
+        );
+        assert_eq!(
+            reference.read(),
+            Ok(TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 9.]).unwrap())),
+        );
     }
 
     #[test]
@@ -565,6 +780,55 @@ mod tests {
             executing.fold_or_residualize(TestIrReferenceWriteOperation::new(), Vec::new(), &[reference, replacement]);
         assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
         assert_eq!(live.read(), Ok(Array::scalar(4.0_f32).unwrap()));
+    }
+
+    #[test]
+    fn test_reference_write_partial_evaluation_transforms() {
+        // The known root enters the residual program while the dynamic index remains an ordinary unknown input.
+        let live = ArrayReference::new(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap());
+        check_operation_partial_evaluation!(
+            backend = (TestIrValue, TestIrOperation),
+            operation = TestIrReferenceWriteOperation::new().with_transforms(vec![
+                ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+                ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+            ]),
+            cases = [
+                {
+                    inputs = [
+                        (@known, TestIrValue::Reference(live.clone())),
+                        (@known, TestIrValue::Array(Array::scalar(2f32).unwrap())),
+                        (@unknown(
+                            type = ArrayType::scalar(DataType::I32).into(),
+                            replay = TestIrValue::Array(Array::scalar(2i32).unwrap()),
+                        )),
+                    ],
+                    outputs = [],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+        assert_eq!(live.read(), Ok(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 2.]).unwrap()));
+
+        // Under the `Stage` placement a known root and a known binding leave the live state untouched, while the
+        // default `Execute` placement folds the viewed write by running it against the live state.
+        let operation = TestIrReferenceWriteOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let inputs = [
+            PartialEvaluationValue::known(TestIrValue::Reference(live.clone())),
+            PartialEvaluationValue::known(TestIrValue::Array(Array::scalar(7f32).unwrap())),
+            PartialEvaluationValue::known(TestIrValue::Array(Array::scalar(0i32).unwrap())),
+        ];
+        let staging =
+            PartialEvaluationContext::new(TestIrContext::new()).with_reference_placement(ReferencePlacement::Stage);
+        let outputs = staging.fold_or_residualize(operation.clone(), Vec::new(), &inputs);
+        assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
+        assert_eq!(live.read(), Ok(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 2.]).unwrap()));
+        let executing = PartialEvaluationContext::new(TestIrContext::new());
+        let outputs = executing.fold_or_residualize(operation, Vec::new(), &inputs);
+        assert_eq!(outputs.map(|outputs| outputs.len()), Ok(0));
+        assert_eq!(live.read(), Ok(Array::matrix(2, 3, vec![1f32, 2., 3., 7., 5., 2.]).unwrap()));
     }
 
     #[test]
@@ -651,6 +915,47 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_write_batching_transforms() {
+        let extent = TestIrValue::Dimension(
+            DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<TestIrValue, TestIrOperation>::new(),
+            extent,
+        );
+        let packed_type = ArrayType::new_static(DataType::F32, [2, 2, 3]);
+        let reference = TestIrValue::Array(
+            Array::from_elements::<f32>(packed_type.clone(), &[1f32, 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.])
+                .unwrap(),
+        )
+        .reference_new()
+        .unwrap();
+        let input =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(1)).unwrap());
+        let index = BatchingTracer::new(
+            context.clone(),
+            ArrayIrBatch::replicated(TestIrValue::Array(Array::scalar(2i32).unwrap())),
+        );
+        let update = BatchingTracer::new(
+            context.clone(),
+            ArrayIrBatch::new(TestIrValue::Array(Array::vector(vec![20f32, 30.]).unwrap()), BatchAxis::new(0)).unwrap(),
+        );
+        let operation = TestIrReferenceWriteOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let outputs = context.bind(operation, Vec::new(), &[input, update, index]).unwrap();
+        assert!(outputs.is_empty());
+        assert_eq!(
+            reference.read(),
+            Ok(TestIrValue::Array(
+                Array::from_elements::<f32>(packed_type, &[1f32, 2., 3., 4., 5., 6., 7., 8., 20., 10., 11., 30.])
+                    .unwrap()
+            )),
+        );
+    }
+
+    #[test]
     fn test_reference_write_differentiation() {
         let context = DifferentiationContext::fused(TestIrContext::new());
         let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0]).unwrap()).reference_new().unwrap();
@@ -719,6 +1024,47 @@ mod tests {
             },
         );
         assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![11.0_f32, 12.0]).unwrap())));
+    }
+
+    #[test]
+    fn test_reference_write_differentiation_transforms() {
+        let context = DifferentiationContext::fused(EagerContext::<TestIrValue, TestIrOperation>::new());
+        let reference = TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap())
+            .reference_new()
+            .unwrap();
+        let tangent_reference = TestIrValue::Array(Array::matrix(2, 3, vec![10f32, 20., 30., 40., 50., 60.]).unwrap())
+            .reference_new()
+            .unwrap();
+        let input = DifferentiationTracer::new(
+            DifferentiationDual::new(reference.clone(), tangent_reference.clone()).unwrap(),
+            context.clone(),
+        );
+        let index = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::scalar(-1i32).unwrap())).unwrap(),
+            context.clone(),
+        );
+        let update = DifferentiationTracer::new(
+            DifferentiationDual::new(
+                TestIrValue::Array(Array::scalar(9f32).unwrap()),
+                TestIrValue::Array(Array::scalar(90f32).unwrap()),
+            )
+            .unwrap(),
+            context.clone(),
+        );
+        let operation = TestIrReferenceWriteOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let outputs = context.bind(operation, Vec::new(), &[input, update, index]).unwrap();
+        assert!(outputs.is_empty());
+        assert_eq!(
+            reference.read(),
+            Ok(TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 9.]).unwrap())),
+        );
+        assert_eq!(
+            tangent_reference.read(),
+            Ok(TestIrValue::Array(Array::matrix(2, 3, vec![10f32, 20., 30., 40., 50., 90.]).unwrap())),
+        );
     }
 
     #[test]
@@ -811,6 +1157,68 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_write_transposition_transforms() {
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(ArrayType::new_static(DataType::F32, [2, 3]).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let index = builder.add_constant(TestIrValue::Array(Array::scalar(-1i32).unwrap()));
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let operation = TestIrReferenceWriteOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let outputs = builder
+            .add_instruction(operation, Vec::new(), vec![reference, update, index], None)
+            .unwrap()
+            .to_vec();
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        assert!(outputs.is_empty());
+        let output_ids = vec![frozen];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(output_ids, vec![Placeholder; 2], vec![Placeholder; 1])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed
+                .interpret(vec![TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap())]),
+            Ok(vec![
+                TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 0.]).unwrap()),
+                TestIrValue::Array(Array::scalar(6f32).unwrap())
+            ])
+        );
+        // The adjoint swap addresses the same elements as the write, so its dynamic binding must be known when
+        // transposing. Transposing with respect to the index leaves that binding unknown.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(ArrayType::new_static(DataType::F32, [2, 3]).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let index = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let operation = TestIrReferenceWriteOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let mut outputs = builder
+            .add_instruction(operation, Vec::new(), vec![reference, update, index], None)
+            .unwrap()
+            .to_vec();
+        outputs.push(
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0],
+        );
+        let output_count = outputs.len();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 3], vec![Placeholder; output_count])
+            .unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0, 1, 2], &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "reference transform bindings must be known when transposing an access",
+        ));
+    }
+
+    #[test]
     fn test_reference_write_reference_discharge() {
         /// Reference policy that deliberately supports write discharge without supporting accumulation.
         #[derive(Copy, Clone, Debug)]
@@ -820,6 +1228,7 @@ mod tests {
             for WriteOnlyReferenceDischarge
         {
             type Referent = TestReferent;
+            type Transform = NoReferenceTransform<TestReferent, TestType>;
             type Alias = TestAlias;
 
             fn storage_alias(_referent: &TestReferent) -> TestAlias {
@@ -879,6 +1288,40 @@ mod tests {
             .into()),
         );
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
+    }
+
+    #[test]
+    fn test_reference_write_reference_discharge_transforms() {
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(ArrayType::new_static(DataType::F32, [2, 3]).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let index = builder.add_constant(TestIrValue::Array(Array::scalar(-1i32).unwrap()));
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let operation = TestIrReferenceWriteOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let outputs = builder
+            .add_instruction(operation, Vec::new(), vec![reference, update, index], None)
+            .unwrap()
+            .to_vec();
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        assert!(outputs.is_empty());
+        let output_ids = vec![frozen];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(output_ids, vec![Placeholder; 2], vec![Placeholder; 1])
+            .unwrap();
+        let discharged = program.discharge_references(0).unwrap();
+        assert!(!discharged.program().entry_region_ref().contains_reference_accesses_in_closure());
+        assert_eq!(
+            discharged.program().interpret(vec![
+                TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap()),
+                TestIrValue::Array(Array::scalar(9f32).unwrap())
+            ]),
+            Ok(vec![TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 9.]).unwrap())])
+        );
     }
 
     #[test]

@@ -1324,10 +1324,10 @@ where
     C::Operation: ArrayReferenceTransformOperation,
 {
     type Referent = ArrayType;
-    type Alias = ArrayReferenceTransformPath<C::Value>;
     type Transform = ArrayReferenceTransform;
+    type Alias = ArrayReferenceTransformPath<C::Value>;
 
-    fn compose_transforms(
+    fn apply_transforms(
         _context: &C,
         alias: &Self::Alias,
         transforms: &[ArrayReferenceTransform],
@@ -2667,14 +2667,14 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_discharge_compose_transforms() {
+    fn test_array_reference_discharge_apply_transforms() {
         let context = EagerContext::<TestValue, TestOperation>::new();
         let index = ArrayIrValue::Array(Array::scalar(1i32).unwrap());
         let alias = ArrayReferenceTransformPath::root()
             .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
         let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
         let composed =
-            ArrayReferenceDischarge::compose_transforms(&context, &alias, &[transform.clone()], &[index.clone()]);
+            ArrayReferenceDischarge::apply_transforms(&context, &alias, &[transform.clone()], &[index.clone()]);
         assert_eq!(composed, Ok(alias.with_bound_transform(transform, vec![index])));
         let current = ArrayIrValue::Array(Array::vector(vec![1i32, 2, 3, 4]).unwrap());
         assert_eq!(

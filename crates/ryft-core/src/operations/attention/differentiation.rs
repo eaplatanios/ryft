@@ -121,12 +121,12 @@ where
 pub struct DifferentiableDotProductAttention<D: Domain<Type = ArrayType>, Primal, Forward, Backward> {
     /// Refer to the documentation of [`call`](Self::call) for the aligned custom derivative boundary.
     function: CustomVjp<
-        Primal,
-        Forward,
-        Backward,
         AttentionInputs<DomainTracer<D>>,
         DomainTracer<D>,
         AttentionResiduals<DomainTracer<D>>,
+        Primal,
+        Forward,
+        Backward,
     >,
 }
 

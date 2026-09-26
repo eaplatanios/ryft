@@ -3,7 +3,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
-use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayType, DataType};
+use crate::arrays::{ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType, DataType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
@@ -17,44 +17,88 @@ use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
 use crate::operations::references::reference_read::ReferenceReadOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, NoReferent, Operation, OperationProvider, ProgramError, ProjectedValue,
-    ReferenceAccessMode, ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceMemberType, ReferenceType,
-    ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
+    BatchableReferenceTransform, Concretizable, EffectClasses, Effects, MaybeZero, NoReferenceTransform, NoReferent,
+    Operation, OperationFormatter, OperationProvider, ProgramError, ProjectedValue, ReferenceAccessDescriptor,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceAccumulationPolicy, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect,
+    ReferenceMemberType, ReferenceTransform, ReferenceType, RegionInterface, Type, TypeError, Typed, Value,
+    ValueProjection, batch_reference_transforms, infer_reference_view_type,
 };
 
 /// Canonical operation name for [`ReferenceAtomicAddUpdateOperation`].
 pub const REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME: &str = "reference_atomic_add_update";
 
-/// Applies an atomic additive update that preserves the reference's exact referent type.
-/// Refer to [`ReferenceAtomicAddUpdate`] for the ordering, scope, and caller contract.
+/// Applies an atomic additive update that preserves the selected referent's exact type. The root and update are the
+/// first two inputs. Dynamic bindings follow them in transform order and the path is stored in `Transform` metadata.
+/// An empty path accesses the complete referent.
+///
+/// Refer to the documentation of [`ReferenceAtomicAddUpdate`] for information on the ordering, scope,
+/// and caller contract.
 #[derive(Clone, Debug)]
-pub struct ReferenceAtomicAddUpdateOperation<T: Type, U: Type>(PhantomData<fn() -> (T, U)>);
+pub struct ReferenceAtomicAddUpdateOperation<
+    T: Type,
+    U: Type,
+    Transform: ReferenceTransform<Type = U, Referent = T> = NoReferenceTransform<T, U>,
+> {
+    /// Refer to the documentation of [`Self::transforms`].
+    transforms: Vec<Transform>,
 
-impl<T: Type, U: Type> ReferenceAtomicAddUpdateOperation<T, U> {
+    /// [`PhantomData`] marker tying this [`Operation`] to its referent [`Type`] `T` and to the [`Type`] universe `U`
+    /// in which it is valid.
+    marker: PhantomData<fn() -> (T, U)>,
+}
+
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>>
+    ReferenceAtomicAddUpdateOperation<T, U, Transform>
+{
     /// Creates a new [`ReferenceAtomicAddUpdateOperation`].
     pub const fn new() -> Self {
-        Self(PhantomData)
+        Self { transforms: Vec::new(), marker: PhantomData }
+    }
+
+    /// Returns a copy of this [`ReferenceAtomicAddUpdateOperation`] with the provided transforms applied
+    /// to the reference input.
+    #[inline]
+    pub fn with_transforms(mut self, transforms: Vec<Transform>) -> Self {
+        self.transforms = transforms;
+        self
+    }
+
+    /// Returns the transforms applied to the reference input.
+    #[inline]
+    pub fn transforms(&self) -> &[Transform] {
+        &self.transforms
+    }
+
+    /// Returns the number of dynamic inputs supplied after the base inputs
+    /// for this [`ReferenceAtomicAddUpdateOperation`].
+    fn binding_count(&self) -> usize {
+        self.transforms.iter().map(ReferenceTransform::binding_count).sum()
     }
 }
 
-impl<T: Type, U: Type> Default for ReferenceAtomicAddUpdateOperation<T, U> {
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>> Default
+    for ReferenceAtomicAddUpdateOperation<T, U, Transform>
+{
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Type, U: Type> Copy for ReferenceAtomicAddUpdateOperation<T, U> {}
-
-impl<T: Type, U: Type> Display for ReferenceAtomicAddUpdateOperation<T, U> {
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>> Display
+    for ReferenceAtomicAddUpdateOperation<T, U, Transform>
+where
+    Self: Operation,
+{
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME)
+        self.render(formatter, 0)
     }
 }
 
-impl<T: Type, U: Type> Operation for ReferenceAtomicAddUpdateOperation<T, U>
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>> Operation
+    for ReferenceAtomicAddUpdateOperation<T, U, Transform>
 where
     for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
     for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
@@ -72,20 +116,24 @@ where
         input_types: &[U],
         region_interfaces: &[RegionInterface<U>],
     ) -> Result<Vec<U>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
+        check_count!("input", input_types, 2 + self.binding_count(), TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let reference = <&ReferenceType<T>>::try_from(&input_types[0])?;
+        let binding_types = input_types[2..].iter().collect::<Vec<_>>();
+        let referent = infer_reference_view_type(
+            reference.referent(),
+            &self.transforms,
+            &binding_types,
+            ReferenceAccessMode::AtomicAccumulate,
+        )?;
         let update = <&T>::try_from(&input_types[1])?;
-        let addition_outputs =
-            AddOperation::<T>::new().infer_output_types(&[reference.referent().clone(), update.clone()], &[])?;
+        let addition_outputs = AddOperation::<T>::new().infer_output_types(&[referent.clone(), update.clone()], &[])?;
         check_count!("output", addition_outputs, 1, TypeError);
         let addition_output = &addition_outputs[0];
-        if addition_output != reference.referent() {
+        if addition_output != &referent {
             return Err(TypeError::invalid(format!(
-                "`{}` addition output type `{}` must exactly match reference referent type `{}`",
-                REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME,
-                addition_output,
-                reference.referent(),
+                "`{REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME}` addition output type `{addition_output}` \
+                 must exactly match reference referent type `{referent}`",
             )));
         }
         Ok(Vec::new())
@@ -98,22 +146,63 @@ where
             Effects::new(
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::AtomicAccumulate }],
-                Vec::new(),
             )
             .unwrap()
         });
         Cow::Borrowed(&EFFECTS)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        // An empty transform path accesses the complete referent, so it renders as just the operation name.
+        let operation = OperationFormatter::new(formatter, indentation, self.name())?;
+        if self.transforms.is_empty() {
+            return Ok(());
+        }
+        operation.bracketed(|operation| operation.list("transforms", &self.transforms))
+    }
+}
+
+impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>> ReferenceAccessOperation
+    for ReferenceAtomicAddUpdateOperation<T, U, Transform>
+where
+    ReferenceAtomicAddUpdateOperation<T, U, Transform>: Operation<Type = U>,
+{
+    type Transform = Transform;
+
+    #[inline]
+    fn base_input_count(&self) -> usize {
+        2
+    }
+
+    #[inline]
+    fn reference_access_descriptor(&self, input_index: usize) -> Option<ReferenceAccessDescriptor<'_, Transform>> {
+        (input_index == 0).then(|| ReferenceAccessDescriptor::new(&self.transforms, 2..2 + self.binding_count()))
+    }
+
+    #[inline]
+    fn with_reference_access_transforms(
+        &self,
+        input_index: usize,
+        transforms: Vec<Transform>,
+    ) -> Result<Self, ProgramError> {
+        if input_index != 0 {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("`{}` has no reference access at input {}", self.name(), input_index),
+            });
+        }
+        Ok(self.clone().with_transforms(transforms))
     }
 }
 
 impl<
     T: Type,
     U: Type + From<T> + From<ReferenceType<T>>,
-    C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U>>>,
-    P: ReferenceAccumulationPolicy<C, Referent = T>,
-> ReferenceDischargeableOperation<C, P> for ReferenceAtomicAddUpdateOperation<T, U>
+    Transform: ReferenceTransform<Type = U, Referent = T>,
+    C: Context<Type = U>,
+    P: ReferenceAccumulationPolicy<C, Referent = T, Transform = Transform>,
+> ReferenceDischargeableOperation<C, P> for ReferenceAtomicAddUpdateOperation<T, U, Transform>
 where
-    ReferenceAtomicAddUpdateOperation<T, U>: Operation<Type = U>,
+    ReferenceAtomicAddUpdateOperation<T, U, Transform>: Operation<Type = U>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -121,8 +210,12 @@ where
         _driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
+        check_count!("input", inputs, 2 + self.binding_count(), ProgramError);
         let reference = inputs[0].try_as_reference("a reference to accumulate into")?;
+        let bindings = inputs[2..]
+            .iter()
+            .map(|input| input.try_as_value("a reference transform binding").cloned())
+            .collect::<Result<Vec<_>, _>>()?;
         let update = inputs[1].try_as_value("an update value")?.clone();
 
         // The sum of the handle's referent and the update must itself be the handle's referent, which is exactly what
@@ -132,41 +225,52 @@ where
         self.infer_output_types(&input_types, &[])?;
 
         // Discharge is sequential replay, selecting one legal order while preserving the caller's state ordering.
-        context.accumulate(reference, update)?;
+        context.accumulate_through(reference, update, &self.transforms, &bindings)?;
         Ok(Vec::new())
     }
 }
 
-impl<T: Type, U: Type, C: Domain<Type = U, Value: ReferenceAtomicAddUpdate<C::Value>>> InterpretableOperation<C>
-    for ReferenceAtomicAddUpdateOperation<T, U>
+impl<
+    T: Type,
+    U: Type,
+    Transform: ReferenceTransform<Type = U, Referent = T>,
+    C: Domain<Type = U, Value: ReferenceAtomicAddUpdate<Transform, C::Value, C::Value>>,
+> InterpretableOperation<C> for ReferenceAtomicAddUpdateOperation<T, U, Transform>
 where
-    ReferenceAtomicAddUpdateOperation<T, U>: Operation<Type = U>,
+    ReferenceAtomicAddUpdateOperation<T, U, Transform>: Operation<Type = U>,
 {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        inputs[0].atomic_add_update(&inputs[1])?;
+        check_count!("input", inputs, 2 + self.binding_count(), ProgramError);
+        inputs[0].atomic_add_update_through(&inputs[1], &self.transforms, &inputs[2..])?;
         Ok(Vec::new())
     }
-}
-
-impl<T: Type, U: Type, C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U>>>>
-    PartiallyEvaluatableOperation<C> for ReferenceAtomicAddUpdateOperation<T, U>
-{
 }
 
 impl<
     T: Type,
     U: Type,
-    C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U>>>,
+    Transform: ReferenceTransform<Type = U, Referent = T>,
+    C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U, Transform>>>,
+> PartiallyEvaluatableOperation<C> for ReferenceAtomicAddUpdateOperation<T, U, Transform>
+{
+}
+
+impl<
+    T: Type,
+    U: Type + From<ReferenceType<T>>,
+    Transform: BatchableReferenceTransform<Type = U, Referent = T>,
+    C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U, Transform>>>,
     P: BatchingPolicy<C>,
-> BatchableOperation<C, P> for ReferenceAtomicAddUpdateOperation<T, U>
+> BatchableOperation<C, P> for ReferenceAtomicAddUpdateOperation<T, U, Transform>
 where
-    ReferenceAtomicAddUpdateOperation<T, U>: Operation<Type = U>,
+    for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
+    ReferenceAtomicAddUpdateOperation<T, U, Transform>: Operation<Type = U>,
 {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
@@ -174,9 +278,17 @@ where
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        check_count!("input", inputs, 2, ProgramError);
-        // The reference's batch axis is fixed. Broadcast or move the stored value to match it.
-        let update = match (P::batch_axis(&inputs[0]).axis(), P::batch_axis(&inputs[1]).axis()) {
+        // Broadcast or move the stored value to the final selected referent's batch axis.
+        check_count!("input", inputs, 2 + self.binding_count(), ProgramError);
+        let binding_axes = inputs[2..].iter().map(P::batch_axis).collect::<Vec<_>>();
+        let (transforms, output_axis) = batch_reference_transforms(
+            P::value(&inputs[0]).r#type().as_ref(),
+            P::batch_axis(&inputs[0]),
+            &self.transforms,
+            &binding_axes,
+        )?;
+
+        let update = match (output_axis.axis(), P::batch_axis(&inputs[1]).axis()) {
             (Some(axis), _) => driver.align_batch_axis(context, inputs[1].clone(), axis)?,
             (None, None) => inputs[1].clone(),
             (None, Some(_)) => {
@@ -188,25 +300,27 @@ where
                 });
             }
         };
-        context
-            .parent()
-            .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&update).clone()])?;
+
+        let mut values = vec![P::value(&inputs[0]).clone(), P::value(&update).clone()];
+        values.extend(inputs[2..].iter().map(|input| P::value(input).clone()));
+        context.parent().bind(self.clone().with_transforms(transforms), Vec::new(), &values)?;
         Ok(Vec::new().into())
     }
 }
 
 impl_differentiable_operation! {
-    <T, U> ReferenceAtomicAddUpdateOperation<T, U>,
+    <T, U, Transform> ReferenceAtomicAddUpdateOperation<T, U, Transform>,
     jvp<C>
     where
         T: Type,
         U: DifferentiableType,
-        C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U>>>,
+        Transform: ReferenceTransform<Type = U, Referent = T>,
+        C: Context<Type = U, Operation: From<ReferenceAtomicAddUpdateOperation<T, U, Transform>>>,
     {
         |operation, context, _driver, inputs| {
             // Accumulate into the tangent reference alongside the primal as a zero update needs no tangent work, and
             // reject a live tangent without tangent storage before either reference can be changed.
-            check_count!("input", inputs, 2, ProgramError);
+            check_count!("input", inputs, 2 + operation.binding_count(), ProgramError);
             let stored = match (inputs[0].tangent(), inputs[1].tangent()) {
                 (MaybeZero::Value(reference), tangent) => Some((reference, tangent.clone())),
                 (MaybeZero::Zero(_), MaybeZero::Zero(_)) => None,
@@ -221,11 +335,14 @@ impl_differentiable_operation! {
                     .into());
                 }
             };
-            context
-                .primal()
-                .bind(*operation, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?;
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            context.primal().bind(operation.clone(), Vec::new(), &primal_inputs)?;
             if let Some((tangent_reference, MaybeZero::Value(tangent))) = stored {
-                context.tangent().bind(*operation, Vec::new(), &[tangent_reference.clone(), tangent])?;
+                let mut tangent_inputs = vec![tangent_reference.clone(), tangent];
+                for input in &inputs[2..] {
+                    tangent_inputs.push(context.primal_to_tangent(input.primal().clone())?);
+                }
+                context.tangent().bind(operation.clone(), Vec::new(), &tangent_inputs)?;
             }
             Ok(Vec::new())
         }
@@ -234,23 +351,36 @@ impl_differentiable_operation! {
     where
         T: Type,
         U: DifferentiableType,
+        Transform: ReferenceTransform<Type = U, Referent = T>,
         V: Value<Type = U>,
-        O: ReferenceViewOperation<Type = U> + From<ReferenceReadOperation<T, U>>,
-        ReferenceReadOperation<T, U>: Operation<Type = U>,
+        O: Operation<Type = U> + From<ReferenceReadOperation<T, U, Transform>>,
+        ReferenceReadOperation<T, U, Transform>: Operation<Type = U>,
     {
-        |_operation, context, driver, inputs, outputs, accumulators| {
+        |operation, context, driver, inputs, outputs, accumulators| {
             // An accumulation maps `(state, x) ↦ state + x`, so its transpose reads the cotangent reference as the
             // cotangent of the update and leaves the reference's contents unchanged for the earlier accesses. An
             // accumulator that nothing has reached yet holds zero, so nothing is staged and the update's cotangent
             // stays symbolic.
-            check_count!("input", inputs, 2, ProgramError);
+            check_count!("input", inputs, 2 + operation.binding_count(), ProgramError);
             check_count!("output", outputs, 0, ProgramError);
-            check_count!("accumulator", accumulators, 2, DifferentiationError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
             let Some(accumulator) = context.cotangent_reference_if_allocated(driver, 0)? else {
                 return Ok(());
             };
             if accumulators[1].is_needed() {
-                let contribution = context.bind(ReferenceReadOperation::new(), Vec::new(), &[accumulator])?.remove(0);
+                let mut adjoint_inputs = vec![accumulator];
+                for input in &inputs[2..] {
+                    adjoint_inputs.push(input.as_known().cloned().ok_or_else(|| ProgramError::UnsupportedOperation {
+                        message: "reference transform bindings must be known when transposing an access".to_string(),
+                    })?);
+                }
+                let contribution = context
+                    .bind(
+                        ReferenceReadOperation::<T, U, Transform>::new().with_transforms(operation.transforms.clone()),
+                        Vec::new(),
+                        &adjoint_inputs,
+                    )?
+                    .remove(0);
                 accumulators[1].accumulate(context, MaybeZero::Value(contribution))?;
             }
             Ok(())
@@ -258,9 +388,8 @@ impl_differentiable_operation! {
     },
 }
 
-// The blanket ReferenceAtomicAddUpdate implementation requires this provider bound before its method can reject
-// a non-reference input. Providing it keeps that capability available for generic scalar/array values, with a
-// runtime error for unsupported calls. Differentiation itself does not require atomic accumulation.
+// Reference-free universes expose the capability so generic calls can reject unsupported reference inputs.
+// Differentiation does not require atomic accumulation.
 impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAtomicAddUpdateOperation<NoReferent, DataType>>
     for O
 {
@@ -279,9 +408,8 @@ impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceAtomicA
     }
 }
 
-// The blanket ReferenceAtomicAddUpdate implementation requires this provider bound before its method can reject
-// a non-reference input. Providing it keeps that capability available for generic scalar/array values, with a
-// runtime error for unsupported calls. Differentiation itself does not require atomic accumulation.
+// Reference-free universes expose the capability so generic calls can reject unsupported reference inputs.
+// Differentiation does not require atomic accumulation.
 impl<O: Operation<Type = ArrayType>>
     OperationProvider<ArrayType, ReferenceAtomicAddUpdateOperation<NoReferent, ArrayType>> for O
 {
@@ -300,17 +428,20 @@ impl<O: Operation<Type = ArrayType>>
     }
 }
 
-impl<O: Operation<Type = ArrayIrType> + From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>>>
-    OperationProvider<ArrayIrType, ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>> for O
+impl<
+    Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
+    O: Operation<Type = ArrayIrType> + From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, Transform>>,
+> OperationProvider<ArrayIrType, ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, Transform>> for O
 {
     type Operation = Self;
 
     fn provide(
-        request: ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>,
+        request: ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, Transform>,
         input_types: &[&ArrayIrType],
     ) -> Result<Self, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        request.infer_output_types(&[input_types[0].clone(), input_types[1].clone()], &[])?;
+        check_count!("input", input_types, 2 + request.binding_count(), ProgramError);
+        let input_types = input_types.iter().map(|input| (*input).clone()).collect::<Vec<_>>();
+        request.infer_output_types(&input_types, &[])?;
         Ok(request.into())
     }
 }
@@ -325,69 +456,115 @@ impl<O: Operation<Type = ArrayIrType> + From<ReferenceAtomicAddUpdateOperation<A
 /// atomic operation so parallel lowering must implement its scope and ordering or reject it. The operation still
 /// carries [`EffectClass::OrderedState`](crate::EffectClass::OrderedState) and so generic transforms gain no
 /// permission to reorder state effects.
-pub trait ReferenceAtomicAddUpdate<Update = Self>: Sized {
-    /// Atomically adds `update` to the selected stored elements under the capability's ordering contract.
-    fn atomic_add_update(&self, update: &Update) -> Result<(), ProgramError>;
+pub trait ReferenceAtomicAddUpdate<Transform: ReferenceTransform, Binding = Self, Update = Self>: Sized {
+    /// Atomically adds `update` to the elements selected by the supplied transforms under the capability's ordering
+    /// contract.
+    ///
+    /// # Parameters
+    ///
+    ///   - `update`: Value added into the viewed reference state. Its sum with the selected referent must have exactly
+    ///     the selected referent type.
+    ///   - `transforms`: Transforms applied in order to the reference.
+    ///   - `bindings`: Dynamic inputs in transform order.
+    fn atomic_add_update_through(
+        &self,
+        update: &Update,
+        transforms: &[Transform],
+        bindings: &[Binding],
+    ) -> Result<(), ProgramError>;
+
+    /// Atomically adds `update` to the elements of the complete referent under the capability's ordering contract.
+    #[inline]
+    fn atomic_add_update(&self, update: &Update) -> Result<(), ProgramError> {
+        self.atomic_add_update_through(update, &[], &[])
+    }
 }
 
-impl<A: Value<Type = ArrayType> + Add + Reshape + Slice + UpdateSlice> ReferenceAtomicAddUpdate for ArrayIrValue<A> {
-    fn atomic_add_update(&self, update: &Self) -> Result<(), ProgramError> {
-        let operation = ReferenceAtomicAddUpdateOperation::<ArrayType, ArrayIrType>::new();
-        operation.infer_output_types(&[self.r#type().into_owned(), update.r#type().into_owned()], &[])?;
+impl<A: Value<Type = ArrayType> + Concretizable<i128> + Add + Reshape + Slice + UpdateSlice>
+    ReferenceAtomicAddUpdate<ArrayReferenceTransform> for ArrayIrValue<A>
+{
+    fn atomic_add_update_through(
+        &self,
+        update: &Self,
+        transforms: &[ArrayReferenceTransform],
+        bindings: &[Self],
+    ) -> Result<(), ProgramError> {
+        let operation = ReferenceAtomicAddUpdateOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+        let operation = operation.with_transforms(transforms.to_vec());
+        let mut input_types = vec![self.r#type().into_owned(), update.r#type().into_owned()];
+        input_types.extend(bindings.iter().map(|value| value.r#type().into_owned()));
+        operation.infer_output_types(&input_types, &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
+        let reference = reference.with_transforms(transforms, bindings)?;
         let update = <Self as ValueProjection<ArrayType>>::projected(update)?;
 
-        // The reference holder serializes the complete read/add/write transaction, including derived views.
-        // This is a valid sequential execution of the per-element atomic contract.
+        // `add_update` holds the root reference's lock while reading, adding, and writing back, including updates
+        // through views. This prevents lost updates and satisfies per-element atomicity by serializing updates
+        // to the entire allocation.
         reference.add_update(update)
     }
 }
 
-// Staged values delegate selection to their operation family over the referent of the reference being updated;
-// a value that is not a reference member of its universe has no referent and is rejected before any selection.
-impl<
+// Staged values delegate selection to their operation family, including a downstream reference universe's family,
+// over the referent of the reference being updated. A value that is not a reference member of its universe has no
+// referent and is rejected before any selection.
+impl<Transform, V> ReferenceAtomicAddUpdate<Transform, V, V> for V
+where
+    Transform: ReferenceTransform<Type = V::Type, Referent = <V::Type as ReferenceMemberType>::Referent>,
     V: Value<
             Type: ReferenceMemberType,
             DispatchDomain: Context<
                 Operation: OperationProvider<
                     V::Type,
-                    ReferenceAtomicAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+                    ReferenceAtomicAddUpdateOperation<<V::Type as ReferenceMemberType>::Referent, V::Type, Transform>,
                     Operation = <V::DispatchDomain as Domain>::Operation,
                 >,
             >,
         >,
-> ReferenceAtomicAddUpdate for V
 {
-    fn atomic_add_update(&self, update: &Self) -> Result<(), ProgramError> {
+    fn atomic_add_update_through(
+        &self,
+        update: &Self,
+        transforms: &[Transform],
+        bindings: &[Self],
+    ) -> Result<(), ProgramError> {
         let reference_type = self.r#type();
         reference_type
             .referent()
             .ok_or_else(|| TypeError::invalid(format!("expected reference type but got `{reference_type}`")))?;
+        let mut inputs = vec![self.clone(), update.clone()];
+        inputs.extend_from_slice(bindings);
+        let input_types = inputs.iter().map(Typed::r#type).collect::<Vec<_>>();
         let operation = <V::DispatchDomain as Domain>::Operation::provide(
-            ReferenceAtomicAddUpdateOperation::new(),
-            &[reference_type.as_ref(), update.r#type().as_ref()],
+            ReferenceAtomicAddUpdateOperation::new().with_transforms(transforms.to_vec()),
+            &input_types.iter().map(|r#type| r#type.as_ref()).collect::<Vec<_>>(),
         )?;
-        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), update.clone()])?;
+        self.dispatch_domain().bind(operation, Vec::new(), &inputs)?;
         Ok(())
     }
 }
 
-impl<
+impl<Transform, V> ReferenceAtomicAddUpdate<Transform, V, ProjectedValue<ArrayType, V>>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    Transform: ReferenceTransform<Type = ArrayIrType, Referent = ArrayType>,
     V: Value<
             Type = ArrayIrType,
             DispatchDomain: Context<
-                Type = ArrayIrType,
-                Operation: From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>>,
+                Operation: From<ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, Transform>>,
             >,
         >,
-> ReferenceAtomicAddUpdate<ProjectedValue<ArrayType, V>> for ProjectedValue<ReferenceType<ArrayType>, V>
 {
-    fn atomic_add_update(&self, update: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
-        self.value().dispatch_domain().bind(
-            ReferenceAtomicAddUpdateOperation::new(),
-            Vec::new(),
-            &[self.value().clone(), update.value().clone()],
-        )?;
+    fn atomic_add_update_through(
+        &self,
+        update: &ProjectedValue<ArrayType, V>,
+        transforms: &[Transform],
+        bindings: &[V],
+    ) -> Result<(), ProgramError> {
+        let mut inputs = vec![self.value().clone(), update.value().clone()];
+        inputs.extend_from_slice(bindings);
+        let operation = ReferenceAtomicAddUpdateOperation::new().with_transforms(transforms.to_vec());
+        self.value().dispatch_domain().bind(operation, Vec::new(), &inputs)?;
         Ok(())
     }
 }
@@ -398,12 +575,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayOperation, ArrayReference, DimensionBounds,
-        DimensionType, DimensionValue,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayOperation, ArrayReference,
+        ArrayReferenceTransformIndex, DimensionBounds, DimensionType, DimensionValue,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+    use crate::differentiation::{
+        DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationTracer,
+    };
     use crate::macros::{check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::arithmetic::AddOperation;
     use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
@@ -418,7 +597,8 @@ mod tests {
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
     type TestIrContext = EagerContext<TestIrValue, TestIrOperation>;
-    type TestIrReferenceAtomicAddUpdateOperation = ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType>;
+    type TestIrReferenceAtomicAddUpdateOperation =
+        ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>;
 
     #[test]
     fn test_reference_atomic_add_update() {
@@ -428,14 +608,16 @@ mod tests {
         assert_eq!(operation.to_string(), REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME);
         assert_eq!(
             format!("{operation:?}"),
-            format!("ReferenceAtomicAddUpdateOperation({:?})", PhantomData::<fn() -> (ArrayType, ArrayIrType)>),
+            format!(
+                "ReferenceAtomicAddUpdateOperation {{ transforms: [], marker: {:?} }}",
+                PhantomData::<fn() -> (ArrayType, ArrayIrType)>
+            ),
         );
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(
             operation.effects().reference_effects(),
             &[ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::AtomicAccumulate }],
         );
-        assert_eq!(operation.effects().reference_aliases(), &[]);
     }
 
     #[test]
@@ -459,6 +641,40 @@ mod tests {
                 },
             ],
         );
+    }
+
+    #[test]
+    fn test_reference_atomic_add_update_type_inference_transforms() {
+        let operation = TestIrReferenceAtomicAddUpdateOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3])));
+        let scalar = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let index = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                { input_types = [reference.clone(), scalar.clone(), index.clone()], output_types = [], },
+                {
+                    input_types = [reference.clone(), scalar.clone(), scalar.clone()],
+                    error = "reference transform requires a scalar integer index but received `f32[]`",
+                },
+                { input_types = [reference.clone(), scalar.clone()], error = "expected 3 inputs but got 2", },
+                {
+                    input_types = [reference, scalar, index.clone(), index],
+                    error = "expected 3 inputs but got 4",
+                },
+            ],
+        );
+        assert_eq!(
+            operation.to_string(),
+            "reference_atomic_add_update [transforms=[index(axis=0, index=1), dynamic_index(axis=0)]]",
+        );
+        let descriptor = operation.reference_access_descriptor(0).unwrap();
+        assert_eq!(descriptor.transforms(), operation.transforms());
+        assert_eq!(descriptor.bindings(), 2..3);
+        assert!(operation.reference_access_descriptor(1).is_none());
     }
 
     #[test]
@@ -505,6 +721,30 @@ mod tests {
             }
         });
         assert_eq!(live.read(), Ok(Array::scalar(128_i32).unwrap()));
+    }
+
+    #[test]
+    fn test_reference_atomic_add_update_interpretation_transforms() {
+        let context = EagerContext::<TestIrValue, TestIrOperation>::new();
+        let reference =
+            TestIrValue::Reference(ArrayReference::new(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap()));
+        let index = TestIrValue::Array(Array::scalar(-1i32).unwrap());
+        let operation = TestIrReferenceAtomicAddUpdateOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        assert_eq!(
+            operation.interpret(
+                &context,
+                &EmptyRegionDriver,
+                &[reference.clone(), TestIrValue::Array(Array::scalar(9f32).unwrap()), index]
+            ),
+            Ok(Vec::new()),
+        );
+        assert_eq!(
+            reference.read(),
+            Ok(TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 15.]).unwrap())),
+        );
     }
 
     #[test]
@@ -566,6 +806,34 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_atomic_add_update_partial_evaluation_transforms() {
+        // The known root enters the residual program while the dynamic index remains an ordinary unknown input.
+        let live = ArrayReference::new(Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap());
+        check_operation_partial_evaluation!(
+            backend = (TestIrValue, TestIrOperation),
+            operation = TestIrReferenceAtomicAddUpdateOperation::new().with_transforms(vec![
+                ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+                ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+            ]),
+            cases = [
+                {
+                    inputs = [
+                        (@known, TestIrValue::Reference(live.clone())),
+                        (@known, TestIrValue::Array(Array::scalar(2i32).unwrap())),
+                        (@unknown(
+                            type = ArrayType::scalar(DataType::I32).into(),
+                            replay = TestIrValue::Array(Array::scalar(2i32).unwrap()),
+                        )),
+                    ],
+                    outputs = [],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+        assert_eq!(live.read(), Ok(Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 8]).unwrap()));
+    }
+
+    #[test]
     fn test_reference_atomic_add_update_batching() {
         let extent = TestIrValue::Dimension(
             DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
@@ -618,6 +886,47 @@ mod tests {
                           reference as a batched input instead"
                         .to_string(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_reference_atomic_add_update_batching_transforms() {
+        let extent = TestIrValue::Dimension(
+            DimensionValue::new(DimensionType::new("batch", DimensionBounds::unbounded()), 2).unwrap(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<TestIrValue, TestIrOperation>::new(),
+            extent,
+        );
+        let packed_type = ArrayType::new_static(DataType::F32, [2, 2, 3]);
+        let reference = TestIrValue::Array(
+            Array::from_elements::<f32>(packed_type.clone(), &[1f32, 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.])
+                .unwrap(),
+        )
+        .reference_new()
+        .unwrap();
+        let input =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(1)).unwrap());
+        let index = BatchingTracer::new(
+            context.clone(),
+            ArrayIrBatch::replicated(TestIrValue::Array(Array::scalar(2i32).unwrap())),
+        );
+        let update = BatchingTracer::new(
+            context.clone(),
+            ArrayIrBatch::new(TestIrValue::Array(Array::vector(vec![20f32, 30.]).unwrap()), BatchAxis::new(0)).unwrap(),
+        );
+        let operation = TestIrReferenceAtomicAddUpdateOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let outputs = context.bind(operation, Vec::new(), &[input, update, index]).unwrap();
+        assert!(outputs.is_empty());
+        assert_eq!(
+            reference.read(),
+            Ok(TestIrValue::Array(
+                Array::from_elements::<f32>(packed_type, &[1f32, 2., 3., 4., 5., 6., 7., 8., 29., 10., 11., 42.])
+                    .unwrap()
+            )),
         );
     }
 
@@ -718,6 +1027,47 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_atomic_add_update_differentiation_transforms() {
+        let context = DifferentiationContext::fused(EagerContext::<TestIrValue, TestIrOperation>::new());
+        let reference = TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap())
+            .reference_new()
+            .unwrap();
+        let tangent_reference = TestIrValue::Array(Array::matrix(2, 3, vec![10f32, 20., 30., 40., 50., 60.]).unwrap())
+            .reference_new()
+            .unwrap();
+        let input = DifferentiationTracer::new(
+            DifferentiationDual::new(reference.clone(), tangent_reference.clone()).unwrap(),
+            context.clone(),
+        );
+        let index = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::scalar(-1i32).unwrap())).unwrap(),
+            context.clone(),
+        );
+        let update = DifferentiationTracer::new(
+            DifferentiationDual::new(
+                TestIrValue::Array(Array::scalar(9f32).unwrap()),
+                TestIrValue::Array(Array::scalar(90f32).unwrap()),
+            )
+            .unwrap(),
+            context.clone(),
+        );
+        let operation = TestIrReferenceAtomicAddUpdateOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let outputs = context.bind(operation, Vec::new(), &[input, update, index]).unwrap();
+        assert!(outputs.is_empty());
+        assert_eq!(
+            reference.read(),
+            Ok(TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 15.]).unwrap())),
+        );
+        assert_eq!(
+            tangent_reference.read(),
+            Ok(TestIrValue::Array(Array::matrix(2, 3, vec![10f32, 20., 30., 40., 50., 150.]).unwrap())),
+        );
+    }
+
+    #[test]
     fn test_reference_atomic_add_update_transposition() {
         let scalar = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -741,6 +1091,68 @@ mod tests {
                 TestIrValue::Array(Array::scalar(5.0_f32).unwrap()),
             ]),
         );
+    }
+
+    #[test]
+    fn test_reference_atomic_add_update_transposition_transforms() {
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(ArrayType::new_static(DataType::F32, [2, 3]).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let index = builder.add_constant(TestIrValue::Array(Array::scalar(-1i32).unwrap()));
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let operation = TestIrReferenceAtomicAddUpdateOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let outputs = builder
+            .add_instruction(operation, Vec::new(), vec![reference, update, index], None)
+            .unwrap()
+            .to_vec();
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        assert!(outputs.is_empty());
+        let output_ids = vec![frozen];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(output_ids, vec![Placeholder; 2], vec![Placeholder; 1])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed
+                .interpret(vec![TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap())]),
+            Ok(vec![
+                TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap()),
+                TestIrValue::Array(Array::scalar(6f32).unwrap())
+            ])
+        );
+        // The adjoint read addresses the same elements as the update, so its dynamic binding must be known when
+        // transposing. Transposing with respect to the index leaves that binding unknown.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(ArrayType::new_static(DataType::F32, [2, 3]).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let index = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let operation = TestIrReferenceAtomicAddUpdateOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let mut outputs = builder
+            .add_instruction(operation, Vec::new(), vec![reference, update, index], None)
+            .unwrap()
+            .to_vec();
+        outputs.push(
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0],
+        );
+        let output_count = outputs.len();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 3], vec![Placeholder; output_count])
+            .unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0, 1, 2], &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "reference transform bindings must be known when transposing an access",
+        ));
     }
 
     #[test]
@@ -777,6 +1189,40 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_atomic_add_update_reference_discharge_transforms() {
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let initial = builder.add_input(ArrayType::new_static(DataType::F32, [2, 3]).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let index = builder.add_constant(TestIrValue::Array(Array::scalar(-1i32).unwrap()));
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let operation = TestIrReferenceAtomicAddUpdateOperation::new().with_transforms(vec![
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ]);
+        let outputs = builder
+            .add_instruction(operation, Vec::new(), vec![reference, update, index], None)
+            .unwrap()
+            .to_vec();
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        assert!(outputs.is_empty());
+        let output_ids = vec![frozen];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(output_ids, vec![Placeholder; 2], vec![Placeholder; 1])
+            .unwrap();
+        let discharged = program.discharge_references(0).unwrap();
+        assert!(!discharged.program().entry_region_ref().contains_reference_accesses_in_closure());
+        assert_eq!(
+            discharged.program().interpret(vec![
+                TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap()),
+                TestIrValue::Array(Array::scalar(9f32).unwrap())
+            ]),
+            Ok(vec![TestIrValue::Array(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 15.]).unwrap())])
+        );
+    }
+
+    #[test]
     fn test_reference_atomic_add_update_provider() {
         let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
@@ -803,6 +1249,27 @@ mod tests {
         assert!(matches!(
             ArrayOperation::<Array>::provide(ReferenceAtomicAddUpdateOperation::new(), &[&array_type, &array_type]),
             Err(ProgramError::UnsupportedOperation { .. }),
+        ));
+
+        // A request with a nonempty transform path expects its dynamic bindings after the root and the update.
+        let viewed =
+            TestIrReferenceAtomicAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                axis: 0,
+                index: ArrayReferenceTransformIndex::Dynamic,
+            }]);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
+        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I32));
+        assert!(matches!(
+            TestIrOperation::provide(viewed.clone(), &[&reference_type, &value_type, &index_type]),
+            Ok(ArrayIrOperation::ReferenceAtomicAddUpdate(operation)) if operation.transforms() == viewed.transforms(),
+        ));
+        assert!(matches!(
+            TestIrOperation::provide(viewed.clone(), &[&reference_type, &value_type]),
+            Err(ProgramError::InvalidInputCount { expected: 3, actual: 2 }),
+        ));
+        assert!(matches!(
+            TestIrOperation::provide(viewed, &[&reference_type, &value_type, &index_type, &index_type]),
+            Err(ProgramError::InvalidInputCount { expected: 3, actual: 4 }),
         ));
     }
 }
