@@ -45,27 +45,27 @@ impl<'t, Transform: ReferenceTransform> ReferenceAccessDescriptor<'t, Transform>
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Operation family whose reference accesses expose the transform paths applied to their root inputs. Every input
 /// declared by a [`ReferenceEffect::Access`](crate::ReferenceEffect::Access) must have a descriptor, including
-/// whole-root accesses with empty paths. Other inputs have no descriptor. Binding inputs trail the base inputs, grouped
-/// by reference input position and then by transform; operation payloads store paths rather than positions. Consumers
-/// read descriptors through [`validated_reference_access_descriptors`], which enforces this layout.
+/// whole-root accesses with empty paths. Other inputs have no descriptor. Binding inputs trail the base inputs,
+/// grouped by reference input position and then by transform; operation payloads store paths rather than positions.
+/// Consumers read descriptors through [`validated_reference_access_descriptors`], which enforces this layout.
 pub trait ReferenceAccessOperation: Operation {
     /// Transform metadata understood by the family, with dynamic bindings in its input universe.
     type Transform: ReferenceTransform<Type = Self::Type>;
 
     /// Returns the number of inputs before the trailing dynamic transform bindings. This count is used only for
-    /// operations with declared reference accesses; pure operations have no binding groups and may return zero.
+    /// operations with declared reference accesses. Pure operations have no binding groups and may return zero.
     fn base_input_count(&self) -> usize;
 
-    /// Returns the path and binding range for the reference access at `input_index`, or [`None`] for a non-access.
+    /// Returns the [`ReferenceAccessDescriptor`] for the reference access at `input_index`,
+    /// or [`None`] for a non-access.
     fn reference_access_descriptor(&self, input_index: usize)
     -> Option<ReferenceAccessDescriptor<'_, Self::Transform>>;
 
-    /// Returns a copy with the path of the access at `input_index` replaced. Rejects a non-access position or a path
-    /// unsupported by that access. The instruction's bindings must be replaced separately in the canonical layout.
+    /// Returns a copy of this [`ReferenceAccessOperation`] with the path of the access at `input_index` replaced.
+    /// Rejects a non-access position or a path unsupported by that access. The instruction's bindings must be replaced
+    /// separately in the canonical layout.
     fn with_reference_access_transforms(
         &self,
         input_index: usize,
@@ -73,18 +73,20 @@ pub trait ReferenceAccessOperation: Operation {
     ) -> Result<Self, ProgramError>;
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Returns the validated access descriptor of each input of an instruction that applies `operation` to `input_count`
-/// inputs, indexed by input position. Accesses map to their [`ReferenceAccessDescriptor`]; ordinary inputs, including
-/// the trailing transform bindings, map to [`None`].
+/// inputs, indexed by input position. Accesses map to their [`ReferenceAccessDescriptor`] while ordinary inputs,
+/// including the trailing transform bindings, map to [`None`].
 ///
-/// Validation enforces the [`ReferenceAccessOperation`] layout contract: every declared
+/// Validation enforces the [`ReferenceAccessOperation`] layout contract whereby every declared
 /// [`ReferenceEffect::Access`](crate::ReferenceEffect::Access) is a base input with a descriptor, no other input has
 /// one, the binding groups follow the base inputs in increasing access order and exactly cover the remaining inputs,
 /// and consuming accesses apply no transforms. The base-input count applies only when reference accesses exist; pure
 /// operations have no binding groups and retain their ordinary input layout.
 ///
-/// [`ProgramBuilder`](crate::ProgramBuilder) is generic over every [`Operation`] family and therefore cannot check this
-/// layout when instructions are added. [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis) and
+/// [`ProgramBuilder`](crate::ProgramBuilder) is generic over every [`Operation`] family and therefore cannot
+/// check this layout when instructions are added. [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis) and
 /// [`rewrite_reference_access_transforms`] validate it before using any descriptor, and every other consumer must read
 /// descriptors through this function instead of calling [`ReferenceAccessOperation::reference_access_descriptor`]
 /// directly, so that malformed downstream families are rejected instead of producing out-of-range bindings.
@@ -93,82 +95,12 @@ pub trait ReferenceAccessOperation: Operation {
 ///
 ///   - `operation`: Operation whose descriptors are validated.
 ///   - `input_count`: Number of inputs of the instruction that applies `operation`, including transform bindings.
+#[inline]
 pub fn validated_reference_access_descriptors<O: ReferenceAccessOperation>(
     operation: &O,
     input_count: usize,
 ) -> Result<Vec<Option<ReferenceAccessDescriptor<'_, O::Transform>>>, ProgramError> {
     reference_access_layout(operation, input_count).map_err(|(_, message)| ProgramError::MalformedProgram(message))
-}
-
-/// Validates the layout described by [`validated_reference_access_descriptors`], reporting a failure as the index of
-/// the failing input together with a message that names the operation. Failures of the trailing binding count are
-/// attributed to the last access, whose binding group ends the canonical layout.
-pub(super) fn reference_access_layout<O: ReferenceAccessOperation>(
-    operation: &O,
-    input_count: usize,
-) -> Result<Vec<Option<ReferenceAccessDescriptor<'_, O::Transform>>>, (usize, String)> {
-    let accesses = operation.effects().accesses().collect::<BTreeMap<_, _>>();
-    let malformed = |input: usize, message: String| (input, format!("operation `{}` {message}", operation.name()));
-    if let Some((&input, _)) = accesses.range(input_count..).next() {
-        return Err(malformed(
-            input,
-            format!("declares reference access at input {input} but has only {input_count} inputs"),
-        ));
-    }
-    let base_count = operation.base_input_count();
-    let mut next_binding = base_count;
-    let mut last_access = None;
-    let mut descriptors = Vec::with_capacity(input_count);
-    for input in 0..input_count {
-        let descriptor = operation.reference_access_descriptor(input);
-        match (accesses.get(&input), &descriptor) {
-            (Some(_), None) => {
-                return Err(malformed(input, format!("does not describe reference access at input {input}")));
-            }
-            (None, Some(_)) => {
-                return Err(malformed(input, format!("describes reference transforms at non-access input {input}")));
-            }
-            (None, None) => {}
-            (Some(mode), Some(descriptor)) => {
-                if input >= base_count {
-                    return Err(malformed(
-                        input,
-                        format!("reference access at input {input} is outside its {base_count} base inputs"),
-                    ));
-                }
-                let start = next_binding;
-                for transform in descriptor.transforms() {
-                    next_binding = next_binding.checked_add(transform.binding_count()).ok_or_else(|| {
-                        malformed(input, "reference transform binding count overflows `usize`".to_string())
-                    })?;
-                }
-                if descriptor.bindings() != (start..next_binding) {
-                    return Err(malformed(
-                        input,
-                        format!(
-                            "reference access at input {input} has binding range {:?}, expected \
-                             {start}..{next_binding}",
-                            descriptor.bindings(),
-                        ),
-                    ));
-                }
-                if !descriptor.transforms().is_empty() && mode.is_consuming() {
-                    return Err(malformed(input, format!("consumes input {input} through a reference view")));
-                }
-                last_access = Some(input);
-            }
-        }
-        descriptors.push(descriptor);
-    }
-    if let Some(input) = last_access
-        && next_binding != input_count
-    {
-        return Err(malformed(
-            input,
-            format!("reference transforms require {next_binding} inputs but the instruction has {input_count}"),
-        ));
-    }
-    Ok(descriptors)
 }
 
 /// Replaces one reference input's path and consecutive dynamic bindings while preserving instruction outputs,
@@ -202,6 +134,82 @@ pub fn rewrite_reference_access_transforms<O: ReferenceAccessOperation>(
     validated_reference_access_descriptors(&operation, inputs.len())?;
     Ok(Instruction::new(operation, inputs, instruction.outputs().to_vec(), instruction.regions().to_vec())
         .with_provenance(instruction.provenance().clone()))
+}
+
+/// Validates the layout described by [`validated_reference_access_descriptors`], reporting a failure as the index of
+/// the failing input together with a message that names the operation. Failures of the trailing binding count are
+/// attributed to the last access, whose binding group ends the canonical layout.
+pub(super) fn reference_access_layout<O: ReferenceAccessOperation>(
+    operation: &O,
+    input_count: usize,
+) -> Result<Vec<Option<ReferenceAccessDescriptor<'_, O::Transform>>>, (usize, String)> {
+    let accesses = operation.effects().accesses().collect::<BTreeMap<_, _>>();
+    let malformed = |input: usize, message: String| (input, format!("operation `{}` {message}", operation.name()));
+    if let Some((&input, _)) = accesses.range(input_count..).next() {
+        return Err(malformed(
+            input,
+            format!("declares reference access at input {input} but has only {input_count} inputs"),
+        ));
+    }
+
+    let base_count = operation.base_input_count();
+    let mut next_binding = base_count;
+    let mut last_access = None;
+    let mut descriptors = Vec::with_capacity(input_count);
+    for input in 0..input_count {
+        let descriptor = operation.reference_access_descriptor(input);
+        match (accesses.get(&input), &descriptor) {
+            (Some(_), None) => {
+                return Err(malformed(input, format!("does not describe reference access at input {input}")));
+            }
+            (None, Some(_)) => {
+                return Err(malformed(input, format!("describes reference transforms at non-access input {input}")));
+            }
+            (None, None) => {}
+            (Some(mode), Some(descriptor)) => {
+                if input >= base_count {
+                    return Err(malformed(
+                        input,
+                        format!("reference access at input {input} is outside its {base_count} base inputs"),
+                    ));
+                }
+                let start = next_binding;
+                for transform in descriptor.transforms() {
+                    next_binding = next_binding.checked_add(transform.binding_count()).ok_or_else(|| {
+                        malformed(input, "reference transform binding count overflows `usize`".to_string())
+                    })?;
+                }
+                if descriptor.bindings() != (start..next_binding) {
+                    return Err(malformed(
+                        input,
+                        format!(
+                            "reference access at input {} has binding range {:?}, expected {}..{}",
+                            input,
+                            descriptor.bindings(),
+                            start,
+                            next_binding,
+                        ),
+                    ));
+                }
+                if !descriptor.transforms().is_empty() && mode.is_consuming() {
+                    return Err(malformed(input, format!("consumes input {input} through a reference view")));
+                }
+                last_access = Some(input);
+            }
+        }
+        descriptors.push(descriptor);
+    }
+
+    if let Some(input) = last_access
+        && next_binding != input_count
+    {
+        return Err(malformed(
+            input,
+            format!("reference transforms require {next_binding} inputs but the instruction has {input_count}"),
+        ));
+    }
+
+    Ok(descriptors)
 }
 
 #[cfg(test)]
