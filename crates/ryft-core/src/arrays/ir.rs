@@ -451,6 +451,18 @@ mod tests {
     }
 
     #[test]
+    fn test_array_ir_value_is_zero() {
+        assert!(ArrayIrValue::Array(Array::scalar(0.0f32).unwrap()).is_zero());
+        assert!(!ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()).is_zero());
+
+        // A zero-filled reference is a mutable handle, not a zero value that a transform can discard.
+        let reference = ArrayReference::new(Array::scalar(0.0f32).unwrap());
+        assert!(!ArrayIrValue::Reference(reference).is_zero());
+        let dimension = DimensionValue::new(DimensionType::new("size", DimensionBounds::unbounded()), 0).unwrap();
+        assert!(!ArrayIrValue::<Array>::Dimension(dimension).is_zero());
+    }
+
+    #[test]
     fn test_array_ir_value_singleton() {
         // Only the dimension member determines a value from its type; the composite value keeps that type's identity.
         let singleton_type = DimensionType::new("batch", DimensionBounds::new(4, Some(5)).unwrap());

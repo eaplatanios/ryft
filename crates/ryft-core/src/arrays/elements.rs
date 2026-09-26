@@ -146,12 +146,12 @@ pub trait ArrayElement: private::Codec {
 
     /// Returns the identity used to initialize a minimum reduction (i.e., the largest integer, `true` for Boolean
     /// elements, or positive infinity for floating-point elements). Formats without infinity use their largest finite
-    /// value. Complex elements use positive infinity in the real component and zero in the imaginary component.
+    /// value. Complex elements use positive infinity in both components to bound their lexicographic ordering.
     fn min_identity() -> Self;
 
     /// Returns the identity used to initialize a maximum reduction (i.e., the smallest integer, `false` for Boolean
     /// elements, or negative infinity for floating-point elements). Formats without infinity use their smallest finite
-    /// value. Complex elements use negative infinity in the real component and zero in the imaginary component.
+    /// value. Complex elements use negative infinity in both components to bound their lexicographic ordering.
     fn max_identity() -> Self;
 
     /// Returns the smaller of `self` and `other`, preserving the selected operand's exact encoding. Integers use
