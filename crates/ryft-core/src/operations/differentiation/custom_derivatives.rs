@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use crate::contexts::Context;
 use crate::differentiation::DifferentiableType;
 use crate::operations::differentiation::custom_jvp::{CustomJvpOperation, custom_jvp};
@@ -24,8 +26,8 @@ pub struct CustomDerivativeBuilder<Input> {
 }
 
 impl<Input> CustomDerivativeBuilder<Input> {
-    /// Declares the number of leading flattened leaves of the input value that should be treated
-    /// as non-differentiated _plumbing_ inputs.
+    /// Returns a copy with the provided number of leading flattened input leaves treated as non-differentiated
+    /// _plumbing_ inputs.
     ///
     /// This is the [`CustomDerivativeBuilder`] counterpart of
     /// [`CustomJvp::with_non_differentiated_count`](crate::CustomJvp::with_non_differentiated_count)
@@ -57,7 +59,7 @@ impl<Input> CustomDerivativeBuilder<Input> {
     pub fn jvp<
         V: Value<Type = C::Type, DispatchDomain = C>,
         C: Context<Type: DifferentiableType, Value = V, Operation: From<CustomJvpOperation<C::Type>>>,
-        Output: Parameterized<DomainTracer<C>>,
+        Output: Parameterized<DomainTracer<C>, ParameterStructure: Debug + PartialEq>,
         Primal: Fn(Input::To<DomainTracer<C>>) -> Result<Output, ProgramError>,
         Jvp: Fn(Input::To<DomainTracer<C>>, Input::To<DomainTracer<C>>) -> Result<(Output, Output), ProgramError>,
     >(
@@ -101,7 +103,7 @@ impl<Input> CustomDerivativeBuilder<Input> {
     pub fn vjp<
         V: Value<Type = C::Type, DispatchDomain = C>,
         C: Context<Type: DifferentiableType, Value = V, Operation: From<CustomVjpOperation<C::Type>>>,
-        Output: Parameterized<DomainTracer<C>>,
+        Output: Parameterized<DomainTracer<C>, ParameterStructure: Debug + PartialEq>,
         Residual: Parameterized<DomainTracer<C>>,
         Primal: Fn(Input::To<DomainTracer<C>>) -> Result<Output, ProgramError>,
         Forward: Fn(Input::To<DomainTracer<C>>) -> Result<(Output, Residual), ProgramError>,
@@ -113,7 +115,7 @@ impl<Input> CustomDerivativeBuilder<Input> {
         backward: Backward,
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
-        Input: Parameterized<V>,
+        Input: Parameterized<V, ParameterStructure: Debug + PartialEq>,
         Input::Family:
             ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<DomainTracer<C>>,
         Input::To<DomainTracer<C>>:

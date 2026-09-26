@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::batching::{
@@ -15,7 +15,7 @@ use crate::macros::{
     check_count, check_types, impl_non_transposable_operation, impl_reference_dischargeable_operation,
 };
 use crate::operations::constants::zero::Zero;
-use crate::parameters::{Parameterized, ParameterizedFamily};
+use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     InputRegionProvenance, Operation, OperationFormatter, OutputRegionProvenance, Program, ProgramError,
@@ -65,7 +65,7 @@ impl<T: DifferentiableType> CustomJvpOperation<T> {
         Self { non_differentiated_count: 0, marker: PhantomData }
     }
 
-    /// Sets the number of leading inputs that parameterize this call without being differentiated. Refer to the
+    /// Returns a copy with the provided number of leading inputs treated as non-differentiated. Refer to the
     /// documentation of [`CustomJvpOperation`] for the impact of this property on the interfaces of the attached
     /// regions.
     #[inline]
@@ -355,7 +355,7 @@ impl<
         //   j(p, x, ẋ) = (f(p, x), (∂f/∂x)(p, x) · ẋ) = (y, ẏ).
         //
         // Feed every primal value, followed only by the differentiated inputs' tangents; `p` has no tangent slot in the
-        // rule, so a nonzero tangent for a numeric `p` is rejected below. Replay stages the rule's ordinary primitive
+        // rule, so a non-zero tangent for a numeric `p` is rejected below. Replay stages the rule's ordinary primitive
         // operations directly in the active context, so it introduces no symbolic capture. Consequently, reverse mode
         // differentiation can transpose the resulting linear map in `ẋ` exactly like any other tangent program, and
         // no nested differentiation request or special reverse rule is needed here.
@@ -407,7 +407,29 @@ impl<
         outputs
             .into_iter()
             .zip(tangents)
-            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .enumerate()
+            .map(|(index, (primal, tangent))| {
+                // Replaying a stored rule loses the structural-zero representation. Recover it from a literal zero
+                // or a zero-producing instruction, without treating every known tangent as zero: a non-zero constant
+                // tangent is affine and must still be rejected by linearization. Replay has already preserved effects.
+                let output = jvp_region.output_ids()[output_count + index];
+                let is_zero = jvp_region.atoms()[output.index()].as_constant().is_some_and(Value::is_zero)
+                    || jvp_region.instructions().iter().any(|instruction| {
+                        instruction
+                            .outputs()
+                            .iter()
+                            .position(|candidate| *candidate == output)
+                            .is_some_and(|index| instruction.operation().is_zero(index))
+                    })
+                    || context.tangent().resolve(&tangent).into_constant().is_some_and(|value| value.is_zero());
+
+                // Keep a materialized dynamic zero when its reconstruction requires runtime dimension values.
+                if is_zero && C::Operation::zero_residual_types(tangent.r#type().as_ref()).is_empty() {
+                    DifferentiationDual::new_with_zero_tangent(primal)
+                } else {
+                    DifferentiationDual::new(primal, tangent)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()
     }
 }
@@ -445,7 +467,7 @@ impl<
     Jvp: Fn(Input, Input) -> Result<(Output, Output), ProgramError>,
 > CustomJvp<Input, Output, Primal, Jvp>
 {
-    /// Declares the leading `non_differentiated_count` flattened leaves of the input value as non-differentiated
+    /// Returns a copy with the leading `non_differentiated_count` flattened input leaves treated as non-differentiated
     /// _plumbing_ inputs, which is the high-level counterpart of [`CustomJvpOperation::with_non_differentiated_count`].
     /// Refer to the documentation of the [`custom_jvp`] function for the semantics of non-differentiated inputs.
     #[inline]
@@ -469,7 +491,7 @@ impl<
     /// of input leaves, when tracing either closure fails, when the JVP closure uses the tangent placeholder of a
     /// non-differentiated input, or when the staged [`CustomJvpOperation`] rejects the traced programs (e.g., because
     /// the JVP rule signature does not match the primal signature or because the call violates the reference
-    /// contract).
+    /// contract), or when the closures return incompatible parameter structures.
     pub fn call<
         V: Value<Type = C::Type, DispatchDomain = C>,
         C: Context<Type: DifferentiableType, Value = V>,
@@ -483,7 +505,7 @@ impl<
         Input: Parameterized<DomainTracer<C>>,
         Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
         Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input>,
-        Output: Parameterized<DomainTracer<C>>,
+        Output: Parameterized<DomainTracer<C>, ParameterStructure: Debug + PartialEq>,
         Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<V>,
         Output::To<C::Type>: Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
     {
@@ -505,9 +527,24 @@ impl<
             input_values.len(),
         )?;
 
-        let (_, primal) = C::trace(&self.primal, input_types.clone())?;
+        let (primal_output_types, primal) = C::trace(&self.primal, input_types.clone())?;
         let input_tangent_types = input_types.clone().try_map_parameters(|r#type| r#type.tangent())?;
-        let ((output_types, _), jvp) = C::trace(|(x, t)| (self.jvp)(x, t), (input_types, input_tangent_types))?;
+        let ((output_types, tangent_types), jvp) =
+            C::trace(|(x, t)| (self.jvp)(x, t), (input_types, input_tangent_types))?;
+
+        // Flattened signatures cannot distinguish differently nested collections with identical leaf types. Preserve
+        // the primal result's structure for ordinary calls and require both halves of the rule to have that structure.
+        let output_structure = primal_output_types.parameter_structure();
+        for rule_structure in [output_types.parameter_structure(), tangent_types.parameter_structure()] {
+            if rule_structure != output_structure {
+                return Err(ParameterError::MismatchedParameterStructures {
+                    left_structure: format!("{output_structure:?}"),
+                    right_structure: format!("{rule_structure:?}"),
+                }
+                .into());
+            }
+        }
+
         let jvp = without_non_differentiated_tangent_inputs(
             jvp.into_flat_program(),
             input_values.len(),
@@ -521,7 +558,6 @@ impl<
         // and `custom_jvp` composes with those transforms.
         let context = first.dispatch_domain();
         let outputs = context.bind(operation, vec![primal.into_flat_program(), jvp], &input_values)?;
-        let output_structure = output_types.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
@@ -569,13 +605,14 @@ impl<
 ///
 /// # Non-Differentiated Inputs
 ///
-/// [`CustomJvp::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
-/// parameterizes the call without being differentiated, which is the analogue of JAX's `nondiff_argnums`. Plumbing
+/// [`CustomJvp::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_
+/// that parameterizes the call without being differentiated. These leaves remain dynamic inputs. Unlike JAX's
+/// `nondiff_argnums`, this is a prefix of flattened leaves, not a set of static argument positions. Plumbing
 /// leaves reach both closures at their usual positions, and the `jvp` closure keeps receiving a full `ẋ` value so that
 /// its signature mirrors the primal signature. However, the tangent leaves of plumbing inputs are placeholders that
 /// the rule must not use, because the staged [`CustomJvpOperation`] has no tangent slot for non-differentiated inputs.
 /// A rule that consumes or returns such a placeholder is rejected when it is traced, and differentiating the call with
-/// a nonzero tangent for a numeric plumbing input is rejected because the rule cannot propagate that tangent.
+/// a non-zero tangent for a numeric plumbing input is rejected because the rule cannot propagate that tangent.
 ///
 /// # References
 ///
@@ -602,8 +639,8 @@ impl<
 /// The transforms treat a staged call as follows:
 ///
 ///   - _interpretation_ and backend lowering replay the lean primal program only,
-///   - _partial evaluation_ folds a call whose inputs are all known and otherwise residualizes it unchanged, so that
-///     the JVP rule stays attached for a later differentiation,
+///   - _partial evaluation_ folds a call when its inputs are known and effect-ordering constraints permit execution
+///     and it otherwise preserves the call and its attached JVP rule for later differentiation,
 ///   - _batching_ preserves the call around axis-reconciled batched copies of both programs, so that the custom
 ///     derivative survives batching applied _before_ differentiation, and
 ///   - _differentiation_ replays the JVP program instead of differentiating the primal body. The replayed rule consists
@@ -708,7 +745,7 @@ pub(super) fn validate_custom_derivative_reference_boundary<T: Type>(
 /// # Errors
 ///
 /// Returns the [`ProgramError`] of the first violated contract: the [`TypeError`] of
-/// [`validate_custom_derivative_reference_boundary`], a reference boundary error, or an unsupported nonzero tangent.
+/// [`validate_custom_derivative_reference_boundary`], a reference boundary error, or an unsupported non-zero tangent.
 pub(super) fn validate_custom_derivative_replay<C: Context<Type: DifferentiableType>>(
     name: &str,
     non_differentiated_count: usize,
@@ -731,7 +768,7 @@ pub(super) fn validate_custom_derivative_replay<C: Context<Type: DifferentiableT
     }) {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "{} cannot propagate the nonzero tangent of type `{}` supplied for one of its \
+                "{} cannot propagate the non-zero tangent of type `{}` supplied for one of its \
                  {} leading non-differentiated inputs, because its rule has no tangent slot for them",
                 name,
                 input.tangent().r#type(),
@@ -2018,10 +2055,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_custom_jvp_differentiation_zero_tangent_outputs() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(scalar_type.clone());
+        builder.add_input(scalar_type.clone());
+        let zero = builder.add_constant(Array::scalar(0.0).unwrap());
+        let rule = builder.build(vec![input, zero], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+        let mut primal = ProgramBuilder::new();
+        let input = primal.add_input(scalar_type.clone());
+        let primal = primal.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let operation = ArrayOperation::CustomJvp(CustomJvpOperation::new());
+        let regions = vec![primal, rule];
+        let program = custom_derivative_call_program(operation.clone(), regions.clone(), vec![scalar_type]);
+
+        // A constant zero is a valid linear tangent map. Program linearization must preserve its output arity even
+        // though it needs neither the primal input nor any tangent input to produce the result.
+        let linearization = program.linearize().unwrap();
+        let inputs = vec![Array::scalar(7.0).unwrap(); linearization.tangent().input_ids().len()];
+        assert_eq!(linearization.residual_count(), 0);
+        assert_eq!(linearization.tangent().interpret(inputs), Ok(vec![Array::scalar(0.0).unwrap()]));
+
+        // Value linearization and reverse mode use the same custom rule boundary.
+        let (_, pushforward) = differentiate_at(Array::scalar(2.0).unwrap())
+            .linearize(|input| {
+                Ok(input.context().bind(operation.clone(), regions.clone(), &[input.clone()])?.remove(0))
+            })
+            .unwrap();
+        assert_eq!(pushforward.apply(Array::scalar(7.0).unwrap()), Ok(Array::scalar(0.0).unwrap()));
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap())
+                .gradient(|input| { input.context().bind(operation, regions, &[input.clone()]).unwrap().remove(0) }),
+            Ok(Array::scalar(0.0).unwrap()),
+        );
+    }
+
+    #[test]
     fn test_custom_jvp_differentiation_rejects_known_tangent_outputs() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let operation = ArrayOperation::CustomJvp(CustomJvpOperation::new());
-        // A constant nonzero tangent ignores the input tangent and is not a linear map.
+
+        // A constant non-zero tangent ignores the input tangent and is not a linear map.
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(scalar_type.clone());
         builder.add_input(scalar_type.clone());
@@ -2269,6 +2343,42 @@ pub(crate) mod tests {
                     .to_string(),
             ))),
         );
+
+        // Equal flattened leaf types cannot distinguish different nested vector lengths.
+        let function = custom_jvp(
+            |input: DomainTracer<ArrayContext>| Ok(vec![vec![input.clone(), input.clone()], vec![input]]),
+            |input, tangent| {
+                Ok((
+                    vec![vec![input.clone()], vec![input.clone(), input]],
+                    vec![vec![tangent.clone()], vec![tangent.clone(), tangent]],
+                ))
+            },
+        );
+        assert_eq!(
+            ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64)).map(|_| ()),
+            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{:?}", vec![vec![Placeholder; 2], vec![Placeholder]]),
+                right_structure: format!("{:?}", vec![vec![Placeholder], vec![Placeholder; 2]]),
+            })),
+        );
+
+        // The primal half may agree while the tangent half has the wrong structure.
+        let function = custom_jvp(
+            |input: DomainTracer<ArrayContext>| Ok(vec![vec![input.clone(), input.clone()], vec![input]]),
+            |input, tangent| {
+                Ok((
+                    vec![vec![input.clone(), input.clone()], vec![input]],
+                    vec![vec![tangent.clone()], vec![tangent.clone(), tangent]],
+                ))
+            },
+        );
+        assert_eq!(
+            ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64)).map(|_| ()),
+            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{:?}", vec![vec![Placeholder; 2], vec![Placeholder]]),
+                right_structure: format!("{:?}", vec![vec![Placeholder], vec![Placeholder; 2]]),
+            })),
+        );
     }
 
     #[test]
@@ -2347,7 +2457,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(validate_custom_derivative_replay("custom_jvp", 1, &ArrayIrContext::new(), &[input], &[]), Ok(()));
 
-        // A non-differentiated numeric input with a nonzero tangent has no tangent slot in the rule.
+        // A non-differentiated numeric input with a non-zero tangent has no tangent slot in the rule.
         let input = DifferentiationDual::new(
             ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()),
             ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()),
@@ -2356,7 +2466,7 @@ pub(crate) mod tests {
         assert!(matches!(
             validate_custom_derivative_replay("custom_jvp", 1, &ArrayIrContext::new(), &[input], &[]),
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "custom_jvp cannot propagate the nonzero tangent of type `f32[]` supplied for one of \
+                if message == "custom_jvp cannot propagate the non-zero tangent of type `f32[]` supplied for one of \
                     its 1 leading non-differentiated inputs, because its rule has no tangent slot for them",
         ));
     }

@@ -1,27 +1,3 @@
-//! Array reference handles, index mappings, analysis, and discharge for the array IR.
-//!
-//! [`ArrayReferenceTransform`] describes array indexing and slicing. [`ArrayReferenceTransformPath`] composes those
-//! transforms into a mapping from a root array to a selected view, and [`ArrayReference`] pairs a static mapping with
-//! an eager reference allocation. Reads select the elements at the mapped indices; mutations reconstruct the root
-//! through the same transforms in reverse order, preserving values outside the view.
-//!
-//! [`ArrayReferenceAnalysis`] specializes the generic view analysis for these mappings. [`ArrayReferenceDischarge`]
-//! uses the same traversal as eager handles to express reads and updates as immutable array operations in a context.
-//! Sharing this traversal keeps eager view access and discharged array programs consistent.
-//!
-//! The [program reference module](crate::programs::references) owns reference identity, lifetime and alias validation,
-//! symbolic path storage, and generic analysis and discharge. This module supplies array shapes, indices, eager array
-//! handles, and array-IR reconstruction; it does not maintain a second reference analysis or state interpreter.
-//!
-//! # Symbolic Indices
-//!
-//! An [`Index`](ArrayReferenceTransform::Index) transform indexes one array axis using a static index or a dynamic
-//! binding. Each dynamic transform consumes the next ordinary input in the access's binding group; analysis records its
-//! [`ValueId`] in the corresponding bound transform. Eager handles carry [`NoReferenceTransformBinding`] and accept
-//! only static transforms. Discharge paths store context values as bindings and reconstruct dynamically indexed views
-//! through dynamic slicing and updates. Following the array dynamic-slicing contract, a negative runtime index counts
-//! from the end of the selected axis once, and the result is then clamped to that axis.
-
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -53,28 +29,24 @@ use crate::programs::{
     ReferenceViewOverlap, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueId,
 };
 
-// TODO(eaplatanios): Review this module.
-
 /// Error produced by an invalid eager array-reference view operation.
-#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum ArrayReferenceViewError {
-    /// A consuming freeze was attempted through a derived view instead of the root handle.
     #[error("cannot freeze a reference view; freeze the root reference instead")]
     CannotFreezeView,
 
-    /// A derived view was read through the bound-free root-only accessor.
     #[error("cannot read a reference view through the root-only snapshot accessor")]
     CannotReadRootThroughView,
 
-    /// A derived or identity-renamed handle was used as a backend root-state transaction boundary.
-    #[error("reference runtime transactions require an unrenamed root handle")]
+    #[error("reference runtime transactions require a root handle using the allocation's stored type identities")]
     InvalidRuntimeRoot,
 
-    /// A transform with a dynamic index was composed onto an eager handle, whose path carries only static transforms.
     #[error("eager reference handles carry only static transforms; dynamic indices are resolved by each access")]
     DynamicTransformIndex,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root, ArrayReferenceTransform, Binding> {
     /// Selects a static position on `axis`, removing that dimension from the viewed referent.
@@ -110,10 +82,12 @@ impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root
 ///
 /// Transforms are interpreted in order from the root outward. [`Index`](Self::Index) removes one axis at a static or
 /// dynamic index; [`Slice`](Self::Slice) preserves rank and selects one static unit-stride range per axis. A dynamic
-/// index is supplied by a binding input of the access that carries the transform. For example, the built-in scan binds
-/// its explicit body index to a leading dynamic index on each access to a stacked reference. Eager handles resolve
-/// dynamic indices into static transforms when an access applies its path. Discharge reconstructs dynamic indices with
-/// dynamic slicing; strided slicing remains unsupported.
+/// index is supplied by the next input in the access's binding group. Analysis records that input's [`ValueId`] in
+/// the corresponding [`BoundReferenceTransform`]. For example, the built-in scan binds its explicit body index to a
+/// leading dynamic index on each access to a stacked reference. Eager handles resolve dynamic indices into static
+/// transforms when an access applies its path. Discharge reconstructs dynamic indices with dynamic slicing and updates.
+/// A negative runtime index counts from the end of the indexed axis once, then the result is clamped to that axis's
+/// valid range, following the array dynamic-slicing contract. Strided slicing remains unsupported.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 #[non_exhaustive]
 pub enum ArrayReferenceTransform {
@@ -997,6 +971,14 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> TransformWriteC
 
 /// Eager array-reference handle pairing one shared root allocation with a handle-local transform path.
 ///
+/// The path contains only static transforms, with [`NoReferenceTransformBinding`] as its binding type. Reads extract
+/// the elements addressed by the path; mutations reconstruct the root through the same transforms in reverse order,
+/// preserving values outside the view. [`ArrayReferenceDischarge`] uses the same traversal to express these accesses
+/// as immutable array operations in a context.
+///
+/// The underlying [`Reference`] owns allocation identity, lifetime, alias validation, and synchronization. This
+/// handle adds the array-specific transform path and referent type without maintaining separate allocation state.
+///
 /// Equality and hashing identify the mutable location and structural view, not the handle-local type-identity
 /// namespace. Renaming type identities therefore preserves equality with the original handle when its view is
 /// unchanged.
@@ -1035,14 +1017,17 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         &self.path
     }
 
-    /// Returns whether this is an unrenamed root handle accepted at a backend runtime state boundary.
+    /// Returns whether this handle accesses the complete allocation and uses the allocation's stored type identities.
+    /// Backend runtime transactions require both: they access the stored value directly, without applying a transform
+    /// path or converting between the handle's type identities and those used in storage.
     #[doc(hidden)]
     #[inline]
     pub fn is_runtime_root_handle(&self) -> bool {
         self.path.is_root() && self.root.uses_storage_type_identities()
     }
 
-    /// Locks an unrenamed root for one backend-owned state transaction.
+    /// Locks the complete allocation for one backend-owned state transaction. The handle must use the allocation's
+    /// stored type identities, as checked by [`Self::is_runtime_root_handle`].
     #[doc(hidden)]
     pub fn lock_root(&self) -> Result<ReadyOrPendingReferenceGuard<'_, A>, ProgramError> {
         if !self.is_runtime_root_handle() {
@@ -1289,24 +1274,24 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayReference<A> {
     }
 }
 
-// TODO(eaplatanios): Review this module.
-
 /// Array specialization of [`ReferenceViewAnalysis`], associating each reference access with its ordered
 /// [`ArrayReferenceTransformPath`]. Allocation roots and lifetimes come from the shared structural analysis. Dynamic
-/// bindings name ordinary values in the access instruction's own region.
+/// bindings name ordinary values in the access instruction's own region. The generic
+/// [program reference module](crate::programs::references) owns allocation identity, lifetime and alias validation,
+/// transform path storage, and analysis; this specialization supplies array shapes and indexing semantics.
 pub type ArrayReferenceAnalysis = ReferenceViewAnalysis<ArrayReferenceTransform>;
-
-// TODO(eaplatanios): Review this module.
 
 /// [`ReferenceDischargePolicy`] of the array reference universe.
 ///
-/// An array reference's referent is an ordinary [`ArrayType`]-typed array, and the alias one flowing handle carries is
-/// the composed [`ArrayReferenceTransformPath`] mapping its allocation to its own indices, with every symbolic index
-/// closed over the context value it selects. Every access therefore reaches its indices through the same transform path
-/// traversal the eager handles use, which is what keeps staged and eager reference semantics from drifting apart:
-/// reading materializes the allocation-to-handle chain and takes its last snapshot, while a replacement or an
-/// accumulation writes the new leaf back through that chain in reverse. Symbolic indices use dynamic slicing and
-/// updates with the same negative-index and clamping policy, so reads and mutations always address the same elements.
+/// An array reference's referent is an [`ArrayType`]-typed array. Each access applies an
+/// [`ArrayReferenceTransformPath`] to its allocation, with dynamic indices bound to context values. The policy uses
+/// the same transform traversal as [`ArrayReference`]: reads extract the viewed array, while replacements and
+/// accumulations reconstruct the root through the transforms in reverse order, preserving values outside the view.
+/// Dynamic indices use dynamic slicing and updates with the negative-index and clamping behavior described by
+/// [`ArrayReferenceTransform`], so eager and discharged accesses address the same elements.
+///
+/// The generic [program reference module](crate::programs::references) owns discharge and state threading. This
+/// policy supplies array-IR reconstruction operations rather than a separate state interpreter.
 ///
 /// The reconstruction context is bounded by [`Context`] rather than [`Domain`](crate::Domain) because the transform
 /// path traversal binds canonical slicing, reshape, and update operations into it. Their value-level capabilities are
@@ -1327,6 +1312,10 @@ where
     type Transform = ArrayReferenceTransform;
     type Alias = ArrayReferenceTransformPath<C::Value>;
 
+    fn storage_alias(_referent: &ArrayType) -> ArrayReferenceTransformPath<C::Value> {
+        ArrayReferenceTransformPath::root()
+    }
+
     fn apply_transforms(
         _context: &C,
         alias: &Self::Alias,
@@ -1336,10 +1325,6 @@ where
         let mut composed = alias.clone();
         composed.append(ArrayReferenceTransformPath::from_transforms(transforms, bindings)?);
         Ok(composed)
-    }
-
-    fn storage_alias(_referent: &ArrayType) -> ArrayReferenceTransformPath<C::Value> {
-        ArrayReferenceTransformPath::root()
     }
 
     fn read(
@@ -1557,7 +1542,7 @@ mod tests {
             ),
             (
                 ArrayReferenceViewError::InvalidRuntimeRoot,
-                "reference runtime transactions require an unrenamed root handle",
+                "reference runtime transactions require a root handle using the allocation's stored type identities",
             ),
             (
                 ArrayReferenceViewError::DynamicTransformIndex,
@@ -2181,7 +2166,10 @@ mod tests {
             error.downcast_custom::<ArrayReferenceViewError>(),
             Some(&ArrayReferenceViewError::InvalidRuntimeRoot),
         );
-        assert_eq!(error.to_string(), "reference runtime transactions require an unrenamed root handle");
+        assert_eq!(
+            error.to_string(),
+            "reference runtime transactions require a root handle using the allocation's stored type identities",
+        );
     }
 
     #[test]

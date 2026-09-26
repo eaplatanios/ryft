@@ -1,4 +1,5 @@
-use std::fmt::Display;
+use std::collections::HashSet;
+use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::batching::{
@@ -19,7 +20,7 @@ use crate::operations::differentiation::custom_jvp::{
     validate_custom_derivative_reference_boundary, validate_custom_derivative_replay, validate_non_differentiated_count,
 };
 use crate::operations::differentiation::linear_call::LinearCallOperation;
-use crate::parameters::{Parameterized, ParameterizedFamily};
+use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     InputRegionProvenance, Operation, OperationFormatter, OutputRegionProvenance, ProgramError, RegionInterface,
@@ -75,7 +76,7 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
         Self { non_differentiated_count: 0, marker: PhantomData }
     }
 
-    /// Sets the number of leading inputs that parameterize this call without being differentiated. Refer to the
+    /// Returns a copy with the provided number of leading inputs treated as non-differentiated. Refer to the
     /// documentation of [`CustomVjpOperation`] for the impact of this property on the interfaces of the attached
     /// regions.
     #[inline]
@@ -139,12 +140,10 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
             output_types,
         )?;
 
-        // A residual is an internal edge from the forward rule to the backward rule. A reference-typed residual can
-        // only be a plumbing input forwarded by identity, because saving a snapshot of a reference is not a residual
-        // the backward rule could mutate, so its type must be the type of one of the leading non-differentiated
-        // inputs. Each such input can be forwarded at most once, because the backward rule's boundary rejects one
-        // reference bound at two of its positions. The identity itself is a property of the forward program that its
-        // tracing boundary checks.
+        // Reference residuals must have types compatible with distinct leading non-differentiated inputs. This is
+        // only a necessary interface constraint: two inputs can have the same reference type. `CustomVjp::call`
+        // checks the actual forwarded input identities while tracing; raw program producers must ensure that same
+        // contract when attaching their forward regions.
         let mut forwarded = vec![false; non_differentiated_types.len()];
         for (index, residual_type) in residual_types.iter().enumerate().filter(|(_, r#type)| r#type.is_reference()) {
             let available = non_differentiated_types
@@ -629,7 +628,7 @@ impl<
     Backward: Fn(Residual, Output) -> Result<Input, ProgramError>,
 > CustomVjp<Input, Output, Residual, Primal, Forward, Backward>
 {
-    /// Declares the leading `non_differentiated_count` flattened leaves of the input value as non-differentiated
+    /// Returns a copy with the leading `non_differentiated_count` flattened input leaves treated as non-differentiated
     /// _plumbing_ inputs, which is the high-level counterpart of [`CustomVjpOperation::with_non_differentiated_count`].
     /// Refer to the documentation of the [`custom_vjp`] function for the semantics of non-differentiated inputs.
     #[inline]
@@ -653,7 +652,7 @@ impl<
     /// of input leaves, when tracing any of the closures fails, when the forward closure returns a reference-typed
     /// residual that is not a non-differentiated input forwarded by identity, or when the staged [`CustomVjpOperation`]
     /// rejects the traced programs (e.g., because the rule signatures do not match the primal signature or because the
-    /// call violates the reference contract).
+    /// call violates the reference contract), or when the closures return incompatible parameter structures.
     pub fn call<
         V: Value<Type = C::Type, DispatchDomain = C>,
         C: Context<Type: DifferentiableType, Value = V>,
@@ -664,10 +663,10 @@ impl<
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
         C::Operation: From<CustomVjpOperation<C::Type>>,
-        Input: Parameterized<DomainTracer<C>>,
+        Input: Parameterized<DomainTracer<C>, ParameterStructure: Debug + PartialEq>,
         Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
         Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input>,
-        Output: Parameterized<DomainTracer<C>>,
+        Output: Parameterized<DomainTracer<C>, ParameterStructure: Debug + PartialEq>,
         Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<V>,
         Output::To<C::Type>: Clone + Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
         Residual: Parameterized<DomainTracer<C>>,
@@ -689,26 +688,49 @@ impl<
         validate_non_differentiated_count(CUSTOM_VJP_OPERATION_NAME, non_differentiated_count, input_values.len())?;
 
         let (output_types, primal) = C::trace(&self.primal, input_types.clone())?;
-        let ((_, residual_types), forward) = C::trace(&self.forward, input_types.clone())?;
+        let ((forward_output_types, residual_types), forward) = C::trace(&self.forward, input_types.clone())?;
 
-        // A reference-typed residual must be an input forwarded by identity rather than a computed value: a reference
-        // allocated by the forward rule would reach the backward rule as a residual whose mutation nothing outside the
-        // rule observes, so the traced forward program is checked here, where its atoms are visible, while the staged
-        // operation checks the residual's type and that the forwarded input is a leading non-differentiated one.
-        let output_count = output_types.parameters().count();
-        if let Some((index, residual)) =
-            forward.output_ids().iter().skip(output_count).enumerate().find(|(_, residual)| {
-                forward.atoms()[residual.index()].r#type().is_reference() && !forward.input_ids().contains(residual)
-            })
-        {
-            return Err(TypeError::invalid(format!(
-                "{} forward rule returns residual {} of reference type `{}` that is not a leading non-differentiated \
-                 input forwarded by identity",
-                CUSTOM_VJP_OPERATION_NAME,
-                index,
-                forward.atoms()[residual.index()].r#type(),
-            ))
+        // Matching flattened types do not establish matching nested collection lengths. Validate the forward result
+        // before its output prefix is separated from the saved residuals.
+        let output_structure = output_types.parameter_structure();
+        let forward_output_structure = forward_output_types.parameter_structure();
+        if forward_output_structure != output_structure {
+            return Err(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{output_structure:?}"),
+                right_structure: format!("{forward_output_structure:?}"),
+            }
             .into());
+        }
+
+        // Reference residuals preserve handles, not snapshots. Validate their input identities while the traced
+        // atoms are available; matching types alone cannot distinguish two inputs of the same reference type. The
+        // operation subsequently checks that reference inputs belong to the non-differentiated prefix.
+        let output_count = output_types.parameters().count();
+        let mut forwarded_inputs = HashSet::new();
+        for (index, residual) in forward.output_ids().iter().skip(output_count).enumerate() {
+            if !forward.atoms()[residual.index()].r#type().is_reference() {
+                continue;
+            }
+            if !forward.input_ids().contains(residual) {
+                return Err(TypeError::invalid(format!(
+                    "{} forward rule returns residual {} of reference type `{}` that is not a leading \
+                     non-differentiated input forwarded by identity",
+                    CUSTOM_VJP_OPERATION_NAME,
+                    index,
+                    forward.atoms()[residual.index()].r#type(),
+                ))
+                .into());
+            }
+            if !forwarded_inputs.insert(*residual) {
+                return Err(TypeError::invalid(format!(
+                    "{} forward rule returns residual {} of reference type `{}` \
+                     from an input already forwarded by an earlier residual",
+                    CUSTOM_VJP_OPERATION_NAME,
+                    index,
+                    forward.atoms()[residual.index()].r#type(),
+                ))
+                .into());
+            }
         }
         let output_cotangent_types = output_types.clone().try_map_parameters(|r#type| r#type.cotangent())?;
 
@@ -719,9 +741,21 @@ impl<
         // staged rule produces exactly one cotangent per differentiated input.
         let non_differentiated_types =
             input_types.parameters().take(non_differentiated_count).cloned().collect::<Vec<_>>();
+        let input_structure = input_types.parameter_structure();
         let (_, backward) = C::trace(
             |(_, residuals, cotangents): (Vec<DomainTracer<C>>, Residual, Output)| {
                 let cotangents = (self.backward)(residuals, cotangents)?;
+
+                // Check the full input structure before dropping the non-differentiated prefix. Otherwise, a misplaced
+                // cotangent could silently become the derivative of a different input with the same leaf type.
+                let cotangent_structure = cotangents.parameter_structure();
+                if cotangent_structure != input_structure {
+                    return Err(ParameterError::MismatchedParameterStructures {
+                        left_structure: format!("{input_structure:?}"),
+                        right_structure: format!("{cotangent_structure:?}"),
+                    }
+                    .into());
+                }
                 Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
             },
             (non_differentiated_types, residual_types, output_cotangent_types),
@@ -738,7 +772,6 @@ impl<
             vec![primal.into_flat_program(), forward.into_flat_program(), backward.into_flat_program()],
             &input_values,
         )?;
-        let output_structure = output_types.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
@@ -759,8 +792,9 @@ impl<
 ///
 /// Thus, `primal` implements `f` for ordinary evaluation. `forward` recomputes `y` and saves exactly the residual
 /// value `r` needed by the reverse rule. `backward` receives `r` and the output-cotangent value `ȳ`, then returns the
-/// input-cotangent value `x̄`. Ryft validates that both occurrences of `y` agree, that `ȳ` is the cotangent of `y`, and
-/// that `x̄` is the cotangent of `x` when it traces the closures.
+/// input-cotangent value `x̄`. When tracing, Ryft validates matching parameter structures and the corresponding
+/// primal, residual, and cotangent types. The caller must ensure that `primal` and `forward` compute the same value
+/// of `y`; tracing cannot establish their numerical equivalence.
 ///
 /// # When to Use
 ///
@@ -773,13 +807,16 @@ impl<
 ///     Equation (PDE) solution via the adjoint system instead of differentiating the individual steps of the
 ///     integrator.
 ///   - **External or Black-Box Calls:** Supply the reverse rule for a custom kernel or for a computation that does not
-///     itself trace into Ryft programs.
+///     has no automatic derivative. The call must still trace as a Ryft operation with interpretation and backend
+///     lowering support; the closure cannot execute arbitrary external code on tracer values.
 ///   - **Numerical Stability:** Replace an unstable or wasteful automatically derived gradient with a handwritten one.
 ///
-/// Note that a custom VJP only supports reverse-mode differentiation. Forward-mode differentiation of a staged call is
-/// rejected, and the current transpose implementation also rejects transposing its generated pullback, so higher-order
-/// derivatives through a custom VJP are not yet supported. When the function is forward-differentiable or must
-/// participate in higher-order differentiation, use [`custom_jvp`](fn@crate::custom_jvp) instead.
+/// Direct forward-mode differentiation of a staged custom VJP call is rejected because no pushforward rule was
+/// supplied. Its generated pullback, however, contains the backward program's operations and can itself be
+/// differentiated when those operations and the residual-producing computation support the requested transforms.
+/// This includes reverse-over-reverse and forward-over-reverse differentiation; it does not supply a forward rule
+/// for a nested custom VJP encountered along either path. Use [`custom_jvp`](fn@crate::custom_jvp) when callers need
+/// direct forward-mode differentiation as well as reverse mode.
 ///
 /// # Calling Convention
 ///
@@ -798,11 +835,12 @@ impl<
 /// # Non-Differentiated Inputs
 ///
 /// [`CustomVjp::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
-/// parameterizes the call without being differentiated, which is the analogue of JAX's `nondiff_argnums`. Plumbing
+/// parameterizes the call without being differentiated. These leaves remain dynamic inputs. Unlike JAX's
+/// `nondiff_argnums`, this is a prefix of flattened leaves, not a set of static argument positions. Plumbing
 /// leaves reach `primal` and `forward` at their usual positions and receive no cotangent: `backward` keeps returning
 /// a full `x̄` value so that its signature mirrors the primal signature, but the leaves that it returns at plumbing
 /// positions are ignored and never become outputs of the staged [`CustomVjpOperation`]. A plumbing value that
-/// `backward` needs must be forwarded to it as a residual in `r`. Differentiating the call with a nonzero tangent
+/// `backward` needs must be forwarded to it as a residual in `r`. Differentiating the call with a non-zero tangent
 /// for a numeric plumbing input is rejected because the rules cannot propagate that tangent.
 ///
 /// # References
@@ -816,9 +854,10 @@ impl<
 ///
 /// `forward` may return a plumbing reference inside `r`, in which case the reference itself (rather than a snapshot
 /// of its contents) is forwarded to `backward`. Every reference-typed residual must be a distinct plumbing input
-/// forwarded by identity, since a reference allocated by `forward` would reach `backward` as state whose mutation
-/// nothing outside of the rules observes. This enables the _stash-gradients_ pattern: a `stash` reference enters as
-/// plumbing, `forward` returns it as a residual, and `backward` writes the incoming `ȳ` into it before returning `x̄`.
+/// forwarded by identity. This interface supports externally owned mutable state, not privately allocated reference
+/// residuals; save immutable values when the backward rule needs a snapshot. This enables the _stash-gradients_
+/// pattern: a `stash` reference enters as plumbing, `forward` returns it as a residual, and `backward` writes the
+/// incoming `ȳ` into it before returning `x̄`.
 /// The closures may also allocate and use local reference state, which executes like any other primitive operation
 /// whenever the corresponding program is replayed. When the call is differentiated, no two reference inputs may bind
 /// the same allocation.
@@ -838,8 +877,8 @@ impl<
 /// The transforms treat a staged call as follows:
 ///
 ///   - _interpretation_ and backend lowering replay the lean primal program only,
-///   - _partial evaluation_ folds a call whose inputs are all known and otherwise residualizes it unchanged, so that
-///     the rules stay attached for a later differentiation,
+///   - _partial evaluation_ folds a call when its inputs are known and effect-ordering constraints permit execution;
+///     otherwise it preserves the call and its attached rules for later differentiation,
 ///   - _batching_ preserves the call around axis-reconciled batched copies of all three programs, so that the custom
 ///     derivative survives batching applied _before_ differentiation, and it sums the cotangents that the batched
 ///     backward program produces for replicated inputs over the batch axis, and
@@ -1621,6 +1660,63 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_vjp_differentiation_second_order() {
+        // The backward program is inlined into the pullback. Its tripled cosine is differentiable with respect to
+        // the primal through the saved residual, giving -3 sin(x), while preserving the custom first derivative.
+        let (gradient, second_derivative) = differentiate_at(Array::scalar(0.7).unwrap())
+            .value_and_gradient(|input| {
+                differentiate_at(input)
+                    .gradient(|input| {
+                        let scalar_type = ArrayType::scalar(DataType::F64);
+                        input
+                            .context()
+                            .bind(
+                                ArrayOperation::CustomVjp(CustomVjpOperation::new()),
+                                vec![
+                                    sin_program(&scalar_type),
+                                    sin_forward_program(&scalar_type),
+                                    tripled_sin_backward_program(&scalar_type),
+                                ],
+                                &[input.clone()],
+                            )
+                            .unwrap()
+                            .remove(0)
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+        assert_eq!(gradient, Array::scalar(3.0 * 0.7f64.cos()).unwrap());
+        assert_eq!(second_derivative, Array::scalar(-3.0 * 0.7f64.sin()).unwrap());
+
+        // Forward differentiation of the resulting gradient also runs the backward program's ordinary operations;
+        // this does not require executing the original call's transpose-only tangent carrier.
+        let (gradient, second_derivative) = differentiate_at(Array::scalar(0.7).unwrap())
+            .jvp(Array::scalar(1.0).unwrap(), |input| {
+                Ok(differentiate_at(input)
+                    .gradient(|input| {
+                        let scalar_type = ArrayType::scalar(DataType::F64);
+                        input
+                            .context()
+                            .bind(
+                                ArrayOperation::CustomVjp(CustomVjpOperation::new()),
+                                vec![
+                                    sin_program(&scalar_type),
+                                    sin_forward_program(&scalar_type),
+                                    tripled_sin_backward_program(&scalar_type),
+                                ],
+                                &[input.clone()],
+                            )
+                            .unwrap()
+                            .remove(0)
+                    })
+                    .unwrap())
+            })
+            .unwrap();
+        assert_eq!(gradient, Array::scalar(3.0 * 0.7f64.cos()).unwrap());
+        assert_eq!(second_derivative, Array::scalar(-3.0 * 0.7f64.sin()).unwrap());
+    }
+
+    #[test]
     fn test_custom_vjp_differentiation_rejects_forward_mode() {
         // A custom VJP supplies no tangent program, so the tangent carrier that its JVP rule stages cannot be executed.
         // Forward mode must therefore fail with a user-facing custom-VJP error rather than leaking the internal
@@ -1887,6 +1983,39 @@ mod tests {
                 "custom_vjp backward output type signature mismatch: expected [f64[2]] but got [f64[]]".to_string(),
             ))),
         );
+
+        // The forward result must preserve nested collection lengths, not just the flattened types.
+        let function = custom_vjp(
+            |input: DomainTracer<ArrayContext>| Ok(vec![vec![input.clone(), input.clone()], vec![input]]),
+            |input| Ok((vec![vec![input.clone()], vec![input.clone(), input]], ())),
+            |(), cotangents| Ok(cotangents[0][0].clone()),
+        );
+        assert_eq!(
+            ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64)).map(|_| ()),
+            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{:?}", vec![vec![Placeholder; 2], vec![Placeholder]]),
+                right_structure: format!("{:?}", vec![vec![Placeholder], vec![Placeholder; 2]]),
+            })),
+        );
+
+        // Check the full backward structure even when the first flattened leaf is non-differentiated.
+        let function = custom_vjp(
+            |input: Vec<Vec<DomainTracer<ArrayContext>>>| Ok(input[1][0].clone()),
+            |input| Ok((input[1][0].clone(), ())),
+            |(), cotangent| Ok(vec![vec![cotangent.clone()], vec![cotangent.clone(), cotangent]]),
+        )
+        .with_non_differentiated_count(1);
+        assert_eq!(
+            ArrayContext::trace(
+                |input| function.call(input),
+                vec![vec![ArrayType::scalar(DataType::F64); 2], vec![ArrayType::scalar(DataType::F64)]],
+            )
+            .map(|_| ()),
+            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{:?}", vec![vec![Placeholder; 2], vec![Placeholder]]),
+                right_structure: format!("{:?}", vec![vec![Placeholder], vec![Placeholder; 2]]),
+            })),
+        );
     }
 
     #[test]
@@ -1955,6 +2084,30 @@ mod tests {
             ArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
                 "custom_vjp cannot return a reference, but output 0 has type `ref<f32[]>`".to_string(),
+            ))),
+        );
+
+        // Two same-typed inputs do not permit forwarding the first one twice. Type multiplicity alone cannot detect
+        // this alias, so the wrapper checks the actual input atoms before staging the call.
+        let function = custom_vjp(
+            |(_, _, input): (ArrayIrTracer, ArrayIrTracer, ArrayIrTracer)| Ok(input),
+            |(first, _, input)| Ok((input, (first.clone(), first))),
+            |(first, second), cotangent| Ok((first, second, cotangent)),
+        )
+        .with_non_differentiated_count(2);
+        assert_eq!(
+            ArrayIrContext::trace(
+                |input| function.call(input),
+                (
+                    ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                    ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                    ArrayIrType::Array(ArrayType::scalar(DataType::F32))
+                ),
+            )
+            .map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "custom_vjp forward rule returns residual 1 of reference type `ref<f32[]>` from an input already \
+                 forwarded by an earlier residual",
             ))),
         );
     }

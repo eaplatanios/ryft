@@ -185,6 +185,39 @@ impl Array {
         decode_elements(&self.r#type, self.bytes.as_slice())
     }
 
+    /// Decodes this integer array as host indices or sizes in logical row-major order, rejecting negative entries and
+    /// entries that do not fit in `usize`. Every signed and unsigned integer element type, including the sub-byte ones,
+    /// is widened losslessly before the range check, so large unsigned values are never misreported as negative. This
+    /// is used by reference kernels that consume integer metadata operands (e.g., offsets and group sizes).
+    ///
+    /// # Parameters
+    ///
+    ///   - `name`: Name of this array (e.g., the metadata operand it is passed as), used in error messages.
+    pub(crate) fn non_negative_integer_elements(&self, name: &str) -> Result<Vec<usize>, ProgramError> {
+        let data_type = self.r#type.data_type();
+        dispatch_on_array_element_type!(@integer data_type, |Element| {
+            self.elements::<Element>()?
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let value = if data_type.is_signed() {
+                        value.convert_to::<i64>().map(i128::from)?
+                    } else {
+                        value.convert_to::<u64>().map(i128::from)?
+                    };
+                    if value < 0 {
+                        return Err(ProgramError::InvalidArgument {
+                            message: format!("`{name}[{index}]` must be nonnegative but got {value}"),
+                        });
+                    }
+                    usize::try_from(value).map_err(|_| ProgramError::InvalidArgument {
+                        message: format!("`{name}[{index}]` value {value} does not fit in `usize`"),
+                    })
+                })
+                .collect()
+        })
+    }
+
     /// Returns the concatenated logical element encodings in row-major order, omitting layout holes and tile padding.
     pub fn logical_bytes(&self) -> Vec<u8> {
         decode_logical_bytes(&self.r#type, self.bytes.as_slice()).unwrap()
@@ -762,6 +795,7 @@ impl Typed for Array {
 
 impl Value for Array {
     type DispatchDomain = EagerContext<Self>;
+
     // A concrete `Array`'s active context is the reference backend's rich eager domain (unlike the constant-only
     // `EagerContext<Array>` it declares as its `Value::DispatchDomain`, which cannot bind operations), so free
     // transform entry points such as `crate::batching::batch` serve top-level concrete values.
@@ -773,6 +807,23 @@ impl Value for Array {
 
     fn execution_domain(&self) -> EagerContext<Self, ArrayOperation<Self>> {
         EagerContext::new()
+    }
+
+    fn is_zero(&self) -> bool {
+        match self.r#type.data_type() {
+            DataType::Token => false,
+            DataType::Zero => true,
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                // Decode logical elements rather than inspecting physical bytes: signed zeros have nonzero bytes,
+                // and strided or tiled layouts can contain padding that is not part of the array's value.
+                let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
+                (0..addressing.element_count()).all(|index| {
+                    Element::decode(&self.bytes[addressing.byte_range_for_flat_index(index)])
+                        .convert_to::<Complex<f64>>()
+                        .is_ok_and(|value| value == Complex::new(0.0, 0.0))
+                })
+            }),
+        }
     }
 }
 
@@ -1585,6 +1636,23 @@ mod tests {
             Array::from_elements(r#type, &[f8e4m3fn::from_f64(1.125).unwrap(), f8e4m3fn::from_f64(2.0).unwrap()])
                 .unwrap();
         assert_abs_diff_eq!(left, right, epsilon = 0.2);
+    }
+
+    #[test]
+    fn test_array_is_zero() {
+        // Both signs of floating-point zero represent the zero vector; NaNs and nonzero elements do not.
+        assert!(Array::vector(vec![0.0f32, -0.0]).unwrap().is_zero());
+        assert!(!Array::vector(vec![0.0f32, 1.0]).unwrap().is_zero());
+        assert!(!Array::scalar(f32::NAN).unwrap().is_zero());
+        assert!(Array::vector(Vec::<f32>::new()).unwrap().is_zero());
+        assert!(Array::scalar(0i64).unwrap().is_zero());
+        assert!(!Array::scalar(1u64).unwrap().is_zero());
+        assert!(Array::scalar(ComplexNumber::new(-0.0f32, 0.0)).unwrap().is_zero());
+        assert!(!Array::scalar(ComplexNumber::new(0.0f32, 1.0)).unwrap().is_zero());
+
+        // The zero differential space has a unique zero value, while an effect token is not a numerical zero.
+        assert!(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap().is_zero());
+        assert!(!Array::new(ArrayType::scalar(DataType::Token), Vec::new()).unwrap().is_zero());
     }
 
     #[test]
