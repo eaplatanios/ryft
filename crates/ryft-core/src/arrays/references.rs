@@ -439,6 +439,227 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayReference<A> {
     }
 }
 
+/// Immutable index mapping between a shared array-reference root and one view of it. This is the array specialization
+/// of the generic [`ReferenceTransformPath`], whose transforms are [`ArrayReferenceTransform`]s.
+///
+/// The mapping stores validated transforms in root-to-handle order. The empty mapping (i.e., [`root`](Self::root)) is
+/// the identity view and denotes the complete root. Each additional transform is applied to the preceding view, so
+/// indexing or slicing an [`ArrayReference`] view composes onto the same shared root rather than creating another
+/// mutable resource.
+///
+/// Traversals of a path call the input of each transform its _parent_ and the output its _child_. The _intermediates_
+/// of a path are the root followed by each child, and the last of them, which is the value that the path selects, is
+/// its _leaf_. Every intermediate before the leaf is a _strict parent_, and reconstruction needs each of them to
+/// preserve the elements outside the view.
+///
+/// This type is structural metadata only: it owns neither the referenced array nor its resource identity, liveness,
+/// or synchronization state. [`ArrayReference`] pairs it with a handle to the shared reference allocation. In staged
+/// programs, [`ArrayReferenceAnalysis`] records one path per reference access, keyed by its instruction and root input
+/// index. The path determines the viewed referent and addressed indices; mutations reconstruct the root by applying the
+/// inverse update of each transform in reverse order. Overlapping views may address the same root indices and observe
+/// one another's ordered mutations, while equality and hashing distinguish different transform sequences.
+///
+/// `Binding` supplies dynamic indices: [`ValueId`] identifies program values, the uninhabited
+/// [`NoReferenceTransformBinding`] restricts eager handles to static transforms, and `C::Value` binds discharge indices
+/// directly to context values. Supported index transforms are described by [`ArrayReferenceTransform`]. Attached-region
+/// and external runtime boundaries pass complete root handles, and each access inside the receiving scope carries its
+/// own path. For example, each access in a scan body selects one item of a stacked reference through a dynamic index
+/// bound to the body's explicit index input.
+pub type ArrayReferenceTransformPath<Binding = ValueId> = ReferenceTransformPath<ArrayReferenceTransform, Binding>;
+
+impl ArrayReferenceTransformPath {
+    /// Returns the part of a root of type `root_type` that this path selects, as one [`ArraySliceAxis`] per root axis.
+    ///
+    /// Static indices and unit-stride slices always select an axis-aligned box of the root. This function describes
+    /// that box in root coordinates and at the root's rank: a sliced axis keeps its narrowed range, and an indexed
+    /// axis, which the path removes from its result, becomes a size-one range. The ranges cover exactly the elements
+    /// that the path selects, so consumers such as kernel validation can compute the elements or bytes that an access
+    /// touches through [`ArrayAddressing`](crate::ArrayAddressing).
+    ///
+    /// Returns [`None`] if the path contains a symbolic index, whose position is only known at the access, if
+    /// `root_type` does not have a static shape, or if the path does not fold against `root_type` (e.g., because an
+    /// index is out of bounds).
+    ///
+    /// # Example
+    ///
+    /// The path `[slice(axes=[1:4, 2:5]), index(axis=0, index=1)]` first selects rows `1..4` and columns `2..5` of an
+    /// `i32[4, 5]` root and then row `1` of that slice, which is row `2` of the root. In root coordinates, it
+    /// therefore selects `[2:3, 2:5]`:
+    ///
+    /// ```rust
+    /// # use ryft_core::{ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayReferenceTransformPath};
+    /// # use ryft_core::{ArraySliceAxis, ArrayType, DataType};
+    /// let path = ArrayReferenceTransformPath::root()
+    ///     .with_transform(ArrayReferenceTransform::Slice {
+    ///         axes: vec![ArraySliceAxis::new(1, 3, 1), ArraySliceAxis::new(2, 3, 1)],
+    ///     })
+    ///     .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
+    /// assert_eq!(
+    ///     path.root_slice_axes(&ArrayType::new_static(DataType::I32, vec![4, 5])),
+    ///     Some(vec![ArraySliceAxis::new(2, 1, 1), ArraySliceAxis::new(2, 3, 1)]),
+    /// );
+    /// ```
+    pub fn root_slice_axes(&self, root_type: &ArrayType) -> Option<Vec<ArraySliceAxis>> {
+        RootIndexSelection::fold(&root_type.static_shape()?, self.bound_transforms())?
+            .into_iter()
+            .map(|selection| match selection {
+                RootIndexSelection::Range { start, limit } => Some(ArraySliceAxis::new(start, limit - start, 1)),
+                RootIndexSelection::Symbolic { .. } => None,
+            })
+            .collect()
+    }
+}
+
+impl<Binding> ArrayReferenceTransformPath<Binding> {
+    /// Returns the type of the value that this path selects from a root of type `root_type`, by applying
+    /// the [`ArrayReferenceTransform::output_type`] of each transform in order. For example, the path
+    /// `[slice(axes=[1:4, 2:5]), index(axis=0, index=1)]` turns an `i32[4, 5]` root into `i32[3, 3]` and
+    /// then into `i32[3]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if a transform does not apply to the type that it receives (e.g., because an index
+    /// is out of bounds), or if writing through the path would not reconstruct the root type exactly.
+    #[inline]
+    pub fn output_type(&self, root_type: &ArrayType) -> Result<ArrayType, TypeError> {
+        self.transforms().try_fold(root_type.clone(), |r#type, transform| transform.output_type(&r#type))
+    }
+
+    /// Returns every value along this path: `root` first, followed by the child that each transform selects from the
+    /// preceding value. The result has one more entry than the path has transforms, so an empty path returns only
+    /// `root`. For example, for the path `[slice(axes=[1:4, 2:5]), index(axis=0, index=1)]` and an `i32[4, 5]` root,
+    /// it returns:
+    ///
+    /// ```text
+    ///     [root: i32[4, 5], root[1:4, 2:5]: i32[3, 3], root[2, 2:5]: i32[3]]
+    /// ```
+    ///
+    /// The last entry is the selected value, and the others are the strict parents that
+    /// [`reconstruct_in`](Self::reconstruct_in) needs to write a new selected value back. `carrier`
+    /// performs the array operations and resolves symbolic indices from the bindings of each transform.
+    #[inline]
+    fn intermediates_in<C: TransformReadCarrier<Binding = Binding>>(
+        &self,
+        carrier: &C,
+        root: C::Value,
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        Self::intermediates_through(carrier, root, self.bound_transforms())
+    }
+
+    /// Returns the root with the value that this path selects replaced by `replacement`, keeping every element outside
+    /// the view unchanged. The traversal runs from the leaf back to the root. Specifically, the last transform writes
+    /// `replacement` into its parent, the transform before it writes that updated parent into its own parent, and so
+    /// on, until the root is rebuilt:
+    ///
+    /// ```text
+    ///     root  ──slice──▶  parent  ──index──▶  leaf           (intermediates_in)
+    ///     root' ◀──update── parent' ◀──update── replacement    (reconstruct_in)
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    ///   - `carrier`: Array operations used to write each child back into its parent.
+    ///   - `intermediates`: Strict parents of the leaf in root-to-leaf order, with one entry per transform. This is
+    ///     the result of [`intermediates_in`](Self::intermediates_in) without its last entry.
+    ///   - `replacement`: New selected value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] if `intermediates` does not have one entry per transform,
+    /// and forwards the errors of `carrier`.
+    fn reconstruct_in<C: TransformWriteCarrier<Binding = Binding>>(
+        &self,
+        carrier: &C,
+        intermediates: &[C::Value],
+        replacement: C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        let bound_transforms = self.bound_transforms();
+        if intermediates.len() != bound_transforms.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference transform path reconstruction requires {} parent snapshots but received {}",
+                bound_transforms.len(),
+                intermediates.len(),
+            )));
+        }
+        let mut reconstructed = replacement;
+        for (bound_transform, intermediate) in bound_transforms.iter().zip(intermediates).rev() {
+            let bindings = bound_transform.bindings();
+            reconstructed = bound_transform.transform().replace_in(carrier, intermediate, &reconstructed, bindings)?;
+        }
+        Ok(reconstructed)
+    }
+
+    /// Replaces the value that this path selects from `root` with `replacement` and returns `(previous, updated)`,
+    /// where `previous` is the selected value before the swap and `updated` is the rebuilt root (see
+    /// [`reconstruct_in`](Self::reconstruct_in)). Both results come from one traversal, which the eager
+    /// [`ArrayReference::swap`] and the discharge-time [`ReferenceDischargePolicy::swap`] share.
+    fn swap_in<C: TransformWriteCarrier<Value: Clone, Binding = Binding>>(
+        &self,
+        carrier: &C,
+        root: C::Value,
+        replacement: C::Value,
+    ) -> Result<(C::Value, C::Value), ProgramError> {
+        let intermediates = self.intermediates_in(carrier, root)?;
+
+        // The traversal always pushes the root itself first, so the chain is never empty and its last snapshot
+        // is the value this view selects.
+        let previous = intermediates.last().unwrap().clone();
+        let intermediates = &intermediates[..self.bound_transforms().len()];
+        let reconstructed = self.reconstruct_in(carrier, intermediates, replacement)?;
+        Ok((previous, reconstructed))
+    }
+
+    /// Returns `root` with the value that this path selects replaced by `replacement`, like [`swap_in`](Self::swap_in)
+    /// but without computing the previous selected value.
+    ///
+    /// The traversal stops at the parent of the leaf. Rebuilding the root needs every strict parent, so that elements
+    /// outside the view survive, but applying the last transform would only produce the old selected value, which a
+    /// write must not observe (e.g., in a staged program, it would stage a read that nothing uses). An empty path
+    /// therefore returns `replacement` itself.
+    fn write_in<C: TransformWriteCarrier<Binding = Binding>>(
+        &self,
+        carrier: &C,
+        root: C::Value,
+        replacement: C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        let Some((_, parents)) = self.bound_transforms().split_last() else {
+            return Ok(replacement);
+        };
+        let intermediates = Self::intermediates_through(carrier, root, parents)?;
+        self.reconstruct_in(carrier, intermediates.as_slice(), replacement)
+    }
+
+    /// Returns `root` followed by the child that each of `bound_transforms` selects from the preceding value.
+    /// This is [`intermediates_in`](Self::intermediates_in) for any prefix of this path's transforms, which lets
+    /// [`write_in`](Self::write_in) stop at the parent of the leaf.
+    fn intermediates_through<C: TransformReadCarrier<Binding = Binding>>(
+        carrier: &C,
+        root: C::Value,
+        bound_transforms: &[BoundReferenceTransform<ArrayReferenceTransform, Binding>],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        let mut intermediates = Vec::with_capacity(bound_transforms.len() + 1);
+        intermediates.push(root);
+        for bound_transform in bound_transforms {
+            let parent = intermediates.last().unwrap();
+            let child = bound_transform.transform().apply_in(carrier, parent, bound_transform.bindings())?;
+            intermediates.push(child);
+        }
+        Ok(intermediates)
+    }
+}
+
+impl ArrayReferenceTransformPath<NoReferenceTransformBinding> {
+    /// Returns the value that this static path selects from `root` (i.e., the last entry of
+    /// [`intermediates_in`](Self::intermediates_in)) without keeping the values along the way.
+    /// `root` is consumed, and so an empty path returns it without copying.
+    fn apply<A: Value<Type = ArrayType> + Reshape + Slice>(&self, root: A) -> Result<A, ProgramError> {
+        let carrier = EagerTransformCarrier(PhantomData);
+        self.bound_transforms().iter().try_fold(root, |value, bound_transform| {
+            bound_transform.transform().apply_in(&carrier, &value, bound_transform.bindings())
+        })
+    }
+}
+
 /// Index selected by an [`Index`](ArrayReferenceTransform::Index) transform.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayReferenceTransformIndex {
@@ -884,6 +1105,38 @@ impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root
 
 // TODO(eaplatanios): Review from here onwards.
 
+/// Normalized indices of one [`ArrayReferenceTransform`] applied to one statically shaped input.
+///
+/// Both transform kinds reduce to taking one static unit-stride slice of the input, optionally followed by squeezing
+/// the indexed axis. Normalizing to this shared form lets every consumer (type derivation, eager reads,
+/// eager update reconstruction, and staged discharge) share one validation and address computation.
+struct TransformSelection {
+    /// Inclusive slice start per input axis.
+    starts: Vec<usize>,
+
+    /// Exclusive slice limit per input axis.
+    limits: Vec<usize>,
+
+    /// Exact static output shape after squeezing the indexed axis, for
+    /// [`ArrayReferenceTransform::Index`] transforms only; [`None`] for rank-preserving slices, whose output
+    /// shape is exactly [`Self::update_shape`].
+    squeezed_output_shape: Option<Shape>,
+}
+
+impl TransformSelection {
+    /// Returns the static shape of the slice before squeezing (i.e., the update shape that writes back into the
+    /// selected indices).
+    fn update_shape(&self) -> Shape {
+        Shape::new(
+            self.starts
+                .iter()
+                .zip(self.limits.iter())
+                .map(|(start, limit)| Dimension::Static(limit - start))
+                .collect(),
+        )
+    }
+}
+
 /// Indices that a folded [`ArrayReferenceTransformPath`] selects on one axis of its root, used by
 /// [`ReferenceTransform::overlap`] to compare two paths of one root.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -991,199 +1244,6 @@ impl RootIndexSelection {
             | (Self::Range { .. }, Self::Symbolic { .. })
             | (Self::Symbolic { .. }, Self::Range { .. }) => ReferenceViewOverlap::MayOverlap,
         }
-    }
-}
-
-/// Normalized indices of one [`ArrayReferenceTransform`] applied to one statically shaped input.
-///
-/// Both transform kinds reduce to taking one static unit-stride slice of the input, optionally followed by squeezing
-/// the indexed axis. Normalizing to this shared form lets every consumer (type derivation, eager reads,
-/// eager update reconstruction, and staged discharge) share one validation and address computation.
-struct TransformSelection {
-    /// Inclusive slice start per input axis.
-    starts: Vec<usize>,
-
-    /// Exclusive slice limit per input axis.
-    limits: Vec<usize>,
-
-    /// Exact static output shape after squeezing the indexed axis, for
-    /// [`ArrayReferenceTransform::Index`] transforms only; [`None`] for rank-preserving slices, whose output
-    /// shape is exactly [`Self::update_shape`].
-    squeezed_output_shape: Option<Shape>,
-}
-
-impl TransformSelection {
-    /// Returns the static shape of the slice before squeezing (i.e., the update shape that writes back into the
-    /// selected indices).
-    fn update_shape(&self) -> Shape {
-        Shape::new(
-            self.starts
-                .iter()
-                .zip(self.limits.iter())
-                .map(|(start, limit)| Dimension::Static(limit - start))
-                .collect(),
-        )
-    }
-}
-
-/// Immutable index mapping between a shared array-reference root and one view of it: the array specialization of the
-/// generic [`ReferenceTransformPath`], whose transforms are [`ArrayReferenceTransform`]s.
-///
-/// The mapping stores validated transforms in root-to-handle order. The empty mapping ([`root`](Self::root)) is the
-/// identity view and denotes the complete root. Each additional transform is applied to the preceding view, so
-/// indexing or slicing an [`ArrayReference`] view composes onto the same shared root rather than creating another
-/// mutable resource.
-///
-/// Traversals of a path call the input of each transform its *parent* and the output its *child*. The
-/// *intermediates* of a path are the root followed by each child, and the last of them, which is the value that the
-/// path selects, is its *leaf*. Every intermediate before the leaf is a *strict parent*, and reconstruction needs each
-/// of them to preserve the elements outside the view.
-///
-/// This type is structural metadata only: it owns neither the referenced array nor its resource identity, liveness, or
-/// synchronization state. [`ArrayReference`] pairs it with a handle to the shared reference allocation. In staged
-/// programs, [`ArrayReferenceAnalysis`] records one path per reference access, keyed by its instruction and root
-/// input index. The path determines the viewed referent and addressed indices; mutations reconstruct the root by
-/// applying the inverse update of each transform in reverse order. Overlapping views may address the same root indices
-/// and observe one another's ordered mutations, while equality and hashing distinguish different transform sequences.
-///
-/// `Binding` supplies dynamic indices: [`ValueId`] identifies program values, the uninhabited
-/// [`NoReferenceTransformBinding`] restricts eager handles to static transforms, and `C::Value` binds discharge indices
-/// directly to context values. Supported index transforms are described by [`ArrayReferenceTransform`]. Attached-region
-/// and external runtime boundaries pass complete root handles, and each access inside the receiving scope carries its
-/// own path. For example, each access in a scan body selects one item of a stacked reference through a dynamic index
-/// bound to the body's explicit index input.
-pub type ArrayReferenceTransformPath<Binding = ValueId> = ReferenceTransformPath<ArrayReferenceTransform, Binding>;
-
-impl ArrayReferenceTransformPath {
-    /// Returns a static, rank-preserving slice of the root selecting the same elements as this path. Indexed axes
-    /// become size-one ranges. Symbolic indices, dynamic root shapes, and invalid compositions return `None` rather
-    /// than claiming a definite selection. The returned transform describes root coordinates, not the path's result
-    /// rank.
-    pub fn root_slice(&self, root_type: &ArrayType) -> Option<ArrayReferenceTransform> {
-        let indices = RootIndexSelection::fold(&root_type.static_shape()?, self.bound_transforms())?;
-        let axes = indices
-            .into_iter()
-            .map(|selection| match selection {
-                RootIndexSelection::Range { start, limit } => Some(ArraySliceAxis::new(start, limit - start, 1)),
-                RootIndexSelection::Symbolic { .. } => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(ArrayReferenceTransform::Slice { axes })
-    }
-}
-
-impl<Binding> ArrayReferenceTransformPath<Binding> {
-    /// Returns the exact view type derived from `root_type`.
-    pub fn output_type(&self, root_type: &ArrayType) -> Result<ArrayType, TypeError> {
-        self.transforms().try_fold(root_type.clone(), |r#type, transform| transform.output_type(&r#type))
-    }
-
-    /// Returns the root followed by each selected child, ending with the value this path selects. An empty path returns
-    /// only the root. The bindings of each bound transform are handed to `carrier`, which resolves symbolic indices;
-    /// reconstruction uses every snapshot except the final child as its strict parents.
-    fn intermediates_in<C: TransformReadCarrier<Binding = Binding>>(
-        &self,
-        carrier: &C,
-        root: C::Value,
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        Self::intermediates_through(carrier, root, self.bound_transforms())
-    }
-
-    /// Reconstructs the root after replacing the selected leaf, working from the innermost view back to the root.
-    ///
-    /// # Parameters
-    ///
-    ///   - `carrier`: array operations used to reconstruct each parent.
-    ///   - `intermediates`: one snapshot per strict parent, in root-to-view order. This is the sequence produced by
-    ///     [`intermediates_in`](Self::intermediates_in) without its final selected value.
-    ///   - `replacement`: new selected value.
-    fn reconstruct_in<C: TransformWriteCarrier<Binding = Binding>>(
-        &self,
-        carrier: &C,
-        intermediates: &[C::Value],
-        replacement: C::Value,
-    ) -> Result<C::Value, ProgramError> {
-        let bound_transforms = self.bound_transforms();
-        if intermediates.len() != bound_transforms.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference transform path reconstruction requires {} parent snapshots but received {}",
-                bound_transforms.len(),
-                intermediates.len(),
-            )));
-        }
-        let mut reconstructed = replacement;
-        for (bound_transform, intermediate) in bound_transforms.iter().zip(intermediates).rev() {
-            let bindings = bound_transform.bindings();
-            reconstructed = bound_transform.transform().replace_in(carrier, intermediate, &reconstructed, bindings)?;
-        }
-        Ok(reconstructed)
-    }
-
-    /// Replaces this view's selected elements through `carrier`, returning their previous snapshot plus the
-    /// reconstructed root, so that the eager swap and the discharge-time replacement share one traversal.
-    fn swap_in<C: TransformWriteCarrier<Value: Clone, Binding = Binding>>(
-        &self,
-        carrier: &C,
-        root: C::Value,
-        replacement: C::Value,
-    ) -> Result<(C::Value, C::Value), ProgramError> {
-        let intermediates = self.intermediates_in(carrier, root)?;
-
-        // The traversal always pushes the root itself first, so the chain is never empty and its last snapshot is
-        // the value this view selects.
-        let previous = intermediates.last().unwrap().clone();
-        let reconstructed =
-            self.reconstruct_in(carrier, &intermediates[..self.bound_transforms().len()], replacement)?;
-        Ok((previous, reconstructed))
-    }
-
-    /// Replaces this view's selected elements through `carrier` without materializing the selected old value.
-    ///
-    /// Immutable root reconstruction still needs each strict parent of the selected leaf so indices outside the logical
-    /// view survive. The final transform is deliberately not applied: its output is exactly the old selected value that
-    /// write-only semantics must not observe. An identity view therefore returns `replacement` directly.
-    fn write_in<C: TransformWriteCarrier<Binding = Binding>>(
-        &self,
-        carrier: &C,
-        root: C::Value,
-        replacement: C::Value,
-    ) -> Result<C::Value, ProgramError> {
-        let Some((_, parents)) = self.bound_transforms().split_last() else {
-            return Ok(replacement);
-        };
-        let intermediates = Self::intermediates_through(carrier, root, parents)?;
-        self.reconstruct_in(carrier, intermediates.as_slice(), replacement)
-    }
-
-    /// Returns `root` followed by the child that each of `bound_transforms` selects from the preceding value, which is
-    /// [`intermediates_in`](Self::intermediates_in) for a prefix of this path's transforms.
-    fn intermediates_through<C: TransformReadCarrier<Binding = Binding>>(
-        carrier: &C,
-        root: C::Value,
-        bound_transforms: &[BoundReferenceTransform<ArrayReferenceTransform, Binding>],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        let mut intermediates = Vec::with_capacity(bound_transforms.len() + 1);
-        intermediates.push(root);
-        for bound_transform in bound_transforms {
-            let parent = intermediates.last().unwrap();
-            let child = bound_transform.transform().apply_in(carrier, parent, bound_transform.bindings())?;
-            intermediates.push(child);
-        }
-        Ok(intermediates)
-    }
-}
-
-impl ArrayReferenceTransformPath<NoReferenceTransformBinding> {
-    /// Applies the complete static mapping to one root snapshot, which it consumes so that an empty path returns the
-    /// snapshot without copying it.
-    fn apply<A>(&self, root: A) -> Result<A, ProgramError>
-    where
-        A: Value<Type = ArrayType> + Reshape + Slice,
-    {
-        let carrier = EagerTransformCarrier(PhantomData);
-        self.bound_transforms().iter().try_fold(root, |value, bound_transform| {
-            bound_transform.transform().apply_in(&carrier, &value, bound_transform.bindings())
-        })
     }
 }
 
@@ -2159,6 +2219,112 @@ mod tests {
     }
 
     #[test]
+    fn test_array_reference_transform_path_root_slice_axes() {
+        let root_type = ArrayType::new_static(DataType::I32, vec![4, 5]);
+        let path = ArrayReferenceTransformPath::root()
+            .with_transform(ArrayReferenceTransform::Slice {
+                axes: vec![ArraySliceAxis::new(1, 3, 1), ArraySliceAxis::new(2, 3, 1)],
+            })
+            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
+        assert_eq!(
+            path.root_slice_axes(&root_type),
+            Some(vec![ArraySliceAxis::new(2, 1, 1), ArraySliceAxis::new(2, 3, 1)]),
+        );
+        assert_eq!(
+            ArrayReferenceTransformPath::root().root_slice_axes(&ArrayType::new_static(DataType::I32, vec![])),
+            Some(vec![]),
+        );
+        let symbolic = ArrayReferenceTransformPath::root().with_bound_transform(
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+            vec![ValueId::new(RegionId::new(0), AtomId::new(0))],
+        );
+        assert_eq!(symbolic.root_slice_axes(&root_type), None);
+        let dynamic = ArrayType::new(
+            DataType::I32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
+        );
+        assert_eq!(ArrayReferenceTransformPath::root().root_slice_axes(&dynamic), None);
+        let invalid = path
+            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(3) });
+        assert_eq!(invalid.root_slice_axes(&root_type), None);
+    }
+
+    #[test]
+    fn test_array_reference_transform_path_output_type() {
+        let root_type = ArrayType::new_static(DataType::F32, [3, 4]);
+        let root: ArrayReferenceTransformPath = ArrayReferenceTransformPath::root();
+        assert_eq!(root.output_type(&root_type), Ok(root_type.clone()));
+
+        // Each transform applies to the preceding view, so the slice narrows both axes and the index then removes
+        // the leading axis of the already-narrowed view.
+        let slice =
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)] };
+        let index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) };
+        let sliced = root.with_transform(slice);
+        let indexed = sliced.clone().with_transform(index);
+        assert_eq!(sliced.output_type(&root_type), Ok(ArrayType::new_static(DataType::F32, [2, 3])));
+        assert_eq!(indexed.output_type(&root_type), Ok(ArrayType::new_static(DataType::F32, [3])));
+    }
+
+    #[test]
+    fn test_array_reference_transform_path_intermediates_in() {
+        let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
+            .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
+            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
+        let root = Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap();
+        let carrier = EagerTransformCarrier::<Array>(PhantomData);
+        assert_eq!(
+            path.intermediates_in(&carrier, root.clone()),
+            Ok(vec![root.clone(), Array::vector(vec![2.0_f32, 3.0]).unwrap(), Array::scalar(3.0_f32).unwrap(),]),
+        );
+        assert_eq!(ArrayReferenceTransformPath::root().intermediates_in(&carrier, root.clone()), Ok(vec![root]));
+    }
+
+    #[test]
+    fn test_array_reference_transform_path_reconstruct_in() {
+        let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
+            .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
+            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
+        let carrier = EagerTransformCarrier::<Array>(PhantomData);
+        // Reconstruction consumes strict parents in reverse order; the old selected scalar is unnecessary.
+        assert_eq!(
+            path.reconstruct_in(
+                &carrier,
+                &[Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap(), Array::vector(vec![2.0_f32, 3.0]).unwrap(),],
+                Array::scalar(7.0_f32).unwrap()
+            ),
+            Ok(Array::vector(vec![1.0_f32, 2.0, 7.0, 4.0]).unwrap()),
+        );
+        assert_eq!(
+            ArrayReferenceTransformPath::root().reconstruct_in(&carrier, &[], Array::scalar(7.0_f32).unwrap()),
+            Ok(Array::scalar(7.0_f32).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_array_reference_transform_path_reconstruct_in_rejects_invalid_parent_count() {
+        let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
+            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) });
+        let carrier = EagerTransformCarrier::<Array>(PhantomData);
+        assert_eq!(
+            path.reconstruct_in(&carrier, &[], Array::scalar(1.0_f32).unwrap()),
+            Err(ProgramError::MalformedProgram(
+                "reference transform path reconstruction requires 1 parent snapshots but received 0".to_string(),
+            )),
+        );
+        assert_eq!(
+            path.reconstruct_in(
+                &carrier,
+                &[Array::vector(vec![1.0_f32]).unwrap(), Array::scalar(1.0_f32).unwrap()],
+                Array::scalar(1.0_f32).unwrap(),
+            ),
+            Err(ProgramError::MalformedProgram(
+                "reference transform path reconstruction requires 1 parent snapshots but received 2".to_string(),
+            )),
+        );
+    }
+
+    #[test]
     fn test_array_reference_transform_output_type() {
         let input = ArrayType::new_static(DataType::F32, [3, 4]);
         assert_eq!(
@@ -2660,114 +2826,6 @@ mod tests {
         assert_eq!(program.clone().interpret(inputs.clone()), Ok(expected.clone()));
         let discharged = program.into_flat_program().discharge_references(0).unwrap();
         assert_eq!(discharged.program().interpret(vec![inputs.0, inputs.1]), Ok(vec![expected]));
-    }
-
-    #[test]
-    fn test_array_reference_transform_path_root_slice() {
-        let root_type = ArrayType::new_static(DataType::I32, vec![4, 5]);
-        let path = ArrayReferenceTransformPath::root()
-            .with_transform(ArrayReferenceTransform::Slice {
-                axes: vec![ArraySliceAxis::new(1, 3, 1), ArraySliceAxis::new(2, 3, 1)],
-            })
-            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
-        assert_eq!(
-            path.root_slice(&root_type),
-            Some(ArrayReferenceTransform::Slice {
-                axes: vec![ArraySliceAxis::new(2, 1, 1), ArraySliceAxis::new(2, 3, 1)]
-            }),
-        );
-        assert_eq!(
-            ArrayReferenceTransformPath::root().root_slice(&ArrayType::new_static(DataType::I32, vec![])),
-            Some(ArrayReferenceTransform::Slice { axes: vec![] }),
-        );
-        let symbolic = ArrayReferenceTransformPath::root().with_bound_transform(
-            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
-            vec![ValueId::new(RegionId::new(0), AtomId::new(0))],
-        );
-        assert_eq!(symbolic.root_slice(&root_type), None);
-        let dynamic = ArrayType::new(
-            DataType::I32,
-            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
-        );
-        assert_eq!(ArrayReferenceTransformPath::root().root_slice(&dynamic), None);
-        let invalid = path
-            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(3) });
-        assert_eq!(invalid.root_slice(&root_type), None);
-    }
-
-    #[test]
-    fn test_array_reference_transform_path_output_type() {
-        let root_type = ArrayType::new_static(DataType::F32, [3, 4]);
-        let root: ArrayReferenceTransformPath = ArrayReferenceTransformPath::root();
-        assert_eq!(root.output_type(&root_type), Ok(root_type.clone()));
-
-        // Each transform applies to the preceding view, so the slice narrows both axes and the index then removes
-        // the leading axis of the already-narrowed view.
-        let slice =
-            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)] };
-        let index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) };
-        let sliced = root.with_transform(slice);
-        let indexed = sliced.clone().with_transform(index);
-        assert_eq!(sliced.output_type(&root_type), Ok(ArrayType::new_static(DataType::F32, [2, 3])));
-        assert_eq!(indexed.output_type(&root_type), Ok(ArrayType::new_static(DataType::F32, [3])));
-    }
-
-    #[test]
-    fn test_array_reference_transform_path_intermediates_in() {
-        let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
-            .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
-            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
-        let root = Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap();
-        let carrier = EagerTransformCarrier::<Array>(PhantomData);
-        assert_eq!(
-            path.intermediates_in(&carrier, root.clone()),
-            Ok(vec![root.clone(), Array::vector(vec![2.0_f32, 3.0]).unwrap(), Array::scalar(3.0_f32).unwrap(),]),
-        );
-        assert_eq!(ArrayReferenceTransformPath::root().intermediates_in(&carrier, root.clone()), Ok(vec![root]));
-    }
-
-    #[test]
-    fn test_array_reference_transform_path_reconstruct_in() {
-        let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
-            .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
-            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) });
-        let carrier = EagerTransformCarrier::<Array>(PhantomData);
-        // Reconstruction consumes strict parents in reverse order; the old selected scalar is unnecessary.
-        assert_eq!(
-            path.reconstruct_in(
-                &carrier,
-                &[Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap(), Array::vector(vec![2.0_f32, 3.0]).unwrap(),],
-                Array::scalar(7.0_f32).unwrap()
-            ),
-            Ok(Array::vector(vec![1.0_f32, 2.0, 7.0, 4.0]).unwrap()),
-        );
-        assert_eq!(
-            ArrayReferenceTransformPath::root().reconstruct_in(&carrier, &[], Array::scalar(7.0_f32).unwrap()),
-            Ok(Array::scalar(7.0_f32).unwrap()),
-        );
-    }
-
-    #[test]
-    fn test_array_reference_transform_path_reconstruct_in_rejects_invalid_parent_count() {
-        let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> = ArrayReferenceTransformPath::root()
-            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) });
-        let carrier = EagerTransformCarrier::<Array>(PhantomData);
-        assert_eq!(
-            path.reconstruct_in(&carrier, &[], Array::scalar(1.0_f32).unwrap()),
-            Err(ProgramError::MalformedProgram(
-                "reference transform path reconstruction requires 1 parent snapshots but received 0".to_string(),
-            )),
-        );
-        assert_eq!(
-            path.reconstruct_in(
-                &carrier,
-                &[Array::vector(vec![1.0_f32]).unwrap(), Array::scalar(1.0_f32).unwrap()],
-                Array::scalar(1.0_f32).unwrap(),
-            ),
-            Err(ProgramError::MalformedProgram(
-                "reference transform path reconstruction requires 1 parent snapshots but received 2".to_string(),
-            )),
-        );
     }
 
     #[test]
