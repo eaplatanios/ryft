@@ -102,8 +102,8 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         Self { root, path: ArrayReferenceTransformPath::root(), r#type }
     }
 
-    /// Returns the process-local identity of the allocation (i.e., the [`ReferenceId`]) that this handle shares
-    /// with every handle derived from the same root.
+    /// Returns the process-local identity of the allocation (i.e., the [`ReferenceId`]) that this handle shares with
+    /// every clone and view of the same root.
     #[inline]
     pub fn id(&self) -> ReferenceId {
         self.root.id()
@@ -370,9 +370,9 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     /// Checks that `value` has exactly this handle's referent type (i.e., the type of the elements that the handle
     /// views). Mutations through views must call this function themselves. A root-handle mutation replaces the complete
     /// stored value, which the underlying [`Reference`] already checks against its own referent type. A view mutation
-    /// instead writes `value` into the root through [`UpdateSlice`], which only requires `value` to fit inside the
-    /// selected region. The reconstructed root then passes the reference's check even when `value` is smaller than
-    /// the view, so without this function, such a value would silently update only part of the view.
+    /// instead writes `value` into the root through [`UpdateSlice`], which only requires `value` to fit inside the part
+    /// of the root that the view selects. The reconstructed root then passes the reference's check even when `value` is
+    /// smaller than the view, so without this function, such a value would silently update only part of the view.
     ///
     /// # Errors
     ///
@@ -465,9 +465,9 @@ pub enum ArrayReferenceTransformIndex {
 /// valid range, following the array dynamic-slicing contract. Strided slicing remains unsupported.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayReferenceTransform {
-    /// Selects a position along one axis and removes that axis from the view shape.
+    /// Selects a position along one axis and removes that axis from the shape.
     Index {
-        /// Axis selected in the transform's input view.
+        /// Axis of the transform's input that this transform indexes.
         axis: usize,
 
         /// Index selected on `axis`.
@@ -476,7 +476,7 @@ pub enum ArrayReferenceTransform {
 
     /// Selects one static unit-stride range on every axis while preserving rank.
     Slice {
-        /// Per-axis selections in the transform's input view.
+        /// Per-axis slices of the transform's input.
         axes: Vec<ArraySliceAxis>,
     },
 }
@@ -487,9 +487,33 @@ impl ArrayReferenceTransform {
     /// known to the access that applies the transform.
     pub fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
         let (output, selection) = self.selected_type(input)?;
-        if let Some(selection) = selection {
-            self.validate_reconstruction(input, &output, &selection)?;
+        let Some(selection) = selection else {
+            return Ok(output);
+        };
+
+        // Prove that updating the selected child reconstructs the exact parent storage type. Shape arithmetic alone
+        // cannot guarantee this: `ArrayType` also carries layouts, shardings, and other metadata whose slice and
+        // update-slice derivations are owned by the type system, so this check catches any transform whose forward
+        // selection and inverse update do not round-trip on that metadata. The proof runs when a view is constructed
+        // and when an access that writes back derives its path type. Read-only accesses derive their path types
+        // through `ReferenceTransform::read_type`, which skips it.
+        let update = match selection.squeezed_output_shape {
+            Some(_) => {
+                output.reshape(selection.update_shape()).map_err(|error| TypeError::invalid(error.to_string()))?
+            }
+            None => output.clone(),
+        };
+
+        let reconstructed = input
+            .update_slice(&update, selection.starts.as_slice())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+
+        if &reconstructed != input {
+            return Err(TypeError::invalid(format!(
+                "reference transform reconstruction changes root type from `{input}` to `{reconstructed}`",
+            )));
         }
+
         Ok(output)
     }
 
@@ -576,34 +600,32 @@ impl ArrayReferenceTransform {
                 }
                 let mut starts = Vec::with_capacity(axes.len());
                 let mut limits = Vec::with_capacity(axes.len());
-                for (axis, (selection, input_size)) in axes.iter().copied().zip(shape.dimensions()).enumerate() {
-                    if selection.stride() != 1 {
+                for (axis, (slice_axis, input_size)) in axes.iter().copied().zip(shape.dimensions()).enumerate() {
+                    if slice_axis.stride() != 1 {
                         return Err(TypeError::invalid(format!(
                             "reference slice axis {axis} stride must be 1 until scatter-backed strided updates are \
                              supported",
                         )));
                     }
-                    let limit = selection.start().checked_add(selection.size()).ok_or_else(|| {
+                    let limit = slice_axis.start().checked_add(slice_axis.size()).ok_or_else(|| {
                         TypeError::invalid(format!("reference slice limit overflows `usize` on axis {axis}"))
                     })?;
                     if limit > *input_size {
                         return Err(TypeError::invalid(format!(
                             "reference slice on axis {} with start {} and size {} exceeds input size {}",
                             axis,
-                            selection.start(),
-                            selection.size(),
+                            slice_axis.start(),
+                            slice_axis.size(),
                             input_size,
                         )));
                     }
-                    starts.push(selection.start());
+                    starts.push(slice_axis.start());
                     limits.push(limit);
                 }
                 Ok(TransformSelection { starts, limits, squeezed_output_shape: None })
             }
         }
     }
-
-    // TODO(eaplatanios): Review from here onwards.
 
     /// Applies this transform to one carried parent value. A symbolic index is resolved by the carrier from the one
     /// value the transform's `bindings` close it over; a symbolic transform that binds no value (an eager path, or a
@@ -646,37 +668,9 @@ impl ArrayReferenceTransform {
             None => carrier.update_slice(input, replacement, selection.starts),
         }
     }
-
-    /// Proves that updating the selected child reconstructs the exact parent storage type.
-    ///
-    /// Shape arithmetic alone cannot guarantee this: [`ArrayType`] also carries layouts, shardings, and other
-    /// metadata whose slice and update-slice derivations are owned by the type system, so this check catches any
-    /// transform whose forward selection and inverse update do not round-trip on that metadata. The proof runs when a
-    /// view is constructed and when an access that writes back derives its path type. Read-only accesses derive their
-    /// path types through [`ReferenceTransform::read_type`], which skips it.
-    fn validate_reconstruction(
-        &self,
-        input: &ArrayType,
-        output: &ArrayType,
-        selection: &TransformSelection,
-    ) -> Result<(), TypeError> {
-        let update = match selection.squeezed_output_shape {
-            Some(_) => {
-                output.reshape(selection.update_shape()).map_err(|error| TypeError::invalid(error.to_string()))?
-            }
-            None => output.clone(),
-        };
-        let reconstructed = input
-            .update_slice(&update, selection.starts.as_slice())
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        if &reconstructed == input {
-            return Ok(());
-        }
-        Err(TypeError::invalid(format!(
-            "reference transform reconstruction changes root type from `{input}` to `{reconstructed}`",
-        )))
-    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Display for ArrayReferenceTransform {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -920,13 +914,13 @@ impl RootIndexSelection {
                     if axes.len() != remaining.len() {
                         return None;
                     }
-                    for (selection, root_axis) in axes.iter().zip(remaining.iter()) {
+                    for (slice_axis, root_axis) in axes.iter().zip(remaining.iter()) {
                         let Self::Range { start, limit } = indices[*root_axis] else {
                             return None;
                         };
-                        let narrowed_start = start.checked_add(selection.start())?;
-                        let narrowed_limit = narrowed_start.checked_add(selection.size())?;
-                        if selection.stride() != 1 || narrowed_limit > limit {
+                        let narrowed_start = start.checked_add(slice_axis.start())?;
+                        let narrowed_limit = narrowed_start.checked_add(slice_axis.size())?;
+                        if slice_axis.stride() != 1 || narrowed_limit > limit {
                             return None;
                         }
                         indices[*root_axis] = Self::Range { start: narrowed_start, limit: narrowed_limit };
@@ -962,8 +956,8 @@ impl RootIndexSelection {
 
 /// Normalized indices of one [`ArrayReferenceTransform`] applied to one statically shaped input.
 ///
-/// Both transform kinds reduce to slicing one unit-stride hyper-rectangle out of the input, optionally followed by
-/// squeezing the indexed axis. Normalizing to this shared form lets every consumer (type derivation, eager reads,
+/// Both transform kinds reduce to taking one static unit-stride slice of the input, optionally followed by squeezing
+/// the indexed axis. Normalizing to this shared form lets every consumer (type derivation, eager reads,
 /// eager update reconstruction, and staged discharge) share one validation and address computation.
 struct TransformSelection {
     /// Inclusive slice start per input axis.
@@ -979,8 +973,8 @@ struct TransformSelection {
 }
 
 impl TransformSelection {
-    /// Returns the static shape of the sliced hyper-rectangle before squeezing (i.e., the update shape that writes back
-    /// into the selected indices).
+    /// Returns the static shape of the slice before squeezing (i.e., the update shape that writes back into the
+    /// selected indices).
     fn update_shape(&self) -> Shape {
         Shape::new(
             self.starts
@@ -992,13 +986,18 @@ impl TransformSelection {
     }
 }
 
-/// Immutable index mapping between a shared array-reference root and one derived handle: the array specialization of
-/// the generic [`ReferenceTransformPath`], whose transforms are [`ArrayReferenceTransform`]s.
+/// Immutable index mapping between a shared array-reference root and one view of it: the array specialization of the
+/// generic [`ReferenceTransformPath`], whose transforms are [`ArrayReferenceTransform`]s.
 ///
 /// The mapping stores validated transforms in root-to-handle order. The empty mapping ([`root`](Self::root)) is the
 /// identity view and denotes the complete root. Each additional transform is applied to the preceding view, so
-/// indexing or slicing an already-derived [`ArrayReference`] composes onto the same shared root rather than creating
-/// another mutable resource.
+/// indexing or slicing an [`ArrayReference`] view composes onto the same shared root rather than creating another
+/// mutable resource.
+///
+/// Traversals of a path call the input of each transform its *parent* and the output its *child*. The
+/// *intermediates* of a path are the root followed by each child, and the last of them, which is the value that the
+/// path selects, is its *leaf*. Every intermediate before the leaf is a *strict parent*, and reconstruction needs each
+/// of them to preserve the elements outside the view.
 ///
 /// This type is structural metadata only: it owns neither the referenced array nor its resource identity, liveness, or
 /// synchronization state. [`ArrayReference`] pairs it with a handle to the shared reference allocation. In staged
@@ -1064,7 +1063,7 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
     ///   - `carrier`: array operations used to reconstruct each parent.
     ///   - `intermediates`: one snapshot per strict parent, in root-to-view order. This is the sequence produced by
     ///     [`intermediates_in`](Self::intermediates_in) without its final selected value.
-    ///   - `replacement`: new value of the selected view.
+    ///   - `replacement`: new selected value.
     fn reconstruct_in<C: TransformWriteCarrier<Binding = Binding>>(
         &self,
         carrier: &mut C,
@@ -1157,7 +1156,7 @@ impl ArrayReferenceTransformPath<NoReferenceTransformBinding> {
 /// Operation-family constructors for the canonical array operations that one array-reference transform path traversal
 /// stages.
 ///
-/// Mapping between a reference root and one derived handle's selected elements uses static or dynamic slices,
+/// Mapping between a reference root and the elements that one of its views selects uses static or dynamic slices,
 /// reshapes, and corresponding updates. Both eager handles and the
 /// [`ArrayReferenceDischarge`] policy walk the same [`ArrayReferenceTransformPath`]. This
 /// contract lets the staging consumer construct those operations in a closed operation family, so core array IR and
@@ -1263,9 +1262,9 @@ impl<A: Value<Type = ArrayType>> ArrayReferenceTransformOperation for ArrayIrOpe
     }
 }
 
-/// One value carrier through which a reference transform path maps between a shared root and one derived handle.
+/// One value carrier through which a reference transform path maps between a shared root and one of its views.
 ///
-/// Reading the selected view and reconstructing the root with update-slice each exist exactly once, on
+/// Reading the selected value and reconstructing the root with update-slice each exist exactly once, on
 /// [`ArrayReferenceTransformPath`], generically over this carrier: the eager carrier operates on concrete values with
 /// the array-manipulation capabilities, while reference discharge binds the identical operation sequence through its
 /// context. Keeping one traversal guarantees the staged and eager semantics cannot drift apart. Static transforms lower
@@ -1281,7 +1280,7 @@ trait TransformReadCarrier {
     /// Returns the carried value's array type, borrowing from the carrier or the value where possible.
     fn array_type<'c>(&'c self, value: &'c Self::Value) -> Result<Cow<'c, ArrayType>, ProgramError>;
 
-    /// Slices one unit-stride hyper-rectangle out of `input`.
+    /// Takes one unit-stride slice of `input`, from the inclusive `starts` to the exclusive `limits`.
     fn slice(
         &mut self,
         input: &Self::Value,
@@ -1301,7 +1300,7 @@ trait TransformReadCarrier {
     ) -> Result<Self::Value, ProgramError>;
 }
 
-/// A [`TransformReadCarrier`] that can also write a selected hyper-rectangle back into its parent.
+/// A [`TransformReadCarrier`] that can also write a selected value back into its parent.
 trait TransformWriteCarrier: TransformReadCarrier {
     /// Returns `target` with `update` written at `starts`.
     fn update_slice(
@@ -1711,7 +1710,7 @@ mod tests {
     #[test]
     fn test_array_reference_with_transform() {
         // Composition validates each appended transform against the preceding view's derived type, so an out-of-bounds
-        // index of the derived view is rejected even though it exists in the root.
+        // index of the view is rejected even though it exists in the root.
         let slice =
             ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)] };
         let handle = ArrayReference::new(Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap())
@@ -1765,19 +1764,19 @@ mod tests {
         };
         let transaction = prepared.begin(ReferenceCompletion::ready(Ok(())));
 
-        // A derived handle is pure structural metadata over a live reference, so composing one must never resolve its
+        // A view is pure structural metadata over a live reference, so composing one must never resolve its
         // submitted work. The reference is parked in its `Taken` state, where every value access is unavailable behind
         // this retained guard until replacement commit, and derivation still computes its exact referent type.
         let transform = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] };
-        let derived = root.with_transform(transform).unwrap();
-        assert_eq!(derived.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
+        let view = root.with_transform(transform).unwrap();
+        assert_eq!(view.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
 
         // Poisoning the submitted mutation is terminal for the alias family, but further derivation remains structural
         // composition. The resulting handle reports the reference failure only when it attempts to access state.
         transaction.poison("submission failed");
         let poisoned = ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() };
         assert_eq!(root.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&poisoned));
-        let composed = derived
+        let composed = view
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) })
             .unwrap();
         assert_eq!(composed.r#type().as_ref(), &ReferenceType::new(ArrayType::scalar(DataType::F32)));
@@ -1846,13 +1845,13 @@ mod tests {
     #[test]
     fn test_array_reference_read() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
-        let derived = root
+        let view = root
             .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
             .unwrap();
 
-        // Reading a derived handle applies its selection rather than exposing the complete allocation.
+        // Reading a view applies its path rather than exposing the complete allocation.
         assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()));
-        assert_eq!(derived.read(), Ok(Array::vector(vec![2.0_f32, 3.0]).unwrap()));
+        assert_eq!(view.read(), Ok(Array::vector(vec![2.0_f32, 3.0]).unwrap()));
     }
 
     #[test]
@@ -1984,7 +1983,7 @@ mod tests {
             Some(&ArrayReferenceViewError::CannotFreezeView),
         );
         assert_eq!(error.to_string(), "cannot freeze a reference view; freeze the root reference instead");
-        // Rejecting a derived handle leaves the allocation available for the root's consuming read.
+        // Rejecting the view leaves the allocation available for the root's consuming read.
         assert_eq!(root.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0]).unwrap()));
         assert_eq!(view.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
