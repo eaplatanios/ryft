@@ -1036,7 +1036,14 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
         Transform: ReferenceTransform<Type = V::Type>,
         for<'t> &'t ReferenceType<Transform::Referent>: TryFrom<&'t V::Type, Error = TypeError>,
     {
+        // The structural analysis comes from the region's transform cache under the same key as this analysis, so that
+        // it is derived at most once per closure and shared with every other consumer of that key (see
+        // `RegionRef::reference_view_analysis`). Its failures convert into `ReferenceViewAnalysisError::Analysis`.
         let analysis = region.reference_analysis_impl(arguments)?;
+
+        // Every instruction in the closure, including those in attached regions, contributes one path per reference
+        // access. The layout validation reports the failing input index so that `InvalidAccess` can name the exact
+        // reference input, whereas `validated_reference_access_descriptors` only produces a `ProgramError`.
         let mut paths = BTreeMap::new();
         for (id, instruction) in region.instructions_in_closure() {
             // Validate even instructions without accesses, so extraneous descriptors cannot hide on pure operations.
@@ -1082,18 +1089,30 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
     where
         Transform: ReferenceTransform<Type = V::Type>,
     {
+        // Reference roots are region-relative: the same allocation reaches a nested region through one of that
+        // region's inputs, which is a distinct root there. Accesses in different regions are therefore incomparable
+        // here, and a caller must first map them into one namespace through the region input bindings.
         if lhs.0.region() != rhs.0.region() {
             return None;
         }
+
+        // Resolve both accesses to the reference atoms they read and to their recorded paths. Any lookup failure
+        // means that one of the accesses does not belong to this analysis, which also makes them incomparable.
         let current = region.with_id(lhs.0.region()).ok()?;
         let lhs_atom = *current.instructions().get(lhs.0.index())?.inputs().get(lhs.1)?;
         let rhs_atom = *current.instructions().get(rhs.0.index())?.inputs().get(rhs.1)?;
         let lhs_path = self.path(lhs.0, lhs.1)?;
         let rhs_path = self.path(rhs.0, rhs.1)?;
+
+        // Different roots are different allocations within one region, so no pair of paths can overlap. Only accesses
+        // to the same root need the transform family's structural comparison of their paths.
         let root = self.analysis.root_of(ValueId::new(current.id(), lhs_atom))?;
         if root != self.analysis.root_of(ValueId::new(current.id(), rhs_atom))? {
             return Some(ReferenceViewOverlap::Disjoint);
         }
+
+        // Every alias of a root denotes the complete referent, so both paths are relative to the root and the reference
+        // type of either accessed atom is the root type against which they are compared.
         let root_type = current.atoms().get(lhs_atom.index())?.r#type();
         Some(lhs_path.overlap(rhs_path, root_type.as_ref()))
     }
@@ -1110,7 +1129,14 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
         Transform: ReferenceTransform<Type = V::Type>,
         for<'t> &'t ReferenceType<Transform::Referent>: TryFrom<&'t V::Type, Error = TypeError>,
     {
+        // Every failure below is attributed to this access, so they all share one error constructor.
         let invalid = |message| ReferenceViewAnalysisError::InvalidAccess { instruction, input_index, message };
+
+        // Locate the accessed atom and check that its type is a reference to this transform family's referents. The
+        // position lookups succeed for any instruction whose layout validated, but they are reported rather than
+        // unwrapped so that a malformed downstream operation family surfaces as an error instead of a panic. The
+        // structural analysis already rejects accesses to non-reference inputs, but the type check can still fail when
+        // the reference type does not project onto the referent type of this transform family.
         let current = region.with_id(instruction.region()).map_err(|error| invalid(error.to_string()))?;
         let application = current
             .instructions()
@@ -1125,6 +1151,11 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
         let source_type = source.r#type();
         let reference = <&ReferenceType<Transform::Referent>>::try_from(source_type.as_ref())
             .map_err(|error| invalid(error.to_string()))?;
+
+        // Collect the types of the access's dynamic bindings. The layout validation guarantees that the descriptor's
+        // binding range lies within the instruction inputs, so slicing cannot panic. Bindings must be ordinary values:
+        // an access declares reference effects only on its reference inputs, so a reference-typed binding would be an
+        // undeclared use of a reference. It is rejected here rather than left to each family's `validate_bindings`.
         let binding_atoms = &application.inputs()[descriptor.bindings()];
         let binding_types = binding_atoms
             .iter()
@@ -1139,6 +1170,10 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
             return Err(invalid("transform binding is a reference rather than an ordinary value".to_string()));
         }
         let binding_types = binding_types.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+
+        // Type-check the path against the root's referent. The access mode matters because only mutating accesses must
+        // also prove that updates can be written back through every transform (refer to `infer_reference_view_type`).
+        // The derived referent itself is discarded, since only the validation outcome is needed here.
         let mode = application
             .operation()
             .effects()
@@ -1147,6 +1182,9 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
             .ok_or_else(|| invalid("reference input has no declared access".to_string()))?;
         infer_reference_view_type(reference.referent(), descriptor.transforms(), &binding_types, mode)
             .map_err(|error| invalid(error.to_string()))?;
+
+        // Record the path with each binding identified by its program value, qualified by the instruction's region so
+        // that bindings from different regions of the closure stay distinct in overlap comparisons.
         let bindings = binding_atoms.iter().map(|atom| ValueId::new(instruction.region(), *atom)).collect::<Vec<_>>();
         ReferenceTransformPath::from_transforms(descriptor.transforms(), &bindings)
             .map_err(|error| invalid(error.to_string()))
@@ -1216,21 +1254,21 @@ struct ValueRecord {
 /// uses the region's own namespace and retains this result. Boundary analysis uses caller identities and derives a
 /// fresh result for each attachment.
 #[derive(Clone, Debug)]
-struct RegionSummary {
+pub(super) struct RegionSummary {
     /// Capture scope the region was analyzed under which is set to the root bound at each capture position,
     /// or [`None`] for a non-reference value.
-    scope: Rc<[Option<ReferenceRoot>]>,
+    pub(super) scope: Rc<[Option<ReferenceRoot>]>,
 
     /// Direct and transitive access modes per root, including the region's local allocations.
-    accesses: BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>>,
+    pub(super) accesses: BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>>,
 
     /// Reference roots needed when replay materializes instruction inputs or region outputs, including inherited
     /// captures. Collected only for boundary summaries; cached structural analysis does not use this set.
     /// Materialization alone is not a semantic reference access.
-    reached: BTreeSet<ReferenceRoot>,
+    pub(super) reached: BTreeSet<ReferenceRoot>,
 
     /// Root of each region output, or [`None`] for value outputs.
-    outputs: Vec<Option<ReferenceRoot>>,
+    pub(super) outputs: Vec<Option<ReferenceRoot>>,
 }
 
 /// Mutable state backing a single [`ReferenceAnalysis::new`] traversal.
@@ -2021,6 +2059,7 @@ mod tests {
     use crate::programs::instructions::{Instruction, InstructionId};
     use crate::programs::operations::Operation;
     use crate::programs::programs::Program;
+    use crate::programs::references::ReferenceError;
     use crate::programs::references::operations::tests::DescribedAccess;
     use crate::programs::references::types::ReferenceType;
     use crate::programs::regions::{OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
@@ -2087,6 +2126,37 @@ mod tests {
     /// Creates a reference type over a static `f32` vector of `size` elements.
     fn array_reference_type(size: usize) -> ArrayIrType {
         ReferenceType::new(ArrayType::new_static(DataType::F32, vec![size])).into()
+    }
+
+    /// Builds a program whose only instruction reads `root[1:3][index]`, where `root` is an `f32[4]` reference input
+    /// and `index` is a scalar input supplying the dynamic index. Returns the program together with the `root` and
+    /// `index` input atoms and the read's transforms.
+    fn dynamic_read_program() -> (
+        Program<TestArrayValue, TestArrayIrOperation, Vec<TestArrayValue>, Vec<TestArrayValue>>,
+        AtomId,
+        AtomId,
+        Vec<ArrayReferenceTransform>,
+    ) {
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let root = builder.add_input(array_reference_type(4));
+        let index = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let transforms = vec![
+            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] },
+            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
+        ];
+        let output = builder
+            .add_instruction(
+                ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
+                    .with_transforms(transforms.clone()),
+                Vec::new(),
+                vec![root, index],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        (program, root, index, transforms)
     }
 
     /// Minimal generic operation universe: the flat reference language, call-like operations with inherited or fresh
@@ -2520,9 +2590,33 @@ mod tests {
             assert_eq!(diagnostics.get(&error), Some(&expected));
             assert_eq!(
                 ProgramError::from(error.clone()),
-                ProgramError::Reference(crate::programs::references::ReferenceError::Analysis(Box::new(error.clone()))),
+                ProgramError::Reference(ReferenceError::Analysis(Box::new(error.clone()))),
             );
         }
+    }
+
+    #[test]
+    fn test_reference_view_analysis_error() {
+        let access = ReferenceViewAnalysisError::InvalidAccess {
+            instruction: instruction_id(0, 1),
+            input_index: 2,
+            message: "transform binding has no atom".to_string(),
+        };
+        assert_eq!(access.to_string(), "invalid reference access at ^0[1] input 2: transform binding has no atom");
+        assert_eq!(
+            ProgramError::from(access.clone()),
+            ProgramError::Reference(ReferenceError::ViewAnalysis(Box::new(access))),
+        );
+
+        // Structural failures render and convert exactly as the structural analysis error they wrap.
+        let structural = ReferenceAnalysisError::InvalidReferenceDeclaration {
+            operation: "test.malformed",
+            instruction: instruction_id(0, 1),
+            message: "accessed input 3 is out of range for an application with 1 inputs".to_string(),
+        };
+        let wrapped = ReferenceViewAnalysisError::from(structural.clone());
+        assert_eq!(wrapped.to_string(), structural.to_string());
+        assert_eq!(ProgramError::from(wrapped), ProgramError::from(structural));
     }
 
     #[test]
@@ -4636,81 +4730,15 @@ mod tests {
         ));
     }
 
-    // TODO(eaplatanios): Are the tests from here onwards appropriately placed?
-
     #[test]
-    fn test_reference_view_analysis_access_path() {
-        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
-        let root = builder.add_input(array_reference_type(4));
-        let binding = builder.add_input(ArrayType::scalar(DataType::I32).into());
-        let transforms = vec![
-            ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] },
-            ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
-        ];
-        let output = builder
-            .add_instruction(
-                ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
-                    .with_transforms(transforms.clone()),
-                Vec::new(),
-                vec![root, binding],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
+    fn test_reference_view_analysis_new() {
+        let (program, _, binding, transforms) = dynamic_read_program();
         let region = program.entry_region_ref();
-        let instruction = InstructionId::new(region.id(), 0);
         let analysis = ReferenceViewAnalysis::new(region, 0).unwrap();
-        let path = ReferenceTransformPath::from_transforms(&transforms, &[ValueId::new(region.id(), binding)]).unwrap();
-        assert_eq!(analysis.path(instruction, 0), Some(&path));
-        assert_eq!(analysis.paths().collect::<Vec<_>>(), vec![((instruction, 0), &path)]);
-        assert_eq!(analysis.path(instruction, 1), None);
         assert_eq!(
-            analysis.analysis().root_of(ValueId::new(region.id(), root)),
-            Some(ReferenceRoot::RegionInput { region: region.id(), input_index: 0 })
+            analysis.path(InstructionId::new(region.id(), 0), 0),
+            Some(&ReferenceTransformPath::from_transforms(&transforms, &[ValueId::new(region.id(), binding)]).unwrap()),
         );
-        assert_eq!(analysis.path(InstructionId::new(region.id(), 1), 0), None);
-        let retained = region.reference_view_analysis(0).unwrap();
-        assert_eq!(*retained, analysis);
-        assert!(Arc::ptr_eq(&retained, &region.reference_view_analysis(0).unwrap()));
-    }
-
-    #[test]
-    fn test_reference_view_analysis_overlap() {
-        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
-        let first = builder.add_input(array_reference_type(2));
-        let second = builder.add_input(array_reference_type(2));
-        let mut outputs = Vec::new();
-        for (root, transforms) in [
-            (first, vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]),
-            (first, vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }]),
-            (second, vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]),
-            (first, Vec::new()),
-        ] {
-            outputs.push(
-                builder
-                    .add_instruction(
-                        ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
-                            .with_transforms(transforms),
-                        Vec::new(),
-                        vec![root],
-                        None,
-                    )
-                    .unwrap()[0],
-            );
-        }
-        let program = builder
-            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 4])
-            .unwrap();
-        let region = program.entry_region_ref();
-        let analysis = ReferenceViewAnalysis::new(region, 0).unwrap();
-        let access = |index| (InstructionId::new(region.id(), index), 0);
-        assert_eq!(analysis.overlap(region, access(0), access(0)), Some(ReferenceViewOverlap::Same));
-        assert_eq!(analysis.overlap(region, access(0), access(1)), Some(ReferenceViewOverlap::Disjoint));
-        assert_eq!(analysis.overlap(region, access(0), access(2)), Some(ReferenceViewOverlap::Disjoint));
-        assert_eq!(analysis.overlap(region, access(0), access(3)), Some(ReferenceViewOverlap::MayOverlap));
-        assert_eq!(analysis.overlap(region, access(0), access(4)), None);
     }
 
     #[test]
@@ -4791,5 +4819,90 @@ mod tests {
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0),
             Err(ReferenceViewAnalysisError::Analysis(ReferenceAnalysisError::ExternalReferenceConsumption { .. }))
         ));
+    }
+
+    #[test]
+    fn test_reference_view_analysis_analysis() {
+        let (program, root, _, _) = dynamic_read_program();
+        let region = program.entry_region_ref();
+        let analysis = ReferenceViewAnalysis::new(region, 0).unwrap();
+
+        // The view analysis shares the structural analysis retained under the same capture count.
+        assert_eq!(analysis.analysis(), &*region.reference_analysis(0).unwrap());
+        assert_eq!(
+            analysis.analysis().root_of(ValueId::new(region.id(), root)),
+            Some(ReferenceRoot::RegionInput { region: region.id(), input_index: 0 }),
+        );
+    }
+
+    #[test]
+    fn test_reference_view_analysis_paths() {
+        let (program, _, binding, transforms) = dynamic_read_program();
+        let region = program.entry_region_ref();
+        let analysis = ReferenceViewAnalysis::new(region, 0).unwrap();
+        let path = ReferenceTransformPath::from_transforms(&transforms, &[ValueId::new(region.id(), binding)]).unwrap();
+        assert_eq!(analysis.paths().collect::<Vec<_>>(), vec![((InstructionId::new(region.id(), 0), 0), &path)]);
+    }
+
+    #[test]
+    fn test_reference_view_analysis_path() {
+        let (program, _, binding, transforms) = dynamic_read_program();
+        let region = program.entry_region_ref();
+        let analysis = ReferenceViewAnalysis::new(region, 0).unwrap();
+        let instruction = InstructionId::new(region.id(), 0);
+        let path = ReferenceTransformPath::from_transforms(&transforms, &[ValueId::new(region.id(), binding)]).unwrap();
+        assert_eq!(analysis.path(instruction, 0), Some(&path));
+
+        // Binding inputs and instructions outside the region have no path.
+        assert_eq!(analysis.path(instruction, 1), None);
+        assert_eq!(analysis.path(InstructionId::new(region.id(), 1), 0), None);
+    }
+
+    #[test]
+    fn test_reference_view_analysis_overlap() {
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let first = builder.add_input(array_reference_type(2));
+        let second = builder.add_input(array_reference_type(2));
+        let mut outputs = Vec::new();
+        for (root, transforms) in [
+            (first, vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]),
+            (first, vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) }]),
+            (second, vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) }]),
+            (first, Vec::new()),
+        ] {
+            outputs.push(
+                builder
+                    .add_instruction(
+                        ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
+                            .with_transforms(transforms),
+                        Vec::new(),
+                        vec![root],
+                        None,
+                    )
+                    .unwrap()[0],
+            );
+        }
+        let program = builder
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 4])
+            .unwrap();
+        let region = program.entry_region_ref();
+        let analysis = ReferenceViewAnalysis::new(region, 0).unwrap();
+        let access = |index| (InstructionId::new(region.id(), index), 0);
+        assert_eq!(analysis.overlap(region, access(0), access(0)), Some(ReferenceViewOverlap::Same));
+        assert_eq!(analysis.overlap(region, access(0), access(1)), Some(ReferenceViewOverlap::Disjoint));
+        assert_eq!(analysis.overlap(region, access(0), access(2)), Some(ReferenceViewOverlap::Disjoint));
+        assert_eq!(analysis.overlap(region, access(0), access(3)), Some(ReferenceViewOverlap::MayOverlap));
+        assert_eq!(analysis.overlap(region, access(0), access(4)), None);
+    }
+
+    #[test]
+    fn test_region_ref_reference_view_analysis() {
+        let (program, _, _, _) = dynamic_read_program();
+        let region = program.entry_region_ref();
+        let retained = region.reference_view_analysis(0).unwrap();
+        assert_eq!(*retained, ReferenceViewAnalysis::new(region, 0).unwrap());
+
+        // Repeated requests under the same capture count reuse the retained analysis.
+        assert!(Arc::ptr_eq(&retained, &region.reference_view_analysis(0).unwrap()));
     }
 }
