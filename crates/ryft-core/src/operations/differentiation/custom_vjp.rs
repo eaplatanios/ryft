@@ -597,28 +597,26 @@ impl<
 // can reach this rejection path.
 impl_non_transposable_operation!(<T> CustomVjpOperation<T> where T: DifferentiableType);
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Function with user-supplied forward and backward (i.e., VJP) rules, built by [`custom_vjp`]. It stores the primal,
-/// forward, and backward closures together with a phantom marker pinning the tracer-tree types named by those closure
-/// signatures. Refer to the documentation of the [`custom_vjp`] function for the calling convention, the tracing
-/// semantics, and when to reach for a custom VJP.
+/// Function with user-supplied forward and backward (i.e., Vector-Jacobian Product or VJP) rules, built by
+/// [`custom_vjp`]. It stores the primal, forward, and backward closures together with a phantom marker pinning the
+/// tracer types named by those closure signatures. Refer to the documentation of the [`custom_vjp`] function for the
+/// calling convention, the tracing semantics, and when to reach for a custom VJP.
 pub struct CustomVjp<Input, Output, Residual, Primal, Forward, Backward> {
-    /// Closure computing the primal output tree from the primal input tree.
+    /// Closure computing the primal output value from the primal input value.
     primal: Primal,
 
-    /// Closure computing `(outputs, residuals)` from the primal input tree.
+    /// Closure computing `(outputs, residuals)` from the primal input value.
     forward: Forward,
 
-    /// Closure computing the input cotangent tree from `(residuals, output_cotangents)`.
+    /// Closure computing the input cotangent value from `(residuals, output_cotangents)`.
     backward: Backward,
 
     /// Number of leading flattened input leaves that parameterize the call without being differentiated.
     non_differentiated_count: usize,
 
-    /// Phantom marker pinning the input, output, and residual tracer-tree types named by the closure signatures. The
-    /// [`Context`] whose universe the rules are traced into is recovered from the values passed to
-    /// [`CustomVjp::call`], and so the wrapper stores neither a context value nor a context type witness.
+    /// Phantom marker pinning the input, output, and residual tracer types named by the closure signatures. The
+    /// [`Context`] whose universe the rules are traced into is recovered from the values passed to [`CustomVjp::call`],
+    /// and so the wrapper stores neither a context value nor a context type witness.
     marker: PhantomData<fn() -> (Input, Output, Residual)>,
 }
 
@@ -631,7 +629,7 @@ impl<
     Backward: Fn(Residual, Output) -> Result<Input, ProgramError>,
 > CustomVjp<Input, Output, Residual, Primal, Forward, Backward>
 {
-    /// Declares the leading `non_differentiated_count` flattened leaves of the input tree as non-differentiated
+    /// Declares the leading `non_differentiated_count` flattened leaves of the input value as non-differentiated
     /// _plumbing_ inputs, which is the high-level counterpart of [`CustomVjpOperation::with_non_differentiated_count`].
     /// Refer to the documentation of the [`custom_vjp`] function for the semantics of non-differentiated inputs.
     #[inline]
@@ -640,40 +638,41 @@ impl<
         self
     }
 
-    /// Stages this custom-VJP function on the provided tracer `input` tree and returns its output tree. Refer to the
-    /// documentation of the [`custom_vjp`] function for the tracing semantics and for how the transforms treat the
-    /// staged call.
+    /// Stages this custom Vector-Jacobian Product (VJP) function on the provided tracer `input` value and returns its
+    /// output value. Refer to the documentation of the [`custom_vjp`] function for the tracing semantics and for how
+    /// the transforms treat the staged call.
     ///
     /// The [`Context`] `C` whose universe the three closures are traced into is the
     /// [`DispatchDomain`](Value::DispatchDomain) of the values in `input`, which is exactly the context the call is
     /// staged into. It is therefore never named at a construction or call site, while the stored closures still pin
-    /// the tracer trees that this universe must produce.
+    /// the tracers that this universe must produce.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] when `input` has no leaves, when the non-differentiated count exceeds the number of
-    /// input leaves, when tracing any of the closures fails, when the forward closure returns a reference-typed
+    /// Returns a [`ProgramError`] when `input` has no leaves, when the non-differentiated count exceeds the number
+    /// of input leaves, when tracing any of the closures fails, when the forward closure returns a reference-typed
     /// residual that is not a non-differentiated input forwarded by identity, or when the staged [`CustomVjpOperation`]
     /// rejects the traced programs (e.g., because the rule signatures do not match the primal signature or because the
     /// call violates the reference contract).
-    pub fn call<C, V, InputValues>(
+    pub fn call<
+        V: Value<Type = C::Type, DispatchDomain = C>,
+        C: Context<Type: DifferentiableType, Value = V>,
+        InputValues: Parameterized<V, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
+    >(
         &self,
         input: InputValues,
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
-        C: Context<Type: DifferentiableType, Value = V>,
-        V: Value<Type = C::Type, DispatchDomain = C>,
         C::Operation: From<CustomVjpOperation<C::Type>>,
         Input: Parameterized<DomainTracer<C>>,
         Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
+        Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input>,
         Output: Parameterized<DomainTracer<C>>,
         Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<V>,
+        Output::To<C::Type>: Clone + Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
         Residual: Parameterized<DomainTracer<C>>,
         Residual::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
-        Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input>,
-        Output::To<C::Type>: Clone + Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
         Residual::To<C::Type>: Parameterized<C::Type, Family = Residual::Family, To<DomainTracer<C>> = Residual>,
-        InputValues: Parameterized<V, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
     {
         let mut input_values = Vec::new();
         let input_types = input
@@ -688,8 +687,10 @@ impl<
         };
         let non_differentiated_count = self.non_differentiated_count;
         validate_non_differentiated_count(CUSTOM_VJP_OPERATION_NAME, non_differentiated_count, input_values.len())?;
+
         let (output_types, primal) = C::trace(&self.primal, input_types.clone())?;
         let ((_, residual_types), forward) = C::trace(&self.forward, input_types.clone())?;
+
         // A reference-typed residual must be an input forwarded by identity rather than a computed value: a reference
         // allocated by the forward rule would reach the backward rule as a residual whose mutation nothing outside the
         // rule observes, so the traced forward program is checked here, where its atoms are visible, while the staged
@@ -710,10 +711,11 @@ impl<
             .into());
         }
         let output_cotangent_types = output_types.clone().try_map_parameters(|r#type| r#type.cotangent())?;
+
         // The backward region consumes `[non_differentiated..., residuals..., output_cotangents...]`. The closure
         // sees only the residuals and cotangents, so the leading non-differentiated inputs are declared as unused
         // region inputs (a plumbing value the backward rule needs is forwarded to it as a residual), and the
-        // input-shaped cotangent tree the closure returns loses its leading non-differentiated leaves so that the
+        // input-shaped cotangent value the closure returns loses its leading non-differentiated leaves so that the
         // staged rule produces exactly one cotangent per differentiated input.
         let non_differentiated_types =
             input_types.parameters().take(non_differentiated_count).cloned().collect::<Vec<_>>();
@@ -726,6 +728,7 @@ impl<
         )?;
         let operation =
             C::Operation::from(CustomVjpOperation::new().with_non_differentiated_count(non_differentiated_count));
+
         // The call binds through whatever context the input values flow through (e.g., a staging trace, a batching
         // context, or a differentiation context), so the batching or differentiation rule of the bound operation fires
         // and `custom_vjp` composes with those transforms.
@@ -740,67 +743,67 @@ impl<
     }
 }
 
-/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over trees of [`DomainTracer`]s. This
-/// is the analogue of JAX's [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
+/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over values of [`DomainTracer`]s.
+/// This is the analogue of JAX's [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
 /// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair.
 ///
 /// For `y = f(x)`, let `J_f(x) = ∂f/∂x` denote the Jacobian of `f` at `x`. The Vector-Jacobian Product (VJP), or
 /// pullback, maps an output cotangent `ȳ` to the input cotangent `x̄ = J_f(x)ᵀ · ȳ`. The three closure arguments
-/// factor that computation through a residual tree `r`:
+/// factor that computation through a residual value `r`:
 ///
 /// ```text
-/// primal:   x      ↦ y = f(x)
-/// forward:  x      ↦ (y, r) = (f(x), r)
-/// backward: (r, ȳ) ↦ x̄ = J_f(x)ᵀ · ȳ
+/// Primal:       x      ↦ y = f(x)
+/// Forward:      x      ↦ (y, r) = (f(x), r)
+/// Backward:     (r, ȳ) ↦ x̄ = J_f(x)ᵀ · ȳ
 /// ```
 ///
-/// Thus, `primal` implements `f` for ordinary evaluation. `forward` recomputes `y` and saves exactly the residual tree
-/// `r` needed by the reverse rule. `backward` receives `r` and the output-cotangent tree `ȳ`, then returns the
-/// input-cotangent tree `x̄`. Ryft validates that both occurrences of `y` agree, that `ȳ` is the cotangent of `y`, and
+/// Thus, `primal` implements `f` for ordinary evaluation. `forward` recomputes `y` and saves exactly the residual
+/// value `r` needed by the reverse rule. `backward` receives `r` and the output-cotangent value `ȳ`, then returns the
+/// input-cotangent value `x̄`. Ryft validates that both occurrences of `y` agree, that `ȳ` is the cotangent of `y`, and
 /// that `x̄` is the cotangent of `x` when it traces the closures.
 ///
-/// # When to use
+/// # When to Use
 ///
-/// Reach for a custom VJP when only the _reverse_ rule is natural, or when the function is not (efficiently)
-/// forward-differentiable. Common cases are:
+/// Reach for a custom Vector-Jacobian Product (VJP) when only the _reverse_ rule is natural, or when the function is
+/// not (efficiently) forward-differentiable. Common cases are:
 ///
-///   - **Implicit differentiation:** differentiate through a solver, optimizer, or fixed point via the implicit
+///   - **Implicit Differentiation:** Differentiate through a solver, optimizer, or fixed point via the implicit
 ///     function theorem rather than unrolling its iterations.
-///   - **Adjoint methods:** backpropagate through an ODE or PDE solve via the adjoint system instead of
-///     differentiating the individual steps of the integrator.
-///   - **External or black-box calls:** supply the reverse rule for a custom kernel or for a computation that does not
+///   - **Adjoint Methods:** Backpropagate through an Ordinary Differential Equation (ODE) or Partial Differential
+///     Equation (PDE) solution via the adjoint system instead of differentiating the individual steps of the
+///     integrator.
+///   - **External or Black-Box Calls:** Supply the reverse rule for a custom kernel or for a computation that does not
 ///     itself trace into Ryft programs.
-///   - **Numerical stability:** replace an unstable or wasteful automatically derived gradient with a hand-written
-///     one.
+///   - **Numerical Stability:** Replace an unstable or wasteful automatically derived gradient with a handwritten one.
 ///
-/// A custom VJP is reverse-mode only: forward-mode differentiation of a staged call is rejected, and the current
-/// transpose implementation also rejects transposing its generated pullback, so higher-order derivatives through a
-/// custom VJP are not yet supported. When the function is forward-differentiable or must participate in higher-order
-/// differentiation, use [`custom_jvp`](fn@crate::operations::differentiation::custom_jvp) instead.
+/// Note that a custom VJP only supports reverse-mode differentiation. Forward-mode differentiation of a staged call is
+/// rejected, and the current transpose implementation also rejects transposing its generated pullback, so higher-order
+/// derivatives through a custom VJP are not yet supported. When the function is forward-differentiable or must
+/// participate in higher-order differentiation, use [`custom_jvp`](fn@crate::custom_jvp) instead.
 ///
-/// # Calling convention
+/// # Calling Convention
 ///
-/// All three closures operate on [`Parameterized`] trees of [`DomainTracer`]s (i.e., Ryft's analogue of JAX
-/// pytrees), so `x`, `y`, and `r` may each be a single tracer, a tuple, or any other parameterized structure. Static
+/// All three closures operate on [`Parameterized`] values of [`DomainTracer`]s (i.e., Ryft's analogue of JAX pytrees),
+/// so `x`, `y`, and `r` may each be a single tracer, a tuple, or any other parameterized structure. Static
 /// non-differentiated configuration should be captured by all three closures. A dynamic value should remain an
 /// explicit input, either as a non-differentiated input (see below) or as an ordinary input that `forward` preserves
 /// as a residual in `r` when `backward` needs it and for which `backward` returns a zero cotangent in `x̄`.
 ///
-/// Because [`custom_vjp`] builds a reusable function before any input is known, the `primal` closure must annotate
-/// the tracer type of its input (e.g., `|x: DomainTracer<C>| ...`), which then also fixes the input types of
-/// `forward` and, through the outputs and residuals that `forward` returns, those of `backward`.
+/// Because [`custom_vjp`] builds a reusable function before any input is known, the `primal` closure must annotate the
+/// tracer type of its input (e.g., `|x: DomainTracer<C>| ...`), which then also fixes the input types of `forward` and,
+/// through the outputs and residuals that `forward` returns, those of `backward`.
 /// [`custom_derivative_at`](crate::custom_derivative_at) instead stages the same rule at a known input, which lets all
 /// three closures infer their parameter types from that input.
 ///
-/// # Non-differentiated inputs
+/// # Non-Differentiated Inputs
 ///
 /// [`CustomVjp::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
 /// parameterizes the call without being differentiated, which is the analogue of JAX's `nondiff_argnums`. Plumbing
-/// leaves reach `primal` and `forward` at their usual positions and receive no cotangent: `backward` keeps returning a
-/// full `x̄` tree so that its signature mirrors the primal signature, but the leaves that it returns at plumbing
+/// leaves reach `primal` and `forward` at their usual positions and receive no cotangent: `backward` keeps returning
+/// a full `x̄` value so that its signature mirrors the primal signature, but the leaves that it returns at plumbing
 /// positions are ignored and never become outputs of the staged [`CustomVjpOperation`]. A plumbing value that
-/// `backward` needs must be forwarded to it as a residual in `r`. Differentiating the call with a nonzero tangent for
-/// a numeric plumbing input is rejected because the rules cannot propagate that tangent.
+/// `backward` needs must be forwarded to it as a residual in `r`. Differentiating the call with a nonzero tangent
+/// for a numeric plumbing input is rejected because the rules cannot propagate that tangent.
 ///
 /// # References
 ///
@@ -811,8 +814,8 @@ impl<
 /// denotes. No output of `primal` may be a reference, because `backward` would then have to consume that output's
 /// cotangent reference.
 ///
-/// `forward` may return a plumbing reference inside `r`, in which case the reference itself (rather than a snapshot of
-/// its contents) is forwarded to `backward`. Every reference-typed residual must be a distinct plumbing input
+/// `forward` may return a plumbing reference inside `r`, in which case the reference itself (rather than a snapshot
+/// of its contents) is forwarded to `backward`. Every reference-typed residual must be a distinct plumbing input
 /// forwarded by identity, since a reference allocated by `forward` would reach `backward` as state whose mutation
 /// nothing outside of the rules observes. This enables the _stash-gradients_ pattern: a `stash` reference enters as
 /// plumbing, `forward` returns it as a residual, and `backward` writes the incoming `ȳ` into it before returning `x̄`.
@@ -820,17 +823,17 @@ impl<
 /// whenever the corresponding program is replayed. When the call is differentiated, no two reference inputs may bind
 /// the same allocation.
 ///
-/// # Tracing semantics
+/// # Tracing Semantics
 ///
-/// Nothing is traced at construction time. Each [`CustomVjp::call`] recovers the tracing [`Context`] from the values it
-/// is called with, reads the input types off those values, traces the closures into programs specialized to those
+/// Nothing is traced at construction time. Each [`CustomVjp::call`] recovers the tracing [`Context`] from the values
+/// it is called with, reads the input types off those values, traces the closures into programs specialized to those
 /// types, validates the rule signatures, and stages one [`CustomVjpOperation`] into the context through which those
 /// values flow. The primal closure is kept separate from the forward closure for efficiency rather than necessity: an
 /// un-differentiated call should not pay for residual computation. Callers that do not care about the distinction can
 /// pass the same body for both, accepting that the residual outputs are dead code outside of differentiation (e.g.,
 /// by writing `forward` as `|x| Ok((f(x)?, residuals))`).
 ///
-/// # Transform semantics
+/// # Transform Semantics
 ///
 /// The transforms treat a staged call as follows:
 ///
@@ -850,16 +853,19 @@ impl<
 ///   - `primal`: Closure implementing `f(x) = y` for ordinary evaluation.
 ///   - `forward`: Closure implementing `x ↦ (y, r)` for reverse-mode residual production.
 ///   - `backward`: Closure implementing `(r, ȳ) ↦ x̄ = J_f(x)ᵀ · ȳ`.
-pub fn custom_vjp<Input, Output, Residual, Primal, Forward, Backward>(
-    primal: Primal,
-    forward: Forward,
-    backward: Backward,
-) -> CustomVjp<Input, Output, Residual, Primal, Forward, Backward>
-where
+#[inline]
+pub fn custom_vjp<
+    Input,
+    Output,
+    Residual,
     Primal: Fn(Input) -> Result<Output, ProgramError>,
     Forward: Fn(Input) -> Result<(Output, Residual), ProgramError>,
     Backward: Fn(Residual, Output) -> Result<Input, ProgramError>,
-{
+>(
+    primal: Primal,
+    forward: Forward,
+    backward: Backward,
+) -> CustomVjp<Input, Output, Residual, Primal, Forward, Backward> {
     CustomVjp { primal, forward, backward, non_differentiated_count: 0, marker: PhantomData }
 }
 
@@ -1614,7 +1620,7 @@ mod tests {
     fn test_custom_vjp_call_with_non_differentiated_count() {
         // The stash-gradients pattern: the leading `stash` reference is plumbing, the forward rule forwards it as a
         // residual by identity rather than saving a snapshot, and the backward rule writes the incoming cotangent into
-        // it before returning `x̄ = cos(x) · ȳ`. The cotangent tree that it returns is input-shaped, so its leading
+        // it before returning `x̄ = cos(x) · ȳ`. The cotangent value that it returns is input-shaped, so its leading
         // plumbing leaf is ignored.
         let function = custom_vjp(
             |(_, x): (ArrayIrTracer, ArrayIrTracer)| {
