@@ -509,14 +509,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(renamed.id(), reference.id());
-        assert!(!renamed.is_runtime_root_handle());
-        let Err(error) = renamed.lock_root() else {
-            panic!("identity-renamed reference must not expose a root transaction guard")
+        assert!(!renamed.is_storage_root());
+        let Err(error) = renamed.lock_storage() else {
+            panic!("identity-renamed reference must not expose a storage transaction guard")
         };
-        assert_eq!(
-            error.downcast_custom::<ArrayReferenceViewError>(),
-            Some(&ArrayReferenceViewError::InvalidRuntimeRoot),
-        );
+        assert_eq!(error.downcast_custom::<ArrayReferenceViewError>(), Some(&ArrayReferenceViewError::NotStorageRoot));
         assert_eq!(
             renamed.r#type().referent(),
             &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target.clone())])),

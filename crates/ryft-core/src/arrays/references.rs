@@ -31,7 +31,6 @@ use crate::programs::{
 
 /// Error produced by an invalid eager array-reference view operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
-#[non_exhaustive]
 pub enum ArrayReferenceViewError {
     #[error("cannot freeze a reference view; freeze the root reference instead")]
     CannotFreezeView,
@@ -39,14 +38,12 @@ pub enum ArrayReferenceViewError {
     #[error("cannot read a reference view through the root-only snapshot accessor")]
     CannotReadRootThroughView,
 
-    #[error("reference runtime transactions require a root handle using the allocation's stored type identities")]
-    InvalidRuntimeRoot,
+    #[error("backend storage transactions require a root handle that uses the allocation's stored type identities")]
+    NotStorageRoot,
 
     #[error("eager reference handles carry only static transforms; dynamic indices are resolved by each access")]
     DynamicTransformIndex,
 }
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Eager handle to a mutable array, which pairs one shared root allocation with a handle-local
 /// [`ArrayReferenceTransformPath`] selecting the elements that the handle views. A root handle (i.e., one
@@ -91,57 +88,71 @@ pub struct ArrayReference<A: Value<Type = ArrayType>> {
     /// transforms, so no symbol is ever bound on this path.
     path: ArrayReferenceTransformPath<NoReferenceTransformBinding>,
 
-    /// Exact handle type derived once from the root type and path, so that repeated
-    /// [`Typed::r#type`](Typed::type) calls borrow the cached type instead of re-deriving the complete transform path.
+    /// Exact handle type derived once from the root type and path, so that repeated [`Typed`] type queries borrow this
+    /// cached type instead of re-deriving it from the complete transform path.
     r#type: ReferenceType<ArrayType>,
 }
 
 impl<A: Value<Type = ArrayType>> ArrayReference<A> {
-    /// Creates a new root [`ArrayReference`] to a fresh allocation initialized with `value`. The returned handle views
-    /// the complete allocation (i.e., its transform path is empty).
+    /// Creates a new root [`ArrayReference`] to a fresh allocation initialized with `value`.
+    /// The returned handle views the complete allocation (i.e., its transform path is empty).
     #[inline]
     pub fn new(value: A) -> Self {
-        // `A::Type` is exactly `ArrayType`, whose type family cannot denote a reference, so the generic nested-
-        // referent rejection is unreachable for this specialized constructor.
+        // `A::Type` is exactly `ArrayType`, whose type family cannot denote a reference, so the generic
+        // nested-referent rejection is unreachable for this specialized constructor.
         let root = Reference::new(value).unwrap();
         let r#type = root.r#type().into_owned();
         Self { root, path: ArrayReferenceTransformPath::root(), r#type }
     }
 
-    /// Returns the process-local identity of the allocation that this handle shares with every handle derived from the
-    /// same root.
+    /// Returns the process-local identity of the allocation (i.e., the [`ReferenceId`]) that this handle shares
+    /// with every handle derived from the same root.
     #[inline]
     pub fn id(&self) -> ReferenceId {
         self.root.id()
     }
 
-    /// Returns the canonical transforms that select this handle's elements from its shared root allocation. The path
-    /// is empty for root handles.
+    /// Returns the [`ArrayReferenceTransformPath`]that select this handle's elements from its shared root allocation.
+    /// Note that the returned path is empty for root handles.
+    #[inline]
     pub fn path(&self) -> &ArrayReferenceTransformPath<NoReferenceTransformBinding> {
         &self.path
     }
 
-    /// Returns whether this handle views the complete allocation and uses the allocation's stored type identities.
-    /// Backend runtime transactions require both, because they access the stored value directly, without applying a
-    /// transform path or converting between the type identities of the handle and those used in storage.
-    #[doc(hidden)]
+    /// Returns whether this handle is a _storage root_ (i.e., a root handle that also uses the allocation's stored type
+    /// identities, so that its value is exactly the stored value). Backend storage transactions require a storage root,
+    /// because they access the stored value directly, without applying a transform path or converting between the type
+    /// identities of the handle and those used in storage.
+    ///
+    /// Backends use this predicate to decide whether a reference argument can enter a compiled call as-is, and must
+    /// reject (or first materialize) views and aliases with renamed type identities, since [`Self::lock_storage`]
+    /// refuses them. Ordinary value access through [`Self::read`] and [`Self::write`] has no such restriction.
     #[inline]
-    pub fn is_runtime_root_handle(&self) -> bool {
+    pub fn is_storage_root(&self) -> bool {
         self.path.is_root() && self.root.uses_storage_type_identities()
     }
 
-    /// Locks the complete allocation for one backend-owned state transaction, which the returned guard holds until it
-    /// is dropped.
+    /// Locks the storage of this handle's allocation for one backend-owned state transaction, which the returned guard
+    /// holds until it is dropped. Backends use it to read the stored value as a compiled-call argument and to publish
+    /// the submitted replacement of that value, following the protocol of [`Reference::lock`]:
+    ///
+    ///   - The function returns as soon as the allocation's mutex is acquired and does not wait for pending values or
+    ///     active read leases, so the guard may observe a `Pending` value that the transaction must order after.
+    ///   - The mutex is not reentrant. Locking the same allocation again while the guard is alive, whether through
+    ///     this function on another alias or through a value access function such as [`Self::read`], deadlocks or
+    ///     panics.
+    ///   - A transaction that locks multiple allocations must lock them in ascending [`ReferenceId`] order (see
+    ///     [`Self::id`]) and keep every guard, or the replacement typestate derived from it, alive until all of its
+    ///     replacements have been validated and committed.
     ///
     /// # Errors
     ///
-    /// Returns [`ArrayReferenceViewError::InvalidRuntimeRoot`] if this handle is not a runtime root handle (as checked
-    /// by [`Self::is_runtime_root_handle`]), and forwards the [`ReferenceError`] of an allocation that cannot be locked
+    /// Returns [`ArrayReferenceViewError::NotStorageRoot`] if this handle is not a storage root (as checked by
+    /// [`Self::is_storage_root`]), and forwards the [`ReferenceError`] of an allocation that cannot be locked
     /// (e.g., because it is frozen or poisoned).
-    #[doc(hidden)]
-    pub fn lock_root(&self) -> Result<ReadyOrPendingReferenceGuard<'_, A>, ProgramError> {
-        if !self.is_runtime_root_handle() {
-            return Err(ProgramError::custom(ArrayReferenceViewError::InvalidRuntimeRoot));
+    pub fn lock_storage(&self) -> Result<ReadyOrPendingReferenceGuard<'_, A>, ProgramError> {
+        if !self.is_storage_root() {
+            return Err(ProgramError::custom(ArrayReferenceViewError::NotStorageRoot));
         }
         self.root.lock().map_err(ProgramError::custom)
     }
@@ -158,6 +169,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         if transform.binding_count() != 0 {
             return Err(ProgramError::custom(ArrayReferenceViewError::DynamicTransformIndex));
         }
+
         // The cached handle type already reflects every earlier transform, so composition validates and derives
         // incrementally instead of re-folding the complete chain from the root type. Derivation is purely structural:
         // holder liveness is checked only when the resulting handle accesses state.
@@ -198,11 +210,13 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
             let count = transform.binding_count();
             if count > remaining.len() {
                 return Err(TypeError::invalid(format!(
-                    "reference transform requires {count} bindings but only {} remain",
+                    "reference transform requires {} bindings but only {} remain",
+                    count,
                     remaining.len(),
                 ))
                 .into());
             }
+
             let (current, rest) = remaining.split_at(count);
             remaining = rest;
             let binding_types = current.iter().map(Typed::r#type).collect::<Vec<_>>();
@@ -227,11 +241,13 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
             referent = transform.output_type(&referent)?;
             path.push_transform(transform);
         }
+
         if !remaining.is_empty() {
             return Err(
                 TypeError::invalid(format!("reference transform path has {} extra bindings", remaining.len())).into()
             );
         }
+
         Ok(Self { root: self.root.clone(), path, r#type: ReferenceType::new(referent) })
     }
 
@@ -240,6 +256,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     /// # Errors
     ///
     /// Forwards the [`ReferenceError`] of an allocation that cannot be read (e.g., because it is frozen or poisoned).
+    #[inline]
     pub fn read(&self) -> Result<A, ProgramError>
     where
         A: Reshape + Slice,
@@ -247,13 +264,16 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         self.path.apply(&self.root.read().map_err(ProgramError::custom)?)
     }
 
-    /// Returns an immutable snapshot of the complete allocation of a root handle. Unlike [`Self::read`], this function
-    /// requires no array-manipulation capabilities, because a root handle applies no transforms.
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Returns an immutable snapshot of the complete allocation through a root handle, and rejects views. Unlike
+    /// [`Self::read`], this function requires no array-manipulation capabilities, because a root handle applies no
+    /// transforms.
     ///
     /// # Errors
     ///
-    /// Returns [`ArrayReferenceViewError::CannotReadRootThroughView`] if this handle is a view, and forwards the
-    /// [`ReferenceError`] of an allocation that cannot be read.
+    /// Returns [`ArrayReferenceViewError::CannotReadRootThroughView`] if this handle is a view, and forwards
+    /// the [`ReferenceError`] of an allocation that cannot be read.
     pub fn read_root(&self) -> Result<A, ProgramError> {
         if !self.path.is_root() {
             return Err(ProgramError::custom(ArrayReferenceViewError::CannotReadRootThroughView));
@@ -469,7 +489,6 @@ impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root
 /// A negative runtime index counts from the end of the indexed axis once, then the result is clamped to that axis's
 /// valid range, following the array dynamic-slicing contract. Strided slicing remains unsupported.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-#[non_exhaustive]
 pub enum ArrayReferenceTransform {
     /// Selects a position along one axis and removes that axis from the view shape.
     Index {
@@ -1616,8 +1635,8 @@ mod tests {
                 "cannot read a reference view through the root-only snapshot accessor",
             ),
             (
-                ArrayReferenceViewError::InvalidRuntimeRoot,
-                "reference runtime transactions require a root handle using the allocation's stored type identities",
+                ArrayReferenceViewError::NotStorageRoot,
+                "backend storage transactions require a root handle that uses the allocation's stored type identities",
             ),
             (
                 ArrayReferenceViewError::DynamicTransformIndex,
@@ -1669,30 +1688,27 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_is_runtime_root_handle() {
+    fn test_array_reference_is_storage_root() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let view = root
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) })
             .unwrap();
-        assert!(root.is_runtime_root_handle());
-        assert!(!view.is_runtime_root_handle());
+        assert!(root.is_storage_root());
+        assert!(!view.is_storage_root());
     }
 
     #[test]
-    fn test_array_reference_lock_root() {
+    fn test_array_reference_lock_storage() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]).unwrap());
         let view = root
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) })
             .unwrap();
-        drop(root.lock_root().unwrap());
-        let error = view.lock_root().err().unwrap();
-        assert_eq!(
-            error.downcast_custom::<ArrayReferenceViewError>(),
-            Some(&ArrayReferenceViewError::InvalidRuntimeRoot),
-        );
+        drop(root.lock_storage().unwrap());
+        let error = view.lock_storage().err().unwrap();
+        assert_eq!(error.downcast_custom::<ArrayReferenceViewError>(), Some(&ArrayReferenceViewError::NotStorageRoot));
         assert_eq!(
             error.to_string(),
-            "reference runtime transactions require a root handle using the allocation's stored type identities",
+            "backend storage transactions require a root handle that uses the allocation's stored type identities",
         );
     }
 
@@ -1747,7 +1763,7 @@ mod tests {
     #[test]
     fn test_array_reference_with_transform_is_structural() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
-        let guard = root.lock_root().unwrap();
+        let guard = root.lock_storage().unwrap();
         let ReferenceReplacementPreparation::Prepared(prepared) = guard.prepare_replacement().unwrap() else {
             panic!("new reference unexpectedly has active read leases")
         };

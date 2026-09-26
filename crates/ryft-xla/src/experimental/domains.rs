@@ -3493,7 +3493,7 @@ impl<'c> XlaDomain<'c> {
     fn lock_stateful_reference<'g>(
         reference: &'g ArrayReference<Array<'c>>,
     ) -> Result<ReadyOrPendingReferenceGuard<'g, Array<'c>>, XlaDomainError> {
-        reference.lock_root().map_err(|error| {
+        reference.lock_storage().map_err(|error| {
             if let Some(reference_error) = error.downcast_custom::<ryft_core::ReferenceError>().cloned() {
                 XlaDomainError::Reference(reference_error)
             } else {
@@ -3600,9 +3600,12 @@ impl<'c> XlaDomain<'c> {
                         ),
                     });
                 }
-                if !reference.is_runtime_root_handle() {
+                if !reference.is_storage_root() {
                     return Err(XlaDomainError::UnsupportedReferenceAbi {
-                        reason: format!("external state input {logical_input_index} must be a root reference handle"),
+                        reason: format!(
+                            "external state input {logical_input_index} must be a root reference handle that uses its \
+                             allocation's stored type identities",
+                        ),
                     });
                 }
                 bindings.push((reference.id(), reference.clone()));
@@ -12244,7 +12247,7 @@ mod tests {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
 
         let unique = ArrayReference::new(f32_scalar(&client, &mesh, 1.0));
-        let unique_guard = unique.lock_root().unwrap();
+        let unique_guard = unique.lock_storage().unwrap();
         let mut inputs = vec![unique_guard.observe().unwrap().snapshot().clone()];
         drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
         let (value, unique_taken) = unique_guard.wait_until_ready().unwrap().take().unwrap();
@@ -12256,7 +12259,7 @@ mod tests {
         let shared_value = f32_scalar(&client, &mesh, 2.0);
         let retained = shared_value.clone();
         let shared = ArrayReference::new(shared_value);
-        let shared_guard = shared.lock_root().unwrap();
+        let shared_guard = shared.lock_storage().unwrap();
         let mut inputs = vec![shared_guard.observe().unwrap().snapshot().clone()];
         drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
         let (value, shared_taken) = shared_guard.wait_until_ready().unwrap().take().unwrap();

@@ -405,11 +405,14 @@ impl RaggedAllToAllOperation {
         effective_collective_axis_size(RAGGED_ALL_TO_ALL_OPERATION_NAME, self.axis_size, self.axis_index_groups())
     }
 
-    /// Returns whether this operation carries the batching-internal physical operand representation.
+    /// Returns whether this operation carries the batching-internal physical operand representation, in which every
+    /// operand has one leading axis that enumerates the participants of the named axis. Batching over a named axis
+    /// produces this representation so that one host-side evaluation can exchange segments between all participants.
     ///
-    /// This predicate is exposed for backend lowerings, which must reject the host-batching representation before
-    /// emitting a custom call whose operands are local to one device participant.
-    #[doc(hidden)]
+    /// Backend lowerings must check this predicate and reject physical operations, because a device-level
+    /// `ragged_all_to_all` expects the public logical representation, in which each device holds only its own
+    /// operands and rank-one metadata operands. Lowering a physical operation as if it were logical would misread its
+    /// leading participant axis as data.
     #[inline]
     pub fn is_physical(&self) -> bool {
         self.representation == RaggedAllToAllRepresentation::Physical
@@ -435,9 +438,12 @@ impl RaggedAllToAllOperation {
 
     /// Returns whether received segments add into the output seed instead of overwriting it.
     ///
-    /// This mode is produced only by the transpose rule. It is exposed so backend lowerings can preserve the
-    /// accumulation semantics without exposing the internal update-kind representation itself.
-    #[doc(hidden)]
+    /// Operations constructed through the public API always overwrite. Only the transpose rule produces accumulating
+    /// operations: its adjoint exchange sends the output cotangent back into a zero seed shaped like the operand, and
+    /// operand regions that several forward segments read must sum the cotangents of all those segments. Backend
+    /// lowerings must check this predicate, because a native `ragged_all_to_all` overwrites its output and would keep
+    /// only one of those contributions, so accumulating operations need a lowering that adds received segments
+    /// explicitly.
     #[inline]
     pub fn accumulates_updates(&self) -> bool {
         self.update_kind == RaggedAllToAllUpdateKind::Add

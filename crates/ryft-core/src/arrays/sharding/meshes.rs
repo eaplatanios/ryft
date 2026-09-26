@@ -2,7 +2,6 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
-use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::arrays::sharding::ShardingError;
@@ -101,9 +100,8 @@ struct LogicalMeshKey {
 }
 
 /// Interned immutable data for a [`LogicalMesh`].
-#[doc(hidden)]
 #[derive(Debug, PartialEq, Eq)]
-pub struct LogicalMeshData {
+struct LogicalMeshData {
     /// Named and sized axes that define this logical mesh topology.
     axes: Vec<MeshAxis>,
 
@@ -158,37 +156,37 @@ impl LogicalMesh {
     /// Returns the rank (i.e., number of axes) of this [`LogicalMesh`].
     #[inline]
     pub fn rank(&self) -> usize {
-        self.axes.len()
+        self.0.axes.len()
     }
 
     /// Returns the named and sized axes that define this logical mesh topology.
     #[inline]
     pub fn axes(&self) -> &[MeshAxis] {
-        &self.axes
+        &self.0.axes
     }
 
     /// Returns the index of the [`MeshAxis`] with the provided name, if such an axis exists.
     #[inline]
     pub fn axis_index<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
-        self.axis_indices.get(axis_name.as_ref()).copied()
+        self.0.axis_indices.get(axis_name.as_ref()).copied()
     }
 
     /// Returns the size of the [`MeshAxis`] in this [`LogicalMesh`] with the provided name, if such an axis exists.
     #[inline]
     pub fn axis_size<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
-        self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].size)
+        self.0.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.0.axes[*axis_index].size)
     }
 
     /// Returns the type of the [`MeshAxis`] in this [`LogicalMesh`] with the provided name, if such an axis exists.
     #[inline]
     pub fn axis_type<S: AsRef<str>>(&self, axis_name: S) -> Option<MeshAxisType> {
-        self.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.axes[*axis_index].r#type)
+        self.0.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.0.axes[*axis_index].r#type)
     }
 
     /// Returns the total number of devices that the topology defined by this [`LogicalMesh`] contains.
     #[inline]
     pub fn device_count(&self) -> usize {
-        self.axes.iter().fold(1usize, |count, axis| count * axis.size)
+        self.0.axes.iter().fold(1usize, |count, axis| count * axis.size)
     }
 }
 
@@ -197,7 +195,7 @@ impl Display for LogicalMesh {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Renders the bracketed axis list (e.g., `['x'=2:manual, 'y'=4:explicit]`) that operation renderings embed
         // as a field and that sharding renderings wrap as `mesh<...>`.
-        write!(formatter, "[{}]", self.axes.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
+        write!(formatter, "[{}]", self.0.axes.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
     }
 }
 
@@ -206,23 +204,15 @@ impl Debug for LogicalMesh {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LogicalMesh")
-            .field("axes", &self.axes)
-            .field("axis_indices", &self.axis_indices)
+            .field("axes", &self.0.axes)
+            .field("axis_indices", &self.0.axis_indices)
             .finish()
     }
 }
 
 impl Hash for LogicalMesh {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.axes.hash(state);
-    }
-}
-
-impl Deref for LogicalMesh {
-    type Target = LogicalMeshData;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref()
+        self.0.axes.hash(state);
     }
 }
 
@@ -400,16 +390,16 @@ mod tests {
             MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        assert_eq!(mesh.axes.iter().map(|axis| axis.name.as_str()).collect::<Vec<_>>(), vec!["x", "y", "z"]);
-        assert_eq!(mesh.axes.iter().map(|axis| axis.size).collect::<Vec<_>>(), vec![2, 3, 1]);
+        assert_eq!(mesh.axes().iter().map(|axis| axis.name.as_str()).collect::<Vec<_>>(), vec!["x", "y", "z"]);
+        assert_eq!(mesh.axes().iter().map(|axis| axis.size).collect::<Vec<_>>(), vec![2, 3, 1]);
         assert_eq!(
-            mesh.axes.iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
+            mesh.axes().iter().map(|axis| axis.r#type).collect::<Vec<_>>(),
             vec![MeshAxisType::Auto, MeshAxisType::Manual, MeshAxisType::Explicit]
         );
-        assert_eq!(mesh.axis_indices.get("x"), Some(&0));
-        assert_eq!(mesh.axis_indices.get("y"), Some(&1));
-        assert_eq!(mesh.axis_indices.get("z"), Some(&2));
-        assert_eq!(mesh.axis_indices.get("w"), None);
+        assert_eq!(mesh.axis_index("x"), Some(0));
+        assert_eq!(mesh.axis_index("y"), Some(1));
+        assert_eq!(mesh.axis_index("z"), Some(2));
+        assert_eq!(mesh.axis_index("w"), None);
         assert_eq!(mesh.rank(), 3);
         assert_eq!(mesh.axis_size("x"), Some(2));
         assert_eq!(mesh.axis_size("y"), Some(3));

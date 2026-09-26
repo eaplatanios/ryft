@@ -1436,10 +1436,6 @@ impl<'c, 't> Lowering<'c, 't> {
                 });
                 Ok(result)
             }
-            _ => Err(Error::Unsupported {
-                operation: "reference transform",
-                reason: "transform has no baseline GPU lowering".to_owned(),
-            }),
         }
     }
 }

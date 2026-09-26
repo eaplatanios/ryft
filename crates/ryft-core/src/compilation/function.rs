@@ -224,9 +224,13 @@ pub struct ReferenceExecution<Output, Error> {
 }
 
 impl<Output, Error> ReferenceExecution<Output, Error> {
-    /// Creates an already-completed stateful invocation result.
+    /// Creates an already-completed stateful invocation result, which returns `result` without waiting when awaited.
+    /// Backends use it when a stateful call finishes synchronously or fails before submitting any work.
+    ///
+    /// A backend must not use this function once work that reads or replaces a
+    /// [`Reference`](crate::programs::Reference) has been submitted, because the result would then hide the completion
+    /// of that work and any asynchronous failure that it reports. Use [`Self::pending`] for submitted work instead.
     #[inline]
-    #[doc(hidden)]
     pub fn ready(result: Result<Output, Error>) -> Self {
         Self { result, completion: None }
     }
@@ -234,13 +238,17 @@ impl<Output, Error> ReferenceExecution<Output, Error> {
     /// Creates a submitted invocation whose public result is already reconstructed but whose execution remains
     /// pending. Completion failure takes precedence over `result` because it may invalidate every pending output.
     ///
+    /// Backends must pass a `completion` that covers the whole invocation, which usually means
+    /// [`ReferenceCompletion::joined`] over the submitted work and the completions that the invocation's references
+    /// already depended on. A completion that only tracks the latest backend event would let awaiting the result
+    /// return before an earlier reference write has finished or reported its failure.
+    ///
     /// # Parameters
     ///
     ///   - `result`: Public output or reconstruction failure prepared right after submission.
     ///   - `completion`: Whole-invocation completion, including every cumulative reference predecessor dependency.
     ///   - `completion_error`: Converts a backend completion failure message into the domain error type. It is applied
     ///     only when the completion itself fails, and its result then replaces `result`.
-    #[doc(hidden)]
     pub fn pending(
         result: Result<Output, Error>,
         completion: ReferenceCompletion,
@@ -687,8 +695,17 @@ where
         )
     }
 
-    /// Returns the source program with runtime captures lifted into leading flat inputs.
-    #[doc(hidden)]
+    /// Returns the source program with its runtime captures lifted into leading flat inputs, in the
+    /// `[captures..., public inputs...]` order that compiled executables are invoked with. Backends lower this program
+    /// rather than the [`ClosedProgram`] returned by [`Self::source_program`], and use the capture count of the source
+    /// program to tell lifted captures apart from public inputs.
+    ///
+    /// The program is derived once and then cached on the shared staged state, so repeated calls, including calls on
+    /// clones of this function, return the same [`Arc`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if rebuilding the source program with explicit capture inputs fails.
     pub fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<D>>, ProgramError> {
         if let Some(program) = self.state.lifted_program.get() {
             return Ok(program.clone());
@@ -763,8 +780,7 @@ where
     Output::Family: ParameterizedFamily<D::Constant>,
 {
     /// Assembles a lowering whose output signature has already been established by its backend.
-    #[doc(hidden)]
-    pub fn from_parts(
+    fn from_parts(
         staged: StagedFunction<D, Input, Output>,
         program: D::LoweredProgram,
         output_types: Vec<D::Type>,
@@ -881,8 +897,20 @@ where
 impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>>
     ExecutableFunction<D, Input, Output>
 {
-    /// Replaces the backend payload after the backend has established call-boundary compatibility.
-    #[doc(hidden)]
+    /// Returns a copy of this function that invokes `program` instead of its current compiled program, while keeping
+    /// its runtime captures, flat input types, and output parameter structure. Backends use it to swap in an
+    /// equivalent executable, such as one deserialized from a persistent cache or recompiled with profile guidance.
+    ///
+    /// This function does not check compatibility, so the caller must establish it first: `program` must accept the
+    /// same `[captures..., public inputs...]` arguments as the current program, and `output_types` must be its
+    /// effective flat output types, with one entry per leaf of the retained output structure. A backend that breaks
+    /// these invariants produces a function whose calls fail or return values of unexpected types. The existing
+    /// function and its clones are unaffected, because this creates new shared state.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Replacement backend executable.
+    ///   - `output_types`: Effective flat output types of `program`.
     pub fn with_compiled_program(&self, program: Arc<D::CompiledProgram>, output_types: Vec<D::Type>) -> Self {
         Self {
             state: Arc::new(ExecutableFunctionState {
@@ -1043,8 +1071,7 @@ where
     Output::Family: ParameterizedFamily<D::Constant>,
 {
     /// Assembles a compiled function from backend-validated parts.
-    #[doc(hidden)]
-    pub fn from_parts(
+    fn from_parts(
         lowered: LoweredFunction<D, Input, Output>,
         program: Arc<D::CompiledProgram>,
         output_types: Vec<D::Type>,

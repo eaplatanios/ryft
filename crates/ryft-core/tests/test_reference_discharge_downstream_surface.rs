@@ -64,10 +64,11 @@ use ryft_core::{
     ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceTransform,
     ReferenceTransformPath, ReferenceType, ReferenceView, ReferenceViewOverlap, ReferenceWrite,
     ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot, ReshapeOperation, ReshardOperation,
-    ResidualZeroProvider, SubOperation, Trace, Tracer, TracingContext, TransposableOperation, TransposeOperation,
-    TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId, ValueProjection, Zero,
-    ZeroLikeOperation, ZeroOperation, batch, check_count, differentiate_at, discharge_reference_free_operation,
-    infer_reference_view_type, jvp_projected_operation, transpose_projected_operation, validate_reference_boundary,
+    ResidualZeroProvider, SelectOperation, SubOperation, Trace, Tracer, TracingContext, TransposableOperation,
+    TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId,
+    ValueProjection, Zero, ZeroLikeOperation, ZeroOperation, batch, check_count, differentiate_at,
+    discharge_reference_free_operation, infer_reference_view_type, jvp_projected_operation,
+    transpose_projected_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -2387,6 +2388,7 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         Reshard(ReshardOperation),
         Compare(CompareOperation<ArrayType>),
         Div(DivOperation<ArrayType>),
+        Select(SelectOperation<ArrayType>),
     }
 
     impl OperationProvider<ArrayType, ParallelVaryOperation> for ValueOnlyArrayOperation {

@@ -486,7 +486,6 @@ impl Lowering {
             ArrayReferenceTransform::Index { .. } => {
                 return Err(unsupported(operation, "dynamic reference transforms are unsupported"));
             }
-            _ => return Err(unsupported(operation, "reference transform is outside the supported subset")),
         }
         Ok(())
     }

@@ -1629,6 +1629,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_custom_jvp_batching_replicated_input_custom_cotangent_reduction() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let primal = {
+            let mut builder = ProgramBuilder::new();
+            builder.add_input(scalar_type.clone());
+            let parameter = builder.add_input(scalar_type.clone());
+            builder.build(vec![parameter], vec![Placeholder; 2], vec![Placeholder]).unwrap()
+        };
+        let jvp = {
+            let mut builder = ProgramBuilder::new();
+            let coefficient = builder.add_input(scalar_type.clone());
+            let parameter = builder.add_input(scalar_type.clone());
+            builder.add_input(scalar_type.clone());
+            let tangent = builder.add_input(scalar_type.clone());
+            let output_tangent =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![coefficient, tangent], None).unwrap()[0];
+            builder.build(vec![parameter, output_tangent], vec![Placeholder; 4], vec![Placeholder; 2]).unwrap()
+        };
+        let regions = vec![primal, jvp];
+        let program = custom_derivative_call_program(
+            ArrayOperation::CustomJvp(CustomJvpOperation::new()),
+            regions.clone(),
+            vec![scalar_type.clone(), scalar_type],
+        );
+        let (batched, output_axes) = program
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+
+        // The primal ignores its mapped input. Only the custom tangent forces the shared output boundary to be
+        // mapped, so a lazy factory cannot recover this natural layout from the primal program alone.
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched.jvp().unwrap().interpret(vec![
+                Array::vector(vec![2.0, 3.0, 5.0]).unwrap(),
+                Array::scalar(7.0).unwrap(),
+                Array::vector(vec![0.0, 0.0, 0.0]).unwrap(),
+                Array::scalar(2.0).unwrap(),
+            ]),
+            Ok(vec![Array::vector(vec![7.0, 7.0, 7.0]).unwrap(), Array::vector(vec![4.0, 6.0, 10.0]).unwrap()]),
+        );
+
+        // Batching before reverse differentiation retains the custom rule and sums contributions to the shared
+        // scalar input. Differentiating the primal body instead would incorrectly produce a scalar cotangent of 3.
+        let (value, pullback) =
+            differentiate_at((Array::vector(vec![2.0, 3.0, 5.0]).unwrap(), Array::scalar(7.0).unwrap()))
+                .vjp(|inputs| {
+                    batch(
+                        |(coefficient, parameter)| {
+                            Ok(coefficient
+                                .context()
+                                .bind(
+                                    ArrayOperation::CustomJvp(CustomJvpOperation::new()),
+                                    regions.clone(),
+                                    &[coefficient.clone(), parameter],
+                                )?
+                                .remove(0))
+                        },
+                        inputs,
+                        (BatchAxis::new(0), BatchAxis::replicated()),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .map_err(ProgramError::from)
+                })
+                .unwrap();
+        assert_eq!(value, Array::vector(vec![7.0, 7.0, 7.0]).unwrap());
+        assert_eq!(
+            pullback.apply(Array::vector(vec![1.0, 2.0, 4.0]).unwrap()),
+            Ok((Array::vector(vec![0.0, 0.0, 0.0]).unwrap(), Array::scalar(28.0).unwrap())),
+        );
+    }
+
+    #[test]
     fn test_custom_jvp_batching_named_axis_outputs() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let primal = {

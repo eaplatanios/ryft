@@ -988,7 +988,6 @@ pub enum RematerializationDecision<S> {
 }
 
 /// Kind of a [`RematerializationRejection`].
-#[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RematerializationRejectionKind {
     /// The residual's producing operation cannot participate in rematerialization.

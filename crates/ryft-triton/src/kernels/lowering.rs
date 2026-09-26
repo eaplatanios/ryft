@@ -609,7 +609,6 @@ impl<'c, 't> Lowering<'c, 't> {
             ArrayReferenceTransform::Index { .. } => {
                 return Err(unsupported(operation, "dynamic reference transforms are unsupported"));
             }
-            _ => return Err(unsupported(operation, "reference transform is outside the supported subset")),
         }
         Ok(())
     }

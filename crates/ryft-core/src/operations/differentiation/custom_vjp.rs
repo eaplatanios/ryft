@@ -1717,6 +1717,43 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_vjp_differentiation_nonlinear_backward_seed() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let identity =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+        let square =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // A custom backward rule may be nonlinear in its seed. Transposition replays its body inline, so further
+        // differentiation computes d(seed²)/d(seed) = 6 at seed 3 instead of treating the rule as a linear map.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let primal = builder.import_region(identity.entry_region_ref());
+        let forward = builder.import_region(identity.entry_region_ref());
+        let backward = builder.import_region(square.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(CustomVjpOperation::new(), vec![primal, forward, backward], vec![input], None)
+            .unwrap()[0];
+        let custom =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let linearization = custom.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        let custom_pullback = linearization.tangent().transpose().unwrap();
+        assert_eq!(custom_pullback.interpret(vec![Array::scalar(3.0).unwrap()]), Ok(vec![Array::scalar(9.0).unwrap()]));
+        assert_eq!(
+            custom_pullback
+                .jvp()
+                .unwrap()
+                .interpret(vec![Array::scalar(3.0).unwrap(), Array::scalar(1.0).unwrap()]),
+            Ok(vec![Array::scalar(9.0).unwrap(), Array::scalar(6.0).unwrap()]),
+        );
+    }
+
+    #[test]
     fn test_custom_vjp_differentiation_rejects_forward_mode() {
         // A custom VJP supplies no tangent program, so the tangent carrier that its JVP rule stages cannot be executed.
         // Forward mode must therefore fail with a user-facing custom-VJP error rather than leaking the internal

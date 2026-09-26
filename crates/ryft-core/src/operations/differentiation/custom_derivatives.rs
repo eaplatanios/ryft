@@ -186,10 +186,13 @@ pub fn custom_derivative_at<Input>(input: Input) -> CustomDerivativeBuilder<Inpu
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrValue, ArrayReference};
-    use crate::differentiation::{CotangentDestination, CotangentSeed, differentiate_at};
+    use crate::arrays::{Array, ArrayIrValue, ArrayOperation, ArrayReference};
+    use crate::differentiation::{CotangentDestination, CotangentDestinationKind, CotangentSeed, differentiate_at};
+    use crate::operations::arithmetic::MulOperation;
     use crate::operations::references::{ReferenceAddUpdate, ReferenceWrite};
     use crate::operations::trigonometric::{Cos, Sin};
 
@@ -197,8 +200,8 @@ mod tests {
 
     #[test]
     fn test_custom_derivative_builder_with_non_differentiated_count() {
-        // The leading counter is plumbing for a custom JVP rule: it reaches both closures at its usual position and the
-        // rule leaves the tangent placeholder of the counter unused.
+        // The leading counter is plumbing for a custom JVP rule: it reaches both closures at its usual position
+        // and the rule leaves the tangent placeholder of the counter unused.
         let counter = ArrayReference::new(Array::scalar(0.0f32).unwrap());
         let counter_tangent = ArrayReference::new(Array::scalar(0.0f32).unwrap());
         assert_eq!(
@@ -315,5 +318,79 @@ mod tests {
             ),
             Ok((Array::scalar(10.0).unwrap(), (Array::scalar(10.0).unwrap(), Array::scalar(4.0).unwrap()))),
         );
+    }
+
+    #[test]
+    fn test_custom_derivative_builder_vjp_effectful_backward_destinations() {
+        // This is one custom backward closure with an observable reference effect and an intentionally nonlinear
+        // seed formula. Destination specialization must preserve the closure's execution and additive semantics.
+        let stash = ArrayReference::new(Array::scalar(-1.0f32).unwrap());
+        let (_, pullback) = differentiate_at((
+            ArrayIrValue::Reference(stash.clone()),
+            ArrayIrValue::Array(Array::scalar(2.0f32).unwrap()),
+        ))
+        .vjp(|input| {
+            custom_derivative_at(input).with_non_differentiated_count(1).vjp(
+                |(_, value)| Ok(value),
+                |(stash, value)| Ok((value, stash)),
+                |stash, seed| {
+                    stash.write(&seed)?;
+                    let contribution = seed
+                        .context()
+                        .bind(
+                            ArrayOperation::<Array>::Mul(MulOperation::new()),
+                            Vec::new(),
+                            &[seed.clone(), seed.clone()],
+                        )?
+                        .remove(0);
+                    Ok((stash, contribution))
+                },
+            )
+        })
+        .unwrap();
+        let first = ArrayReference::new(Array::scalar(10.0f32).unwrap());
+        let second = ArrayReference::new(Array::scalar(20.0f32).unwrap());
+        let seed = ArrayIrValue::Array(Array::scalar(3.0f32).unwrap());
+        let destinations = [CotangentDestinationKind::Ignore, CotangentDestinationKind::Reference];
+        let retained = pullback.transposed_program(&destinations).unwrap();
+        assert_eq!(
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(seed.clone()),
+                (CotangentDestination::Ignore, CotangentDestination::Reference(ArrayIrValue::Reference(first.clone()))),
+            ),
+            Ok((None, None)),
+        );
+        assert_eq!(first.read(), Ok(Array::scalar(19.0f32).unwrap()));
+        assert_eq!(stash.read(), Ok(Array::scalar(3.0f32).unwrap()));
+        assert_eq!(
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(seed.clone()),
+                (
+                    CotangentDestination::Ignore,
+                    CotangentDestination::Reference(ArrayIrValue::Reference(second.clone()))
+                ),
+            ),
+            Ok((None, None)),
+        );
+        assert_eq!(second.read(), Ok(Array::scalar(29.0f32).unwrap()));
+        assert_eq!(first.read(), Ok(Array::scalar(19.0f32).unwrap()));
+        assert!(Arc::ptr_eq(&retained, &pullback.transposed_program(&destinations).unwrap()));
+        assert_eq!(
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(seed),
+                (CotangentDestination::Ignore, CotangentDestination::Return),
+            ),
+            Ok((None, Some(ArrayIrValue::Array(Array::scalar(9.0f32).unwrap())))),
+        );
+
+        // A numerical zero is still a live seed. Dropping every returned gradient must not erase the stash write.
+        assert_eq!(
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(0.0f32).unwrap())),
+                (CotangentDestination::Ignore, CotangentDestination::Ignore),
+            ),
+            Ok((None, None)),
+        );
+        assert_eq!(stash.read(), Ok(Array::scalar(0.0f32).unwrap()));
     }
 }

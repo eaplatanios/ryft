@@ -3252,7 +3252,9 @@ mod tests {
         assert!(matches!(
             compiled.call_statefully(&domain, ArrayIrValue::Reference(view)),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
-                if reason == "external state input 0 must be a root reference handle",
+                if reason
+                    == "external state input 0 must be a root reference handle that uses its allocation's stored \
+                        type identities",
         ));
         assert_eq!(read_f32_array(&client, &root.read().unwrap()), vec![4.0, 9.0]);
     }

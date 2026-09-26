@@ -334,6 +334,17 @@ update this file so that they do not need to remind you again in the future.
   - what handle/representation is being exposed,
   - why it is unsafe, and
   - why it is still exposed (e.g., extensibility/interoperability).
+- Public items that other workspace crates need (e.g., backend hooks that `ryft-xla` calls on `ryft-core` types) are
+  documented public API: explain why callers need them, the invariants callers must uphold, and any caveats (e.g.,
+  locking order or reentrancy), and include `# Errors` where applicable. Do not use `#[doc(hidden)]` to avoid
+  documenting them. Reserve `#[doc(hidden)]` for macro-expansion support and for items that are public only for
+  type-system reasons (e.g., the payload of an uninhabited variant). Make items that are only used within their own
+  crate `pub(crate)` or private instead of hiding them, and never make a type public solely to name it as a `Deref`
+  target or in another public signature when the owning type can expose the needed functions directly.
+- Do not mark in-repo types `#[non_exhaustive]`. Workspace crates evolve together, and the attribute forces wildcard
+  `_` arms in other crates, which hide newly added variants that those crates should handle (e.g., a backend lowering
+  that must cover every `ArrayReferenceTransform`). Match exhaustively instead, and use the attribute only for a
+  published-API compatibility reason that the user explicitly asks for.
 - For callback- and threading-heavy code, explain the lifetime/ownership invariants in comments. You can refer to
   documentation strings in the core traits of the `ryft-pjrt` crate for examples of this.
 - When using ASCII diagrams or Markdown tables in doc comments, align columns for source readability and indent the
