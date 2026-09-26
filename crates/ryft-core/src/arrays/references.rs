@@ -390,8 +390,6 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<A: Value<Type = ArrayType>> Clone for ArrayReference<A> {
     #[inline]
     fn clone(&self) -> Self {
@@ -400,6 +398,7 @@ impl<A: Value<Type = ArrayType>> Clone for ArrayReference<A> {
 }
 
 impl<A: Value<Type = ArrayType>> Debug for ArrayReference<A> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("ArrayReference").field("id", &self.id()).field("path", &self.path).finish()
     }
@@ -430,18 +429,19 @@ impl<A: Value<Type = ArrayType>> Hash for ArrayReference<A> {
 }
 
 impl<A: Value<Type = ArrayType>> Typed for ArrayReference<A> {
-    // The cached type is derived deterministically from the root type and path at construction, so equality and
-    // hashing over `(root, path)` remain consistent with it.
-
     type Type = ReferenceType<ArrayType>;
 
+    #[inline]
     fn r#type(&self) -> Cow<'_, Self::Type> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root, ArrayReferenceTransform, Binding> {
     /// Selects a static position on `axis`, removing that dimension from the viewed referent.
+    #[inline]
     pub fn index(self, axis: usize, index: usize) -> Result<Self, ProgramError> {
         self.with_bound_transform(
             ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) },
@@ -450,12 +450,14 @@ impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root
     }
 
     /// Selects the supplied static unit-stride ranges from the currently viewed referent.
+    #[inline]
     pub fn slice(self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
         self.with_bound_transform(ArrayReferenceTransform::Slice { axes: axes.to_vec() }, Vec::new())
     }
 
     /// Selects a dynamic position on `axis`. Construction validates the scalar integer binding's type and memory
     /// space; concretization and negative-index normalization happen at the eventual access.
+    #[inline]
     pub fn dynamic_index(self, axis: usize, index: &Binding) -> Result<Self, ProgramError> {
         self.with_bound_transform(
             ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic },
