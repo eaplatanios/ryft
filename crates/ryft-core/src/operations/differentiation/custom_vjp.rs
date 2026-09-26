@@ -881,6 +881,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::{CotangentDestination, CotangentSeed, differentiate_at};
     use crate::operations::arithmetic::MulOperation;
+    use crate::operations::assertions::AssertOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::differentiation::custom_jvp::tests::nested_custom_derivative_state_program;
     use crate::operations::differentiation::tests::{
@@ -930,8 +931,8 @@ mod tests {
         builder.build(vec![y, residual], vec![Placeholder], vec![Placeholder; 2]).unwrap()
     }
 
-    /// Builds the deliberately wrong rule `backward(residual, cotangent) = 3 * residual * cotangent`, which is
-    /// detectably different from the true gradient so that tests can prove that the custom rule is used.
+    /// Builds the custom rule `backward(residual, cotangent) = 3 * residual * cotangent`, whose result deliberately
+    /// differs from the mathematical gradient so that tests can prove that the custom rule is used.
     fn tripled_sin_backward_program(r#type: &ArrayType) -> FlatProgram<ArrayContext> {
         let mut builder = ProgramBuilder::new();
         let residual = builder.add_input(r#type.clone());
@@ -943,13 +944,21 @@ mod tests {
         builder.build(vec![gradient], vec![Placeholder; 2], vec![Placeholder]).unwrap()
     }
 
-    /// Returns a custom-VJP call over `f(x) = sin(x)` together with its `["primal", "forward", "backward"]` regions,
-    /// whose backward rule deliberately triples the true gradient.
-    fn custom_vjp_sin(r#type: &ArrayType) -> (ArrayOperation<Array>, Vec<FlatProgram<ArrayContext>>) {
-        (
-            ArrayOperation::CustomVjp(CustomVjpOperation::new()),
-            vec![sin_program(r#type), sin_forward_program(r#type), tripled_sin_backward_program(r#type)],
-        )
+    /// Builds a reference-capable region that forwards the specified inputs unchanged, preserving their order.
+    fn forwarded_inputs_program(
+        input_types: Vec<ArrayIrType>,
+        output_positions: Vec<usize>,
+    ) -> FlatProgram<ArrayIrContext> {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+        let outputs = output_positions.iter().map(|position| inputs[*position]).collect::<Vec<_>>();
+        builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                outputs,
+                vec![Placeholder; input_types.len()],
+                vec![Placeholder; output_positions.len()],
+            )
+            .unwrap()
     }
 
     #[test]
@@ -959,6 +968,13 @@ mod tests {
         assert_eq!(operation.name(), CUSTOM_VJP_OPERATION_NAME);
         assert_eq!(operation.non_differentiated_count(), 0);
         assert_eq!(format!("{operation}"), "custom_vjp");
+        assert_eq!(
+            format!("{operation:?}"),
+            format!(
+                "CustomVjpOperation {{ non_differentiated_count: 0, marker: PhantomData<{}> }}",
+                std::any::type_name::<fn() -> ArrayType>(),
+            ),
+        );
 
         // The primal program is a computation region followed by the dormant forward and backward rule regions.
         assert_eq!(
@@ -981,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_vjp_with_non_differentiated_count() {
+    fn test_custom_vjp_operation_with_non_differentiated_count() {
         let operation = CustomVjpOperation::<ArrayType>::new().with_non_differentiated_count(1);
         assert_eq!(operation.non_differentiated_count(), 1);
         assert_eq!(format!("{operation}"), "custom_vjp [non_differentiated_count=1]");
@@ -1091,6 +1107,25 @@ mod tests {
             )),
         );
 
+        // A forward rule with enough outputs must still match the types of the leading primal outputs.
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&scalar_type),
+                &[
+                    primal_interface.clone(),
+                    RegionInterface::new(
+                        vec![scalar_type.clone()],
+                        vec![vector_type.clone(), scalar_type.clone()],
+                        EffectClasses::NONE
+                    ),
+                    backward_interface.clone(),
+                ],
+            ),
+            Err(TypeError::invalid(
+                "custom_vjp forward output type signature mismatch: expected [f64[]] but got [f64[2]]".to_string()
+            )),
+        );
+
         // The backward interface must be `(residuals..., output_cotangents...) → input_cotangents...`, so a
         // primal-shaped rule signature is rejected.
         assert_eq!(
@@ -1130,6 +1165,15 @@ mod tests {
             Err(TypeError::invalid(
                 "custom_vjp input type signature mismatch: expected [f64[]] but got [f64[2]]".to_string(),
             )),
+        );
+
+        // Standalone output inference must reject an excessive non-differentiated count as well.
+        assert_eq!(
+            operation.with_non_differentiated_count(2).infer_output_types(
+                std::slice::from_ref(&scalar_type),
+                &[primal_interface.clone(), forward_interface.clone(), backward_interface.clone()],
+            ),
+            Err(TypeError::invalid("custom_vjp non-differentiated input count 2 exceeds input count 1".to_string())),
         );
 
         // The call carries exactly three regions and at most as many non-differentiated inputs as it has inputs.
@@ -1202,9 +1246,8 @@ mod tests {
             )),
         );
 
-        // One plumbing input can be forwarded at most once: a second residual of the same reference type cannot be a
-        // forwarded plumbing input (the backward rule's boundary would bind one reference at two positions), so it is
-        // rejected even though its type matches a leading non-differentiated input.
+        // Each leading non-differentiated reference input may supply at most one residual. A second residual of
+        // the same reference type exceeds that input's allowance, even though its type matches.
         let duplicating_forward_interface = RegionInterface::new(
             input_types.clone(),
             vec![scalar_type.clone(), reference_type.clone(), reference_type.clone()],
@@ -1329,24 +1372,16 @@ mod tests {
         // caller reference cannot cross the custom-VJP boundary, instead of failing on undeclared provenance.
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let identity = |input_types: Vec<ArrayIrType>, output_positions: Vec<usize>| {
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-            let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-            let outputs = output_positions.iter().map(|position| inputs[*position]).collect::<Vec<_>>();
-            builder
-                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                    outputs,
-                    vec![Placeholder; input_types.len()],
-                    vec![Placeholder; output_positions.len()],
-                )
-                .unwrap()
-        };
+
         let branch = custom_derivative_call_program(
             CustomVjpOperation::<ArrayIrType>::new().with_non_differentiated_count(1),
             vec![
-                identity(vec![reference_type.clone(), scalar_type.clone()], vec![1]),
-                identity(vec![reference_type.clone(), scalar_type.clone()], vec![1, 0]),
-                identity(vec![reference_type.clone(), reference_type.clone(), scalar_type.clone()], vec![2]),
+                forwarded_inputs_program(vec![reference_type.clone(), scalar_type.clone()], vec![1]),
+                forwarded_inputs_program(vec![reference_type.clone(), scalar_type.clone()], vec![1, 0]),
+                forwarded_inputs_program(
+                    vec![reference_type.clone(), reference_type.clone(), scalar_type.clone()],
+                    vec![2],
+                ),
             ],
             vec![reference_type.clone(), scalar_type.clone()],
         );
@@ -1365,9 +1400,33 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_interpretation() {
-        // Interpretation replays the primal region only, so an un-differentiated call produces just the primal output
-        // and never pays for the residual computation of the forward region.
-        let (operation, regions) = custom_vjp_sin(&ArrayType::scalar(DataType::F64));
+        // Assertions in both derivative rules make accidental execution observable: interpreting the primal must
+        // succeed without running either dormant rule.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let operation = ArrayOperation::CustomVjp(CustomVjpOperation::new());
+        let mut regions = vec![
+            sin_program(&scalar_type),
+            sin_forward_program(&scalar_type),
+            tripled_sin_backward_program(&scalar_type),
+        ];
+        // Keep each rule's valid interface while making execution of its first instruction fail.
+        for region in &mut regions[1..] {
+            let mut builder = ProgramBuilder::new();
+            let inputs =
+                region.input_types().iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+            let predicate = builder.add_constant(Array::scalar(false).unwrap());
+            builder
+                .add_instruction(
+                    AssertOperation::new("dormant derivative rule executed"),
+                    Vec::new(),
+                    vec![predicate],
+                    None,
+                )
+                .unwrap();
+            let outputs = builder.splice_program(region, &inputs).unwrap();
+            let output_count = outputs.len();
+            *region = builder.build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count]).unwrap();
+        }
         assert_eq!(
             ArrayContext::new().bind(operation, regions, &[Array::scalar(2.0).unwrap()]),
             Ok(vec![Array::scalar(2.0f64.sin()).unwrap()]),
@@ -1377,7 +1436,12 @@ mod tests {
     #[test]
     fn test_custom_vjp_partial_evaluation() {
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let (operation, regions) = custom_vjp_sin(&scalar_type);
+        let operation = ArrayOperation::CustomVjp(CustomVjpOperation::new());
+        let regions = vec![
+            sin_program(&scalar_type),
+            sin_forward_program(&scalar_type),
+            tripled_sin_backward_program(&scalar_type),
+        ];
         let program = custom_derivative_call_program(operation, regions, vec![scalar_type.clone()]);
 
         // A call whose inputs are all known folds by interpreting its primal region.
@@ -1393,13 +1457,28 @@ mod tests {
         assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
         assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::CustomVjp(_)));
+        let linearization = evaluation.program.linearize().unwrap();
+        let mut outputs = linearization.primal().interpret(vec![Array::scalar(2.0).unwrap()]).unwrap();
+        assert_eq!(outputs.remove(0), Array::scalar(2.0f64.sin()).unwrap());
+        let mut cotangents = vec![Array::scalar(1.0).unwrap()];
+        cotangents.extend(outputs);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(cotangents),
+            Ok(vec![Array::scalar(3.0 * 2.0f64.cos()).unwrap()]),
+        );
     }
 
     #[test]
     fn test_custom_vjp_batching() {
         let output: Array = batch(
             |x| {
-                let (operation, regions) = custom_vjp_sin(&ArrayType::scalar(DataType::F64));
+                let scalar_type = ArrayType::scalar(DataType::F64);
+                let operation = ArrayOperation::CustomVjp(CustomVjpOperation::new());
+                let regions = vec![
+                    sin_program(&scalar_type),
+                    sin_forward_program(&scalar_type),
+                    tripled_sin_backward_program(&scalar_type),
+                ];
                 Ok(x.context().bind(operation, regions, &[x.clone()])?.remove(0))
             },
             Array::vector(vec![0.5, 1.0, 1.5]).unwrap(),
@@ -1475,6 +1554,20 @@ mod tests {
             batched.interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap(), Array::scalar(5.0).unwrap()]),
             Ok(vec![Array::vector(vec![10.0, 15.0]).unwrap()]),
         );
+
+        // Unequal output cotangents verify the actual reduction, not just the presence of a reduce instruction.
+        let linearization = batched.linearize().unwrap();
+        let mut outputs = linearization
+            .primal()
+            .interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap(), Array::scalar(5.0).unwrap()])
+            .unwrap();
+        assert_eq!(outputs.remove(0), Array::vector(vec![10.0, 15.0]).unwrap());
+        let mut cotangents = vec![Array::vector(vec![7.0, 11.0]).unwrap()];
+        cotangents.extend(outputs);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(cotangents),
+            Ok(vec![Array::vector(vec![35.0, 55.0]).unwrap(), Array::scalar(47.0).unwrap()]),
+        );
     }
 
     #[test]
@@ -1485,7 +1578,13 @@ mod tests {
             .value_and_gradient(|x| {
                 let mapped = batch(
                     |item| {
-                        let (operation, regions) = custom_vjp_sin(&ArrayType::scalar(DataType::F64));
+                        let scalar_type = ArrayType::scalar(DataType::F64);
+                        let operation = ArrayOperation::CustomVjp(CustomVjpOperation::new());
+                        let regions = vec![
+                            sin_program(&scalar_type),
+                            sin_forward_program(&scalar_type),
+                            tripled_sin_backward_program(&scalar_type),
+                        ];
                         Ok(item.context().bind(operation, regions, &[item.clone()])?.remove(0))
                     },
                     x,
@@ -1507,7 +1606,13 @@ mod tests {
         // differentiation.
         let (value, gradient) = differentiate_at(Array::scalar(2.0).unwrap())
             .value_and_gradient(|x| {
-                let (operation, regions) = custom_vjp_sin(&ArrayType::scalar(DataType::F64));
+                let scalar_type = ArrayType::scalar(DataType::F64);
+                let operation = ArrayOperation::CustomVjp(CustomVjpOperation::new());
+                let regions = vec![
+                    sin_program(&scalar_type),
+                    sin_forward_program(&scalar_type),
+                    tripled_sin_backward_program(&scalar_type),
+                ];
                 x.context().bind(operation, regions, &[x.clone()]).unwrap().remove(0)
             })
             .unwrap();
@@ -1522,7 +1627,13 @@ mod tests {
         // vocabulary of the carrier.
         assert!(matches!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| {
-                let (operation, regions) = custom_vjp_sin(&ArrayType::scalar(DataType::F64));
+                let scalar_type = ArrayType::scalar(DataType::F64);
+                let operation = ArrayOperation::CustomVjp(CustomVjpOperation::new());
+                let regions = vec![
+                    sin_program(&scalar_type),
+                    sin_forward_program(&scalar_type),
+                    tripled_sin_backward_program(&scalar_type),
+                ];
                 Ok(x.context().bind(operation, regions, &[x.clone()])?.remove(0))
             }),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
@@ -1575,12 +1686,21 @@ mod tests {
         let vector_type = ArrayType::new_static(DataType::F64, [2]);
         let jacobian = differentiate_at(Array::vector(vec![0.5, 1.0]).unwrap())
             .jacobian_reverse(|x| {
-                let (operation, regions) = custom_vjp_sin(&vector_type);
+                let operation = ArrayOperation::CustomVjp(CustomVjpOperation::new());
+                let regions = vec![
+                    sin_program(&vector_type),
+                    sin_forward_program(&vector_type),
+                    tripled_sin_backward_program(&vector_type),
+                ];
                 Ok(x.context().bind(operation, regions, &[x.clone()])?.remove(0))
             })
             .unwrap();
-        let block = jacobian.iter_blocks().next().unwrap();
-        assert_eq!(block.value().to_f64s(), vec![3.0 * 0.5f64.cos(), 0.0, 0.0, 3.0 * 1.0f64.cos()]);
+        let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].value(),
+            &Array::matrix(2, 2, vec![3.0 * 0.5f64.cos(), 0.0, 0.0, 3.0 * 1.0f64.cos()]).unwrap(),
+        );
     }
 
     #[test]
@@ -1588,7 +1708,12 @@ mod tests {
         // Differentiation replaces the call with a transpose-only linear call before transposition, so only a direct
         // transpose of an un-linearized call reaches the operation, which rejects it.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let (operation, regions) = custom_vjp_sin(&scalar_type);
+        let operation = ArrayOperation::CustomVjp(CustomVjpOperation::new());
+        let regions = vec![
+            sin_program(&scalar_type),
+            sin_forward_program(&scalar_type),
+            tripled_sin_backward_program(&scalar_type),
+        ];
         let program = custom_derivative_call_program(operation, regions, vec![scalar_type]);
         assert!(matches!(
             program.transpose_with_respect_to(&[0], &[]),
@@ -1598,26 +1723,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_vjp_call() {
-        // The wrapper traces the closures at the call site, specialized to the input types. The deliberately wrong
-        // rule `backward(residual, cotangent) = 3 * residual * cotangent` triples the true gradient (expressed through
-        // addition to avoid constant lifting), which proves that the rule is in control.
-        let function = custom_vjp(
-            |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
-            |x| Ok((x.sin()?, x.cos()?)),
-            |residual, cotangent| {
-                let product = residual * cotangent;
-                Ok(product.clone() + product.clone() + product)
-            },
-        );
-        assert_eq!(
-            differentiate_at(Array::scalar(2.0).unwrap()).value_and_gradient(|x| function.call(x).unwrap()),
-            Ok((Array::scalar(2.0f64.sin()).unwrap(), Array::scalar(3.0 * 2.0f64.cos()).unwrap())),
-        );
-    }
-
-    #[test]
-    fn test_custom_vjp_call_with_non_differentiated_count() {
+    fn test_custom_vjp_with_non_differentiated_count() {
         // The stash-gradients pattern: the leading `stash` reference is plumbing, the forward rule forwards it as a
         // residual by identity rather than saving a snapshot, and the backward rule writes the incoming cotangent into
         // it before returning `x̄ = cos(x) · ȳ`. The cotangent value that it returns is input-shaped, so its leading
@@ -1662,12 +1768,13 @@ mod tests {
         assert_eq!(stash.read(), Ok(Array::scalar(2.0f32).unwrap()));
 
         // Every application writes the stash anew.
-        pullback
-            .apply_with_destinations(
+        assert_eq!(
+            pullback.apply_with_destinations(
                 CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())),
                 (CotangentDestination::Ignore, CotangentDestination::Return),
-            )
-            .unwrap();
+            ),
+            Ok((None, Some(ArrayIrValue::Array(Array::scalar(0.5f32.cos() * 3.0).unwrap())))),
+        );
         assert_eq!(stash.read(), Ok(Array::scalar(3.0f32).unwrap()));
 
         // The non-differentiated count cannot exceed the number of input leaves.
@@ -1681,6 +1788,103 @@ mod tests {
             ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
                 "custom_vjp non-differentiated input count 2 exceeds input count 1".to_string(),
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_custom_vjp_call() {
+        // The wrapper traces the closures at the call site, specialized to the input types. The custom
+        // rule `backward(residual, cotangent) = 3 * residual * cotangent` triples the true gradient (expressed through
+        // addition to avoid constant lifting), which proves that the rule is in control.
+        let function = custom_vjp(
+            |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
+            |x| Ok((x.sin()?, x.cos()?)),
+            |residual, cotangent| {
+                let product = residual * cotangent;
+                Ok(product.clone() + product.clone() + product)
+            },
+        );
+        let (_, program) = ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64)).unwrap();
+        assert_eq!(program.interpret(Array::scalar(2.0).unwrap()), Ok(Array::scalar(2.0f64.sin()).unwrap()));
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).value_and_gradient(|x| function.call(x).unwrap()),
+            Ok((Array::scalar(2.0f64.sin()).unwrap(), Array::scalar(3.0 * 2.0f64.cos()).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_custom_vjp_call_tracing_errors() {
+        // An empty collection provides no value from which the call can recover its execution context.
+        let function = custom_vjp(
+            |inputs: Vec<DomainTracer<ArrayContext>>| Ok(inputs),
+            |inputs| Ok((inputs, ())),
+            |(), cotangents| Ok(cotangents),
+        );
+        assert_eq!(
+            ArrayContext::trace(|inputs| function.call(inputs), Vec::<ArrayType>::new()).map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid("custom_vjp requires at least one input".to_string()))),
+        );
+
+        // Each closure's original error must propagate rather than becoming a rule-interface diagnostic.
+        let function = custom_vjp(
+            |_: DomainTracer<ArrayContext>| -> Result<DomainTracer<ArrayContext>, ProgramError> {
+                Err(ProgramError::InvalidArgument { message: "primal tracing failed".to_string() })
+            },
+            |input| Ok((input, ())),
+            |(), cotangent| Ok(cotangent),
+        );
+        assert_eq!(
+            ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64)).map(|_| ()),
+            Err(ProgramError::InvalidArgument { message: "primal tracing failed".to_string() }),
+        );
+        let function = custom_vjp(
+            |input: DomainTracer<ArrayContext>| Ok(input),
+            |_| -> Result<(DomainTracer<ArrayContext>, ()), ProgramError> {
+                Err(ProgramError::InvalidArgument { message: "forward tracing failed".to_string() })
+            },
+            |(), cotangent| Ok(cotangent),
+        );
+        assert_eq!(
+            ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64)).map(|_| ()),
+            Err(ProgramError::InvalidArgument { message: "forward tracing failed".to_string() }),
+        );
+        let function = custom_vjp(
+            |input: DomainTracer<ArrayContext>| Ok(input),
+            |input| Ok((input, ())),
+            |(), _| Err(ProgramError::InvalidArgument { message: "backward tracing failed".to_string() }),
+        );
+        assert_eq!(
+            ArrayContext::trace(|input| function.call(input), ArrayType::scalar(DataType::F64)).map(|_| ()),
+            Err(ProgramError::InvalidArgument { message: "backward tracing failed".to_string() }),
+        );
+    }
+
+    #[test]
+    fn test_custom_vjp_call_rule_signature_mismatch() {
+        // The closure signatures fix the parameter families, but array shapes still require validation after tracing.
+        let function = custom_vjp(
+            |input: DomainTracer<ArrayContext>| Ok(input),
+            |input| Ok((input.reduce(&[0], ReductionKind::Sum)?, ())),
+            |(), cotangent| Ok(cotangent),
+        );
+        assert_eq!(
+            ArrayContext::trace(|input| function.call(input), ArrayType::new_static(DataType::F64, [2])).map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "custom_vjp forward output type signature mismatch: expected [f64[2]] but got [f64[]]".to_string(),
+            ))),
+        );
+
+        // A valid forward interface must not hide a backward rule that produces the wrong input-cotangent shape.
+        let function = custom_vjp(
+            |input: DomainTracer<ArrayContext>| Ok(input),
+            |input| Ok((input, ())),
+            |(), cotangent| Ok(cotangent.reduce(&[0], ReductionKind::Sum)?),
+        );
+        assert_eq!(
+            ArrayContext::trace(|input| function.call(input), ArrayType::new_static(DataType::F64, [2])).map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "custom_vjp backward output type signature mismatch: expected [f64[2]] but got [f64[]]".to_string(),
             ))),
         );
     }
@@ -1757,27 +1961,26 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_call_pullback() {
-        // The reverse entry stages an opaque tangent carrier, and its direct transpose replays the backward program
-        // into the pullback, so seeding the pullback at `[cotangent, residuals...]` recovers `residual * cotangent`.
-        // The forward rule defines the residual as `cos(x)`, so at `x = 0.7` and a unit cotangent the input cotangent
-        // is `cos(0.7)`.
+        // Extracting the stored pullback must preserve the custom backward rule and its residual inputs. The forward
+        // rule saves `cos(x)`, and the backward rule returns `2 * residual * cotangent`, so a unit cotangent at
+        // `x = 0.7` produces `2 * cos(0.7)` rather than the mathematical derivative.
         let function = custom_vjp(
             |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
             |x| Ok((x.sin()?, x.cos()?)),
-            |residual, cotangent| Ok(residual * cotangent),
+            |residual, cotangent| Ok((residual.clone() + residual) * cotangent),
         );
         let (_, pullback) = differentiate_at(Array::scalar(0.7).unwrap()).vjp(|x| function.call(x)).unwrap();
         let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
         let mut pullback_inputs = vec![Array::scalar(1.0).unwrap()];
         pullback_inputs.extend(residuals);
-        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![Array::scalar(0.7f64.cos()).unwrap()]));
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![Array::scalar(2.0 * 0.7f64.cos()).unwrap()]));
     }
 
     #[test]
     fn test_custom_vjp_call_multiple_outputs() {
         // A two-output custom VJP exercises the output/residual split of the forward region: its leading values are the
         // primal outputs and the rest are residuals, and the backward region consumes one cotangent per output. The
-        // deliberately wrong rule scales the contribution of the first output by 2 and that of the second by 3, so
+        // custom rule scales the contribution of the first output by 2 and that of the second by 3, so
         // seeding one output cotangent at a time isolates each term of the custom backward rule.
         let function = custom_vjp(
             |x: DomainTracer<ArrayContext>| Ok((x.sin()?, x.cos()?)),
@@ -1812,7 +2015,7 @@ mod tests {
             |(x, y): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok(x * y),
             |(x, y)| Ok((x.clone() * y.clone(), (x, y))),
             move |(x, y), cotangent| {
-                // The deliberately wrong rule repeats both cotangents `repeats` times.
+                // The custom rule repeats both cotangents `repeats` times.
                 let (base_x, base_y) = (y * cotangent.clone(), x * cotangent);
                 let (mut scaled_x, mut scaled_y) = (base_x.clone(), base_y.clone());
                 for _ in 1..repeats {
@@ -1834,7 +2037,7 @@ mod tests {
     #[test]
     fn test_custom_vjp_call_empty_residuals() {
         // A forward rule that saves nothing (i.e., `Residuals = ()`) exercises the zero-residual carrier path: the
-        // backward rule depends only on the output cotangent, so the deliberately wrong
+        // backward rule depends only on the output cotangent, so the custom rule
         // `backward(cotangent) = 2 * cotangent` makes the gradient the constant `2` instead of `cos(x)`.
         let function = custom_vjp(
             |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
