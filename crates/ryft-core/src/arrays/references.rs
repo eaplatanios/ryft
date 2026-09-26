@@ -481,11 +481,9 @@ pub enum ArrayReferenceTransform {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ArrayReferenceTransform {
-    /// Returns the exact canonical array type produced from `input`. A symbolic index removes its axis exactly like a
-    /// static one, without the static bounds check and reconstruction proof, because the index it selects is only
+    /// Returns the exact canonical [`ArrayType`] produced from `input`. A symbolic index removes its axis exactly like
+    /// a static one, without the static bounds check and reconstruction proof, because the index it selects is only
     /// known to the access that applies the transform.
     pub fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
         let (output, selection) = self.selected_type(input)?;
@@ -513,6 +511,8 @@ impl ArrayReferenceTransform {
         };
         Ok((output, Some(selection)))
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Validates the axis of an [`Index`](Self::Index) transform against `input` and returns the static shape of
     /// `input`.
