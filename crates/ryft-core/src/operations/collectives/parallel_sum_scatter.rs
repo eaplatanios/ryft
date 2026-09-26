@@ -43,15 +43,20 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 
 use super::all_gather::{AllGatherOperation, AllGatherOutputVariance};
-use super::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
-    divided_collective_extent, explicit_collective_inputs, forward_collective_to_parent, forward_explicit_collective,
-    forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
-    infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
-    jvp_shape_changing_collective_with_adjoint, reject_ragged_collective_inputs, require_collective_axis_extent,
-    resolve_named_axis_size, shape_changing_collective, shape_changing_collective_dimensions,
-    shape_changing_collective_output_type, transpose_shape_changing_collective, validate_collective_axis_size,
+use super::linear::{
+    interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,
+    transpose_linear_collective,
+};
+use super::shape_changing::{
+    CollectiveArrayExtentBatchingPolicy, collective_input_extents, divided_collective_extent,
+    explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
+    impl_shape_changing_collective_member_operation, infer_explicit_shape_changing_collective_output_type,
+    jvp_shape_changing_collective_with_adjoint, require_collective_axis_extent,
     validate_explicit_collective_output_extents,
+};
+use super::{
+    CollectiveMode, CollectiveOptions, forward_collective_to_parent, reject_ragged_collective_inputs,
+    resolve_named_axis_size, validate_collective_axis_size,
 };
 
 /// Applies sum-scatter's reduction-state transition. Ordinary operands preserve their variance metadata. An operand
@@ -117,6 +122,7 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
             .collect::<Vec<_>>();
         let mut output_types = infer_explicit_shape_changing_collective_output_type(
             PARALLEL_SUM_SCATTER_OPERATION_NAME,
+            true,
             input_types,
             base_output_type,
             unchanged_input_axes.as_slice(),
@@ -143,6 +149,7 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
         .collect::<Vec<_>>();
     let mut output_types = infer_explicit_shape_changing_collective_output_type(
         PARALLEL_SUM_SCATTER_OPERATION_NAME,
+        true,
         input_types,
         base_output_type,
         unchanged_input_axes.as_slice(),
@@ -180,7 +187,7 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
     Ok(vec![parallel_sum_scatter_output_type(input_type, output_type, operation)?.into()])
 }
 
-shape_changing_collective! {
+linear_collective! {
     /// [`Operation`] that sums every participant's operand across the named axis and scatters the result: each
     /// participant receives its own chunk of the sum along `scatter_axis` — the analogue of
     /// [JAX's `psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html) with
@@ -191,6 +198,7 @@ shape_changing_collective! {
     /// `scatter_axis` onto it, so batch item `i` receives chunk `i` of the sum.
     operation = ParallelSumScatterOperation,
     name = PARALLEL_SUM_SCATTER_OPERATION_NAME = "parallel_sum_scatter",
+    accepts_unreduced = true,
     fields = {
         /// Axis of the operand along which the summed result is scattered across the participants.
         scatter_axis: usize,
@@ -236,7 +244,7 @@ shape_changing_collective! {
                     )));
                 }
                 *dimension /= effective_axis_size;
-                shape_changing_collective_output_type(
+                linear_collective_output_type(
                     PARALLEL_SUM_SCATTER_OPERATION_NAME,
                     input_type,
                     output_dimensions,
@@ -328,7 +336,7 @@ where
     }
 }
 
-shape_changing_collective!(@differentiation ParallelSumScatterOperation);
+linear_collective!(@differentiation ParallelSumScatterOperation);
 
 // Transpose rule for [`ParallelSumScatterOperation`]. A sum-scatter is the adjoint of a varying all-gather with the
 // same mode, axis, and participant groups, so the operand cotangent is an [`AllGatherOperation`] of the output
@@ -350,7 +358,7 @@ where
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
         let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
-            transpose_shape_changing_collective(
+            transpose_linear_collective(
                 context,
                 inputs,
                 outputs,
@@ -672,8 +680,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionType, DimensionVariable, RaggedAxis,
+        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionType, DimensionVariable,
+        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis,
     };
+    use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::operations::collectives::tests::f32_vector;
@@ -774,5 +784,39 @@ mod tests {
             panic!("`parallel_sum_scatter` must preserve the array member kind");
         };
         assert_eq!(output.to_f64s(), vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn test_array_ir_untiled_collective_retains_dynamic_extent_assertion() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let input_variable = DimensionVariable::new("items", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(input_variable)]));
+        let (_, program) = TestContext::trace_with_named_axes(
+            |input| input.parallel_sum_scatter("devices", 0),
+            ArrayIrType::Array(input_type),
+            vec![(
+                "devices".to_string(),
+                NamedAxis::Mesh {
+                    mesh: LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    axis: 0,
+                    size: 2,
+                },
+            )],
+        )
+        .unwrap();
+
+        let [dimension_size, axis_size, comparison, assertion, parallel_sum_scatter] = program.instructions() else {
+            panic!("expected dimension observation, axis-size constant, comparison, assertion, and sum-scatter");
+        };
+        assert!(matches!(dimension_size.operation(), ArrayIrOperation::DimensionSize(_)));
+        assert!(matches!(axis_size.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
+        assert!(matches!(comparison.operation(), ArrayIrOperation::Compare(_)));
+        assert!(matches!(assertion.operation(), ArrayIrOperation::Assert(_)));
+        assert_eq!(comparison.inputs(), &[dimension_size.outputs()[0], axis_size.outputs()[0]]);
+        assert_eq!(assertion.inputs(), &[comparison.outputs()[0], dimension_size.outputs()[0], axis_size.outputs()[0]]);
+        assert!(matches!(parallel_sum_scatter.operation(), ArrayIrOperation::ParallelSumScatter(_)));
+        assert_eq!(parallel_sum_scatter.inputs(), &[program.input_ids()[0]]);
+        assert_eq!(program.output_types(), &[ArrayIrType::Array(ArrayType::scalar(DataType::F32))],);
     }
 }

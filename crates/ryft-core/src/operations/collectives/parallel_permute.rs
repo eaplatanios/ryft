@@ -6,7 +6,10 @@
 
 use std::fmt::Display;
 
-use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, RaggedAxis};
+use crate::arrays::{
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
+    ArrayType, RaggedAxis,
+};
 use crate::axes::NamedAxes;
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -28,13 +31,13 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-use super::{
-    forward_collective_to_parent, interpret_degenerate_collective, resolve_named_axis_size, shape_changing_collective,
-    shape_changing_collective_dimensions, shape_changing_collective_output_type, transpose_shape_changing_collective,
-    validate_collective_axis_size,
+use super::linear::{
+    interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,
+    transpose_linear_collective,
 };
+use super::{forward_collective_to_parent, resolve_named_axis_size, validate_collective_axis_size};
 
-shape_changing_collective! {
+linear_collective! {
     /// [`Operation`] that sends every participant's operand to another participant along the named axis according
     /// to explicit `(source, target)` pairs — the analogue of
     /// [JAX's `ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and
@@ -46,6 +49,7 @@ shape_changing_collective! {
     /// extents together with their zero-filled values.
     operation = ParallelPermuteOperation,
     name = PARALLEL_PERMUTE_OPERATION_NAME = "parallel_permute",
+    accepts_unreduced = false,
     fields = {
         /// Pairs of `(source, target)` positions along the named axis: the value of participant `source` is sent to
         /// participant `target`.
@@ -68,7 +72,7 @@ shape_changing_collective! {
                     )));
             }
         }
-        shape_changing_collective_output_type(PARALLEL_PERMUTE_OPERATION_NAME, input_type, dimensions)
+        linear_collective_output_type(PARALLEL_PERMUTE_OPERATION_NAME, input_type, dimensions)
     },
 }
 
@@ -166,7 +170,7 @@ where
     }
 }
 
-shape_changing_collective!(@differentiation ParallelPermuteOperation);
+linear_collective!(@differentiation ParallelPermuteOperation);
 
 // Transpose rule for [`ParallelPermuteOperation`]: sending along `(source, target)` pulls cotangents back along
 // `(target, source)`, so the operand cotangent is the permutation with every pair inverted.
@@ -189,7 +193,7 @@ where
         let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
             let inverted_pairs =
                 self.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect::<Vec<_>>();
-            transpose_shape_changing_collective(
+            transpose_linear_collective(
                 context,
                 inputs,
                 outputs,
@@ -205,15 +209,49 @@ where
     }
 }
 
-shape_changing_collective! {
-    @capability
-    operation = ParallelPermuteOperation,
-    /// Value-level entry point for staging a [`ParallelPermuteOperation`]. Refer to its documentation for the semantics
-    /// and transform rules.
-    capability = ParallelPermute::parallel_permute,
-    fields = {
+impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: ParallelPermuteOperation) -> Self {
+        Self::Array(ArrayOperation::ParallelPermute(operation))
+    }
+}
+
+/// Value-level entry point for staging a [`ParallelPermuteOperation`]. Refer to its documentation for the semantics
+/// and transform rules.
+pub trait ParallelPermute: Sized {
+    /// Stages this collective over axis `axis_name`, resolving the axis size from the active [`NamedAxes`]
+    /// environment and returning an [`AxisError::UnboundAxisName`](crate::axes::AxisError::UnboundAxisName) error
+    /// when no enclosing binder binds the name.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_name`: Name of the axis to permute over.
+    ///   - `source_target_pairs`: Pairs of `(source, target)` positions along the named axis: the value of
+    ///     participant `source` is sent to participant `target`, and participants that no pair targets receive zeros.
+    fn parallel_permute(&self, axis_name: &str, source_target_pairs: Vec<(usize, usize)>)
+    -> Result<Self, ProgramError>;
+}
+
+impl<V: Value<Type = ArrayType>> ParallelPermute for V
+where
+    V::DispatchDomain: Context + NamedAxes,
+    <V::DispatchDomain as Domain>::Operation: From<ParallelPermuteOperation>,
+{
+    fn parallel_permute(
+        &self,
+        axis_name: &str,
         source_target_pairs: Vec<(usize, usize)>,
-    },
+    ) -> Result<Self, ProgramError> {
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let mut outputs = context.bind(
+            ParallelPermuteOperation::new(axis_name.to_string(), axis_size, source_target_pairs),
+            Vec::new(),
+            std::slice::from_ref(self),
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
 }
 
 /// Convenience permutation encoded as the source participant selected for each output participant.

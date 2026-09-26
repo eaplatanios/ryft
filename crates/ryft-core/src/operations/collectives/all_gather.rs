@@ -44,16 +44,21 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
+use super::linear::{
+    interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,
+    transpose_linear_collective,
+};
 use super::parallel_sum_scatter::ParallelSumScatterOperation;
-use super::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,
-    collective_input_extents, explicit_collective_inputs, forward_collective_to_parent, forward_explicit_collective,
-    forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
-    infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
-    jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent, reject_ragged_collective_inputs,
-    resolve_named_axis_size, shape_changing_collective, shape_changing_collective_dimensions,
-    shape_changing_collective_output_type, transpose_shape_changing_collective, validate_collective_axis_size,
+use super::shape_changing::{
+    CollectiveArrayExtentBatchingPolicy, collective_extent_constant, collective_input_extents,
+    explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
+    impl_shape_changing_collective_member_operation, infer_explicit_shape_changing_collective_output_type,
+    jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent,
     validate_explicit_collective_output_extents,
+};
+use super::{
+    CollectiveMode, CollectiveOptions, forward_collective_to_parent, reject_ragged_collective_inputs,
+    resolve_named_axis_size, validate_collective_axis_size,
 };
 
 /// Named-axis variance carried by an all-gather result.
@@ -184,6 +189,7 @@ pub(crate) fn infer_explicit_all_gather_output_types(
     };
     let mut output_types = infer_explicit_shape_changing_collective_output_type(
         ALL_GATHER_OPERATION_NAME,
+        false,
         input_types,
         base_output_type,
         unchanged_input_axes.as_slice(),
@@ -226,7 +232,7 @@ pub(crate) fn infer_explicit_all_gather_output_types(
     Ok(vec![all_gather_output_type(input_type, output_type, operation)?.into()])
 }
 
-shape_changing_collective! {
+linear_collective! {
     /// [`Operation`] that concatenates every participant's operand along `concat_axis` across the named axis, so
     /// every participant receives the full concatenation — the analogue of
     /// [JAX's `all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html) with `tiled = True`
@@ -243,6 +249,7 @@ shape_changing_collective! {
     /// chunks non-prefix-shaped, which one [`RaggedAxis`] cannot represent faithfully.
     operation = AllGatherOperation,
     name = ALL_GATHER_OPERATION_NAME = "all_gather",
+    accepts_unreduced = false,
     fields = {
         /// Axis of the operand along which the participants' values are concatenated.
         concat_axis: usize,
@@ -270,7 +277,7 @@ shape_changing_collective! {
                 *dimension = dimension.checked_mul(effective_axis_size).ok_or_else(|| {
                     TypeError::invalid("`all_gather` result extent does not fit in usize".to_string())
                 })?;
-                shape_changing_collective_output_type(ALL_GATHER_OPERATION_NAME, input_type, output_dimensions)?
+                linear_collective_output_type(ALL_GATHER_OPERATION_NAME, input_type, output_dimensions)?
             }
         };
         all_gather_output_type(input_type, output_type, operation)
@@ -393,7 +400,7 @@ where
     }
 }
 
-shape_changing_collective!(@differentiation AllGatherOperation);
+linear_collective!(@differentiation AllGatherOperation);
 
 // Transpose rule for [`AllGatherOperation`]. A varying all-gather is the adjoint of a sum-scatter with the same
 // mode, axis, and participant groups, so the operand cotangent is a [`ParallelSumScatterOperation`] of the output
@@ -423,7 +430,7 @@ where
             }
             .into());
         }
-        let contributions = transpose_shape_changing_collective(
+        let contributions = transpose_linear_collective(
             context,
             inputs,
             outputs,
@@ -1082,13 +1089,13 @@ mod tests {
         DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
         MeshAxisType, RaggedAxis, Shape, Sharding,
     };
-    use crate::axes::AxisError;
+    use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::collectives::parallel_sum_scatter::infer_explicit_parallel_sum_scatter_output_types;
     use crate::operations::collectives::tests::f32_vector;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramError};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -1154,6 +1161,61 @@ mod tests {
             BatchAxisSpecification::named("i"),
         );
         assert_eq!(result.unwrap_err(), BatchingError::Axis(AxisError::UnboundAxisName { name: "x".to_string() }));
+    }
+
+    #[test]
+    fn test_array_ir_explicit_collective_tracing_import_and_rendering() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let bounds = DimensionBounds::new(1, Some(5)).unwrap();
+        let input_variable = DimensionVariable::new("items", bounds);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(input_variable.clone())]));
+        let (_, program) = TestContext::trace_with_named_axes(
+            |input| input.all_gather_tiled("devices", 0),
+            ArrayIrType::Array(input_type),
+            vec![(
+                "devices".to_string(),
+                NamedAxis::Mesh {
+                    mesh: LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    axis: 0,
+                    size: 2,
+                },
+            )],
+        )
+        .unwrap();
+
+        let [dimension_size, axis_size, multiplied_extent, all_gather] = program.instructions() else {
+            panic!("expected dimension observation, axis-size constant, multiplication, and all-gather");
+        };
+        assert!(matches!(dimension_size.operation(), ArrayIrOperation::DimensionSize(_)));
+        assert!(matches!(axis_size.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
+        assert!(matches!(multiplied_extent.operation(), ArrayIrOperation::Dimension(DimensionOperation::Mul(_)),));
+        assert!(matches!(all_gather.operation(), ArrayIrOperation::AllGather(_)));
+        assert_eq!(multiplied_extent.inputs(), &[dimension_size.outputs()[0], axis_size.outputs()[0]]);
+        assert_eq!(all_gather.inputs(), &[program.input_ids()[0], multiplied_extent.outputs()[0]]);
+        let rendered = program.to_string();
+        assert!(rendered.contains("dimension_size"));
+        assert!(rendered.contains("dimension_mul"));
+        assert!(rendered.contains("all_gather ["));
+        assert!(rendered.contains("axis_name=\"devices\""));
+        assert!(rendered.contains("options=Tiled"));
+
+        let target_variable = DimensionVariable::new("target", bounds);
+        let target_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target_variable)]));
+        let instantiated = program
+            .with_instantiated_type_identities(&[ArrayIrType::Array(target_type.clone())])
+            .unwrap()
+            .into_owned();
+        let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let imported_input = destination.add_input(target_type.into());
+        let imported_outputs = destination.splice_program(&instantiated, &[imported_input]).unwrap();
+        let [imported_dimension_size, _, imported_multiplied_extent, imported_all_gather] = destination.instructions()
+        else {
+            panic!("expected the imported explicit collective graph");
+        };
+        assert_eq!(imported_dimension_size.inputs(), &[imported_input]);
+        assert_eq!(imported_all_gather.inputs(), &[imported_input, imported_multiplied_extent.outputs()[0]]);
+        assert_eq!(imported_all_gather.outputs(), imported_outputs.as_slice());
     }
 
     #[test]
@@ -1458,6 +1520,95 @@ mod tests {
         let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert!(matches!(pullback.instructions()[0].operation(), ArrayOperation::ParallelSumScatter(_)));
         assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
+    }
+
+    #[test]
+    fn test_array_ir_invariant_all_gather_linearization() {
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let dimension_type = DimensionType::from(variable.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let array = builder.add_input(array_type.into());
+        let result_extent = builder.add_input(dimension_type.clone().into());
+        let output = builder
+            .add_instruction(
+                AllGatherOperation::new(
+                    "x".to_string(),
+                    1,
+                    0,
+                    CollectiveOptions::tiled(),
+                    AllGatherOutputVariance::Invariant,
+                ),
+                Vec::new(),
+                vec![array, result_extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let rendered_tangent = linearization.tangent().to_string();
+        assert!(rendered_tangent.contains("dynamic_slice"));
+        assert!(rendered_tangent.contains("reshape"));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap());
+        let extent = ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 3).unwrap());
+        let mut primal_outputs = linearization.primal().interpret(vec![input, extent]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap());
+        let mut pullback_inputs = vec![cotangent];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]).unwrap())]),
+        );
+
+        // A nondegenerate untiled invariant gather selects the current participant's size-one slice and reshapes
+        // away the ranked participant axis.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let array = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
+        let participant_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let input_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
+        let output = builder
+            .add_instruction(
+                AllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::default(),
+                    AllGatherOutputVariance::Invariant,
+                ),
+                Vec::new(),
+                vec![array, participant_extent, input_extent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        // The mixed boundary delegates its array contribution to the homogeneous all-gather rule, so the invariant
+        // guard that rule owns is what rejects direct transposition here.
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0], &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "direct transposition of invariant `all_gather` cannot represent the participant-indexed \
+                    slice; linearize so that the current participant can select its gathered chunk",
+        ));
+        let pullback = program.linearize().unwrap().pullback().unwrap().to_string();
+        assert!(pullback.contains("axis_index [axis_name=\"x\"]"));
+        assert!(pullback.contains("dimension_from_scalar"));
+        assert!(!pullback.contains("dimension_mul"));
+        assert!(pullback.contains("dynamic_slice"));
     }
 
     #[test]

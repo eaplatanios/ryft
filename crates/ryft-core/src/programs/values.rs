@@ -138,6 +138,15 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
         Ok(())
     }
 
+    /// Returns whether this value is provably zero without executing operations or reading back device data.
+    /// A `true` result permits transforms to replace the value with a structural zero of the same type. A `false`
+    /// result means that zero has not been established, including for opaque values, tracers, and references; it
+    /// does not establish that the value is non-zero. Concrete host values may override the conservative default.
+    #[inline]
+    fn is_zero(&self) -> bool {
+        false
+    }
+
     /// Returns the unique value inhabiting `r#type` when that type admits exactly one value, and [`None`] when it
     /// admits several values or when this value family cannot materialize the unique one. A first-class dimension type
     /// whose bounds are a singleton interval is the canonical example: it denotes exactly one extent, so the
@@ -550,6 +559,7 @@ mod tests {
         let value =
             TestValue { r#type: ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())])) };
         assert_eq!(value.validate_as_constant(), Ok(()));
+        assert!(!value.is_zero());
         assert_eq!(value.rename_type_identities(&TypeIdentityRenaming::new()), Ok(value.clone()));
 
         let mut renaming = TypeIdentityRenaming::new();

@@ -214,7 +214,7 @@ pub(crate) mod tests {
         AddOperation, BroadcastOperation, CompareOperation, ConstantOperation, ConvertElementTypeOperation,
         DivOperation, ExpOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation, ParallelVaryOperation,
         ReduceOperation, ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation, ReshardOperation,
-        SubOperation, TransposeOperation, ZeroLikeOperation, ZeroOperation,
+        SelectOperation, SubOperation, TransposeOperation, ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -233,8 +233,8 @@ pub(crate) mod tests {
     /// constant and arithmetic operations, and tracing's static constructors additionally need the zero and one
     /// operation types. Broadcast and transpose support staged batching alignment. Differentiation's shared alignment
     /// rules also require conversion, reduction, reshape, and reshard. Reduction derivatives require comparison,
-    /// division, subtraction, and exponentiation. These dependencies apply to the operation family even when a
-    /// particular scalar test emits none of those operations. This family has no region-bearing payloads and
+    /// division, subtraction, exponentiation, and selection. These dependencies apply to the operation family even
+    /// when a particular scalar test emits none of those operations. This family has no region-bearing payloads and
     /// therefore needs no value type parameter.
     #[derive(Clone, Debug, Operation)]
     #[ryft(type = ArrayType, constant = Array, dispatch(batching, differentiation, transposition))]
@@ -257,6 +257,7 @@ pub(crate) mod tests {
         Reduce(ReduceOperation),
         Reshard(ReshardOperation),
         Compare(CompareOperation<ArrayType>),
+        Select(SelectOperation<ArrayType>),
     }
 
     // Like `ArrayOperation`, this reference-free family declares no access layout, but reverse-mode differentiation

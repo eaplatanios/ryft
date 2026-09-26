@@ -394,7 +394,8 @@ impl<
         // A fused differentiation context stages primal and tangent work in the same context, so the rule replays
         // there directly. Otherwise, partition the rule into its known part, which depends only on the primal inputs
         // and computes the primal outputs, and its tangent part, and replay each part in its own context.
-        let mut outputs = if std::ptr::eq(context.primal(), context.tangent()) {
+        let shares_context = std::ptr::eq(context.primal(), context.tangent());
+        let mut outputs = if shares_context {
             jvp_region.interpret_in_context(context.primal(), jvp_inputs)?
         } else {
             let mut known = vec![true; inputs.len()];
@@ -421,7 +422,10 @@ impl<
                             .position(|candidate| *candidate == output)
                             .is_some_and(|index| instruction.operation().is_zero(index))
                     })
-                    || context.tangent().resolve(&tangent).into_constant().is_some_and(|value| value.is_zero());
+                    // Only partitioning needs to recover zeros produced by constant folding. Inspecting arbitrary
+                    // eager tangent results would otherwise add a full array scan to each ordinary JVP call.
+                    || (!shares_context
+                        && context.tangent().resolve(&tangent).into_constant().is_some_and(|value| value.is_zero()));
 
                 // Keep a materialized dynamic zero when its reconstruction requires runtime dimension values.
                 if is_zero && C::Operation::zero_residual_types(tangent.r#type().as_ref()).is_empty() {

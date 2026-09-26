@@ -1732,7 +1732,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_extrema_match_jax_semantics() {
+    fn test_eager_extrema() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -1792,7 +1792,7 @@ mod tests {
             Array::from_host_buffer(&client, replicated_type(&mesh, DataType::C64, &[0]), mesh.clone(), &[]).unwrap();
         assert_eq!(
             read_c64s(&empty_complex.reduce(&[0], ReductionKind::Max).unwrap()),
-            vec![num_complex::Complex::new(f32::NEG_INFINITY, 0.0)],
+            vec![num_complex::Complex::new(f32::NEG_INFINITY, f32::NEG_INFINITY)],
         );
 
         let indices = Array::from_host_buffer(

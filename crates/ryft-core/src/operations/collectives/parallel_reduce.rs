@@ -42,8 +42,11 @@ use super::{effective_collective_axis_size, forward_collective_to_parent, resolv
 /// `jax.lax.{psum, pmean, pmax}` family.
 ///
 /// `Sum`/`Mean`/`Max` reduce the named axis away, producing a result that is identical across all batch items or
-/// device shards (replicated). Shape-changing collectives use their dedicated operation payloads below because their
-/// result types also depend on a ranked array axis and on whether the named axis is materialized or tiled.
+/// device shards (replicated). The collectives that resize an array axis use their own operation payloads (i.e.,
+/// [`AllGatherOperation`](super::AllGatherOperation),
+/// [`ParallelSumScatterOperation`](super::ParallelSumScatterOperation), and
+/// [`AllToAllOperation`](super::AllToAllOperation)) because their result types also depend on a ranked array axis and
+/// on whether the named axis is materialized or tiled.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ParallelReductionKind {
     /// Sum reduction across the named axis (`jax.lax.psum`).

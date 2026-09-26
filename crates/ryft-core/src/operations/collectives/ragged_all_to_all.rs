@@ -8,8 +8,8 @@ use std::fmt::Display;
 
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType,
-    Dimension, DimensionVariable, Shape,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayType, DataType, Dimension, DimensionVariable, Shape,
 };
 use crate::axes::NamedAxes;
 use crate::batching::{
@@ -54,9 +54,9 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 
 use super::all_to_all::AllToAllOperation;
+use super::shape_changing::CollectiveArrayExtentBatchingPolicy;
 use super::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveOptions, effective_collective_axis_size,
-    reject_ragged_collective_inputs, resolve_named_axis_size,
+    CollectiveOptions, effective_collective_axis_size, reject_ragged_collective_inputs, resolve_named_axis_size,
 };
 
 /// Operand representation carried by [`RaggedAllToAllOperation`].
@@ -95,6 +95,196 @@ pub(crate) trait RaggedAllToAllEvaluation: Sized {
         output_offsets: &Self,
         receive_sizes: &Self,
     ) -> Result<Self, ProgramError>;
+}
+
+// TODO(eaplatanios): Review this.
+
+impl RaggedAllToAllEvaluation for Array {
+    fn evaluate_ragged_all_to_all(
+        operation: &RaggedAllToAllOperation,
+        operand: &Self,
+        output: &Self,
+        input_offsets: &Self,
+        send_sizes: &Self,
+        output_offsets: &Self,
+        receive_sizes: &Self,
+    ) -> Result<Self, ProgramError> {
+        let batched = operation.is_physical();
+        let input_offsets = input_offsets.non_negative_integer_elements("input_offsets")?;
+        let send_sizes = send_sizes.non_negative_integer_elements("send_sizes")?;
+        let output_offsets = output_offsets.non_negative_integer_elements("output_offsets")?;
+        let receive_sizes = receive_sizes.non_negative_integer_elements("receive_sizes")?;
+        let participant_count = if batched { operation.axis_size() } else { 1 };
+        let metadata_length = input_offsets.len() / participant_count;
+        let input_extent = operand.r#type().shape().dimensions()[usize::from(batched)].value().unwrap();
+        let output_extent = output.r#type().shape().dimensions()[usize::from(batched)].value().unwrap();
+        let groups = if batched {
+            operation
+                .axis_index_groups()
+                .map_or_else(|| vec![(0..participant_count).collect()], |groups| groups.to_vec())
+        } else {
+            vec![vec![0]]
+        };
+        let trailing_start = usize::from(batched) + 1;
+        let row_element_count = operand.r#type().shape().dimensions()[trailing_start..]
+            .iter()
+            .try_fold(1usize, |count, dimension| count.checked_mul(dimension.value().unwrap()))
+            .ok_or_else(|| ProgramError::InvalidArgument {
+                message: format!("`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row size does not fit in `usize`"),
+            })?;
+        let row_byte_count =
+            row_element_count
+                .checked_mul(ArrayAddressing::new(operand.r#type().into_owned())?.element_byte_width())
+                .ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!(
+                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` trailing row byte size does not fit in `usize`",
+                    ),
+                })?;
+
+        // Validate the complete exchange before copying anything. `output_offsets` are sender-owned metadata in the
+        // receiver coordinate frame, while `receive_sizes` are indexed receiver-first and sender-second.
+        let overwrite = operation.update_kind() == RaggedAllToAllUpdateKind::Overwrite;
+        let mut received_regions = overwrite.then(|| vec![Vec::new(); participant_count]);
+        let mut transfers = Vec::new();
+        for group in &groups {
+            let slices_per_peer = metadata_length / group.len();
+            for (sender_position, &sender) in group.iter().enumerate() {
+                for (receiver_position, &receiver) in group.iter().enumerate() {
+                    for slice in 0..slices_per_peer {
+                        let send_index = receiver_position * slices_per_peer + slice;
+                        let receive_index = sender_position * slices_per_peer + slice;
+                        let sender_metadata_index = sender * metadata_length + send_index;
+                        let receiver_metadata_index = receiver * metadata_length + receive_index;
+                        let input_offset = input_offsets[sender_metadata_index];
+                        let send_size = send_sizes[sender_metadata_index];
+                        let output_offset = output_offsets[sender_metadata_index];
+                        let receive_size = receive_sizes[receiver_metadata_index];
+                        let input_end =
+                            input_offset.checked_add(send_size).ok_or_else(|| ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` input region for participant {sender} at \
+                                     metadata index {send_index} overflows `usize`",
+                                ),
+                            })?;
+                        if input_end > input_extent {
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` input region [{input_offset}, {input_end}) \
+                                     for participant {sender} exceeds input extent {input_extent}",
+                                ),
+                            });
+                        }
+                        if send_size != receive_size {
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` send size {send_size} from participant \
+                                     {sender} to participant {receiver} does not match receive size {receive_size}",
+                                ),
+                            });
+                        }
+                        let output_end =
+                            output_offset.checked_add(receive_size).ok_or_else(|| ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` output region for participant {receiver} \
+                                     from participant {sender} overflows `usize`",
+                                ),
+                            })?;
+                        if output_end > output_extent {
+                            return Err(ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` output region [{output_offset}, \
+                                     {output_end}) for participant {receiver} exceeds output extent {output_extent}",
+                                ),
+                            });
+                        }
+                        if receive_size != 0
+                            && let Some(received_regions) = &mut received_regions
+                        {
+                            received_regions[receiver].push((output_offset, output_end));
+                        }
+                        if send_size != 0 && row_byte_count != 0 {
+                            let source_row = sender
+                                .checked_mul(input_extent)
+                                .and_then(|offset| offset.checked_add(input_offset))
+                                .ok_or_else(|| ProgramError::InvalidArgument {
+                                    message: format!(
+                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` source byte offset for participant \
+                                         {sender} does not fit in `usize`",
+                                    ),
+                                })?;
+                            let destination_row = receiver
+                                .checked_mul(output_extent)
+                                .and_then(|offset| offset.checked_add(output_offset))
+                                .ok_or_else(|| ProgramError::InvalidArgument {
+                                    message: format!(
+                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` destination byte offset for \
+                                         participant {receiver} does not fit in `usize`",
+                                    ),
+                                })?;
+                            let source_start = source_row.checked_mul(row_byte_count).ok_or_else(|| {
+                                ProgramError::InvalidArgument {
+                                    message: format!(
+                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` source byte offset for participant \
+                                         {sender} does not fit in `usize`",
+                                    ),
+                                }
+                            })?;
+                            let destination_start = destination_row.checked_mul(row_byte_count).ok_or_else(|| {
+                                ProgramError::InvalidArgument {
+                                    message: format!(
+                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` destination byte offset for \
+                                         participant {receiver} does not fit in `usize`",
+                                    ),
+                                }
+                            })?;
+                            let byte_count =
+                                send_size.checked_mul(row_byte_count).ok_or_else(|| ProgramError::InvalidArgument {
+                                    message: format!(
+                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transfer byte size does not fit in \
+                                         `usize`",
+                                    ),
+                                })?;
+                            transfers.push((source_start, destination_start, byte_count, send_size));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(mut received_regions) = received_regions {
+            for (receiver, regions) in received_regions.iter_mut().enumerate() {
+                regions.sort_unstable();
+                for regions in regions.windows(2) {
+                    if regions[1].0 < regions[0].1 {
+                        return Err(ProgramError::InvalidArgument {
+                            message: format!(
+                                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` received output regions [{}, {}) and [{}, {}) \
+                                 overlap for participant {receiver}",
+                                regions[0].0, regions[0].1, regions[1].0, regions[1].1,
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        let operand_bytes = operand.logical_bytes();
+        let mut result_bytes = output.logical_bytes();
+        for (source_start, destination_start, byte_count, row_count) in transfers {
+            let source = &operand_bytes[source_start..source_start + byte_count];
+            let destination = &mut result_bytes[destination_start..destination_start + byte_count];
+            if overwrite {
+                destination.copy_from_slice(source);
+            } else {
+                let mut dimensions = vec![Dimension::Static(row_count)];
+                dimensions.extend(operand.r#type().shape().dimensions()[trailing_start..].iter().cloned());
+                let segment_type = ArrayType::new(operand.r#type().data_type(), Shape::new(dimensions));
+                let source = Array::from_logical_bytes(segment_type.clone(), source)?;
+                let destination_array = Array::from_logical_bytes(segment_type, destination)?;
+                destination.copy_from_slice(destination_array.add(&source)?.logical_bytes().as_slice());
+            }
+        }
+        Array::from_logical_bytes(output.r#type().into_owned(), result_bytes.as_slice())
+    }
 }
 
 /// Canonical name of the [`RaggedAllToAllOperation`].
@@ -1249,6 +1439,49 @@ mod tests {
         ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))
     }
 
+    // Executes a degenerate single-participant ragged exchange with i64 metadata.
+    fn interpret_single_participant_ragged_all_to_all(
+        input_offsets: Vec<i64>,
+        send_sizes: Vec<i64>,
+        output_offsets: Vec<i64>,
+        receive_sizes: Vec<i64>,
+    ) -> Result<Array, ProgramError> {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let mut outputs = context.bind(
+            RaggedAllToAllOperation::new("x".to_string(), 1),
+            Vec::new(),
+            &[
+                Array::vector(vec![1.0_f32, 2.0, 3.0]).unwrap(),
+                Array::vector(vec![9.0_f32, 9.0, 9.0, 9.0]).unwrap(),
+                Array::vector(input_offsets).unwrap(),
+                Array::vector(send_sizes).unwrap(),
+                Array::vector(output_offsets).unwrap(),
+                Array::vector(receive_sizes).unwrap(),
+            ],
+        )?;
+        Ok(outputs.remove(0))
+    }
+
+    // Applies an explicit list of logical row transfers without deriving routing from the operation metadata.
+    fn reference_ragged_transfers(
+        operand: &[i32],
+        output: &[i32],
+        input_extent: usize,
+        output_extent: usize,
+        row_width: usize,
+        transfers: &[(usize, usize, usize, usize, usize)],
+    ) -> Vec<i32> {
+        let mut result = output.to_vec();
+        for &(sender, input_offset, receiver, output_offset, size) in transfers {
+            for row in 0..size {
+                let source = (sender * input_extent + input_offset + row) * row_width;
+                let destination = (receiver * output_extent + output_offset + row) * row_width;
+                result[destination..destination + row_width].copy_from_slice(&operand[source..source + row_width]);
+            }
+        }
+        result
+    }
+
     #[test]
     fn test_ragged_all_to_all_staging_contracts() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
@@ -2008,6 +2241,199 @@ mod tests {
         assert_eq!(
             RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1]]).unwrap_err().to_string(),
             "`ragged_all_to_all` axis index groups do not contain participant 2",
+        );
+    }
+
+    #[test]
+    fn test_array_ragged_all_to_all_eager_metadata_validation() {
+        assert_eq!(
+            interpret_single_participant_ragged_all_to_all(vec![1], vec![2], vec![0], vec![2]),
+            Ok(Array::vector(vec![2.0_f32, 3.0, 9.0, 9.0]).unwrap()),
+        );
+        assert_eq!(
+            interpret_single_participant_ragged_all_to_all(vec![-1], vec![1], vec![0], vec![1]).unwrap_err(),
+            ProgramError::InvalidArgument { message: "`input_offsets[0]` must be nonnegative but got -1".to_string() },
+        );
+        assert_eq!(
+            interpret_single_participant_ragged_all_to_all(vec![2], vec![2], vec![0], vec![2]).unwrap_err(),
+            ProgramError::InvalidArgument {
+                message: "`ragged_all_to_all` input region [2, 4) for participant 0 exceeds input extent 3".to_string(),
+            },
+        );
+        assert_eq!(
+            interpret_single_participant_ragged_all_to_all(vec![0], vec![2], vec![0], vec![1]).unwrap_err(),
+            ProgramError::InvalidArgument {
+                message: "`ragged_all_to_all` send size 2 from participant 0 to participant 0 does not match receive \
+                          size 1"
+                    .to_string(),
+            },
+        );
+        assert_eq!(
+            interpret_single_participant_ragged_all_to_all(vec![0], vec![2], vec![3], vec![2]).unwrap_err(),
+            ProgramError::InvalidArgument {
+                message: "`ragged_all_to_all` output region [3, 5) for participant 0 exceeds output extent 4"
+                    .to_string(),
+            },
+        );
+        assert_eq!(
+            interpret_single_participant_ragged_all_to_all(vec![0, 1], vec![1, 1], vec![0, 0], vec![1, 1],)
+                .unwrap_err(),
+            ProgramError::InvalidArgument {
+                message: "`ragged_all_to_all` received output regions [0, 1) and [0, 1) overlap for participant 0"
+                    .to_string(),
+            },
+        );
+        assert_eq!(
+            interpret_single_participant_ragged_all_to_all(vec![0, 0], vec![1, 1], vec![0, 1], vec![1, 1]),
+            Ok(Array::vector(vec![1.0_f32, 1.0, 9.0, 9.0]).unwrap()),
+        );
+
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        assert_eq!(
+            context
+                .bind(
+                    RaggedAllToAllOperation::new("x".to_string(), 1),
+                    Vec::new(),
+                    &[
+                        Array::vector(vec![1.0_f32]).unwrap(),
+                        Array::vector(vec![0.0_f32]).unwrap(),
+                        Array::vector(vec![u64::MAX]).unwrap(),
+                        Array::vector(vec![1_u64]).unwrap(),
+                        Array::vector(vec![0_u64]).unwrap(),
+                        Array::vector(vec![1_u64]).unwrap(),
+                    ],
+                )
+                .unwrap_err(),
+            ProgramError::InvalidArgument {
+                message: "`ragged_all_to_all` input region for participant 0 at metadata index 0 overflows `usize`"
+                    .to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_array_ragged_all_to_all_matches_documented_and_grouped_reference_exchanges() {
+        type TestContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type TestTracer = BatchingTracer<TestContext, ArrayIrBatchingPolicy>;
+
+        let operand = vec![1_i32, 2, 2, 3, 4, 0];
+        let output_seed = vec![0_i32; 8];
+        let input_offsets = vec![0_usize, 1, 0, 1];
+        let send_sizes = vec![1_usize, 2, 1, 1];
+        let output_offsets = vec![0_usize, 0, 1, 2];
+        let receive_sizes = vec![1_i32, 1, 2, 1];
+        let output: ArrayIrValue<Array> = batch(
+            |inputs: Vec<TestTracer>| {
+                inputs[0].ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+            },
+            vec![
+                ArrayIrValue::Array(Array::matrix(2, 3, operand.clone()).unwrap()),
+                ArrayIrValue::Array(Array::matrix(2, 4, output_seed.clone()).unwrap()),
+                ArrayIrValue::Array(
+                    Array::matrix(2, 2, input_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::matrix(2, 2, send_sizes.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::matrix(2, 2, output_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(Array::matrix(2, 2, receive_sizes).unwrap()),
+            ],
+            vec![BatchAxis::new(0); 6],
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
+        let expected = reference_ragged_transfers(
+            operand.as_slice(),
+            output_seed.as_slice(),
+            3,
+            4,
+            1,
+            &[(0, 0, 0, 0, 1), (0, 1, 1, 0, 2), (1, 0, 0, 1, 1), (1, 1, 1, 2, 1)],
+        );
+        assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 4, expected).unwrap()));
+
+        // Reversed noncontiguous groups, two slices per peer, and width-two rows exercise every routing index and
+        // prove that the byte kernel preserves trailing dimensions.
+        let groups = vec![vec![3, 1], vec![2, 0]];
+        let operand = (0..4)
+            .flat_map(|participant| {
+                (0..4).flat_map(move |row| [participant * 100 + row * 10, participant * 100 + row * 10 + 1])
+            })
+            .collect::<Vec<i32>>();
+        let output_seed = vec![-1_i32; 4 * 5 * 2];
+        let input_offsets = [0_usize, 1, 2, 3].repeat(4);
+        let send_sizes = vec![1_usize; 16];
+        let output_offsets = vec![2, 3, 2, 3, 2, 3, 2, 3, 0, 1, 0, 1, 0, 1, 0, 1];
+        let receive_sizes = vec![1_i32; 16];
+        let output: ArrayIrValue<Array> = batch(
+            |inputs: Vec<TestTracer>| {
+                inputs[0].ragged_all_to_all_with_axis_index_groups(
+                    "x",
+                    &inputs[1],
+                    &inputs[2],
+                    &inputs[3],
+                    &inputs[4],
+                    &inputs[5],
+                    groups.clone(),
+                )
+            },
+            vec![
+                ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::I32, [4, 4, 2]), operand.as_slice()).unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::from_elements(ArrayType::new_static(DataType::I32, [4, 5, 2]), output_seed.as_slice())
+                        .unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::matrix(4, 4, input_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::matrix(4, 4, send_sizes.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(
+                    Array::matrix(4, 4, output_offsets.iter().map(|value| *value as i32).collect()).unwrap(),
+                ),
+                ArrayIrValue::Array(Array::matrix(4, 4, receive_sizes).unwrap()),
+            ],
+            vec![BatchAxis::new(0); 6],
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
+        let expected = reference_ragged_transfers(
+            operand.as_slice(),
+            output_seed.as_slice(),
+            4,
+            5,
+            2,
+            &[
+                (3, 0, 3, 0, 1),
+                (3, 1, 3, 1, 1),
+                (3, 2, 1, 0, 1),
+                (3, 3, 1, 1, 1),
+                (1, 0, 3, 2, 1),
+                (1, 1, 3, 3, 1),
+                (1, 2, 1, 2, 1),
+                (1, 3, 1, 3, 1),
+                (2, 0, 2, 0, 1),
+                (2, 1, 2, 1, 1),
+                (2, 2, 0, 0, 1),
+                (2, 3, 0, 1, 1),
+                (0, 0, 2, 2, 1),
+                (0, 1, 2, 3, 1),
+                (0, 2, 0, 2, 1),
+                (0, 3, 0, 3, 1),
+            ],
+        );
+        assert_eq!(
+            output,
+            ArrayIrValue::Array(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [4, 5, 2]), expected.as_slice()).unwrap(),
+            ),
         );
     }
 

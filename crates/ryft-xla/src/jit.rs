@@ -2182,6 +2182,89 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_reduce_narrow_floating_point() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        // The larger mean requires both a widened accumulator and a widened divisor.
+        for (kind, count, input, expected) in [
+            (ReductionKind::Sum, 4096, 1f32, 4096f32),
+            (ReductionKind::Mean, 4096, 1f32, 1f32),
+            (ReductionKind::Mean, 70000, 1f32, 1f32),
+            (ReductionKind::LogSumExp, 4096, 0f32, 8.3203125f32),
+        ] {
+            let input_type = ArrayType::new_static(DataType::F32, [count])
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+                .unwrap();
+            let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+                |value| {
+                    value
+                        .convert_element_type(DataType::F16)
+                        .unwrap()
+                        .reduce(&[0], kind)
+                        .unwrap()
+                        .convert_element_type(DataType::F32)
+                        .unwrap()
+                },
+                input_type.clone(),
+                &engine,
+                mesh.clone(),
+            )
+            .unwrap();
+            let input =
+                Array::from_host_buffer(&client, input_type, mesh.clone(), &values_to_bytes(&vec![input; count]))
+                    .unwrap();
+            let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+            assert_eq!(read_f32_array(&client, &output), vec![expected]);
+        }
+    }
+
+    #[test]
+    fn test_compile_reduce_mean_empty() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+        let input_type = ArrayType::new_static(DataType::F32, [0])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            |value| value.reduce(&[0], ReductionKind::Mean).unwrap(),
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(&client, input_type, mesh, &[]).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+        assert!(read_f32_array(&client, &output)[0].is_nan());
+    }
+
+    #[test]
+    fn test_compile_reduce_complex() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+        // Complex storage interleaves the real and imaginary components. Infinite real components force extrema
+        // to compare the imaginary component against the identity rather than deciding on the real component.
+        for (kind, components, expected) in [
+            (ReductionKind::Mean, vec![2f32, 4., 6., 8.], vec![4f32, 6.]),
+            (ReductionKind::Max, vec![f32::NEG_INFINITY, -1., f32::NEG_INFINITY, -1.], vec![f32::NEG_INFINITY, -1.]),
+            (ReductionKind::Min, vec![f32::INFINITY, 1., f32::INFINITY, 1.], vec![f32::INFINITY, 1.]),
+        ] {
+            let input_type = ArrayType::new_static(DataType::C64, [components.len() / 2])
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+                .unwrap();
+            let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+                compile(|value| value.reduce(&[0], kind).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            let input =
+                Array::from_host_buffer(&client, input_type, mesh.clone(), &values_to_bytes(&components)).unwrap();
+            let output = engine.interpret(&compiled.executable_function(), input).unwrap();
+            assert_eq!(read_f32_array(&client, &output), expected);
+        }
+    }
+
+    #[test]
     fn test_jit_cumulative_sum_runs_end_to_end() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2229,6 +2312,51 @@ mod tests {
         let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = total.gradient(&engine).unwrap();
         let output = engine.interpret(&gradient.executable_function(), source()).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![4.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_compile_reduce_log_sum_exp_gradient() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+        let input_type = ArrayType::new_static(DataType::F64, [2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|value| value.log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let gradient = compiled.gradient(&engine).unwrap();
+
+        // Rounding the primal output at a large offset must not erase the derivative's normalization.
+        let input =
+            Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &values_to_bytes(&[1e20f64, 1e20]))
+                .unwrap();
+        let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+        assert_eq!(read_f32_array(&client, &output.convert_element_type(DataType::F32).unwrap()), vec![0.5, 0.5]);
+
+        // The compiled finite-shift guard must retain the undefined weight at an infinite input.
+        let input = Array::from_host_buffer(&client, input_type, mesh, &values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
+        let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+        let values = read_f32_array(&client, &output.convert_element_type(DataType::F32).unwrap());
+        assert!(values[0].is_nan());
+        assert_eq!(values[1], 0.);
+    }
+
+    #[test]
+    fn test_compile_reduce_log_sum_exp_narrow_jvp() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+        let input_type = ArrayType::new_static(DataType::F16, [65536])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|value| value.log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let differentiated = compiled.jvp(&engine).unwrap();
+        // The normalization count exceeds the largest finite `f16`, so derivative intermediates must stay widened.
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh, &values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
+        let (_, tangent) = engine.interpret(&differentiated.executable_function(), (input.clone(), input)).unwrap();
+        assert_eq!(read_f32_array(&client, &tangent.convert_element_type(DataType::F32).unwrap()), vec![1.]);
     }
 
     #[test]

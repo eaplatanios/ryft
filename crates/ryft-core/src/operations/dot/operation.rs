@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::arrays::operations::decode_nonnegative_integer_metadata;
 use crate::arrays::{Array, ArrayAddressing, ArrayElement, NumericArrayElement, StaticShape};
 use crate::macros::dispatch_on_array_element_type;
 use crate::operations::arithmetic::Add;
@@ -501,7 +500,7 @@ impl Array {
                 message: format!("`{RAGGED_DOT_OPERATION_NAME}` requires a static group count for eager evaluation"),
             }
         })?;
-        let sizes = decode_nonnegative_integer_metadata(group_sizes, RAGGED_DOT_OPERATION_NAME, "group_sizes")?;
+        let sizes = group_sizes.non_negative_integer_elements("group_sizes")?;
         let expected_size_count = if group_sizes.r#type().rank() == 1 {
             group_count
         } else {

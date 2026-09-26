@@ -1451,7 +1451,7 @@ fn test_ragged_dot_eager_rejects_negative_group_sizes() {
     assert!(matches!(
         lhs.ragged_dot(&rhs, &Array::vector(vec![1_i32, -1]).unwrap()),
         Err(ProgramError::InvalidArgument { message })
-            if message == "`ragged_dot_general` `group_sizes[1]` must be nonnegative but got -1",
+            if message == "`group_sizes[1]` must be nonnegative but got -1",
     ));
 }
 

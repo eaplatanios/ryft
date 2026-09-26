@@ -41,15 +41,21 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
+use super::linear::{
+    interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,
+    transpose_linear_collective,
+};
+use super::shape_changing::{
+    CollectiveArrayExtentBatchingPolicy, collective_extent_constant, collective_input_extents,
+    divided_collective_extent, explicit_collective_inputs, forward_explicit_collective,
+    forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
+    infer_explicit_shape_changing_collective_output_type, jvp_shape_changing_collective_with_adjoint,
+    multiplied_collective_extent, require_collective_axis_divisible, require_collective_axis_extent,
+    validate_explicit_collective_output_extents,
+};
 use super::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,
-    collective_input_extents, divided_collective_extent, explicit_collective_inputs, forward_collective_to_parent,
-    forward_explicit_collective, forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
-    infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
-    jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent, require_collective_axis_divisible,
-    require_collective_axis_extent, resolve_named_axis_size, shape_changing_collective,
-    shape_changing_collective_dimensions, shape_changing_collective_output_type, transpose_shape_changing_collective,
-    validate_collective_axis_size, validate_explicit_collective_output_extents,
+    CollectiveMode, CollectiveOptions, forward_collective_to_parent, resolve_named_axis_size,
+    validate_collective_axis_size,
 };
 
 /// Infers the composite all-to-all contract.
@@ -87,6 +93,7 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
         unchanged_input_axes.insert(operation.concat_axis, None);
         return infer_explicit_shape_changing_collective_output_type(
             ALL_TO_ALL_OPERATION_NAME,
+            false,
             input_types,
             output_type,
             unchanged_input_axes.as_slice(),
@@ -122,6 +129,7 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
         }
         return infer_explicit_shape_changing_collective_output_type(
             ALL_TO_ALL_OPERATION_NAME,
+            false,
             input_types,
             input_type.clone(),
             &(0..input_type.rank()).map(Some).collect::<Vec<_>>(),
@@ -148,6 +156,7 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
         .collect::<Vec<_>>();
     infer_explicit_shape_changing_collective_output_type(
         ALL_TO_ALL_OPERATION_NAME,
+        false,
         input_types,
         base_output_type,
         unchanged_input_axes.as_slice(),
@@ -190,7 +199,7 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
     )
 }
 
-shape_changing_collective! {
+linear_collective! {
     /// [`Operation`] that exchanges chunks between the participants along the named axis: every participant splits
     /// its operand into `axis_size` chunks along `split_axis` and receives the participants' chunks concatenated
     /// along `concat_axis` — the analogue of
@@ -206,6 +215,7 @@ shape_changing_collective! {
     /// output offsets and per-destination sizes of [`RaggedAllToAllOperation`](super::RaggedAllToAllOperation).
     operation = AllToAllOperation,
     name = ALL_TO_ALL_OPERATION_NAME = "all_to_all",
+    accepts_unreduced = false,
     fields = {
         /// Axis of the operand that is split into one chunk per participant.
         split_axis: usize,
@@ -255,7 +265,7 @@ shape_changing_collective! {
                 .ok_or_else(|| {
                     TypeError::invalid("`all_to_all` concatenation result extent does not fit in usize".to_string())
                 })?;
-            shape_changing_collective_output_type(ALL_TO_ALL_OPERATION_NAME, input_type, output_dimensions)
+            linear_collective_output_type(ALL_TO_ALL_OPERATION_NAME, input_type, output_dimensions)
         }
     },
 }
@@ -356,7 +366,7 @@ where
     }
 }
 
-shape_changing_collective!(@differentiation AllToAllOperation);
+linear_collective!(@differentiation AllToAllOperation);
 
 // Transpose rule for [`AllToAllOperation`]: the chunk exchange is its own adjoint with the split and concatenation
 // axes swapped.
@@ -377,7 +387,7 @@ where
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
         let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
-            transpose_shape_changing_collective(
+            transpose_linear_collective(
                 context,
                 inputs,
                 outputs,
