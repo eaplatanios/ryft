@@ -1319,10 +1319,8 @@ impl TransformSelection {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Indices that a folded [`ArrayReferenceTransformPath`] selects on one axis of its root, used by
-/// [`ReferenceTransform::overlap`] to compare two paths of one root.
+/// Indices that a folded [`ArrayReferenceTransformPath`] selects on one axis of its root,
+/// used by [`ReferenceTransform::overlap`] to compare two paths of one root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RootIndexSelection {
     /// A static unit-stride range `[start, limit)` of the root axis. Before any transform touches the axis this is the
@@ -1336,8 +1334,8 @@ enum RootIndexSelection {
     },
 
     /// One index `offset + clamp(wrap(index), 0, extent - 1)` of the root axis, selected relative to the range that
-    /// earlier transforms narrowed the axis to, where `index` is the runtime value of the binding and `wrap(index)` is
-    /// `index + extent` for a negative `index` and `index` otherwise. Both wrapping and clamping depend on this
+    /// earlier transforms narrowed the axis to, where `index` is the runtime value of the binding and `wrap(index)`
+    /// is `index + extent` for a negative `index` and `index` otherwise. Both wrapping and clamping depend on this
     /// extent, not just the binding.
     Dynamic {
         /// Binding that supplies the dynamic index.
@@ -1353,14 +1351,15 @@ enum RootIndexSelection {
 
 impl RootIndexSelection {
     /// Folds the closed `bound_transforms` of a path over a root of static shape `shape` into one static range or
-    /// dynamic index per root axis, or [`None`] when the path is malformed for that root (an axis, index, binding, or
-    /// stride that the derivation would have rejected).
+    /// dynamic index per root axis, or [`None`] when the path is malformed for that root (i.e., an axis, index,
+    /// binding, or stride that the derivation would have rejected).
     fn fold(
         shape: &StaticShape,
         bound_transforms: &[BoundReferenceTransform<ArrayReferenceTransform>],
     ) -> Option<Vec<Self>> {
         let mut indices =
             shape.dimensions().iter().map(|size| Self::Static { start: 0, limit: *size }).collect::<Vec<_>>();
+
         // Root axes that the folded transforms have not indexed away yet, in view axis order.
         let mut remaining = (0..shape.rank()).collect::<Vec<_>>();
         for bound_transform in bound_transforms {
@@ -1406,10 +1405,12 @@ impl RootIndexSelection {
                 }
             }
         }
+
         Some(indices)
     }
 
-    /// Returns the relation between the indices that this and `other` select on one root axis.
+    /// Returns the [`ReferenceViewOverlap`] between the indices that this [`RootIndexSelection`] and `other`
+    /// select on one root axis.
     fn overlap(&self, other: &Self) -> ReferenceViewOverlap {
         match (self, other) {
             (Self::Static { start: a_start, limit: a_limit }, Self::Static { start: b_start, limit: b_limit }) => {
@@ -1431,6 +1432,8 @@ impl RootIndexSelection {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// One value carrier through which a reference transform path maps between a shared root and one of its views.
 ///
