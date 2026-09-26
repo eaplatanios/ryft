@@ -187,6 +187,7 @@ pub struct ReferenceTransformPath<Transform: ReferenceTransform, Binding = Value
     /// the root.
     bound_transforms: Vec<BoundReferenceTransform<Transform, Binding>>,
 }
+
 impl<Transform: ReferenceTransform, Binding> ReferenceTransformPath<Transform, Binding> {
     /// Returns the empty [`ReferenceTransformPath`] denoting the complete root.
     pub const fn root() -> Self {
@@ -676,6 +677,51 @@ pub(crate) mod tests {
         let path = TestPath::root().with_transform(index(0, 1)).with_transform(index(0, 2));
         assert_eq!(path.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &index(0, 2)]);
         assert_eq!(path.transforms().rev().collect::<Vec<_>>(), vec![&index(0, 2), &index(0, 1)]);
+    }
+
+    #[test]
+    fn test_reference_transform_path_push_bound_transform() {
+        let binding = ValueId::new(RegionId::new(0), AtomId::new(3));
+        let mut path = TestPath::root();
+        path.push_bound_transform(index(0, 1), Vec::new());
+        path.push_bound_transform(dynamic(), vec![binding]);
+        assert_eq!(
+            path.bound_transforms(),
+            &[
+                BoundReferenceTransform { transform: index(0, 1), bindings: Vec::new() },
+                BoundReferenceTransform { transform: dynamic(), bindings: vec![binding] },
+            ],
+        );
+        assert_eq!(path, TestPath::root().with_transform(index(0, 1)).with_bound_transform(dynamic(), vec![binding]));
+    }
+
+    #[test]
+    fn test_reference_transform_path_push_transform() {
+        let mut path = TestPath::root();
+        path.push_transform(index(0, 1));
+        path.push_transform(index(0, 2));
+        assert_eq!(path.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &index(0, 2)]);
+        assert!(path.bound_transforms().iter().all(|bound_transform| bound_transform.bindings().is_empty()));
+        assert_eq!(path, TestPath::root().with_transform(index(0, 1)).with_transform(index(0, 2)));
+    }
+
+    #[test]
+    fn test_reference_transform_path_append() {
+        let binding = ValueId::new(RegionId::new(0), AtomId::new(3));
+        let mut path = TestPath::root().with_transform(index(0, 1));
+        path.append(TestPath::root().with_bound_transform(dynamic(), vec![binding]).with_transform(index(0, 2)));
+        assert_eq!(
+            path,
+            TestPath::root()
+                .with_transform(index(0, 1))
+                .with_bound_transform(dynamic(), vec![binding])
+                .with_transform(index(0, 2)),
+        );
+
+        // Appending the root path leaves a path unchanged.
+        let before = path.clone();
+        path.append(TestPath::root());
+        assert_eq!(path, before);
     }
 
     #[test]
