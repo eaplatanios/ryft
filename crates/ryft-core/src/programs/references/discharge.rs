@@ -4519,16 +4519,15 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArrayReferenceTransformOperation, ArrayType, DataType,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArrayType, DataType,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        Add, AddOperation, ConditionOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSwapOperation, ReferenceWriteOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation,
+        Add, AddOperation, ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
     };
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
@@ -4537,7 +4536,7 @@ mod tests {
     use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceAccessMode, ReferenceEffect};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::{Instruction, InstructionId};
-    use crate::programs::operations::{Operation, OperationFormatter};
+    use crate::programs::operations::{Operation, OperationFormatter, OperationProjection};
     use crate::programs::programs::ProgramRenderingMode;
     use crate::programs::provenance::{Provenance, ProvenanceScope};
     use crate::programs::references::analysis::ReferenceAnalysisError;
@@ -9330,24 +9329,13 @@ mod tests {
             }
         }
 
-        impl ArrayReferenceTransformOperation for CallingOperation {
-            fn from_reference_reshape(operation: ReshapeOperation) -> Self {
-                Self::Native(DischargeOperation::from_reference_reshape(operation))
-            }
+        impl OperationProjection<ArrayType> for CallingOperation {
+            type Projected = ArrayOperation<Array>;
+        }
 
-            fn from_reference_slice(operation: SliceOperation) -> Self {
-                Self::Native(DischargeOperation::from_reference_slice(operation))
-            }
-
-            fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
-                Self::Native(DischargeOperation::from_reference_update_slice(operation))
-            }
-            fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
-                Self::Native(DischargeOperation::from_reference_dynamic_slice(operation))
-            }
-
-            fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
-                Self::Native(DischargeOperation::from_reference_dynamic_update_slice(operation))
+        impl From<ArrayOperation<Array>> for CallingOperation {
+            fn from(operation: ArrayOperation<Array>) -> Self {
+                Self::Native(operation.into())
             }
         }
 

@@ -9,7 +9,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
+use crate::arrays::operations::ArrayIrOperation;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::arrays::types::ir::ArrayIrType;
@@ -23,10 +23,10 @@ use crate::operations::{
 use crate::parameters::Parameter;
 use crate::programs::{
     BatchableReferenceTransform, BoundReferenceTransform, Concretizable, NoReferenceTransformBinding, Operation,
-    ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceAccessDescriptor, ReferenceAccessOperation,
-    ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType, ReferenceError, ReferenceId,
-    ReferenceTransform, ReferenceTransformPath, ReferenceType, ReferenceView, ReferenceViewAnalysis,
-    ReferenceViewOverlap, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueId,
+    OperationProjection, ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceAccessDescriptor,
+    ReferenceAccessOperation, ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType,
+    ReferenceError, ReferenceId, ReferenceTransform, ReferenceTransformPath, ReferenceType, ReferenceView,
+    ReferenceViewAnalysis, ReferenceViewOverlap, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueId,
 };
 
 /// Error produced by an invalid eager array-reference view operation.
@@ -1112,56 +1112,6 @@ impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Operation-family constructors for the canonical array operations that one array-reference transform path traversal
-/// stages.
-///
-/// Mapping between a reference root and the elements that one of its views selects uses static or dynamic slices,
-/// reshapes, and corresponding updates. Both eager handles and the
-/// [`ArrayReferenceDischarge`] policy walk the same [`ArrayReferenceTransformPath`]. This
-/// contract lets the staging consumer construct those operations in a closed operation family, so core array IR and
-/// backend-owned supersets share one traversal without matching operation names.
-///
-/// Per-access transform metadata is exposed through [`ReferenceAccessOperation`]. These constructors stage
-/// array-valued operations over discharged immutable state.
-pub trait ArrayReferenceTransformOperation: Operation<Type = ArrayIrType> {
-    /// Wraps a canonical homogeneous array reshape for reference-transform staging.
-    fn from_reference_reshape(operation: ReshapeOperation) -> Self;
-
-    /// Wraps a canonical homogeneous array slice for reference-transform staging.
-    fn from_reference_slice(operation: SliceOperation) -> Self;
-
-    /// Wraps a canonical homogeneous array update-slice for reference-transform staging.
-    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
-
-    /// Wraps a dynamic slice over discharged reference state.
-    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self;
-
-    /// Wraps a dynamic update over discharged reference state.
-    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self;
-}
-
-impl<A: Value<Type = ArrayType>> ArrayReferenceTransformOperation for ArrayIrOperation<A> {
-    fn from_reference_reshape(operation: ReshapeOperation) -> Self {
-        Self::Array(ArrayOperation::Reshape(operation))
-    }
-
-    fn from_reference_slice(operation: SliceOperation) -> Self {
-        Self::Array(ArrayOperation::Slice(operation))
-    }
-
-    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
-        Self::Array(ArrayOperation::UpdateSlice(operation))
-    }
-
-    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
-        Self::Array(ArrayOperation::DynamicSlice(operation))
-    }
-
-    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
-        Self::Array(ArrayOperation::DynamicUpdateSlice(operation))
-    }
-}
-
 /// [`ReferenceDischargePolicy`] of the array reference universe.
 ///
 /// An array reference's referent is an [`ArrayType`]-typed array. Each access applies an
@@ -1183,7 +1133,14 @@ pub struct ArrayReferenceDischarge;
 
 impl<C: Context<Type = ArrayIrType>> ReferenceDischargePolicy<C> for ArrayReferenceDischarge
 where
-    C::Operation: ArrayReferenceTransformOperation,
+    C::Operation: OperationProjection<
+            ArrayType,
+            Projected: From<ReshapeOperation>
+                           + From<SliceOperation>
+                           + From<UpdateSliceOperation>
+                           + From<DynamicSliceOperation>
+                           + From<DynamicUpdateSliceOperation>,
+        >,
 {
     type Referent = ArrayType;
     type Transform = ArrayReferenceTransform;
@@ -1241,7 +1198,15 @@ where
 // addition through the context, requiring nothing beyond the conversion the operation family already provides.
 impl<C: Context<Type = ArrayIrType>> ReferenceAccumulationPolicy<C> for ArrayReferenceDischarge
 where
-    C::Operation: ArrayReferenceTransformOperation + From<AddOperation<ArrayIrType>>,
+    C::Operation: From<AddOperation<ArrayIrType>>
+        + OperationProjection<
+            ArrayType,
+            Projected: From<ReshapeOperation>
+                           + From<SliceOperation>
+                           + From<UpdateSliceOperation>
+                           + From<DynamicSliceOperation>
+                           + From<DynamicUpdateSliceOperation>,
+        >,
 {
     fn accumulate(
         context: &C,
@@ -1568,6 +1533,11 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> TransformWriteC
 /// the eager value carrier, which keeps staged and eager reference semantics consistent. Symbolic indices arrive closed
 /// over context values and select a size-one dynamic slice; updates restore the removed axis before replacing that
 /// slice.
+///
+/// The carrier lifts each of these array operations into the context's operation family through that family's
+/// [`OperationProjection<ArrayType>`](OperationProjection) member family. Any composite family that embeds the array
+/// operations (e.g., one that derives `#[ryft(members(ArrayType))]`) therefore supports array reference discharge,
+/// and core array IR and backend-owned supersets share one traversal without matching operation names.
 struct ContextTransformCarrier<'c, C>(
     /// Context in which the slice, reshape, and update-slice operations are bound.
     &'c C,
@@ -1586,11 +1556,28 @@ impl<C: Context<Type = ArrayIrType>> ContextTransformCarrier<'_, C> {
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
+
+    /// Binds one single-result array operation of the traversal, lifted into the context's operation family through
+    /// its [`OperationProjection<ArrayType>`](OperationProjection) member family, and returns its result.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Array operation to bind.
+    ///   - `inputs`: Inputs of the application, in operation-defined order.
+    fn bind_array<O>(&self, operation: O, inputs: &[&C::Value]) -> Result<C::Value, ProgramError>
+    where
+        C::Operation: OperationProjection<ArrayType, Projected: From<O>>,
+    {
+        self.bind(<C::Operation as OperationProjection<ArrayType>>::Projected::from(operation).into(), inputs)
+    }
 }
 
 impl<C: Context<Type = ArrayIrType>> TransformReadCarrier for ContextTransformCarrier<'_, C>
 where
-    C::Operation: ArrayReferenceTransformOperation,
+    C::Operation: OperationProjection<
+            ArrayType,
+            Projected: From<ReshapeOperation> + From<SliceOperation> + From<DynamicSliceOperation>,
+        >,
 {
     type Value = C::Value;
     type Binding = C::Value;
@@ -1603,11 +1590,11 @@ where
     }
 
     fn slice(&self, input: &C::Value, starts: Vec<usize>, limits: Vec<usize>) -> Result<C::Value, ProgramError> {
-        self.bind(C::Operation::from_reference_slice(SliceOperation::new(starts, limits)), &[input])
+        self.bind_array(SliceOperation::new(starts, limits), &[input])
     }
 
     fn reshape(&self, input: &C::Value, shape: Shape) -> Result<C::Value, ProgramError> {
-        self.bind(C::Operation::from_reference_reshape(ReshapeOperation::new(shape)), &[input])
+        self.bind_array(ReshapeOperation::new(shape), &[input])
     }
 
     fn index_symbolic(&self, input: &C::Value, axis: usize, binding: &C::Value) -> Result<C::Value, ProgramError> {
@@ -1618,18 +1605,24 @@ where
         // the scalar index there avoids constructing redundant zero values in the context's value family.
         let mut inputs = vec![input];
         inputs.extend(std::iter::repeat_n(binding, sizes.len()));
-        let selected =
-            self.bind(C::Operation::from_reference_dynamic_slice(DynamicSliceOperation::new(sizes)), &inputs)?;
+        let selected = self.bind_array(DynamicSliceOperation::new(sizes), &inputs)?;
         self.reshape(&selected, input_type.without_dimension(axis)?.0.shape().clone())
     }
 }
 
 impl<C: Context<Type = ArrayIrType>> TransformWriteCarrier for ContextTransformCarrier<'_, C>
 where
-    C::Operation: ArrayReferenceTransformOperation,
+    C::Operation: OperationProjection<
+            ArrayType,
+            Projected: From<ReshapeOperation>
+                           + From<SliceOperation>
+                           + From<UpdateSliceOperation>
+                           + From<DynamicSliceOperation>
+                           + From<DynamicUpdateSliceOperation>,
+        >,
 {
     fn update_slice(&self, target: &C::Value, update: &C::Value, starts: Vec<usize>) -> Result<C::Value, ProgramError> {
-        self.bind(C::Operation::from_reference_update_slice(UpdateSliceOperation::new(starts)), &[target, update])
+        self.bind_array(UpdateSliceOperation::new(starts), &[target, update])
     }
 
     fn update_index_symbolic(
@@ -1648,7 +1641,7 @@ where
         // while the selected axis uses the same runtime index and clamping extent as the original index transform.
         let mut inputs = vec![target, &update];
         inputs.extend(std::iter::repeat_n(binding, rank));
-        self.bind(C::Operation::from_reference_dynamic_update_slice(DynamicUpdateSliceOperation::new()), &inputs)
+        self.bind_array(DynamicUpdateSliceOperation::new(), &inputs)
     }
 }
 

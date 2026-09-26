@@ -727,7 +727,7 @@ mod tests {
         );
         assert_eq!(
             operation.to_string(),
-            "reference_add_update [transforms=[index(axis=0, index=1), dynamic_index(axis=0)]]",
+            "reference_add_update [transforms=[index(axis=0, index=1), index(axis=0, index=dynamic)]]",
         );
         let descriptor = operation.reference_access_descriptor(0).unwrap();
         assert_eq!(descriptor.transforms(), operation.transforms());
@@ -1279,7 +1279,7 @@ mod tests {
                     %2:ref<f32[2, 3]> = reference_new %1
                     %3:i32[] = const -1
                     () = reference_add_update %2 %0
-                    %4:f32[] = reference_read [transforms=[index(axis=0, index=1), dynamic_index(axis=0)]] %2 %3
+                    %4:f32[] = reference_read [transforms=[index(axis=0, index=1), index(axis=0, index=dynamic)]] %2 %3
                     %5:f32[2, 3] = reference_freeze %2
                 in (%5, %4)"},
         );

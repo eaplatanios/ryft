@@ -1736,7 +1736,7 @@ pub fn validate_reference_boundary<'v, V: 'v + Value, I: IntoIterator<Item = &'v
 ///     indoc! {"
 ///         lambda %0:f32[3], %1:i32[] .
 ///         let %2:ref<f32[3]> = reference_new %0
-///             %3:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %2 %1
+///             %3:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %2 %1
 ///         in (%3)"},
 /// );
 ///

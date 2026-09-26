@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceTransform,
-    ArrayReferenceTransformPath, ArrayType, DataType, Dimension, DimensionValue,
+    ArrayReferenceTransformPath, ArraySliceAxis, ArrayType, DataType, Dimension, DimensionValue,
 };
 use crate::kernels::calls::{KernelCallOperation, KernelError};
 use crate::kernels::grids::GridExecution;
@@ -356,9 +356,8 @@ where
             return Err(KernelInitializationError::IncompleteOutput { parameter });
         }
     }
-    for (root, operation, transform) in &initialization.unmasked_accesses {
+    for (root, operation, axes) in &initialization.unmasked_accesses {
         if let Some(valid_shape) = valid_shapes.get(root) {
-            let ArrayReferenceTransform::Slice { axes } = transform else { unreachable!() };
             if !axes.iter().any(|axis| axis.size() == 0)
                 && axes.iter().zip(valid_shape).any(|(axis, &valid)| axis.start() + axis.size() > valid)
             {
@@ -372,8 +371,8 @@ where
 
 /// Canonical accesses reserved until a completion token is consumed.
 struct PendingCopy {
-    /// Root, root-relative selection, and declared access mode for each outstanding access.
-    accesses: Vec<(ReferenceRoot, ArrayReferenceTransform, ReferenceAccessMode)>,
+    /// Root, root-coordinate slice axes, and declared access mode for each outstanding access.
+    accesses: Vec<(ReferenceRoot, Vec<ArraySliceAxis>, ReferenceAccessMode)>,
 }
 
 /// Ordered coverage state, keyed by canonical roots after attachment-specific input substitution.
@@ -385,7 +384,7 @@ struct Initialization<'a> {
     /// Static root array types used to interpret canonical selections.
     types: BTreeMap<ReferenceRoot, ArrayType>,
     /// Ordinary reads and read-write accesses checked against actual launch validity after body initialization.
-    unmasked_accesses: Vec<(ReferenceRoot, &'static str, ArrayReferenceTransform)>,
+    unmasked_accesses: Vec<(ReferenceRoot, &'static str, Vec<ArraySliceAxis>)>,
     /// Outstanding asynchronous access reservations keyed by their canonical completion allocation.
     pending_copies: BTreeMap<ReferenceRoot, PendingCopy>,
 }
@@ -403,15 +402,15 @@ impl Initialization<'_> {
                 return Err(KernelInitializationError::CrossRegionCopy { instruction: id });
             }
             if matches!(instruction.operation(), KernelOperation::AsyncCopy(_)) {
-                let (source, source_transform) =
+                let (source, source_axes) =
                     self.selection(id, 0, ValueId::new(region.id(), instruction.inputs()[0]), bindings)?;
-                let (destination, destination_transform) =
+                let (destination, destination_axes) =
                     self.selection(id, 1, ValueId::new(region.id(), instruction.inputs()[1]), bindings)?;
                 if source == destination {
-                    let source_path =
-                        ArrayReferenceTransformPath::<ValueId>::root().with_transform(source_transform.clone());
-                    let destination_path =
-                        ArrayReferenceTransformPath::<ValueId>::root().with_transform(destination_transform.clone());
+                    let source_path = ArrayReferenceTransformPath::<ValueId>::root()
+                        .with_transform(ArrayReferenceTransform::Slice { axes: source_axes.clone() });
+                    let destination_path = ArrayReferenceTransformPath::<ValueId>::root()
+                        .with_transform(ArrayReferenceTransform::Slice { axes: destination_axes.clone() });
                     let r#type = ArrayIrType::Reference(ReferenceType::new(self.types[&source].clone()));
                     if source_path.overlap(&destination_path, &r#type) != ReferenceViewOverlap::Disjoint {
                         return Err(KernelInitializationError::OverlappingCopy { instruction: id });
@@ -423,8 +422,8 @@ impl Initialization<'_> {
                     token,
                     PendingCopy {
                         accesses: vec![
-                            (source, source_transform, ReferenceAccessMode::Read),
-                            (destination, destination_transform, ReferenceAccessMode::Write),
+                            (source, source_axes, ReferenceAccessMode::Read),
+                            (destination, destination_axes, ReferenceAccessMode::Write),
                         ],
                     },
                 );
@@ -538,11 +537,10 @@ impl Initialization<'_> {
 
     /// Publishes deferred writes only after the corresponding completion operation.
     fn complete(&mut self, pending: PendingCopy) -> Result<(), KernelInitializationError> {
-        for (root, transform, mode) in pending.accesses {
+        for (root, axes, mode) in pending.accesses {
             if mode == ReferenceAccessMode::Read {
                 continue;
             }
-            let ArrayReferenceTransform::Slice { axes } = transform else { unreachable!() };
             let addressing = ArrayAddressing::new(self.types[&root].clone())?;
             let state = self.states.get_mut(&root).unwrap();
             for range in addressing.ranges(&axes)? {
@@ -631,7 +629,7 @@ impl Initialization<'_> {
                                 ValueId::new(region.id(), instruction.inputs()[*input]),
                                 bindings,
                             )
-                            .map(|(root, transform)| (root, transform, *mode))
+                            .map(|(root, axes)| (root, axes, *mode))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     self.pending_copies.insert(root, PendingCopy { accesses: reservations });
@@ -715,14 +713,13 @@ impl Initialization<'_> {
             .filter(|access| access.instruction() == id)
         {
             let value = ValueId::new(region.id(), instruction.inputs()[access.input_index()]);
-            let (root, transform) = self.selection(id, access.input_index(), value, bindings)?;
+            let (root, axes) = self.selection(id, access.input_index(), value, bindings)?;
             if self.pending_copies.contains_key(&root) {
                 return Err(KernelInitializationError::InvalidCopyTokenAccess { instruction: id, token: root });
             }
             if mask.is_none() && access.mode() != ReferenceAccessMode::Write {
-                self.unmasked_accesses.push((root, instruction.operation().name(), transform.clone()));
+                self.unmasked_accesses.push((root, instruction.operation().name(), axes.clone()));
             }
-            let ArrayReferenceTransform::Slice { axes } = transform else { unreachable!() };
             let addressing = ArrayAddressing::new(self.types[&root].clone())?;
             let writes_only = access.mode() == ReferenceAccessMode::Write
                 || self.references.swap_lowering(id) == Some(KernelSwapLowering::Store);
@@ -753,26 +750,26 @@ impl Initialization<'_> {
         Ok(())
     }
 
-    /// Resolves a reference input to its canonical allocation and root-relative static transform.
+    /// Resolves a reference input to its canonical allocation and the root-coordinate slice axes that its path selects.
     fn selection(
         &self,
         instruction: InstructionId,
         input_index: usize,
         value: ValueId,
         bindings: &BTreeMap<ReferenceRoot, ReferenceRoot>,
-    ) -> Result<(ReferenceRoot, ArrayReferenceTransform), KernelInitializationError> {
+    ) -> Result<(ReferenceRoot, Vec<ArraySliceAxis>), KernelInitializationError> {
         let original = self.references.analysis().analysis().root_of(value).unwrap();
         let root = bindings.get(&original).copied().unwrap_or(original);
-        let transform = self
+        let axes = self
             .references
             .path(instruction, input_index)
             .unwrap()
-            .root_slice(&self.types[&root])
+            .root_slice_axes(&self.types[&root])
             .ok_or(KernelInitializationError::UnknownSelection { instruction, input_index })?;
         if !self.states.contains_key(&root) {
             return Err(KernelInitializationError::UnavailableReference { value });
         }
-        Ok((root, transform))
+        Ok((root, axes))
     }
 
     /// Rejects accesses to pending destinations and mutations of pending sources, including through masked views.
@@ -784,10 +781,9 @@ impl Initialization<'_> {
         instruction: InstructionId,
     ) -> Result<(), KernelInitializationError> {
         for (&token, copy) in &self.pending_copies {
-            for (reserved_root, transform, reserved_mode) in &copy.accesses {
+            for (reserved_root, axes, reserved_mode) in &copy.accesses {
                 let conflicts = *reserved_mode != ReferenceAccessMode::Read || mode != ReferenceAccessMode::Read;
                 if *reserved_root == root && conflicts {
-                    let ArrayReferenceTransform::Slice { axes } = transform else { unreachable!() };
                     let addressing = ArrayAddressing::new(self.types[&root].clone())?;
                     if addressing.ranges(axes)?.any(|reserved| {
                         let reserved = reserved.elements();

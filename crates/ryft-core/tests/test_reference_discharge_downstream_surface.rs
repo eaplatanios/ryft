@@ -2782,9 +2782,8 @@ mod custom_array_transforms {
 
     use super::*;
     use ryft_core::{
-        ArrayIrOperation, ArrayReferenceDischarge, ArrayReferenceTransform, ArrayReferenceTransformIndex,
-        ArrayReferenceTransformOperation, ArrayReferenceTransformPath, DynamicSliceOperation,
-        DynamicUpdateSliceOperation, ReferenceAccumulationPolicy, SliceOperation, UpdateSliceOperation,
+        ArrayIrOperation, ArrayOperation, ArrayReferenceDischarge, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArrayReferenceTransformPath, OperationProjection, ReferenceAccumulationPolicy,
     };
 
     type ArrayValue = ArrayIrValue<Array>;
@@ -2964,22 +2963,13 @@ mod custom_array_transforms {
             }
         }
     }
-    impl ArrayReferenceTransformOperation for CustomOperation {
-        fn from_reference_reshape(operation: ReshapeOperation) -> Self {
-            Self::Core(CoreOperation::from_reference_reshape(operation))
+    impl From<ArrayOperation<Array>> for CustomOperation {
+        fn from(operation: ArrayOperation<Array>) -> Self {
+            Self::Core(operation.into())
         }
-        fn from_reference_slice(operation: SliceOperation) -> Self {
-            Self::Core(CoreOperation::from_reference_slice(operation))
-        }
-        fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
-            Self::Core(CoreOperation::from_reference_update_slice(operation))
-        }
-        fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
-            Self::Core(CoreOperation::from_reference_dynamic_slice(operation))
-        }
-        fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
-            Self::Core(CoreOperation::from_reference_dynamic_update_slice(operation))
-        }
+    }
+    impl OperationProjection<ArrayType> for CustomOperation {
+        type Projected = ArrayOperation<Array>;
     }
     impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for CustomOperation
     where

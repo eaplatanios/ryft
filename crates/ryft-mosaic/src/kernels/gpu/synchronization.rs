@@ -719,12 +719,10 @@ impl CtaSynchronization {
                                 else {
                                     unreachable!()
                                 };
-                                let Some(ArrayReferenceTransform::Slice { axes }) = ArrayReferenceTransformPath::root()
+                                let axes = ArrayReferenceTransformPath::root()
                                     .with_transform(transform.clone())
-                                    .root_slice(&plan.storage[&value])
-                                else {
-                                    unreachable!()
-                                };
+                                    .root_slice_axes(&plan.storage[&value])
+                                    .unwrap();
                                 if axes[0].start() < block * rows
                                     || axes[0].start() + axes[0].size() > (block + 1) * rows
                                 {
@@ -971,7 +969,7 @@ impl CtaSynchronization {
     ) -> Result<Access, SynchronizationError> {
         let r#type = self.storage.get(&value).ok_or(SynchronizationError::Storage { value })?;
         let path = ArrayReferenceTransformPath::root().with_transform(transform.clone());
-        let Some(ArrayReferenceTransform::Slice { axes }) = path.root_slice(r#type) else {
+        let Some(axes) = path.root_slice_axes(r#type) else {
             return Err(SynchronizationError::Selection { value });
         };
         let addressing = ArrayAddressing::new(r#type.clone())?;

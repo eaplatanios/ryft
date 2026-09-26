@@ -3382,7 +3382,7 @@ mod tests {
                 let %3:ref<f32[4]> = reference_new %0
                     () = reference_write [transforms=[slice(axes=[1:3])]] %3 %1
                     () = reference_add_update [transforms=[slice(axes=[0:2])]] %3 %1
-                    %4:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %3 %2
+                    %4:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %3 %2
                     %5:f32[] = reference_swap [transforms=[index(axis=0, index=3)]] %3 %4
                     %6:f32[4] = reference_freeze %3
                 in (%5, %6)"},

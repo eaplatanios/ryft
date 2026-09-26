@@ -657,7 +657,7 @@ mod tests {
         );
         assert_eq!(
             operation.to_string(),
-            "reference_swap [transforms=[index(axis=0, index=1), dynamic_index(axis=0)]]",
+            "reference_swap [transforms=[index(axis=0, index=1), index(axis=0, index=dynamic)]]",
         );
         let descriptor = operation.reference_access_descriptor(0).unwrap();
         assert_eq!(descriptor.transforms(), operation.transforms());
@@ -1334,10 +1334,10 @@ mod tests {
 
     #[test]
     fn test_reference_swap_reference_discharge_views_out_of_range_indices() {
-        // `y = swap(r[transforms=[dynamic_index(axis=0)]](i), x)` replaces the same element whether the transform runs
-        // on eager reference handles or is discharged into dynamic slices and updates. A negative signed index counts
-        // from the end of the axis once and is then clamped, while an unsigned index keeps its full value until it is
-        // clamped.
+        // `y = swap(r[transforms=[index(axis=0, index=dynamic)]](i), x)` replaces the same element whether the
+        // transform runs on eager reference handles or is discharged into dynamic slices and updates. A negative signed
+        // index counts from the end of the axis once and is then clamped, while an unsigned index keeps its full value
+        // until it is clamped.
         let signed = [(-9i64, 0), (-3, 0), (-1, 2), (0, 0), (2, 2), (7, 2)]
             .map(|(index, position)| (Array::scalar(index).unwrap(), position));
         let unsigned =

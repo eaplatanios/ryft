@@ -5184,7 +5184,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:i32[], %1:ref<f32[2, 3]> .
-                let %2:f32[] = reference_read [transforms=[index(axis=0, index=1), dynamic_index(axis=0)]] %1 %0
+                let %2:f32[] = reference_read [transforms=[index(axis=0, index=1), index(axis=0, index=dynamic)]] %1 %0
                 in (%2)"},
         );
         assert_eq!(live.read(), Ok(Array::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap()));

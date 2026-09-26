@@ -4889,8 +4889,8 @@ mod tests {
                     %4:f32[] = scan [carry_count=1, length=3, reverse=true] %0 %3 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
-                            let () = reference_add_update [transforms=[dynamic_index(axis=0)]] %2 %1 %0
-                                %3:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %2 %0
+                            let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %2 %1 %0
+                                %3:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %2 %0
                                 %4:f32[] = add %1 %3
                             in (%4)
                         },
@@ -6745,9 +6745,9 @@ mod tests {
                     %3:f32[] = scan [carry_count=1, length=3, reverse=true] %0 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
-                            let %3:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %2 %0
+                            let %3:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %2 %0
                                 %4:f32[] = add %1 %3
-                                () = reference_write [transforms=[dynamic_index(axis=0)]] %2 %4 %0
+                                () = reference_write [transforms=[index(axis=0, index=dynamic)]] %2 %4 %0
                             in (%4)
                         },
                     ]
@@ -7095,8 +7095,8 @@ mod tests {
                     %3:f32[] = scan [carry_count=1, length=3, reverse=false] %0 %2 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:ref<f32[3]> .
-                            let () = reference_add_update [transforms=[dynamic_index(axis=0)]] %2 %1 %0
-                                %3:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %2 %0
+                            let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %2 %1 %0
+                                %3:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %2 %0
                                 %4:f32[] = add %1 %3
                             in (%4)
                         },
@@ -7141,10 +7141,10 @@ mod tests {
                     %6:f32[], %7:f32[] = scan [carry_count=2, length=3, reverse=false] %0 %2 %4 %5 [
                         body={
                             lambda %0:i64[], %1:f32[], %2:f32[], %3:ref<f32[3]>, %4:ref<f32[3]> .
-                            let () = reference_add_update [transforms=[dynamic_index(axis=0)]] %3 %1 %0
-                                () = reference_add_update [transforms=[dynamic_index(axis=0)]] %4 %2 %0
-                                %5:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %3 %0
-                                %6:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %4 %0
+                            let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %3 %1 %0
+                                () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %4 %2 %0
+                                %5:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %3 %0
+                                %6:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %4 %0
                                 %7:f32[] = add %1 %5
                                 %8:f32[] = add %2 %6
                             in (%7, %8)
@@ -8407,8 +8407,8 @@ mod tests {
                     %4:dimension<2>, %5:f32[2] = scan [carry_count=2, length=3, reverse=false] %0 %1 %3 [
                         body={
                             lambda %0:i64[], %1:dimension<2>, %2:f32[2], %3:ref<f32[3, 2]> .
-                            let () = reference_add_update [transforms=[dynamic_index(axis=0)]] %3 %2 %0
-                                %4:f32[2] = reference_read [transforms=[dynamic_index(axis=0)]] %3 %0
+                            let () = reference_add_update [transforms=[index(axis=0, index=dynamic)]] %3 %2 %0
+                                %4:f32[2] = reference_read [transforms=[index(axis=0, index=dynamic)]] %3 %0
                                 %5:f32[2] = add %2 %4
                             in (%1, %5)
                         },

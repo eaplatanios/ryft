@@ -980,7 +980,7 @@ mod tests {
             ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
             ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] },
         ]);
-        assert_eq!(operation.to_string(), "masked_load [transforms=[dynamic_index(axis=0), slice(axes=[1:3])]]");
+        assert_eq!(operation.to_string(), "masked_load [transforms=[index(axis=0, index=dynamic), slice(axes=[1:3])]]");
     }
 
     #[test]
@@ -1173,7 +1173,7 @@ mod tests {
             axis: 0,
             index: ArrayReferenceTransformIndex::Dynamic,
         }]);
-        assert_eq!(operation.to_string(), "masked_swap [transforms=[dynamic_index(axis=0)]]");
+        assert_eq!(operation.to_string(), "masked_swap [transforms=[index(axis=0, index=dynamic)]]");
     }
 
     #[test]
@@ -1320,7 +1320,7 @@ mod tests {
         ];
         assert_eq!(
             AsyncCopyOperation::new().with_source_transforms(source.clone()).to_string(),
-            "async_copy [source_transforms=[dynamic_index(axis=0)]]",
+            "async_copy [source_transforms=[index(axis=0, index=dynamic)]]",
         );
         assert_eq!(
             AsyncCopyOperation::new().with_destination_transforms(destination.clone()).to_string(),
@@ -1335,7 +1335,7 @@ mod tests {
                 .to_string(),
             indoc! {"
                 async_copy [
-                    source_transforms=[dynamic_index(axis=0)],
+                    source_transforms=[index(axis=0, index=dynamic)],
                     destination_transforms=[slice(axes=[1:4]), index(axis=0, index=2)],
                 ]"},
         );

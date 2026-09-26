@@ -482,7 +482,7 @@ mod tests {
             operation.to_string(),
             indoc! {"
                 reference_read [
-                    transforms=[index(axis=0, index=1), slice(axes=[0:2, 1:3, 2:5]), dynamic_index(axis=0)],
+                    transforms=[index(axis=0, index=1), slice(axes=[0:2, 1:3, 2:5]), index(axis=0, index=dynamic)],
                 ]"},
         );
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -498,7 +498,7 @@ mod tests {
             indoc! {"
                 lambda %0:ref<f32[4, 5, 6, 7]>, %1:i32[] .
                 let %2:f32[2, 3] = reference_read [
-                    transforms=[index(axis=0, index=1), slice(axes=[0:2, 1:3, 2:5]), dynamic_index(axis=0)],
+                    transforms=[index(axis=0, index=1), slice(axes=[0:2, 1:3, 2:5]), index(axis=0, index=dynamic)],
                 ] %0 %1
                 in (%2)"},
         );
@@ -586,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             operation.to_string(),
-            "reference_read [transforms=[index(axis=0, index=1), dynamic_index(axis=0)]]",
+            "reference_read [transforms=[index(axis=0, index=1), index(axis=0, index=dynamic)]]",
         );
         let descriptor = operation.reference_access_descriptor(0).unwrap();
         assert_eq!(descriptor.transforms(), operation.transforms());
@@ -1004,7 +1004,7 @@ mod tests {
                 let %1:i32[] = const -1
                     %2:f32[2, 3] = zero [type=f32[2, 3]]
                     %3:ref<f32[2, 3]> = reference_new %2
-                    () = reference_add_update [transforms=[index(axis=0, index=1), dynamic_index(axis=0)]] %3 %0 %1
+                    () = reference_add_update [transforms=[index(axis=0, index=1), index(axis=0, index=dynamic)]] %3 %0 %1
                     %4:f32[2, 3] = reference_freeze %3
                 in (%4)"},
         );
@@ -1083,9 +1083,9 @@ mod tests {
 
     #[test]
     fn test_reference_read_reference_discharge_views_out_of_range_indices() {
-        // `y = read(r[transforms=[dynamic_index(axis=0)]](i))` selects the same element whether the transform runs on
-        // eager reference handles or is discharged into dynamic slices. A negative signed index counts from the end of
-        // the axis once and is then clamped, while an unsigned index keeps its full value until it is clamped.
+        // `y = read(r[transforms=[index(axis=0, index=dynamic)]](i))` selects the same element whether the transform
+        // runs on eager reference handles or is discharged into dynamic slices. A negative signed index counts from the
+        // end of the axis once and is then clamped, while an unsigned index keeps its full value until it is clamped.
         let signed = [(-9i64, 1f32), (-3, 1.), (-1, 3.), (0, 1.), (2, 3.), (7, 3.)]
             .map(|(index, expected)| (Array::scalar(index).unwrap(), expected));
         let unsigned =

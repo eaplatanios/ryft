@@ -17,38 +17,37 @@ use ryft_core::operations::sort::SortOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceTransform,
-    ArrayReferenceTransformOperation, ArrayType, AssertOperation, AssertionValue, Atan2Operation, AxisIndexOperation,
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, ClampOperation,
-    CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
-    ConstantOperation, ConstrainShardingOperation, Context, ConvertElementTypeOperation, CosOperation,
-    CotangentDestinationKind, CotangentDestinations, CumulativeLogSumExpOperation, CumulativeMaxOperation,
-    CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation,
-    DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension, DimensionAddOperation,
-    DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
-    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
-    DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
-    DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
-    DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation,
-    GatherOperation, InputRegionProvenance, IotaOperation, LinearCallOperation, Ln1pOperation, LogAddExpOperation,
-    LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation,
-    OneLikeOperation, OneOperation, Operation, OperationFormatter, OperationProvider, OrOperation,
-    OutputRegionProvenance, PadOperation, ParallelReduceOperation, ParallelVaryOperation, Parameter,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAccessDescriptor,
-    ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
-    ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
-    SelectOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation,
-    SubOperation, TagOperation, TanhOperation, Tracer, TracingContext, TransferToMemoryOperation,
-    TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
-    TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
-    ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
+    ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceTransform, ArrayType,
+    AssertOperation, AssertionValue, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation, BatchedOutputs,
+    BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver,
+    CaptureConstant, CaptureReference, CeilOperation, ClampOperation, CompareOperation, CompiledCallOperation,
+    ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, ConstrainShardingOperation, Context,
+    ConvertElementTypeOperation, CosOperation, CotangentDestinationKind, CotangentDestinations,
+    CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation,
+    CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation, DataType, DifferentiableOperation,
+    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
+    DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation,
+    DimensionRemOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
+    DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
+    DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
+    ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation, LinearCallOperation,
+    Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation,
+    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationFormatter,
+    OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation,
+    ParallelVaryOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
+    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation,
+    ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation,
+    ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, SelectOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation, StagingContext,
+    StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer, TracingContext,
+    TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver,
+    Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
+    XorOperation, Zero, ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;
 
@@ -607,31 +606,6 @@ where
             Self::Kernel(operation) => operation.operation().swap_output_index(),
             _ => matches!(self, Self::ReferenceSwap(_)).then_some(0),
         }
-    }
-}
-
-impl<Constant> ArrayReferenceTransformOperation for XlaOperation<Constant>
-where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    fn from_reference_reshape(operation: ReshapeOperation) -> Self {
-        Self::Array(ArrayOperation::Reshape(operation))
-    }
-
-    fn from_reference_slice(operation: SliceOperation) -> Self {
-        Self::Array(ArrayOperation::Slice(operation))
-    }
-
-    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
-        Self::Array(ArrayOperation::UpdateSlice(operation))
-    }
-
-    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
-        Self::Array(ArrayOperation::DynamicSlice(operation))
-    }
-
-    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
-        Self::Array(ArrayOperation::DynamicUpdateSlice(operation))
     }
 }
 

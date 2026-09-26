@@ -26,17 +26,17 @@ pub use arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIndexRange,
     ArrayIndexRanges, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrOperations, ArrayIrType,
     ArrayIrTypeRefinements, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReference, ArrayReferenceAnalysis,
-    ArrayReferenceDischarge, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayReferenceTransformOperation,
-    ArrayReferenceTransformPath, ArrayReferenceViewError, ArraySliceAxis, ArrayTracingContext, ArrayType,
-    ArrayTypeRefinements, Broadcastable, BroadcastingError, Complex, DataType, DataTypeError, Device, DeviceId,
-    DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionOperations, DimensionSource,
-    DimensionTracingContext, DimensionType, DimensionValue, DimensionVariable, ExactShape, ExactShapeDimension, Layout,
-    LayoutError, LinearResiduals, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, ProcessIndex,
-    RaggedArrayExtentBatchingPolicy, RaggedAxis, RaggedMaskIdentity, ReplicatedDimensionBatchingPolicy, Shape,
-    Sharding, ShardingDimension, ShardingError, ShardingVisualization, StaticArrayExtentBatchingPolicy, StaticShape,
-    StridedLayout, Tile, TileDimension, TiledLayout, bf16, decode_elements, decode_logical_bytes, encode_elements,
-    encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
-    f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, materialize_array_tangent, u1, u2, u4,
+    ArrayReferenceDischarge, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayReferenceTransformPath,
+    ArrayReferenceViewError, ArraySliceAxis, ArrayTracingContext, ArrayType, ArrayTypeRefinements, Broadcastable,
+    BroadcastingError, Complex, DataType, DataTypeError, Device, DeviceId, DeviceMesh, Dimension, DimensionBounds,
+    DimensionError, DimensionOperation, DimensionOperations, DimensionSource, DimensionTracingContext, DimensionType,
+    DimensionValue, DimensionVariable, ExactShape, ExactShapeDimension, Layout, LayoutError, LinearResiduals,
+    LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, ProcessIndex, RaggedArrayExtentBatchingPolicy,
+    RaggedAxis, RaggedMaskIdentity, ReplicatedDimensionBatchingPolicy, Shape, Sharding, ShardingDimension,
+    ShardingError, ShardingVisualization, StaticArrayExtentBatchingPolicy, StaticShape, StridedLayout, Tile,
+    TileDimension, TiledLayout, bf16, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes,
+    f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
+    f16, i1, i2, i4, materialize_array_tangent, u1, u2, u4,
 };
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
 pub use batching::{
@@ -210,11 +210,13 @@ pub(crate) mod tests {
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
+    use crate::operations::differentiation::tests::PreparedCubeOperation;
     use crate::operations::{
-        AddOperation, BroadcastOperation, CompareOperation, ConstantOperation, ConvertElementTypeOperation,
-        DivOperation, ExpOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation, ParallelVaryOperation,
-        ReduceOperation, ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation, ReshardOperation,
-        SelectOperation, SubOperation, TransposeOperation, ZeroLikeOperation, ZeroOperation,
+        AddOperation, BroadcastOperation, CompareOperation, ConditionOperation, ConstantOperation,
+        ConvertElementTypeOperation, DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation,
+        OneLikeOperation, OneOperation, ParallelVaryOperation, ReduceOperation, ReferenceReadOperation,
+        ReferenceWriteOperation, ReshapeOperation, ReshardOperation, SelectOperation, SubOperation, TransposeOperation,
+        ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -234,8 +236,9 @@ pub(crate) mod tests {
     /// operation types. Broadcast and transpose support staged batching alignment. Differentiation's shared alignment
     /// rules also require conversion, reduction, reshape, and reshard. Reduction derivatives require comparison,
     /// division, subtraction, exponentiation, and selection. These dependencies apply to the operation family even
-    /// when a particular scalar test emits none of those operations. This family has no region-bearing payloads and
-    /// therefore needs no value type parameter.
+    /// when a particular scalar test emits none of those operations. Custom reverse-preparation tests additionally
+    /// use the cube fixture, conditional regions, and a retained linear call. All regions use the fixed `Array` value
+    /// family, so no value type parameter is needed.
     #[derive(Clone, Debug, Operation)]
     #[ryft(type = ArrayType, constant = Array, dispatch(batching, differentiation, transposition))]
     pub(crate) enum TestArrayOperation {
@@ -250,6 +253,7 @@ pub(crate) mod tests {
         Mul(MulOperation<ArrayType>),
         Div(DivOperation<ArrayType>),
         Exp(ExpOperation<ArrayType>),
+        PreparedCube(PreparedCubeOperation),
         ConvertElementType(ConvertElementTypeOperation<ArrayType>),
         Broadcast(BroadcastOperation),
         Transpose(TransposeOperation),
@@ -258,6 +262,8 @@ pub(crate) mod tests {
         Reshard(ReshardOperation),
         Compare(CompareOperation<ArrayType>),
         Select(SelectOperation<ArrayType>),
+        Condition(ConditionOperation<Array>),
+        LinearCall(LinearCallOperation<ArrayType>),
     }
 
     // Like `ArrayOperation`, this reference-free family declares no access layout, but reverse-mode differentiation

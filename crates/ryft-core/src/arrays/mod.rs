@@ -1,3 +1,5 @@
+// TODO(eaplatanios): Write a module docstring that is consistent with our established conventions.
+
 pub mod addressing;
 #[allow(clippy::module_inception)]
 pub mod arrays;
@@ -37,8 +39,7 @@ pub use operations::{
 };
 pub use references::{
     ArrayReference, ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceTransform,
-    ArrayReferenceTransformIndex, ArrayReferenceTransformOperation, ArrayReferenceTransformPath,
-    ArrayReferenceViewError,
+    ArrayReferenceTransformIndex, ArrayReferenceTransformPath, ArrayReferenceViewError,
 };
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,

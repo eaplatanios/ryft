@@ -2393,13 +2393,13 @@ mod tests {
                     %5:ref<f32[3]>, %6:f32[] = condition %1 %0 %4 [
                         true={
                             lambda %0:ref<f32[3]>, %1:i32[] .
-                            let %2:f32[] = reference_read [transforms=[dynamic_index(axis=0)]] %0 %1
+                            let %2:f32[] = reference_read [transforms=[index(axis=0, index=dynamic)]] %0 %1
                             in (%0, %2)
                         },
                         false={
                             lambda %0:ref<f32[3]>, %1:i32[] .
                             let %2:f32[] = zero [type=f32[]]
-                                %3:f32[] = reference_swap [transforms=[dynamic_index(axis=0)]] %0 %2 %1
+                                %3:f32[] = reference_swap [transforms=[index(axis=0, index=dynamic)]] %0 %2 %1
                             in (%0, %3)
                         },
                     ]

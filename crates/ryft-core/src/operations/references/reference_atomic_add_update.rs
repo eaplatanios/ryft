@@ -669,7 +669,7 @@ mod tests {
         );
         assert_eq!(
             operation.to_string(),
-            "reference_atomic_add_update [transforms=[index(axis=0, index=1), dynamic_index(axis=0)]]",
+            "reference_atomic_add_update [transforms=[index(axis=0, index=1), index(axis=0, index=dynamic)]]",
         );
         let descriptor = operation.reference_access_descriptor(0).unwrap();
         assert_eq!(descriptor.transforms(), operation.transforms());

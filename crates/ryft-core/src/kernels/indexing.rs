@@ -612,7 +612,7 @@ mod tests {
                 tile_load [
                     block_shape=[2],
                     boundary=Masked,
-                    transforms=[dynamic_index(axis=0), slice(axes=[1:4])],
+                    transforms=[index(axis=0, index=dynamic), slice(axes=[1:4])],
                 ]"},
         );
     }
