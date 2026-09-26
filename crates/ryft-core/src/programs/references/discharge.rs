@@ -62,7 +62,8 @@
 //!
 //!    - A reference type family implements [`ReferenceDischargePolicy`], which names its referent type, the alias
 //!      metadata that a reference handle carries, and how to read and replace the part of a complete value that a
-//!      reference denotes. It selects that policy through [`ReferenceDischargeableType`] and may additionally
+//!      reference denotes. [`ReferenceDischargeableType`] names a default policy, while the program discharge APIs
+//!      accept an explicit policy for operation families with custom reference transforms. The policy may additionally
 //!      implement [`ReferenceAccumulationPolicy`] when it supports ordered additive updates.
 //!    - Every operation implements [`ReferenceDischargeableOperation`], the rule that rewrites one application of that
 //!      operation. Reference primitives rewrite their own accesses, region-carrying operations decide how state is
@@ -122,8 +123,9 @@
 //! Reference-typed carries and outputs of structured operations are supported when the operation states their identity,
 //! partial discharge may preserve internal allocations, and a `while` operation whose condition mutates references is
 //! rotated into "do-while form" (i.e., the condition runs once before the loop and again at the tail of the body)
-//! unless the loop declares an iteration bound. Array views with dynamic index operands, gathered views, and
-//! uninitialized references remain unsupported.
+//! unless the loop declares an iteration bound. Static array indices, unit-stride slices, and scalar dynamic indices
+//! are carried directly by accesses and reconstructed during discharge. Gather transforms and uninitialized references
+//! remain unsupported.
 //!
 //! # End-to-End Flow
 //!
@@ -156,6 +158,7 @@ use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::references::analysis::{ReferenceAnalysis, ReferenceRoot};
+use crate::programs::references::transforms::ReferenceTransform;
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{
     EmptyRegionDriver, InputRegionProvenance, RegionDriver, RegionId, RegionRef, RegionReplayMappings,
@@ -929,21 +932,17 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> From<ReferenceDischargeReference
 }
 
 /// Reference value tracked while reference discharge rewrites a [`Program`]. Each [`ReferenceDischargeReference`]
-/// identifies one allocation and denotes either its complete stored value or a view created by
-/// [`ReferenceDischargeContext::alias_reference`]. Its alias describes how the [`ReferenceDischargePolicy`] accesses
-/// the portion selected by this reference, and its reference type describes that selected portion. When partial
-/// discharge preserves the allocation, this value also retains the exact destination reference that it denotes.
+/// identifies one complete allocation. Access paths belong to the access operation, whose rule applies them to this
+/// reference's storage alias through [`ReferenceDischargePolicy::apply_transforms`]. When partial discharge preserves
+/// the allocation, this value retains its exact destination reference.
 ///
-/// Note that only [`ReferenceDischargeContext`] constructs instances of type while also doing any necessary validation.
+/// Only [`ReferenceDischargeContext`] constructs these values and validates their types and allocation identities.
 pub struct ReferenceDischargeReference<C: Domain, P: ReferenceDischargePolicy<C>> {
     /// Refer to the documentation of [`Self::allocation_id`].
     allocation_id: ReferenceDischargeAllocationId,
 
     /// Refer to the documentation of the `r#type` function on [`Typed`].
     r#type: ReferenceType<P::Referent>,
-
-    /// Refer to the documentation of [`Self::is_view`].
-    is_view: bool,
 
     /// Refer to the documentation of [`Self::alias`].
     alias: P::Alias,
@@ -959,33 +958,19 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeReference<C, P
         self.allocation_id
     }
 
-    /// Returns the [`ReferenceType`] exposed by this [`ReferenceDischargeReference`]. Note that a view can expose a
-    /// different type from the type of the allocation's complete stored value.
+    /// Returns the [`ReferenceType`] of the allocation's complete stored value.
     pub const fn r#type(&self) -> &ReferenceType<P::Referent> {
         &self.r#type
     }
 
-    /// Returns whether this [`ReferenceDischargeReference`] is a view created by
-    /// [`ReferenceDischargeContext::alias_reference`]. Consumption and region boundaries reject views because they
-    /// operate on the allocation's complete stored value. This function returns `true` even when the view's reference
-    /// type equals the allocation's reference type.
-    pub const fn is_view(&self) -> bool {
-        self.is_view
-    }
-
-    /// Returns the alias that a [`ReferenceDischargePolicy`] can use to access the portion selected by this
-    /// [`ReferenceDischargeReference`]. The alias always applies directly to the allocation's complete stored value.
-    /// When this reference is created from another view, the alias therefore describes the portion selected by the new
-    /// reference relative to the complete stored value, rather than relative only to the input view. A view step with
-    /// symbols is closed over the destination values of the operands they name when the alias is created, so the policy
-    /// resolves it from the alias alone, without an environment lookup.
+    /// Returns the storage alias for the complete allocation. An access rule combines its path with this alias through
+    /// [`ReferenceDischargePolicy::apply_transforms`] before reading or updating the allocation's state.
     pub const fn alias(&self) -> &P::Alias {
         &self.alias
     }
 
     /// Returns the exact destination reference value that this [`ReferenceDischargeReference`] denotes when its
-    /// allocation is preserved, or [`None`] when the allocation is discharged. For a view of a preserved allocation,
-    /// this is the result of replaying the view operation in the destination [`Program`].
+    /// allocation is preserved, or [`None`] when the allocation is discharged.
     pub const fn preserved(&self) -> Option<&C::Value> {
         match &self.binding {
             ReferenceDischargeBinding::Discharged => None,
@@ -1008,7 +993,6 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Clone for ReferenceDischargeRefe
         Self {
             allocation_id: self.allocation_id,
             r#type: self.r#type.clone(),
-            is_view: self.is_view,
             alias: self.alias.clone(),
             binding: self.binding.clone(),
         }
@@ -1022,7 +1006,6 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Debug for ReferenceDischargeRefe
             .debug_struct("ReferenceDischargeReference")
             .field("allocation_id", &self.allocation_id)
             .field("type", &self.r#type)
-            .field("is_view", &self.is_view)
             .field("alias", &self.alias)
             .field("binding", &self.binding)
             .finish()
@@ -1043,7 +1026,6 @@ impl<C: Domain<Value: PartialEq>, P: ReferenceDischargePolicy<C, Alias: PartialE
     fn eq(&self, other: &Self) -> bool {
         self.allocation_id == other.allocation_id
             && self.r#type == other.r#type
-            && self.is_view == other.is_view
             && self.alias == other.alias
             && self.binding == other.binding
     }
@@ -1087,9 +1069,8 @@ enum ReferenceDischargeBinding<V> {
     /// and write operations against the environment.
     Discharged,
 
-    /// The allocation remains a reference in the destination program. A preserved reference must consume this value
-    /// rather than replaying its view chain per access, because doing so would duplicate and reorder the view
-    /// operations in the destination program.
+    /// The allocation remains a reference in the destination program. Replayed accesses use this value as their root
+    /// and retain their original transform metadata and dynamic binding inputs.
     Preserved {
         /// Exact destination reference value this handle denotes.
         reference: V,
@@ -1258,10 +1239,10 @@ impl ReferenceDischargeRegionBoundary {
     /// position 2: [View(3)]
     /// ```
     ///
-    /// The rebuilt outputs are `[carry, final_state_A, final_state_B, result, final_state_of_view_3]`. Here `View(3)`
-    /// identifies the view supplied at original input position 3. Both insertion positions refer to the original
-    /// output list (i.e., earlier insertions do not shift later positions). A position equal to the original output
-    /// count appends the group, and groups at the same position retain their supplied order.
+    /// The rebuilt outputs are `[carry, final_state_A, final_state_B, result, final_state_of_view_3]`. Here
+    /// `View(3)` identifies the view supplied at original input position 3. Both insertion positions refer to the
+    /// original output list (i.e., earlier insertions do not shift later positions). A position equal to the original
+    /// output count appends the group, and groups at the same position retain their supplied order.
     pub const fn added_outputs(&self) -> &[ReferenceDischargeRegionBoundaryInsertion<ReferenceDischargeRegionOutput>] {
         self.added_outputs.as_slice()
     }
@@ -1280,9 +1261,9 @@ pub struct ReferenceDischargeRegionBoundaryInsertion<T = ReferenceDischargeAlloc
 }
 
 impl<T> ReferenceDischargeRegionBoundaryInsertion<T> {
-    /// Creates a new [`ReferenceDischargeRegionBoundaryInsertion`]. Each entry in `sources` identifies a value to insert,
-    /// in the supplied order, before `position` in the original input or output list. The sources are identifiers, not
-    /// the values themselves.
+    /// Creates a new [`ReferenceDischargeRegionBoundaryInsertion`]. Each entry in `sources` identifies a value to
+    /// insert, in the supplied order, before `position` in the original input or output list. The sources are
+    /// identifiers, not the values themselves.
     #[inline]
     pub fn new(sources: Vec<T>, position: usize) -> Self {
         Self { sources, position }
@@ -1610,7 +1591,7 @@ impl ReferenceDischargeRegionSummary {
             output_allocations: summary
                 .outputs
                 .into_iter()
-                .map(|output| output.and_then(|(root, _)| allocations.get(&root).copied()))
+                .map(|output| output.and_then(|root| allocations.get(&root).copied()))
                 .collect(),
         })
     }
@@ -1730,10 +1711,10 @@ impl ReferenceDischargeBoundaryWidening {
     }
 }
 
-/// [`Type`] capability selecting the canonical [`ReferenceDischargePolicy`] used by reference discharge entry points.
-/// This is a discharge-owned extension of [`Type`] rather than part of the core type contract. It lets generic
-/// [`Program`] functions select the reference policy of each type family without requiring callers to name that
-/// policy or relying on overlapping implementations distinguished only by the program's type family.
+/// [`Type`] capability naming the canonical [`ReferenceDischargePolicy`] of a type family. Generic callers can use
+/// this associated policy when they do not need an operation-family-specific policy. The explicitly parameterized
+/// [`Program`] discharge functions also accept other policies over the same type family, so downstream operation
+/// families can supply their own reference transforms without replacing that type family.
 pub trait ReferenceDischargeableType: Type {
     /// Canonical [`ReferenceDischargePolicy`] of this type family.
     type Policy: Copy + Clone + Debug;
@@ -1754,8 +1735,11 @@ pub trait ReferenceDischargePolicy<C: Domain> {
     /// Referent [`Type`] family of this reference family.
     type Referent: Type;
 
+    /// Reference transforms supported by this policy, including the types of their dynamic inputs.
+    type Transform: ReferenceTransform<Type = C::Type, Referent = Self::Referent>;
+
     /// Metadata describing which part of a complete stored value a [`Reference`](crate::Reference) denotes.
-    /// A reference family with no views can use a unit-like alias whose application is the identity function.
+    /// A reference family with no transforms can use a unit-like alias whose application is the identity function.
     type Alias: Clone + Debug;
 
     /// Returns the storage alias for a complete value with the provided referent [`Type`]. Allocation and
@@ -1763,6 +1747,30 @@ pub trait ReferenceDischargePolicy<C: Domain> {
     /// Validating a referent type is type inference's job, and constructing the identity alias of an already-valid
     /// referent is total.
     fn storage_alias(referent: &Self::Referent) -> Self::Alias;
+
+    /// Applies an access's transforms to the portion of an allocation described by `alias`. The default implementation
+    /// serves reference families without transforms and returns `alias` unchanged for an empty path while rejecting any
+    /// transforms or dynamic inputs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Context containing the values that bind the transforms' dynamic inputs.
+    ///   - `alias`: Existing portion of the allocation, before applying this access's transforms.
+    ///   - `transforms`: Transforms applied in order, starting from `alias`.
+    ///   - `bindings`: Dynamic inputs in transform order, with the count required by each transform.
+    fn apply_transforms(
+        _context: &C,
+        alias: &Self::Alias,
+        transforms: &[Self::Transform],
+        bindings: &[C::Value],
+    ) -> Result<Self::Alias, ProgramError> {
+        if !transforms.is_empty() || !bindings.is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "reference discharge policy does not support reference transforms".to_owned(),
+            });
+        }
+        Ok(alias.clone())
+    }
 
     /// Returns the value that a [`Reference`](crate::Reference) with `alias` reads from `current`. If `alias` describes
     /// a view into the stored value (e.g., a slice of an array), this function returns only that view. Otherwise, it
@@ -2389,19 +2397,6 @@ where
                             ))
                         })?;
 
-                        // The boundary publishes the complete stored value, so a view cannot cross it. Whoever needs
-                        // the view must create it inside the region, just as for a view passed into a region.
-                        if reference.is_view() {
-                            let whole = region_context.allocation_entry(reference.allocation_id())?.r#type.clone();
-                            return Err(ProgramError::MalformedProgram(format!(
-                                "reference discharge cannot publish the view `{}` of {} from region `{}`, \
-                                 whose boundary carries the complete stored value `{}`",
-                                reference.r#type(),
-                                caller,
-                                region.id(),
-                                whole,
-                            )));
-                        }
                         output_allocations.push(Some(caller));
                         output_ids.push(match reference.preserved() {
                             Some(value) => value.atom_id()?,
@@ -2466,9 +2461,8 @@ where
 ///
 /// Access rules see only _discharged_ allocations. When partial discharge preserves an allocation, the dispatch path
 /// replays every region-free, access-only application over it verbatim before rule dispatch, so an access rule never
-/// needs a preserved branch of its own. The exceptions own their preserved handling because their outputs create or
-/// alias references (i.e., an allocation rule consults its replay position against the targets, and a view rule calls
-/// [`ReferenceDischargeContext::alias_reference`], which replays the view over a preserved parent's destination value).
+/// needs a preserved branch of its own. Allocation rules handle preservation themselves by consulting the replay
+/// position against the selected targets and binding either explicit state or the replayed destination reference.
 ///
 /// `C` is bounded by [`Domain`] rather than [`Context`] for the same reason as with
 /// [`InterpretableOperation`](crate::InterpretableOperation): the destination context's own binding contract is
@@ -2492,7 +2486,7 @@ pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy
     ///     [`ReferenceDischargeContext::parent`] the rewritten work is bound.
     ///   - `driver`: Application-scoped [`ReferenceDischargeDriver`] exposing the replay position and any attached
     ///     [`Region`](crate::Region)s.
-    ///   - `inputs`: Carrier [`ReferenceDischargeValue`]s supplied as this application's operands,
+    ///   - `inputs`: Carrier [`ReferenceDischargeValue`]s supplied as this application's inputs,
     ///     in [`Operation`]-defined order.
     ///
     /// # Errors
@@ -2516,17 +2510,17 @@ pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy
 /// with this context, and that implementation emits destination work through [`parent`](Self::parent).
 ///
 /// Each source reference allocation is bound into this context exactly once. [`bind_discharged`](Self::bind_discharged)
-/// records an allocation as explicit immutable state, while [`bind_preserved`](Self::bind_preserved) records the
-/// exact destination reference value when partial discharge leaves the allocation intact. The allocation remains in
-/// that representation for the rest of the transform.
-/// A [`ReferenceDischargeableOperation`] implementation uses [`alias_reference`](Self::alias_reference) to construct
-/// another view of the same allocation, then either rewrites accesses through [`read`](Self::read),
-/// [`write`](Self::write), [`swap`](Self::swap), and [`accumulate`](Self::accumulate), or replays
-/// them against the preserved destination reference.
+/// records an allocation as explicit immutable state, while [`bind_preserved`](Self::bind_preserved) records the exact
+/// destination reference value when partial discharge leaves the allocation intact. The allocation remains in that
+/// representation for the rest of the transform. A [`ReferenceDischargeableOperation`] implementation rewrites
+/// accesses through [`read_through`](Self::read_through), [`write_through`](Self::write_through),
+/// [`swap_through`](Self::swap_through), and [`accumulate_through`](Self::accumulate_through), passing the operation's
+/// transforms and bindings. Preserved accesses instead replay against their destination reference with those same
+/// inputs and paths.
 ///
 /// The allocation environment lives on the context rather than on flowing values because references carry identity:
-/// several reference values can denote different views of the same allocation, and every one of them must observe the
-/// same current state and liveness. Clones therefore share one environment. A structured rule that must rebuild an
+/// several accesses can address different parts of the same allocation, and every one must observe the same current
+/// state and liveness. Clones therefore share one environment. A structured rule that must rebuild an
 /// attached region instead uses [`ReferenceDischargeDriver::rebuild_region`], which creates an isolated environment
 /// and commits nothing here until the rule explicitly merges its outputs.
 pub struct ReferenceDischargeContext<C: Domain, P: ReferenceDischargePolicy<C>> {
@@ -2768,7 +2762,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
             (entry.r#type.clone(), binding)
         };
         let alias = P::storage_alias(r#type.referent());
-        Ok(ReferenceDischargeReference { allocation_id: allocation, r#type, is_view: false, alias, binding })
+        Ok(ReferenceDischargeReference { allocation_id: allocation, r#type, alias, binding })
     }
 
     /// Returns an immutable borrow of one live [`ReferenceDischargeAllocationEntry`]. The returned guard keeps the
@@ -2827,10 +2821,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         ))
     }
 
-    /// Binds an allocation preserved by partial discharge and returns its unviewed reference value. The environment
-    /// retains `reference` so structured boundaries can thread the allocation, while each alias retains the exact
-    /// destination value produced when its view operation is replayed. A preserved allocation never becomes discharged
-    /// later in this transform.
+    /// Binds an allocation preserved by partial discharge and returns its reference value. The environment retains
+    /// `reference` so structured boundaries can thread the allocation and accesses can replay over the same value.
+    /// A preserved allocation never becomes discharged later in this transform.
     ///
     /// # Parameters
     ///
@@ -2885,102 +2878,63 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 .push(Some(ReferenceDischargeAllocationEntry { r#type: r#type.clone(), state }));
             ReferenceDischargeAllocationId { environment: environment.id, index: environment.allocations.len() - 1 }
         };
-        ReferenceDischargeReference { allocation_id: allocation, r#type, is_view: false, alias, binding }
+        ReferenceDischargeReference { allocation_id: allocation, r#type, alias, binding }
     }
 
-    /// Creates another [`ReferenceDischargeReference`] that aliases the same allocation with the provided composed view
-    /// and exposed [`ReferenceType`]. This function creates another handle rather than binding a new allocation. The
-    /// returned reference keeps the input reference's allocation identity, cannot denote the allocation's complete
-    /// value, and carries `alias` as its authoritative complete view chain rather than merely its newest view step.
-    /// Any view symbols in `alias` must already be bound to their corresponding values in the destination context.
-    ///
-    /// For a discharged allocation, later accesses apply that chain to the allocation's immutable state and
-    /// `replay_preserved_view_fn` is never called. For a preserved allocation, `replay_preserved_view_fn` must replay
-    /// the source view operation against the parent reference's exact destination value and return that operation's
-    /// single reference result. The returned destination value is retained on the alias so later accesses use it
-    /// directly instead of replaying the view again. The function should perform only that replay because whether it
-    /// is called depends on whether partial discharge preserved the allocation.
-    ///
-    /// # Parameters
-    ///
-    ///   - `reference`: Reference value being aliased.
-    ///   - `alias`: Complete composed view chain, including destination-context values for all view symbols.
-    ///   - `r#type`: Reference type the alias exposes.
-    ///   - `replay_preserved_view_fn`: Function that replays the source view operation against the parent destination
-    ///     reference and returns its single reference result. It is called exactly once for a preserved allocation and
-    ///     is never called for a discharged allocation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when the allocation is no longer live or when the replayed
-    /// destination value does not carry the reference type `r#type`, and propagates every `replay_preserved_view_fn`
-    /// failure.
-    pub fn alias_reference<F: FnOnce(&C::Value) -> Result<C::Value, ProgramError>>(
-        &self,
-        reference: &ReferenceDischargeReference<C, P>,
-        alias: P::Alias,
-        r#type: ReferenceType<P::Referent>,
-        replay_preserved_view_fn: F,
-    ) -> Result<ReferenceDischargeReference<C, P>, ProgramError>
-    where
-        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
-    {
-        let allocation = reference.allocation_id();
-
-        // Handles can outlive the allocation they denote, so resolve the ID against the active environment before
-        // creating another alias. This reports foreign, never-bound, and consumed allocations at the attempted use.
-        self.allocation_entry(allocation)?;
-
-        let binding = match &reference.binding {
-            ReferenceDischargeBinding::Discharged => ReferenceDischargeBinding::Discharged,
-            ReferenceDischargeBinding::Preserved { reference: parent } => {
-                let replayed = replay_preserved_view_fn(parent)?;
-                let replayed_type = replayed.r#type();
-                let actual = <&ReferenceType<P::Referent>>::try_from(replayed_type.as_ref()).map_err(|_| {
-                    ProgramError::MalformedProgram(format!(
-                        "reference discharge preserved an allocation as `{replayed_type}` \
-                         which is not a reference type",
-                    ))
-                })?;
-                if actual != &r#type {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "reference discharge preserved an allocation as `{actual}` but its handle exposes `{type}`",
-                    )));
-                }
-                ReferenceDischargeBinding::Preserved { reference: replayed }
-            }
-        };
-
-        Ok(ReferenceDischargeReference { allocation_id: allocation, r#type, is_view: true, alias, binding })
-    }
-
-    /// Reads the portion that `reference` selects from its discharged allocation's current state. Reference operation
-    /// rules call this function only for discharged references. An access to a preserved reference must instead replay
-    /// the source operation against [`ReferenceDischargeReference::preserved`].
+    /// Reads the complete current value of a discharged reference. Reference operation rules call this function only
+    /// for discharged references. An access to a preserved reference must instead replay the source operation against
+    /// [`ReferenceDischargeReference::preserved`].
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live, and propagates the policy's error
     /// when the alias cannot be applied. Reading a preserved reference through this function is rejected, because a
     /// preserved access must replay verbatim in the destination instead.
+    #[inline]
     pub fn read(&self, reference: &ReferenceDischargeReference<C, P>) -> Result<C::Value, ProgramError> {
-        let current = self.discharged_state(reference.allocation_id())?;
-        P::read(&self.parent, &current, reference.alias())
+        self.read_through(reference, &[], &[])
     }
 
-    /// Replaces the portion that `reference` selects in a discharged allocation. The policy returns a complete
-    /// successor state, which this function installs through [`set_discharged_state`](Self::set_discharged_state)
-    /// and records as a mutation.
+    /// Reads the part of a discharged reference addressed by `transforms`. The transforms are applied after the part
+    /// that the reference itself denotes (i.e., its alias) through [`ReferenceDischargePolicy::apply_transforms`],
+    /// so an access that carries a transform path reads only the elements it selects. [`read`](Self::read) is this
+    /// function with an empty path. Like `read`, this function is only for discharged references. An access to a
+    /// preserved reference must instead replay the source operation against [`ReferenceDischargeReference::preserved`].
     ///
     /// # Parameters
     ///
-    ///   - `reference`: Handle selecting the portion to replace.
-    ///   - `replacement`: Value written into the selected portion.
+    ///   - `reference`: Live discharged reference that is read.
+    ///   - `transforms`: Transforms applied in order after the reference's alias.
+    ///   - `bindings`: Dynamic inputs of `transforms`, in transform order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved, and propagates the
+    /// policy's error when the transforms or the resulting alias cannot be applied.
+    pub fn read_through(
+        &self,
+        reference: &ReferenceDischargeReference<C, P>,
+        transforms: &[P::Transform],
+        bindings: &[C::Value],
+    ) -> Result<C::Value, ProgramError> {
+        let current = self.discharged_state(reference.allocation_id())?;
+        let alias = P::apply_transforms(&self.parent, reference.alias(), transforms, bindings)?;
+        P::read(&self.parent, &current, &alias)
+    }
+
+    /// Replaces the complete value of a discharged reference. The policy returns a complete successor state, which
+    /// this function installs through [`set_discharged_state`](Self::set_discharged_state) and records as a mutation.
+    ///
+    /// # Parameters
+    ///
+    ///   - `reference`: Live discharged reference whose value is replaced.
+    ///   - `replacement`: New complete value of the reference.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved, and propagates the
     /// policy's error when the write cannot be applied.
+    #[inline]
     pub fn write(
         &self,
         reference: &ReferenceDischargeReference<C, P>,
@@ -2989,25 +2943,57 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     where
         C::Type: From<P::Referent>,
     {
-        let allocation = reference.allocation_id();
-        let current = self.discharged_state(allocation)?;
-        let successor = P::write(&self.parent, &current, replacement, reference.alias())?;
-        self.set_discharged_state(allocation, successor, true)
+        self.write_through(reference, replacement, &[], &[])
     }
 
-    /// Replaces the portion that `reference` selects and returns its previous contents. Like [`write`](Self::write),
-    /// this function installs the policy's complete successor state and records a mutation. Unlike `write`, it also
-    /// returns the value selected before replacement.
+    /// Replaces the part of a discharged reference addressed by `transforms`. The transforms are applied after the
+    /// reference's alias as in [`read_through`](Self::read_through), and the policy returns a complete successor state
+    /// in which only that part is replaced. This function installs that state through
+    /// [`set_discharged_state`](Self::set_discharged_state) and records it as a mutation.
+    /// [`write`](Self::write) is this function with an empty path.
     ///
     /// # Parameters
     ///
-    ///   - `reference`: Handle selecting the portion to replace.
-    ///   - `replacement`: Value written into the selected portion.
+    ///   - `reference`: Live discharged reference whose addressed part is replaced.
+    ///   - `replacement`: New value of the addressed part.
+    ///   - `transforms`: Transforms applied in order after the reference's alias.
+    ///   - `bindings`: Dynamic inputs of `transforms`, in transform order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved, and propagates the
+    /// policy's error when the transforms cannot be applied or the write cannot be performed.
+    pub fn write_through(
+        &self,
+        reference: &ReferenceDischargeReference<C, P>,
+        replacement: C::Value,
+        transforms: &[P::Transform],
+        bindings: &[C::Value],
+    ) -> Result<(), ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
+        let allocation = reference.allocation_id();
+        let current = self.discharged_state(allocation)?;
+        let alias = P::apply_transforms(&self.parent, reference.alias(), transforms, bindings)?;
+        let successor = P::write(&self.parent, &current, replacement, &alias)?;
+        self.set_discharged_state(allocation, successor, true)
+    }
+
+    /// Replaces the complete value of a discharged reference and returns its previous contents. Like
+    /// [`write`](Self::write), this function installs the policy's complete successor state and records a mutation.
+    /// Unlike `write`, it also returns the value before replacement.
+    ///
+    /// # Parameters
+    ///
+    ///   - `reference`: Live discharged reference whose value is replaced.
+    ///   - `replacement`: New complete value of the reference.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved, and propagates the
     /// policy's error when the alias cannot be applied.
+    #[inline]
     pub fn swap(
         &self,
         reference: &ReferenceDischargeReference<C, P>,
@@ -3016,26 +3002,57 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     where
         C::Type: From<P::Referent>,
     {
+        self.swap_through(reference, replacement, &[], &[])
+    }
+
+    /// Replaces the part of a discharged reference addressed by `transforms` and returns its previous contents. Like
+    /// [`write_through`](Self::write_through), this function installs the policy's complete successor state and
+    /// records a mutation. Unlike `write_through`, it also returns the addressed part's value before replacement.
+    /// [`swap`](Self::swap) is this function with an empty path.
+    ///
+    /// # Parameters
+    ///
+    ///   - `reference`: Live discharged reference whose addressed part is replaced.
+    ///   - `replacement`: New value of the addressed part.
+    ///   - `transforms`: Transforms applied in order after the reference's alias.
+    ///   - `bindings`: Dynamic inputs of `transforms`, in transform order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved, and propagates the
+    /// policy's error when the transforms or the resulting alias cannot be applied.
+    pub fn swap_through(
+        &self,
+        reference: &ReferenceDischargeReference<C, P>,
+        replacement: C::Value,
+        transforms: &[P::Transform],
+        bindings: &[C::Value],
+    ) -> Result<C::Value, ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
         let allocation = reference.allocation_id();
         let current = self.discharged_state(allocation)?;
-        let (previous, successor) = P::swap(&self.parent, &current, replacement, reference.alias())?;
+        let alias = P::apply_transforms(&self.parent, reference.alias(), transforms, bindings)?;
+        let (previous, successor) = P::swap(&self.parent, &current, replacement, &alias)?;
         self.set_discharged_state(allocation, successor, true)?;
         Ok(previous)
     }
 
-    /// Accumulates `update` into the portion that `reference` selects in a discharged allocation. The policy returns a
-    /// complete successor state, which this function installs and records as a mutation.
+    /// Accumulates `update` into the complete value of a discharged reference. The policy returns a complete successor
+    /// state, which this function installs and records as a mutation.
     ///
     /// # Parameters
     ///
-    ///   - `reference`: Handle selecting the portion to update.
-    ///   - `update`: Value accumulated into the selected portion.
+    ///   - `reference`: Live discharged reference whose value is updated.
+    ///   - `update`: Value accumulated into the reference's complete value.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved, and propagates the
     /// policy's error when the alias cannot be applied. Whether the reference type family supports accumulation at all
     /// is a compile-time requirement expressed by the [`ReferenceAccumulationPolicy`] bound.
+    #[inline]
     pub fn accumulate(
         &self,
         reference: &ReferenceDischargeReference<C, P>,
@@ -3045,25 +3062,58 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         C::Type: From<P::Referent>,
         P: ReferenceAccumulationPolicy<C>,
     {
+        self.accumulate_through(reference, update, &[], &[])
+    }
+
+    /// Accumulates `update` into the part of a discharged reference addressed by `transforms`. The transforms are
+    /// applied after the reference's alias as in [`read_through`](Self::read_through), and the policy returns a
+    /// complete successor state in which only that part is updated. This function installs that state and records
+    /// it as a mutation. [`accumulate`](Self::accumulate) is this function with an empty path.
+    ///
+    /// # Parameters
+    ///
+    ///   - `reference`: Live discharged reference whose addressed part is updated.
+    ///   - `update`: Value accumulated into the addressed part.
+    ///   - `transforms`: Transforms applied in order after the reference's alias.
+    ///   - `bindings`: Dynamic inputs of `transforms`, in transform order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved, and propagates the
+    /// policy's error when the transforms or the resulting alias cannot be applied. Whether the reference type family
+    /// supports accumulation at all is a compile-time requirement expressed by the [`ReferenceAccumulationPolicy`]
+    /// bound.
+    pub fn accumulate_through(
+        &self,
+        reference: &ReferenceDischargeReference<C, P>,
+        update: C::Value,
+        transforms: &[P::Transform],
+        bindings: &[C::Value],
+    ) -> Result<(), ProgramError>
+    where
+        C::Type: From<P::Referent>,
+        P: ReferenceAccumulationPolicy<C>,
+    {
         let allocation = reference.allocation_id();
         let current = self.discharged_state(allocation)?;
-        let successor = P::accumulate(&self.parent, &current, update, reference.alias())?;
+        let alias = P::apply_transforms(&self.parent, reference.alias(), transforms, bindings)?;
+        let successor = P::accumulate(&self.parent, &current, update, &alias)?;
         self.set_discharged_state(allocation, successor, true)
     }
 
     /// Consumes a discharged allocation and returns its complete current immutable state. Consumption removes the
     /// allocation's live environment entry, so every later access reports a use-after-consume. It always yields the
-    /// complete stored value and deliberately ignores aliases; only the unviewed reference value returned when the
-    /// allocation was bound can therefore name the transition. For a preserved allocation, the replay path performs
-    /// the destination operation first and then removes the corresponding live environment entry.
+    /// complete stored value; access transforms never produce reference values and cannot be consumed. For a preserved
+    /// allocation, the replay path performs the destination operation first and then removes the corresponding live
+    /// environment entry.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live, was preserved rather than
-    /// discharged, or is named through a view rather than the reference for its complete stored value.
+    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved rather than
+    /// discharged.
     pub fn consume(&self, reference: &ReferenceDischargeReference<C, P>) -> Result<C::Value, ProgramError> {
         let allocation = reference.allocation_id();
-        self.validate_consumption(reference)?;
+        self.allocation_entry(reference.allocation_id())?;
         if !self.is_allocation_discharged(allocation)? {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge requested the discharged state of preserved {allocation}",
@@ -3076,28 +3126,6 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 unreachable!()
             }
         }
-    }
-
-    /// Validates that `reference` may consume its allocation: the allocation must be live and the handle must denote
-    /// the complete stored value, because consumption yields and invalidates that value and a view cannot name that
-    /// transition even when it has the same reference type as the allocation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or when `reference` is a view.
-    fn validate_consumption(&self, reference: &ReferenceDischargeReference<C, P>) -> Result<(), ProgramError> {
-        let allocation = reference.allocation_id();
-        let entry = self.allocation_entry(allocation)?;
-        if reference.is_view() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot consume {} through the view `{}`; consumption yields the complete stored \
-                 value, whose reference type is `{}`",
-                allocation,
-                reference.r#type(),
-                entry.r#type,
-            )));
-        }
-        Ok(())
     }
 
     /// Summarizes the transitive reference accesses of a [`Region`](crate::Region) closure under this context's capture
@@ -3155,14 +3183,14 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     }
 
     /// Returns the [`ReferenceDischargeAllocationId`] denoted by `value`, or [`None`] when it is a non-reference value.
-    /// A view is rejected rather than resolved to its allocation because a state boundary carries the allocation's
-    /// complete stored value. The view must instead be created inside the region. A preserved allocation is resolved
-    /// like any other: it crosses the boundary as its existing reference at its declared position and needs no added
-    /// state carry, so [`boundary_widening`](Self::boundary_widening) excludes it from the threaded allocations.
+    /// Access transforms never produce reference values, so every reference value denotes a complete allocation and a
+    /// state boundary carries that allocation's complete stored value. A preserved allocation is resolved like any
+    /// other: it crosses the boundary as its existing reference at its declared position and needs no added state
+    /// carry, so [`boundary_widening`](Self::boundary_widening) excludes it from the threaded allocations.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when `value` is a view or its allocation is no longer live.
+    /// Returns [`ProgramError::MalformedProgram`] when the allocation is no longer live.
     pub fn boundary_allocation(
         &self,
         value: &ReferenceDischargeValue<C, P>,
@@ -3171,16 +3199,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
             return Ok(None);
         };
         let allocation = reference.allocation_id();
-        let entry = self.allocation_entry(allocation)?;
-        if reference.is_view() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference view `{}` of {} cannot cross a region boundary, which requires the complete stored \
-                 value `{}`; create the view inside the region instead",
-                reference.r#type(),
-                allocation,
-                entry.r#type,
-            )));
-        }
+        self.allocation_entry(allocation)?;
         Ok(Some(allocation))
     }
 
@@ -3189,9 +3208,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// itself. This applies both to inputs passed into a rebuilt operation and to outputs publishing an allocation's
     /// final state.
     ///
-    /// This function does not read through reference views: a discharged reference contributes its complete allocation
-    /// state. Use [`boundary_allocation`](Self::boundary_allocation) to validate that a reference value denotes a
-    /// complete allocation before constructing its boundary representation.
+    /// A discharged reference contributes its complete allocation state.
+    /// Use [`boundary_allocation`](Self::boundary_allocation) to validate that a reference value's allocation
+    /// is still live before constructing its boundary representation.
     ///
     /// # Errors
     ///
@@ -3371,10 +3390,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when a consumed reference is a view rather than the reference for the
-    /// complete stored value, when a reference operand's allocation is no longer live, when an operand outside the
-    /// declared accesses denotes a discharged reference, or when a replayed output is reference-typed. It also
-    /// propagates type inference errors and the destination's error from the replay itself.
+    /// Returns [`ProgramError::MalformedProgram`] when a reference input's allocation is no longer live, when an input
+    /// outside the declared accesses denotes a discharged reference, or when a replayed output is reference-typed. It
+    /// also propagates type inference errors and the destination's error from the replay itself.
     fn replay_preserved_access(
         &self,
         operation: &C::Operation,
@@ -3385,10 +3403,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
     {
         let effects = operation.effects();
-        if !effects.has_accesses()
-            || effects.allocation_output_indices().next().is_some()
-            || !effects.reference_aliases().is_empty()
-        {
+        if !effects.has_accesses() || effects.allocation_output_indices().next().is_some() {
             return Ok(None);
         }
         let mut consumed = Vec::new();
@@ -3429,12 +3444,12 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         // Validate every consumption before the replay as well, so that a rejected application never leaves a
         // destination operation behind on an error path.
         for reference in &consumed {
-            self.validate_consumption(reference)?;
+            self.allocation_entry(reference.allocation_id())?;
         }
 
-        // Each reference operand contributes the destination value its handle denotes, which is the only place a view's
-        // exact value lives. Liveness is checked against the environment rather than assumed from the handle, because a
-        // handle retains its destination value after its allocation is consumed.
+        // Each reference input contributes the destination value its handle denotes, and the replayed operation
+        // applies its own transforms to it. Liveness is checked against the environment rather than assumed from
+        // the handle, because a handle retains its destination value after its allocation is consumed.
         let values = inputs
             .iter()
             .map(|input| match input {
@@ -3715,8 +3730,13 @@ impl Default for ReferenceDischargeCaptureScope {
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
-    /// Rewrites every [`Reference`](crate::Reference) in this [`Program`] as explicit immutable state and returns the
-    /// resulting reference-free program together with bindings for its external references.
+    /// Rewrites every [`Reference`](crate::Reference) in this [`Program`] as explicit immutable state and returns
+    /// the resulting reference-free program together with bindings for its external references.
+    ///
+    /// The type family's default [`ReferenceDischargeableType::Policy`] determines how views are reconstructed
+    /// as immutable values (e.g., [`ArrayReferenceDischarge`](crate::ArrayReferenceDischarge) for array programs).
+    /// A downstream family with its own reference transforms over the same types uses
+    /// [`discharge_references_with_policy`](Self::discharge_references_with_policy) instead.
     ///
     /// A reference-typed input keeps its position but becomes a value input carrying the reference's initial state.
     /// Local reference allocations disappear. The source program's public outputs remain first and in the same order;
@@ -3753,6 +3773,23 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ) -> Result<ReferenceDischargeResult<V, O>, ProgramError>
     where
         V::Type: From<P::Referent> + From<ReferenceType<P::Referent>> + ReferenceDischargeableType<Policy = P>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
+    {
+        self.discharge_references_with_policy::<P>(capture_count)
+    }
+
+    /// Same as [`discharge_references`](Self::discharge_references), but with an explicit reference discharge policy
+    /// `P` instead of the type family's default [`ReferenceDischargeableType::Policy`]. A downstream operation family
+    /// that supplies its own reference transforms over an existing type universe discharges through its own policy with
+    /// this function.
+    #[inline]
+    pub fn discharge_references_with_policy<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
+        self,
+        capture_count: usize,
+    ) -> Result<ReferenceDischargeResult<V, O>, ProgramError>
+    where
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
@@ -3793,6 +3830,27 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
+        self.discharge_references_in_capture_lifted_program_with_policy::<P>(capture_count)
+    }
+
+    /// Same as
+    /// [`discharge_references_in_capture_lifted_program`](Self::discharge_references_in_capture_lifted_program),
+    /// but with an explicit reference discharge policy `P` instead of the type family's default
+    /// [`ReferenceDischargeableType::Policy`]. A downstream operation family that supplies its own reference
+    /// transforms over an existing type universe discharges through its own policy with this function.
+    #[inline]
+    pub fn discharge_references_in_capture_lifted_program_with_policy<
+        P: ReferenceDischargePolicy<TracingContext<V, O>>,
+    >(
+        self,
+        capture_count: usize,
+    ) -> Result<ReferenceDischargeResult<V, O>, ProgramError>
+    where
+        V: CaptureConstant,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
+    {
         ReferenceDischargeResult::try_from(
             self.discharge_references_helper::<P>(capture_count, ReferenceDischargeTargets::everything())?,
         )
@@ -3803,7 +3861,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ///
     /// The selected references follow the same rewrite as [`discharge_references`](Self::discharge_references). An
     /// unselected reference keeps its reference-typed boundary position or allocation operation, and its accesses and
-    /// views are replayed unchanged. It contributes no [`ExternalReferenceBinding`] or hidden final-state
+    /// their transforms are replayed unchanged. It contributes no [`ExternalReferenceBinding`] or hidden final-state
     /// output because it never becomes explicit state.
     ///
     /// Preserved references can cross structured-[`Region`](crate::Region) boundaries beside discharged state. A
@@ -3843,6 +3901,24 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
+        self.partially_discharge_references_with_policy::<P>(capture_count, targets)
+    }
+
+    /// Same as [`partially_discharge_references`](Self::partially_discharge_references), but with an explicit reference
+    /// discharge policy `P` instead of the type family's default [`ReferenceDischargeableType::Policy`]. A downstream
+    /// operation family that supplies its own reference transforms over an existing type universe discharges through
+    /// its own policy with this function.
+    #[inline]
+    pub fn partially_discharge_references_with_policy<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
+        self,
+        capture_count: usize,
+        targets: &[ReferenceDischargeTarget],
+    ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError>
+    where
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
+    {
         let targets = ReferenceDischargeTargets::from_targets(&self, capture_count, targets)?;
         self.discharge_references_helper::<P>(capture_count, targets)
     }
@@ -3876,6 +3952,27 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     where
         V: CaptureConstant,
         V::Type: From<P::Referent> + From<ReferenceType<P::Referent>> + ReferenceDischargeableType<Policy = P>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
+    {
+        self.partially_discharge_references_in_capture_lifted_program_with_policy::<P>(capture_count, targets)
+    }
+
+    /// Same as [`Self::partially_discharge_references_in_capture_lifted_program`], but with an explicit reference
+    /// discharge policy `P` instead of the type family's default [`ReferenceDischargeableType::Policy`]. A downstream
+    /// operation family that supplies its own reference transforms over an existing type universe discharges through
+    /// its own policy with this function.
+    #[inline]
+    pub fn partially_discharge_references_in_capture_lifted_program_with_policy<
+        P: ReferenceDischargePolicy<TracingContext<V, O>>,
+    >(
+        self,
+        capture_count: usize,
+        targets: &[ReferenceDischargeTarget],
+    ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError>
+    where
+        V: CaptureConstant,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
@@ -4074,9 +4171,25 @@ impl<
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t Capture::Type>,
     {
+        self.discharge_references_with_policy::<P>()
+    }
+
+    /// Same as [`discharge_references`](Self::discharge_references), but with an explicit reference discharge policy
+    /// `P` instead of the type family's default [`ReferenceDischargeableType::Policy`]. A downstream operation family
+    /// that supplies its own reference transforms over an existing type universe discharges through its own policy with
+    /// this function.
+    #[inline]
+    pub fn discharge_references_with_policy<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
+        &self,
+    ) -> Result<ReferenceDischargeResult<V, O>, ProgramError>
+    where
+        Capture::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t Capture::Type>,
+    {
         let capture_count = self.captures().len();
         let program = self.to_program_with_lifted_captures()?;
-        program.discharge_references_in_capture_lifted_program::<P>(capture_count)
+        program.discharge_references_in_capture_lifted_program_with_policy::<P>(capture_count)
     }
 }
 
@@ -4101,7 +4214,7 @@ impl<
 ///   - `operation`: Operation application being replayed.
 ///   - `context`: Active discharge context whose [`ReferenceDischargeContext::parent`] binds the replay.
 ///   - `driver`: Application-scoped [`ReferenceDischargeDriver`] supplying any attached regions.
-///   - `inputs`: Carriers supplied as this application's operands, in operation-defined order.
+///   - `inputs`: Carriers supplied as this application's inputs, in operation-defined order.
 ///
 /// # Errors
 ///
@@ -4142,28 +4255,28 @@ pub fn discharge_reference_free_operation<
 
 /// Discharges one region-carrying [`Operation`] application whose reference state is confined to its attached regions.
 /// This is a shared rule body for [`ReferenceDischargeableOperation`] implementations that can rewrite each region
-/// independently without adding state operands or outputs to the operation or its regions. The regions need not share
-/// an interface or receive the operation's operands positionally, which allows the same rule to handle custom
+/// independently without adding state inputs or outputs to the operation or its regions. The regions need not share
+/// an interface or receive the operation's inputs positionally, which allows the same rule to handle custom
 /// derivative operations whose primal and derivative regions have different signatures.
 ///
 /// Unlike [`discharge_reference_free_operation`], which copies reference-free regions unchanged, this function
 /// rebuilds every attached region to discharge its local reference state, including derivative regions that are not
 /// executed by the primal operation. Unlike [`discharge_positional_region_operation`], it does not widen boundaries
-/// to thread caller state through the regions. Reference operands, reference region inputs, and region closures that
+/// to thread caller state through the regions. Reference inputs, reference region inputs, and region closures that
 /// reach caller allocations are therefore rejected. The operation is then rebound unchanged with the rebuilt regions,
 /// so its own interface validation checks their compatibility.
 ///
 /// # Parameters
 ///
-///   - `operation`: Operation application being rewritten without adding state operands or outputs.
+///   - `operation`: Operation application being rewritten without adding state inputs or outputs.
 ///   - `context`: Active [`ReferenceDischargeContext`] owning the allocation environment.
 ///   - `driver`: Application-scoped [`ReferenceDischargeDriver`] supplying all attached regions.
-///   - `inputs`: Carrier [`ReferenceDischargeValue`]s supplied as this application's operands,
-///     in operation-defined order.
+///   - `inputs`: Carrier [`ReferenceDischargeValue`]s supplied as this application's inputs, in operation-defined
+///     order.
 ///
 /// # Errors
 ///
-/// Returns [`ProgramError::UnsupportedOperation`] when an operand or declared region input is a reference, or a region
+/// Returns [`ProgramError::UnsupportedOperation`] when an input or declared region input is a reference, or a region
 /// closure reaches a caller allocation. Propagates errors from region-count validation, reference analysis, region
 /// rebuilding, mutation validation, and binding the rewritten application in the destination.
 pub fn discharge_local_reference_operation<
@@ -4182,24 +4295,24 @@ pub fn discharge_local_reference_operation<
     if let Some(position) = inputs.iter().position(|input| matches!(input, ReferenceDischargeValue::Reference(_))) {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "`{name}` does not thread external references through discharge, but operand {position} is a \
-                 reference; pass reference-free operands or discharge external references first",
+                "`{name}` does not thread external references through discharge, but input {position} is a \
+                 reference; pass reference-free inputs or discharge external references first",
             ),
         });
     }
 
-    // Reference-free operands leave the primal and forward boundaries reference-free, but a hand-built call may
-    // still declare reference inputs on its rule regions (through a reference-typed residual in the forward tail).
-    // Those inputs are bound by the transform that instantiates the rule rather than by any operand, so no caller
-    // allocation can be threaded into them. So, they are rejected here, under the operand diagnostic, instead of
+    // Reference-free inputs leave the primal and forward boundaries reference-free, but a hand-built call may still
+    // declare reference inputs on its rule regions (through a reference-typed residual in the forward tail). Those
+    // region inputs are bound by the transform that instantiates the rule rather than by any input of the call, so no
+    // caller allocation can be threaded into them. So, they are rejected here, under the input diagnostic, instead of
     // failing the region rebuild with an internal boundary error.
     for index in 0..driver.region_count() {
         if let Some(position) = driver.region(index)?.input_types().iter().position(Type::is_reference) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "`{name}` does not thread external references through discharge, but input {position} of \
-                     region {index} is a reference; pass reference-free operands or discharge external \
-                     references first",
+                     region {index} is a reference; pass reference-free inputs or discharge external references \
+                     first",
                 ),
             });
         }
@@ -4262,7 +4375,7 @@ pub fn discharge_local_reference_operation<
 ///     because threading state past a positional boundary changes only the boundary.
 ///   - `context`: Active [`ReferenceDischargeContext`] owning the allocation environment.
 ///   - `driver`: Application-scoped [`ReferenceDischargeDriver`] supplying the attached regions.
-///   - `inputs`: Carrier [`ReferenceDischargeValue`]s supplied as this application's operands,
+///   - `inputs`: Carrier [`ReferenceDischargeValue`]s supplied as this application's inputs,
 ///     in operation-defined order.
 ///   - `leading_input_count`: Number of leading inputs/operands that parameterize the operation itself rather than
 ///     being forwarded to its regions, which is one for a condition's predicate and zero for a call.
@@ -4271,10 +4384,9 @@ pub fn discharge_local_reference_operation<
 ///
 /// Returns [`ProgramError::MalformedProgram`] when the application has fewer inputs than `leading_input_count`,
 /// when a leading operand is a reference, when an attached region's boundary does not forward the remaining operands
-/// positionally, when a reference operand is a view rather than the reference for the complete stored value, when a
-/// region closure reaches an allocation that never entered the boundary or consumes one, when a region returns an
-/// allocation its caller never threaded, when the attached regions disagree on which outputs denote references, or
-/// when a region mutates an allocation the widening did not predict.
+/// positionally, when a region closure reaches an allocation that never entered the boundary or consumes one, when a
+/// region returns an allocation its caller never threaded, when the attached regions disagree on which outputs denote
+/// references, or when a region mutates an allocation the widening did not predict.
 pub fn discharge_positional_region_operation<
     O: Operation<Type = C::Type>,
     C: Context<Type: From<P::Referent>, Operation: From<O>>,
@@ -4407,33 +4519,31 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceView,
-        ArrayReferenceViewOperation, ArrayType, DataType,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArrayReferenceTransformOperation, ArrayType, DataType,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
         Add, AddOperation, ConditionOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-        ReferenceAddUpdateOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
-        ReferenceWriteOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSwapOperation, ReferenceWriteOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation,
     };
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
     use crate::programs::atoms::AtomId;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::{
-        EffectClass, EffectClasses, Effects, ReferenceAccessMode, ReferenceAlias, ReferenceAliasKind, ReferenceEffect,
-    };
+    use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceAccessMode, ReferenceEffect};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::{Instruction, InstructionId};
-    use crate::programs::operations::Operation;
+    use crate::programs::operations::{Operation, OperationFormatter};
     use crate::programs::programs::ProgramRenderingMode;
     use crate::programs::provenance::{Provenance, ProvenanceScope};
     use crate::programs::references::analysis::ReferenceAnalysisError;
+    use crate::programs::references::operations::{ReferenceAccessDescriptor, ReferenceAccessOperation};
+    use crate::programs::references::transforms::{BoundReferenceTransform, ReferenceViewOverlap};
     use crate::programs::references::types::ReferenceType;
-    use crate::programs::references::views::{ReferenceViewOperation, ReferenceViewValidationError};
     use crate::programs::regions::{EmptyRegionDriver, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
     use crate::programs::types::{Type, TypeError, Typed};
     use crate::programs::values::Value;
@@ -4441,9 +4551,9 @@ mod tests {
     use super::*;
 
     // The fixtures below are the non-array prototype universe shared by the interpreter tests: a deliberately small
-    // reference universe whose referents are fixed-length integer lists and whose views are contiguous sub-ranges. It
-    // is the standing proof that the discharge architecture has not silently become array-shaped, because nothing in
-    // it mentions arrays and its alias mechanics are real rather than trivial.
+    // reference universe whose referents are fixed-length integer lists and whose transforms select contiguous
+    // sub-ranges. It is the standing proof that the discharge architecture has not silently become array-shaped,
+    // because nothing in it mentions arrays and its alias mechanics are real rather than trivial.
 
     thread_local! {
         static OBSERVED_ALLOCATION_POSITIONS: RefCell<Vec<Option<InstructionId>>> =
@@ -4640,11 +4750,44 @@ mod tests {
         }
     }
 
-    /// View chain of the prototype universe: one contiguous sub-range of the allocation list.
-    #[derive(Copy, Clone, Debug, PartialEq)]
+    /// Reference transform of the prototype universe, which also serves as its alias: one contiguous sub-range of the
+    /// allocation list.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     struct ListAlias {
         offset: usize,
         length: usize,
+    }
+
+    impl Display for ListAlias {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "slice(offset={}, length={})", self.offset, self.length)
+        }
+    }
+
+    impl ReferenceTransform for ListAlias {
+        type Type = ListIrType;
+        type Referent = ListType;
+
+        fn binding_count(&self) -> usize {
+            0
+        }
+        fn validate_bindings(&self, input: &ListType, bindings: &[&ListIrType]) -> Result<(), TypeError> {
+            check_count!("binding", bindings, 0, TypeError);
+            self.output_type(input).map(|_| ())
+        }
+        fn output_type(&self, input: &ListType) -> Result<ListType, TypeError> {
+            if self.offset.checked_add(self.length).is_none_or(|end| end > input.length) {
+                return Err(TypeError::invalid("list transform exceeds its input length"));
+            }
+            Ok(ListType { length: self.length })
+        }
+        fn overlap(
+            _type: &ListIrType,
+            _lhs: &[BoundReferenceTransform<Self>],
+            _rhs: &[BoundReferenceTransform<Self>],
+        ) -> ReferenceViewOverlap {
+            ReferenceViewOverlap::MayOverlap
+        }
     }
 
     /// Binds one single-result prototype operation into a destination. Routing the alias mechanics through the
@@ -4675,10 +4818,26 @@ mod tests {
         for ListReferenceDischarge
     {
         type Referent = ListType;
+        type Transform = ListAlias;
         type Alias = ListAlias;
 
         fn storage_alias(referent: &ListType) -> ListAlias {
             ListAlias { offset: 0, length: referent.length }
+        }
+
+        fn apply_transforms(
+            _context: &C,
+            alias: &ListAlias,
+            transforms: &[ListAlias],
+            bindings: &[C::Value],
+        ) -> Result<ListAlias, ProgramError> {
+            if !bindings.is_empty() {
+                return Err(TypeError::invalid("list transforms take no bindings").into());
+            }
+            transforms.iter().try_fold(*alias, |alias, transform| {
+                transform.output_type(&ListType { length: alias.length })?;
+                Ok(ListAlias { offset: alias.offset + transform.offset, length: transform.length })
+            })
         }
 
         fn read(context: &C, current: &C::Value, alias: &ListAlias) -> Result<C::Value, ProgramError> {
@@ -4724,15 +4883,11 @@ mod tests {
             offset: usize,
         },
         ReferenceNew,
-        Slice {
-            offset: usize,
-            length: usize,
-        },
-        Read,
-        Write,
-        Swap,
-        AddUpdate,
-        AtomicAddUpdate,
+        Read(Option<ListAlias>),
+        Write(Option<ListAlias>),
+        Swap(Option<ListAlias>),
+        AddUpdate(Option<ListAlias>),
+        AtomicAddUpdate(Option<ListAlias>),
         Freeze,
         UnreportedFreeze,
         Call,
@@ -4750,7 +4905,7 @@ mod tests {
 
     impl Display for ListOperation {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(self.name())
+            self.render(formatter, 0)
         }
     }
 
@@ -4763,12 +4918,11 @@ mod tests {
                 Self::Select { .. } => "list.select",
                 Self::Splice { .. } => "list.splice",
                 Self::ReferenceNew => "list.reference_new",
-                Self::Slice { .. } => "list.slice",
-                Self::Read => "list.read",
-                Self::Write => "list.write",
-                Self::Swap => "list.swap",
-                Self::AddUpdate => "list.add_update",
-                Self::AtomicAddUpdate => "list.atomic_add_update",
+                Self::Read(_) => "list.read",
+                Self::Write(_) => "list.write",
+                Self::Swap(_) => "list.swap",
+                Self::AddUpdate(_) => "list.add_update",
+                Self::AtomicAddUpdate(_) => "list.atomic_add_update",
                 Self::Freeze => "list.freeze",
                 Self::UnreportedFreeze => "test.unreported_freeze",
                 Self::Call => "list.call",
@@ -4832,33 +4986,38 @@ mod tests {
                     };
                     Ok(vec![ListIrType::Reference(ReferenceType::new(referent.clone()))])
                 }
-                Self::Slice { offset, length } => {
+                Self::Read(transform) => {
                     check_count!("input", input_types, 1, TypeError);
-                    let referent = referent(0)?;
-                    if offset + length > referent.length {
-                        return Err(TypeError::invalid(format!(
-                            "view [{offset}, {}) does not fit `{referent}`",
-                            offset + length,
-                        )));
-                    }
-                    Ok(vec![ListIrType::Reference(ReferenceType::new(ListType { length: *length }))])
+                    let input = referent(0)?;
+                    Ok(vec![ListIrType::List(
+                        transform.map_or(Ok(input.clone()), |transform| transform.output_type(&input))?,
+                    )])
                 }
-                Self::Read | Self::Freeze | Self::UnreportedFreeze => {
+                Self::Freeze | Self::UnreportedFreeze => {
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![ListIrType::List(referent(0)?)])
                 }
-                Self::Write => {
+                Self::Write(transform) => {
                     check_count!("input", input_types, 2, TypeError);
-                    referent(0)?;
+                    let input = referent(0)?;
+                    if let Some(transform) = transform {
+                        transform.output_type(&input)?;
+                    }
                     Ok(Vec::new())
                 }
-                Self::Swap => {
+                Self::Swap(transform) => {
                     check_count!("input", input_types, 2, TypeError);
-                    Ok(vec![ListIrType::List(referent(0)?)])
+                    let input = referent(0)?;
+                    Ok(vec![ListIrType::List(
+                        transform.map_or(Ok(input.clone()), |transform| transform.output_type(&input))?,
+                    )])
                 }
-                Self::AddUpdate | Self::AtomicAddUpdate => {
+                Self::AddUpdate(transform) | Self::AtomicAddUpdate(transform) => {
                     check_count!("input", input_types, 2, TypeError);
-                    referent(0)?;
+                    let input = referent(0)?;
+                    if let Some(transform) = transform {
+                        transform.output_type(&input)?;
+                    }
                     Ok(Vec::new())
                 }
                 Self::Call | Self::ScopedCall { .. } => {
@@ -4908,25 +5067,17 @@ mod tests {
 
         fn effects(&self) -> Cow<'_, Effects> {
             let access = |mode| {
-                Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Access { input_index: 0, mode }], Vec::new())
-                    .unwrap()
+                Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Access { input_index: 0, mode }]).unwrap()
             };
             let effects = match self {
                 Self::ReferenceNew => {
-                    Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new())
-                        .unwrap()
+                    Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap()
                 }
-                Self::Slice { .. } => Effects::new(
-                    EffectClasses::NONE,
-                    Vec::new(),
-                    vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
-                )
-                .unwrap(),
-                Self::Read => access(ReferenceAccessMode::Read),
-                Self::Write => access(ReferenceAccessMode::Write),
-                Self::Swap => access(ReferenceAccessMode::ReadWrite),
-                Self::AddUpdate => access(ReferenceAccessMode::Accumulate),
-                Self::AtomicAddUpdate => access(ReferenceAccessMode::AtomicAccumulate),
+                Self::Read(_) => access(ReferenceAccessMode::Read),
+                Self::Write(_) => access(ReferenceAccessMode::Write),
+                Self::Swap(_) => access(ReferenceAccessMode::ReadWrite),
+                Self::AddUpdate(_) => access(ReferenceAccessMode::Accumulate),
+                Self::AtomicAddUpdate(_) => access(ReferenceAccessMode::AtomicAccumulate),
                 Self::Freeze => access(ReferenceAccessMode::Consume),
                 Self::UnreportedFreeze => Effects::explicit(EffectClasses::single(EffectClass::OrderedState)),
                 Self::Add | Self::Select { .. } | Self::Splice { .. } | Self::Call | Self::ScopedCall { .. } => {
@@ -4935,11 +5086,27 @@ mod tests {
             };
             Cow::Owned(effects)
         }
+
+        fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+            // Accesses with a transform render their path like the array access operations, so program snapshots show
+            // when a rewrite keeps or drops a transform.
+            match self {
+                Self::Read(Some(transform))
+                | Self::Write(Some(transform))
+                | Self::Swap(Some(transform))
+                | Self::AddUpdate(Some(transform))
+                | Self::AtomicAddUpdate(Some(transform)) => {
+                    OperationFormatter::new(formatter, indentation, self.name())?
+                        .bracketed(|formatter| formatter.list("transforms", &[transform]))
+                }
+                _ => formatter.write_str(self.name()),
+            }
+        }
     }
 
     // One implementation covers every prototype operation, which is why the accumulating rule's
-    // `ReferenceAccumulationPolicy` requirement appears as an implementation-level bound here:
-    // closed operation-enum dispatch reintroduces the union that the policy split otherwise keeps separate.
+    // `ReferenceAccumulationPolicy` requirement appears as an implementation-level bound here: closed
+    // operation-enum dispatch reintroduces the union that the policy split otherwise keeps separate.
     impl<C: Context<Type = ListIrType, Operation: From<ListOperation>>>
         ReferenceDischargeableOperation<C, ListReferenceDischarge> for ListOperation
     {
@@ -4974,54 +5141,38 @@ mod tests {
                     check_count!("output", outputs, 1, ProgramError);
                     Ok(vec![context.bind_preserved(r#type, outputs.remove(0))?.into()])
                 }
-                Self::Slice { offset, length } => {
-                    check_count!("input", inputs, 1, ProgramError);
-                    let reference = inputs[0].try_as_reference("a reference to view")?;
-                    let alias = reference.alias();
-                    if offset + length > alias.length {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "view [{}, {}) does not fit `{}`",
-                            offset,
-                            offset + length,
-                            reference.r#type(),
-                        )));
-                    }
-                    let composed = ListAlias { offset: alias.offset + offset, length: *length };
-                    let r#type = ReferenceType::new(ListType { length: *length });
-                    Ok(vec![
-                        context
-                            .alias_reference(reference, composed, r#type, |value| {
-                                let mut outputs =
-                                    context.parent().bind(*self, Vec::new(), std::slice::from_ref(value))?;
-                                check_count!("output", outputs, 1, ProgramError);
-                                Ok(outputs.remove(0))
-                            })?
-                            .into(),
-                    ])
-                }
-                Self::Read => {
+                Self::Read(transform) => {
                     check_count!("input", inputs, 1, ProgramError);
                     let reference = inputs[0].try_as_reference("a reference to read")?;
-                    Ok(vec![ReferenceDischargeValue::Value(context.read(reference)?)])
+                    Ok(vec![ReferenceDischargeValue::Value(context.read_through(
+                        reference,
+                        transform.as_slice(),
+                        &[],
+                    )?)])
                 }
-                Self::Write => {
+                Self::Write(transform) => {
                     check_count!("input", inputs, 2, ProgramError);
                     let reference = inputs[0].try_as_reference("a reference to write")?;
                     let replacement = inputs[1].try_as_value("a replacement value")?.clone();
-                    context.write(reference, replacement)?;
+                    context.write_through(reference, replacement, transform.as_slice(), &[])?;
                     Ok(Vec::new())
                 }
-                Self::Swap => {
+                Self::Swap(transform) => {
                     check_count!("input", inputs, 2, ProgramError);
                     let reference = inputs[0].try_as_reference("a reference to replace")?;
                     let replacement = inputs[1].try_as_value("a replacement value")?.clone();
-                    Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
+                    Ok(vec![ReferenceDischargeValue::Value(context.swap_through(
+                        reference,
+                        replacement,
+                        transform.as_slice(),
+                        &[],
+                    )?)])
                 }
-                Self::AddUpdate | Self::AtomicAddUpdate => {
+                Self::AddUpdate(transform) | Self::AtomicAddUpdate(transform) => {
                     check_count!("input", inputs, 2, ProgramError);
                     let reference = inputs[0].try_as_reference("a reference to accumulate into")?;
                     let update = inputs[1].try_as_value("an update value")?.clone();
-                    context.accumulate(reference, update)?;
+                    context.accumulate_through(reference, update, transform.as_slice(), &[])?;
                     Ok(Vec::new())
                 }
                 Self::Freeze => {
@@ -5108,8 +5259,10 @@ mod tests {
                     let length = spliced.len();
                     let range = spliced.get_mut(*offset..offset + update.len()).ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
-                            "splice [{offset}, {}) does not fit a list of length {length}",
+                            "splice [{}, {}) does not fit a list of length {}",
+                            offset,
                             offset + update.len(),
+                            length,
                         ))
                     })?;
                     range.clone_from_slice(update);
@@ -5197,7 +5350,7 @@ mod tests {
         let initial = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let allocation =
             builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
-        let read = builder.add_instruction(ListOperation::Read, Vec::new(), vec![public], None).unwrap()[0];
+        let read = builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![public], None).unwrap()[0];
         let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
         builder
             .build::<Vec<ListCapture>, Vec<ListCapture>>(vec![read, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
@@ -5211,7 +5364,7 @@ mod tests {
         let captured_reference =
             callee_builder.add_constant(ListCapture::new(0, ListIrType::Reference(reference_type.clone())));
         let observed = callee_builder
-            .add_instruction(ListOperation::Read, Vec::new(), vec![captured_reference], None)
+            .add_instruction(ListOperation::Read(None), Vec::new(), vec![captured_reference], None)
             .unwrap()[0];
         let callee = callee_builder
             .build::<Vec<ListCapture>, Vec<ListCapture>>(vec![observed], Vec::<Placeholder>::new(), vec![Placeholder])
@@ -5235,9 +5388,12 @@ mod tests {
         let observed = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let forwarded = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        builder.add_instruction(ListOperation::Write, Vec::new(), vec![written, update], None).unwrap();
-        builder.add_instruction(ListOperation::Read, Vec::new(), vec![observed], None).unwrap();
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![forwarded], None).unwrap()[0];
+        builder
+            .add_instruction(ListOperation::Write(None), Vec::new(), vec![written, update], None)
+            .unwrap();
+        builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![observed], None).unwrap();
+        let snapshot =
+            builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![forwarded], None).unwrap()[0];
         builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 4], vec![Placeholder])
             .unwrap()
@@ -5263,12 +5419,16 @@ mod tests {
 
     /// Array IR values used to exercise immutable state reconstruction.
     type DischargeValue = ArrayIrValue<Array>;
+
     /// Array IR operations used by the discharge integration fixtures.
     type DischargeOperation = ArrayIrOperation<Array>;
+
     /// Captured composite value in the reference discharge fixtures.
     type DischargeCapture = CaptureReference<ArrayIrType>;
+
     /// Captured array payload in the reference discharge fixtures.
     type DischargeArrayCapture = CaptureReference<ArrayType>;
+
     /// Operation family used by captured array discharge programs.
     type DischargeCaptureOperation = ArrayIrOperation<DischargeArrayCapture>;
 
@@ -5631,7 +5791,6 @@ mod tests {
                     Self::RetainedReference => Effects::new(
                         EffectClasses::single(EffectClass::OrderedIo),
                         vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-                        Vec::new(),
                     )
                     .unwrap(),
                 })
@@ -6037,7 +6196,7 @@ mod tests {
             format!("{reference:?}"),
             format!(
                 "Reference(ReferenceDischargeReference {{ allocation_id: {allocation:?}, type: ReferenceType {{ \
-                 referent: ListType {{ length: 2 }} }}, is_view: false, alias: ListAlias \
+                 referent: ListType {{ length: 2 }} }}, alias: ListAlias \
                  {{ offset: 0, length: 2 }}, \
                  binding: Discharged }})",
             ),
@@ -6120,8 +6279,9 @@ mod tests {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        let previous =
-            builder.add_instruction(ListOperation::Swap, Vec::new(), vec![reference, update], None).unwrap()[0];
+        let previous = builder
+            .add_instruction(ListOperation::Swap(None), Vec::new(), vec![reference, update], None)
+            .unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(
                 vec![previous, reference],
@@ -6181,7 +6341,7 @@ mod tests {
             callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let replacement = callee_builder.add_input(ListIrType::List(ListType { length: 2 }));
         let previous = callee_builder
-            .add_instruction(ListOperation::Swap, Vec::new(), vec![callee_reference, replacement], None)
+            .add_instruction(ListOperation::Swap(None), Vec::new(), vec![callee_reference, replacement], None)
             .unwrap()[0];
         let callee = callee_builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
@@ -6193,9 +6353,11 @@ mod tests {
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let replacement = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let callee = builder.import_program(callee);
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+        let snapshot =
+            builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![reference], None).unwrap()[0];
         let local = builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![snapshot], None).unwrap()[0];
-        let local_snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![local], None).unwrap()[0];
+        let local_snapshot =
+            builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![local], None).unwrap()[0];
         let previous = builder
             .add_instruction(ListOperation::Call, vec![callee], vec![reference, replacement], None)
             .unwrap()[0];
@@ -6463,7 +6625,7 @@ mod tests {
         // A reference allocated in the outer region remains bound when a nested region gives it a capture index.
         let region = summary_region_with_local_reference(
             ListOperation::ScopedCall { capture_count: Some(1), allowed: None, identity: false, dormant: false },
-            ListOperation::Read,
+            ListOperation::Read(None),
             true,
         );
         assert_eq!(
@@ -6488,7 +6650,7 @@ mod tests {
                 identity: false,
                 dormant: false,
             },
-            ListOperation::Read,
+            ListOperation::Read(None),
             false,
         );
         let entry = region.entry_region_ref();
@@ -6627,26 +6789,31 @@ mod tests {
             let replacement = builder.add_input(ListIrType::List(ListType { length: 2 }));
             match accessed {
                 ReferenceAccessMode::Read => {
-                    builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap();
+                    builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![reference], None).unwrap();
                 }
                 ReferenceAccessMode::Write => {
                     builder
-                        .add_instruction(ListOperation::Write, Vec::new(), vec![reference, replacement], None)
+                        .add_instruction(ListOperation::Write(None), Vec::new(), vec![reference, replacement], None)
                         .unwrap();
                 }
                 ReferenceAccessMode::ReadWrite => {
                     builder
-                        .add_instruction(ListOperation::Swap, Vec::new(), vec![reference, replacement], None)
+                        .add_instruction(ListOperation::Swap(None), Vec::new(), vec![reference, replacement], None)
                         .unwrap();
                 }
                 ReferenceAccessMode::Accumulate => {
                     builder
-                        .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, replacement], None)
+                        .add_instruction(ListOperation::AddUpdate(None), Vec::new(), vec![reference, replacement], None)
                         .unwrap();
                 }
                 ReferenceAccessMode::AtomicAccumulate => {
                     builder
-                        .add_instruction(ListOperation::AtomicAddUpdate, Vec::new(), vec![reference, replacement], None)
+                        .add_instruction(
+                            ListOperation::AtomicAddUpdate(None),
+                            Vec::new(),
+                            vec![reference, replacement],
+                            None,
+                        )
                         .unwrap();
                 }
                 ReferenceAccessMode::Consume => unreachable!(),
@@ -6694,7 +6861,7 @@ mod tests {
         let reference = callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let replacement = callee_builder.add_input(ListIrType::List(ListType { length: 2 }));
         callee_builder
-            .add_instruction(ListOperation::Swap, Vec::new(), vec![reference, replacement], None)
+            .add_instruction(ListOperation::Swap(None), Vec::new(), vec![reference, replacement], None)
             .unwrap();
         let callee = callee_builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
@@ -6767,7 +6934,7 @@ mod tests {
         let reference_type = ReferenceType::new(ListType { length: 2 });
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let captured = builder.add_constant(ListIrValue::Reference(reference_type.clone()));
-        let observed = builder.add_instruction(ListOperation::Read, Vec::new(), vec![captured], None).unwrap()[0];
+        let observed = builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![captured], None).unwrap()[0];
         let reads = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], Vec::<Placeholder>::new(), vec![Placeholder])
             .unwrap();
@@ -6837,7 +7004,7 @@ mod tests {
         // A dormant rule may contain a reference read without declaring how the attaching operation supplies it.
         let region = summary_region_with_local_reference(
             ListOperation::ScopedCall { capture_count: None, allowed: None, identity: false, dormant: true },
-            ListOperation::Read,
+            ListOperation::Read(None),
             false,
         );
         assert_eq!(
@@ -6879,6 +7046,7 @@ mod tests {
     fn test_reference_discharge_region_summary_output_allocations() {
         let (_, [_, _, forwarded], mut summary) = summarized_region_with_three_allocations();
         assert_eq!(summary.output_allocations(), &[None]);
+
         // The accessor preserves positions and repeated identities; it does not deduplicate declared outputs.
         summary.output_allocations = vec![Some(forwarded), None, Some(forwarded)];
         assert_eq!(summary.output_allocations(), &[Some(forwarded), None, Some(forwarded)]);
@@ -7053,7 +7221,7 @@ mod tests {
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = builder.add_constant(ListIrValue::List(vec![10, 10]));
         builder
-            .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, update], None)
+            .add_instruction(ListOperation::AddUpdate(None), Vec::new(), vec![reference, update], None)
             .unwrap();
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
@@ -7102,7 +7270,7 @@ mod tests {
         builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![reference], None).unwrap();
         let failing = builder.add_variable(ListIrType::List(ListType { length: 2 }));
         builder.add_instruction_unchecked(Instruction::new(
-            ListOperation::Read,
+            ListOperation::Read(None),
             vec![reference],
             vec![failing],
             Vec::new(),
@@ -7171,7 +7339,7 @@ mod tests {
         // against its own isolated environment.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let captured = builder.add_constant(ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })));
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![captured], None).unwrap()[0];
+        let snapshot = builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![captured], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -7222,8 +7390,10 @@ mod tests {
         let view = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 1 })));
         builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = builder.add_constant(ListIrValue::List(vec![5]));
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view], None).unwrap()[0];
+        builder
+            .add_instruction(ListOperation::AddUpdate(None), Vec::new(), vec![view, update], None)
+            .unwrap();
+        let snapshot = builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![view], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -7332,7 +7502,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recursive_reference_discharge_driver_rebuild_region_binds_boundary_views() {
+    fn test_recursive_reference_discharge_driver_rebuild_region_binds_boundary_transforms() {
         // A boundary view is region-local state typed by the region input rather than by the caller allocation. The
         // rebuilt region receives the view's initial state as a value, its accesses discharge against that state, and
         // a published view appends its final state after every declared output, while the caller's environment stays
@@ -7341,8 +7511,10 @@ mod tests {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let view = builder.add_input(ListIrType::Reference(view_type.clone()));
         let update = builder.add_constant(ListIrValue::List(vec![5]));
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view], None).unwrap()[0];
+        builder
+            .add_instruction(ListOperation::AddUpdate(None), Vec::new(), vec![view, update], None)
+            .unwrap();
+        let snapshot = builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![view], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -7495,43 +7667,6 @@ mod tests {
     }
 
     #[test]
-    fn test_recursive_reference_discharge_driver_rebuild_region_rejects_same_type_view_output() {
-        let reference_type = ReferenceType::new(ListType { length: 2 });
-        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
-        let reference = builder.add_input(ListIrType::Reference(reference_type.clone()));
-        let view = builder
-            .add_instruction(ListOperation::Slice { offset: 0, length: 2 }, Vec::new(), vec![reference], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![view], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let context = ListDischargeContext::new(ListDestination::new());
-        let allocated = ReferenceDischargeValue::from(
-            context.bind_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap(),
-        );
-        let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
-        let regions = [program];
-        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
-        let boundary = ReferenceDischargeRegionBoundary::new(
-            &ListOperation::Call,
-            0,
-            vec![Some(allocation)],
-            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
-            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1)],
-        );
-
-        assert_eq!(
-            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err(),
-            ProgramError::MalformedProgram(format!(
-                "reference discharge cannot publish the view `ref<list<2>>` of {allocation} from region `{}`, \
-                 whose boundary carries the complete stored value `ref<list<2>>`",
-                regions[0].entry_region_ref().id(),
-            )),
-        );
-    }
-
-    #[test]
     fn test_recursive_reference_discharge_driver_rebuild_region_rejects_duplicate_added_allocations() {
         let builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let program = builder.build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), Vec::new(), Vec::new()).unwrap();
@@ -7646,9 +7781,10 @@ mod tests {
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         builder
-            .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, update], None)
+            .add_instruction(ListOperation::AddUpdate(None), Vec::new(), vec![reference, update], None)
             .unwrap();
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+        let snapshot =
+            builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -7838,16 +7974,40 @@ mod tests {
         let initial = builder.add_input(ListIrType::List(ListType { length: 4 }));
         let allocation =
             builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
-        let view = builder
-            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![allocation], None)
-            .unwrap()[0];
         let update = builder.add_constant(ListIrValue::List(vec![10, 20]));
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
+        builder
+            .add_instruction(
+                ListOperation::AddUpdate(Some(ListAlias { offset: 1, length: 2 })),
+                Vec::new(),
+                vec![allocation, update],
+                None,
+            )
+            .unwrap();
         let replacement = builder.add_constant(ListIrValue::List(vec![7, 8]));
-        builder.add_instruction(ListOperation::Write, Vec::new(), vec![view, replacement], None).unwrap();
-        let replaced =
-            builder.add_instruction(ListOperation::Swap, Vec::new(), vec![view, replacement], None).unwrap()[0];
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view], None).unwrap()[0];
+        builder
+            .add_instruction(
+                ListOperation::Write(Some(ListAlias { offset: 1, length: 2 })),
+                Vec::new(),
+                vec![allocation, replacement],
+                None,
+            )
+            .unwrap();
+        let replaced = builder
+            .add_instruction(
+                ListOperation::Swap(Some(ListAlias { offset: 1, length: 2 })),
+                Vec::new(),
+                vec![allocation, replacement],
+                None,
+            )
+            .unwrap()[0];
+        let snapshot = builder
+            .add_instruction(
+                ListOperation::Read(Some(ListAlias { offset: 1, length: 2 })),
+                Vec::new(),
+                vec![allocation],
+                None,
+            )
+            .unwrap()[0];
         let total = builder.add_instruction(ListOperation::Add, Vec::new(), vec![replaced, snapshot], None).unwrap()[0];
         let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
         let program = builder
@@ -8041,7 +8201,6 @@ mod tests {
         let reconstructed = context.allocation_reference(preserved.allocation_id()).unwrap();
         assert_eq!(reconstructed, preserved);
         assert_eq!(reconstructed.preserved(), Some(&destination_reference));
-        assert!(!reconstructed.is_view());
     }
 
     #[test]
@@ -8067,7 +8226,6 @@ mod tests {
         assert_eq!(context.is_mutated(allocation), Ok(false));
         assert_eq!(reference.r#type(), &reference_type);
         assert_eq!(reference.alias(), &ListAlias { offset: 0, length: 4 });
-        assert!(!reference.is_view());
         assert_eq!(reference.preserved(), None);
         assert_eq!(context.discharged_state(allocation), Ok(ListIrValue::List(vec![1, 2, 3, 4])));
     }
@@ -8137,91 +8295,15 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_context_alias_reference() {
-        let context = ListDischargeContext::new(ListDestination::new());
-        let reference_type = ReferenceType::new(ListType { length: 4 });
-        let reference = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2, 3, 4])).unwrap();
-        let allocation = reference.allocation_id();
-
-        // A view of a discharged allocation keeps the allocation's identity, records its alias, and never replays the
-        // view operation.
-        let view = context
-            .alias_reference(
-                &reference,
-                ListAlias { offset: 1, length: 2 },
-                ReferenceType::new(ListType { length: 2 }),
-                |_| unreachable!("the allocation is discharged"),
-            )
-            .unwrap();
-        assert_eq!(view.allocation_id(), allocation);
-        assert!(view.is_view());
-        assert_eq!(view.alias(), &ListAlias { offset: 1, length: 2 });
-        assert_eq!(view.r#type(), &ReferenceType::new(ListType { length: 2 }));
-        assert_eq!(view.preserved(), None);
-        assert_eq!(context.read(&view), Ok(ListIrValue::List(vec![2, 3])));
-
-        // A view remains a view even when it exposes the allocation's own type; consumption and region boundaries
-        // consult `is_view` rather than comparing reference types.
-        let same_type_view = context
-            .alias_reference(&reference, ListAlias { offset: 0, length: 4 }, reference_type.clone(), |_| {
-                unreachable!("the allocation is discharged")
-            })
-            .unwrap();
-        assert!(same_type_view.is_view());
-        assert_eq!(same_type_view.r#type(), reference.r#type());
-
-        // A view of a preserved allocation replays the view operation over the parent's destination value exactly once
-        // and retains the replayed reference as its own destination value.
-        let destination_reference = ListIrValue::Reference(reference_type.clone());
-        let preserved = context.bind_preserved(reference_type.clone(), destination_reference.clone()).unwrap();
-        let view_type = ReferenceType::new(ListType { length: 1 });
-        let preserved_view = context
-            .alias_reference(&preserved, ListAlias { offset: 0, length: 1 }, view_type.clone(), |parent| {
-                assert_eq!(parent, &destination_reference);
-                Ok(ListIrValue::Reference(view_type.clone()))
-            })
-            .unwrap();
-        assert_eq!(preserved_view.allocation_id(), preserved.allocation_id());
-        assert_eq!(preserved_view.preserved(), Some(&ListIrValue::Reference(view_type.clone())));
-
-        // A replayed view whose type disagrees with the requested type is rejected.
-        assert_eq!(
-            context.alias_reference(&preserved, ListAlias { offset: 0, length: 1 }, view_type, |_| {
-                Ok(ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })))
-            }),
-            Err(ProgramError::MalformedProgram(
-                "reference discharge preserved an allocation as `ref<list<2>>` but its handle exposes `ref<list<1>>`"
-                    .to_string(),
-            )),
-        );
-
-        // Aliasing a consumed allocation is rejected at the attempted use.
-        context.consume(&reference).unwrap();
-        assert_eq!(
-            context.alias_reference(&reference, ListAlias { offset: 0, length: 1 }, reference_type, |_| {
-                unreachable!("the allocation is discharged")
-            }),
-            Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}"))),
-        );
-    }
-
-    #[test]
     fn test_reference_discharge_context_read() {
         let context = ListDischargeContext::new(ListDestination::new());
         let reference_type = ReferenceType::new(ListType { length: 4 });
         let reference = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2, 3, 4])).unwrap();
-        let view = context
-            .alias_reference(
-                &reference,
-                ListAlias { offset: 1, length: 2 },
-                ReferenceType::new(ListType { length: 2 }),
-                |_| unreachable!("the allocation is discharged"),
-            )
-            .unwrap();
+        let transforms = [ListAlias { offset: 1, length: 2 }];
 
         // A complete-value handle reads the whole state and a view reads only its portion; neither marks a mutation.
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 2, 3, 4])));
-        assert_eq!(context.read(&view), Ok(ListIrValue::List(vec![2, 3])));
+        assert_eq!(context.read_through(&reference, &transforms, &[]), Ok(ListIrValue::List(vec![2, 3])));
         assert_eq!(context.is_mutated(reference.allocation_id()), Ok(false));
 
         // A preserved reference is read by replaying its source operation, never through this function.
@@ -8241,17 +8323,10 @@ mod tests {
         let reference = context
             .bind_discharged(ReferenceType::new(ListType { length: 4 }), ListIrValue::List(vec![1, 2, 3, 4]))
             .unwrap();
-        let view = context
-            .alias_reference(
-                &reference,
-                ListAlias { offset: 1, length: 2 },
-                ReferenceType::new(ListType { length: 2 }),
-                |_| unreachable!("the allocation is discharged"),
-            )
-            .unwrap();
+        let transforms = [ListAlias { offset: 1, length: 2 }];
 
         // Writing through a view replaces only its portion, and any write marks the allocation as mutated.
-        assert_eq!(context.write(&view, ListIrValue::List(vec![10, 11])), Ok(()));
+        assert_eq!(context.write_through(&reference, ListIrValue::List(vec![10, 11]), &transforms, &[]), Ok(()));
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 10, 11, 4])));
         assert_eq!(context.is_mutated(reference.allocation_id()), Ok(true));
         assert_eq!(context.write(&reference, ListIrValue::List(vec![5, 6, 7, 8])), Ok(()));
@@ -8259,7 +8334,7 @@ mod tests {
 
         // A replacement that does not fit the view is rejected by the policy and leaves the state unchanged.
         assert_eq!(
-            context.write(&view, ListIrValue::List(vec![1, 2, 3, 4])),
+            context.write_through(&reference, ListIrValue::List(vec![1, 2, 3, 4]), &transforms, &[]),
             Err(ProgramError::MalformedProgram("splice [1, 5) does not fit a list of length 4".to_string())),
         );
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![5, 6, 7, 8])));
@@ -8271,17 +8346,13 @@ mod tests {
         let reference = context
             .bind_discharged(ReferenceType::new(ListType { length: 4 }), ListIrValue::List(vec![1, 2, 3, 4]))
             .unwrap();
-        let view = context
-            .alias_reference(
-                &reference,
-                ListAlias { offset: 1, length: 2 },
-                ReferenceType::new(ListType { length: 2 }),
-                |_| unreachable!("the allocation is discharged"),
-            )
-            .unwrap();
+        let transforms = [ListAlias { offset: 1, length: 2 }];
 
         // Swapping returns the previous contents of the view and installs the replacement.
-        assert_eq!(context.swap(&view, ListIrValue::List(vec![20, 30])), Ok(ListIrValue::List(vec![2, 3])));
+        assert_eq!(
+            context.swap_through(&reference, ListIrValue::List(vec![20, 30]), &transforms, &[]),
+            Ok(ListIrValue::List(vec![2, 3]))
+        );
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 20, 30, 4])));
         assert_eq!(context.is_mutated(reference.allocation_id()), Ok(true));
     }
@@ -8292,21 +8363,14 @@ mod tests {
         let reference = context
             .bind_discharged(ReferenceType::new(ListType { length: 4 }), ListIrValue::List(vec![1, 2, 3, 4]))
             .unwrap();
-        let view = context
-            .alias_reference(
-                &reference,
-                ListAlias { offset: 1, length: 2 },
-                ReferenceType::new(ListType { length: 2 }),
-                |_| unreachable!("the allocation is discharged"),
-            )
-            .unwrap();
+        let transforms = [ListAlias { offset: 1, length: 2 }];
 
         // Accumulation adds into the view and leaves everything outside it intact.
-        assert_eq!(context.accumulate(&view, ListIrValue::List(vec![1, 1])), Ok(()));
+        assert_eq!(context.accumulate_through(&reference, ListIrValue::List(vec![1, 1]), &transforms, &[]), Ok(()));
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 3, 4, 4])));
         assert_eq!(context.is_mutated(reference.allocation_id()), Ok(true));
         assert_eq!(
-            context.accumulate(&view, ListIrValue::List(vec![1])),
+            context.accumulate_through(&reference, ListIrValue::List(vec![1]), &transforms, &[]),
             Err(ProgramError::MalformedProgram("cannot add lists of lengths 2 and 1".to_string())),
         );
     }
@@ -8317,43 +8381,14 @@ mod tests {
         let reference_type = ReferenceType::new(ListType { length: 4 });
         let reference = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2, 3, 4])).unwrap();
         let allocation = reference.allocation_id();
-        let view = context
-            .alias_reference(
-                &reference,
-                ListAlias { offset: 1, length: 2 },
-                ReferenceType::new(ListType { length: 2 }),
-                |_| unreachable!("the allocation is discharged"),
-            )
-            .unwrap();
-        let same_type_view = context
-            .alias_reference(&reference, ListAlias { offset: 0, length: 4 }, reference_type.clone(), |_| {
-                unreachable!("the allocation is discharged")
-            })
-            .unwrap();
-
-        // Consumption yields the complete stored value, so no view may perform it, even one exposing the same type.
-        assert_eq!(
-            context.consume(&view),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot consume {allocation} through the view `ref<list<2>>`; consumption \
-                 yields the complete stored value, whose reference type is `ref<list<4>>`",
-            ))),
-        );
-        assert_eq!(
-            context.consume(&same_type_view),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot consume {allocation} through the view `ref<list<4>>`; consumption \
-                 yields the complete stored value, whose reference type is `ref<list<4>>`",
-            ))),
-        );
 
         // Through the complete-value handle it yields the state and unbinds the allocation, so every later access
         // through any handle of that allocation is reported against the exact allocation.
         assert_eq!(context.consume(&reference), Ok(ListIrValue::List(vec![1, 2, 3, 4])));
         assert_eq!(context.live_allocation_ids(), Vec::new());
+
         let consumed = ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}"));
         assert_eq!(context.read(&reference), Err(consumed.clone()));
-        assert_eq!(context.read(&view), Err(consumed.clone()));
         assert_eq!(context.set_discharged_state(allocation, ListIrValue::List(vec![0; 4]), true), Err(consumed));
 
         // A preserved allocation has no state to yield; its consumption replays in the destination instead.
@@ -8473,25 +8508,6 @@ mod tests {
         );
         let preserved_allocation = preserved.try_as_reference("the preserved allocation").unwrap().allocation_id();
         assert_eq!(context.boundary_allocation(&preserved), Ok(Some(preserved_allocation)));
-
-        // A view cannot cross a region boundary, because the boundary carries the complete stored value.
-        let view = ReferenceDischargeValue::from(
-            context
-                .alias_reference(
-                    discharged_reference,
-                    ListAlias { offset: 0, length: 1 },
-                    ReferenceType::new(ListType { length: 1 }),
-                    |_| unreachable!("the allocation is discharged"),
-                )
-                .unwrap(),
-        );
-        assert_eq!(
-            context.boundary_allocation(&view),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference view `ref<list<1>>` of {discharged_allocation} cannot cross a region boundary, which requires \
-                 the complete stored value `ref<list<2>>`; create the view inside the region instead",
-            ))),
-        );
 
         // A consumed allocation is no longer live.
         context.consume(discharged_reference).unwrap();
@@ -8674,24 +8690,6 @@ mod tests {
         let reference = preserved.try_as_reference("the preserved reference").unwrap();
         let allocation = reference.allocation_id();
 
-        // A same-type view is not the reference for the allocation's complete stored value. Replaying the consuming
-        // operation therefore leaves the allocation live and reports the invalid consumption at this seam.
-        let same_type_view = ReferenceDischargeValue::from(
-            context
-                .alias_reference(reference, ListAlias { offset: 0, length: 2 }, reference_type, |value| {
-                    Ok(value.clone())
-                })
-                .unwrap(),
-        );
-        assert_eq!(
-            context.inline_region(program.entry_region_ref(), vec![same_type_view]),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot consume {allocation} through the view `ref<list<2>>`; consumption \
-                 yields the complete stored value, whose reference type is `ref<list<2>>`",
-            ))),
-        );
-        assert_eq!(context.live_allocation_ids(), vec![allocation]);
-
         // The original reference does denote the complete value. Once its destination operation has been staged,
         // the allocation entry disappears so every later access is diagnosed as a use-after-consume.
         assert!(context.inline_region(program.entry_region_ref(), vec![preserved]).is_ok());
@@ -8721,7 +8719,7 @@ mod tests {
                     .unwrap(),
             );
             let outputs = context
-                .replay_preserved_access(&ListOperation::Read, std::slice::from_ref(&preserved))
+                .replay_preserved_access(&ListOperation::Read(None), std::slice::from_ref(&preserved))
                 .unwrap()
                 .unwrap();
             assert_eq!(outputs.len(), 1);
@@ -8753,7 +8751,10 @@ mod tests {
         let discharged = ReferenceDischargeValue::from(
             context.bind_discharged(ReferenceType::new(referent), ListIrValue::List(vec![1, 2])).unwrap(),
         );
-        assert_eq!(context.replay_preserved_access(&ListOperation::Read, std::slice::from_ref(&discharged)), Ok(None));
+        assert_eq!(
+            context.replay_preserved_access(&ListOperation::Read(None), std::slice::from_ref(&discharged)),
+            Ok(None),
+        );
     }
 
     #[test]
@@ -8875,7 +8876,7 @@ mod tests {
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let replacement = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let previous = builder
-            .add_instruction(ListOperation::Swap, Vec::new(), vec![reference, replacement], None)
+            .add_instruction(ListOperation::Swap(None), Vec::new(), vec![reference, replacement], None)
             .unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
@@ -9260,7 +9261,7 @@ mod tests {
         impl<C, P> ReferenceDischargeableOperation<C, P> for CallingOperation
         where
             C: Context<Type = ArrayIrType, Operation = CallingOperation>,
-            P: ReferenceAccumulationPolicy<C, Referent = ArrayType>,
+            P: ReferenceAccumulationPolicy<C, Referent = ArrayType, Transform = ArrayReferenceTransform>,
         {
             fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
                 &self,
@@ -9293,53 +9294,43 @@ mod tests {
             }
         }
 
-        impl From<ReferenceIndexOperation> for CallingOperation {
-            fn from(operation: ReferenceIndexOperation) -> Self {
-                Self::Native(operation.into())
-            }
-        }
+        impl ReferenceAccessOperation for CallingOperation {
+            type Transform = ArrayReferenceTransform;
 
-        impl From<ReferenceDynamicIndexOperation> for CallingOperation {
-            fn from(operation: ReferenceDynamicIndexOperation) -> Self {
-                Self::Native(operation.into())
-            }
-        }
-
-        impl From<ReferenceSliceOperation> for CallingOperation {
-            fn from(operation: ReferenceSliceOperation) -> Self {
-                Self::Native(operation.into())
-            }
-        }
-
-        impl ReferenceViewOperation for CallingOperation {
-            type View = ArrayReferenceView;
-
-            fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
+            fn base_input_count(&self) -> usize {
                 match self {
-                    Self::Native(operation) => operation.reference_view(output_index),
+                    Self::Native(operation) => operation.base_input_count(),
+                    Self::Call => 0,
+                }
+            }
+
+            fn reference_access_descriptor(
+                &self,
+                input_index: usize,
+            ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+                match self {
+                    Self::Native(operation) => operation.reference_access_descriptor(input_index),
                     Self::Call => None,
                 }
             }
 
-            fn validate_reference_view(
-                view: &ArrayReferenceView,
-                source: &ArrayIrType,
-                target: &ArrayIrType,
-            ) -> Result<(), ReferenceViewValidationError> {
-                DischargeOperation::validate_reference_view(view, source, target)
-            }
-
-            fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-                context: &C,
-                view: &ArrayReferenceView,
-                source: C::Value,
-                symbols: &[C::Value],
-            ) -> Result<C::Value, ProgramError> {
-                view.reapply(context, source, symbols)
+            fn with_reference_access_transforms(
+                &self,
+                input_index: usize,
+                transforms: Vec<Self::Transform>,
+            ) -> Result<Self, ProgramError> {
+                match self {
+                    Self::Native(operation) => {
+                        operation.with_reference_access_transforms(input_index, transforms).map(Self::Native)
+                    }
+                    Self::Call => Err(ProgramError::UnsupportedOperation {
+                        message: "calls do not carry reference access paths".to_owned(),
+                    }),
+                }
             }
         }
 
-        impl ArrayReferenceViewOperation for CallingOperation {
+        impl ArrayReferenceTransformOperation for CallingOperation {
             fn from_reference_reshape(operation: ReshapeOperation) -> Self {
                 Self::Native(DischargeOperation::from_reference_reshape(operation))
             }
@@ -9369,21 +9360,29 @@ mod tests {
         macro_rules! impl_calling_operation_from_reference_primitive {
             // Lifts one reference primitive into the calling family, which is the conversion seam a primitive rule
             // spends when it replays an access to a preserved reference. A dispatch derive generates the same seam.
-            ($payload:ident) => {
-                impl From<$payload<ArrayType, ArrayIrType>> for CallingOperation {
-                    fn from(operation: $payload<ArrayType, ArrayIrType>) -> Self {
+            ($payload:ty) => {
+                impl From<$payload> for CallingOperation {
+                    fn from(operation: $payload) -> Self {
                         Self::Native(operation.into())
                     }
                 }
             };
         }
 
-        impl_calling_operation_from_reference_primitive!(ReferenceNewOperation);
-        impl_calling_operation_from_reference_primitive!(ReferenceReadOperation);
-        impl_calling_operation_from_reference_primitive!(ReferenceWriteOperation);
-        impl_calling_operation_from_reference_primitive!(ReferenceSwapOperation);
-        impl_calling_operation_from_reference_primitive!(ReferenceAddUpdateOperation);
-        impl_calling_operation_from_reference_primitive!(ReferenceFreezeOperation);
+        impl_calling_operation_from_reference_primitive!(ReferenceNewOperation<ArrayType, ArrayIrType>);
+        impl_calling_operation_from_reference_primitive!(
+            ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>
+        );
+        impl_calling_operation_from_reference_primitive!(
+            ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>
+        );
+        impl_calling_operation_from_reference_primitive!(
+            ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>
+        );
+        impl_calling_operation_from_reference_primitive!(
+            ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>
+        );
+        impl_calling_operation_from_reference_primitive!(ReferenceFreezeOperation<ArrayType, ArrayIrType>);
 
         // The callee mutates the allocation it receives and returns only the old snapshot, so its declared boundary
         // hides the final state that the call target needs after discharge.
@@ -9471,7 +9470,8 @@ mod tests {
     fn test_program_discharge_references_rejects_an_oversized_capture_prefix() {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        let observed = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+        let observed =
+            builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -9527,7 +9527,7 @@ mod tests {
         let targets = lifted.reference_discharge_targets(1).unwrap();
         assert_eq!(targets, vec![ReferenceDischargeTarget::External(ReferenceSource::Capture { index: 0 })]);
 
-        let discharged = lifted.discharge_references_in_capture_lifted_program::<ListReferenceDischarge>(1).unwrap();
+        let discharged = lifted.discharge_references_in_capture_lifted_program(1).unwrap();
         assert_eq!(discharged.capture_count(), 1);
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(
@@ -9558,9 +9558,13 @@ mod tests {
         let pipeline = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let kernel = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        let observed = builder.add_instruction(ListOperation::Read, Vec::new(), vec![kernel], None).unwrap()[0];
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![pipeline, update], None).unwrap();
-        builder.add_instruction(ListOperation::Swap, Vec::new(), vec![kernel, observed], None).unwrap();
+        let observed = builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![kernel], None).unwrap()[0];
+        builder
+            .add_instruction(ListOperation::AddUpdate(None), Vec::new(), vec![pipeline, update], None)
+            .unwrap();
+        builder
+            .add_instruction(ListOperation::Swap(None), Vec::new(), vec![kernel, observed], None)
+            .unwrap();
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
@@ -9624,10 +9628,16 @@ mod tests {
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![pipeline, step], None)
             .unwrap();
-        let element =
-            builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![kernel], None).unwrap()[0];
         let previous = builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![element, step], None)
+            .add_instruction(
+                ReferenceSwapOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceTransformIndex::Static(1),
+                }]),
+                Vec::new(),
+                vec![kernel, step],
+                None,
+            )
             .unwrap()[0];
         let pipeline_final =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
@@ -9653,8 +9663,8 @@ mod tests {
         );
         let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
 
-        // The selected allocation disappeared into threaded array state, while the unselected one, its view, its swap,
-        // and its freeze all survive as the reference operations the source performed. Neither allocation is
+        // The selected allocation disappeared into threaded array state, while the unselected allocation, its viewed
+        // swap, and its freeze survive as the reference operations the source performed. Neither allocation is
         // caller-owned, so the mixed program reports no external-reference bindings and keeps exactly its source
         // boundary.
         assert_eq!(discharged.output_count(), 3);
@@ -9665,10 +9675,9 @@ mod tests {
                 lambda %0:f32[], %1:f32[3], %2:f32[] .
                 let %3:ref<f32[3]> = reference_new %1
                     %4:f32[] = add %0 %2
-                    %5:ref<f32[]> = reference_index [axis=0, index=1] %3
-                    %6:f32[] = reference_swap %5 %2
-                    %7:f32[3] = reference_freeze %3
-                in (%6, %4, %7)"},
+                    %5:f32[] = reference_swap [transforms=[index(axis=0, index=1)]] %3 %2
+                    %6:f32[3] = reference_freeze %3
+                in (%5, %4, %6)"},
         );
 
         // Eager reference semantics stay the oracle: the mixed program computes exactly what the source program does.
@@ -9814,18 +9823,21 @@ mod tests {
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let allocation =
             builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
-        let view = builder
-            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![allocation], None)
-            .unwrap()[0];
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
+        builder
+            .add_instruction(
+                ListOperation::AddUpdate(Some(ListAlias { offset: 1, length: 2 })),
+                Vec::new(),
+                vec![allocation, update],
+                None,
+            )
+            .unwrap();
         let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        // Selecting nothing preserves the allocation, so the whole reference language survives: the view operation is
-        // replayed too, and the resulting view consumes the exact reference produced by that replay rather than
-        // replaying the chain again at the access.
+        // Selecting nothing preserves the allocation and its viewed access. The access keeps the path in its payload
+        // and directly names the allocation returned by the replayed constructor.
         let discharged = source.clone().partially_discharge_references(0, &[]);
         let discharged = discharged.unwrap();
         assert_eq!(discharged.output_count(), 1);
@@ -9835,10 +9847,9 @@ mod tests {
             indoc! {"
                 lambda %0:list<4>, %1:list<2> .
                 let %2:ref<list<4>> = list.reference_new %0
-                    %3:ref<list<2>> = list.slice %2
-                    () = list.add_update %3 %1
-                    %4:list<4> = list.freeze %2
-                in (%4)"},
+                    () = list.add_update [transforms=[slice(offset=1, length=2)]] %2 %1
+                    %3:list<4> = list.freeze %2
+                in (%3)"},
         );
 
         // Selecting the allocation instead discharges it, which is the everything-selected case and therefore has to
@@ -9909,10 +9920,11 @@ mod tests {
         let mut callee_builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let callee_state = callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let callee_kernel = callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        let observed =
-            callee_builder.add_instruction(ListOperation::Read, Vec::new(), vec![callee_kernel], None).unwrap()[0];
+        let observed = callee_builder
+            .add_instruction(ListOperation::Read(None), Vec::new(), vec![callee_kernel], None)
+            .unwrap()[0];
         callee_builder
-            .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![callee_state, observed], None)
+            .add_instruction(ListOperation::AddUpdate(None), Vec::new(), vec![callee_state, observed], None)
             .unwrap();
         let callee = callee_builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder; 2], vec![Placeholder])
@@ -9967,10 +9979,10 @@ mod tests {
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let origin = |name: &str| Some(Provenance::scope(ProvenanceScope::new(name), Provenance::unknown()));
         builder
-            .add_instruction(ListOperation::Write, Vec::new(), vec![reference, update], origin("probe_write"))
+            .add_instruction(ListOperation::Write(None), Vec::new(), vec![reference, update], origin("probe_write"))
             .unwrap();
         let observed = builder
-            .add_instruction(ListOperation::Read, Vec::new(), vec![reference], origin("probe_read"))
+            .add_instruction(ListOperation::Read(None), Vec::new(), vec![reference], origin("probe_read"))
             .unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder; 2], vec![Placeholder])
@@ -9991,7 +10003,7 @@ mod tests {
         // against the program rather than surfacing later as an allocation that never appeared.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        let observed = builder.add_instruction(ListOperation::Read, Vec::new(), vec![external], None).unwrap()[0];
+        let observed = builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![external], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -10015,9 +10027,7 @@ mod tests {
         // Selecting nothing preserves the capture as a reference and explicitly threads it into the nested region.
         let closed = closed_list_program_with_nested_reference_capture();
         let lifted = closed.to_program_with_lifted_captures().unwrap();
-        let discharged = lifted
-            .partially_discharge_references_in_capture_lifted_program::<ListReferenceDischarge>(1, &[])
-            .unwrap();
+        let discharged = lifted.partially_discharge_references_in_capture_lifted_program(1, &[]).unwrap();
 
         assert_eq!(discharged.capture_count(), 1);
         assert_eq!(discharged.output_count(), 1);
@@ -10040,7 +10050,7 @@ mod tests {
     #[test]
     fn test_closed_program_discharge_references() {
         let closed = closed_list_program_with_nested_reference_capture();
-        let discharged = closed.discharge_references::<ListReferenceDischarge>().unwrap();
+        let discharged = closed.discharge_references().unwrap();
 
         assert_eq!(discharged.capture_count(), 1);
         assert_eq!(discharged.output_count(), 1);
@@ -10159,7 +10169,7 @@ mod tests {
         let context = ListDischargeContext::new(ListDestination::new());
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let input = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 1 })));
-        let read = builder.add_instruction(ListOperation::Read, Vec::new(), vec![input], None).unwrap()[0];
+        let read = builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![input], None).unwrap()[0];
         let stateful = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![read], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -10224,7 +10234,9 @@ mod tests {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let input = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let reference = builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![input], None).unwrap()[0];
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, input], None).unwrap();
+        builder
+            .add_instruction(ListOperation::AddUpdate(None), Vec::new(), vec![reference, input], None)
+            .unwrap();
         let output = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![reference], None).unwrap()[0];
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -10268,8 +10280,8 @@ mod tests {
         assert_eq!(
             discharge_local_reference_operation(&ListOperation::Call, &context, &driver, &[reference.clone().into()]),
             Err(ProgramError::UnsupportedOperation {
-                message: "`list.call` does not thread external references through discharge, but operand 0 is a \
-                          reference; pass reference-free operands or discharge external references first"
+                message: "`list.call` does not thread external references through discharge, but input 0 is a \
+                          reference; pass reference-free inputs or discharge external references first"
                     .to_string(),
             }),
         );
@@ -10281,7 +10293,7 @@ mod tests {
     fn test_discharge_local_reference_operation_rejects_reference_region_inputs() {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        let output = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+        let output = builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![reference], None).unwrap()[0];
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -10297,7 +10309,7 @@ mod tests {
             ),
             Err(ProgramError::UnsupportedOperation {
                 message: "`list.call` does not thread external references through discharge, but input 0 of region 0 \
-                          is a reference; pass reference-free operands or discharge external references first"
+                          is a reference; pass reference-free inputs or discharge external references first"
                     .to_string(),
             }),
         );
@@ -10307,7 +10319,7 @@ mod tests {
     fn test_discharge_local_reference_operation_rejects_captured_references() {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let captured = builder.add_constant(ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })));
-        let output = builder.add_instruction(ListOperation::Read, Vec::new(), vec![captured], None).unwrap()[0];
+        let output = builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![captured], None).unwrap()[0];
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -10359,8 +10371,11 @@ mod tests {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        builder.add_instruction(ListOperation::Write, Vec::new(), vec![reference, update], None).unwrap();
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(ListOperation::Write(None), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let snapshot =
+            builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![reference], None).unwrap()[0];
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -10475,10 +10490,10 @@ mod tests {
         let observed = callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let replacement = callee_builder.add_constant(ListIrValue::List(vec![7, 8]));
         callee_builder
-            .add_instruction(ListOperation::Write, Vec::new(), vec![written, replacement], None)
+            .add_instruction(ListOperation::Write(None), Vec::new(), vec![written, replacement], None)
             .unwrap();
         let snapshot =
-            callee_builder.add_instruction(ListOperation::Read, Vec::new(), vec![observed], None).unwrap()[0];
+            callee_builder.add_instruction(ListOperation::Read(None), Vec::new(), vec![observed], None).unwrap()[0];
         let callee = callee_builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -10532,7 +10547,7 @@ mod tests {
             callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = callee_builder.add_input(ListIrType::List(ListType { length: 2 }));
         let previous = callee_builder
-            .add_instruction(ListOperation::Swap, Vec::new(), vec![callee_reference, update], None)
+            .add_instruction(ListOperation::Swap(None), Vec::new(), vec![callee_reference, update], None)
             .unwrap()[0];
         let callee = callee_builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])

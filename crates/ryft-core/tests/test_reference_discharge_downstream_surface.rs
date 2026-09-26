@@ -454,10 +454,10 @@ impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>> Refe
     for RegisterReferenceDischarge
 {
     type Referent = RegisterType;
-    type Alias = ReferenceTransformPath<RegisterTransform, C::Value>;
     type Transform = RegisterTransform;
+    type Alias = ReferenceTransformPath<RegisterTransform, C::Value>;
 
-    fn compose_transforms(
+    fn apply_transforms(
         _context: &C,
         alias: &Self::Alias,
         transforms: &[RegisterTransform],
@@ -3004,13 +3004,13 @@ mod custom_array_transforms {
         type Referent = ArrayType;
         type Transform = CustomTransform;
         type Alias = ArrayReferenceTransformPath<C::Value>;
-        fn compose_transforms(
+        fn apply_transforms(
             context: &C,
             alias: &Self::Alias,
             transforms: &[CustomTransform],
             bindings: &[C::Value],
         ) -> Result<Self::Alias, ProgramError> {
-            ArrayReferenceDischarge::compose_transforms(
+            ArrayReferenceDischarge::apply_transforms(
                 context,
                 alias,
                 &transforms.iter().map(|transform| transform.0.clone()).collect::<Vec<_>>(),
