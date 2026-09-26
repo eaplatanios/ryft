@@ -602,7 +602,7 @@ impl_non_transposable_operation!(<T> CustomVjpOperation<T> where T: Differentiab
 /// forward, and backward closures together with a phantom marker pinning the tracer-tree types named by those closure
 /// signatures. Refer to the documentation of the [`custom_vjp`] function for the calling convention, the tracing
 /// semantics, and when to reach for a custom VJP.
-pub struct CustomVjp<Primal, Forward, Backward, Inputs, Outputs, Residuals> {
+pub struct CustomVjp<Input, Output, Residual, Primal, Forward, Backward> {
     /// Closure computing the primal output tree from the primal input tree.
     primal: Primal,
 
@@ -616,17 +616,19 @@ pub struct CustomVjp<Primal, Forward, Backward, Inputs, Outputs, Residuals> {
     non_differentiated_count: usize,
 
     /// Phantom marker pinning the input, output, and residual tracer-tree types named by the closure signatures. The
-    /// [`Domain`] whose universe the rules are traced into is recovered from the values passed to [`CustomVjp::call`],
-    /// and so the wrapper stores neither a domain value nor a domain type witness.
-    marker: PhantomData<fn() -> (Inputs, Outputs, Residuals)>,
+    /// [`Context`] whose universe the rules are traced into is recovered from the values passed to
+    /// [`CustomVjp::call`], and so the wrapper stores neither a context value nor a context type witness.
+    marker: PhantomData<fn() -> (Input, Output, Residual)>,
 }
 
-impl<Primal, Forward, Backward, Inputs, Outputs, Residuals>
-    CustomVjp<Primal, Forward, Backward, Inputs, Outputs, Residuals>
-where
-    Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
-    Forward: Fn(Inputs) -> Result<(Outputs, Residuals), ProgramError>,
-    Backward: Fn(Residuals, Outputs) -> Result<Inputs, ProgramError>,
+impl<
+    Input,
+    Output,
+    Residual,
+    Primal: Fn(Input) -> Result<Output, ProgramError>,
+    Forward: Fn(Input) -> Result<(Output, Residual), ProgramError>,
+    Backward: Fn(Residual, Output) -> Result<Input, ProgramError>,
+> CustomVjp<Input, Output, Residual, Primal, Forward, Backward>
 {
     /// Declares the leading `non_differentiated_count` flattened leaves of the input tree as non-differentiated
     /// _plumbing_ inputs, which is the high-level counterpart of [`CustomVjpOperation::with_non_differentiated_count`].
@@ -641,7 +643,7 @@ where
     /// documentation of the [`custom_vjp`] function for the tracing semantics and for how the transforms treat the
     /// staged call.
     ///
-    /// The [`Domain`] `D` whose universe the three closures are traced into is the
+    /// The [`Context`] `C` whose universe the three closures are traced into is the
     /// [`DispatchDomain`](Value::DispatchDomain) of the values in `input`, which is exactly the context the call is
     /// staged into. It is therefore never named at a construction or call site, while the stored closures still pin
     /// the tracer trees that this universe must produce.
@@ -653,24 +655,24 @@ where
     /// residual that is not a non-differentiated input forwarded by identity, or when the staged [`CustomVjpOperation`]
     /// rejects the traced programs (e.g., because the rule signatures do not match the primal signature or because the
     /// call violates the reference contract).
-    pub fn call<D, V, InputValues>(
+    pub fn call<C, V, InputValues>(
         &self,
         input: InputValues,
-    ) -> Result<<Outputs::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
+    ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
-        D: Context<Type: DifferentiableType, Value = V>,
-        V: Value<Type = D::Type, DispatchDomain = D>,
-        D::Operation: From<CustomVjpOperation<D::Type>>,
-        Inputs: Parameterized<DomainTracer<D>>,
-        Inputs::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-        Outputs: Parameterized<DomainTracer<D>>,
-        Outputs::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant> + ParameterizedFamily<V>,
-        Residuals: Parameterized<DomainTracer<D>>,
-        Residuals::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-        Inputs::To<D::Type>: Clone + Parameterized<D::Type, Family = Inputs::Family, To<DomainTracer<D>> = Inputs>,
-        Outputs::To<D::Type>: Clone + Parameterized<D::Type, Family = Outputs::Family, To<DomainTracer<D>> = Outputs>,
-        Residuals::To<D::Type>: Parameterized<D::Type, Family = Residuals::Family, To<DomainTracer<D>> = Residuals>,
-        InputValues: Parameterized<V, Family = Inputs::Family, To<D::Type> = Inputs::To<D::Type>>,
+        C: Context<Type: DifferentiableType, Value = V>,
+        V: Value<Type = C::Type, DispatchDomain = C>,
+        C::Operation: From<CustomVjpOperation<C::Type>>,
+        Input: Parameterized<DomainTracer<C>>,
+        Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
+        Output: Parameterized<DomainTracer<C>>,
+        Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<V>,
+        Residual: Parameterized<DomainTracer<C>>,
+        Residual::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
+        Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input>,
+        Output::To<C::Type>: Clone + Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
+        Residual::To<C::Type>: Parameterized<C::Type, Family = Residual::Family, To<DomainTracer<C>> = Residual>,
+        InputValues: Parameterized<V, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
     {
         let mut input_values = Vec::new();
         let input_types = input
@@ -685,9 +687,8 @@ where
         };
         let non_differentiated_count = self.non_differentiated_count;
         validate_non_differentiated_count(CUSTOM_VJP_OPERATION_NAME, non_differentiated_count, input_values.len())?;
-        let (output_types, primal) = D::trace(&self.primal, input_types.clone())?;
-        let (forward_output_types, forward) = D::trace(&self.forward, input_types.clone())?;
-        let (_, residual_types) = forward_output_types;
+        let (output_types, primal) = C::trace(&self.primal, input_types.clone())?;
+        let ((_, residual_types), forward) = C::trace(&self.forward, input_types.clone())?;
         // A reference-typed residual must be an input forwarded by identity rather than a computed value: a reference
         // allocated by the forward rule would reach the backward rule as a residual whose mutation nothing outside the
         // rule observes, so the traced forward program is checked here, where its atoms are visible, while the staged
@@ -715,15 +716,15 @@ where
         // staged rule produces exactly one cotangent per differentiated input.
         let non_differentiated_types =
             input_types.parameters().take(non_differentiated_count).cloned().collect::<Vec<_>>();
-        let (_, backward) = D::trace(
-            |(_, residuals, cotangents): (Vec<DomainTracer<D>>, Residuals, Outputs)| {
+        let (_, backward) = C::trace(
+            |(_, residuals, cotangents): (Vec<DomainTracer<C>>, Residual, Output)| {
                 let cotangents = (self.backward)(residuals, cotangents)?;
                 Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
             },
             (non_differentiated_types, residual_types, output_cotangent_types),
         )?;
         let operation =
-            D::Operation::from(CustomVjpOperation::new().with_non_differentiated_count(non_differentiated_count));
+            C::Operation::from(CustomVjpOperation::new().with_non_differentiated_count(non_differentiated_count));
         // The call binds through whatever context the input values flow through (e.g., a staging trace, a batching
         // context, or a differentiation context), so the batching or differentiation rule of the bound operation fires
         // and `custom_vjp` composes with those transforms.
@@ -785,7 +786,7 @@ where
 /// as a residual in `r` when `backward` needs it and for which `backward` returns a zero cotangent in `x̄`.
 ///
 /// Because [`custom_vjp`] builds a reusable function before any input is known, the `primal` closure must annotate
-/// the tracer type of its input (e.g., `|x: DomainTracer<D>| ...`), which then also fixes the input types of
+/// the tracer type of its input (e.g., `|x: DomainTracer<C>| ...`), which then also fixes the input types of
 /// `forward` and, through the outputs and residuals that `forward` returns, those of `backward`.
 /// [`custom_derivative_at`](crate::custom_derivative_at) instead stages the same rule at a known input, which lets all
 /// three closures infer their parameter types from that input.
@@ -820,7 +821,7 @@ where
 ///
 /// # Tracing semantics
 ///
-/// Nothing is traced at construction time. Each [`CustomVjp::call`] recovers the tracing [`Domain`] from the values it
+/// Nothing is traced at construction time. Each [`CustomVjp::call`] recovers the tracing [`Context`] from the values it
 /// is called with, reads the input types off those values, traces the closures into programs specialized to those
 /// types, validates the rule signatures, and stages one [`CustomVjpOperation`] into the context through which those
 /// values flow. The primal closure is kept separate from the forward closure for efficiency rather than necessity: an
@@ -848,15 +849,15 @@ where
 ///   - `primal`: Closure implementing `f(x) = y` for ordinary evaluation.
 ///   - `forward`: Closure implementing `x ↦ (y, r)` for reverse-mode residual production.
 ///   - `backward`: Closure implementing `(r, ȳ) ↦ x̄ = J_f(x)ᵀ · ȳ`.
-pub fn custom_vjp<Primal, Forward, Backward, Inputs, Outputs, Residuals>(
+pub fn custom_vjp<Input, Output, Residual, Primal, Forward, Backward>(
     primal: Primal,
     forward: Forward,
     backward: Backward,
-) -> CustomVjp<Primal, Forward, Backward, Inputs, Outputs, Residuals>
+) -> CustomVjp<Input, Output, Residual, Primal, Forward, Backward>
 where
-    Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
-    Forward: Fn(Inputs) -> Result<(Outputs, Residuals), ProgramError>,
-    Backward: Fn(Residuals, Outputs) -> Result<Inputs, ProgramError>,
+    Primal: Fn(Input) -> Result<Output, ProgramError>,
+    Forward: Fn(Input) -> Result<(Output, Residual), ProgramError>,
+    Backward: Fn(Residual, Output) -> Result<Input, ProgramError>,
 {
     CustomVjp { primal, forward, backward, non_differentiated_count: 0, marker: PhantomData }
 }

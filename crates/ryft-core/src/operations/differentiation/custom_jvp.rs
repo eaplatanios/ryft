@@ -419,11 +419,11 @@ impl<
 impl_non_transposable_operation!(<T> CustomJvpOperation<T> where T: DifferentiableType);
 
 /// Function with a user-supplied Jacobian-Vector Product (JVP) rule, built by [`custom_jvp`]. It stores the primal and
-/// JVP closures together with a phantom marker pinning the tracer-tree types named by those closure signatures. Refer
-/// to the documentation of the [`custom_jvp`] function for the calling convention, the tracing semantics, and when to
-/// reach for a custom JVP.
-pub struct CustomJvp<Primal, Jvp, Input, Output> {
-    /// Closure computing the primal output tree from the primal input tree.
+/// JVP closures together with a phantom marker pinning the tracer types named by those closure signatures. Refer to the
+/// documentation of the [`custom_jvp`] function for the calling convention, the tracing semantics, and when to reach
+/// for a custom JVP.
+pub struct CustomJvp<Input, Output, Primal, Jvp> {
+    /// Closure computing the primal output value from the primal input value.
     primal: Primal,
 
     /// Closure computing `(outputs, output_tangents)` from `(inputs, input_tangents)`.
@@ -432,22 +432,20 @@ pub struct CustomJvp<Primal, Jvp, Input, Output> {
     /// Number of leading flattened input leaves that parameterize the call without being differentiated.
     non_differentiated_count: usize,
 
-    /// Phantom marker pinning the input and output tracer-tree types named by the closure signatures. The [`Domain`]
+    /// Phantom marker pinning the input and output tracer types named by the closure signatures. The [`Context`]
     /// whose universe the rules are traced into is recovered from the values passed to [`CustomJvp::call`], and so
-    /// the wrapper stores neither a domain value nor a domain type witness.
+    /// the wrapper stores neither a context value nor a context type witness.
     marker: PhantomData<fn() -> (Input, Output)>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
-    Primal: Fn(Input) -> Result<Output, ProgramError>,
-    Jvp: Fn(Input, Input) -> Result<(Output, Output), ProgramError>,
     Input,
     Output,
-> CustomJvp<Primal, Jvp, Input, Output>
+    Primal: Fn(Input) -> Result<Output, ProgramError>,
+    Jvp: Fn(Input, Input) -> Result<(Output, Output), ProgramError>,
+> CustomJvp<Input, Output, Primal, Jvp>
 {
-    /// Declares the leading `non_differentiated_count` flattened leaves of the input tree as non-differentiated
+    /// Declares the leading `non_differentiated_count` flattened leaves of the input value as non-differentiated
     /// _plumbing_ inputs, which is the high-level counterpart of [`CustomJvpOperation::with_non_differentiated_count`].
     /// Refer to the documentation of the [`custom_jvp`] function for the semantics of non-differentiated inputs.
     #[inline]
@@ -456,37 +454,38 @@ impl<
         self
     }
 
-    /// Stages this custom-JVP function on the provided tracer `input` tree and returns its output tree. Refer to the
-    /// documentation of the [`custom_jvp`] function for the tracing semantics and for how the transforms treat the
-    /// staged call.
+    /// Stages this custom Jacobian-Vector Product (JVP) function on the provided tracer `input` value and returns its
+    /// output value. Refer to the documentation of the [`custom_jvp`] function for the tracing semantics and for how
+    /// the transforms treat the staged call.
     ///
-    /// The [`Domain`] `D` whose universe the two closures are traced into is the
+    /// The [`Context`] `C` whose universe the two closures are traced into is the
     /// [`DispatchDomain`](Value::DispatchDomain) of the values in `input`, which is exactly the context the call is
     /// staged into. It is therefore never named at a construction or call site, while the stored closures still pin
-    /// the tracer trees that this universe must produce.
+    /// the tracer values that this universe must produce.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] when `input` has no leaves, when the non-differentiated count exceeds the number of
-    /// input leaves, when tracing either closure fails, when the JVP closure uses the tangent placeholder of a
+    /// Returns a [`ProgramError`] when `input` has no leaves, when the non-differentiated count exceeds the number
+    /// of input leaves, when tracing either closure fails, when the JVP closure uses the tangent placeholder of a
     /// non-differentiated input, or when the staged [`CustomJvpOperation`] rejects the traced programs (e.g., because
     /// the JVP rule signature does not match the primal signature or because the call violates the reference
     /// contract).
-    pub fn call<D, V, InputValues>(
+    pub fn call<
+        V: Value<Type = C::Type, DispatchDomain = C>,
+        C: Context<Type: DifferentiableType, Value = V>,
+        InputValues: Parameterized<V, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
+    >(
         &self,
         input: InputValues,
-    ) -> Result<<Output::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
+    ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
-        D: Context<Type: DifferentiableType, Value = V>,
-        V: Value<Type = D::Type, DispatchDomain = D>,
-        D::Operation: From<CustomJvpOperation<D::Type>>,
-        Input: Parameterized<DomainTracer<D>>,
-        Input::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-        Output: Parameterized<DomainTracer<D>>,
-        Output::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant> + ParameterizedFamily<V>,
-        Input::To<D::Type>: Clone + Parameterized<D::Type, Family = Input::Family, To<DomainTracer<D>> = Input>,
-        Output::To<D::Type>: Parameterized<D::Type, Family = Output::Family, To<DomainTracer<D>> = Output>,
-        InputValues: Parameterized<V, Family = Input::Family, To<D::Type> = Input::To<D::Type>>,
+        C::Operation: From<CustomJvpOperation<C::Type>>,
+        Input: Parameterized<DomainTracer<C>>,
+        Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
+        Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input>,
+        Output: Parameterized<DomainTracer<C>>,
+        Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<V>,
+        Output::To<C::Type>: Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
     {
         let mut input_values = Vec::new();
         let input_types = input
@@ -499,32 +498,37 @@ impl<
         let Some(first) = input_values.first() else {
             return Err(TypeError::invalid(format!("{CUSTOM_JVP_OPERATION_NAME} requires at least one input")).into());
         };
+
         validate_non_differentiated_count(
             CUSTOM_JVP_OPERATION_NAME,
             self.non_differentiated_count,
             input_values.len(),
         )?;
-        let (_, primal) = D::trace(&self.primal, input_types.clone())?;
+
+        let (_, primal) = C::trace(&self.primal, input_types.clone())?;
         let input_tangent_types = input_types.clone().try_map_parameters(|r#type| r#type.tangent())?;
-        let (output_types, jvp) = D::trace(|(x, t)| (self.jvp)(x, t), (input_types, input_tangent_types))?;
+        let ((output_types, _), jvp) = C::trace(|(x, t)| (self.jvp)(x, t), (input_types, input_tangent_types))?;
         let jvp = without_non_differentiated_tangent_inputs(
             jvp.into_flat_program(),
             input_values.len(),
             self.non_differentiated_count,
         )?;
         let operation =
-            D::Operation::from(CustomJvpOperation::new().with_non_differentiated_count(self.non_differentiated_count));
+            C::Operation::from(CustomJvpOperation::new().with_non_differentiated_count(self.non_differentiated_count));
+
         // The call binds through whatever context the input values flow through (e.g., a staging trace, a batching
         // context, or a differentiation context), so the batching or differentiation rule of the bound operation fires
         // and `custom_jvp` composes with those transforms.
         let context = first.dispatch_domain();
         let outputs = context.bind(operation, vec![primal.into_flat_program(), jvp], &input_values)?;
-        let output_structure = output_types.0.parameter_structure();
+        let output_structure = output_types.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
 
-/// Creates a [`CustomJvp`] function from a primal closure and a Jacobian-Vector Product (JVP) closure over trees of
+// TODO(eaplatanios): Review from here onwards.
+
+/// Creates a [`CustomJvp`] function from a primal closure and a Jacobian-Vector Product (JVP) closure over values of
 /// [`DomainTracer`]s. This is the analogue of JAX's
 /// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
 /// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
@@ -536,10 +540,10 @@ impl<
 /// jvp:    (x, ẋ) ↦ (y, ẏ) = (f(x), J_f(x) · ẋ)
 /// ```
 ///
-/// Thus, `primal` receives the input tracer tree `x` and returns the output tracer tree `y`. `jvp` receives `x` and an
-/// input-tangent tree `ẋ`, then returns the primal output `y` together with the Jacobian-vector product
-/// `ẏ = J_f(x) · ẋ`, which must be linear in `ẋ`. The tangent trees have the same parameter structures as their
-/// corresponding primal trees, and Ryft validates these structural and type relationships when it traces the closures.
+/// Thus, `primal` receives the input tracer value `x` and returns the output tracer value `y`. `jvp` receives `x` and
+/// an input-tangent value `ẋ`, then returns the primal output `y` together with the Jacobian-vector product
+/// `ẏ = J_f(x) · ẋ`, which must be linear in `ẋ`. The tangent values have the same parameter structures as their
+/// corresponding primal values, and Ryft validates these structural and type relationships when it traces the closures.
 ///
 /// # When to use
 ///
@@ -554,14 +558,14 @@ impl<
 ///
 /// # Calling convention
 ///
-/// Both closures operate on [`Parameterized`] trees of [`DomainTracer`]s (i.e., Ryft's analogue of JAX pytrees), so
+/// Both closures operate on [`Parameterized`] values of [`DomainTracer`]s (i.e., Ryft's analogue of JAX pytrees), so
 /// `x` and `y` may each be a single tracer, a tuple, or any other parameterized structure. Static non-differentiated
 /// configuration should be captured by both closures. A dynamic value should remain an explicit input, either as a
 /// non-differentiated input (see below) or as an ordinary input whose tangent is present in `ẋ` and which a rule that
 /// treats the value as a parameter ignores when constructing `ẏ`.
 ///
 /// Because [`custom_jvp`] builds a reusable function before any input is known, the `primal` closure must annotate
-/// the tracer type of its input (e.g., `|x: DomainTracer<D>| ...`), which then also fixes the input types of the
+/// the tracer type of its input (e.g., `|x: DomainTracer<C>| ...`), which then also fixes the input types of the
 /// `jvp` closure. [`custom_derivative_at`](crate::custom_derivative_at) instead stages the same rule at a known input,
 /// which lets both closures infer their parameter types from that input.
 ///
@@ -569,7 +573,7 @@ impl<
 ///
 /// [`CustomJvp::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
 /// parameterizes the call without being differentiated, which is the analogue of JAX's `nondiff_argnums`. Plumbing
-/// leaves reach both closures at their usual positions, and the `jvp` closure keeps receiving a full `ẋ` tree so that
+/// leaves reach both closures at their usual positions, and the `jvp` closure keeps receiving a full `ẋ` value so that
 /// its signature mirrors the primal signature. However, the tangent leaves of plumbing inputs are placeholders that
 /// the rule must not use, because the staged [`CustomJvpOperation`] has no tangent slot for non-differentiated inputs.
 /// A rule that consumes or returns such a placeholder is rejected when it is traced, and differentiating the call with
@@ -588,7 +592,7 @@ impl<
 ///
 /// # Tracing semantics
 ///
-/// Nothing is traced at construction time. Each [`CustomJvp::call`] recovers the tracing [`Domain`] from the values it
+/// Nothing is traced at construction time. Each [`CustomJvp::call`] recovers the tracing [`Context`] from the values it
 /// is called with, reads the input types off those values, traces both closures into programs specialized to those
 /// types, validates the rule signature, and stages one [`CustomJvpOperation`] into the context through which those
 /// values flow. The primal closure is kept separate from the JVP closure for efficiency rather than necessity: the JVP
@@ -613,10 +617,10 @@ impl<
 ///   - `primal`: Closure implementing `f(x) = y`.
 ///   - `jvp`: Closure implementing `(x, ẋ) ↦ (y, ẏ)`, where `ẏ = J_f(x) · ẋ`.
 #[inline]
-pub fn custom_jvp<Primal, Jvp, Inputs, Outputs>(primal: Primal, jvp: Jvp) -> CustomJvp<Primal, Jvp, Inputs, Outputs>
+pub fn custom_jvp<Input, Output, Primal, Jvp>(primal: Primal, jvp: Jvp) -> CustomJvp<Input, Output, Primal, Jvp>
 where
-    Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
-    Jvp: Fn(Inputs, Inputs) -> Result<(Outputs, Outputs), ProgramError>,
+    Primal: Fn(Input) -> Result<Output, ProgramError>,
+    Jvp: Fn(Input, Input) -> Result<(Output, Output), ProgramError>,
 {
     CustomJvp { primal, jvp, non_differentiated_count: 0, marker: PhantomData }
 }
@@ -2012,7 +2016,7 @@ pub(crate) mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
 
         // The leading counter is plumbing: it reaches both closures at its usual position, and the rule closure keeps
-        // receiving a full tangent tree whose counter leaf is a placeholder that it leaves unused.
+        // receiving a full tangent value whose counter leaf is a placeholder that it leaves unused.
         let function = custom_jvp(
             |(counter, x): (DomainTracer<ArrayIrContext>, DomainTracer<ArrayIrContext>)| {
                 counter.add_update(&x)?;
