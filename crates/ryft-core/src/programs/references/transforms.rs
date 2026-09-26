@@ -259,13 +259,11 @@ impl<Transform: ReferenceTransform, Binding> BoundReferenceTransform<Transform, 
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Sequence of [`BoundReferenceTransform`]s from a reference root to one derived reference (i.e., a view), in the order
-/// they are applied. `Transform` is the type of each transform, such as
+/// Sequence of [`BoundReferenceTransform`]s from a reference root to one derived reference
+/// (i.e., a view), in the order they are applied. `Transform` is the type of each transform, such as
 /// [`ArrayReferenceTransform`](crate::ArrayReferenceTransform), and `Binding` represents the inputs needed by a
-/// symbolic transform. Each [`BoundReferenceTransform`] pairs a `Transform` with a vector of `Binding`s. The path
-/// stores these bound transforms, but neither the root allocation nor its identity;
+/// symbolic transform. Each [`BoundReferenceTransform`] pairs a `Transform` with a vector of `Binding`s.
+/// The path stores these bound transforms, but neither the root allocation nor its identity. Instead,
 /// [`ReferenceAnalysis`](crate::ReferenceAnalysis) identifies the root when analyzing a [`Program`](crate::Program).
 ///
 /// For example, `root[row][column]` produces two transforms: the first addresses a row in the root, and the second
@@ -274,10 +272,9 @@ impl<Transform: ReferenceTransform, Binding> BoundReferenceTransform<Transform, 
 /// discharge, `Binding = C::Value` stores their values in the reconstruction context instead, so the same path
 /// traversal can reapply the transforms without looking up source program identities.
 ///
-/// Eager reference handles resolve indices immediately into static transforms and use
-/// [`NoReferenceTransformBinding`]. Their transforms have empty binding vectors. Dynamic paths instead bind each
-/// transform to the consecutive inputs declared by the access descriptor, consuming exactly
-/// [`ReferenceTransform::binding_count`] bindings per transform.
+/// Eager reference handles resolve indices immediately into static transforms and use [`NoReferenceTransformBinding`].
+/// Their transforms have empty binding vectors. Dynamic paths instead bind each transform to the consecutive inputs
+/// declared by the access descriptor, consuming exactly [`ReferenceTransform::binding_count`] bindings per transform.
 ///
 /// The empty path denotes the complete root. Complete root handles, capture constants, and forwarded complete
 /// references carry it. A path belongs to one access instruction and therefore stays inside that instruction's region:
@@ -291,6 +288,7 @@ pub struct ReferenceTransformPath<Transform: ReferenceTransform, Binding = Value
     bound_transforms: Vec<BoundReferenceTransform<Transform, Binding>>,
 }
 
+// TODO(eaplatanios): Review this block.
 impl<Transform: ReferenceTransform, Binding> ReferenceTransformPath<Transform, Binding> {
     /// Returns the empty [`ReferenceTransformPath`] denoting the complete root.
     pub const fn root() -> Self {
@@ -382,13 +380,14 @@ impl<Transform: ReferenceTransform, Binding> ReferenceTransformPath<Transform, B
     /// transforms into a new path, this moves the bound transforms of `suffix` without cloning either path, so
     /// extending a path by `k` transforms costs `O(k)` amortized time regardless of its current length. Like
     /// [`with_bound_transform`](Self::with_bound_transform), it does not validate the transforms or their bindings.
+    #[inline]
     pub fn append(&mut self, suffix: Self) {
         self.bound_transforms.extend(suffix.bound_transforms);
     }
 }
 
 impl<Transform: ReferenceTransform> ReferenceTransformPath<Transform, ValueId> {
-    /// Returns the [`ReferenceViewOverlap`] between the parts this [`ReferenceTransformPath`] and `other` address
+    /// Returns the [`ReferenceViewOverlap`] between the parts that this [`ReferenceTransformPath`] and `other` address
     /// within one root of type `root`, through [`ReferenceTransform::overlap`]. Both paths must be relative to that
     /// same root rather than to an intermediate view. Callers resolve each access's allocation root through
     /// [`ReferenceAnalysis`](crate::ReferenceAnalysis) before comparing access paths.
