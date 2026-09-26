@@ -589,7 +589,7 @@ where
             Self::ReferenceAtomicAddUpdate(operation) => operation
                 .with_reference_access_transforms(input_index, transforms)
                 .map(Self::ReferenceAtomicAddUpdate),
-            Self::ReferenceFreeze(_) if input_index == 0 && transforms.is_empty() => Ok(self.clone()),
+            _ if self.reference_access_descriptor(input_index).is_some() && transforms.is_empty() => Ok(self.clone()),
             _ => Err(ProgramError::UnsupportedOperation {
                 message: format!("`{}` cannot replace the reference transforms at input {input_index}", self.name()),
             }),

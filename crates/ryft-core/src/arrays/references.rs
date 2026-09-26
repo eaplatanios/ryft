@@ -1162,7 +1162,7 @@ where
     ) -> Result<C::Value, ProgramError> {
         // The traversal starts with the complete allocation, so the chain is non-empty and its final value is the part
         // selected by this handle.
-        let mut intermediates = alias.intermediates_in(&ContextTransformCarrier(context), current.clone())?;
+        let mut intermediates = alias.intermediates_in(&ContextTransformCarrier { context }, current.clone())?;
         Ok(intermediates.pop().unwrap())
     }
 
@@ -1173,7 +1173,7 @@ where
         replacement: C::Value,
         alias: &ArrayReferenceTransformPath<C::Value>,
     ) -> Result<C::Value, ProgramError> {
-        alias.write_in(&ContextTransformCarrier(context), current.clone(), replacement)
+        alias.write_in(&ContextTransformCarrier { context }, current.clone(), replacement)
     }
 
     #[inline]
@@ -1183,7 +1183,7 @@ where
         replacement: C::Value,
         alias: &ArrayReferenceTransformPath<C::Value>,
     ) -> Result<(C::Value, C::Value), ProgramError> {
-        alias.swap_in(&ContextTransformCarrier(context), current.clone(), replacement)
+        alias.swap_in(&ContextTransformCarrier { context }, current.clone(), replacement)
     }
 }
 
@@ -1210,7 +1210,7 @@ where
         // member instead, which is the same seam generic reverse mode uses to accumulate cotangents. Accumulation
         // therefore binds the lifted addition through the context, requiring nothing beyond the conversion the
         // operation family already provides.
-        let carrier = ContextTransformCarrier(context);
+        let carrier = ContextTransformCarrier { context };
         let intermediates = alias.intermediates_in(&carrier, current.clone())?;
 
         // Add at the selected leaf, then rebuild each enclosing slice without reading the leaf a second time.
@@ -1297,9 +1297,8 @@ struct TransformSelection {
     /// Exclusive slice limit per input axis.
     limits: Vec<usize>,
 
-    /// Exact static output shape after squeezing the indexed axis, for
-    /// [`ArrayReferenceTransform::Index`] transforms only; [`None`] for rank-preserving slices, whose output
-    /// shape is exactly [`Self::update_shape`].
+    /// Exact static output shape after squeezing the indexed axis. [`Some`] for [`ArrayReferenceTransform::Index`]
+    /// transforms only and [`None`] for rank-preserving slices, whose output shape is exactly [`Self::update_shape`].
     squeezed_output_shape: Option<Shape>,
 }
 
@@ -1537,10 +1536,10 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> TransformWriteC
 /// [`OperationProjection<ArrayType>`](OperationProjection) member family. Any composite family that embeds the array
 /// operations (e.g., one that derives `#[ryft(members(ArrayType))]`) therefore supports array reference discharge,
 /// and core array IR and backend-owned supersets share one traversal without matching operation names.
-struct ContextTransformCarrier<'c, C>(
+struct ContextTransformCarrier<'c, C> {
     /// Context in which the slice, reshape, and update-slice operations are bound.
-    &'c C,
-);
+    context: &'c C,
+}
 
 impl<C: Context<Type = ArrayIrType>> ContextTransformCarrier<'_, C> {
     /// Binds one single-result operation of the traversal into the context and returns its result.
@@ -1551,7 +1550,7 @@ impl<C: Context<Type = ArrayIrType>> ContextTransformCarrier<'_, C> {
     ///   - `inputs`: Inputs of the application, in operation-defined order.
     fn bind(&self, operation: C::Operation, inputs: &[&C::Value]) -> Result<C::Value, ProgramError> {
         let inputs = inputs.iter().map(|input| (*input).clone()).collect::<Vec<_>>();
-        let mut outputs = self.0.bind(operation, Vec::new(), inputs.as_slice())?;
+        let mut outputs = self.context.bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
