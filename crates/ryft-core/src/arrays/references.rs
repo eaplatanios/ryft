@@ -261,8 +261,6 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         self.path.apply(self.root.read().map_err(ProgramError::custom)?)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Replaces the elements that this handle views with `replacement` and returns a snapshot of their previous
     /// values. Values outside the view are preserved.
     ///
@@ -279,16 +277,17 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         if self.path.is_root() {
             return self.root.swap(replacement).map_err(ProgramError::custom);
         }
-        // Validating inside the update keeps holder-state errors (frozen, poisoned, mid-transaction) ahead of the
-        // replacement-type diagnostic, matching the root path.
+
+        // Validation remains inside the holder transaction so frozen, poisoned, and leased-state diagnostics retain
+        // precedence over replacement-type errors, matching the root write and swap paths.
         self.root.update(|current| {
             self.validate_view_referent_type(&replacement)?;
             self.path.swap(current, &replacement)
         })
     }
 
-    /// Replaces the elements that this handle views with `replacement`, like [`Self::swap`], but without returning a
-    /// snapshot of their previous values.
+    /// Replaces the elements that this handle views with `replacement`, like [`Self::swap`], but without returning
+    /// a snapshot of their previous values.
     ///
     /// # Errors
     ///
@@ -300,6 +299,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         if self.path.is_root() {
             return self.root.write(replacement).map_err(ProgramError::custom);
         }
+
         // Validation remains inside the holder transaction so frozen, poisoned, and leased-state diagnostics retain
         // precedence over replacement-type errors, matching the root write and swap paths.
         self.root.update(|current| {
@@ -324,6 +324,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         if self.path.is_root() {
             return self.root.update(|current| current.add(update).map(|updated| (updated, ())));
         }
+
         self.root.update(|current| {
             let mut carrier = EagerTransformCarrier(PhantomData);
             let intermediates = self.path.intermediates_in(&mut carrier, current.clone())?;
@@ -366,10 +367,17 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         Ok(Self { root, path: self.path.clone(), r#type: ReferenceType::new(referent) })
     }
 
-    /// Validates that `value` exactly matches this handle's derived referent type. Root-handle mutations inherit this
-    /// rule from the shared reference state, but derived-view mutations must enforce it themselves: update-slice
-    /// reconstruction only requires the written value to fit inside the selected indices, so a smaller replacement
-    /// would otherwise silently write a partial update.
+    /// Checks that `value` has exactly this handle's referent type (i.e., the type of the elements that the handle
+    /// views). Mutations through views must call this function themselves. A root-handle mutation replaces the complete
+    /// stored value, which the underlying [`Reference`] already checks against its own referent type. A view mutation
+    /// instead writes `value` into the root through [`UpdateSlice`], which only requires `value` to fit inside the
+    /// selected region. The reconstructed root then passes the reference's check even when `value` is smaller than
+    /// the view, so without this function, such a value would silently update only part of the view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceError::ReferentTypeMismatch`] if the type of `value` differs from this handle's
+    /// referent type.
     fn validate_view_referent_type(&self, value: &A) -> Result<(), ProgramError> {
         let actual = value.r#type();
         if actual.as_ref() == self.r#type.referent() {
@@ -381,6 +389,8 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         }))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<A: Value<Type = ArrayType>> Clone for ArrayReference<A> {
     #[inline]
