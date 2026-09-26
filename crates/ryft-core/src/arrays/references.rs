@@ -35,9 +35,6 @@ pub enum ArrayReferenceViewError {
     #[error("cannot freeze a reference view; freeze the root reference instead")]
     CannotFreezeView,
 
-    #[error("cannot read a reference view through the root-only snapshot accessor")]
-    CannotReadRootThroughView,
-
     #[error("backend storage transactions require a root handle that uses the allocation's stored type identities")]
     NotStorageRoot,
 
@@ -261,25 +258,10 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     where
         A: Reshape + Slice,
     {
-        self.path.apply(&self.root.read().map_err(ProgramError::custom)?)
+        self.path.apply(self.root.read().map_err(ProgramError::custom)?)
     }
 
     // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns an immutable snapshot of the complete allocation through a root handle, and rejects views. Unlike
-    /// [`Self::read`], this function requires no array-manipulation capabilities, because a root handle applies no
-    /// transforms.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ArrayReferenceViewError::CannotReadRootThroughView`] if this handle is a view, and forwards
-    /// the [`ReferenceError`] of an allocation that cannot be read.
-    pub fn read_root(&self) -> Result<A, ProgramError> {
-        if !self.path.is_root() {
-            return Err(ProgramError::custom(ArrayReferenceViewError::CannotReadRootThroughView));
-        }
-        self.root.read().map_err(ProgramError::custom)
-    }
 
     /// Replaces the elements that this handle views with `replacement` and returns a snapshot of their previous
     /// values. Values outside the view are preserved.
@@ -1132,13 +1114,14 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
 }
 
 impl ArrayReferenceTransformPath<NoReferenceTransformBinding> {
-    /// Applies the complete static mapping to one root snapshot.
-    fn apply<A>(&self, root: &A) -> Result<A, ProgramError>
+    /// Applies the complete static mapping to one root snapshot, which it consumes so that an empty path returns the
+    /// snapshot without copying it.
+    fn apply<A>(&self, root: A) -> Result<A, ProgramError>
     where
         A: Value<Type = ArrayType> + Reshape + Slice,
     {
         let mut carrier = EagerTransformCarrier(PhantomData);
-        self.bound_transforms().iter().try_fold(root.clone(), |value, bound_transform| {
+        self.bound_transforms().iter().try_fold(root, |value, bound_transform| {
             bound_transform.transform().apply_in(&mut carrier, &value, bound_transform.bindings())
         })
     }
@@ -1631,10 +1614,6 @@ mod tests {
                 "cannot freeze a reference view; freeze the root reference instead",
             ),
             (
-                ArrayReferenceViewError::CannotReadRootThroughView,
-                "cannot read a reference view through the root-only snapshot accessor",
-            ),
-            (
                 ArrayReferenceViewError::NotStorageRoot,
                 "backend storage transactions require a root handle that uses the allocation's stored type identities",
             ),
@@ -1742,7 +1721,7 @@ mod tests {
         let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> =
             ArrayReferenceTransformPath::root().with_transform(symbolic.clone());
         assert_eq!(
-            path.apply(&Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap()),
+            path.apply(Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap()),
             Err(TypeError::invalid(
                 "a dynamic index has no static selection; apply its binding at the reference access",
             )
@@ -1857,24 +1836,6 @@ mod tests {
         // Reading a derived handle applies its selection rather than exposing the complete allocation.
         assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()));
         assert_eq!(derived.read(), Ok(Array::vector(vec![2.0_f32, 3.0]).unwrap()));
-    }
-
-    #[test]
-    fn test_array_reference_read_root() {
-        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap());
-        let derived = root
-            .with_transform(ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
-            .unwrap();
-        assert_eq!(root.read_root(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]).unwrap()));
-
-        assert_eq!(
-            derived.read_root().unwrap_err().downcast_custom::<ArrayReferenceViewError>(),
-            Some(&ArrayReferenceViewError::CannotReadRootThroughView),
-        );
-        assert_eq!(
-            derived.read_root().unwrap_err().to_string(),
-            "cannot read a reference view through the root-only snapshot accessor",
-        );
     }
 
     #[test]

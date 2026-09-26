@@ -518,19 +518,18 @@ mod tests {
             renamed.r#type().referent(),
             &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target.clone())])),
         );
-        assert_eq!(renamed.read_root().unwrap().r#type().into_owned(), renamed.r#type().referent().clone());
         assert_eq!(
             <ArrayIrValue<CaptureReference<ArrayType>> as ValueProjection<ReferenceType<ArrayType>>>::projected(&value),
             Ok(&reference),
         );
 
-        // A non-bijective mapping cannot reconstruct stored root metadata and is rejected transactionally.
+        // A non-bijective mapping cannot reconstruct stored root metadata, so it is rejected before any alias exists.
         let second = DimensionVariable::new("second", bounds);
         let two_axis_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(source.clone()), Dimension::Dynamic(second.clone())]),
         );
-        let two_axis_reference = ArrayReference::new(CaptureReference::new(1, two_axis_type.clone()));
+        let two_axis_reference = ArrayReference::new(CaptureReference::new(1, two_axis_type));
         let mut non_bijective = TypeIdentityRenaming::new();
         non_bijective.insert(source.clone(), target.clone()).unwrap();
         non_bijective.insert(second.clone(), target).unwrap();
@@ -538,7 +537,6 @@ mod tests {
             two_axis_reference.rename_type_identities(&non_bijective),
             Err(TypeError::invalid("type identities `source` and `second` are both renamed to `target`")),
         );
-        assert_eq!(two_axis_reference.read_root(), Ok(CaptureReference::new(1, two_axis_type)));
 
         // The collision is reported in the caller's direction, so a handle that already carries a bijective
         // handle-local mapping names its own identities rather than the root identities behind them. Deriving the
