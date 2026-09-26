@@ -6,17 +6,17 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::DomainTracer;
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Builder, returned by [`custom_derivative_at`], that stages a custom derivative rule at a known input tree. Because
+/// Builder, returned by [`custom_derivative_at`], that stages a custom derivative rule at a known input value. Because
 /// the builder captures the input before the rule closures are written, those closures infer their tracer parameter
 /// types from the input and need no type annotations.
-/// [`with_non_differentiated_count`](Self::with_non_differentiated_count) configures the call, and the terminal
-/// [`jvp`](Self::jvp) and [`vjp`](Self::vjp) functions stage it as a [`CustomJvpOperation`] or a
-/// [`CustomVjpOperation`], respectively. Refer to the documentation of the [`custom_jvp`] and [`custom_vjp`] functions
-/// for the semantics of the staged calls.
+///
+/// [`with_non_differentiated_count`](Self::with_non_differentiated_count) configures the call, and the
+/// terminal [`jvp`](Self::jvp) and [`vjp`](Self::vjp) functions stage it as a [`CustomJvpOperation`] or a
+/// [`CustomVjpOperation`], respectively.
+///
+/// Refer to the documentation of the [`custom_jvp`] and [`custom_vjp`] functions for the semantics of the staged calls.
 pub struct CustomDerivativeBuilder<Input> {
-    /// Input tree at which the custom derivative rule is staged.
+    /// Input value at which the custom derivative rule is staged.
     input: Input,
 
     /// Number of leading flattened input leaves that parameterize the call without being differentiated.
@@ -24,22 +24,26 @@ pub struct CustomDerivativeBuilder<Input> {
 }
 
 impl<Input> CustomDerivativeBuilder<Input> {
-    /// Declares the leading `non_differentiated_count` flattened leaves of the input tree as non-differentiated
-    /// _plumbing_ inputs, which is the builder counterpart of
-    /// [`CustomJvp::with_non_differentiated_count`](crate::CustomJvp::with_non_differentiated_count) and
-    /// [`CustomVjp::with_non_differentiated_count`](crate::CustomVjp::with_non_differentiated_count). Refer to the
-    /// documentation of the [`custom_jvp`] and [`custom_vjp`] functions for the semantics of non-differentiated
-    /// inputs.
+    /// Declares the number of leading flattened leaves of the input value that should be treated
+    /// as non-differentiated _plumbing_ inputs.
+    ///
+    /// This is the [`CustomDerivativeBuilder`] counterpart of
+    /// [`CustomJvp::with_non_differentiated_count`](crate::CustomJvp::with_non_differentiated_count)
+    /// and [`CustomVjp::with_non_differentiated_count`](crate::CustomVjp::with_non_differentiated_count).
+    ///
+    /// Refer to the documentation of the [`custom_jvp`] and [`custom_vjp`] functions for the semantics
+    /// of non-differentiated inputs.
     #[inline]
     pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Self {
         self.non_differentiated_count = non_differentiated_count;
         self
     }
 
-    /// Stages a custom-JVP call at the input of this builder and returns its output tree. This is equivalent to
-    /// `custom_jvp(primal, jvp).with_non_differentiated_count(count).call(input)`, except that the closures infer their
-    /// parameter types from the input. Refer to the documentation of the [`custom_jvp`] function for the semantics of
-    /// the staged call.
+    /// Stages a custom Jacobian-Vector Product (JVP) call at the input of this builder and returns its output value.
+    /// This is equivalent to `custom_jvp(primal, jvp).with_non_differentiated_count(count).call(input)`, except that
+    /// the closures infer their parameter types from the input.
+    ///
+    /// Refer to the documentation of the [`custom_jvp`] function for the semantics of the staged call.
     ///
     /// # Parameters
     ///
@@ -49,37 +53,40 @@ impl<Input> CustomDerivativeBuilder<Input> {
     /// # Errors
     ///
     /// Returns the [`ProgramError`]s described in the documentation of [`CustomJvp::call`](crate::CustomJvp::call).
-    pub fn jvp<D, V, Outputs, Primal, Jvp>(
+    #[inline]
+    pub fn jvp<
+        V: Value<Type = C::Type, DispatchDomain = C>,
+        C: Context<Type: DifferentiableType, Value = V, Operation: From<CustomJvpOperation<C::Type>>>,
+        Output: Parameterized<DomainTracer<C>>,
+        Primal: Fn(Input::To<DomainTracer<C>>) -> Result<Output, ProgramError>,
+        Jvp: Fn(Input::To<DomainTracer<C>>, Input::To<DomainTracer<C>>) -> Result<(Output, Output), ProgramError>,
+    >(
         self,
         primal: Primal,
         jvp: Jvp,
-    ) -> Result<<Outputs::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
+    ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
-        D: Context<Type: DifferentiableType, Value = V>,
-        V: Value<Type = D::Type, DispatchDomain = D>,
-        D::Operation: From<CustomJvpOperation<D::Type>>,
         Input: Parameterized<V>,
         Input::Family:
-            ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant> + ParameterizedFamily<DomainTracer<D>>,
-        Input::To<DomainTracer<D>>:
-            Parameterized<DomainTracer<D>, Family = Input::Family, To<D::Type> = Input::To<D::Type>>,
-        Input::To<D::Type>:
-            Clone + Parameterized<D::Type, Family = Input::Family, To<DomainTracer<D>> = Input::To<DomainTracer<D>>>,
-        Outputs: Parameterized<DomainTracer<D>>,
-        Outputs::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant> + ParameterizedFamily<V>,
-        Outputs::To<D::Type>: Parameterized<D::Type, Family = Outputs::Family, To<DomainTracer<D>> = Outputs>,
-        Primal: Fn(Input::To<DomainTracer<D>>) -> Result<Outputs, ProgramError>,
-        Jvp: Fn(Input::To<DomainTracer<D>>, Input::To<DomainTracer<D>>) -> Result<(Outputs, Outputs), ProgramError>,
+            ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<DomainTracer<C>>,
+        Input::To<DomainTracer<C>>:
+            Parameterized<DomainTracer<C>, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
+        Input::To<C::Type>:
+            Clone + Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input::To<DomainTracer<C>>>,
+        Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<V>,
+        Output::To<C::Type>: Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
     {
         custom_jvp(primal, jvp)
             .with_non_differentiated_count(self.non_differentiated_count)
             .call(self.input)
     }
 
-    /// Stages a custom-VJP call at the input of this builder and returns its output tree. This is equivalent to
-    /// `custom_vjp(primal, forward, backward).with_non_differentiated_count(count).call(input)`, except that the
-    /// closures infer their parameter types from the input and, for `backward`, from the residuals that `forward`
-    /// returns. Refer to the documentation of the [`custom_vjp`] function for the semantics of the staged call.
+    /// Stages a custom Vector-Jacobian Product (VJP) call at the input of this builder and returns its output value.
+    /// This is equivalent to `custom_vjp(primal, forward, backward).with_non_differentiated_count(count).call(input)`,
+    /// except that the closures infer their parameter types from the input and, for `backward`, from the residuals
+    /// that `forward` returns.
+    ///
+    /// Refer to the documentation of the [`custom_vjp`] function for the semantics of the staged call.
     ///
     /// # Parameters
     ///
@@ -90,32 +97,33 @@ impl<Input> CustomDerivativeBuilder<Input> {
     /// # Errors
     ///
     /// Returns the [`ProgramError`]s described in the documentation of [`CustomVjp::call`](crate::CustomVjp::call).
-    pub fn vjp<D, V, Outputs, Residuals, Primal, Forward, Backward>(
+    #[inline]
+    pub fn vjp<
+        V: Value<Type = C::Type, DispatchDomain = C>,
+        C: Context<Type: DifferentiableType, Value = V, Operation: From<CustomVjpOperation<C::Type>>>,
+        Output: Parameterized<DomainTracer<C>>,
+        Residual: Parameterized<DomainTracer<C>>,
+        Primal: Fn(Input::To<DomainTracer<C>>) -> Result<Output, ProgramError>,
+        Forward: Fn(Input::To<DomainTracer<C>>) -> Result<(Output, Residual), ProgramError>,
+        Backward: Fn(Residual, Output) -> Result<Input::To<DomainTracer<C>>, ProgramError>,
+    >(
         self,
         primal: Primal,
         forward: Forward,
         backward: Backward,
-    ) -> Result<<Outputs::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
+    ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
-        D: Context<Type: DifferentiableType, Value = V>,
-        V: Value<Type = D::Type, DispatchDomain = D>,
-        D::Operation: From<CustomVjpOperation<D::Type>>,
         Input: Parameterized<V>,
         Input::Family:
-            ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant> + ParameterizedFamily<DomainTracer<D>>,
-        Input::To<DomainTracer<D>>:
-            Parameterized<DomainTracer<D>, Family = Input::Family, To<D::Type> = Input::To<D::Type>>,
-        Input::To<D::Type>:
-            Clone + Parameterized<D::Type, Family = Input::Family, To<DomainTracer<D>> = Input::To<DomainTracer<D>>>,
-        Outputs: Parameterized<DomainTracer<D>>,
-        Outputs::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant> + ParameterizedFamily<V>,
-        Outputs::To<D::Type>: Clone + Parameterized<D::Type, Family = Outputs::Family, To<DomainTracer<D>> = Outputs>,
-        Residuals: Parameterized<DomainTracer<D>>,
-        Residuals::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-        Residuals::To<D::Type>: Parameterized<D::Type, Family = Residuals::Family, To<DomainTracer<D>> = Residuals>,
-        Primal: Fn(Input::To<DomainTracer<D>>) -> Result<Outputs, ProgramError>,
-        Forward: Fn(Input::To<DomainTracer<D>>) -> Result<(Outputs, Residuals), ProgramError>,
-        Backward: Fn(Residuals, Outputs) -> Result<Input::To<DomainTracer<D>>, ProgramError>,
+            ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<DomainTracer<C>>,
+        Input::To<DomainTracer<C>>:
+            Parameterized<DomainTracer<C>, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
+        Input::To<C::Type>:
+            Clone + Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input::To<DomainTracer<C>>>,
+        Output::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant> + ParameterizedFamily<V>,
+        Output::To<C::Type>: Clone + Parameterized<C::Type, Family = Output::Family, To<DomainTracer<C>> = Output>,
+        Residual::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
+        Residual::To<C::Type>: Parameterized<C::Type, Family = Residual::Family, To<DomainTracer<C>> = Residual>,
     {
         custom_vjp(primal, forward, backward)
             .with_non_differentiated_count(self.non_differentiated_count)
@@ -130,7 +138,7 @@ impl<Input> CustomDerivativeBuilder<Input> {
 /// Prefer it when a rule is applied where it is defined, and prefer [`custom_jvp`] or [`custom_vjp`] when the same
 /// rule is called at several sites.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```rust
 /// # use ryft_core::{Array, Cos, ProgramError, Sin, custom_derivative_at, differentiate_at};
@@ -168,7 +176,7 @@ impl<Input> CustomDerivativeBuilder<Input> {
 ///
 /// # Parameters
 ///
-///   - `input`: [`Parameterized`] tree of values at which the custom derivative rule is staged.
+///   - `input`: [`Parameterized`] value at which the custom derivative rule is staged.
 #[inline]
 pub fn custom_derivative_at<Input>(input: Input) -> CustomDerivativeBuilder<Input> {
     CustomDerivativeBuilder { input, non_differentiated_count: 0 }
