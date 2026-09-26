@@ -6,8 +6,8 @@
 //!   - **Numeric Reductions:** [`Sum`](ReductionKind::Sum) adds the reduced elements, and
 //!     [`Mean`](ReductionKind::Mean) additionally divides that sum by the number of reduced elements.
 //!   - **Extrema:** [`Max`](ReductionKind::Max) and [`Min`](ReductionKind::Min) select the largest and smallest
-//!     reduced elements, propagating NaNs, ordering negative zero below positive zero, and comparing complex elements
-//!     by their real parts first and their imaginary parts second.
+//!     reduced elements, propagating NaNs, ordering negative zero below positive zero, and comparing complex
+//!     elements by their real parts first and their imaginary parts second.
 //!   - **Logarithmic Sums of Exponentials:** [`LogSumExp`](ReductionKind::LogSumExp) computes `log(sum(exp(x)))`
 //!     without overflowing for large finite inputs. The [`LogSumExp`] value capability provides it as a function of
 //!     its own.
@@ -15,15 +15,15 @@
 //!     conjunction of Boolean elements.
 //!
 //! The reduced axes are removed from the output shape, and the remaining axes keep their order, as for StableHLO's
-//! [`reduce`](https://openxla.org/stablehlo/spec#reduce). Sums, extrema, and Boolean reductions start from the
-//! identity of their combiner (e.g., `0` for sums and the smallest value of the element type for maxima), so reducing
-//! an empty axis produces that identity. Batching also supports reducing bounded ragged axes, whose padding is replaced
-//! by the identity of the reduction before it is applied.
+//! [`reduce`](https://openxla.org/stablehlo/spec#reduce). Sums, extrema, and Boolean reductions start from the identity
+//! of their combiner (e.g., `0` for sums and the smallest value of the element type for maxima), so reducing an empty
+//! axis produces that identity. Batching also supports reducing bounded ragged axes, whose padding is replaced by the
+//! identity of the reduction before it is applied.
 //!
 //! Sums and means are linear, and their transposes broadcast the cotangent back over the reduced axes (dividing it by
-//! the number of reduced elements for means). Extrema route the tangent through the positions of the selected
-//! elements, splitting it evenly between ties, and logarithmic sums of exponentials are differentiable as well, but
-//! neither is linear. Boolean reductions are not differentiable.
+//! the number of reduced elements for means). Extrema route the tangent through the positions of the selected elements,
+//! splitting it evenly between ties, and logarithmic sums of exponentials are differentiable as well, but neither is
+//! linear. Boolean reductions are not differentiable.
 //!
 //! # Example
 //!
@@ -79,19 +79,16 @@ use crate::programs::{
     TypeError, Typed, Value, ValueProjection,
 };
 
-// TODO(eaplatanios): Review this module.
-
-/// Kind of reduction performed by a [`ReduceOperation`].
-///
-/// Reductions collapse selected axes while preserving the order of the remaining axes. Sums, extrema, and Boolean
-/// reductions combine elements directly; means and logarithmic sums of exponentials additionally normalize or
-/// transform those elements. Backends may implement a kind with several primitive operations.
+/// Kind of reduction performed by a [`ReduceOperation`]. Reductions collapse selected axes while preserving the order
+/// of the remaining axes. Sums, extrema, and Boolean reductions combine elements directly while means and logarithmic
+/// sums of exponentials additionally normalize or transform those elements. Backends may implement reductions of a
+/// specific kind by decomposing them into several primitive operations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReductionKind {
     /// Numeric sum reduction. The identity is `0` and the combiner is addition.
     Sum,
 
-    /// Numeric mean reduction: a [`Sum`](Self::Sum) divided by the product of reduced extents.
+    /// Numeric mean reduction defined as a [`Sum`](Self::Sum) divided by the product of reduced extents.
     /// The numeric data type must support division.
     Mean,
 
@@ -109,17 +106,20 @@ pub enum ReductionKind {
     /// data type's largest value under that ordering.
     Min,
 
-    /// Boolean disjunction reduction (logical-OR). The identity is `false` and the combiner is OR.
+    /// Boolean disjunction reduction. The identity is `false` and the combiner is the logical _or_ operation.
     /// Inputs must have [`DataType::Boolean`].
     Any,
 
-    /// Boolean conjunction reduction (logical-AND). The identity is `true` and the combiner is
-    /// AND. Inputs must have [`DataType::Boolean`].
+    /// Boolean conjunction reduction. The identity is `true` and the combiner is the logical _and_ operation.
+    /// Inputs must have [`DataType::Boolean`].
     All,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl ReductionKind {
     /// Returns the canonical operation name suffix for this kind.
+    #[inline]
     pub fn name(self) -> &'static str {
         match self {
             Self::Sum => "sum",
@@ -133,6 +133,7 @@ impl ReductionKind {
     }
 
     /// Returns `true` when this kind requires [`DataType::Boolean`] inputs.
+    #[inline]
     pub fn requires_boolean(self) -> bool {
         matches!(self, Self::Any | Self::All)
     }
