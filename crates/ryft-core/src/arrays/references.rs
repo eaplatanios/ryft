@@ -82,7 +82,7 @@ pub struct ArrayReference<A: Value<Type = ArrayType>> {
     root: Reference<A>,
 
     /// Ordered mapping from the shared root to this handle's referent. Eager handles only ever carry static
-    /// transforms, so no symbol is ever bound on this path.
+    /// transforms, so no dynamic index is ever bound on this path.
     path: ArrayReferenceTransformPath<NoReferenceTransformBinding>,
 
     /// Exact handle type derived once from the root type and path, so that repeated [`Typed`] type queries borrow this
@@ -483,9 +483,9 @@ impl ArrayReferenceTransformPath {
     /// that the path selects, so consumers such as kernel validation can compute the elements or bytes that an access
     /// touches through [`ArrayAddressing`](crate::ArrayAddressing).
     ///
-    /// Returns [`None`] if the path contains a symbolic index, whose position is only known at the access, if
-    /// `root_type` does not have a static shape, or if the path does not fold against `root_type` (e.g., because an
-    /// index is out of bounds).
+    /// Returns [`None`] if the path contains a dynamic index, whose position is only known at the access, if
+    /// `root_type` does not have a static shape, or if the path does not fold against `root_type` (e.g., because
+    /// an index is out of bounds).
     ///
     /// # Example
     ///
@@ -510,8 +510,8 @@ impl ArrayReferenceTransformPath {
         RootIndexSelection::fold(&root_type.static_shape()?, self.bound_transforms())?
             .into_iter()
             .map(|selection| match selection {
-                RootIndexSelection::Range { start, limit } => Some(ArraySliceAxis::new(start, limit - start, 1)),
-                RootIndexSelection::Symbolic { .. } => None,
+                RootIndexSelection::Static { start, limit } => Some(ArraySliceAxis::new(start, limit - start, 1)),
+                RootIndexSelection::Dynamic { .. } => None,
             })
             .collect()
     }
@@ -543,7 +543,7 @@ impl<Binding> ArrayReferenceTransformPath<Binding> {
     ///
     /// The last entry is the selected value, and the others are the strict parents that
     /// [`reconstruct_in`](Self::reconstruct_in) needs to write a new selected value back. `carrier`
-    /// performs the array operations and resolves symbolic indices from the bindings of each transform.
+    /// performs the array operations and resolves dynamic indices from the bindings of each transform.
     #[inline]
     fn intermediates_in<C: TransformReadCarrier<Binding = Binding>>(
         &self,
@@ -712,7 +712,7 @@ pub enum ArrayReferenceTransform {
 }
 
 impl ArrayReferenceTransform {
-    /// Returns the exact canonical [`ArrayType`] produced from `input`. A symbolic index removes its axis exactly like
+    /// Returns the exact canonical [`ArrayType`] produced from `input`. A dynamic index removes its axis exactly like
     /// a static one, without the static bounds check and reconstruction proof, because the index it selects is only
     /// known to the access that applies the transform.
     pub fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
@@ -849,8 +849,8 @@ impl ArrayReferenceTransform {
         }
     }
 
-    /// Applies this transform to one carried parent value. A symbolic index is resolved by the carrier from the one
-    /// value the transform's `bindings` close it over; a symbolic transform that binds no value (an eager path, or a
+    /// Applies this transform to one carried parent value. A dynamic index is resolved by the carrier from the one
+    /// value the transform's `bindings` close it over; a dynamic index that binds no value (an eager path, or a
     /// malformed closure) has no selection and is rejected by [`selection`](Self::selection).
     fn apply_in<C: TransformReadCarrier>(
         &self,
@@ -859,7 +859,7 @@ impl ArrayReferenceTransform {
         bindings: &[C::Binding],
     ) -> Result<C::Value, ProgramError> {
         if let (Self::Index { axis, index: ArrayReferenceTransformIndex::Dynamic }, [binding]) = (self, bindings) {
-            return carrier.index_symbolic(input, *axis, binding);
+            return carrier.dynamic_index(input, *axis, binding);
         }
         let selection = self.selection(carrier.array_type(input)?.as_ref())?;
         let output_shape = selection.removed_axis.map(|_| selection.output_shape());
@@ -871,7 +871,7 @@ impl ArrayReferenceTransform {
     }
 
     /// Reconstructs the carried parent after replacing exactly the elements selected by this transform, resolving
-    /// a symbolic index exactly as [`apply_in`](Self::apply_in) does.
+    /// a dynamic index exactly as [`apply_in`](Self::apply_in) does.
     fn replace_in<C: TransformWriteCarrier>(
         &self,
         carrier: &C,
@@ -880,7 +880,7 @@ impl ArrayReferenceTransform {
         bindings: &[C::Binding],
     ) -> Result<C::Value, ProgramError> {
         if let (Self::Index { axis, index: ArrayReferenceTransformIndex::Dynamic }, [binding]) = (self, bindings) {
-            return carrier.update_index_symbolic(input, replacement, *axis, binding);
+            return carrier.dynamic_update_index(input, replacement, *axis, binding);
         }
         let selection = self.selection(carrier.array_type(input)?.as_ref())?;
         if selection.removed_axis.is_some() {
@@ -967,8 +967,8 @@ impl ReferenceTransform for ArrayReferenceTransform {
         lhs: &[BoundReferenceTransform<Self>],
         rhs: &[BoundReferenceTransform<Self>],
     ) -> ReferenceViewOverlap {
-        // Both paths fold to one range or symbolic index per root axis. Non-intersecting static ranges prove
-        // disjointness; identical static ranges or symbolic indices with equal bindings, offsets, and clamping extents
+        // Both paths fold to one static range or dynamic index per root axis. Non-intersecting static ranges prove
+        // disjointness; identical static ranges or dynamic indices with equal bindings, offsets, and clamping extents
         // prove equality. Everything else may overlap. A malformed path cannot be folded and is treated as possibly
         // overlapping, because paths are validated when they are derived and this query must not fail.
         let Some(shape) = <&ReferenceType<ArrayType>>::try_from(r#type)
@@ -1327,7 +1327,7 @@ impl TransformSelection {
 enum RootIndexSelection {
     /// A static unit-stride range `[start, limit)` of the root axis. Before any transform touches the axis this is the
     /// complete axis, a slice narrows it, and a static index collapses it to one index.
-    Range {
+    Static {
         /// Inclusive start of the range.
         start: usize,
 
@@ -1335,14 +1335,15 @@ enum RootIndexSelection {
         limit: usize,
     },
 
-    /// One index `offset + clamp(wrap(symbol), 0, extent - 1)` of the root axis, selected relative to the range that
-    /// earlier transforms narrowed the axis to, where `wrap(symbol)` is `symbol + extent` for a negative `symbol` and
-    /// `symbol` otherwise. Both wrapping and clamping depend on this extent, not just the binding.
-    Symbolic {
-        /// Binding of the symbolic index.
+    /// One index `offset + clamp(wrap(index), 0, extent - 1)` of the root axis, selected relative to the range that
+    /// earlier transforms narrowed the axis to, where `index` is the runtime value of the binding and `wrap(index)` is
+    /// `index + extent` for a negative `index` and `index` otherwise. Both wrapping and clamping depend on this
+    /// extent, not just the binding.
+    Dynamic {
+        /// Binding that supplies the dynamic index.
         binding: ValueId,
 
-        /// Start of the narrowed range that the symbolic index is relative to.
+        /// Start of the narrowed range that the dynamic index is relative to.
         offset: usize,
 
         /// Size of the narrowed axis against which the runtime index is wrapped and clamped.
@@ -1351,15 +1352,15 @@ enum RootIndexSelection {
 }
 
 impl RootIndexSelection {
-    /// Folds the closed `bound_transforms` of a path over a root of static shape `shape` into one range or symbolic
-    /// index per root axis, or [`None`] when the path is malformed for that root (an axis, index, binding, or stride
-    /// that the derivation would have rejected).
+    /// Folds the closed `bound_transforms` of a path over a root of static shape `shape` into one static range or
+    /// dynamic index per root axis, or [`None`] when the path is malformed for that root (an axis, index, binding, or
+    /// stride that the derivation would have rejected).
     fn fold(
         shape: &StaticShape,
         bound_transforms: &[BoundReferenceTransform<ArrayReferenceTransform>],
     ) -> Option<Vec<Self>> {
         let mut indices =
-            shape.dimensions().iter().map(|size| Self::Range { start: 0, limit: *size }).collect::<Vec<_>>();
+            shape.dimensions().iter().map(|size| Self::Static { start: 0, limit: *size }).collect::<Vec<_>>();
         // Root axes that the folded transforms have not indexed away yet, in view axis order.
         let mut remaining = (0..shape.rank()).collect::<Vec<_>>();
         for bound_transform in bound_transforms {
@@ -1369,7 +1370,7 @@ impl RootIndexSelection {
                         return None;
                     }
                     let root_axis = remaining.remove(*axis);
-                    let Self::Range { start, limit } = indices[root_axis] else {
+                    let Self::Static { start, limit } = indices[root_axis] else {
                         return None;
                     };
                     indices[root_axis] = match index {
@@ -1379,11 +1380,11 @@ impl RootIndexSelection {
                             if index >= limit {
                                 return None;
                             }
-                            Self::Range { start: index, limit: index + 1 }
+                            Self::Static { start: index, limit: index + 1 }
                         }
                         ArrayReferenceTransformIndex::Dynamic => {
                             let binding = *bound_transform.bindings().first()?;
-                            Self::Symbolic { binding, offset: start, extent: limit - start }
+                            Self::Dynamic { binding, offset: start, extent: limit - start }
                         }
                     };
                 }
@@ -1392,7 +1393,7 @@ impl RootIndexSelection {
                         return None;
                     }
                     for (slice_axis, root_axis) in axes.iter().zip(remaining.iter()) {
-                        let Self::Range { start, limit } = indices[*root_axis] else {
+                        let Self::Static { start, limit } = indices[*root_axis] else {
                             return None;
                         };
                         let narrowed_start = start.checked_add(slice_axis.start())?;
@@ -1400,7 +1401,7 @@ impl RootIndexSelection {
                         if slice_axis.stride() != 1 || narrowed_limit > limit {
                             return None;
                         }
-                        indices[*root_axis] = Self::Range { start: narrowed_start, limit: narrowed_limit };
+                        indices[*root_axis] = Self::Static { start: narrowed_start, limit: narrowed_limit };
                     }
                 }
             }
@@ -1411,7 +1412,7 @@ impl RootIndexSelection {
     /// Returns the relation between the indices that this and `other` select on one root axis.
     fn overlap(&self, other: &Self) -> ReferenceViewOverlap {
         match (self, other) {
-            (Self::Range { start: a_start, limit: a_limit }, Self::Range { start: b_start, limit: b_limit }) => {
+            (Self::Static { start: a_start, limit: a_limit }, Self::Static { start: b_start, limit: b_limit }) => {
                 if a_limit <= b_start || b_limit <= a_start {
                     ReferenceViewOverlap::Disjoint
                 } else if a_start == b_start && a_limit == b_limit {
@@ -1421,12 +1422,12 @@ impl RootIndexSelection {
                 }
             }
             (
-                Self::Symbolic { binding: a_binding, offset: a_offset, extent: a_extent },
-                Self::Symbolic { binding: b_binding, offset: b_offset, extent: b_extent },
+                Self::Dynamic { binding: a_binding, offset: a_offset, extent: a_extent },
+                Self::Dynamic { binding: b_binding, offset: b_offset, extent: b_extent },
             ) if a_binding == b_binding && a_offset == b_offset && a_extent == b_extent => ReferenceViewOverlap::Same,
-            (Self::Symbolic { .. }, Self::Symbolic { .. })
-            | (Self::Range { .. }, Self::Symbolic { .. })
-            | (Self::Symbolic { .. }, Self::Range { .. }) => ReferenceViewOverlap::MayOverlap,
+            (Self::Dynamic { .. }, Self::Dynamic { .. })
+            | (Self::Static { .. }, Self::Dynamic { .. })
+            | (Self::Dynamic { .. }, Self::Static { .. }) => ReferenceViewOverlap::MayOverlap,
         }
     }
 }
@@ -1437,13 +1438,13 @@ impl RootIndexSelection {
 /// [`ArrayReferenceTransformPath`], generically over this carrier: the eager carrier operates on concrete values with
 /// the array-manipulation capabilities, while reference discharge binds the identical operation sequence through its
 /// context. Keeping one traversal guarantees the staged and eager semantics cannot drift apart. Static transforms lower
-/// to the carrier's slice and reshape; a symbolic index transform hands the carrier its index through the path's
+/// to the carrier's slice and reshape; a dynamic index transform hands the carrier its index through the path's
 /// [`Binding`](Self::Binding).
 trait TransformReadCarrier {
     /// Value representation carried through the traversal.
     type Value;
 
-    /// What a symbolic index of the traversed path is closed over.
+    /// What a dynamic index of the traversed path is closed over.
     type Binding;
 
     /// Returns the carried value's array type, borrowing from the carrier or the value where possible.
@@ -1456,7 +1457,7 @@ trait TransformReadCarrier {
     fn reshape(&self, input: &Self::Value, shape: Shape) -> Result<Self::Value, ProgramError>;
 
     /// Selects the index that `binding` closes over on `axis` of `input` and removes that axis.
-    fn index_symbolic(
+    fn dynamic_index(
         &self,
         input: &Self::Value,
         axis: usize,
@@ -1475,8 +1476,8 @@ trait TransformWriteCarrier: TransformReadCarrier {
     ) -> Result<Self::Value, ProgramError>;
 
     /// Returns `target` with `update` written at the index that `binding` closes over on `axis`, the inverse of
-    /// [`index_symbolic`](TransformReadCarrier::index_symbolic).
-    fn update_index_symbolic(
+    /// [`dynamic_index`](TransformReadCarrier::dynamic_index).
+    fn dynamic_update_index(
         &self,
         target: &Self::Value,
         update: &Self::Value,
@@ -1486,7 +1487,7 @@ trait TransformWriteCarrier: TransformReadCarrier {
 }
 
 /// Stateless eager carrier over one concrete array value family. Eager paths carry only static transforms, so the
-/// symbolic-index hooks are unreachable by type.
+/// dynamic-index hooks are unreachable by type.
 struct EagerTransformCarrier<A>(PhantomData<A>);
 
 impl<A: Value<Type = ArrayType> + Reshape + Slice> TransformReadCarrier for EagerTransformCarrier<A> {
@@ -1505,7 +1506,7 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice> TransformReadCarrier for Eage
         input.reshape(shape)
     }
 
-    fn index_symbolic(
+    fn dynamic_index(
         &self,
         _input: &A,
         _axis: usize,
@@ -1520,7 +1521,7 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> TransformWriteC
         target.update_slice(update, starts.as_slice())
     }
 
-    fn update_index_symbolic(
+    fn dynamic_update_index(
         &self,
         _target: &A,
         _update: &A,
@@ -1533,7 +1534,7 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> TransformWriteC
 
 /// Transform carrier that binds the canonical slice, reshape, and update-slice operations of one array reference
 /// transform path into a reference discharge context, sharing the single [`ArrayReferenceTransformPath`] traversal with
-/// the eager value carrier, which keeps staged and eager reference semantics consistent. Symbolic indices arrive closed
+/// the eager value carrier, which keeps staged and eager reference semantics consistent. Dynamic indices arrive closed
 /// over context values and select a size-one dynamic slice; updates restore the removed axis before replacing that
 /// slice.
 ///
@@ -1600,7 +1601,7 @@ where
         self.bind_array(ReshapeOperation::new(shape), &[input])
     }
 
-    fn index_symbolic(&self, input: &C::Value, axis: usize, binding: &C::Value) -> Result<C::Value, ProgramError> {
+    fn dynamic_index(&self, input: &C::Value, axis: usize, binding: &C::Value) -> Result<C::Value, ProgramError> {
         let input_type = self.array_type(input)?.into_owned();
         let mut sizes = ArrayReferenceTransform::indexed_shape(axis, &input_type)?.dimensions().to_vec();
         sizes[axis] = 1;
@@ -1628,7 +1629,7 @@ where
         self.bind_array(UpdateSliceOperation::new(starts), &[target, update])
     }
 
-    fn update_index_symbolic(
+    fn dynamic_update_index(
         &self,
         target: &C::Value,
         update: &C::Value,
@@ -1810,12 +1811,12 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_with_transform_rejects_symbolic_indices() {
+    fn test_array_reference_with_transform_rejects_dynamic_indices() {
         // An unresolved dynamic index cannot enter a static eager path. The access must supply its binding through
         // `with_transforms`, which resolves the index before extending the handle.
-        let symbolic = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let dynamic_index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
         let path: ArrayReferenceTransformPath<NoReferenceTransformBinding> =
-            ArrayReferenceTransformPath::root().with_transform(symbolic.clone());
+            ArrayReferenceTransformPath::root().with_transform(dynamic_index.clone());
         assert_eq!(
             path.apply(Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap()),
             Err(TypeError::invalid(
@@ -1824,7 +1825,7 @@ mod tests {
             .into()),
         );
         let root = ArrayReference::new(Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()).unwrap());
-        let error = root.with_transform(symbolic).unwrap_err();
+        let error = root.with_transform(dynamic_index).unwrap_err();
         assert_eq!(
             error.downcast_custom::<ArrayReferenceViewError>(),
             Some(&ArrayReferenceViewError::DynamicTransformIndex),
@@ -2230,16 +2231,16 @@ mod tests {
             ArrayReferenceTransformPath::root().root_slice_axes(&ArrayType::new_static(DataType::I32, vec![])),
             Some(vec![]),
         );
-        let symbolic = ArrayReferenceTransformPath::root().with_bound_transform(
+        let dynamically_indexed = ArrayReferenceTransformPath::root().with_bound_transform(
             ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic },
             vec![ValueId::new(RegionId::new(0), AtomId::new(0))],
         );
-        assert_eq!(symbolic.root_slice_axes(&root_type), None);
-        let dynamic = ArrayType::new(
+        assert_eq!(dynamically_indexed.root_slice_axes(&root_type), None);
+        let dynamically_shaped = ArrayType::new(
             DataType::I32,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
         );
-        assert_eq!(ArrayReferenceTransformPath::root().root_slice_axes(&dynamic), None);
+        assert_eq!(ArrayReferenceTransformPath::root().root_slice_axes(&dynamically_shaped), None);
         let invalid = path
             .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(3) });
         assert_eq!(invalid.root_slice_axes(&root_type), None);
@@ -2366,7 +2367,7 @@ mod tests {
         let matrix_type = ArrayType::new_static(DataType::F32, [3, 4]);
         let vector_type = ArrayType::new_static(DataType::F32, [3]);
 
-        // Static indexing selects one existing index on one existing axis; a symbolic index still names an
+        // Static indexing selects one existing index on one existing axis; a dynamic index still names an
         // existing axis.
         assert_eq!(
             ArrayReferenceTransform::Index { axis: 2, index: ArrayReferenceTransformIndex::Static(0) }
@@ -2428,15 +2429,15 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_transform_output_type_symbolic_index() {
+    fn test_array_reference_transform_output_type_dynamic_index() {
         let matrix_type = ArrayType::new_static(DataType::F32, [3, 4]);
-        let symbolic = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let dynamic_index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
         let static_index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) };
-        // Removing a symbolic axis derives the same type even when no static index could select it.
-        assert_eq!(symbolic.output_type(&matrix_type), static_index.output_type(&matrix_type));
-        assert_eq!(symbolic.output_type(&matrix_type), Ok(ArrayType::new_static(DataType::F32, [4])));
+        // Removing an axis at a dynamic index derives the same type even when no static index could select it.
+        assert_eq!(dynamic_index.output_type(&matrix_type), static_index.output_type(&matrix_type));
+        assert_eq!(dynamic_index.output_type(&matrix_type), Ok(ArrayType::new_static(DataType::F32, [4])));
         assert_eq!(
-            symbolic.output_type(&ArrayType::new_static(DataType::F32, [0, 4])),
+            dynamic_index.output_type(&ArrayType::new_static(DataType::F32, [0, 4])),
             Ok(ArrayType::new_static(DataType::F32, [4])),
         );
     }
@@ -2567,18 +2568,18 @@ mod tests {
         assert_eq!(empty.overlap(&rows_0_1, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(empty.overlap(&row_1_column_1, &root), ReferenceViewOverlap::MayOverlap);
 
-        // Symbolic indices agree only when their binding, offset, and clamping extent agree. Different
+        // Dynamic indices agree only when their binding, offset, and clamping extent agree. Different
         // offsets can clamp to the same root element, so they cannot establish disjointness.
-        let symbolic = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let dynamic_index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
         let first = ValueId::new(RegionId::new(0), AtomId::new(1));
         let second = ValueId::new(RegionId::new(0), AtomId::new(2));
         let other_region = ValueId::new(RegionId::new(1), AtomId::new(1));
-        let row_first = empty.clone().with_bound_transform(symbolic.clone(), vec![first]);
-        let row_second = empty.clone().with_bound_transform(symbolic.clone(), vec![second]);
-        let row_other_region = empty.clone().with_bound_transform(symbolic.clone(), vec![other_region]);
-        let shifted_row_first = rows_1_2.with_bound_transform(symbolic.clone(), vec![first]);
+        let row_first = empty.clone().with_bound_transform(dynamic_index.clone(), vec![first]);
+        let row_second = empty.clone().with_bound_transform(dynamic_index.clone(), vec![second]);
+        let row_other_region = empty.clone().with_bound_transform(dynamic_index.clone(), vec![other_region]);
+        let shifted_row_first = rows_1_2.with_bound_transform(dynamic_index.clone(), vec![first]);
         assert_eq!(
-            row_first.overlap(&empty.clone().with_bound_transform(symbolic.clone(), vec![first]), &root),
+            row_first.overlap(&empty.clone().with_bound_transform(dynamic_index.clone(), vec![first]), &root),
             ReferenceViewOverlap::Same
         );
         assert_eq!(row_first.overlap(&row_second, &root), ReferenceViewOverlap::MayOverlap);
@@ -2589,7 +2590,7 @@ mod tests {
         assert_eq!(row_first.overlap(&shifted_row_first, &root), ReferenceViewOverlap::MayOverlap);
         // Equal offsets with different extents also clamp differently: a large index selects row 3 in the
         // whole root but row 1 in its first two rows.
-        let shortened_row_first = rows_0_1.clone().with_bound_transform(symbolic.clone(), vec![first]);
+        let shortened_row_first = rows_0_1.clone().with_bound_transform(dynamic_index.clone(), vec![first]);
         assert_eq!(row_first.overlap(&shortened_row_first, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(
             row_first
@@ -2607,13 +2608,13 @@ mod tests {
             ReferenceViewOverlap::Disjoint,
         );
 
-        // A path or root that cannot be folded (an out-of-bounds axis or index, a symbolic transform without its
+        // A path or root that cannot be folded (an out-of-bounds axis or index, a dynamic index without its
         // binding, a non-reference root, or a root without a static shape) is conservatively reported as possibly
         // overlapping rather than failing.
         let out_of_bounds = empty
             .clone()
             .with_transform(ArrayReferenceTransform::Index { axis: 2, index: ArrayReferenceTransformIndex::Static(0) });
-        let unbound = empty.clone().with_transform(symbolic);
+        let unbound = empty.clone().with_transform(dynamic_index);
         assert_eq!(out_of_bounds.overlap(&rows_2_3, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(
             empty
@@ -2694,10 +2695,10 @@ mod tests {
             )),
         );
 
-        // Batching preserves the symbol that supplies the index.
-        let symbolic = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        // Batching preserves the binding that supplies the index.
+        let dynamic_index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
         assert_eq!(
-            symbolic.batch(&packed, BatchAxis::new(0)),
+            dynamic_index.batch(&packed, BatchAxis::new(0)),
             Ok((
                 ArrayReferenceTransform::Index { axis: 1, index: ArrayReferenceTransformIndex::Dynamic },
                 BatchAxis::new(0),
@@ -3201,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_discharge_symbolic_indices() {
+    fn test_array_reference_discharge_dynamic_indices() {
         // Stage a composed view: select a runtime row, then its last two columns. Updating the leaf must preserve
         // both the rest of that row and every other row of the shared root.
         let stage = |inputs: Vec<Tracer<TestContext>>| {
