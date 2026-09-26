@@ -232,6 +232,24 @@ impl<Transform: ReferenceTransform, Binding> ReferenceTransformPath<Transform, B
         Ok(Self { bound_transforms })
     }
 
+    /// Consumes this [`ReferenceTransformPath`] and returns it extended by one more [`BoundReferenceTransform`],
+    /// as [`push_bound_transform`](Self::push_bound_transform) does in place. Clone the path first to derive
+    /// several paths from a common prefix.
+    #[inline]
+    pub fn with_bound_transform(mut self, transform: Transform, bindings: Vec<Binding>) -> Self {
+        self.push_bound_transform(transform, bindings);
+        self
+    }
+
+    /// Consumes this [`ReferenceTransformPath`] and returns it extended by one more static [`ReferenceTransform`],
+    /// as [`push_transform`](Self::push_transform) does in place. Clone the path first to derive several paths from
+    /// a common prefix.
+    #[inline]
+    pub fn with_transform(mut self, transform: Transform) -> Self {
+        self.push_transform(transform);
+        self
+    }
+
     /// Returns whether this [`ReferenceTransformPath`] denotes the complete root (i.e., whether it is empty).
     #[inline]
     pub fn is_root(&self) -> bool {
@@ -251,36 +269,27 @@ impl<Transform: ReferenceTransform, Binding> ReferenceTransformPath<Transform, B
         self.bound_transforms.iter().map(BoundReferenceTransform::transform)
     }
 
-    /// Returns a copy of this [`ReferenceTransformPath`] extended by one more [`BoundReferenceTransform`] applied to
-    /// its current end, associating `transform` with `bindings`. The caller must supply the number of bindings declared
-    /// by [`ReferenceTransform::binding_count`], in the transform family's order. This generic container does not
-    /// validate the transform or its bindings.
-    pub fn with_bound_transform(&self, transform: Transform, bindings: Vec<Binding>) -> Self
-    where
-        Binding: Clone,
-    {
-        let mut bound_transforms = Vec::with_capacity(self.bound_transforms.len() + 1);
-        bound_transforms.extend(self.bound_transforms.iter().cloned());
-        bound_transforms.push(BoundReferenceTransform { transform, bindings });
-        Self { bound_transforms }
-    }
-
-    /// Returns a copy of this [`ReferenceTransformPath`] extended by one more static [`ReferenceTransform`] applied to
-    /// its current end. This is the shorthand of [`with_bound_transform`](Self::with_bound_transform) with no bindings.
-    /// The caller must ensure that `transform` requires no dynamic bindings.
+    /// Extends this [`ReferenceTransformPath`] in place by one more [`BoundReferenceTransform`] applied to its current
+    /// end, associating `transform` with `bindings`, in `O(1)` amortized time. The caller must supply the number of
+    /// bindings declared by [`ReferenceTransform::binding_count`], in the transform family's order. This generic
+    /// container does not validate the transform or its bindings.
     #[inline]
-    pub fn with_transform(&self, transform: Transform) -> Self
-    where
-        Binding: Clone,
-    {
-        self.with_bound_transform(transform, Vec::new())
+    pub fn push_bound_transform(&mut self, transform: Transform, bindings: Vec<Binding>) {
+        self.bound_transforms.push(BoundReferenceTransform { transform, bindings });
     }
 
-    /// Extends this [`ReferenceTransformPath`] in place by the bound transforms of `suffix`, applied in order after its
-    /// current end. Unlike [`with_bound_transform`](Self::with_bound_transform), which copies the existing bound
-    /// transforms into a new path, this moves the bound transforms of `suffix` without cloning either path, so
-    /// extending a path by `k` transforms costs `O(k)` amortized time regardless of its current length. Like
-    /// [`with_bound_transform`](Self::with_bound_transform), it does not validate the transforms or their bindings.
+    /// Extends this [`ReferenceTransformPath`] in place by one more static [`ReferenceTransform`] applied to its current
+    /// end. This is the shorthand of [`push_bound_transform`](Self::push_bound_transform) with no bindings, and so the
+    /// caller must ensure that `transform` requires no dynamic bindings.
+    #[inline]
+    pub fn push_transform(&mut self, transform: Transform) {
+        self.push_bound_transform(transform, Vec::new());
+    }
+
+    /// Extends this [`ReferenceTransformPath`] in place by the bound transforms of `suffix`, applied in order after
+    /// its current end. The bound transforms of `suffix` are moved rather than cloned, so extending a path by `k`
+    /// transforms costs `O(k)` amortized time regardless of its current length. This is similar to
+    /// [`push_bound_transform`](Self::push_bound_transform), but it does not validate the transforms or their bindings.
     #[inline]
     pub fn append(&mut self, suffix: Self) {
         self.bound_transforms.extend(suffix.bound_transforms);
@@ -563,7 +572,6 @@ pub(crate) mod tests {
         assert_eq!(root.bound_transforms(), &[]);
         assert_eq!(root.transforms().count(), 0);
         assert_eq!(root, TestPath::default());
-
         assert_eq!(format!("{root:?}"), "ReferenceTransformPath { bound_transforms: [] }");
     }
 
@@ -593,6 +601,59 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_reference_transform_path_with_bound_transform() {
+        let row = TestPath::root().with_transform(index(0, 1));
+        let symbolic = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let bound = row
+            .clone()
+            .with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))]);
+        assert_eq!(bound.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &symbolic]);
+        assert_eq!(bound.bound_transforms()[1].bindings(), &[ValueId::new(RegionId::new(0), AtomId::new(3))]);
+        assert_eq!(row.transforms().collect::<Vec<_>>(), vec![&index(0, 1)]);
+
+        // Equal transforms can select different indices when their source bindings differ.
+        assert_eq!(
+            bound,
+            row.clone()
+                .with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))])
+        );
+        assert_ne!(
+            bound,
+            row.clone()
+                .with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(4))])
+        );
+        assert_ne!(
+            bound,
+            row.clone().with_bound_transform(symbolic, vec![ValueId::new(RegionId::new(1), AtomId::new(0))])
+        );
+
+        // Paths used as map keys distinguish bindings as well as transforms.
+        let paths = HashMap::from([(bound.clone(), "bound")]);
+        assert_eq!(paths.get(&bound), Some(&"bound"));
+        assert_eq!(paths.get(&row), None);
+    }
+
+    #[test]
+    fn test_reference_transform_path_with_transform() {
+        let root = TestPath::root();
+        let row = root.clone().with_transform(index(0, 1));
+        let element = row.clone().with_transform(index(0, 2));
+
+        // Appending preserves root-to-value order without modifying either source path.
+        assert!(root.is_root());
+        assert_eq!(row.transforms().collect::<Vec<_>>(), vec![&index(0, 1)]);
+        assert_eq!(element.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &index(0, 2)]);
+        assert_eq!(row, TestPath::root().with_transform(index(0, 1)));
+        assert_ne!(row, element);
+        assert_ne!(row, TestPath::root().with_transform(index(1, 1)));
+        assert_eq!(
+            format!("{row:?}"),
+            "ReferenceTransformPath { bound_transforms: [BoundReferenceTransform { transform: Index { axis: 0, index: \
+             Static(1) }, bindings: [] }] }",
+        );
+    }
+
+    #[test]
     fn test_reference_transform_path_is_root() {
         assert!(TestPath::root().is_root());
         assert!(!TestPath::root().with_transform(index(0, 1)).is_root());
@@ -615,52 +676,6 @@ pub(crate) mod tests {
         let path = TestPath::root().with_transform(index(0, 1)).with_transform(index(0, 2));
         assert_eq!(path.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &index(0, 2)]);
         assert_eq!(path.transforms().rev().collect::<Vec<_>>(), vec![&index(0, 2), &index(0, 1)]);
-    }
-
-    #[test]
-    fn test_reference_transform_path_with_bound_transform() {
-        let row = TestPath::root().with_transform(index(0, 1));
-        let symbolic = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let bound = row.with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))]);
-        assert_eq!(bound.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &symbolic]);
-        assert_eq!(bound.bound_transforms()[1].bindings(), &[ValueId::new(RegionId::new(0), AtomId::new(3))]);
-        assert_eq!(row.transforms().collect::<Vec<_>>(), vec![&index(0, 1)]);
-
-        // Equal transforms can select different indices when their source bindings differ.
-        assert_eq!(
-            bound,
-            row.with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))])
-        );
-        assert_ne!(
-            bound,
-            row.with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(4))])
-        );
-        assert_ne!(bound, row.with_bound_transform(symbolic, vec![ValueId::new(RegionId::new(1), AtomId::new(0))]));
-
-        // Paths used as map keys distinguish bindings as well as transforms.
-        let paths = HashMap::from([(bound.clone(), "bound")]);
-        assert_eq!(paths.get(&bound), Some(&"bound"));
-        assert_eq!(paths.get(&row), None);
-    }
-
-    #[test]
-    fn test_reference_transform_path_with_transform() {
-        let root = TestPath::root();
-        let row = root.with_transform(index(0, 1));
-        let element = row.with_transform(index(0, 2));
-
-        // Appending preserves root-to-value order without modifying either source path.
-        assert!(root.is_root());
-        assert_eq!(row.transforms().collect::<Vec<_>>(), vec![&index(0, 1)]);
-        assert_eq!(element.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &index(0, 2)]);
-        assert_eq!(row, TestPath::root().with_transform(index(0, 1)));
-        assert_ne!(row, element);
-        assert_ne!(row, TestPath::root().with_transform(index(1, 1)));
-        assert_eq!(
-            format!("{row:?}"),
-            "ReferenceTransformPath { bound_transforms: [BoundReferenceTransform { transform: Index { axis: 0, index: \
-             Static(1) }, bindings: [] }] }",
-        );
     }
 
     #[test]

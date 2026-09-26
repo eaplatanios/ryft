@@ -1811,7 +1811,7 @@ impl<Root: Typed, Transform: ReferenceTransform, Binding: Clone + Typed<Type = T
         let binding_types = binding_types.iter().map(AsRef::as_ref).collect::<Vec<_>>();
         transform.validate_bindings(self.r#type.referent(), &binding_types)?;
         let referent = transform.output_type(self.r#type.referent())?;
-        self.path.append(ReferenceTransformPath::root().with_bound_transform(transform, bindings));
+        self.path.push_bound_transform(transform, bindings);
         self.r#type = ReferenceType::new(referent);
         Ok(self)
     }
