@@ -105,12 +105,7 @@ impl<T: DifferentiableType> Display for CustomJvpOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
-    // Type inference declares the region inputs described in the documentation of `CustomJvpOperation` independently
-    // of the concrete programs and then checks that the supplied interfaces realize that declaration exactly.
-
     type Type = T;
 
     #[inline]
@@ -145,8 +140,8 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        // Output inference is a standalone validation entry point, so it must validate the complete post-instantiation
-        // region contract even when `infer_region_input_types` was not called first.
+        // Output inference is a standalone validation entry point, so it must validate the complete
+        // post-instantiation region contract even when `infer_region_input_types` was not called first.
         check_count!("region", region_interfaces, 2, TypeError);
         let primal_interface = &region_interfaces[0];
         let jvp_interface = &region_interfaces[1];
@@ -222,6 +217,7 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
 impl_reference_dischargeable_operation!(@local_reference <T> CustomJvpOperation<T> where T: DifferentiableType);
 
 impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomJvpOperation<C::Type> {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -235,19 +231,16 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomJv
     }
 }
 
-impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomJvpOperation<C::Type>
-where
-    C::Operation: From<CustomJvpOperation<C::Type>>,
+// The default partial-evaluation rule is the desired one here where we interpret the primal region when every input
+// is known and residualize the complete custom-JVP call so its attached derivative rule remains available to later
+// differentiation, otherwise.
+impl<C: Context<Type: DifferentiableType, Operation: From<CustomJvpOperation<C::Type>>>>
+    PartiallyEvaluatableOperation<C> for CustomJvpOperation<C::Type>
 {
-    // The default partial-evaluation rule is the desired one: interpret the primal region when every input is known;
-    // otherwise residualize the complete custom-JVP call so its attached derivative rule remains available to later
-    // differentiation.
 }
 
-impl<T: DifferentiableType, C: Context<Type = T>, P: BatchingPolicy<C>> BatchableOperation<C, P>
-    for CustomJvpOperation<T>
-where
-    C::Operation: From<CustomJvpOperation<T>>,
+impl<T: DifferentiableType, C: Context<Type = T, Operation: From<CustomJvpOperation<T>>>, P: BatchingPolicy<C>>
+    BatchableOperation<C, P> for CustomJvpOperation<T>
 {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
@@ -257,8 +250,8 @@ where
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         // Batch the two region contracts without opening the custom derivative:
         //
-        //   primal: (p, x)    → y
-        //   jvp:    (p, x, ẋ) → (y_jvp, ẏ).
+        //   - Primal: (p, x)    → y
+        //   - JVP:    (p, x, ẋ) → (y_jvp, ẏ).
         //
         // Each `ẋ` follows the batch axis of its corresponding `x`, while `p` has no tangent counterpart. The
         // ordinary primal, JVP-primal, and JVP-tangent computations may independently choose replicated or mapped
@@ -346,9 +339,10 @@ where
     }
 }
 
-impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation<C::Type>
-where
-    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
+impl<
+    C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>
+        + Zero<C::Value>,
+> DifferentiableOperation<C> for CustomJvpOperation<C::Type>
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -356,14 +350,14 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Apply the user-supplied pushforward directly. For `f(p, x) = y`, region 1 implements
+        // Apply the user-supplied pushforward directly. For `f(p, x) = y`, region 1 implements:
         //
         //   j(p, x, ẋ) = (f(p, x), (∂f/∂x)(p, x) · ẋ) = (y, ẏ).
         //
         // Feed every primal value, followed only by the differentiated inputs' tangents; `p` has no tangent slot in the
-        // rule, so a nonzero tangent for a numeric `p` is rejected below. Replay stages the rule's ordinary
-        // primitive operations directly in the active context, so it introduces no symbolic capture. Consequently,
-        // reverse mode can transpose the resulting linear map in `ẋ` exactly like any other tangent program, and
+        // rule, so a nonzero tangent for a numeric `p` is rejected below. Replay stages the rule's ordinary primitive
+        // operations directly in the active context, so it introduces no symbolic capture. Consequently, reverse mode
+        // differentiation can transpose the resulting linear map in `ẋ` exactly like any other tangent program, and
         // no nested differentiation request or special reverse rule is needed here.
         let jvp_region = driver.region(1)?;
         let output_types = jvp_region.output_types();
@@ -419,16 +413,16 @@ where
 }
 
 // The raw carrier is intentionally non-transposable. Differentiation first replaces `f(p, x)` with the ordinary
-// primitive program computing the linear map `ẋ ↦ (∂f/∂x)(p, x) · ẋ`; reverse mode transposes that replayed
-// program, not `CustomJvpOperation`. Therefore only an invalid direct transpose of an un-linearized carrier can reach
-// this rejection path.
+// primitive program computing the linear map `ẋ ↦ (∂f/∂x)(p, x) · ẋ`. Reverse mode differentiation transposes that
+// replayed program, that has no `CustomJvpOperation` instructions. Therefore, only an invalid direct transpose of
+// an un-linearized carrier can reach this rejection path.
 impl_non_transposable_operation!(<T> CustomJvpOperation<T> where T: DifferentiableType);
 
-/// Function with a user-supplied JVP rule, built by [`custom_jvp`]. It stores the primal and JVP closures together
-/// with a phantom marker pinning the tracer-tree types named by those closure signatures. Refer to the documentation
-/// of the [`custom_jvp`] function for the calling convention, the tracing semantics, and when to reach for a custom
-/// JVP.
-pub struct CustomJvp<Primal, Jvp, Inputs, Outputs> {
+/// Function with a user-supplied Jacobian-Vector Product (JVP) rule, built by [`custom_jvp`]. It stores the primal and
+/// JVP closures together with a phantom marker pinning the tracer-tree types named by those closure signatures. Refer
+/// to the documentation of the [`custom_jvp`] function for the calling convention, the tracing semantics, and when to
+/// reach for a custom JVP.
+pub struct CustomJvp<Primal, Jvp, Input, Output> {
     /// Closure computing the primal output tree from the primal input tree.
     primal: Primal,
 
@@ -439,15 +433,19 @@ pub struct CustomJvp<Primal, Jvp, Inputs, Outputs> {
     non_differentiated_count: usize,
 
     /// Phantom marker pinning the input and output tracer-tree types named by the closure signatures. The [`Domain`]
-    /// whose universe the rules are traced into is recovered from the values passed to [`CustomJvp::call`], and so the
-    /// wrapper stores neither a domain value nor a domain type witness.
-    marker: PhantomData<fn() -> (Inputs, Outputs)>,
+    /// whose universe the rules are traced into is recovered from the values passed to [`CustomJvp::call`], and so
+    /// the wrapper stores neither a domain value nor a domain type witness.
+    marker: PhantomData<fn() -> (Input, Output)>,
 }
 
-impl<Primal, Jvp, Inputs, Outputs> CustomJvp<Primal, Jvp, Inputs, Outputs>
-where
-    Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
-    Jvp: Fn(Inputs, Inputs) -> Result<(Outputs, Outputs), ProgramError>,
+// TODO(eaplatanios): Review from here onwards.
+
+impl<
+    Primal: Fn(Input) -> Result<Output, ProgramError>,
+    Jvp: Fn(Input, Input) -> Result<(Output, Output), ProgramError>,
+    Input,
+    Output,
+> CustomJvp<Primal, Jvp, Input, Output>
 {
     /// Declares the leading `non_differentiated_count` flattened leaves of the input tree as non-differentiated
     /// _plumbing_ inputs, which is the high-level counterpart of [`CustomJvpOperation::with_non_differentiated_count`].
@@ -477,18 +475,18 @@ where
     pub fn call<D, V, InputValues>(
         &self,
         input: InputValues,
-    ) -> Result<<Outputs::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
+    ) -> Result<<Output::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
     where
         D: Context<Type: DifferentiableType, Value = V>,
         V: Value<Type = D::Type, DispatchDomain = D>,
         D::Operation: From<CustomJvpOperation<D::Type>>,
-        Inputs: Parameterized<DomainTracer<D>>,
-        Inputs::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
-        Outputs: Parameterized<DomainTracer<D>>,
-        Outputs::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant> + ParameterizedFamily<V>,
-        Inputs::To<D::Type>: Clone + Parameterized<D::Type, Family = Inputs::Family, To<DomainTracer<D>> = Inputs>,
-        Outputs::To<D::Type>: Parameterized<D::Type, Family = Outputs::Family, To<DomainTracer<D>> = Outputs>,
-        InputValues: Parameterized<V, Family = Inputs::Family, To<D::Type> = Inputs::To<D::Type>>,
+        Input: Parameterized<DomainTracer<D>>,
+        Input::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>,
+        Output: Parameterized<DomainTracer<D>>,
+        Output::Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant> + ParameterizedFamily<V>,
+        Input::To<D::Type>: Clone + Parameterized<D::Type, Family = Input::Family, To<DomainTracer<D>> = Input>,
+        Output::To<D::Type>: Parameterized<D::Type, Family = Output::Family, To<DomainTracer<D>> = Output>,
+        InputValues: Parameterized<V, Family = Input::Family, To<D::Type> = Input::To<D::Type>>,
     {
         let mut input_values = Vec::new();
         let input_types = input
