@@ -437,45 +437,26 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayReference<A> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Index selected by an [`Index`](ArrayReferenceTransform::Index) transform.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub enum ArrayReferenceTransformIndex {
+    /// An index known when the transform is described.
+    Static(usize),
 
-impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root, ArrayReferenceTransform, Binding> {
-    /// Selects a static position on `axis`, removing that dimension from the viewed referent.
-    #[inline]
-    pub fn index(self, axis: usize, index: usize) -> Result<Self, ProgramError> {
-        self.with_bound_transform(
-            ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) },
-            Vec::new(),
-        )
-    }
-
-    /// Selects the supplied static unit-stride ranges from the currently viewed referent.
-    #[inline]
-    pub fn slice(self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
-        self.with_bound_transform(ArrayReferenceTransform::Slice { axes: axes.to_vec() }, Vec::new())
-    }
-
-    /// Selects a dynamic position on `axis`. Construction validates the scalar integer binding's type and memory
-    /// space; concretization and negative-index normalization happen at the eventual access.
-    #[inline]
-    pub fn dynamic_index(self, axis: usize, index: &Binding) -> Result<Self, ProgramError> {
-        self.with_bound_transform(
-            ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic },
-            vec![index.clone()],
-        )
-    }
+    /// An index supplied by the next ordinary input in the access's binding sequence.
+    Dynamic,
 }
 
-/// One validated index transform in an [`ArrayReferenceTransformPath`]'s root-to-handle mapping.
+/// One validated index [`ReferenceTransform`] in an [`ArrayReferenceTransformPath`]'s root-to-handle mapping.
 ///
-/// A transform describes both directions of one selection: applying it extracts a selected child value from its
-/// parent, while replacing that child reconstructs a value with exactly the parent's original type. This
-/// bidirectional contract lets reference reads operate on the selected value and lets write-only replacements, swaps,
-/// or additive updates reconstruct the shared root without changing its declared type. A write-only traversal
-/// materializes the strict parents needed for reconstruction but deliberately skips extracting the overwritten leaf.
+/// A transform describes both directions of one selection: applying it extracts a selected child value from its parent,
+/// while replacing that child reconstructs a value with exactly the parent's original type. This bidirectional contract
+/// lets reference reads operate on the selected value and lets write-only replacements, swaps, or additive updates
+/// reconstruct the shared root without changing its declared type. A write-only traversal materializes the strict
+/// parents needed for reconstruction but deliberately skips extracting the overwritten leaf.
 ///
 /// Transforms are interpreted in order from the root outward. [`Index`](Self::Index) removes one axis at a static or
-/// dynamic index; [`Slice`](Self::Slice) preserves rank and selects one static unit-stride range per axis. A dynamic
+/// dynamic index. [`Slice`](Self::Slice) preserves rank and selects one static unit-stride range per axis. A dynamic
 /// index is supplied by the next input in the access's binding group. Analysis records that input's [`ValueId`] in
 /// the corresponding [`BoundReferenceTransform`]. For example, the built-in scan binds its explicit body index to a
 /// leading dynamic index on each access to a stacked reference. Eager handles resolve dynamic indices into static
@@ -500,15 +481,7 @@ pub enum ArrayReferenceTransform {
     },
 }
 
-/// Index selected by an [`Index`](ArrayReferenceTransform::Index) transform.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub enum ArrayReferenceTransformIndex {
-    /// An index known when the transform is described.
-    Static(usize),
-
-    /// An index supplied by the next ordinary input in the access's binding sequence.
-    Dynamic,
-}
+// TODO(eaplatanios): Review from here onwards.
 
 impl ArrayReferenceTransform {
     /// Returns the exact canonical array type produced from `input`. A symbolic index removes its axis exactly like a
@@ -842,6 +815,33 @@ impl BatchableReferenceTransform for ArrayReferenceTransform {
                 Ok((Self::Slice { axes }, batch_axis))
             }
         }
+    }
+}
+
+impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root, ArrayReferenceTransform, Binding> {
+    /// Selects a static position on `axis`, removing that dimension from the viewed referent.
+    #[inline]
+    pub fn index(self, axis: usize, index: usize) -> Result<Self, ProgramError> {
+        self.with_bound_transform(
+            ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Static(index) },
+            Vec::new(),
+        )
+    }
+
+    /// Selects the supplied static unit-stride ranges from the currently viewed referent.
+    #[inline]
+    pub fn slice(self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
+        self.with_bound_transform(ArrayReferenceTransform::Slice { axes: axes.to_vec() }, Vec::new())
+    }
+
+    /// Selects a dynamic position on `axis`. Construction validates the scalar integer binding's type and memory
+    /// space; concretization and negative-index normalization happen at the eventual access.
+    #[inline]
+    pub fn dynamic_index(self, axis: usize, index: &Binding) -> Result<Self, ProgramError> {
+        self.with_bound_transform(
+            ArrayReferenceTransform::Index { axis, index: ArrayReferenceTransformIndex::Dynamic },
+            vec![index.clone()],
+        )
     }
 }
 
@@ -2574,6 +2574,67 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_view_array_selection() {
+        let root =
+            ArrayIrValue::Reference(ArrayReference::new(Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap()));
+        let viewed = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(root).unwrap();
+        let selected = viewed
+            .index(0, 1)
+            .unwrap()
+            .slice(&[ArraySliceAxis::new(1, 2, 1)])
+            .unwrap()
+            .dynamic_index(0, &ArrayIrValue::Array(Array::scalar(-1i32).unwrap()))
+            .unwrap();
+        assert_eq!(selected.read(), Ok(ArrayIrValue::Array(Array::scalar(6i32).unwrap())));
+        let empty_root = ArrayIrValue::Reference(ArrayReference::new(Array::vector(Vec::<i32>::new()).unwrap()));
+        let empty = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(empty_root)
+            .unwrap()
+            .dynamic_index(0, &ArrayIrValue::Array(Array::scalar(0i32).unwrap()))
+            .unwrap();
+        assert_eq!(empty.read(), Err(TypeError::invalid("cannot dynamically index an empty reference axis").into()));
+    }
+
+    #[test]
+    fn test_reference_view_projected_tracer() {
+        type TestTracer = Tracer<TestContext>;
+        let (output_type, program) = TestContext::trace(
+            |(input, index): (TestTracer, TestTracer)| {
+                let input = <TestTracer as ValueProjection<ArrayType>>::into_projected(input)?;
+                let reference = input.reference_new()?;
+                let viewed = ReferenceView::<_, ArrayReferenceTransform, TestTracer>::new(reference)?
+                    .slice(&[ArraySliceAxis::new(1, 2, 1)])?
+                    .dynamic_index(0, &index)?;
+                let selected: ProjectedValue<ArrayType, TestTracer> = viewed.read()?;
+                viewed.write(&selected)?;
+                viewed.add_update(&selected)?;
+                let result: ProjectedValue<ArrayType, TestTracer> = viewed.read()?;
+                Ok(result.into_value())
+            },
+            (
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])),
+                ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["reference_new", "reference_read", "reference_write", "reference_add_update", "reference_read"],
+        );
+        let read = &program.instructions()[1];
+        assert_eq!(read.inputs().len(), 2);
+        assert_eq!(read.operation().reference_access_descriptor(0).unwrap().transforms().len(), 2);
+        let inputs = (
+            TestValue::Array(Array::vector(vec![2f32, 3., 5.]).unwrap()),
+            TestValue::Array(Array::scalar(-1i32).unwrap()),
+        );
+        let expected = TestValue::Array(Array::scalar(10f32).unwrap());
+        assert_eq!(program.clone().interpret(inputs.clone()), Ok(expected.clone()));
+        let discharged = program.into_flat_program().discharge_references(0).unwrap();
+        assert_eq!(discharged.program().interpret(vec![inputs.0, inputs.1]), Ok(vec![expected]));
+    }
+
+    #[test]
     fn test_array_reference_transform_path_root_slice() {
         let root_type = ArrayType::new_static(DataType::I32, vec![4, 5]);
         let path = ArrayReferenceTransformPath::root()
@@ -3151,67 +3212,6 @@ mod tests {
                 ]),
             );
         }
-    }
-
-    #[test]
-    fn test_reference_view_array_selection() {
-        let root =
-            ArrayIrValue::Reference(ArrayReference::new(Array::matrix(2, 3, vec![1i32, 2, 3, 4, 5, 6]).unwrap()));
-        let viewed = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(root).unwrap();
-        let selected = viewed
-            .index(0, 1)
-            .unwrap()
-            .slice(&[ArraySliceAxis::new(1, 2, 1)])
-            .unwrap()
-            .dynamic_index(0, &ArrayIrValue::Array(Array::scalar(-1i32).unwrap()))
-            .unwrap();
-        assert_eq!(selected.read(), Ok(ArrayIrValue::Array(Array::scalar(6i32).unwrap())));
-        let empty_root = ArrayIrValue::Reference(ArrayReference::new(Array::vector(Vec::<i32>::new()).unwrap()));
-        let empty = ReferenceView::<_, ArrayReferenceTransform, TestValue>::new(empty_root)
-            .unwrap()
-            .dynamic_index(0, &ArrayIrValue::Array(Array::scalar(0i32).unwrap()))
-            .unwrap();
-        assert_eq!(empty.read(), Err(TypeError::invalid("cannot dynamically index an empty reference axis").into()));
-    }
-
-    #[test]
-    fn test_reference_view_projected_tracer() {
-        type TestTracer = Tracer<TestContext>;
-        let (output_type, program) = TestContext::trace(
-            |(input, index): (TestTracer, TestTracer)| {
-                let input = <TestTracer as ValueProjection<ArrayType>>::into_projected(input)?;
-                let reference = input.reference_new()?;
-                let viewed = ReferenceView::<_, ArrayReferenceTransform, TestTracer>::new(reference)?
-                    .slice(&[ArraySliceAxis::new(1, 2, 1)])?
-                    .dynamic_index(0, &index)?;
-                let selected: ProjectedValue<ArrayType, TestTracer> = viewed.read()?;
-                viewed.write(&selected)?;
-                viewed.add_update(&selected)?;
-                let result: ProjectedValue<ArrayType, TestTracer> = viewed.read()?;
-                Ok(result.into_value())
-            },
-            (
-                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])),
-                ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
-            ),
-        )
-        .unwrap();
-        assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
-        assert_eq!(
-            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["reference_new", "reference_read", "reference_write", "reference_add_update", "reference_read"],
-        );
-        let read = &program.instructions()[1];
-        assert_eq!(read.inputs().len(), 2);
-        assert_eq!(read.operation().reference_access_descriptor(0).unwrap().transforms().len(), 2);
-        let inputs = (
-            TestValue::Array(Array::vector(vec![2f32, 3., 5.]).unwrap()),
-            TestValue::Array(Array::scalar(-1i32).unwrap()),
-        );
-        let expected = TestValue::Array(Array::scalar(10f32).unwrap());
-        assert_eq!(program.clone().interpret(inputs.clone()), Ok(expected.clone()));
-        let discharged = program.into_flat_program().discharge_references(0).unwrap();
-        assert_eq!(discharged.program().interpret(vec![inputs.0, inputs.1]), Ok(vec![expected]));
     }
 
     #[test]
