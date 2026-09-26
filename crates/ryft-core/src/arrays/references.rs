@@ -1350,29 +1350,69 @@ enum RootIndexSelection {
 }
 
 impl RootIndexSelection {
-    /// Folds the closed `bound_transforms` of a path over a root of static shape `shape` into one static range or
-    /// dynamic index per root axis, or [`None`] when the path is malformed for that root (i.e., an axis, index,
-    /// binding, or stride that the derivation would have rejected).
+    /// Translates the transforms of a path into what they select on each axis of a root of static shape `shape`,
+    /// in root coordinates. [`ReferenceTransform::overlap`] compares two paths through this translation, and
+    /// [`ArrayReferenceTransformPath::root_slice_axes`] exposes it for static paths.
+    ///
+    /// Each transform is written in the coordinates of the view that it is applied to. A slice narrows each view axis
+    /// relative to that axis's current start, and an index selects a position relative to that start and removes the
+    /// axis from the view, so later transforms number the view axes without it. This function replays the path while
+    /// tracking the root axes that remain in the view, in view axis order, each with the range that the path has
+    /// narrowed it to. Every root axis starts as its complete [`Static`](Self::Static) range. A slice narrows the
+    /// ranges of the axes that remain in the view, a static index collapses one range to a single index, and a
+    /// dynamic index replaces one range with a [`Dynamic`](Self::Dynamic) index relative to it. Both kinds of index
+    /// also remove their axis from the view.
+    ///
+    /// For example, over an `f32[4, 6]` root, the path `[slice(axes=[1:4, 2:6]), index(axis=0, index=dynamic),
+    /// slice(axes=[1:3])]`, with its dynamic index bound to `%i`, folds as follows:
+    ///
+    /// ```text
+    ///     transform                       root axis 0                  root axis 1    remaining view axes
+    ///     (root)                          0:4                          0:6            [0, 1]
+    ///     slice(axes=[1:4, 2:6])          1:4                          2:6            [0, 1]
+    ///     index(axis=0, index=dynamic)    1 + clamp(wrap(%i), 0, 2)    2:6            [1]
+    ///     slice(axes=[1:3])               1 + clamp(wrap(%i), 0, 2)    3:5            [1]
+    /// ```
+    ///
+    /// The final `slice(axes=[1:3])` has one axis because the dynamic index removed view axis `0`, and it narrows
+    /// root axis `1` from `2:6` to `3:5`. The path therefore selects root columns `3..5` of the root row
+    /// `1 + clamp(wrap(%i), 0, 2)`.
+    ///
+    /// Returns [`None`] if the path does not fold against `shape`, which covers the paths that
+    /// [`ArrayReferenceTransform::output_type`] rejects: an axis out of bounds, a static index or slice range that
+    /// extends past its current range, a slice with the wrong number of axes or a stride other than one, and a dynamic
+    /// index without a binding. It also returns [`None`] when a root coordinate overflows `usize`, so that malformed
+    /// paths stay conservative.
+    ///
+    /// # Parameters
+    ///
+    ///   - `shape`: Static shape of the root.
+    ///   - `bound_transforms`: Transforms of the path, in order from the root, with the program values that bind
+    ///     their dynamic indices.
     fn fold(
         shape: &StaticShape,
         bound_transforms: &[BoundReferenceTransform<ArrayReferenceTransform>],
     ) -> Option<Vec<Self>> {
-        let mut indices =
+        let mut selections =
             shape.dimensions().iter().map(|size| Self::Static { start: 0, limit: *size }).collect::<Vec<_>>();
 
-        // Root axes that the folded transforms have not indexed away yet, in view axis order.
-        let mut remaining = (0..shape.rank()).collect::<Vec<_>>();
+        // Root axes that remain in the view, in view axis order, each with the static range `start..limit` that the
+        // path has narrowed it to so far. Indexing an axis removes it from this list and records its final selection,
+        // so the ranges of the axes that are still listed are written back once the whole path has been folded.
+        let mut remaining = shape
+            .dimensions()
+            .iter()
+            .enumerate()
+            .map(|(root_axis, size)| (root_axis, 0usize, *size))
+            .collect::<Vec<_>>();
         for bound_transform in bound_transforms {
             match bound_transform.transform() {
                 ArrayReferenceTransform::Index { axis, index } => {
                     if *axis >= remaining.len() {
                         return None;
                     }
-                    let root_axis = remaining.remove(*axis);
-                    let Self::Static { start, limit } = indices[root_axis] else {
-                        return None;
-                    };
-                    indices[root_axis] = match index {
+                    let (root_axis, start, limit) = remaining.remove(*axis);
+                    selections[root_axis] = match index {
                         ArrayReferenceTransformIndex::Static(index) => {
                             // Invalid paths must remain conservative even when the relative index overflows.
                             let index = start.checked_add(*index)?;
@@ -1391,22 +1431,23 @@ impl RootIndexSelection {
                     if axes.len() != remaining.len() {
                         return None;
                     }
-                    for (slice_axis, root_axis) in axes.iter().zip(remaining.iter()) {
-                        let Self::Static { start, limit } = indices[*root_axis] else {
-                            return None;
-                        };
+                    for (slice_axis, (_, start, limit)) in axes.iter().zip(remaining.iter_mut()) {
                         let narrowed_start = start.checked_add(slice_axis.start())?;
                         let narrowed_limit = narrowed_start.checked_add(slice_axis.size())?;
-                        if slice_axis.stride() != 1 || narrowed_limit > limit {
+                        if slice_axis.stride() != 1 || narrowed_limit > *limit {
                             return None;
                         }
-                        indices[*root_axis] = Self::Static { start: narrowed_start, limit: narrowed_limit };
+                        (*start, *limit) = (narrowed_start, narrowed_limit);
                     }
                 }
             }
         }
 
-        Some(indices)
+        for (root_axis, start, limit) in remaining {
+            selections[root_axis] = Self::Static { start, limit };
+        }
+
+        Some(selections)
     }
 
     /// Returns the [`ReferenceViewOverlap`] between the indices that this [`RootIndexSelection`] and `other`
