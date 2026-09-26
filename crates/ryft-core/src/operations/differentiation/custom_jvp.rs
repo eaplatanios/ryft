@@ -564,6 +564,11 @@ where
 /// non-differentiated input (see below) or as an ordinary input whose tangent is present in `ẋ` and which a rule that
 /// treats the value as a parameter ignores when constructing `ẏ`.
 ///
+/// Because [`custom_jvp`] builds a reusable function before any input is known, the `primal` closure must annotate
+/// the tracer type of its input (e.g., `|x: DomainTracer<D>| ...`), which then also fixes the input types of the
+/// `jvp` closure. [`custom_derivative_at`](crate::custom_derivative_at) instead stages the same rule at a known input,
+/// which lets both closures infer their parameter types from that input.
+///
 /// # Non-differentiated inputs
 ///
 /// [`CustomJvp::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
@@ -1988,7 +1993,7 @@ pub(crate) mod tests {
         // to avoid constant lifting), which proves that the rule is in control.
         let function = custom_jvp(
             |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
-            |x: DomainTracer<ArrayContext>, tangent| {
+            |x, tangent| {
                 let tangent = x.cos()? * tangent;
                 Ok((x.sin()?, tangent.clone() + tangent))
             },
@@ -2092,11 +2097,9 @@ pub(crate) mod tests {
         );
 
         // The non-differentiated count cannot exceed the number of input leaves.
-        let function = custom_jvp(
-            |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
-            |x: DomainTracer<ArrayContext>, tangent| Ok((x.sin()?, x.cos()? * tangent)),
-        )
-        .with_non_differentiated_count(2);
+        let function =
+            custom_jvp(|x: DomainTracer<ArrayContext>| Ok(x.sin()?), |x, tangent| Ok((x.sin()?, x.cos()? * tangent)))
+                .with_non_differentiated_count(2);
         assert_eq!(
             ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
@@ -2112,9 +2115,7 @@ pub(crate) mod tests {
         // program fails the signature validation that `CustomJvpOperation` performs at the call site.
         let function = custom_jvp(
             |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
-            |x: DomainTracer<ArrayContext>, tangent| {
-                Ok((x.sin()?, tangent.dot(&tangent, &DotDimensionNumbers::inner_product())?))
-            },
+            |x, tangent| Ok((x.sin()?, tangent.dot(&tangent, &DotDimensionNumbers::inner_product())?)),
         );
         assert_eq!(
             ArrayContext::trace(|x| function.call(x), ArrayType::new_static(DataType::F64, [2])).map(|_| ()),
@@ -2131,10 +2132,7 @@ pub(crate) mod tests {
         // rule unchanged instead of demanding a dense tangent space.
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-        let function = custom_jvp(
-            |token: DomainTracer<ArrayContext>| Ok(token),
-            |token: DomainTracer<ArrayContext>, tangent| Ok((token, tangent)),
-        );
+        let function = custom_jvp(|token: DomainTracer<ArrayContext>| Ok(token), |token, tangent| Ok((token, tangent)));
         assert_eq!(differentiate_at(token.clone()).jvp(zero.clone(), |token| function.call(token)), Ok((token, zero)));
     }
 

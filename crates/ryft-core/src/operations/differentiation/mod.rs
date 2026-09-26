@@ -8,7 +8,9 @@
 //!     Jacobian-Vector Product (JVP) rule that governs both forward- and reverse-mode differentiation, and
 //!     [`custom_vjp`](fn@custom_vjp) pairs a function with handwritten forward and backward rules that govern
 //!     reverse-mode differentiation only. They stage a [`CustomJvpOperation`] and a [`CustomVjpOperation`],
-//!     respectively, which carry the primal program and the rule programs as attached regions.
+//!     respectively, which carry the primal program and the rule programs as attached regions. [`custom_derivative_at`]
+//!     stages either kind of rule at a known input, which lets the rule closures infer all of their parameter types
+//!     from that input.
 //!   - **Linear Maps:** [`LinearCallOperation`] calls a residual-parameterized linear map together with its transpose,
 //!     which lets differentiation rules keep a linear map and its handwritten transpose together in tangent programs
 //!     (e.g., for shape-dependent maps such as dynamic reshapes, or for the pullback of a [`custom_vjp`](fn@custom_vjp)
@@ -27,23 +29,18 @@
 //! # Examples
 //!
 //! ```rust
-//! # use ryft_core::{
-//! #     Array, ArrayOperation, Cos, DomainTracer, EagerContext, ProgramError, Sin, StopGradient, custom_jvp,
-//! #     differentiate_at,
-//! # };
+//! # use ryft_core::{Array, Cos, ProgramError, Sin, StopGradient, custom_derivative_at, differentiate_at};
 //! # fn main() -> Result<(), ProgramError> {
-//! type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
-//!
 //! // A custom JVP rule for `sin` that doubles the true derivative, so that its effect is visible.
-//! let doubled_sin = custom_jvp(
-//!     |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
-//!     |x: DomainTracer<ArrayContext>, tangent| {
-//!         let tangent = x.cos()? * tangent;
-//!         Ok((x.sin()?, tangent.clone() + tangent))
-//!     },
-//! );
-//! let (value, tangent) =
-//!     differentiate_at(Array::scalar(0.5f64)?).jvp(Array::scalar(1.0f64)?, |x| doubled_sin.call(x))?;
+//! let (value, tangent) = differentiate_at(Array::scalar(0.5f64)?).jvp(Array::scalar(1.0f64)?, |x| {
+//!     custom_derivative_at(x).jvp(
+//!         |x| Ok(x.sin()?),
+//!         |x, tangent| {
+//!             let tangent = x.cos()? * tangent;
+//!             Ok((x.sin()?, tangent.clone() + tangent))
+//!         },
+//!     )
+//! })?;
 //! assert_eq!(value, Array::scalar(0.5f64.sin())?);
 //! assert_eq!(tangent, Array::scalar(2.0 * 0.5f64.cos())?);
 //!
@@ -54,13 +51,13 @@
 //! # }
 //! ```
 
-// TODO(eaplatanios): Review this module.
-
+pub mod custom_derivatives;
 pub mod custom_jvp;
 pub mod custom_vjp;
 pub mod linear_call;
 pub mod stop_gradient;
 
+pub use custom_derivatives::{CustomDerivativeBuilder, custom_derivative_at};
 pub use custom_jvp::{CUSTOM_JVP_OPERATION_NAME, CustomJvp, CustomJvpOperation, custom_jvp};
 pub use custom_vjp::{CUSTOM_VJP_OPERATION_NAME, CustomVjp, CustomVjpOperation, custom_vjp};
 pub use linear_call::{LINEAR_CALL_OPERATION_NAME, LinearCallOperation};

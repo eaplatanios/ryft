@@ -784,6 +784,12 @@ where
 /// explicit input, either as a non-differentiated input (see below) or as an ordinary input that `forward` preserves
 /// as a residual in `r` when `backward` needs it and for which `backward` returns a zero cotangent in `x̄`.
 ///
+/// Because [`custom_vjp`] builds a reusable function before any input is known, the `primal` closure must annotate
+/// the tracer type of its input (e.g., `|x: DomainTracer<D>| ...`), which then also fixes the input types of
+/// `forward` and, through the outputs and residuals that `forward` returns, those of `backward`.
+/// [`custom_derivative_at`](crate::custom_derivative_at) instead stages the same rule at a known input, which lets all
+/// three closures infer their parameter types from that input.
+///
 /// # Non-differentiated inputs
 ///
 /// [`CustomVjp::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
@@ -1590,7 +1596,7 @@ mod tests {
         // addition to avoid constant lifting), which proves that the rule is in control.
         let function = custom_vjp(
             |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
-            |x: DomainTracer<ArrayContext>| Ok((x.sin()?, x.cos()?)),
+            |x| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| {
                 let product = residual * cotangent;
                 Ok(product.clone() + product.clone() + product)
@@ -1612,11 +1618,11 @@ mod tests {
             |(_, x): (ArrayIrTracer, ArrayIrTracer)| {
                 Ok(ValueProjection::<ArrayType>::into_projected(x)?.sin()?.into_value())
             },
-            |(stash, x): (ArrayIrTracer, ArrayIrTracer)| {
+            |(stash, x)| {
                 let x = ValueProjection::<ArrayType>::into_projected(x)?;
                 Ok((x.sin()?.into_value(), (stash, x.cos()?.into_value())))
             },
-            |(stash, cosine): (ArrayIrTracer, ArrayIrTracer), cotangent| {
+            |(stash, cosine), cotangent| {
                 stash.write(&cotangent)?;
                 let cosine = ValueProjection::<ArrayType>::into_projected(cosine)?;
                 let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
@@ -1659,7 +1665,7 @@ mod tests {
         // The non-differentiated count cannot exceed the number of input leaves.
         let function = custom_vjp(
             |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
-            |x: DomainTracer<ArrayContext>| Ok((x.sin()?, x.cos()?)),
+            |x| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| Ok(residual * cotangent),
         )
         .with_non_differentiated_count(2);
@@ -1681,8 +1687,8 @@ mod tests {
         // A reference input that is not declared as plumbing is an active input, which the staged operation rejects.
         let function = custom_vjp(
             |(_, x): (ArrayIrTracer, ArrayIrTracer)| Ok(x),
-            |(stash, x): (ArrayIrTracer, ArrayIrTracer)| Ok((x, stash)),
-            |stash: ArrayIrTracer, cotangent| Ok((stash, cotangent)),
+            |(stash, x)| Ok((x, stash)),
+            |stash, cotangent| Ok((stash, cotangent)),
         );
         assert_eq!(
             ArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types.clone()).map(|_| ()),
@@ -1696,8 +1702,8 @@ mod tests {
         // A forward rule may forward the plumbing reference as a residual but not return a reference it allocated.
         let function = custom_vjp(
             |(_, x): (ArrayIrTracer, ArrayIrTracer)| Ok(x),
-            |(_, x): (ArrayIrTracer, ArrayIrTracer)| Ok((x.clone(), x.reference_new()?)),
-            |allocated: ArrayIrTracer, cotangent| Ok((allocated, cotangent)),
+            |(_, x)| Ok((x.clone(), x.reference_new()?)),
+            |allocated, cotangent| Ok((allocated, cotangent)),
         )
         .with_non_differentiated_count(1);
         assert_eq!(
@@ -1713,8 +1719,8 @@ mod tests {
         // reference and then returning an allocated reference beside it is rejected at the allocated residual.
         let function = custom_vjp(
             |(_, x): (ArrayIrTracer, ArrayIrTracer)| Ok(x),
-            |(stash, x): (ArrayIrTracer, ArrayIrTracer)| Ok((x.clone(), (stash, x.reference_new()?))),
-            |(stash, _allocated): (ArrayIrTracer, ArrayIrTracer), cotangent| Ok((stash, cotangent)),
+            |(stash, x)| Ok((x.clone(), (stash, x.reference_new()?))),
+            |(stash, _allocated), cotangent| Ok((stash, cotangent)),
         )
         .with_non_differentiated_count(1);
         assert_eq!(
@@ -1729,8 +1735,8 @@ mod tests {
         // No rule may return a reference as a primal output, not even a plumbing input forwarded by identity.
         let function = custom_vjp(
             |(stash, _): (ArrayIrTracer, ArrayIrTracer)| Ok(stash),
-            |(stash, _): (ArrayIrTracer, ArrayIrTracer)| Ok((stash, ())),
-            |(), cotangent: ArrayIrTracer| Ok((cotangent.clone(), cotangent.read()?)),
+            |(stash, _)| Ok((stash, ())),
+            |(), cotangent| Ok((cotangent.clone(), cotangent.read()?)),
         )
         .with_non_differentiated_count(1);
         assert_eq!(
@@ -1749,7 +1755,7 @@ mod tests {
         // is `cos(0.7)`.
         let function = custom_vjp(
             |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
-            |x: DomainTracer<ArrayContext>| Ok((x.sin()?, x.cos()?)),
+            |x| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| Ok(residual * cotangent),
         );
         let (_, pullback) = differentiate_at(Array::scalar(0.7).unwrap()).vjp(|x| function.call(x)).unwrap();
@@ -1767,8 +1773,8 @@ mod tests {
         // seeding one output cotangent at a time isolates each term of the custom backward rule.
         let function = custom_vjp(
             |x: DomainTracer<ArrayContext>| Ok((x.sin()?, x.cos()?)),
-            |x: DomainTracer<ArrayContext>| Ok(((x.sin()?, x.cos()?), (x.cos()?, x.sin()?))),
-            |(cosine, sine): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>), (first, second)| {
+            |x| Ok(((x.sin()?, x.cos()?), (x.cos()?, x.sin()?))),
+            |(cosine, sine), (first, second)| {
                 let from_first = cosine * first;
                 let from_second = sine * second;
                 Ok(from_first.clone() + from_first + from_second.clone() + from_second.clone() + from_second)
@@ -1796,7 +1802,7 @@ mod tests {
         let repeats = 3usize;
         let function = custom_vjp(
             |(x, y): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok(x * y),
-            |(x, y): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok((x.clone() * y.clone(), (x, y))),
+            |(x, y)| Ok((x.clone() * y.clone(), (x, y))),
             move |(x, y), cotangent| {
                 // The deliberately wrong rule repeats both cotangents `repeats` times.
                 let (base_x, base_y) = (y * cotangent.clone(), x * cotangent);
@@ -1824,8 +1830,8 @@ mod tests {
         // `backward(cotangent) = 2 * cotangent` makes the gradient the constant `2` instead of `cos(x)`.
         let function = custom_vjp(
             |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
-            |x: DomainTracer<ArrayContext>| Ok((x.sin()?, ())),
-            |(), cotangent: DomainTracer<ArrayContext>| Ok(cotangent.clone() + cotangent),
+            |x| Ok((x.sin()?, ())),
+            |(), cotangent| Ok(cotangent.clone() + cotangent),
         );
         assert_eq!(
             differentiate_at(Array::scalar(2.0).unwrap()).value_and_gradient(|x| function.call(x).unwrap()),
@@ -1839,7 +1845,7 @@ mod tests {
         // operations inside its regions broadcast it only where per-item multiplication requires alignment.
         let function = custom_vjp(
             |(x, y): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok(x * y),
-            |(x, y): (DomainTracer<ArrayContext>, DomainTracer<ArrayContext>)| Ok((x.clone() * y.clone(), (x, y))),
+            |(x, y)| Ok((x.clone() * y.clone(), (x, y))),
             |(x, y), cotangent| Ok((y * cotangent.clone(), x * cotangent)),
         );
         let output: Array = batch(
@@ -1861,8 +1867,8 @@ mod tests {
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
         let function = custom_vjp(
             |token: DomainTracer<ArrayContext>| Ok(token),
-            |token: DomainTracer<ArrayContext>| Ok((token.clone(), token)),
-            |_residual: DomainTracer<ArrayContext>, cotangent| Ok(cotangent),
+            |token| Ok((token.clone(), token)),
+            |_residual, cotangent| Ok(cotangent),
         );
         let (value, pullback) = differentiate_at(token.clone()).vjp(|token| function.call(token)).unwrap();
         assert_eq!(value, token);
