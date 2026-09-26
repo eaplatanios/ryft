@@ -1,8 +1,6 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-// TODO(eaplatanios): Review this module.
-
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
@@ -33,20 +31,19 @@ use crate::tracing::{DomainTracer, Trace};
 pub const CUSTOM_VJP_OPERATION_NAME: &str = "custom_vjp";
 
 /// Higher-order [`Operation`] that pairs a primal [`Program`](crate::programs::Program) with user-supplied forward and
-/// backward (i.e., Vector-Jacobian Product (VJP)) programs and that the [`custom_vjp`] function stages. Refer to the
+/// backward (i.e., Vector-Jacobian Product or VJP) programs and that the [`custom_vjp`] function stages. Refer to the
 /// documentation of that function for the semantics of custom VJPs, including their treatment of references, how each
 /// transform handles a staged call, and when to reach for one.
 ///
 /// The three programs are supplied as the operation's attached regions (i.e., via the
-/// [`RegionDriver`](crate::programs::RegionDriver) passed to [`Context::bind`]) in the region order
-/// `["primal", "forward", "backward"]`. Writing the leading
-/// [`non_differentiated_count`](Self::non_differentiated_count) inputs as `p`, the remaining _differentiated_ inputs
-/// as `x`, the primal outputs as `y`, the forward residuals as `r`, and cotangents using an overbar, the region
-/// interfaces are:
+/// [`RegionDriver`](crate::RegionDriver) passed to [`Context::bind`]) in the region order `["primal", "forward",
+/// "backward"]`. Writing the leading [`non_differentiated_count`](Self::non_differentiated_count) inputs as `p`,
+/// the remaining _differentiated_ inputs as `x`, the primal outputs as `y`, the forward residuals as `r`, and
+/// cotangents using an overbar, the region interfaces are:
 ///
-///   - `primal`: `(p, x) → y`,
-///   - `forward`: `(p, x) → (y, r)`, with arbitrarily many residuals following the primal outputs, and
-///   - `backward`: `(p, r, ȳ) → x̄`, with one cotangent per primal output and one cotangent per differentiated input.
+///   - **Primal:**   `(p, x) → y`,
+///   - **Forward:**  `(p, x) → (y, r)`, with arbitrarily many residuals following the primal outputs, and
+///   - **Backward:** `(p, r, ȳ) → x̄`, with one cotangent per primal output and one cotangent per differentiated input.
 ///
 /// [`Operation::infer_output_types`] validates that the attached regions realize exactly these interfaces, that only
 /// `p` contains references, and that no output is a reference. A reference-typed residual must additionally have the
@@ -101,7 +98,7 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
         Ok(values.split_at(self.non_differentiated_count))
     }
 
-    /// Validates the custom-VJP contract over the three attached region interfaces (in the
+    /// Validates the custom Vector-Jacobian Product (VJP) contract over the three attached region interfaces (in the
     /// `["primal", "forward", "backward"]` region order) and returns the primal interface. Refer to the documentation
     /// of [`CustomVjpOperation`] for that contract.
     fn validated_interfaces<'i>(
@@ -119,6 +116,7 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
             input_types,
             forward_interface.input_types(),
         ]);
+
         let forward_output_types = forward_interface.output_types();
         if forward_output_types.len() < output_types.len() {
             return Err(TypeError::invalid(format!(
@@ -132,6 +130,7 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
             output_types,
             &forward_output_types[..output_types.len()],
         ]);
+
         let residual_types = &forward_output_types[output_types.len()..];
         validate_custom_derivative_reference_boundary(
             CUSTOM_VJP_OPERATION_NAME,
@@ -139,6 +138,7 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
             input_types,
             output_types,
         )?;
+
         // A residual is an internal edge from the forward rule to the backward rule. A reference-typed residual can
         // only be a plumbing input forwarded by identity, because saving a snapshot of a reference is not a residual
         // the backward rule could mutate, so its type must be the type of one of the leading non-differentiated
@@ -168,6 +168,7 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
                 }
             }
         }
+
         let output_cotangent_types = output_types
             .iter()
             .map(DifferentiableType::cotangent)
@@ -211,10 +212,6 @@ impl<T: DifferentiableType> Display for CustomVjpOperation<T> {
 }
 
 impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
-    // Type inference renames the independently traced primal and forward identities into the call boundary, derives
-    // the backward signature described in the documentation of `CustomVjpOperation` from the resulting `y` and `r`
-    // types, and validates that no cotangent is produced for `p`.
-
     type Type = T;
 
     #[inline]
@@ -259,6 +256,7 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
                 forward_output_types.len(),
             )));
         }
+
         let (non_differentiated_types, _) = self.split_inputs(input_types)?;
         let mut backward_input_types = non_differentiated_types.to_vec();
         backward_input_types.extend_from_slice(&forward_output_types[primal_output_types.len()..]);
@@ -318,6 +316,7 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
 impl_reference_dischargeable_operation!(@local_reference <T> CustomVjpOperation<T> where T: DifferentiableType);
 
 impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomVjpOperation<C::Type> {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -330,19 +329,16 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomVj
     }
 }
 
-impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomVjpOperation<C::Type>
-where
-    C::Operation: From<CustomVjpOperation<C::Type>>,
+// The default partial-evaluation rule is the desired one here where we interpret the primal region when every input
+// is known and residualize the complete custom VJP call so its forward and backward regions remain attached for a
+// later reverse-mode transformation.
+impl<C: Context<Type: DifferentiableType, Operation: From<CustomVjpOperation<C::Type>>>>
+    PartiallyEvaluatableOperation<C> for CustomVjpOperation<C::Type>
 {
-    // The default partial-evaluation rule is the desired one: interpret the primal region when every input is known;
-    // otherwise residualize the complete custom-VJP call so its forward and backward regions remain attached for a
-    // later reverse-mode transformation.
 }
 
-impl<T: DifferentiableType, C: Context<Type = T>, P: CotangentBatchingPolicy<C>> BatchableOperation<C, P>
-    for CustomVjpOperation<T>
-where
-    C::Operation: From<CustomVjpOperation<T>>,
+impl<T: DifferentiableType, C: Context<Type = T, Operation: From<CustomVjpOperation<T>>>, P: CotangentBatchingPolicy<C>>
+    BatchableOperation<C, P> for CustomVjpOperation<T>
 {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
@@ -350,27 +346,26 @@ where
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        // Batch all three region contracts while retaining the opaque custom-VJP carrier:
+        // Batch all three region contracts while retaining the opaque custom VJP carrier:
         //
-        //   primal:   (p, x)    → y
-        //   forward:  (p, x)    → (y_fwd, r)
-        //   backward: (p, r, ȳ) → x̄.
+        //   - Primal:   (p, x)    → y
+        //   - Forward:  (p, x)    → (y_fwd, r)
+        //   - Backward: (p, r, ȳ) → x̄.
         //
-        // Reconcile each `y` with its corresponding `y_fwd` so the wrapper exposes one physical output axis, but keep
-        // every residual's naturally produced axis because residuals are internal edges between the forward and
-        // backward rules. Batch the backward region with `(p, r, ȳ)` on those exact axes and align each `x̄`
+        // Reconcile each `y` with its corresponding `y_fwd` so the wrapper exposes one physical output axis, but
+        // keep every residual's naturally produced axis because residuals are internal edges between the forward
+        // and backward rules. Batch the backward region with `(p, r, ȳ)` on those exact axes and align each `x̄`
         // with its corresponding differentiated input `x`. When a replicated `x` receives a mapped cotangent, the
         // batching policy sums that mapped axis, which is the transpose of broadcasting `x` across the batch.
         //
-        // A batching policy may add runtime boundary inputs such as a first-class mapped extent. Those values must
-        // reach all three regions but have no cotangent, so prepend them to `p` and increase
+        // A batching policy may add runtime boundary inputs such as a first-class mapped extent. Those
+        // values must reach all three regions but have no cotangent, so prepend them to `p` and increase
         // `non_differentiated_count` after the regions have been adapted to their new boundaries.
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let (non_differentiated_axes, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
         let primal_region = driver.region(0)?;
         let forward_region = driver.region(1)?;
         let backward_region = driver.region(2)?;
-
         let naturally_batched_primal = driver.batch_program(
             context,
             primal_region,
@@ -471,10 +466,12 @@ where
     }
 }
 
-impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation<C::Type>
-where
-    C::Type: DifferentiableType,
-    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<LinearCallOperation<C::Type>>,
+impl<
+    C: Context<
+            Type: DifferentiableType,
+            Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<LinearCallOperation<C::Type>>,
+        > + Zero<C::Value>,
+> DifferentiableOperation<C> for CustomVjpOperation<C::Type>
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -482,21 +479,21 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // A custom VJP specifies the pullback `ȳ ↦ x̄`, not the pushforward `ẋ ↦ ẏ`. Replay
+        // A custom VJP specifies the pullback `ȳ ↦ x̄`, not the pushforward `ẋ ↦ ẏ`. Replay:
         //
         //   forward(p, x) = (y, r)
         //
-        // to recover the primal outputs and residuals, then stage an opaque linear call representing the unknown map
+        // to recover the primal outputs and residuals, then stage an opaque linear call representing the unknown map:
         //
         //   L_(p,r): ẋ ↦ ẏ.
         //
-        // `LinearCallOperation` knows only how to transpose that map: its transpose replays
-        // `backward(p, r, ȳ) = x̄`. An eager forward-mode use attempts to execute `L_(p,r)` and is therefore
-        // rejected, while reverse mode transposes it without execution. Passing `p` and `r` as the carrier's leading
-        // residual inputs keeps the path capture-free and exposes every dependency as an ordinary SSA edge.
+        // `LinearCallOperation` knows only how to transpose that map: its transpose replays `backward(p, r, ȳ) = x̄`.
+        // An eager forward-mode use attempts to execute `L_(p,r)` and is therefore rejected, while reverse mode
+        // transposes it without execution. Passing `p` and `r` as the carrier's leading residual inputs keeps the path
+        // capture-free and exposes every dependency as an ordinary Single Static Assignment (SSA) edge.
         //
-        // The attached regions are `["primal", "forward", "backward"]`; the primal interface provides the boundary
-        // types.
+        // The attached regions are `["primal", "forward", "backward"]` and the primal interface provides
+        // the boundary types.
         let primal_region = driver.region(0)?;
         let forward_region = driver.region(1)?;
         let backward_region = driver.region(2)?;
@@ -552,6 +549,7 @@ where
             .into_iter()
             .map(|value| context.primal_to_tangent(value))
             .collect::<Result<Vec<_>, _>>()?;
+
         // The carrier's leading non-tangent group is the non-differentiated inputs followed by the residuals, and both
         // are passed through the residual-count slot: to the linear call they are alike inputs that its transpose
         // forwards to the backward region rather than transposing.
@@ -566,6 +564,7 @@ where
         }
         let carrier =
             LinearCallOperation::transpose_only(leading_input_count, input_tangent_types, output_tangent_types);
+
         // Any context that must _execute_ the carrier (i.e., an eager forward-mode pass or a forward-mode pass over an
         // already staged carrier) rejects it as unsupported. Restate that rejection in `custom_vjp` vocabulary instead
         // of leaking the internals of the carrier.
@@ -594,9 +593,11 @@ where
 // The raw carrier is intentionally non-transposable, which does not restrict reverse-mode differentiation. Reverse
 // mode linearizes first, and the JVP rule replaces `f(p, x)` with the opaque linear map `L_(p,r): ẋ ↦ ẏ` (i.e., the
 // analogue of JAX's `custom_lin` primitive), so reverse mode transposes that `LinearCallOperation`, whose rule
-// evaluates `backward(p, r, ȳ) = x̄`. Therefore, only an invalid direct transpose of an un-linearized custom-VJP call
+// evaluates `backward(p, r, ȳ) = x̄`. Therefore, only an invalid direct transpose of an un-linearized custom VJP call
 // can reach this rejection path.
 impl_non_transposable_operation!(<T> CustomVjpOperation<T> where T: DifferentiableType);
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Function with user-supplied forward and backward (i.e., VJP) rules, built by [`custom_vjp`]. It stores the primal,
 /// forward, and backward closures together with a phantom marker pinning the tracer-tree types named by those closure
