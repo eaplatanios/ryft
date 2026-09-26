@@ -67,7 +67,7 @@ pub struct CustomVjpOperation<T: DifferentiableType> {
     /// Number of leading inputs that parameterize the call without being differentiated.
     non_differentiated_count: usize,
 
-    /// Type universe in which this [`CustomVjpOperation`] is valid.
+    /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.
     marker: PhantomData<fn() -> T>,
 }
 

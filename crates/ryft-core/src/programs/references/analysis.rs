@@ -97,9 +97,7 @@ use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::references::discharge::ReferenceSource;
-use crate::programs::references::operations::{
-    ReferenceAccessDescriptor, ReferenceAccessOperation, reference_access_layout,
-};
+use crate::programs::references::operations::{ReferenceAccessOperation, reference_access_layout};
 use crate::programs::references::transforms::{
     ReferenceTransform, ReferenceTransformPath, ReferenceViewOverlap, infer_reference_view_type,
 };
@@ -1010,7 +1008,6 @@ pub struct ReferenceViewAnalysis<Transform: ReferenceTransform> {
     paths: BTreeMap<(InstructionId, usize), ReferenceTransformPath<Transform>>,
 }
 
-// TODO(eaplatanios): Review this.
 impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
     /// Creates a new [`ReferenceViewAnalysis`] by validating every reference access descriptor in the provided
     /// region's closure and recording its transform path.
@@ -1058,10 +1055,71 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
                 },
             )?;
 
+            // `instructions_in_closure` yields only instructions of regions in this arena, so the lookup cannot fail.
+            let current = region.with_id(id.region()).unwrap();
+            let atoms = current.atoms();
             for (input_index, descriptor) in descriptors.iter().enumerate() {
-                if let Some(descriptor) = descriptor {
-                    paths.insert((id, input_index), Self::derive_access_path(region, id, input_index, descriptor)?);
+                let Some(descriptor) = descriptor else { continue };
+
+                // Every failure below is attributed to this access, so they all share one error constructor.
+                let invalid = |message: String| ReferenceViewAnalysisError::InvalidAccess {
+                    instruction: id,
+                    input_index,
+                    message,
+                };
+
+                // Check that the accessed atom is a reference to this transform family's referents. The layout
+                // validation produced one descriptor per input, so indexing the inputs cannot panic. Atom lookups are
+                // reported rather than unwrapped so that a malformed downstream program surfaces as an error instead
+                // of a panic. The structural analysis already rejects accesses to non-reference inputs, but the type
+                // check can still fail when the reference type does not project onto this family's referent type.
+                let atom = instruction.inputs()[input_index];
+                let source =
+                    atoms.get(atom.index()).ok_or_else(|| invalid("reference input has no atom".to_string()))?;
+                let source_type = source.r#type();
+                let reference = <&ReferenceType<Transform::Referent>>::try_from(source_type.as_ref())
+                    .map_err(|error| invalid(error.to_string()))?;
+
+                // Collect the types of the access's dynamic bindings. The layout validation guarantees that the
+                // descriptor's binding range lies within the instruction inputs, so slicing cannot panic. Bindings
+                // must be ordinary values: an access declares reference effects only on its reference inputs, so a
+                // reference-typed binding would be an undeclared use of a reference. It is rejected here rather than
+                // left to each family's `validate_bindings`.
+                let binding_atoms = &instruction.inputs()[descriptor.bindings()];
+                let binding_types = binding_atoms
+                    .iter()
+                    .map(|atom| {
+                        atoms
+                            .get(atom.index())
+                            .map(Typed::r#type)
+                            .ok_or_else(|| invalid("transform binding has no atom".to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if binding_types.iter().any(|r#type| r#type.is_reference()) {
+                    return Err(invalid("transform binding is a reference rather than an ordinary value".to_string()));
                 }
+                let binding_types = binding_types.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+
+                // Type-check the path against the root's referent. The access mode matters because only mutating
+                // accesses must also prove that updates can be written back through every transform (refer to
+                // `infer_reference_view_type`). The layout validation paired every descriptor with a declared access,
+                // so the mode lookup cannot fail. The derived referent itself is discarded, since only the validation
+                // outcome is needed here.
+                let mode = instruction
+                    .operation()
+                    .effects()
+                    .accesses()
+                    .find_map(|(input, mode)| (input == input_index).then_some(mode))
+                    .unwrap();
+                infer_reference_view_type(reference.referent(), descriptor.transforms(), &binding_types, mode)
+                    .map_err(|error| invalid(error.to_string()))?;
+
+                // Record the path with each binding identified by its program value, qualified by the instruction's
+                // region so that bindings from different regions of the closure stay distinct in overlap comparisons.
+                let bindings = binding_atoms.iter().map(|atom| ValueId::new(id.region(), *atom)).collect::<Vec<_>>();
+                let path = ReferenceTransformPath::from_transforms(descriptor.transforms(), &bindings)
+                    .map_err(|error| invalid(error.to_string()))?;
+                paths.insert((id, input_index), path);
             }
         }
 
@@ -1125,79 +1183,6 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
         // type of either accessed atom is the root type against which they are compared.
         let root_type = current.atoms().get(lhs_atom.index())?.r#type();
         Some(lhs_path.overlap(rhs_path, root_type.as_ref()))
-    }
-
-    /// Resolves the path of the access at `input_index` and its dynamic input identities from the descriptor that
-    /// the caller has validated against the instruction layout.
-    fn derive_access_path<V: Value, O: ReferenceAccessOperation<Type = V::Type, Transform = Transform>>(
-        region: RegionRef<'_, V, O>,
-        instruction: InstructionId,
-        input_index: usize,
-        descriptor: &ReferenceAccessDescriptor<'_, Transform>,
-    ) -> Result<ReferenceTransformPath<Transform>, ReferenceViewAnalysisError>
-    where
-        Transform: ReferenceTransform<Type = V::Type>,
-        for<'t> &'t ReferenceType<Transform::Referent>: TryFrom<&'t V::Type, Error = TypeError>,
-    {
-        // Every failure below is attributed to this access, so they all share one error constructor.
-        let invalid = |message| ReferenceViewAnalysisError::InvalidAccess { instruction, input_index, message };
-
-        // Locate the accessed atom and check that its type is a reference to this transform family's referents. The
-        // position lookups succeed for any instruction whose layout validated, but they are reported rather than
-        // unwrapped so that a malformed downstream operation family surfaces as an error instead of a panic. The
-        // structural analysis already rejects accesses to non-reference inputs, but the type check can still fail when
-        // the reference type does not project onto the referent type of this transform family.
-        let current = region.with_id(instruction.region()).map_err(|error| invalid(error.to_string()))?;
-        let application = current
-            .instructions()
-            .get(instruction.index())
-            .ok_or_else(|| invalid("instruction is outside its region".to_string()))?;
-        let atom = *application
-            .inputs()
-            .get(input_index)
-            .ok_or_else(|| invalid("reference input is outside the instruction inputs".to_string()))?;
-        let atoms = current.atoms();
-        let source = atoms.get(atom.index()).ok_or_else(|| invalid("reference input has no atom".to_string()))?;
-        let source_type = source.r#type();
-        let reference = <&ReferenceType<Transform::Referent>>::try_from(source_type.as_ref())
-            .map_err(|error| invalid(error.to_string()))?;
-
-        // Collect the types of the access's dynamic bindings. The layout validation guarantees that the descriptor's
-        // binding range lies within the instruction inputs, so slicing cannot panic. Bindings must be ordinary values:
-        // an access declares reference effects only on its reference inputs, so a reference-typed binding would be an
-        // undeclared use of a reference. It is rejected here rather than left to each family's `validate_bindings`.
-        let binding_atoms = &application.inputs()[descriptor.bindings()];
-        let binding_types = binding_atoms
-            .iter()
-            .map(|atom| {
-                atoms
-                    .get(atom.index())
-                    .map(Typed::r#type)
-                    .ok_or_else(|| invalid("transform binding has no atom".to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if binding_types.iter().any(|r#type| r#type.is_reference()) {
-            return Err(invalid("transform binding is a reference rather than an ordinary value".to_string()));
-        }
-        let binding_types = binding_types.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-
-        // Type-check the path against the root's referent. The access mode matters because only mutating accesses must
-        // also prove that updates can be written back through every transform (refer to `infer_reference_view_type`).
-        // The derived referent itself is discarded, since only the validation outcome is needed here.
-        let mode = application
-            .operation()
-            .effects()
-            .accesses()
-            .find_map(|(input, mode)| (input == input_index).then_some(mode))
-            .ok_or_else(|| invalid("reference input has no declared access".to_string()))?;
-        infer_reference_view_type(reference.referent(), descriptor.transforms(), &binding_types, mode)
-            .map_err(|error| invalid(error.to_string()))?;
-
-        // Record the path with each binding identified by its program value, qualified by the instruction's region so
-        // that bindings from different regions of the closure stay distinct in overlap comparisons.
-        let bindings = binding_atoms.iter().map(|atom| ValueId::new(instruction.region(), *atom)).collect::<Vec<_>>();
-        ReferenceTransformPath::from_transforms(descriptor.transforms(), &bindings)
-            .map_err(|error| invalid(error.to_string()))
     }
 }
 

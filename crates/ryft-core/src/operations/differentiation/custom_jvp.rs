@@ -23,20 +23,18 @@ use crate::programs::{
 };
 use crate::tracing::{DomainTracer, Trace};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`CustomJvpOperation`].
 pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 
 /// Higher-order [`Operation`] that pairs a primal [`Program`] with a user-supplied Jacobian-Vector Product (JVP)
 /// [`Program`] and that the [`custom_jvp`] function stages. Refer to the documentation of that function for the
-/// semantics of custom JVPs, including their treatment of references, how each transform handles a staged call, and
-/// when to reach for one.
+/// semantics of custom JVPs, including their treatment of references, how each transform handles a staged call,
+/// and when to reach for one.
 ///
 /// The two programs are supplied as the operation's attached regions (i.e., via the
-/// [`RegionDriver`](crate::programs::RegionDriver) passed to [`Context::bind`]) in the region order
-/// `["primal", "jvp"]`. Writing the leading [`non_differentiated_count`](Self::non_differentiated_count) inputs as `p`,
-/// the remaining _differentiated_ inputs as `x`, and the primal outputs as `y`, the region interfaces are:
+/// [`RegionDriver`](crate::RegionDriver) passed to [`Context::bind`]) in the region order `["primal", "jvp"]`.
+/// Writing the leading [`non_differentiated_count`](Self::non_differentiated_count) inputs as `p`, the remaining
+/// _differentiated_ inputs as `x`, and the primal outputs as `y`, the region interfaces are:
 ///
 ///   - `primal`: `(p, x) → y`, and
 ///   - `jvp`: `(p, x, ẋ) → (y, ẏ)`, with one tangent per differentiated input and one tangent per primal output.
@@ -44,9 +42,9 @@ pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 /// [`Operation::infer_output_types`] validates that the attached regions realize exactly these interfaces, that only
 /// `p` contains references, and that no output is a reference. Keeping `p` explicit while omitting its tangent from
 /// the JVP region distinguishes an input that parameterizes the rule from an ordinary input whose tangent merely
-/// happens to be zero. Batching is a canonical producer of such inputs: a batching policy that threads batching state
-/// through a structurally batched region's boundary (e.g., a composite universe's first-class mapped extent)
-/// reintroduces that state as additional leading non-differentiated inputs of the batched call.
+/// happens to be zero. Batching is a canonical producer of such inputs with a batching policy that threads batching
+/// state through a structurally batched region's boundary (e.g., a composite universe's first-class mapped extent)
+/// reintroducing that state as additional leading non-differentiated inputs of the batched call.
 ///
 /// The `T` parameter fixes the type universe of both attached regions and the call boundary, so each concrete payload
 /// has exactly one [`Operation<Type = T>`](Operation) contract while the semantic and transform implementations remain
@@ -56,7 +54,7 @@ pub struct CustomJvpOperation<T: DifferentiableType> {
     /// Number of leading inputs that parameterize the call without being differentiated.
     non_differentiated_count: usize,
 
-    /// Type universe in which this [`CustomJvpOperation`] is valid.
+    /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.
     marker: PhantomData<fn() -> T>,
 }
 

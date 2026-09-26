@@ -218,13 +218,18 @@ pub(super) fn reference_access_layout<O: ReferenceAccessOperation>(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::borrow::Cow;
+    use std::fmt::Display;
+
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrType, ArrayReferenceTransform};
+    use crate::arrays::{ArrayIrType, ArrayReferenceTransform, ArrayType};
     use crate::kernels::AsyncCopyOperation;
     use crate::programs::effects::{EffectClasses, Effects, ReferenceAccessMode, ReferenceEffect};
+    use crate::programs::provenance::{Provenance, ProvenanceScope};
     use crate::programs::references::transforms::tests::{dynamic, index};
-    use crate::programs::regions::RegionInterface;
+    use crate::programs::references::transforms::{BoundReferenceTransform, ReferenceViewOverlap};
+    use crate::programs::regions::{RegionId, RegionInterface};
     use crate::programs::types::TypeError;
 
     use super::*;
@@ -258,9 +263,9 @@ pub(crate) mod tests {
             Ok(Vec::new())
         }
 
-        fn effects(&self) -> std::borrow::Cow<'_, Effects> {
+        fn effects(&self) -> Cow<'_, Effects> {
             let access = self.access.map(|(input_index, mode)| ReferenceEffect::Access { input_index, mode });
-            std::borrow::Cow::Owned(Effects::new(EffectClasses::NONE, access.into_iter().collect()).unwrap())
+            Cow::Owned(Effects::new(EffectClasses::NONE, access.into_iter().collect()).unwrap())
         }
     }
 
@@ -295,12 +300,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_reference_access_descriptor() {
+    fn test_reference_access_descriptor_new() {
         let transforms = [dynamic()];
         let descriptor = ReferenceAccessDescriptor::new(&transforms, 2..3);
-        assert_eq!(descriptor.transforms(), &transforms);
-        assert_eq!(descriptor.bindings(), 2..3);
-        assert_eq!(descriptor.clone(), descriptor);
+        assert_eq!(descriptor, ReferenceAccessDescriptor::new(&[dynamic()], 2..3));
+        assert_ne!(descriptor, ReferenceAccessDescriptor::new(&[dynamic()], 1..2));
+        assert_ne!(descriptor, ReferenceAccessDescriptor::new(&[index(0, 0)], 2..3));
+    }
+
+    #[test]
+    fn test_reference_access_descriptor_transforms() {
+        let transforms = [index(0, 1), dynamic()];
+        assert_eq!(ReferenceAccessDescriptor::new(&transforms, 1..2).transforms(), &transforms);
+        assert_eq!(ReferenceAccessDescriptor::<ArrayReferenceTransform>::new(&[], 1..1).transforms(), &[]);
+    }
+
+    #[test]
+    fn test_reference_access_descriptor_bindings() {
+        assert_eq!(ReferenceAccessDescriptor::new(&[dynamic()], 2..3).bindings(), 2..3);
+        assert_eq!(ReferenceAccessDescriptor::<ArrayReferenceTransform>::new(&[], 1..1).bindings(), 1..1);
     }
 
     #[test]
@@ -334,9 +352,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_validated_reference_access_descriptors_rejects_malformed_layouts() {
-        let malformed =
-            |message: &str| Err(ProgramError::MalformedProgram(format!("operation `described_access` {message}")));
-
         // A declared access needs a descriptor, and only declared accesses may have one.
         let missing = DescribedAccess {
             access: Some((1, ReferenceAccessMode::Read)),
@@ -345,7 +360,9 @@ pub(crate) mod tests {
         };
         assert_eq!(
             validated_reference_access_descriptors(&missing, 2),
-            malformed("does not describe reference access at input 1"),
+            Err(ProgramError::MalformedProgram(
+                "operation `described_access` does not describe reference access at input 1".to_string(),
+            )),
         );
         let extraneous = DescribedAccess {
             access: Some((0, ReferenceAccessMode::Read)),
@@ -354,13 +371,17 @@ pub(crate) mod tests {
         };
         assert_eq!(
             validated_reference_access_descriptors(&extraneous, 2),
-            malformed("describes reference transforms at non-access input 1"),
+            Err(ProgramError::MalformedProgram(
+                "operation `described_access` describes reference transforms at non-access input 1".to_string(),
+            )),
         );
 
         // Accesses must be base inputs within the instruction.
         assert_eq!(
             validated_reference_access_descriptors(&missing, 1),
-            malformed("declares reference access at input 1 but has only 1 inputs"),
+            Err(ProgramError::MalformedProgram(
+                "operation `described_access` declares reference access at input 1 but has only 1 inputs".to_string(),
+            )),
         );
         let outside_base = DescribedAccess {
             access: Some((1, ReferenceAccessMode::Read)),
@@ -369,7 +390,9 @@ pub(crate) mod tests {
         };
         assert_eq!(
             validated_reference_access_descriptors(&outside_base, 2),
-            malformed("reference access at input 1 is outside its 1 base inputs"),
+            Err(ProgramError::MalformedProgram(
+                "operation `described_access` reference access at input 1 is outside its 1 base inputs".to_string(),
+            )),
         );
 
         // Binding groups start right after the base inputs and exactly cover the remaining inputs.
@@ -380,7 +403,10 @@ pub(crate) mod tests {
         };
         assert_eq!(
             validated_reference_access_descriptors(&shifted, 3),
-            malformed("reference access at input 0 has binding range 2..3, expected 1..2"),
+            Err(ProgramError::MalformedProgram(
+                "operation `described_access` reference access at input 0 has binding range 2..3, expected 1..2"
+                    .to_string(),
+            )),
         );
         let whole_root = DescribedAccess {
             access: Some((0, ReferenceAccessMode::Read)),
@@ -389,7 +415,10 @@ pub(crate) mod tests {
         };
         assert_eq!(
             validated_reference_access_descriptors(&whole_root, 2),
-            malformed("reference transforms require 1 inputs but the instruction has 2"),
+            Err(ProgramError::MalformedProgram(
+                "operation `described_access` reference transforms require 1 inputs but the instruction has 2"
+                    .to_string(),
+            )),
         );
 
         // Consumption is a complete-root lifetime event and cannot go through a view.
@@ -400,7 +429,102 @@ pub(crate) mod tests {
         };
         assert_eq!(
             validated_reference_access_descriptors(&consuming, 1),
-            malformed("consumes input 0 through a reference view"),
+            Err(ProgramError::MalformedProgram(
+                "operation `described_access` consumes input 0 through a reference view".to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_validated_reference_access_descriptors_rejects_overflowing_binding_counts() {
+        /// Transform declaring more bindings than any instruction can supply, so that the binding layout overflows.
+        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        struct UnboundedTransform;
+
+        impl Display for UnboundedTransform {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("unbounded")
+            }
+        }
+
+        impl ReferenceTransform for UnboundedTransform {
+            type Type = ArrayIrType;
+            type Referent = ArrayType;
+
+            fn binding_count(&self) -> usize {
+                usize::MAX
+            }
+
+            fn validate_bindings(&self, _input: &ArrayType, _bindings: &[&ArrayIrType]) -> Result<(), TypeError> {
+                Ok(())
+            }
+
+            fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
+                Ok(input.clone())
+            }
+
+            fn overlap(
+                _type: &ArrayIrType,
+                _lhs: &[BoundReferenceTransform<Self>],
+                _rhs: &[BoundReferenceTransform<Self>],
+            ) -> ReferenceViewOverlap {
+                ReferenceViewOverlap::MayOverlap
+            }
+        }
+
+        /// Read of input 0 through one [`UnboundedTransform`], whose bindings start after that single base input.
+        #[derive(Clone, Debug)]
+        struct UnboundedAccess([UnboundedTransform; 1]);
+
+        impl Operation for UnboundedAccess {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                "unbounded_access"
+            }
+
+            fn infer_output_types(
+                &self,
+                _inputs: &[ArrayIrType],
+                _regions: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                Ok(Vec::new())
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                let access = ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read };
+                Cow::Owned(Effects::new(EffectClasses::NONE, vec![access]).unwrap())
+            }
+        }
+
+        impl ReferenceAccessOperation for UnboundedAccess {
+            type Transform = UnboundedTransform;
+
+            fn base_input_count(&self) -> usize {
+                1
+            }
+
+            fn reference_access_descriptor(
+                &self,
+                input_index: usize,
+            ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+                (input_index == 0).then(|| ReferenceAccessDescriptor::new(&self.0, 1..1))
+            }
+
+            fn with_reference_access_transforms(
+                &self,
+                _input_index: usize,
+                _transforms: Vec<Self::Transform>,
+            ) -> Result<Self, ProgramError> {
+                Ok(self.clone())
+            }
+        }
+
+        assert_eq!(
+            validated_reference_access_descriptors(&UnboundedAccess([UnboundedTransform]), 1),
+            Err(ProgramError::MalformedProgram(
+                "operation `unbounded_access` reference transform binding count overflows `usize`".to_string(),
+            )),
         );
     }
 
@@ -413,46 +537,136 @@ pub(crate) mod tests {
         let destination = AtomId::new(1);
         let source_index = AtomId::new(2);
         let destination_index = AtomId::new(3);
+        let provenance = Provenance::scope(ProvenanceScope::new("copy"), Provenance::unknown());
         let instruction = Instruction::new(
             operation,
             vec![source, destination, source_index, destination_index],
-            Vec::new(),
-            Vec::new(),
-        );
-        let rewritten = rewrite_reference_access_transforms(&instruction, 0, Vec::new(), Vec::new()).unwrap();
-        assert_eq!(rewritten.inputs(), &[source, destination, destination_index]);
-        assert_eq!(rewritten.operation().reference_access_descriptor(0).unwrap().bindings(), 2..2);
-        assert_eq!(rewritten.operation().reference_access_descriptor(1).unwrap().bindings(), 2..3);
-        assert_eq!(rewritten.provenance(), instruction.provenance());
-        assert_eq!(rewritten.outputs(), instruction.outputs());
-        assert_eq!(rewritten.regions(), instruction.regions());
+            vec![AtomId::new(4)],
+            vec![RegionId::new(1)],
+        )
+        .with_provenance(provenance.clone());
+
+        // Removing the source's bindings shifts the destination's binding group left.
+        let removed = rewrite_reference_access_transforms(&instruction, 0, Vec::new(), Vec::new()).unwrap();
+        assert_eq!(removed.inputs(), &[source, destination, destination_index]);
+        assert_eq!(removed.operation().reference_access_descriptor(0), Some(ReferenceAccessDescriptor::new(&[], 2..2)));
         assert_eq!(
-            rewrite_reference_access_transforms(&instruction, 0, Vec::new(), vec![source_index])
-                .unwrap_err()
-                .to_string(),
-            "encountered malformed program: reference transform path has 1 extra bindings",
-        );
-        let malformed = Instruction::new(instruction.operation().clone(), vec![source], Vec::new(), Vec::new());
-        assert_eq!(
-            rewrite_reference_access_transforms(&malformed, 0, Vec::new(), Vec::new()).unwrap_err().to_string(),
-            "encountered malformed program: operation `async_copy` declares reference access at input 1 \
-             but has only 1 inputs",
+            removed.operation().reference_access_descriptor(1),
+            Some(ReferenceAccessDescriptor::new(&[dynamic()], 2..3)),
         );
 
-        // Rewrites validate downstream layouts before reading any descriptor.
+        // Adding bindings to the source shifts the destination's binding group right.
+        let first = AtomId::new(5);
+        let second = AtomId::new(6);
+        let added =
+            rewrite_reference_access_transforms(&instruction, 0, vec![dynamic(), dynamic()], vec![first, second])
+                .unwrap();
+        assert_eq!(added.inputs(), &[source, destination, first, second, destination_index]);
+        assert_eq!(
+            added.operation().reference_access_descriptor(0),
+            Some(ReferenceAccessDescriptor::new(&[dynamic(), dynamic()], 2..4)),
+        );
+        assert_eq!(
+            added.operation().reference_access_descriptor(1),
+            Some(ReferenceAccessDescriptor::new(&[dynamic()], 4..5)),
+        );
+
+        // Everything other than the rewritten access is preserved.
+        assert_eq!(added.outputs(), &[AtomId::new(4)]);
+        assert_eq!(added.regions(), &[RegionId::new(1)]);
+        assert_eq!(added.provenance(), &provenance);
+    }
+
+    #[test]
+    fn test_rewrite_reference_access_transforms_rejects_non_access_inputs() {
+        let operation = AsyncCopyOperation::new().with_source_transforms(vec![dynamic()]);
+        let instruction =
+            Instruction::new(operation, vec![AtomId::new(0), AtomId::new(1), AtomId::new(2)], Vec::new(), Vec::new());
+        assert_eq!(
+            rewrite_reference_access_transforms(&instruction, 2, Vec::new(), Vec::new()).unwrap_err(),
+            ProgramError::MalformedProgram("operation `async_copy` has no reference access at input 2".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_access_transforms_rejects_mismatched_bindings() {
+        let instruction =
+            Instruction::new(AsyncCopyOperation::new(), vec![AtomId::new(0), AtomId::new(1)], Vec::new(), Vec::new());
+        assert_eq!(
+            rewrite_reference_access_transforms(&instruction, 0, Vec::new(), vec![AtomId::new(2)]).unwrap_err(),
+            ProgramError::MalformedProgram("reference transform path has 1 extra bindings".to_string()),
+        );
+        assert_eq!(
+            rewrite_reference_access_transforms(&instruction, 0, vec![dynamic()], Vec::new()).unwrap_err(),
+            ProgramError::MalformedProgram("reference transform requires 1 bindings but only 0 remain".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_rewrite_reference_access_transforms_rejects_malformed_layouts() {
+        // The input layout is validated before any descriptor is read.
+        let truncated = Instruction::new(AsyncCopyOperation::new(), vec![AtomId::new(0)], Vec::new(), Vec::new());
+        assert_eq!(
+            rewrite_reference_access_transforms(&truncated, 0, Vec::new(), Vec::new()).unwrap_err(),
+            ProgramError::MalformedProgram(
+                "operation `async_copy` declares reference access at input 1 but has only 1 inputs".to_string(),
+            ),
+        );
+
+        // The rewritten layout is validated as well, so a consuming access cannot gain transforms.
         let consuming = Instruction::new(
             DescribedAccess {
                 access: Some((0, ReferenceAccessMode::Consume)),
                 base_input_count: 1,
-                descriptors: vec![Some((vec![index(0, 0)], 1..1))],
+                descriptors: vec![Some((Vec::new(), 1..1))],
             },
-            vec![source],
+            vec![AtomId::new(0)],
             Vec::new(),
             Vec::new(),
         );
         assert_eq!(
-            rewrite_reference_access_transforms(&consuming, 0, Vec::new(), Vec::new()).unwrap_err().to_string(),
-            "encountered malformed program: operation `described_access` consumes input 0 through a reference view",
+            rewrite_reference_access_transforms(&consuming, 0, vec![index(0, 0)], Vec::new()).unwrap_err(),
+            ProgramError::MalformedProgram(
+                "operation `described_access` consumes input 0 through a reference view".to_string(),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_reference_access_layout() {
+        let operation = AsyncCopyOperation::new()
+            .with_source_transforms(vec![dynamic()])
+            .with_destination_transforms(vec![dynamic()]);
+        assert_eq!(
+            reference_access_layout(&operation, 4),
+            Ok(vec![
+                Some(ReferenceAccessDescriptor::new(&[dynamic()], 2..3)),
+                Some(ReferenceAccessDescriptor::new(&[dynamic()], 3..4)),
+                None,
+                None,
+            ]),
+        );
+
+        // Each failure names the input it is attributed to, and a trailing binding count mismatch is attributed to the
+        // last access, whose binding group ends the canonical layout.
+        assert_eq!(
+            reference_access_layout(&operation, 5),
+            Err((
+                1,
+                "operation `async_copy` reference transforms require 4 inputs but the instruction has 5".to_string(),
+            )),
+        );
+        let missing = DescribedAccess {
+            access: Some((1, ReferenceAccessMode::Read)),
+            base_input_count: 2,
+            descriptors: Vec::new(),
+        };
+        assert_eq!(
+            reference_access_layout(&missing, 1),
+            Err((
+                1,
+                "operation `described_access` declares reference access at input 1 but has only 1 inputs".to_string(),
+            )),
         );
     }
 }
