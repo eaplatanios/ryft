@@ -32,12 +32,6 @@ pub enum ReferenceViewOverlap {
     MayOverlap,
 }
 
-/// Uninhabited binding of [`ReferenceTransformPath`]s that only ever carry static [`BoundReferenceTransform`]s, such
-/// as the path of an eager array reference handle. Every transform in such paths has empty bindings; consumers must
-/// reject transforms that require dynamic bindings because no binding value can be supplied for them.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub enum NoReferenceTransformBinding {}
-
 /// Metadata describing one selection applied to a reference allocation, carried by each access operation that applies
 /// it. A transform stores information such as an array axis and a static index, or indicates that a dynamic binding
 /// supplies an index. It stores neither the allocation nor the dynamic value or its instruction input position.
@@ -131,6 +125,184 @@ pub trait BatchableReferenceTransform: ReferenceTransform {
     /// Returns a [`BatchingError`] when this family cannot carry `batch_axis` through the transform (e.g., a family
     /// without axes rejects every mapped axis, and a static array slice cannot span a dynamically sized batch axis).
     fn batch(&self, r#type: &Self::Type, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError>;
+}
+
+/// A [`ReferenceTransform`] grouped together with its dynamic bindings. [`ReferenceTransformPath`] applies bound
+/// transforms in order from the complete root. `Transform` owns transform metadata, such as an array axis or a static
+/// slice while `Binding` supplies the ordinary values required by [`ReferenceTransform::binding_count`]. Static
+/// transforms carry no bindings.
+///
+/// During analysis, bindings are [`ValueId`]s in the access instruction's region. During discharge, they are values
+/// in the reconstruction context. For example, an array `Index { axis: 0, index: Dynamic }` consumes one binding and
+/// that binding identifies the runtime index value, independently of its position among the instruction's inputs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct BoundReferenceTransform<Transform: ReferenceTransform, Binding = ValueId> {
+    /// [`ReferenceTransform`] of this [`BoundReferenceTransform`].
+    transform: Transform,
+
+    /// Dynamic bindings consumed by this transform, in the order defined by the transform family.
+    bindings: Vec<Binding>,
+}
+
+impl<Transform: ReferenceTransform, Binding> BoundReferenceTransform<Transform, Binding> {
+    /// Returns the [`ReferenceTransform`] of this [`BoundReferenceTransform`].
+    #[inline]
+    pub fn transform(&self) -> &Transform {
+        &self.transform
+    }
+
+    /// Returns the binding of each symbol of the [`ReferenceTransform`], in the order returned
+    /// by [`ReferenceTransform::binding_count`].
+    #[inline]
+    pub fn bindings(&self) -> &[Binding] {
+        self.bindings.as_slice()
+    }
+}
+
+/// Sequence of [`BoundReferenceTransform`]s from a reference root to one derived reference
+/// (i.e., a view), in the order they are applied. `Transform` is the type of each transform, such as
+/// [`ArrayReferenceTransform`](crate::ArrayReferenceTransform), and `Binding` represents the inputs needed by a
+/// symbolic transform. Each [`BoundReferenceTransform`] pairs a `Transform` with a vector of `Binding`s.
+/// The path stores these bound transforms, but neither the root allocation nor its identity. Instead,
+/// [`ReferenceAnalysis`](crate::ReferenceAnalysis) identifies the root when analyzing a [`Program`](crate::Program).
+///
+/// For example, `root[row][column]` produces two transforms: the first addresses a row in the root, and the second
+/// addresses an element in that row. With `Transform = ArrayReferenceTransform` and `Binding = ValueId`, the bound
+/// transforms describe the two indexing operations and store the program identities of `row` and `column`. During
+/// discharge, `Binding = C::Value` stores their values in the reconstruction context instead, so the same path
+/// traversal can reapply the transforms without looking up source program identities.
+///
+/// Eager reference handles resolve indices immediately into static transforms and use [`NoReferenceTransformBinding`].
+/// Their transforms have empty binding vectors. Dynamic paths instead bind each transform to the consecutive inputs
+/// declared by the access descriptor, consuming exactly [`ReferenceTransform::binding_count`] bindings per transform.
+///
+/// The empty path denotes the complete root. Complete root handles, capture constants, and forwarded complete
+/// references carry it. A path belongs to one access instruction and therefore stays inside that instruction's region:
+/// references that cross region boundaries always denote complete roots, and accesses in the receiving region carry
+/// their own paths. Equality and hashing compare transforms and bindings, not the identities of the reference handles
+/// or the array elements addressed by different transform sequences.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct ReferenceTransformPath<Transform: ReferenceTransform, Binding = ValueId> {
+    /// [`BoundReferenceTransform`]s in this [`ReferenceTransformPath`] in the order they are applied, starting from
+    /// the root.
+    bound_transforms: Vec<BoundReferenceTransform<Transform, Binding>>,
+}
+impl<Transform: ReferenceTransform, Binding> ReferenceTransformPath<Transform, Binding> {
+    /// Returns the empty [`ReferenceTransformPath`] denoting the complete root.
+    pub const fn root() -> Self {
+        Self { bound_transforms: Vec::new() }
+    }
+
+    /// Resolves an access's ordered transforms against consecutive dynamic bindings. The bindings must contain exactly
+    /// the sum of [`ReferenceTransform::binding_count`] across all transforms. This function checks only the binding
+    /// layout; [`infer_reference_view_type`] validates binding types and transform semantics.
+    ///
+    /// # Parameters
+    ///
+    ///   - `transforms`: Transforms applied in order from the complete root.
+    ///   - `bindings`: Dynamic bindings grouped in transform order, with each transform consuming its declared
+    ///     binding count.
+    pub fn from_transforms(transforms: &[Transform], bindings: &[Binding]) -> Result<Self, ProgramError>
+    where
+        Binding: Clone,
+    {
+        let mut remaining = bindings;
+        let mut bound_transforms = Vec::with_capacity(transforms.len());
+        for transform in transforms {
+            let count = transform.binding_count();
+            if count > remaining.len() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference transform requires {} bindings but only {} remain",
+                    count,
+                    remaining.len(),
+                )));
+            }
+            let (current, rest) = remaining.split_at(count);
+            bound_transforms.push(BoundReferenceTransform { transform: transform.clone(), bindings: current.to_vec() });
+            remaining = rest;
+        }
+
+        if !remaining.is_empty() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference transform path has {} extra bindings",
+                remaining.len(),
+            )));
+        }
+
+        Ok(Self { bound_transforms })
+    }
+
+    /// Returns whether this [`ReferenceTransformPath`] denotes the complete root (i.e., whether it is empty).
+    #[inline]
+    pub fn is_root(&self) -> bool {
+        self.bound_transforms.is_empty()
+    }
+
+    /// Returns the [`BoundReferenceTransform`]s in this [`ReferenceTransformPath`] in the order they are applied,
+    /// starting from the root.
+    #[inline]
+    pub fn bound_transforms(&self) -> &[BoundReferenceTransform<Transform, Binding>] {
+        self.bound_transforms.as_slice()
+    }
+
+    /// Returns the ordered [`ReferenceTransform`]s applied from the root outward, without their bindings.
+    #[inline]
+    pub fn transforms(&self) -> impl ExactSizeIterator<Item = &Transform> + DoubleEndedIterator {
+        self.bound_transforms.iter().map(BoundReferenceTransform::transform)
+    }
+
+    /// Returns a copy of this [`ReferenceTransformPath`] extended by one more [`BoundReferenceTransform`] applied to
+    /// its current end, associating `transform` with `bindings`. The caller must supply the number of bindings declared
+    /// by [`ReferenceTransform::binding_count`], in the transform family's order. This generic container does not
+    /// validate the transform or its bindings.
+    pub fn with_bound_transform(&self, transform: Transform, bindings: Vec<Binding>) -> Self
+    where
+        Binding: Clone,
+    {
+        let mut bound_transforms = Vec::with_capacity(self.bound_transforms.len() + 1);
+        bound_transforms.extend(self.bound_transforms.iter().cloned());
+        bound_transforms.push(BoundReferenceTransform { transform, bindings });
+        Self { bound_transforms }
+    }
+
+    /// Returns a copy of this [`ReferenceTransformPath`] extended by one more static [`ReferenceTransform`] applied to
+    /// its current end. This is the shorthand of [`with_bound_transform`](Self::with_bound_transform) with no bindings.
+    /// The caller must ensure that `transform` requires no dynamic bindings.
+    #[inline]
+    pub fn with_transform(&self, transform: Transform) -> Self
+    where
+        Binding: Clone,
+    {
+        self.with_bound_transform(transform, Vec::new())
+    }
+
+    /// Extends this [`ReferenceTransformPath`] in place by the bound transforms of `suffix`, applied in order after its
+    /// current end. Unlike [`with_bound_transform`](Self::with_bound_transform), which copies the existing bound
+    /// transforms into a new path, this moves the bound transforms of `suffix` without cloning either path, so
+    /// extending a path by `k` transforms costs `O(k)` amortized time regardless of its current length. Like
+    /// [`with_bound_transform`](Self::with_bound_transform), it does not validate the transforms or their bindings.
+    #[inline]
+    pub fn append(&mut self, suffix: Self) {
+        self.bound_transforms.extend(suffix.bound_transforms);
+    }
+}
+
+impl<Transform: ReferenceTransform> ReferenceTransformPath<Transform, ValueId> {
+    /// Returns the [`ReferenceViewOverlap`] between the parts that this [`ReferenceTransformPath`] and `other` address
+    /// within one root of type `root`, through [`ReferenceTransform::overlap`]. Both paths must be relative to that
+    /// same root rather than to an intermediate view. Callers resolve each access's allocation root through
+    /// [`ReferenceAnalysis`](crate::ReferenceAnalysis) before comparing access paths.
+    #[inline]
+    pub fn overlap(&self, other: &Self, root: &Transform::Type) -> ReferenceViewOverlap {
+        Transform::overlap(root, self.bound_transforms(), other.bound_transforms())
+    }
+}
+
+impl<Transform: ReferenceTransform, Binding> Default for ReferenceTransformPath<Transform, Binding> {
+    #[inline]
+    fn default() -> Self {
+        Self::root()
+    }
 }
 
 /// Uninhabited transform type for a referent family `T` in an input universe `U` that supports only whole-root
@@ -227,182 +399,11 @@ impl<T: 'static + Type, U: 'static + Type> BatchableReferenceTransform for NoRef
     }
 }
 
-/// A [`ReferenceTransform`] grouped together with its dynamic bindings. [`ReferenceTransformPath`] applies bound
-/// transforms in order from the complete root. `Transform` owns transform metadata, such as an array axis or a static
-/// slice while `Binding` supplies the ordinary values required by [`ReferenceTransform::binding_count`]. Static
-/// transforms carry no bindings.
-///
-/// During analysis, bindings are [`ValueId`]s in the access instruction's region. During discharge, they are values
-/// in the reconstruction context. For example, an array `Index { axis: 0, index: Dynamic }` consumes one binding and
-/// that binding identifies the runtime index value, independently of its position among the instruction's inputs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub struct BoundReferenceTransform<Transform: ReferenceTransform, Binding = ValueId> {
-    /// [`ReferenceTransform`] of this [`BoundReferenceTransform`].
-    transform: Transform,
-
-    /// Dynamic bindings consumed by this transform, in the order defined by the transform family.
-    bindings: Vec<Binding>,
-}
-
-impl<Transform: ReferenceTransform, Binding> BoundReferenceTransform<Transform, Binding> {
-    /// Returns the [`ReferenceTransform`] of this [`BoundReferenceTransform`].
-    #[inline]
-    pub fn transform(&self) -> &Transform {
-        &self.transform
-    }
-
-    /// Returns the binding of each symbol of the [`ReferenceTransform`], in the order returned
-    /// by [`ReferenceTransform::binding_count`].
-    #[inline]
-    pub fn bindings(&self) -> &[Binding] {
-        self.bindings.as_slice()
-    }
-}
-
-/// Sequence of [`BoundReferenceTransform`]s from a reference root to one derived reference
-/// (i.e., a view), in the order they are applied. `Transform` is the type of each transform, such as
-/// [`ArrayReferenceTransform`](crate::ArrayReferenceTransform), and `Binding` represents the inputs needed by a
-/// symbolic transform. Each [`BoundReferenceTransform`] pairs a `Transform` with a vector of `Binding`s.
-/// The path stores these bound transforms, but neither the root allocation nor its identity. Instead,
-/// [`ReferenceAnalysis`](crate::ReferenceAnalysis) identifies the root when analyzing a [`Program`](crate::Program).
-///
-/// For example, `root[row][column]` produces two transforms: the first addresses a row in the root, and the second
-/// addresses an element in that row. With `Transform = ArrayReferenceTransform` and `Binding = ValueId`, the bound
-/// transforms describe the two indexing operations and store the program identities of `row` and `column`. During
-/// discharge, `Binding = C::Value` stores their values in the reconstruction context instead, so the same path
-/// traversal can reapply the transforms without looking up source program identities.
-///
-/// Eager reference handles resolve indices immediately into static transforms and use [`NoReferenceTransformBinding`].
-/// Their transforms have empty binding vectors. Dynamic paths instead bind each transform to the consecutive inputs
-/// declared by the access descriptor, consuming exactly [`ReferenceTransform::binding_count`] bindings per transform.
-///
-/// The empty path denotes the complete root. Complete root handles, capture constants, and forwarded complete
-/// references carry it. A path belongs to one access instruction and therefore stays inside that instruction's region:
-/// references that cross region boundaries always denote complete roots, and accesses in the receiving region carry
-/// their own paths. Equality and hashing compare transforms and bindings, not the identities of the reference handles
-/// or the array elements addressed by different transform sequences.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub struct ReferenceTransformPath<Transform: ReferenceTransform, Binding = ValueId> {
-    /// [`BoundReferenceTransform`]s in this [`ReferenceTransformPath`] in the order they are applied, starting from
-    /// the root.
-    bound_transforms: Vec<BoundReferenceTransform<Transform, Binding>>,
-}
-
-// TODO(eaplatanios): Review this block.
-impl<Transform: ReferenceTransform, Binding> ReferenceTransformPath<Transform, Binding> {
-    /// Returns the empty [`ReferenceTransformPath`] denoting the complete root.
-    pub const fn root() -> Self {
-        Self { bound_transforms: Vec::new() }
-    }
-
-    /// Resolves an access's ordered transforms against consecutive dynamic bindings. The bindings must contain exactly
-    /// the sum of [`ReferenceTransform::binding_count`] across all transforms. This function checks only the binding
-    /// layout; [`infer_reference_view_type`] validates binding types and transform semantics.
-    ///
-    /// # Parameters
-    ///
-    ///   - `transforms`: Transforms applied in order from the complete root.
-    ///   - `bindings`: Dynamic bindings grouped in transform order, with each transform consuming its declared binding
-    ///     count.
-    pub fn from_transforms(transforms: &[Transform], bindings: &[Binding]) -> Result<Self, ProgramError>
-    where
-        Binding: Clone,
-    {
-        let mut remaining = bindings;
-        let mut bound_transforms = Vec::with_capacity(transforms.len());
-        for transform in transforms {
-            let count = transform.binding_count();
-            if count > remaining.len() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "reference transform requires {count} bindings but only {} remain",
-                    remaining.len(),
-                )));
-            }
-            let (current, rest) = remaining.split_at(count);
-            bound_transforms.push(BoundReferenceTransform { transform: transform.clone(), bindings: current.to_vec() });
-            remaining = rest;
-        }
-        if !remaining.is_empty() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference transform path has {} extra bindings",
-                remaining.len(),
-            )));
-        }
-        Ok(Self { bound_transforms })
-    }
-
-    /// Returns whether this [`ReferenceTransformPath`] denotes the complete root (i.e., whether it is empty).
-    #[inline]
-    pub fn is_root(&self) -> bool {
-        self.bound_transforms.is_empty()
-    }
-
-    /// Returns the [`BoundReferenceTransform`]s in this [`ReferenceTransformPath`] in the order they are applied,
-    /// starting from the root.
-    #[inline]
-    pub fn bound_transforms(&self) -> &[BoundReferenceTransform<Transform, Binding>] {
-        self.bound_transforms.as_slice()
-    }
-
-    /// Returns the ordered [`ReferenceTransform`]s applied from the root outward, without their bindings.
-    #[inline]
-    pub fn transforms(&self) -> impl ExactSizeIterator<Item = &Transform> + DoubleEndedIterator {
-        self.bound_transforms.iter().map(BoundReferenceTransform::transform)
-    }
-
-    /// Returns a copy of this [`ReferenceTransformPath`] extended by one more [`BoundReferenceTransform`] applied to
-    /// its current end, associating `transform` with `bindings`. The caller must supply the number of bindings declared
-    /// by [`ReferenceTransform::binding_count`], in the transform family's order. This generic container does not
-    /// validate the transform or its bindings.
-    pub fn with_bound_transform(&self, transform: Transform, bindings: Vec<Binding>) -> Self
-    where
-        Binding: Clone,
-    {
-        let mut bound_transforms = Vec::with_capacity(self.bound_transforms.len() + 1);
-        bound_transforms.extend(self.bound_transforms.iter().cloned());
-        bound_transforms.push(BoundReferenceTransform { transform, bindings });
-        Self { bound_transforms }
-    }
-
-    /// Returns a copy of this [`ReferenceTransformPath`] extended by one more static [`ReferenceTransform`] applied to
-    /// its current end. This is the shorthand of [`with_bound_transform`](Self::with_bound_transform) with no bindings.
-    /// The caller must ensure that `transform` requires no dynamic bindings.
-    #[inline]
-    pub fn with_transform(&self, transform: Transform) -> Self
-    where
-        Binding: Clone,
-    {
-        self.with_bound_transform(transform, Vec::new())
-    }
-
-    /// Extends this [`ReferenceTransformPath`] in place by the bound transforms of `suffix`, applied in order after its
-    /// current end. Unlike [`with_bound_transform`](Self::with_bound_transform), which copies the existing bound
-    /// transforms into a new path, this moves the bound transforms of `suffix` without cloning either path, so
-    /// extending a path by `k` transforms costs `O(k)` amortized time regardless of its current length. Like
-    /// [`with_bound_transform`](Self::with_bound_transform), it does not validate the transforms or their bindings.
-    #[inline]
-    pub fn append(&mut self, suffix: Self) {
-        self.bound_transforms.extend(suffix.bound_transforms);
-    }
-}
-
-impl<Transform: ReferenceTransform> ReferenceTransformPath<Transform, ValueId> {
-    /// Returns the [`ReferenceViewOverlap`] between the parts that this [`ReferenceTransformPath`] and `other` address
-    /// within one root of type `root`, through [`ReferenceTransform::overlap`]. Both paths must be relative to that
-    /// same root rather than to an intermediate view. Callers resolve each access's allocation root through
-    /// [`ReferenceAnalysis`](crate::ReferenceAnalysis) before comparing access paths.
-    #[inline]
-    pub fn overlap(&self, other: &Self, root: &Transform::Type) -> ReferenceViewOverlap {
-        Transform::overlap(root, self.bound_transforms(), other.bound_transforms())
-    }
-}
-
-impl<Transform: ReferenceTransform, Binding> Default for ReferenceTransformPath<Transform, Binding> {
-    #[inline]
-    fn default() -> Self {
-        Self::root()
-    }
-}
+/// Uninhabited binding of [`ReferenceTransformPath`]s that only ever carry static [`BoundReferenceTransform`]s, such
+/// as the path of an eager array reference handle. Every transform in such paths has empty bindings; consumers must
+/// reject transforms that require dynamic bindings because no binding value can be supplied for them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub enum NoReferenceTransformBinding {}
 
 /// Validates dynamic bindings and derives the referent of the view produced by an ordered path, applying its
 /// transforms in order. Every transform consumes its own consecutive group of [`ReferenceTransform::binding_count`]
@@ -535,21 +536,6 @@ pub(crate) mod tests {
     /// Creates a dynamic index transform.
     pub(crate) fn dynamic() -> ArrayReferenceTransform {
         ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }
-    }
-
-    #[test]
-    fn test_no_reference_transform() {
-        let root = ReferenceTransformPath::<NoReferenceTransform<ArrayType, ArrayIrType>>::root();
-        assert_eq!(root.overlap(&root, &reference_type([2])), ReferenceViewOverlap::Same);
-        assert_eq!(
-            batch_reference_transforms::<NoReferenceTransform<ArrayType, ArrayIrType>>(
-                &reference_type([2]),
-                BatchAxis::new(0),
-                &[],
-                &[],
-            ),
-            Ok((Vec::new(), BatchAxis::new(0))),
-        );
     }
 
     #[test]
@@ -699,6 +685,21 @@ pub(crate) mod tests {
         assert_eq!(symbolic.overlap(&TestPath::root(), &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(symbolic.overlap(&row_1, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(symbolic.overlap(&other, &root), ReferenceViewOverlap::MayOverlap);
+    }
+
+    #[test]
+    fn test_no_reference_transform() {
+        let root = ReferenceTransformPath::<NoReferenceTransform<ArrayType, ArrayIrType>>::root();
+        assert_eq!(root.overlap(&root, &reference_type([2])), ReferenceViewOverlap::Same);
+        assert_eq!(
+            batch_reference_transforms::<NoReferenceTransform<ArrayType, ArrayIrType>>(
+                &reference_type([2]),
+                BatchAxis::new(0),
+                &[],
+                &[],
+            ),
+            Ok((Vec::new(), BatchAxis::new(0))),
+        );
     }
 
     #[test]
