@@ -679,8 +679,7 @@ impl Display for ArrayReferenceTransform {
                 write!(formatter, "index(axis={axis}, index={index})")
             }
             Self::Index { axis, index: ArrayReferenceTransformIndex::Dynamic } => {
-                // TODO(eaplatanios): Should this be rendered as write!(formatter, "index(axis={axis}, index=dynamic)")?
-                write!(formatter, "dynamic_index(axis={axis})")
+                write!(formatter, "index(axis={axis}, index=dynamic)")
             }
             Self::Slice { axes } => {
                 // Each axis renders as `start:limit`, with the tight exclusive limit one past its last selected index,
@@ -2259,7 +2258,7 @@ mod tests {
         );
         assert_eq!(
             ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }.to_string(),
-            "dynamic_index(axis=0)",
+            "index(axis=0, index=dynamic)",
         );
         assert_eq!(
             ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] }.to_string(),
