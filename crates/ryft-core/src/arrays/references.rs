@@ -826,10 +826,16 @@ impl BatchableReferenceTransform for ArrayReferenceTransform {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root, ArrayReferenceTransform, Binding> {
-    /// Selects a static position on `axis`, removing that dimension from the viewed referent.
+    /// Returns this view narrowed to position `index` on `axis`, with that axis removed from the viewed referent. For
+    /// example, indexing axis `0` of an `f32[2, 3]` view at `1` produces an `f32[3]` view of its second row. The index
+    /// is static, so it is validated against the viewed referent immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the viewed referent does not have a static shape, if `axis` is out of bounds for its
+    /// rank, if `index` is out of bounds for `axis`, or if writing the selected elements back would not reconstruct the
+    /// exact type of the viewed referent.
     #[inline]
     pub fn index(self, axis: usize, index: usize) -> Result<Self, ProgramError> {
         self.with_bound_transform(
@@ -838,14 +844,21 @@ impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root
         )
     }
 
-    /// Selects the supplied static unit-stride ranges from the currently viewed referent.
-    #[inline]
-    pub fn slice(self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
-        self.with_bound_transform(ArrayReferenceTransform::Slice { axes: axes.to_vec() }, Vec::new())
-    }
-
-    /// Selects a dynamic position on `axis`. Construction validates the scalar integer binding's type and memory
-    /// space; concretization and negative-index normalization happen at the eventual access.
+    /// Returns this view narrowed to the runtime position that `index` holds on `axis`, with that axis removed from
+    /// the viewed referent as in [`Self::index`]. Only the type of `index` is validated here. Each access through the
+    /// returned view reads the value of `index`, counts a negative index from the end of `axis` once, and then clamps
+    /// the result to the valid range of `axis`. An access fails if `axis` is empty.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Axis of the viewed referent to index.
+    ///   - `index`: Scalar integer value that holds the position, in the same memory space as the viewed referent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if `index` is not a scalar integer, if it resides in a different memory space than the
+    /// viewed referent, if the viewed referent does not have a static shape, or if `axis` is out of bounds for its
+    /// rank.
     #[inline]
     pub fn dynamic_index(self, axis: usize, index: &Binding) -> Result<Self, ProgramError> {
         self.with_bound_transform(
@@ -853,7 +866,23 @@ impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root
             vec![index.clone()],
         )
     }
+
+    /// Returns this view narrowed to one static unit-stride range per axis, which preserves the rank of the viewed
+    /// referent. `axes` holds exactly one [`ArraySliceAxis`] per axis. For example, slicing an `f32[4]` view with
+    /// `ArraySliceAxis::new(1, 2, 1)` produces an `f32[2]` view of its two middle elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if the viewed referent does not have a static shape, if `axes` does not have one entry
+    /// per axis, if an entry has a stride other than one, if a range extends past the end of its axis, or if writing
+    /// the selected elements back would not reconstruct the exact type of the viewed referent.
+    #[inline]
+    pub fn slice(self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
+        self.with_bound_transform(ArrayReferenceTransform::Slice { axes: axes.to_vec() }, Vec::new())
+    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Indices that a folded [`ArrayReferenceTransformPath`] selects on one axis of its root, used by
 /// [`ReferenceTransform::overlap`] to compare two paths of one root.
