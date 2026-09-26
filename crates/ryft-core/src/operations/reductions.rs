@@ -115,10 +115,8 @@ pub enum ReductionKind {
     All,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ReductionKind {
-    /// Returns the canonical operation name suffix for this kind.
+    /// Returns the canonical operation name suffix for this [`ReductionKind`].
     #[inline]
     pub fn name(self) -> &'static str {
         match self {
@@ -131,24 +129,18 @@ impl ReductionKind {
             Self::All => "all",
         }
     }
-
-    /// Returns `true` when this kind requires [`DataType::Boolean`] inputs.
-    #[inline]
-    pub fn requires_boolean(self) -> bool {
-        matches!(self, Self::Any | Self::All)
-    }
 }
 
 impl Display for ReductionKind {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.name())
     }
 }
 
-/// Primitive representing one N-dimensional axis-collapsing reduction.
-///
-/// [`ReduceOperation`] collapses the input array along `axes` using the reduction described by [`kind`](Self::kind).
-/// The output rank is the input rank minus the number of reduced axes; non-reduced axes keep their relative order.
+/// Represents an N-dimensional axis-collapsing reduction. [`ReduceOperation`] collapses the input array along `axes`
+/// using the reduction described by [`kind`](Self::kind). The output rank is the input rank minus the number of reduced
+/// axes; non-reduced axes keep their relative order.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReduceOperation {
     /// Axes to reduce. Refer to the documentation of [`Self::axes`].
@@ -160,6 +152,8 @@ pub struct ReduceOperation {
     /// Optional requested output [`Sharding`]. Refer to the documentation of [`Self::with_output_sharding`].
     output_sharding: Option<Sharding>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ReduceOperation {
     /// Creates a new [`ReduceOperation`] reducing along `axes` with the supplied `kind`. The input
@@ -1236,7 +1230,7 @@ pub fn reduce_abstract(
     if kind == ReductionKind::LogSumExp {
         validate_log_sum_exp_data_type(data_type, operation_name)?;
     } else {
-        let (requirement, supports_kind) = if kind.requires_boolean() {
+        let (requirement, supports_kind) = if matches!(kind, ReductionKind::Any | ReductionKind::All) {
             ("Boolean", data_type.is_boolean())
         } else if matches!(kind, ReductionKind::Max | ReductionKind::Min) {
             ("Boolean or numeric", data_type.is_boolean() || data_type.is_numeric() || data_type == DataType::Zero)
@@ -1663,17 +1657,6 @@ mod tests {
             assert_eq!(kind.name(), name);
             assert_eq!(kind.to_string(), name);
         }
-    }
-
-    #[test]
-    fn test_reduction_kind_requires_boolean() {
-        for kind in
-            [ReductionKind::Sum, ReductionKind::Mean, ReductionKind::LogSumExp, ReductionKind::Max, ReductionKind::Min]
-        {
-            assert!(!kind.requires_boolean());
-        }
-        assert!(ReductionKind::Any.requires_boolean());
-        assert!(ReductionKind::All.requires_boolean());
     }
 
     #[test]
