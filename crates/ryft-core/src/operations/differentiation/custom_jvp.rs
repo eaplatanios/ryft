@@ -627,10 +627,123 @@ pub fn custom_jvp<
     CustomJvp { primal, jvp, non_differentiated_count: 0, marker: PhantomData }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Validates that the leading `non_differentiated_count` input positions of a custom derivative call named `name` fit
+/// within its `input_count` inputs.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] when `non_differentiated_count` exceeds `input_count`.
+pub(super) fn validate_non_differentiated_count(
+    name: &str,
+    non_differentiated_count: usize,
+    input_count: usize,
+) -> Result<(), TypeError> {
+    if non_differentiated_count > input_count {
+        return Err(TypeError::invalid(format!(
+            "{name} non-differentiated input count {non_differentiated_count} exceeds input count {input_count}",
+        )));
+    }
+    Ok(())
+}
 
-/// Removes the tangent inputs that a traced JVP rule declares for the leading `non_differentiated_count` inputs. The
-/// rule closure receives one tangent per input so that its signature mirrors the primal signature, but a
+/// Validates the reference contract that the custom derivative operations share over one primal boundary.
+/// A reference-typed input is accepted only in the leading `non_differentiated_count` positions, which correspond to
+/// _plumbing_ that every attached rule region receives unchanged (the rule interfaces define no tangent or cotangent
+/// slot for a reference, so an active reference input would have a derivative that no user-supplied rule can express).
+/// No output may be a reference, because a rule region would then have to produce that output's tangent reference or
+/// consume its cotangent reference, and a user-supplied rule can neither allocate nor receive one. Both operations
+/// apply this contract during type inference, so it holds for every constructed call, and their forward-mode rules
+/// apply it again to the replayed inputs as defense in depth.
+///
+/// # Parameters
+///
+///   - `name`: Operation name used in diagnostics.
+///   - `non_differentiated_count`: Number of leading inputs that parameterize the call without being differentiated.
+///   - `input_types`: Primal input types in input order.
+///   - `output_types`: Primal output types in output order.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] naming the first reference-typed input in the differentiated segment, or otherwise the
+/// first reference-typed output.
+pub(super) fn validate_custom_derivative_reference_boundary<T: Type>(
+    name: &str,
+    non_differentiated_count: usize,
+    input_types: &[T],
+    output_types: &[T],
+) -> Result<(), TypeError> {
+    if let Some((index, r#type)) = input_types
+        .iter()
+        .enumerate()
+        .skip(non_differentiated_count)
+        .find(|(_, r#type)| r#type.is_reference())
+    {
+        return Err(TypeError::invalid(format!(
+            "{name} accepts reference inputs only in its leading non-differentiated segment; move input {index} of \
+             type `{type}` before the differentiated inputs",
+        )));
+    }
+    if let Some((index, r#type)) = output_types.iter().enumerate().find(|(_, r#type)| r#type.is_reference()) {
+        return Err(TypeError::invalid(format!(
+            "{name} cannot return a reference, but output {index} has type `{type}`",
+        )));
+    }
+    Ok(())
+}
+
+/// Validates the inputs before replaying a custom derivative rule. Rule regions bypass ordinary differentiation
+/// dispatch, so replay checks the reference contract of [`validate_custom_derivative_reference_boundary`] that type
+/// inference already enforces and uses [`ReferenceBoundary`] to reject aliased concrete or staged references.
+/// Non-differentiated numeric inputs must have zero tangents, while non-differentiated references carry state whose
+/// tangent the rule leaves untouched.
+///
+/// # Parameters
+///
+///   - `name`: Operation name used in diagnostics.
+///   - `non_differentiated_count`: Number of leading inputs that parameterize the call without being differentiated.
+///   - `context`: Context in which the rule is replayed, which resolves the inputs.
+///   - `inputs`: Dual inputs of the replayed call, in input order.
+///   - `output_types`: Primal output types in output order.
+///
+/// # Errors
+///
+/// Returns the [`ProgramError`] of the first violated contract: the [`TypeError`] of
+/// [`validate_custom_derivative_reference_boundary`], a reference boundary error, or an unsupported nonzero tangent.
+pub(super) fn validate_custom_derivative_replay<C: Context<Type: DifferentiableType>>(
+    name: &str,
+    non_differentiated_count: usize,
+    context: &C,
+    inputs: &[DifferentiationDual<C::Value>],
+    output_types: &[C::Type],
+) -> Result<(), ProgramError> {
+    let primal_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
+    validate_custom_derivative_reference_boundary(
+        name,
+        non_differentiated_count,
+        primal_types.as_slice(),
+        output_types,
+    )?;
+    ReferenceBoundary::new_for_differentiation(context, inputs.iter().map(DifferentiationDual::primal), [], [])?;
+    if let Some(input) = inputs.iter().take(non_differentiated_count).find(|input| {
+        !input.primal().r#type().is_reference()
+            && !input.tangent().is_zero()
+            && !input.tangent().r#type().is_zero_space()
+    }) {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "{} cannot propagate the nonzero tangent of type `{}` supplied for one of its \
+                 {} leading non-differentiated inputs, because its rule has no tangent slot for them",
+                name,
+                input.tangent().r#type(),
+                non_differentiated_count,
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Removes the tangent inputs that a traced JVP rule declares for the leading `non_differentiated_count` inputs.
+/// The rule closure receives one tangent per input so that its signature mirrors the primal signature, but a
 /// non-differentiated input has no tangent slot in the [`CustomJvpOperation`] contract, so its tangent input is a
 /// placeholder that the rule must ignore. The traced program has inputs `[inputs..., input_tangents...]`, and the
 /// placeholders are the tangents at positions `input_count..input_count + non_differentiated_count`, which are
@@ -677,119 +790,7 @@ fn without_non_differentiated_tangent_inputs<V: Value, O: Clone + Operation<Type
     Ok(pruned)
 }
 
-/// Validates that the leading `non_differentiated_count` input positions of a custom derivative call named `name` fit
-/// within its `input_count` inputs.
-///
-/// # Errors
-///
-/// Returns a [`TypeError`] when `non_differentiated_count` exceeds `input_count`.
-pub(crate) fn validate_non_differentiated_count(
-    name: &str,
-    non_differentiated_count: usize,
-    input_count: usize,
-) -> Result<(), TypeError> {
-    if non_differentiated_count > input_count {
-        return Err(TypeError::invalid(format!(
-            "{name} non-differentiated input count {non_differentiated_count} exceeds input count {input_count}",
-        )));
-    }
-    Ok(())
-}
-
-/// Validates the reference contract that the custom derivative operations share over one primal boundary. A
-/// reference-typed input is accepted only in the leading `non_differentiated_count` positions, where it is plumbing
-/// that every attached rule region receives unchanged: the rule interfaces define no tangent or cotangent slot for a
-/// reference, so an active reference input would have a derivative that no user-supplied rule can express. No output
-/// may be a reference, because a rule region would then have to produce that output's tangent reference or consume
-/// its cotangent reference, and a user-supplied rule can neither allocate nor receive one. Both operations apply this
-/// contract during type inference, so it holds for every constructed call, and their forward-mode rules apply it
-/// again to the replayed inputs as defense in depth.
-///
-/// # Parameters
-///
-///   - `name`: Operation name used in diagnostics.
-///   - `non_differentiated_count`: Number of leading inputs that parameterize the call without being differentiated.
-///   - `input_types`: Primal input types in input order.
-///   - `output_types`: Primal output types in output order.
-///
-/// # Errors
-///
-/// Returns a [`TypeError`] naming the first reference-typed input in the differentiated segment, or otherwise the
-/// first reference-typed output.
-pub(crate) fn validate_custom_derivative_reference_boundary<T: Type>(
-    name: &str,
-    non_differentiated_count: usize,
-    input_types: &[T],
-    output_types: &[T],
-) -> Result<(), TypeError> {
-    if let Some((index, r#type)) = input_types
-        .iter()
-        .enumerate()
-        .skip(non_differentiated_count)
-        .find(|(_, r#type)| r#type.is_reference())
-    {
-        return Err(TypeError::invalid(format!(
-            "{name} accepts reference inputs only in its leading non-differentiated segment; move input {index} of \
-             type `{type}` before the differentiated inputs",
-        )));
-    }
-    if let Some((index, r#type)) = output_types.iter().enumerate().find(|(_, r#type)| r#type.is_reference()) {
-        return Err(TypeError::invalid(format!(
-            "{name} cannot return a reference, but output {index} has type `{type}`",
-        )));
-    }
-    Ok(())
-}
-
-/// Validates the inputs before replaying a custom derivative rule. Rule regions bypass ordinary differentiation
-/// dispatch, so replay checks the reference contract of [`validate_custom_derivative_reference_boundary`] that type
-/// inference already enforces and uses [`ReferenceBoundary`] to reject aliased concrete or staged references.
-/// Non-differentiated numeric inputs must have zero tangents, while non-differentiated references carry state whose
-/// tangent the rule leaves untouched.
-///
-/// # Parameters
-///
-///   - `name`: Operation name used in diagnostics.
-///   - `non_differentiated_count`: Number of leading inputs that parameterize the call without being differentiated.
-///   - `context`: Context in which the rule is replayed, which resolves the inputs.
-///   - `inputs`: Dual inputs of the replayed call, in input order.
-///   - `output_types`: Primal output types in output order.
-///
-/// # Errors
-///
-/// Returns the [`ProgramError`] of the first violated contract: the [`TypeError`] of
-/// [`validate_custom_derivative_reference_boundary`], a reference boundary error, or an unsupported nonzero tangent.
-pub(crate) fn validate_custom_derivative_replay<C: Context<Type: DifferentiableType>>(
-    name: &str,
-    non_differentiated_count: usize,
-    context: &C,
-    inputs: &[DifferentiationDual<C::Value>],
-    output_types: &[C::Type],
-) -> Result<(), ProgramError> {
-    let primal_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
-    validate_custom_derivative_reference_boundary(
-        name,
-        non_differentiated_count,
-        primal_types.as_slice(),
-        output_types,
-    )?;
-    ReferenceBoundary::new_for_differentiation(context, inputs.iter().map(DifferentiationDual::primal), [], [])?;
-    if let Some(input) = inputs.iter().take(non_differentiated_count).find(|input| {
-        !input.primal().r#type().is_reference()
-            && !input.tangent().is_zero()
-            && !input.tangent().r#type().is_zero_space()
-    }) {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "{name} cannot propagate the nonzero tangent of type `{}` supplied for one of its \
-                 {non_differentiated_count} leading non-differentiated inputs, because its rule has no tangent slot \
-                 for them",
-                input.tangent().r#type(),
-            ),
-        });
-    }
-    Ok(())
-}
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 pub(crate) mod tests {
