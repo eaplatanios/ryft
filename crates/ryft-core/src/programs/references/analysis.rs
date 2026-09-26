@@ -998,16 +998,15 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// Structural reference analysis and validated paths keyed by access instruction and input. The structural
-/// [`ReferenceAnalysis`] owns allocation identity and lifetime rules; this analysis adds the validated path and dynamic
-/// bindings of every reference access.
+/// [`ReferenceAnalysis`] owns allocation identity and lifetime rules. This analysis adds the validated path
+/// and dynamic bindings of every reference access.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceViewAnalysis<Transform: ReferenceTransform> {
-    /// Shared structural analysis that resolves each reference input to its root.
+    /// Shared [`ReferenceAnalysis`] that resolves each reference input to its root.
     analysis: Arc<ReferenceAnalysis>,
 
-    /// Path of each declared reference access, in canonical instruction and input order.
+    /// [`ReferenceTransformPath`] of each declared reference access, in canonical instruction and input order.
     paths: BTreeMap<(InstructionId, usize), ReferenceTransformPath<Transform>>,
 }
 
@@ -1154,18 +1153,17 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl<'r, V: Value, O: ReferenceAccessOperation<Type = V::Type>> RegionRef<'r, V, O>
 where
     for<'t> &'t ReferenceType<<O::Transform as ReferenceTransform>::Referent>: TryFrom<&'t V::Type, Error = TypeError>,
 {
-    /// Returns the [`ReferenceViewAnalysis`] of this [`Region`]'s closure, retained in the region's transform cache
-    /// under exactly the cache identity of [`reference_analysis`](Self::reference_analysis): the same `capture_count`
-    /// and closure region identifiers key both, so a topology-preserving import that renumbers regions derives its own
-    /// view analysis instead of being served paths keyed by another arena's identifiers, and repeated analysis of an
-    /// unmoved region hits. The view analysis shares the retained structural analysis rather than deriving a second
-    /// one. Refer to the documentation of [`ReferenceViewAnalysis::new`] for the view analysis itself; that function
-    /// remains the uncached path.
+    /// Returns the [`ReferenceViewAnalysis`] of this [`Region`]'s closure, retained in the region's transform
+    /// cache under exactly the cache identity of [`reference_analysis`](Self::reference_analysis) (i.e., the same
+    /// `capture_count` and closure region identifiers key both, so that a topology-preserving import that renumbers
+    /// regions derives its own view analysis instead of being served paths keyed by another arena's identifiers, and
+    /// repeated analysis of an unmoved region hits). The view analysis shares the retained structural analysis rather
+    /// than deriving a second one. Refer to the documentation of [`ReferenceViewAnalysis::new`] for the view analysis
+    /// itself as that function remains the uncached path.
     ///
     /// # Parameters
     ///

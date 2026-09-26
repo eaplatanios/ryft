@@ -1806,7 +1806,7 @@ impl<Root: Typed, Transform: ReferenceTransform, Binding: Clone + Typed<Type = T
     /// immediately. Construction performs no reference access. The view is consumed so that the transform is appended
     /// to its existing path without copying it, making a view with `k` transforms cost `O(k)` to construct; clone the
     /// view first to derive several views from a common prefix.
-    pub fn with_transform(mut self, transform: Transform, bindings: Vec<Binding>) -> Result<Self, ProgramError> {
+    pub fn with_bound_transform(mut self, transform: Transform, bindings: Vec<Binding>) -> Result<Self, ProgramError> {
         let binding_types = bindings.iter().map(Typed::r#type).collect::<Vec<_>>();
         let binding_types = binding_types.iter().map(AsRef::as_ref).collect::<Vec<_>>();
         transform.validate_bindings(self.r#type.referent(), &binding_types)?;
@@ -3310,12 +3310,12 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_view_with_transform() {
+    fn test_reference_view_with_bound_transform() {
         let root = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1i32, 2, 3]).unwrap()));
         let viewed = ReferenceView::<_, ArrayReferenceTransform, ArrayIrValue<Array>>::new(root.clone()).unwrap();
         let binding = ArrayIrValue::Array(Array::scalar(-1i32).unwrap());
         let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let selected = viewed.clone().with_transform(transform.clone(), vec![binding.clone()]).unwrap();
+        let selected = viewed.clone().with_bound_transform(transform.clone(), vec![binding.clone()]).unwrap();
         assert_eq!(selected.root(), &root);
         assert_eq!(selected.path(), &ReferenceTransformPath::root().with_bound_transform(transform, vec![binding]));
         assert!(viewed.path().is_root());
@@ -3324,7 +3324,7 @@ mod tests {
         selected.add_update(&ArrayIrValue::Array(Array::scalar(2i32).unwrap())).unwrap();
         assert_eq!(root.read(), Ok(ArrayIrValue::Array(Array::vector(vec![1i32, 2, 12]).unwrap())));
         let error = selected
-            .with_transform(
+            .with_bound_transform(
                 ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) },
                 Vec::new(),
             )
