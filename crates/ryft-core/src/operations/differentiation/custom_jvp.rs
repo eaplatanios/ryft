@@ -526,37 +526,35 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Creates a [`CustomJvp`] function from a primal closure and a Jacobian-Vector Product (JVP) closure over values of
-/// [`DomainTracer`]s. This is the analogue of JAX's
+/// Creates a [`CustomJvp`] function from a primal closure and a Jacobian-Vector Product (JVP)
+/// closure over values of [`DomainTracer`]s. This is the analogue of JAX's
 /// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
 /// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
 ///
-/// For `y = f(x)`, let `J_f(x) = ∂f/∂x` denote the Jacobian of `f` at `x`. The two closure arguments implement
+/// For `y = f(x)`, let `J_f(x) = ∂f/∂x` denote the Jacobian of `f` at `x`. The two closure arguments implement:
 ///
 /// ```text
-/// primal: x      ↦ y = f(x)
-/// jvp:    (x, ẋ) ↦ (y, ẏ) = (f(x), J_f(x) · ẋ)
+/// Primal:     x      ↦ y = f(x)
+/// JVP:        (x, ẋ) ↦ (y, ẏ) = (f(x), J_f(x) · ẋ)
 /// ```
 ///
-/// Thus, `primal` receives the input tracer value `x` and returns the output tracer value `y`. `jvp` receives `x` and
-/// an input-tangent value `ẋ`, then returns the primal output `y` together with the Jacobian-vector product
+/// Thus, `primal` receives the input tracer value `x` and returns the output tracer value `y`. `jvp` receives `x`
+/// and an input-tangent value `ẋ`, then returns the primal output `y` together with the Jacobian-vector product
 /// `ẏ = J_f(x) · ẋ`, which must be linear in `ẋ`. The tangent values have the same parameter structures as their
 /// corresponding primal values, and Ryft validates these structural and type relationships when it traces the closures.
 ///
-/// # When to use
+/// # When to Use
 ///
 /// Reach for a custom JVP when the function _is_ forward-differentiable but its automatically derived tangent is
 /// numerically unstable or wasteful and you want to supply a stable, efficient one by hand. Classic cases are a
-/// `log`-`sum`-`exp`, a softmax, or a normalization, where a hand-written tangent avoids the cancellation or redundant
+/// `log`-`sum`-`exp`, a softmax, or a normalization, where a handwritten tangent avoids the cancellation or redundant
 /// work that the generic rule incurs. A single custom JVP serves **both** differentiation modes: reverse mode obtains
 /// its gradient by transposing the supplied tangent map, so the one rule composes with forward mode, reverse mode, and
-/// their higher-order combinations. Prefer it over [`custom_vjp`](fn@crate::operations::differentiation::custom_vjp)
-/// whenever the function is naturally forward-differentiable, and use a custom VJP only when just the reverse rule is
-/// natural (e.g., for implicit differentiation or adjoint solvers).
+/// their higher-order combinations. Prefer it over [`custom_vjp`](fn@crate::custom_vjp) whenever the function is
+/// naturally forward-differentiable, and use a custom VJP only when just the reverse rule is natural (e.g., for
+/// implicit differentiation or adjoint solvers).
 ///
-/// # Calling convention
+/// # Calling Convention
 ///
 /// Both closures operate on [`Parameterized`] values of [`DomainTracer`]s (i.e., Ryft's analogue of JAX pytrees), so
 /// `x` and `y` may each be a single tracer, a tuple, or any other parameterized structure. Static non-differentiated
@@ -569,7 +567,7 @@ impl<
 /// `jvp` closure. [`custom_derivative_at`](crate::custom_derivative_at) instead stages the same rule at a known input,
 /// which lets both closures infer their parameter types from that input.
 ///
-/// # Non-differentiated inputs
+/// # Non-Differentiated Inputs
 ///
 /// [`CustomJvp::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
 /// parameterizes the call without being differentiated, which is the analogue of JAX's `nondiff_argnums`. Plumbing
@@ -590,16 +588,16 @@ impl<
 /// operation whenever the corresponding program is replayed. When the call is differentiated, no two reference inputs
 /// may bind the same allocation.
 ///
-/// # Tracing semantics
+/// # Tracing Semantics
 ///
-/// Nothing is traced at construction time. Each [`CustomJvp::call`] recovers the tracing [`Context`] from the values it
-/// is called with, reads the input types off those values, traces both closures into programs specialized to those
+/// Nothing is traced at construction time. Each [`CustomJvp::call`] recovers the tracing [`Context`] from the values
+/// it is called with, reads the input types off those values, traces both closures into programs specialized to those
 /// types, validates the rule signature, and stages one [`CustomJvpOperation`] into the context through which those
 /// values flow. The primal closure is kept separate from the JVP closure for efficiency rather than necessity: the JVP
-/// rule computes both the outputs and their tangents, so deriving the primal from it would make every
-/// un-differentiated call pay for tangent computation.
+/// rule computes both the outputs and their tangents, so deriving the primal from it would make every un-differentiated
+/// call pay for tangent computation.
 ///
-/// # Transform semantics
+/// # Transform Semantics
 ///
 /// The transforms treat a staged call as follows:
 ///
@@ -617,13 +615,19 @@ impl<
 ///   - `primal`: Closure implementing `f(x) = y`.
 ///   - `jvp`: Closure implementing `(x, ẋ) ↦ (y, ẏ)`, where `ẏ = J_f(x) · ẋ`.
 #[inline]
-pub fn custom_jvp<Input, Output, Primal, Jvp>(primal: Primal, jvp: Jvp) -> CustomJvp<Input, Output, Primal, Jvp>
-where
+pub fn custom_jvp<
+    Input,
+    Output,
     Primal: Fn(Input) -> Result<Output, ProgramError>,
     Jvp: Fn(Input, Input) -> Result<(Output, Output), ProgramError>,
-{
+>(
+    primal: Primal,
+    jvp: Jvp,
+) -> CustomJvp<Input, Output, Primal, Jvp> {
     CustomJvp { primal, jvp, non_differentiated_count: 0, marker: PhantomData }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Removes the tangent inputs that a traced JVP rule declares for the leading `non_differentiated_count` inputs. The
 /// rule closure receives one tangent per input so that its signature mirrors the primal signature, but a
