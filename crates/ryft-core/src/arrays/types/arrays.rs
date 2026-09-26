@@ -16,6 +16,7 @@ use crate::arrays::types::layouts::Layout;
 use crate::arrays::types::memories::Memory;
 use crate::axes::Axis;
 use crate::contexts::EagerContext;
+use crate::operations::collectives::PARALLEL_VARY_OPERATION_NAME;
 use crate::parameters::Parameter;
 use crate::programs::types::visit_type_signature_pairs;
 use crate::programs::{
@@ -462,6 +463,41 @@ impl ArrayType {
                 ))),
             },
         )
+    }
+
+    /// Checks that the array inputs of an ordinary operation vary over the same manual mesh axes, which is the
+    /// standard variation rule of an operation that computes a function of its inputs on every device independently.
+    /// Such an operation's output varies over exactly those axes. Its capability aligns the inputs before binding
+    /// by calling [`align_manual_variation`](crate::ManualVariationAlignment::align_manual_variation), which inserts a
+    /// [`ParallelVaryOperation`](crate::ParallelVaryOperation) on every input that lacks an axis, so this check fails
+    /// only for a hand-built program or a capability that skipped the alignment. Every operation's type inference owns
+    /// its variation rule: an operation that changes variation, such as a collective, computes its output variation
+    /// itself, and any other operation with several array inputs should call this function. An input without a sharding
+    /// counts as invariant, because ignoring it would let an unaligned constant bypass the check.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation_name`: Name of the operation whose inputs are checked, used in the error message.
+    ///   - `inputs`: Array input types of the operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] naming the operation and the remedy if two inputs vary over different manual axes.
+    pub fn check_matching_manual_variation(operation_name: &str, inputs: &[&Self]) -> Result<(), TypeError> {
+        let Some(first) = inputs.first() else { return Ok(()) };
+        let empty = BTreeSet::new();
+        let expected = first.sharding().map(Sharding::varying_manual_axes).unwrap_or(&empty);
+        if inputs
+            .iter()
+            .skip(1)
+            .any(|input| input.sharding().map(Sharding::varying_manual_axes).unwrap_or(&empty) != expected)
+        {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` inputs must have matching varying manual axes; insert \
+                 `{PARALLEL_VARY_OPERATION_NAME}` on the inputs that lack an axis, as `align_manual_variation` does",
+            )));
+        }
+        Ok(())
     }
 
     /// Returns this array type's sharding for a same-rank resize, preserving dimension placement and reduction state.
@@ -1479,6 +1515,34 @@ mod tests {
     fn test_array_type_as_referent() {
         assert_eq!(ArrayType::scalar(F32).as_referent(), None);
         assert_eq!(ArrayType::new_static(F64, [3]).as_referent(), None);
+    }
+
+    #[test]
+    fn test_array_type_check_matching_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let plain = ArrayType::scalar(DataType::F32);
+        let invariant = plain.clone().with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let varying = plain
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap())
+            .unwrap();
+        assert_eq!(ArrayType::check_matching_manual_variation("add", &[]), Ok(()));
+        assert_eq!(ArrayType::check_matching_manual_variation("add", &[&plain, &invariant]), Ok(()));
+        assert_eq!(ArrayType::check_matching_manual_variation("add", &[&varying, &varying]), Ok(()));
+        assert_eq!(
+            ArrayType::check_matching_manual_variation("add", &[&varying, &plain]),
+            Err(TypeError::invalid(
+                "`add` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack \
+                 an axis, as `align_manual_variation` does",
+            )),
+        );
+        assert_eq!(
+            ArrayType::check_matching_manual_variation("add", &[&invariant, &varying]),
+            Err(TypeError::invalid(
+                "`add` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs that lack \
+                 an axis, as `align_manual_variation` does",
+            )),
+        );
     }
 
     #[test]
