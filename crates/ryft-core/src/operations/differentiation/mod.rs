@@ -1,8 +1,58 @@
-//! Differentiation-specific operation families.
+//! Operations that control how values are differentiated rather than what they compute. Each operation is defined by
+//! an [`Operation`](crate::Operation) type (e.g., [`CustomJvpOperation`]) together with a user-facing function or
+//! value capability trait (e.g., [`custom_jvp`](fn@custom_jvp) or [`StopGradient`]) that applies it to eager
+//! [`Array`](crate::Array)s and traced values alike, so the same code executes immediately or records into a
+//! program depending on the value it runs on. The operations fall into three groups:
 //!
-//! This module owns custom JVP and VJP calls, residual-parameterized linear calls, and gradient barriers.
-//! Differentiation algorithms and transform contexts live in [`crate::differentiation`], while the transform-wide
-//! residual-zero protocol is owned separately by [`crate::differentiation::zeros`].
+//!   - **Custom Derivative Rules:** [`custom_jvp`](fn@custom_jvp) pairs a function with a handwritten
+//!     Jacobian-Vector Product (JVP) rule that governs both forward- and reverse-mode differentiation, and
+//!     [`custom_vjp`](fn@custom_vjp) pairs a function with handwritten forward and backward rules that govern
+//!     reverse-mode differentiation only. They stage a [`CustomJvpOperation`] and a [`CustomVjpOperation`],
+//!     respectively, which carry the primal program and the rule programs as attached regions.
+//!   - **Linear Maps:** [`LinearCallOperation`] calls a residual-parameterized linear map together with its transpose,
+//!     which lets differentiation rules keep a linear map and its handwritten transpose together in tangent programs
+//!     (e.g., for shape-dependent maps such as dynamic reshapes, or for the pullback of a [`custom_vjp`](fn@custom_vjp)
+//!     call).
+//!   - **Gradient Barriers:** [`StopGradient`] and [`StopGradients`] return values unchanged while replacing their
+//!     tangents with structural zeros, so that no derivative flows through them.
+//!
+//! Outside of differentiation, all of these operations are transparent. That is, interpretation and backend lowering
+//! replay the primal program of a custom derivative rule, execute the forward map of a linear call when it has one,
+//! and pass the inputs of a gradient barrier through unchanged. Under differentiation, a custom derivative call replays
+//! its rule programs instead of differentiating its primal program, and a gradient barrier produces zero tangents.
+//! Refer to the documentation of [`custom_jvp`](fn@custom_jvp) and [`custom_vjp`](fn@custom_vjp) for how custom
+//! derivative rules interact with references, batching, and partial evaluation. The differentiation transforms
+//! themselves live in the [`differentiation`](crate::differentiation) module.
+//!
+//! # Examples
+//!
+//! ```rust
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, Cos, DomainTracer, EagerContext, ProgramError, Sin, StopGradient, custom_jvp,
+//! #     differentiate_at,
+//! # };
+//! # fn main() -> Result<(), ProgramError> {
+//! type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
+//!
+//! // A custom JVP rule for `sin` that doubles the true derivative, so that its effect is visible.
+//! let doubled_sin = custom_jvp(
+//!     |x: DomainTracer<ArrayContext>| Ok(x.sin()?),
+//!     |x: DomainTracer<ArrayContext>, tangent| {
+//!         let tangent = x.cos()? * tangent;
+//!         Ok((x.sin()?, tangent.clone() + tangent))
+//!     },
+//! );
+//! let (value, tangent) =
+//!     differentiate_at(Array::scalar(0.5f64)?).jvp(Array::scalar(1.0f64)?, |x| doubled_sin.call(x))?;
+//! assert_eq!(value, Array::scalar(0.5f64.sin())?);
+//! assert_eq!(tangent, Array::scalar(2.0 * 0.5f64.cos())?);
+//!
+//! // A gradient barrier treats its input as a constant, so the gradient of `x * stop_gradient(x)` is `x`.
+//! let gradient = differentiate_at(Array::scalar(3.0f64)?).gradient(|x| x.clone() * x.stop_gradient().unwrap())?;
+//! assert_eq!(gradient, Array::scalar(3.0f64)?);
+//! # Ok(())
+//! # }
+//! ```
 
 // TODO(eaplatanios): Review this module.
 
@@ -13,7 +63,7 @@ pub mod stop_gradient;
 
 pub use custom_jvp::{CUSTOM_JVP_OPERATION_NAME, CustomJvp, CustomJvpOperation, custom_jvp};
 pub use custom_vjp::{CUSTOM_VJP_OPERATION_NAME, CustomVjp, CustomVjpOperation, custom_vjp};
-pub use linear_call::LinearCallOperation;
+pub use linear_call::{LINEAR_CALL_OPERATION_NAME, LinearCallOperation};
 pub use stop_gradient::{STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients};
 
 #[cfg(test)]
