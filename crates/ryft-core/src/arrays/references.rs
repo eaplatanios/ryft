@@ -862,8 +862,8 @@ impl ArrayReferenceTransform {
             return carrier.index_symbolic(input, *axis, binding);
         }
         let selection = self.selection(carrier.array_type(input)?.as_ref())?;
-        let sliced = carrier.slice(input, selection.starts, selection.limits)?;
         let output_shape = selection.removed_axis.map(|_| selection.output_shape());
+        let sliced = carrier.slice(input, selection.starts, selection.limits)?;
         match output_shape {
             Some(shape) => carrier.reshape(&sliced, shape),
             None => Ok(sliced),
@@ -1275,13 +1275,10 @@ impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayIrOperation<A
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Normalized indices of one [`ArrayReferenceTransform`] applied to one statically shaped input.
-///
-/// Both transform kinds reduce to taking one static unit-stride slice of the input, optionally followed by squeezing
-/// the indexed axis. Normalizing to this shared form lets every consumer (type derivation, eager reads,
-/// eager update reconstruction, and staged discharge) share one validation and address computation.
+/// Normalized indices of one [`ArrayReferenceTransform`] applied to one statically shaped input. Both transform kinds
+/// reduce to taking one static unit-stride slice of the input, optionally followed by squeezing the indexed axis.
+/// Normalizing to this shared form lets every consumer (e.g., type derivation, eager reads, eager update
+/// reconstruction, and staged discharge) share one validation and address computation.
 struct TransformSelection {
     /// Inclusive slice start per input axis.
     starts: Vec<usize>,
@@ -1290,7 +1287,7 @@ struct TransformSelection {
     limits: Vec<usize>,
 
     /// Axis that an [`ArrayReferenceTransform::Index`] transform removes from the output after slicing it to size one,
-    /// or [`None`] for a rank-preserving [`ArrayReferenceTransform::Slice`].
+    /// or [`None`] for rank-preserving [`ArrayReferenceTransform::Slice`]s.
     removed_axis: Option<usize>,
 }
 
@@ -1307,7 +1304,7 @@ impl TransformSelection {
         )
     }
 
-    /// Returns the static shape of the value that the transform selects: [`Self::update_shape`] without
+    /// Returns the static shape of the value that the transform selects. This is either [`Self::update_shape`] without
     /// [`Self::removed_axis`], or exactly [`Self::update_shape`] when the transform removes no axis.
     fn output_shape(&self) -> Shape {
         Shape::new(
@@ -1321,6 +1318,8 @@ impl TransformSelection {
         )
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Indices that a folded [`ArrayReferenceTransformPath`] selects on one axis of its root, used by
 /// [`ReferenceTransform::overlap`] to compare two paths of one root.
