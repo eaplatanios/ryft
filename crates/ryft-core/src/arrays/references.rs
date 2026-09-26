@@ -1110,24 +1110,15 @@ impl<Root: Typed, Binding: Clone + Typed<Type = ArrayIrType>> ReferenceView<Root
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// [`ReferenceDischargePolicy`] of the array reference universe.
+/// [`ReferenceDischargePolicy`] of the array reference universe. An array reference's referent is an array. Each access
+/// applies an [`ArrayReferenceTransformPath`] to its allocation, with dynamic indices bound to context values. The
+/// policy uses the same transform traversal as [`ArrayReference`]. Specifically, it reads extract the viewed array,
+/// while replacements and accumulations reconstruct the root through the transforms in reverse order, preserving values
+/// outside the view. Dynamic indices use dynamic slicing and updates with the negative index and clamping behavior
+/// described by [`ArrayReferenceTransform`], so eager and discharged accesses address the same elements.
 ///
-/// An array reference's referent is an [`ArrayType`]-typed array. Each access applies an
-/// [`ArrayReferenceTransformPath`] to its allocation, with dynamic indices bound to context values. The policy uses
-/// the same transform traversal as [`ArrayReference`]: reads extract the viewed array, while replacements and
-/// accumulations reconstruct the root through the transforms in reverse order, preserving values outside the view.
-/// Dynamic indices use dynamic slicing and updates with the negative-index and clamping behavior described by
-/// [`ArrayReferenceTransform`], so eager and discharged accesses address the same elements.
-///
-/// The generic [program reference module](crate::programs::references) owns discharge and state threading. This
-/// policy supplies array-IR reconstruction operations rather than a separate state interpreter.
-///
-/// The reconstruction context is bounded by [`Context`] rather than [`Domain`](crate::Domain) because the transform
-/// path traversal binds canonical slicing, reshape, and update operations into it. Their value-level capabilities are
-/// stated over [`ArrayType`]-typed values rather than the composite array IR, so the policy constructs them through the
-/// context's operation family.
+/// The generic [`references` module](crate::programs::references) owns discharge and state threading. This policy
+/// supplies array-specific reconstruction operations rather than a separate state interpreter.
 #[derive(Copy, Clone, Debug)]
 pub struct ArrayReferenceDischarge;
 
@@ -1146,10 +1137,12 @@ where
     type Transform = ArrayReferenceTransform;
     type Alias = ArrayReferenceTransformPath<C::Value>;
 
+    #[inline]
     fn storage_alias(_referent: &ArrayType) -> ArrayReferenceTransformPath<C::Value> {
         ArrayReferenceTransformPath::root()
     }
 
+    #[inline]
     fn apply_transforms(
         _context: &C,
         alias: &Self::Alias,
@@ -1161,18 +1154,19 @@ where
         Ok(composed)
     }
 
+    #[inline]
     fn read(
         context: &C,
         current: &C::Value,
         alias: &ArrayReferenceTransformPath<C::Value>,
     ) -> Result<C::Value, ProgramError> {
-        let mut intermediates = alias.intermediates_in(&ContextTransformCarrier(context), current.clone())?;
-
-        // The traversal starts with the complete allocation, so the chain is nonempty and its final value is the part
+        // The traversal starts with the complete allocation, so the chain is non-empty and its final value is the part
         // selected by this handle.
+        let mut intermediates = alias.intermediates_in(&ContextTransformCarrier(context), current.clone())?;
         Ok(intermediates.pop().unwrap())
     }
 
+    #[inline]
     fn write(
         context: &C,
         current: &C::Value,
@@ -1182,6 +1176,7 @@ where
         alias.write_in(&ContextTransformCarrier(context), current.clone(), replacement)
     }
 
+    #[inline]
     fn swap(
         context: &C,
         current: &C::Value,
@@ -1192,10 +1187,6 @@ where
     }
 }
 
-// Composite array-IR values deliberately expose no value-level addition: the composite family carries array payloads
-// through `ArrayIrOperation::Array` and lifts the type-generic `AddOperation<ArrayIrType>` into that member instead,
-// which is the same seam generic reverse mode uses to accumulate cotangents. Accumulation therefore binds the lifted
-// addition through the context, requiring nothing beyond the conversion the operation family already provides.
 impl<C: Context<Type = ArrayIrType>> ReferenceAccumulationPolicy<C> for ArrayReferenceDischarge
 where
     C::Operation: From<AddOperation<ArrayIrType>>
@@ -1214,8 +1205,14 @@ where
         update: C::Value,
         alias: &ArrayReferenceTransformPath<C::Value>,
     ) -> Result<C::Value, ProgramError> {
+        // Composite array IR values deliberately expose no value-level addition: the composite family carries array
+        // payloads through `ArrayIrOperation::Array` and lifts the type-generic `AddOperation<ArrayIrType>` into that
+        // member instead, which is the same seam generic reverse mode uses to accumulate cotangents. Accumulation
+        // therefore binds the lifted addition through the context, requiring nothing beyond the conversion the
+        // operation family already provides.
         let carrier = ContextTransformCarrier(context);
         let intermediates = alias.intermediates_in(&carrier, current.clone())?;
+
         // Add at the selected leaf, then rebuild each enclosing slice without reading the leaf a second time.
         let selected = intermediates.last().unwrap().clone();
         let accumulated = carrier.bind(C::Operation::from(AddOperation::new()), &[&selected, &update])?;
@@ -1280,11 +1277,13 @@ impl<A: Value<Type = ArrayType>> ReferenceAccessOperation for ArrayIrOperation<A
                 .map(Self::ReferenceAtomicAddUpdate),
             _ if self.reference_access_descriptor(input_index).is_some() && transforms.is_empty() => Ok(self.clone()),
             _ => Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` cannot replace the reference transforms at input {input_index}", self.name()),
+                message: format!("`{}` cannot replace the reference transforms at input {}", self.name(), input_index),
             }),
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Normalized indices of one [`ArrayReferenceTransform`] applied to one statically shaped input.
 ///
