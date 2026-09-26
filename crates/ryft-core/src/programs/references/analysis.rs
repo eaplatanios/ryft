@@ -1012,7 +1012,9 @@ pub struct ReferenceViewAnalysis<Transform: ReferenceTransform> {
 
 // TODO(eaplatanios): Review this.
 impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
-    /// Validates every access descriptor in the region closure and records its transform path.
+    /// Creates a new [`ReferenceViewAnalysis`] by validating every reference access descriptor in the provided
+    /// region's closure and recording its transform path.
+    #[inline]
     pub fn new<V: Value, O: ReferenceAccessOperation<Type = V::Type, Transform = Transform>>(
         region: RegionRef<'_, V, O>,
         capture_count: usize,
@@ -1027,7 +1029,8 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
         )
     }
 
-    /// Derives access paths with the same retained structural-analysis cache key.
+    /// Creates a new [`ReferenceViewAnalysis`] by deriving reference access paths with the provided retained
+    /// structural analysis cache key.
     fn new_with_arguments<V: Value, O: ReferenceAccessOperation<Type = V::Type, Transform = Transform>>(
         region: RegionRef<'_, V, O>,
         arguments: &ReferenceAnalysisTransformArguments,
@@ -1036,8 +1039,8 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
         Transform: ReferenceTransform<Type = V::Type>,
         for<'t> &'t ReferenceType<Transform::Referent>: TryFrom<&'t V::Type, Error = TypeError>,
     {
-        // The structural analysis comes from the region's transform cache under the same key as this analysis, so that
-        // it is derived at most once per closure and shared with every other consumer of that key (see
+        // The structural analysis comes from the region's transform cache under the same key as this analysis,
+        // so that it is derived at most once per closure and shared with every other consumer of that key (see
         // `RegionRef::reference_view_analysis`). Its failures convert into `ReferenceViewAnalysisError::Analysis`.
         let analysis = region.reference_analysis_impl(arguments)?;
 
@@ -1054,32 +1057,39 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
                     message,
                 },
             )?;
+
             for (input_index, descriptor) in descriptors.iter().enumerate() {
                 if let Some(descriptor) = descriptor {
                     paths.insert((id, input_index), Self::derive_access_path(region, id, input_index, descriptor)?);
                 }
             }
         }
+
         Ok(Self { analysis, paths })
     }
 
-    /// Returns the shared structural analysis.
+    /// Returns the shared underlying [`ReferenceAnalysis`] of this [`ReferenceViewAnalysis`].
+    #[inline]
     pub fn analysis(&self) -> &ReferenceAnalysis {
         &self.analysis
     }
 
-    /// Returns validated paths keyed by instruction and reference input.
+    /// Returns the validated [`ReferenceTransformPath`]s of this [`ReferenceViewAnalysis`] keyed by [`InstructionId`]
+    /// and reference input index.
+    #[inline]
     pub fn paths(&self) -> impl '_ + Iterator<Item = ((InstructionId, usize), &ReferenceTransformPath<Transform>)> {
         self.paths.iter().map(|(access, path)| (*access, path))
     }
 
-    /// Returns the validated path for one reference access.
+    /// Returns the validated [`ReferenceTransformPath`] for one reference access identified by the provided
+    /// [`InstructionId`] and reference input index.
+    #[inline]
     pub fn path(&self, instruction: InstructionId, input_index: usize) -> Option<&ReferenceTransformPath<Transform>> {
         self.paths.get(&(instruction, input_index))
     }
 
-    /// Compares two access paths after resolving their allocation roots. Accesses in different regions are not
-    /// comparable until their caller resolves region input bindings; distinct roots in one region are disjoint.
+    /// Compares two reference access paths after resolving their allocation roots. Accesses in different regions are
+    /// not comparable until their caller resolves region input bindings and distinct roots in one region are disjoint.
     pub fn overlap<V: Value, O: ReferenceAccessOperation<Type = V::Type, Transform = Transform>>(
         &self,
         region: RegionRef<'_, V, O>,
@@ -1089,9 +1099,9 @@ impl<Transform: ReferenceTransform> ReferenceViewAnalysis<Transform> {
     where
         Transform: ReferenceTransform<Type = V::Type>,
     {
-        // Reference roots are region-relative: the same allocation reaches a nested region through one of that
-        // region's inputs, which is a distinct root there. Accesses in different regions are therefore incomparable
-        // here, and a caller must first map them into one namespace through the region input bindings.
+        // Reference roots are "region-relative" meaning that the same allocation reaches a nested region through
+        // one of that region's inputs, which is a distinct root there. Accesses in different regions are therefore
+        // incomparable here, and a caller must first map them into one namespace through the region input bindings.
         if lhs.0.region() != rhs.0.region() {
             return None;
         }
