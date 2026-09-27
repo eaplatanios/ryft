@@ -1503,8 +1503,6 @@ macro_rules! impl_element_divide_by_count_for_complex {
 impl_element_divide_by_count_for_complex!(f32);
 impl_element_divide_by_count_for_complex!(f64);
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
