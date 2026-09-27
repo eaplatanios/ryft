@@ -8,7 +8,7 @@ use thiserror::Error;
 use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
-use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::ir::{ArrayIrContext, ArrayIrValue};
 use crate::arrays::operations::ArrayIrOperation;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
@@ -1201,7 +1201,9 @@ where
 
         // Add at the selected leaf, then rebuild each enclosing slice without reading the leaf a second time.
         let selected = intermediates.last().unwrap().clone();
-        let accumulated = carrier.bind(C::Operation::from(AddOperation::new()), &[&selected, &update])?;
+        let mut outputs = context.bind(C::Operation::from(AddOperation::new()), Vec::new(), &[selected, update])?;
+        check_count!("output", outputs, 1, ProgramError);
+        let accumulated = outputs.remove(0);
         alias.reconstruct_in(&carrier, &intermediates[..alias.transforms().len()], accumulated)
     }
 }
@@ -1633,25 +1635,6 @@ struct ContextTransformCarrier<'c, C> {
     context: &'c C,
 }
 
-impl<C: Context<Type = ArrayIrType>> ContextTransformCarrier<'_, C> {
-    /// Binds one single-result operation of the traversal into the context and returns its result.
-    fn bind(&self, operation: C::Operation, inputs: &[&C::Value]) -> Result<C::Value, ProgramError> {
-        let inputs = inputs.iter().map(|input| (*input).clone()).collect::<Vec<_>>();
-        let mut outputs = self.context.bind(operation, Vec::new(), inputs.as_slice())?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-
-    /// Binds one single-result array operation of the traversal, lifted into the context's operation family through
-    /// its [`OperationProjection<ArrayType>`](OperationProjection) member family, and returns its result.
-    fn bind_array<O>(&self, operation: O, inputs: &[&C::Value]) -> Result<C::Value, ProgramError>
-    where
-        C::Operation: OperationProjection<ArrayType, Projected: From<O>>,
-    {
-        self.bind(<C::Operation as OperationProjection<ArrayType>>::Projected::from(operation).into(), inputs)
-    }
-}
-
 impl<C: Context<Type = ArrayIrType>> TransformReadCarrier for ContextTransformCarrier<'_, C>
 where
     C::Operation: OperationProjection<
@@ -1662,6 +1645,7 @@ where
     type Value = C::Value;
     type Binding = C::Value;
 
+    #[inline]
     fn array_type<'c>(&'c self, value: &'c C::Value) -> Result<Cow<'c, ArrayType>, ProgramError> {
         match value.r#type() {
             Cow::Borrowed(r#type) => Ok(Cow::Borrowed(<&ArrayType>::try_from(r#type)?)),
@@ -1669,12 +1653,14 @@ where
         }
     }
 
+    #[inline]
     fn slice(&self, input: &C::Value, starts: Vec<usize>, limits: Vec<usize>) -> Result<C::Value, ProgramError> {
-        self.bind_array(SliceOperation::new(starts, limits), &[input])
+        self.context.bind_array(SliceOperation::new(starts, limits), &[input.clone()])
     }
 
+    #[inline]
     fn reshape(&self, input: &C::Value, shape: Shape) -> Result<C::Value, ProgramError> {
-        self.bind_array(ReshapeOperation::new(shape), &[input])
+        self.context.bind_array(ReshapeOperation::new(shape), &[input.clone()])
     }
 
     fn dynamic_index(&self, input: &C::Value, axis: usize, binding: &C::Value) -> Result<C::Value, ProgramError> {
@@ -1684,9 +1670,9 @@ where
 
         // Unselected axes span their complete extent, so dynamic slicing clamps their start to zero. Reusing
         // the scalar index there avoids constructing redundant zero values in the context's value family.
-        let mut inputs = vec![input];
-        inputs.extend(std::iter::repeat_n(binding, sizes.len()));
-        let selected = self.bind_array(DynamicSliceOperation::new(sizes), &inputs)?;
+        let mut inputs = vec![input.clone()];
+        inputs.extend(std::iter::repeat_n(binding.clone(), sizes.len()));
+        let selected = self.context.bind_array(DynamicSliceOperation::new(sizes), &inputs)?;
         self.reshape(&selected, input_type.without_dimension(axis)?.0.shape().clone())
     }
 }
@@ -1702,8 +1688,9 @@ where
                            + From<DynamicUpdateSliceOperation>,
         >,
 {
+    #[inline]
     fn update_slice(&self, target: &C::Value, update: &C::Value, starts: Vec<usize>) -> Result<C::Value, ProgramError> {
-        self.bind_array(UpdateSliceOperation::new(starts), &[target, update])
+        self.context.bind_array(UpdateSliceOperation::new(starts), &[target.clone(), update.clone()])
     }
 
     fn dynamic_update_index(
@@ -1721,9 +1708,9 @@ where
 
         // Restore the indexed axis before writing back. Full-size axes clamp to zero just as in the read path,
         // while the selected axis uses the same runtime index and clamping extent as the original index transform.
-        let mut inputs = vec![target, &update];
-        inputs.extend(std::iter::repeat_n(binding, rank));
-        self.bind_array(DynamicUpdateSliceOperation::new(), &inputs)
+        let mut inputs = vec![target.clone(), update];
+        inputs.extend(std::iter::repeat_n(binding.clone(), rank));
+        self.context.bind_array(DynamicUpdateSliceOperation::new(), &inputs)
     }
 }
 

@@ -9,11 +9,12 @@ use crate::arrays::references::ArrayReference;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::DimensionType;
 use crate::arrays::types::ir::ArrayIrType;
-use crate::contexts::EagerContext;
+use crate::contexts::{Context, EagerContext};
+use crate::macros::check_count;
 use crate::parameters::Parameter;
 use crate::programs::{
-    Concretizable, ProgramError, ReferenceId, ReferenceType, Type, TypeError, TypeIdentityRenaming, Typed, Value,
-    ValueProjection,
+    Concretizable, OperationProjection, ProgramError, ReferenceId, ReferenceType, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
 /// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
@@ -276,6 +277,55 @@ impl<A: Value<Type = ArrayType> + TryFrom<bool, Error = ProgramError>> TryFrom<b
 
     fn try_from(value: bool) -> Result<Self, Self::Error> {
         Ok(Self::Array(A::try_from(value)?))
+    }
+}
+
+/// Extension of [`Context`] for contexts over the mixed [`ArrayIrType`] universe.
+///
+/// The operation family of such a context contains ordinary array operations only through its [`ArrayType`] member
+/// family (e.g., [`ArrayIrOperation::Array`]), which it exposes via
+/// [`OperationProjection<ArrayType>`](OperationProjection). Rules over this universe (e.g., the linear call regions
+/// that dynamically shaped differentiation rules stage, or the array reference discharge traversal) bind such array
+/// operations all the time, but [`Context::bind`] only accepts operations that convert into the operation family
+/// directly and conversions do not chain through a member family. [`ArrayIrContext`] provides that missing step once,
+/// instead of every rule spelling out the fully qualified projection path.
+///
+/// This trait is blanket-implemented for every [`Context`] over [`ArrayIrType`] whose operation family has an
+/// [`ArrayType`] member family, and so it is available in eager, tracing, and nested region contexts alike.
+/// That includes contexts over operation families defined in other crates (e.g., families that derive
+/// `#[ryft(members(ArrayType))]`), which is why custom operation implementations and transform rules
+/// outside of this crate should also use it instead of spelling out the projection themselves.
+pub trait ArrayIrContext: Context<Type = ArrayIrType> {
+    /// Binds the array operation `operation` in this context and returns its single output. This is the array
+    /// counterpart of [`Context::bind`] for the common case of an operation with no [`Region`](crate::Region)s
+    /// and exactly one output. `operation` is lifted into the operation family of this context through its
+    /// [`OperationProjection<ArrayType>`](OperationProjection) member family before it is bound.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Array operation to bind, which must produce exactly one output.
+    ///   - `inputs`: Inputs of `operation`, owned by this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if this context fails to bind `operation` or if `operation` does not produce exactly
+    /// one output.
+    fn bind_array<O>(&self, operation: O, inputs: &[Self::Value]) -> Result<Self::Value, ProgramError>
+    where
+        Self::Operation: OperationProjection<ArrayType, Projected: From<O>>;
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: OperationProjection<ArrayType>>> ArrayIrContext for C {
+    fn bind_array<O>(&self, operation: O, inputs: &[C::Value]) -> Result<C::Value, ProgramError>
+    where
+        C::Operation: OperationProjection<ArrayType, Projected: From<O>>,
+    {
+        // The explicit projection is the one conversion step that `Context::bind` cannot infer on its own, because the
+        // member family converts into the operation family but `operation` only converts into the member family.
+        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(operation);
+        let mut outputs = self.bind(operation, Vec::new(), inputs)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 

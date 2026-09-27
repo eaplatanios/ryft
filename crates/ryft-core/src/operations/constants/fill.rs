@@ -1,6 +1,6 @@
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrType, ArrayType, Dimension,
-    DimensionValue,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrContext, ArrayIrType, ArrayType,
+    Dimension, DimensionValue,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
@@ -268,22 +268,9 @@ where
             }
         }
 
-        let scalar_operation =
-            <C::Operation as OperationProjection<ArrayType>>::Projected::from(ConstantOperation::new(literal));
-        let mut outputs = self.bind(scalar_operation, Vec::new(), &[])?;
-        check_count!("output", outputs, 1, ProgramError);
-        let scalar = outputs.remove(0);
+        let scalar = self.bind_array(ConstantOperation::new(literal), &[])?;
         if dimensions.is_empty() {
-            let mut outputs = self.bind(
-                <C::Operation as OperationProjection<ArrayType>>::Projected::from(BroadcastOperation::new(
-                    r#type.clone(),
-                    Vec::new(),
-                )),
-                Vec::new(),
-                &[scalar],
-            )?;
-            check_count!("output", outputs, 1, ProgramError);
-            return Ok(outputs.remove(0));
+            return self.bind_array(BroadcastOperation::new(r#type.clone(), Vec::new()), &[scalar]);
         }
 
         // Dynamic broadcast consumes every output axis. Static axes become dimension constants, while the

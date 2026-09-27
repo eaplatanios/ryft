@@ -4,9 +4,9 @@ use std::marker::PhantomData;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType, ArrayTypeRefinements, DataType,
-    Dimension, DimensionType, DimensionValue, LinearResiduals, MeshAxisType, Shape, Sharding, ShardingDimension,
-    StaticShape,
+    ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArraySliceAxis, ArrayType,
+    ArrayTypeRefinements, DataType, Dimension, DimensionType, DimensionValue, LinearResiduals, MeshAxisType, Shape,
+    Sharding, ShardingDimension, StaticShape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -418,10 +418,7 @@ where
             return jvp_projected_operation(context, &operation, inputs);
         }
 
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-        let mut primal_outputs = context.primal().bind(operation, Vec::new(), std::slice::from_ref(input.primal()))?;
-        check_count!("output", primal_outputs, 1, ProgramError);
-        let output_primal = primal_outputs.remove(0);
+        let output_primal = context.primal().bind_array(self.clone(), std::slice::from_ref(input.primal()))?;
         let tangent_primal = context.primal_to_tangent(output_primal.clone())?;
         let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
         let input = &tangent_inputs[0];
@@ -441,59 +438,38 @@ where
                     residuals.into_values(),
                     vec![input_tangent.clone()],
                     move |_, linear_inputs| {
-                        linear_inputs[0].dispatch_domain().bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(forward_operation),
-                            Vec::new(),
-                            std::slice::from_ref(&linear_inputs[0]),
-                        )
+                        Ok(vec![
+                            linear_inputs[0]
+                                .dispatch_domain()
+                                .bind_array(forward_operation, std::slice::from_ref(&linear_inputs[0]))?,
+                        ])
                     },
                     move |residuals, output_cotangents| {
                         let transpose_context = output_cotangents[0].dispatch_domain();
                         let mut output_cotangent = output_cotangents[0].clone();
                         let zero_extents = transpose_shape.dynamic_dimensions(residuals);
                         let zeros = transpose_context
-                            .bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
-                                    transpose_input_type.clone(),
-                                )),
-                                Vec::new(),
-                                zero_extents.as_slice(),
-                            )?
-                            .remove(0);
+                            .bind_array(ZeroOperation::new(transpose_input_type.clone()), zero_extents.as_slice())?;
                         if transpose_strides.iter().any(|stride| *stride != 1) {
-                            let padding_value = transpose_context
-                                .bind(
-                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                        ZeroOperation::new(
-                                            <&ArrayType>::try_from(output_cotangent.r#type().as_ref())?
-                                                .scalar_like()?,
-                                        ),
-                                    ),
-                                    Vec::new(),
-                                    &[],
-                                )?
-                                .remove(0);
-                            output_cotangent = transpose_context
-                                .bind(
-                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(PadOperation::<
-                                        ArrayType,
-                                    >::new(
-                                        vec![0; transpose_input_type.rank()],
-                                        vec![0; transpose_input_type.rank()],
-                                        transpose_strides.iter().map(|stride| stride - 1).collect(),
-                                    )?),
-                                    Vec::new(),
-                                    &[output_cotangent, padding_value],
-                                )?
-                                .remove(0);
+                            let padding_value = transpose_context.bind_array(
+                                ZeroOperation::new(
+                                    <&ArrayType>::try_from(output_cotangent.r#type().as_ref())?.scalar_like()?,
+                                ),
+                                &[],
+                            )?;
+                            output_cotangent = transpose_context.bind_array(
+                                PadOperation::<ArrayType>::new(
+                                    vec![0; transpose_input_type.rank()],
+                                    vec![0; transpose_input_type.rank()],
+                                    transpose_strides.iter().map(|stride| stride - 1).collect(),
+                                )?,
+                                &[output_cotangent, padding_value],
+                            )?;
                         }
-                        transpose_context.bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                UpdateSliceOperation::new(transpose_starts),
-                            ),
-                            Vec::new(),
-                            &[zeros, output_cotangent],
-                        )
+                        Ok(vec![
+                            transpose_context
+                                .bind_array(UpdateSliceOperation::new(transpose_starts), &[zeros, output_cotangent])?,
+                        ])
                     },
                 )?
                 .remove(0);
@@ -1045,8 +1021,8 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let input_type = <&ArrayType>::try_from(inputs[0].primal().r#type().as_ref())?.clone();
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
         if input_type.static_shape().is_some() || !inputs[0].tangent().is_zero() || inputs[1].tangent().is_zero() {
+            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
             return jvp_projected_operation(context, &operation, inputs);
         }
 
@@ -1054,8 +1030,7 @@ where
         // the type alone cannot allocate it. Validate the primal first, then retain just its dynamic dimensions in a
         // linear call. The pullback extracts the updated window and does not need to retain the input's array data.
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut primals = context.primal().bind(operation, Vec::new(), &primal_inputs)?;
-        check_count!("output", primals, 1, ProgramError);
+        let primal = context.primal().bind_array(self.clone(), &primal_inputs)?;
 
         let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
         let tangent_context = context.tangent();
@@ -1090,29 +1065,16 @@ where
             move |residuals, linear_inputs| {
                 let context = linear_inputs[0].dispatch_domain();
                 let dimensions = input_shape.dynamic_dimensions(residuals);
-                let mut zeros = context.bind(
-                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(tangent_type)),
-                    Vec::new(),
-                    &dimensions,
-                )?;
-                check_count!("output", zeros, 1, ProgramError);
-                context.bind(
-                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(forward_operation),
-                    Vec::new(),
-                    &[zeros.remove(0), linear_inputs[0].clone()],
-                )
+                let zeros = context.bind_array(ZeroOperation::new(tangent_type), &dimensions)?;
+                Ok(vec![context.bind_array(forward_operation, &[zeros, linear_inputs[0].clone()])?])
             },
             move |_, output_cotangents| {
-                output_cotangents[0].dispatch_domain().bind(
-                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(transpose_operation),
-                    Vec::new(),
-                    output_cotangents,
-                )
+                Ok(vec![output_cotangents[0].dispatch_domain().bind_array(transpose_operation, output_cotangents)?])
             },
         )?;
 
         check_count!("output", tangents, 1, ProgramError);
-        Ok(vec![DifferentiationDual::new(primals.remove(0), MaybeZero::Value(tangents.remove(0)))?])
+        Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangents.remove(0)))?])
     }
 }
 
@@ -1954,10 +1916,7 @@ where
         }
 
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-        let mut primal_outputs = context.primal().bind(operation, Vec::new(), primal_inputs.as_slice())?;
-        check_count!("output", primal_outputs, 1, ProgramError);
-        let output_primal = primal_outputs.remove(0);
+        let output_primal = context.primal().bind_array(self.clone(), primal_inputs.as_slice())?;
         let tangent_primal = context.primal_to_tangent(output_primal.clone())?;
         let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
         let (input, start_indices) = tangent_inputs.split_first().unwrap();
@@ -1984,33 +1943,22 @@ where
                         let mut slice_inputs = Vec::with_capacity(1 + forward_start_indices.len());
                         slice_inputs.push(linear_inputs[0].clone());
                         slice_inputs.extend(forward_start_indices.iter().map(|index| residuals[*index].clone()));
-                        linear_inputs[0].dispatch_domain().bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(forward_operation),
-                            Vec::new(),
-                            slice_inputs.as_slice(),
-                        )
+                        Ok(vec![
+                            linear_inputs[0]
+                                .dispatch_domain()
+                                .bind_array(forward_operation, slice_inputs.as_slice())?,
+                        ])
                     },
                     move |residuals, output_cotangents| {
                         let transpose_context = output_cotangents[0].dispatch_domain();
                         let zero_extents = transpose_shape.dynamic_dimensions(residuals);
                         let zeros = transpose_context
-                            .bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
-                                    transpose_input_type.clone(),
-                                )),
-                                Vec::new(),
-                                zero_extents.as_slice(),
-                            )?
-                            .remove(0);
+                            .bind_array(ZeroOperation::new(transpose_input_type.clone()), zero_extents.as_slice())?;
                         let mut update_inputs = Vec::with_capacity(2 + start_indices.len());
                         update_inputs.push(zeros);
                         update_inputs.push(output_cotangents[0].clone());
                         update_inputs.extend(start_indices.iter().map(|index| residuals[*index].clone()));
-                        transpose_context.bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(transpose_operation),
-                            Vec::new(),
-                            update_inputs.as_slice(),
-                        )
+                        Ok(vec![transpose_context.bind_array(transpose_operation, update_inputs.as_slice())?])
                     },
                 )?
                 .remove(0);
@@ -2072,31 +2020,13 @@ where
                     .remove(0);
                 let mut slice_inputs = vec![current.clone()];
                 slice_inputs.extend(start_indices.iter().cloned());
-                let selected = context
-                    .bind(
-                        <O as OperationProjection<ArrayType>>::Projected::from(self.clone()),
-                        Vec::new(),
-                        &slice_inputs,
-                    )?
-                    .remove(0);
-                let updated = context
-                    .bind(
-                        <O as OperationProjection<ArrayType>>::Projected::from(AddOperation::new()),
-                        Vec::new(),
-                        &[selected, cotangent.clone()],
-                    )?
-                    .remove(0);
+                let selected = context.bind_array(self.clone(), &slice_inputs)?;
+                let updated = context.bind_array(AddOperation::new(), &[selected, cotangent.clone()])?;
                 let mut update_inputs = vec![current, updated];
                 update_inputs.extend(start_indices);
                 let transpose_operation =
                     DynamicUpdateSliceOperation::new().with_allow_negative_indices(self.allows_negative_indices());
-                let updated = context
-                    .bind(
-                        <O as OperationProjection<ArrayType>>::Projected::from(transpose_operation),
-                        Vec::new(),
-                        &update_inputs,
-                    )?
-                    .remove(0);
+                let updated = context.bind_array(transpose_operation, &update_inputs)?;
                 context.bind(ReferenceWriteOperation::new(), Vec::new(), &[reference, updated])?;
             }
             return Ok(());
@@ -3588,10 +3518,7 @@ impl<
         }
 
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(*self);
-        let mut primal_outputs = context.primal().bind(operation, Vec::new(), primal_inputs.as_slice())?;
-        check_count!("output", primal_outputs, 1, ProgramError);
-        let output_primal = primal_outputs.remove(0);
+        let output_primal = context.primal().bind_array(*self, primal_inputs.as_slice())?;
         let tangent_primal = context.primal_to_tangent(output_primal.clone())?;
         let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
         let input = &tangent_inputs[0];
@@ -3669,89 +3596,47 @@ impl<
                     tangent
                 } else {
                     let extents = forward_input_shape.as_ref().unwrap().dynamic_dimensions(residuals);
-                    forward_context
-                        .bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
-                                forward_input_type.clone(),
-                            )),
-                            Vec::new(),
-                            extents.as_slice(),
-                        )?
-                        .remove(0)
+                    forward_context.bind_array(ZeroOperation::new(forward_input_type.clone()), extents.as_slice())?
                 };
 
                 let update_tangent = if update_is_live {
                     linear_inputs[linear_index].clone()
                 } else {
-                    forward_context
-                        .bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
-                                forward_update_type.clone(),
-                            )),
-                            Vec::new(),
-                            &[],
-                        )?
-                        .remove(0)
+                    forward_context.bind_array(ZeroOperation::new(forward_update_type.clone()), &[])?
                 };
 
                 let mut update_inputs = Vec::with_capacity(2 + forward_start_indices.len());
                 update_inputs.extend([input_tangent, update_tangent]);
                 update_inputs.extend(forward_start_indices.iter().map(|index| residuals[*index].clone()));
-                forward_context.bind(
-                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                        DynamicUpdateSliceOperation::new().with_allow_negative_indices(allow_negative_indices),
-                    ),
-                    Vec::new(),
+                Ok(vec![forward_context.bind_array(
+                    DynamicUpdateSliceOperation::new().with_allow_negative_indices(allow_negative_indices),
                     update_inputs.as_slice(),
-                )
+                )?])
             },
             move |residuals, output_cotangents| {
                 let transpose_context = output_cotangents[0].dispatch_domain();
                 let mut cotangents = Vec::with_capacity(usize::from(input_is_live) + usize::from(update_is_live));
 
                 if input_is_live {
-                    let update_zero = transpose_context
-                        .bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
-                                transpose_update_type.clone(),
-                            )),
-                            Vec::new(),
-                            &[],
-                        )?
-                        .remove(0);
+                    let update_zero =
+                        transpose_context.bind_array(ZeroOperation::new(transpose_update_type.clone()), &[])?;
                     let mut input_cotangent_inputs = vec![output_cotangents[0].clone(), update_zero];
                     input_cotangent_inputs
                         .extend(transpose_start_indices.iter().map(|index| residuals[*index].clone()));
-                    cotangents.push(
-                        transpose_context
-                            .bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    DynamicUpdateSliceOperation::new()
-                                        .with_allow_negative_indices(allow_negative_indices),
-                                ),
-                                Vec::new(),
-                                input_cotangent_inputs.as_slice(),
-                            )?
-                            .remove(0),
-                    );
+                    cotangents.push(transpose_context.bind_array(
+                        DynamicUpdateSliceOperation::new().with_allow_negative_indices(allow_negative_indices),
+                        input_cotangent_inputs.as_slice(),
+                    )?);
                 }
 
                 if update_is_live {
                     let mut update_cotangent_inputs = vec![output_cotangents[0].clone()];
                     update_cotangent_inputs
                         .extend(transpose_start_indices.iter().map(|index| residuals[*index].clone()));
-                    cotangents.push(
-                        transpose_context
-                            .bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    DynamicSliceOperation::new(update_sizes)
-                                        .with_allow_negative_indices(allow_negative_indices),
-                                ),
-                                Vec::new(),
-                                update_cotangent_inputs.as_slice(),
-                            )?
-                            .remove(0),
-                    );
+                    cotangents.push(transpose_context.bind_array(
+                        DynamicSliceOperation::new(update_sizes).with_allow_negative_indices(allow_negative_indices),
+                        update_cotangent_inputs.as_slice(),
+                    )?);
                 }
 
                 Ok(cotangents)

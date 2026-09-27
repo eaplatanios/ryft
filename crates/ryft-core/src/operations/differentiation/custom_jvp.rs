@@ -881,7 +881,7 @@ pub(crate) mod tests {
     type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
 
     /// Eager composite context whose values may be arrays or references.
-    type ArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Retained scalar-array JVP definition used only by the lazy batching representation checkpoint.
     type LazyJvpFactory = dyn Fn(&[ArrayType], &[ArrayType]) -> Result<FlatProgram<EagerContext<Array, TestArrayOperation>>, ProgramError>
@@ -1112,7 +1112,7 @@ pub(crate) mod tests {
     }
 
     /// Builds a reference-free program representing the identity function over `r#type`.
-    fn array_ir_identity_program(r#type: &ArrayIrType) -> FlatProgram<ArrayIrContext> {
+    fn array_ir_identity_program(r#type: &ArrayIrType) -> FlatProgram<EagerArrayIrContext> {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(r#type.clone());
         builder
@@ -1125,7 +1125,7 @@ pub(crate) mod tests {
     }
 
     /// Pairs an identity primal program with a custom JVP program that allocates and reads local reference state.
-    fn custom_jvp_regions_with_reference_state(r#type: &ArrayIrType) -> Vec<FlatProgram<ArrayIrContext>> {
+    fn custom_jvp_regions_with_reference_state(r#type: &ArrayIrType) -> Vec<FlatProgram<EagerArrayIrContext>> {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(r#type.clone());
         let tangent = builder.add_input(r#type.clone());
@@ -1147,7 +1147,7 @@ pub(crate) mod tests {
     pub(crate) fn nested_custom_derivative_state_program(
         scalar_type: &ArrayIrType,
         include_tangent_output: bool,
-    ) -> FlatProgram<ArrayIrContext> {
+    ) -> FlatProgram<EagerArrayIrContext> {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let regions = custom_jvp_regions_with_reference_state(scalar_type)
             .iter()
@@ -1200,7 +1200,7 @@ pub(crate) mod tests {
     /// output. The coefficient is pure known work even though the accumulator must be fresh for every pushforward
     /// call. The rule reads the accumulator through [`ReferenceFreezeOperation`] when `consume` is `true` and through
     /// [`ReferenceReadOperation`] otherwise.
-    fn stateful_square_regions(consume: bool) -> Vec<FlatProgram<ArrayIrContext>> {
+    fn stateful_square_regions(consume: bool) -> Vec<FlatProgram<EagerArrayIrContext>> {
         let scalar: ArrayIrType = ArrayType::scalar(DataType::F32).into();
         let mut primal = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = primal.add_input(scalar.clone());
@@ -1235,7 +1235,7 @@ pub(crate) mod tests {
     /// Builds the plumbing-reference primal `f(counters..., x) = { counters += x; x }` and the JVP rule
     /// `jvp(counters..., x, ẋ) = { counters += x; (x, ẋ) }` over `counter_count` leading `ref<f32[]>` counters and
     /// an `f32[]` input, so that replaying either region is observable through the counters.
-    fn counting_custom_jvp_regions(counter_count: usize) -> Vec<FlatProgram<ArrayIrContext>> {
+    fn counting_custom_jvp_regions(counter_count: usize) -> Vec<FlatProgram<EagerArrayIrContext>> {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut primal = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -2372,7 +2372,7 @@ pub(crate) mod tests {
         let driver =
             ReferenceRuleDifferentiationDriver { programs: vec![array_ir_identity_program(&scalar_type), jvp] };
         let outputs = CustomJvpOperation::<ArrayIrType>::new()
-            .jvp(&DifferentiationContext::fused(ArrayIrContext::new()), &driver, std::slice::from_ref(&input))
+            .jvp(&DifferentiationContext::fused(EagerArrayIrContext::new()), &driver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()));
@@ -2384,7 +2384,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_custom_jvp_differentiation_plumbing_references() {
-        let context = DifferentiationContext::fused(ArrayIrContext::new());
+        let context = DifferentiationContext::fused(EagerArrayIrContext::new());
         let driver = ReferenceRuleDifferentiationDriver { programs: counting_custom_jvp_regions(1) };
 
         // The plumbing counter reaches the replayed rule as the same reference and is mutated by it. Its live tangent
@@ -2691,7 +2691,7 @@ pub(crate) mod tests {
         // The leading counter is plumbing: it reaches both closures at its usual position, and the rule closure keeps
         // receiving a full tangent value whose counter leaf is a placeholder that it leaves unused.
         let function = custom_jvp(
-            |(counter, x): (DomainTracer<ArrayIrContext>, DomainTracer<ArrayIrContext>)| {
+            |(counter, x): (DomainTracer<EagerArrayIrContext>, DomainTracer<EagerArrayIrContext>)| {
                 counter.add_update(&x)?;
                 Ok(x)
             },
@@ -2728,7 +2728,7 @@ pub(crate) mod tests {
         // A rule that uses the placeholder tangent of a plumbing input is rejected when it is traced, because the
         // staged rule has no tangent slot for it.
         let function = custom_jvp(
-            |(counter, x): (DomainTracer<ArrayIrContext>, DomainTracer<ArrayIrContext>)| {
+            |(counter, x): (DomainTracer<EagerArrayIrContext>, DomainTracer<EagerArrayIrContext>)| {
                 counter.add_update(&x)?;
                 Ok(x)
             },
@@ -2739,7 +2739,7 @@ pub(crate) mod tests {
         )
         .with_non_differentiated_count(1);
         assert_eq!(
-            ArrayIrContext::trace(
+            EagerArrayIrContext::trace(
                 |(counter, x)| function.call((counter, x)),
                 (reference_type.clone(), scalar_type.clone()),
             )
@@ -2772,14 +2772,14 @@ pub(crate) mod tests {
 
         // Without the declaration, the reference is an active input, which the staged operation rejects.
         let function = custom_jvp(
-            |(counter, x): (DomainTracer<ArrayIrContext>, DomainTracer<ArrayIrContext>)| {
+            |(counter, x): (DomainTracer<EagerArrayIrContext>, DomainTracer<EagerArrayIrContext>)| {
                 counter.add_update(&x)?;
                 Ok(x)
             },
             |(_, x), (_, tangent)| Ok((x, tangent)),
         );
         assert_eq!(
-            ArrayIrContext::trace(|(counter, x)| function.call((counter, x)), (reference_type, scalar_type))
+            EagerArrayIrContext::trace(|(counter, x)| function.call((counter, x)), (reference_type, scalar_type))
                 .map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
                 "custom_jvp accepts reference inputs only in its leading non-differentiated segment; move input 0 of \
@@ -2995,13 +2995,19 @@ pub(crate) mod tests {
         // Structural zeros and zero-space values require no tangent slot for a non-differentiated input.
         let input =
             DifferentiationDual::new_with_zero_tangent(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())).unwrap();
-        assert_eq!(validate_custom_derivative_replay("custom_jvp", 1, &ArrayIrContext::new(), &[input], &[]), Ok(()));
+        assert_eq!(
+            validate_custom_derivative_replay("custom_jvp", 1, &EagerArrayIrContext::new(), &[input], &[]),
+            Ok(()),
+        );
         let input = DifferentiationDual::new(
             ArrayIrValue::Array(Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap()),
             ArrayIrValue::Array(Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap()),
         )
         .unwrap();
-        assert_eq!(validate_custom_derivative_replay("custom_jvp", 1, &ArrayIrContext::new(), &[input], &[]), Ok(()));
+        assert_eq!(
+            validate_custom_derivative_replay("custom_jvp", 1, &EagerArrayIrContext::new(), &[input], &[]),
+            Ok(()),
+        );
 
         // A non-differentiated numeric input with a non-zero tangent has no tangent slot in the rule.
         let input = DifferentiationDual::new(
@@ -3010,7 +3016,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_custom_derivative_replay("custom_jvp", 1, &ArrayIrContext::new(), &[input], &[]),
+            validate_custom_derivative_replay("custom_jvp", 1, &EagerArrayIrContext::new(), &[input], &[]),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "custom_jvp cannot propagate the non-zero tangent of type `f32[]` supplied for one of \
                     its 1 leading non-differentiated inputs, because its rule has no tangent slot for them",
@@ -3021,7 +3027,7 @@ pub(crate) mod tests {
     fn test_validate_custom_derivative_replay_staged_references() {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        ArrayIrContext::trace(
+        EagerArrayIrContext::trace(
             |inputs: Vec<_>| {
                 let context = inputs[0].context();
                 let mut duals = inputs

@@ -47,11 +47,11 @@ use half::{bf16, f16};
 use num_complex::Complex;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrType, ArrayType, DataType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, FloatingPointArrayElement, LinearResiduals, MeshAxisType,
-    NumericArrayElement, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity, Shape, Sharding, ShardingDimension,
-    f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
-    i1, i2, i4, u1, u2, u4,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrContext, ArrayIrType, ArrayType,
+    DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, FloatingPointArrayElement, LinearResiduals,
+    MeshAxisType, NumericArrayElement, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity, Shape, Sharding,
+    ShardingDimension, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
+    f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -543,7 +543,12 @@ impl_differentiable_operation! {
                             let primal_input = primal_input.convert_element_type(working_data_type)?;
                             let input_tangent = input_tangent.convert_element_type(working_data_type)?;
                             let input_type = primal_input.r#type().into_owned();
-                            let output_axes = output_to_input_axis_map(input_type.rank(), operation.axes.as_slice());
+
+                            // The reduced output axes are the input axes that the reduction keeps, in order,
+                            // and so broadcasting maps them back there.
+                            let output_axes = (0..input_type.rank())
+                                .filter(|axis| !operation.axes.contains(axis))
+                                .collect::<Vec<_>>();
 
                             // Normalize before adding the maximum back as the rounded logarithmic output can lose the
                             // normalization term entirely when the inputs share a large finite offset.
@@ -576,7 +581,12 @@ impl_differentiable_operation! {
                     let primal_input = inputs[0].primal();
                     let primal = primal_input.reduce(operation.axes(), kind)?;
                     let input_type = primal_input.r#type().into_owned();
-                    let output_axes = output_to_input_axis_map(input_type.rank(), operation.axes());
+
+                    // The reduced output axes are the input axes that the reduction keeps, in order,
+                    // and so broadcasting maps them back there.
+                    let output_axes =
+                        (0..input_type.rank()).filter(|axis| !operation.axes().contains(axis)).collect::<Vec<_>>();
+
                     let broadcast_primal = primal.broadcast(input_type, output_axes.as_slice())?;
                     let mask = primal_input.compare(&broadcast_primal, ComparisonDirection::Equal)?;
                     let tangent = match inputs[0].tangent() {
@@ -655,7 +665,12 @@ impl_differentiable_operation! {
                         }
 
                         let output_type = input_type.cotangent()?;
-                        let output_axes = output_to_input_axis_map(input_shape.rank(), &operation.axes);
+
+                        // The cotangent axes are the input axes that the reduction keeps, in order,
+                        // and so broadcasting maps them back there.
+                        let output_axes =
+                            (0..input_shape.rank()).filter(|axis| !operation.axes.contains(axis)).collect::<Vec<_>>();
+
                         let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
                         let cotangent_input = match operation.kind {
                             ReductionKind::Sum => broadcasted,
@@ -741,7 +756,7 @@ where
             return jvp_projected_operation(context, &operation, inputs);
         }
 
-        let output = bind_array(context.primal(), self.clone(), std::slice::from_ref(inputs[0].primal()))?;
+        let output = context.primal().bind_array(self.clone(), std::slice::from_ref(inputs[0].primal()))?;
         let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
         let input = &tangent_inputs[0];
         let input_tangent = match input.tangent() {
@@ -755,7 +770,11 @@ where
         let tangent_context = context.tangent();
         let mut residuals = LinearResiduals::new();
         let input_shape = residuals.retain_shape(tangent_context, input.primal())?;
-        let output_axes = output_to_input_axis_map(input_type.rank(), self.axes());
+
+        // The reduced output axes are the input axes that the reduction keeps, in order,
+        // and so broadcasting the reduced output or its cotangent maps them back there.
+        let output_axes = (0..input_type.rank()).filter(|axis| !self.axes.contains(axis)).collect::<Vec<_>>();
+
         let cotangent_type = input_type.cotangent()?;
         let axes = self.axes().to_vec();
         let tangent = if matches!(self.kind(), ReductionKind::Max | ReductionKind::Min) {
@@ -773,21 +792,14 @@ where
                     &[vec![context.primal_to_tangent(output.clone())?], input_extents].concat(),
                 )?
                 .remove(0);
-            let mask = bind_array(
-                tangent_context,
+            let mask = tangent_context.bind_array(
                 CompareOperation::new(ComparisonDirection::Equal),
                 &[input.primal().clone(), broadcast_output],
             )?;
-            let mask = bind_array(
-                tangent_context,
-                ConvertElementTypeOperation::new(input_type.tangent()?.data_type(), false),
-                &[mask],
-            )?;
-            let tie_count = bind_array(
-                tangent_context,
-                ReduceOperation::new(axes.clone(), ReductionKind::Sum),
-                std::slice::from_ref(&mask),
-            )?;
+            let mask = tangent_context
+                .bind_array(ConvertElementTypeOperation::new(input_type.tangent()?.data_type(), false), &[mask])?;
+            let tie_count = tangent_context
+                .bind_array(ReduceOperation::new(axes.clone(), ReductionKind::Sum), std::slice::from_ref(&mask))?;
             let mask_index = residuals.retain(mask);
             let tie_count_index = residuals.retain(tie_count);
             LinearCallOperation::stage(
@@ -796,19 +808,15 @@ where
                 vec![input_tangent],
                 move |residuals, linear_inputs| {
                     let context = linear_inputs[0].dispatch_domain();
-                    let masked = bind_array(
-                        &context,
-                        MulOperation::new(),
-                        &[residuals[mask_index].clone(), linear_inputs[0].clone()],
-                    )?;
-                    let sum = bind_array(&context, ReduceOperation::new(axes, ReductionKind::Sum), &[masked])?;
-                    Ok(vec![bind_array(&context, DivOperation::new(), &[sum, residuals[tie_count_index].clone()])?])
+                    let masked = context
+                        .bind_array(MulOperation::new(), &[residuals[mask_index].clone(), linear_inputs[0].clone()])?;
+                    let sum = context.bind_array(ReduceOperation::new(axes, ReductionKind::Sum), &[masked])?;
+                    Ok(vec![context.bind_array(DivOperation::new(), &[sum, residuals[tie_count_index].clone()])?])
                 },
                 move |residuals, output_cotangents| {
                     let context = output_cotangents[0].dispatch_domain();
                     let input_extents = input_shape.dimensions(&context, residuals)?;
-                    let cotangent = bind_array(
-                        &context,
+                    let cotangent = context.bind_array(
                         DivOperation::new(),
                         &[output_cotangents[0].clone(), residuals[tie_count_index].clone()],
                     )?;
@@ -817,7 +825,7 @@ where
                         output_axes.as_slice(),
                         cotangent_type.sharding().cloned(),
                     )?;
-                    Ok(vec![bind_array(&context, MulOperation::new(), &[residuals[mask_index].clone(), cotangent])?])
+                    Ok(vec![context.bind_array(MulOperation::new(), &[residuals[mask_index].clone(), cotangent])?])
                 },
             )?
         } else {
@@ -833,7 +841,7 @@ where
                 residuals.into_values(),
                 vec![input_tangent],
                 move |_, linear_inputs| {
-                    Ok(vec![bind_array(&linear_inputs[0].dispatch_domain(), forward_operation, linear_inputs)?])
+                    Ok(vec![linear_inputs[0].dispatch_domain().bind_array(forward_operation, linear_inputs)?])
                 },
                 move |residuals, output_cotangents| {
                     let context = output_cotangents[0].dispatch_domain();
@@ -859,12 +867,11 @@ where
                     }
                     let element_count =
                         context.bind(DimensionToScalarOperation, Vec::new(), &[element_count])?.remove(0);
-                    let element_count = bind_array(
-                        &context,
+                    let element_count = context.bind_array(
                         ConvertElementTypeOperation::new(cotangent_type.data_type(), false),
                         &[element_count],
                     )?;
-                    Ok(vec![bind_array(&context, DivOperation::new(), &[cotangent, element_count])?])
+                    Ok(vec![context.bind_array(DivOperation::new(), &[cotangent, element_count])?])
                 },
             )?
         }
@@ -1506,30 +1513,6 @@ impl_element_divide_by_count_for_complex!(f32);
 impl_element_divide_by_count_for_complex!(f64);
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Builds the `output_axes` vector that maps a reduced output's axes back to the
-/// corresponding input axes. Output axis `j` corresponds to the `j`-th non-reduced input axis;
-/// the returned vector lists those input-axis indices in order.
-pub(crate) fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<usize> {
-    let mut reduce_mask = vec![false; input_rank];
-    for axis in reduced_axes {
-        reduce_mask[*axis] = true;
-    }
-    (0..input_rank).filter(|axis| !reduce_mask[*axis]).collect()
-}
-
-/// Binds the single-output array operation `operation` in `context`, lifting it into the context's operation family
-/// through that family's [`OperationProjection<ArrayType>`](OperationProjection) member family, and returns its output.
-fn bind_array<O, C: Context<Type = ArrayIrType, Operation: OperationProjection<ArrayType, Projected: From<O>>>>(
-    context: &C,
-    operation: O,
-    inputs: &[C::Value],
-) -> Result<C::Value, ProgramError> {
-    let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(operation);
-    let mut outputs = context.bind(operation, Vec::new(), inputs)?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
 
 #[cfg(test)]
 mod tests {
@@ -3002,17 +2985,5 @@ mod tests {
                 .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
                 .unwrap()),
         );
-    }
-
-    #[test]
-    fn test_output_to_input_axis_map() {
-        // Input rank 3, reduce axis 1: output axes [0, 1] map back to input axes [0, 2].
-        assert_eq!(super::output_to_input_axis_map(3, &[1]), vec![0, 2]);
-        // Input rank 3, reduce axes [0, 2]: output axis [0] maps back to input axis [1].
-        assert_eq!(super::output_to_input_axis_map(3, &[0, 2]), vec![1]);
-        // Input rank 4, reduce axes [1, 3]: output axes [0, 1] map back to input axes [0, 2].
-        assert_eq!(super::output_to_input_axis_map(4, &[1, 3]), vec![0, 2]);
-        // No reduction: identity map.
-        assert_eq!(super::output_to_input_axis_map(3, &[]), vec![0, 1, 2]);
     }
 }

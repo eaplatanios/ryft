@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayType, DataType, Dimension, NumericArrayElement, Shape, Sharding, ShardingDimension,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrContext,
+    ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, NumericArrayElement, Shape, Sharding, ShardingDimension,
     materialize_array_tangent,
 };
 use crate::axes::Axis;
@@ -1401,8 +1401,8 @@ where
         let is_static = |r#type: &ArrayType| {
             r#type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
         };
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
         if is_static(&input_type) && is_static(&updates_type) {
+            let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
             return jvp_projected_operation(destinations, &operation, inputs);
         }
 
@@ -1412,9 +1412,7 @@ where
         let updates = &tangent_inputs[2];
         let tangent_context = destinations.tangent();
         let (output_primal, tangent) = if input.tangent().is_zero() && updates.tangent().is_zero() {
-            let mut outputs = destinations.primal().bind(operation, Vec::new(), &primal_inputs)?;
-            check_count!("output", outputs, 1, ProgramError);
-            let primal = outputs.remove(0);
+            let primal = destinations.primal().bind_array(self.clone(), &primal_inputs)?;
             let tangent = MaybeZero::Zero(primal.r#type().tangent()?);
             (primal, tangent)
         } else {

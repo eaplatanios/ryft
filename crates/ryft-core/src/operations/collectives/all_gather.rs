@@ -8,8 +8,9 @@ use std::fmt::Display;
 
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LinearResiduals, RaggedAxis, Shape, Sharding,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType, ArrayType,
+    Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LinearResiduals, RaggedAxis,
+    Shape, Sharding,
 };
 use crate::axes::{AxisIndexOperation, NamedAxes};
 use crate::batching::{
@@ -901,14 +902,7 @@ where
                         zero.clone()
                     } else {
                         let axis_index = transpose_context
-                            .bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    AxisIndexOperation::new(transpose_operation.axis_name().to_string()),
-                                ),
-                                Vec::new(),
-                                &[],
-                            )?
-                            .remove(0);
+                            .bind_array(AxisIndexOperation::new(transpose_operation.axis_name().to_string()), &[])?;
                         let axis_index_variable = DimensionVariable::new(
                             format!("{}_index", transpose_operation.axis_name()),
                             crate::arrays::DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Dimension, DimensionType,
-    DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
+    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, Dimension,
+    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
@@ -1008,18 +1008,13 @@ impl_differentiable_operation! {
                                 // reconstructing the shape, just as the homogeneous rule's unalignment does.
                                 let cotangent =
                                     if <&ArrayType>::try_from(cotangent.r#type().as_ref())? != &transpose_target_type {
-                                        let mut outputs = transpose_context.bind(
-                                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                                BroadcastOperation::new(
-                                                    transpose_target_type.clone(),
-                                                    (0..transpose_target_type.rank()).collect(),
-                                                ),
+                                        transpose_context.bind_array(
+                                            BroadcastOperation::new(
+                                                transpose_target_type.clone(),
+                                                (0..transpose_target_type.rank()).collect(),
                                             ),
-                                            Vec::new(),
                                             std::slice::from_ref(&cotangent),
-                                        )?;
-                                        check_count!("output", outputs, 1, ProgramError);
-                                        outputs.remove(0)
+                                        )?
                                     } else {
                                         cotangent
                                     };

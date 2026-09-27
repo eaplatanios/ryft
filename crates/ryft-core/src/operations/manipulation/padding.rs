@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
-    ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, ArrayTypeRefinements, DataType,
-    Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, RaggedAxis, Shape,
-    materialize_array_tangent,
+    ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType,
+    ArrayTypeRefinements, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals,
+    RaggedAxis, Shape, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1196,15 +1196,8 @@ impl_differentiable_operation! {
                                     })
                                     .collect::<Result<Vec<_>, _>>()?;
 
-                                let mut zero = transpose_context.bind(
-                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                        ZeroOperation::new(transpose_padding_type.clone()),
-                                    ),
-                                    Vec::new(),
-                                    &[],
-                                )?;
-                                check_count!("output", zero, 1, ProgramError);
-                                let zero = zero.remove(0);
+                                let zero = transpose_context
+                                    .bind_array(ZeroOperation::new(transpose_padding_type.clone()), &[])?;
                                 let mut inverse_inputs = vec![output_cotangent.clone(), zero];
                                 inverse_inputs.extend(dilated_extents);
 
@@ -1288,15 +1281,12 @@ impl_differentiable_operation! {
                             )?;
                             check_count!("output", mask_input, 1, ProgramError);
                             let mask_input = mask_input.remove(0);
-                            let mut mask_padding = transpose_context.bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(OneOperation::new(
+                            let mask_padding = transpose_context.bind_array(
+                                OneOperation::new(
                                     transpose_padding_type.clone().with_data_type(DataType::Boolean).with_layout(None),
-                                )),
-                                Vec::new(),
+                                ),
                                 &[],
                             )?;
-                            check_count!("output", mask_padding, 1, ProgramError);
-                            let mask_padding = mask_padding.remove(0);
                             let mut mask_inputs = vec![mask_input, mask_padding];
                             mask_inputs.extend(output_extents.iter().map(|index| residuals[*index].clone()));
                             let mut mask =
@@ -1318,27 +1308,12 @@ impl_differentiable_operation! {
                             )?;
                             check_count!("output", output_zero, 1, ProgramError);
                             let output_zero = output_zero.remove(0);
-                            let mut selected = transpose_context.bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    SelectOperation::new(),
-                                ),
-                                Vec::new(),
-                                &[mask, output_cotangent, output_zero],
-                            )?;
-                            check_count!("output", selected, 1, ProgramError);
-                            let selected = selected.remove(0);
-                            let mut padding_cotangent = transpose_context.bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    ReduceOperation::new(
-                                        (0..transpose_output_type.rank()).collect(),
-                                        ReductionKind::Sum,
-                                    ),
-                                ),
-                                Vec::new(),
+                            let selected = transpose_context
+                                .bind_array(SelectOperation::new(), &[mask, output_cotangent, output_zero])?;
+                            let padding_cotangent = transpose_context.bind_array(
+                                ReduceOperation::new((0..transpose_output_type.rank()).collect(), ReductionKind::Sum),
                                 &[selected],
                             )?;
-                            check_count!("output", padding_cotangent, 1, ProgramError);
-                            let padding_cotangent = padding_cotangent.remove(0);
                             Ok(vec![
                                 ValueProjection::<ArrayType>::into_projected(input_cotangent)?
                                     .unalign_cotangent(&transpose_operand_type)?

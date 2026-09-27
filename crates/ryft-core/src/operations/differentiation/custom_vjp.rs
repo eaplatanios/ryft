@@ -952,10 +952,10 @@ mod tests {
     type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
 
     /// Eager composite context whose values may be arrays or references.
-    type ArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+    type EagerArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     /// Tracer of the composite universe used by the plumbing-reference tests.
-    type ArrayIrTracer = DomainTracer<ArrayIrContext>;
+    type ArrayIrTracer = DomainTracer<EagerArrayIrContext>;
 
     /// Error message of the forward-mode rejection of staged custom-VJP calls.
     const FORWARD_MODE_REJECTION: &str = "cannot apply forward-mode differentiation to a custom_vjp call; it supports \
@@ -996,7 +996,7 @@ mod tests {
     fn forwarded_inputs_program(
         input_types: Vec<ArrayIrType>,
         output_positions: Vec<usize>,
-    ) -> FlatProgram<ArrayIrContext> {
+    ) -> FlatProgram<EagerArrayIrContext> {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         let outputs = output_positions.iter().map(|position| inputs[*position]).collect::<Vec<_>>();
@@ -1898,7 +1898,7 @@ mod tests {
 
         // Building executable forward derivatives of an already staged call rejects immediately too: neither
         // request returns an artifact that defers the error until its transpose-only carrier is executed.
-        let (_, program) = ArrayIrContext::trace(
+        let (_, program) = EagerArrayIrContext::trace(
             |inputs| function.call(inputs),
             (
                 ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
@@ -2237,7 +2237,7 @@ mod tests {
             |stash, cotangent| Ok((stash, cotangent)),
         );
         assert_eq!(
-            ArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types.clone()).map(|_| ()),
+            EagerArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types.clone()).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
                 "custom_vjp accepts reference inputs only in its leading non-differentiated segment; move input 0 of \
                  type `ref<f32[]>` before the differentiated inputs"
@@ -2253,7 +2253,7 @@ mod tests {
         )
         .with_non_differentiated_count(1);
         assert_eq!(
-            ArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types.clone()).map(|_| ()),
+            EagerArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types.clone()).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
                 "custom_vjp forward rule returns residual 0 of reference type `ref<f32[]>` that is not a leading \
                  non-differentiated input forwarded by identity"
@@ -2270,7 +2270,7 @@ mod tests {
         )
         .with_non_differentiated_count(1);
         assert_eq!(
-            ArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types.clone()).map(|_| ()),
+            EagerArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types.clone()).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
                 "custom_vjp forward rule returns residual 1 of reference type `ref<f32[]>` that is not a leading \
                  non-differentiated input forwarded by identity"
@@ -2286,7 +2286,7 @@ mod tests {
         )
         .with_non_differentiated_count(1);
         assert_eq!(
-            ArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types).map(|_| ()),
+            EagerArrayIrContext::trace(|(stash, x)| function.call((stash, x)), input_types).map(|_| ()),
             Err(ProgramError::Type(TypeError::invalid(
                 "custom_vjp cannot return a reference, but output 0 has type `ref<f32[]>`".to_string(),
             ))),
@@ -2301,7 +2301,7 @@ mod tests {
         )
         .with_non_differentiated_count(2);
         assert_eq!(
-            ArrayIrContext::trace(
+            EagerArrayIrContext::trace(
                 |input| function.call(input),
                 (
                     ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),

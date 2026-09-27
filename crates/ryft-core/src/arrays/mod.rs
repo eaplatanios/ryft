@@ -31,7 +31,7 @@ pub use elements::{
     f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
     f16, i1, i2, i4, u1, u2, u4,
 };
-pub use ir::ArrayIrValue;
+pub use ir::{ArrayIrContext, ArrayIrValue};
 pub use macros::dispatch_on_array_element_type;
 pub use operations::{
     ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayTracingContext, DimensionOperation,

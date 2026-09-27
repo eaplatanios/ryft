@@ -3,8 +3,8 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayType, DataType, Dimension, DimensionVariable, LinearResiduals, Shape, Sharding,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayIrContext,
+    ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionVariable, LinearResiduals, Shape, Sharding,
     ShardingDimension,
 };
 use crate::axes::Axis;
@@ -891,14 +891,9 @@ where
             return jvp_projected_operation(destinations, &operation, inputs);
         }
 
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-        let mut primal_outputs =
-            destinations
-                .primal()
-                .bind(operation, Vec::new(), &[input.primal().clone(), indices.primal().clone()])?;
-        check_count!("output", primal_outputs, 1, ProgramError);
-
-        let output_primal = primal_outputs.remove(0);
+        let output_primal = destinations
+            .primal()
+            .bind_array(self.clone(), &[input.primal().clone(), indices.primal().clone()])?;
         let tangent_primal = destinations.primal_to_tangent(output_primal.clone())?;
         let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
         let input = &tangent_inputs[0];
@@ -929,47 +924,33 @@ where
                     residuals.into_values(),
                     vec![input_tangent.clone()],
                     move |residuals, linear_inputs| {
-                        linear_inputs[0].dispatch_domain().bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(forward_operation),
-                            Vec::new(),
+                        Ok(vec![linear_inputs[0].dispatch_domain().bind_array(
+                            forward_operation,
                             &[linear_inputs[0].clone(), residuals[indices_index].clone()],
-                        )
+                        )?])
                     },
                     move |residuals, output_cotangents| {
                         let transpose_context = output_cotangents[0].dispatch_domain();
-                        let mut zero_outputs = transpose_context.bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(ZeroOperation::new(
-                                transpose_operand_type.clone(),
-                            )),
-                            Vec::new(),
+                        let zeros = transpose_context.bind_array(
+                            ZeroOperation::new(transpose_operand_type.clone()),
                             input_shape.dynamic_dimensions(residuals).as_slice(),
                         )?;
-                        check_count!("output", zero_outputs, 1, ProgramError);
-                        let zeros = zero_outputs.remove(0);
-                        let mut contributions = transpose_context.bind(
-                            <C::Operation as OperationProjection<ArrayType>>::Projected::from(transpose_operation),
-                            Vec::new(),
+                        let contribution = transpose_context.bind_array(
+                            transpose_operation,
                             &[zeros, residuals[indices_index].clone(), output_cotangents[0].clone()],
                         )?;
-                        check_count!("output", contributions, 1, ProgramError);
 
                         // Residual extents may refine singleton dynamic dimensions to static dimensions. Restore
                         // the original cotangent signature, including its dimension identities and storage metadata.
-                        let contribution = contributions.remove(0);
                         let contribution =
                             if <&ArrayType>::try_from(contribution.r#type().as_ref())? != &transpose_operand_type {
-                                let mut outputs = transpose_context.bind(
-                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                        BroadcastOperation::new(
-                                            transpose_operand_type.clone(),
-                                            (0..transpose_operand_type.rank()).collect(),
-                                        ),
+                                transpose_context.bind_array(
+                                    BroadcastOperation::new(
+                                        transpose_operand_type.clone(),
+                                        (0..transpose_operand_type.rank()).collect(),
                                     ),
-                                    Vec::new(),
                                     std::slice::from_ref(&contribution),
-                                )?;
-                                check_count!("output", outputs, 1, ProgramError);
-                                outputs.remove(0)
+                                )?
                             } else {
                                 contribution
                             };
