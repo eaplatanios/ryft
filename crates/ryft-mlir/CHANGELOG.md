@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added the builtin `TokenTypeRef` and `Context::token_type` for the new builtin `token` type.
 - Added a wrapper for the new Triton `tt.atomic_poll` operation.
 - Added support for the new optional `result_tilings` attribute of the StableHLO `custom_call` operation.
-- Added the StableHLO `collective_reduce` operation and CHLO `top_k` (including `is_stable`) and `mulhi` operations.
+- Added the StableHLO `collective_reduce` operation and CHLO `top_k` (including `is_stable`), `scan`, and `mulhi`
+  operations.
 - Added the Shardy `ReductionOperation` enum along with the new reduction operation accessors and constructor
   parameters for tensor sharding attributes and the `all_reduce` and `reduce_scatter` operations.
 

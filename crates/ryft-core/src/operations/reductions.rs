@@ -17,9 +17,10 @@
 //! [`reduce`](https://openxla.org/stablehlo/spec#reduce). Sums, products, extrema, and Boolean reductions start from
 //! their combiner identity (e.g., `0` for sums and `1` for products), so an empty axis produces that identity. Bounded
 //! ragged-axis reductions support sums, products, and logarithmic sums of exponentials; padding is replaced by zero,
-//! one, or negative infinity, respectively. Other kinds reject ragged reduced axes. Narrow floating-point sums,
-//! products, means, and logarithmic sums of exponentials compute in `f32` before converting the output back to the
-//! input data type. Empty floating-point and complex means compute NaNs before output conversion.
+//! one, or negative infinity (with a zero imaginary component for complex inputs), respectively. Other kinds reject
+//! ragged reduced axes. Narrow floating-point sums, products, means, and logarithmic sums of exponentials compute in
+//! `f32` before converting the output back to the input data type. Empty floating-point and complex means compute NaNs
+//! before output conversion.
 //!
 //! Floating-point and complex sums and means are linear: their transposes broadcast the cotangent over the reduced
 //! axes, dividing it by the number of reduced elements for means. Extrema route the tangent through selected elements,
@@ -122,7 +123,7 @@ pub enum ReductionKind {
     /// shift before exponentiating, avoiding overflow for large finite inputs:
     ///
     /// ```text
-    /// m      = reduce_max(x)                      // with a -∞ initial value
+    /// m      = reduce_max(real(x))                // with a -∞ initial value
     /// safe_m = select(isfinite(m), m, 0)
     /// output = log(reduce_sum(exp(x - safe_m))) + safe_m
     /// ```
@@ -132,12 +133,15 @@ pub enum ReductionKind {
     /// Substituting zero there leaves `log(0) + 0 = -∞`, which is the correct value of an empty or all-zero
     /// sum of exponentials. A maximum of `+∞` is guarded the same way, and a NaN input propagates as usual.
     ///
-    /// Only real floating-point formats that represent negative infinity are supported. The ragged batching rule fills
-    /// padding with negative infinity so its exponential stays zero after subtraction of any finite maximum. A finite
-    /// sentinel cannot provide that guarantee, even when it is an identity of rounded pairwise `log_add_exp`:
+    /// Real floating-point formats that represent negative infinity and complex inputs are supported. Complex inputs
+    /// are shifted by the maximum of their real components, which is the only component that affects the magnitude of
+    /// an exponential, and their output is the principal logarithm of the shifted sum (so its imaginary component lies
+    /// in `(-π, π]`) plus that shift. The ragged batching rule fills padding with negative infinity (with a zero
+    /// imaginary component for complex inputs), so its exponential stays zero after subtraction of any finite maximum.
+    /// A finite sentinel cannot provide that guarantee, even when it is an identity of rounded pairwise `log_add_exp`:
     /// subtracting a nearby maximum makes padded entries contribute to the inner sum. This reduction is the unweighted,
     /// unmasked subset of [`jax.nn.logsumexp`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.logsumexp.html);
-    /// weights, masks, sign outputs, and complex inputs are not supported.
+    /// weights, masks, and sign outputs are not supported.
     LogSumExp,
 
     /// Maximum reduction. Boolean inputs use disjunction, real numeric inputs propagate NaNs and order negative zero
@@ -462,7 +466,7 @@ where
         let masked = match self.kind {
             ReductionKind::Product => P::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::One)?,
             ReductionKind::LogSumExp => {
-                P::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::Lowest)?
+                P::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::LowestReal)?
             }
             _ => P::mask_reduction_input(context, input, reduced_axes, self.kind)?,
         };
@@ -641,7 +645,10 @@ impl_differentiable_operation! {
                         MaybeZero::Value(input_tangent) => {
                             let primal_input = context.primal_to_tangent(primal_input.clone())?;
                             let tangent_data_type = input_tangent.r#type().data_type();
-                            let working_data_type = if matches!(tangent_data_type, DataType::F32 | DataType::F64) {
+                            let working_data_type = if matches!(
+                                tangent_data_type,
+                                DataType::F32 | DataType::F64 | DataType::C64 | DataType::C128,
+                            ) {
                                 tangent_data_type
                             } else {
                                 DataType::F32
@@ -1136,12 +1143,14 @@ impl Reduce for Array {
                 })
             }
             ReductionKind::LogSumExp => {
-                dispatch_on_array_element_type!(@float data_type, |Element| {
+                dispatch_on_array_element_type!(@float_or_complex data_type, |Element| {
                     // Compute `log(sum(exp(input)))` by subtracting the maximum of each reduced slice before
                     // exponentiating. Non-finite maxima are replaced by zero, so that NaNs and infinities propagate
                     // through the exponentials instead of producing `-∞ - -∞ = NaN` for all-`-∞` or empty slices.
                     // Narrow inputs were already widened above, but reassociation in other backends can still
-                    // change the final rounding.
+                    // change the final rounding. The lexicographic maximum of complex elements has the largest real
+                    // component, and converting it into `f64` keeps only that component, so the shift is real (i.e.,
+                    // its imaginary component is zero) for complex elements and exact for real ones.
                     let zero = Element::zero()?;
                     let maximums = self
                         .reduce_elements(
@@ -1151,7 +1160,8 @@ impl Reduce for Array {
                             |left, right| Ok(ArrayElement::max(&left, &right)),
                         )?
                         .map_elements::<Element, Element>(output_type.clone(), |value| {
-                            Ok(if value.convert_to::<f64>()?.is_finite() { value } else { zero })
+                            let maximum = value.convert_to::<f64>()?;
+                            if maximum.is_finite() { Element::from_real(maximum) } else { Ok(zero) }
                         })?;
 
                     // Accumulate the shifted exponentials of every input element into the output element that its
@@ -1296,8 +1306,8 @@ impl ArrayType {
     ///
     ///   - `axes` are unique and within `0..self.rank()`, and
     ///   - `kind` matches the input data type (i.e., Boolean for `Any`/`All`, Boolean or numeric for `Max`/`Min`,
-    ///     and numeric for `Sum`/`Product`/`Mean`; logarithmic sums require the real floating-point domain documented
-    ///     on [`ReductionKind::LogSumExp`]).
+    ///     and numeric for `Sum`/`Product`/`Mean`; logarithmic sums require the floating-point and complex domain
+    ///     documented on [`ReductionKind::LogSumExp`]).
     ///
     /// The reduced axes are removed from the output shape and non-reduced axes keep their order. The output
     /// [`Sharding`] drops the reduced axes' per-dimension [`ShardingDimension`] entries while retaining the remaining
@@ -1326,12 +1336,12 @@ impl ArrayType {
 
         // Validate axes before the element domain so malformed geometry retains diagnostic precedence.
         if kind == ReductionKind::LogSumExp {
-            // Logarithmic sums are built from exponentials and logarithms, so they require the real floating-point
-            // domain documented on `ReductionKind::LogSumExp`, restricted to formats that represent the negative
-            // infinity that the maximum-shifted evaluation starts from.
-            if !data_type.is_floating_point() {
+            // Logarithmic sums are built from exponentials and logarithms, so they require the floating-point and
+            // complex domain documented on `ReductionKind::LogSumExp`, restricted to formats that represent the
+            // negative infinity that the maximum-shifted evaluation starts from.
+            if !data_type.is_floating_point() && !data_type.is_complex() {
                 return Err(TypeError::invalid(format!(
-                    "`{REDUCE_OPERATION_NAME}` with kind `{kind}` requires real floating-point inputs but got \
+                    "`{REDUCE_OPERATION_NAME}` with kind `{kind}` requires floating-point or complex inputs but got \
                      `{data_type}`",
                 )));
             }
@@ -1344,7 +1354,9 @@ impl ArrayType {
                     | DataType::F64
                     | DataType::F8E3M4
                     | DataType::F8E4M3
-                    | DataType::F8E5M2,
+                    | DataType::F8E5M2
+                    | DataType::C64
+                    | DataType::C128,
             ) {
                 return Err(TypeError::invalid(format!(
                     "`{REDUCE_OPERATION_NAME}` with kind `{kind}` requires a floating-point format that represents \
@@ -2049,7 +2061,7 @@ mod tests {
             ),
             Err(BatchingError::UnsupportedOperation {
                 message: "static array batching cannot identity-mask bounded ragged dimension `length` on axis 1 \
-                          with `Lowest`"
+                          with `LowestReal`"
                     .to_string(),
             }),
         );
@@ -2269,7 +2281,8 @@ mod tests {
 
     #[test]
     fn test_reduce_differentiation_log_sum_exp() {
-        // The tangent is the softmax-weighted sum of the input tangents over the reduced axes.
+        // The tangent is the softmax-weighted sum of the input tangents over the reduced axes, which is also the
+        // complex derivative for complex inputs.
         let primals = [1.0f64, 2.0, 3.0];
         let tangents = [0.5f64, -1.5, 2.0];
         let output = ((1.0f64 - 3.0).exp() + (2.0f64 - 3.0).exp() + 1.0).ln() + 3.0;
@@ -2278,6 +2291,14 @@ mod tests {
             .zip(tangents.iter())
             .map(|(primal, tangent)| (primal - output).exp() * tangent)
             .sum::<f64>();
+        let complex_primals = [ComplexNumber::new(0.5f64, 0.25), ComplexNumber::new(-0.3, 1.0)];
+        let complex_tangents = [ComplexNumber::new(1.0f64, 0.0), ComplexNumber::new(0.0, 1.0)];
+        let complex_output = complex_primals.iter().map(|primal| primal.exp()).sum::<ComplexNumber<f64>>().ln();
+        let complex_tangent = complex_primals
+            .iter()
+            .zip(complex_tangents.iter())
+            .map(|(primal, tangent)| (primal - complex_output).exp() * tangent)
+            .sum::<ComplexNumber<f64>>();
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = ReduceOperation::new(vec![0], ReductionKind::LogSumExp),
@@ -2304,6 +2325,11 @@ mod tests {
                         %15:f64[] = reduce [kind=sum, axes=[0]] %14
                     in (%2, %15)
                 "},
+            }, {
+                primals = [Array::vector(complex_primals.to_vec()).unwrap()],
+                tangents = [Array::vector(complex_tangents.to_vec()).unwrap()],
+                primal_outputs = [Array::scalar(complex_output).unwrap()],
+                tangent_outputs = [Array::scalar(complex_tangent).unwrap()],
             }],
         );
     }
@@ -2693,12 +2719,12 @@ mod tests {
             (
                 Array::vector(vec![1i32, 2]).unwrap(),
                 ReductionKind::LogSumExp,
-                "`reduce` with kind `log_sum_exp` requires real floating-point inputs but got `i32`",
+                "`reduce` with kind `log_sum_exp` requires floating-point or complex inputs but got `i32`",
             ),
             (
                 Array::new(ArrayType::new_static(DataType::Zero, [2]), Vec::new()).unwrap(),
                 ReductionKind::LogSumExp,
-                "`reduce` with kind `log_sum_exp` requires real floating-point inputs but got `zero`",
+                "`reduce` with kind `log_sum_exp` requires floating-point or complex inputs but got `zero`",
             ),
         ] {
             assert_eq!(input.reduce(&[], kind), Err(ProgramError::Type(TypeError::invalid(message))));
@@ -2944,6 +2970,29 @@ mod tests {
         assert_eq!(
             matrix.reduce(&[1], ReductionKind::LogSumExp),
             Ok(Array::vector(vec![expected, ((-2.0f64).exp() + (-1.0f64).exp() + 1.0).ln() + 6.0]).unwrap()),
+        );
+
+        // Complex inputs are shifted by the maximum of their real components, and the output is the principal logarithm
+        // of the shifted sum plus that shift. Negative infinity with a zero imaginary component contributes a zero
+        // exponential, like its real counterpart, which is why it is the padding of ragged complex reductions, and
+        // an empty reduction pins to it.
+        let first = ComplexNumber::new(1.0f64, 0.5);
+        let second = ComplexNumber::new(3.0f64, -2.0);
+        let shift = ComplexNumber::new(3.0f64, 0.0);
+        let expected = ((first - shift).exp() + (second - shift).exp()).ln() + shift;
+        for padding in [Vec::new(), vec![ComplexNumber::new(f64::NEG_INFINITY, 0.0)]] {
+            assert_eq!(
+                Array::vector([vec![first, second], padding].concat())
+                    .unwrap()
+                    .reduce(&[0], ReductionKind::LogSumExp),
+                Ok(Array::scalar(expected).unwrap()),
+            );
+        }
+        assert_eq!(
+            Array::new(ArrayType::new_static(DataType::C128, [0]), Vec::new())
+                .unwrap()
+                .reduce(&[0], ReductionKind::LogSumExp),
+            Ok(Array::scalar(ComplexNumber::new(f64::NEG_INFINITY, 0.0)).unwrap()),
         );
     }
 
@@ -3220,13 +3269,20 @@ mod tests {
             Err(TypeError::invalid("`reduce` with kind `product` requires numeric inputs but got `zero`")),
         );
 
-        // Only real floating-point formats have the exponential and logarithm that logarithmic sums are built from.
-        for data_type in [DataType::I32, DataType::Boolean, DataType::C64, DataType::Token, DataType::Zero] {
+        // Only floating-point and complex types have the exponential and logarithm that logarithmic sums are built
+        // from, and complex types represent the negative infinity that their shift starts from in the real component.
+        for data_type in [DataType::I32, DataType::Boolean, DataType::Token, DataType::Zero] {
             assert_eq!(
                 ArrayType::new_static(data_type, [2, 3]).reduce(&[1], ReductionKind::LogSumExp),
                 Err(TypeError::invalid(format!(
-                    "`reduce` with kind `log_sum_exp` requires real floating-point inputs but got `{data_type}`",
+                    "`reduce` with kind `log_sum_exp` requires floating-point or complex inputs but got `{data_type}`",
                 ))),
+            );
+        }
+        for data_type in [DataType::C64, DataType::C128] {
+            assert_eq!(
+                ArrayType::new_static(data_type, [2, 3]).reduce(&[1], ReductionKind::LogSumExp),
+                Ok(ArrayType::new_static(data_type, [2])),
             );
         }
 

@@ -1,6 +1,7 @@
 use crate::macros::{mlir_op, mlir_op_trait};
 use crate::{
-    Attribute, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Type, Value, ValueRef,
+    Attribute, Block, DetachedOp, DetachedRegion, DialectHandle, Error, Location, Operation, OperationBuilder,
+    OperationResultRef, Region, SingleBlock, Type, Value, ValueRef,
 };
 
 use super::attributes::{Precision, PrecisionAttributeRef, RaggedDotDimensionsAttributeRef};
@@ -245,6 +246,229 @@ pub fn top_k<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
         })
 }
 
+/// Name of the attribute storing the sizes of the input and initial value operand segments of [`ScanOperation`].
+pub const SCAN_OPERAND_SEGMENT_SIZES_ATTRIBUTE: &str = "operandSegmentSizes";
+
+/// Name of the attribute storing the sizes of the output and carry result segments of [`ScanOperation`].
+pub const SCAN_RESULT_SEGMENT_SIZES_ATTRIBUTE: &str = "resultSegmentSizes";
+
+/// Name of the [`ScanOperation::dimension`] attribute.
+pub const SCAN_DIMENSION_ATTRIBUTE: &str = "dimension";
+
+/// Name of the [`ScanOperation::scan_dimension_size`] attribute.
+pub const SCAN_DIMENSION_SIZE_ATTRIBUTE: &str = "scan_dim_size";
+
+/// Name of the [`ScanOperation::is_reverse`] attribute.
+pub const SCAN_IS_REVERSE_ATTRIBUTE: &str = "is_reverse";
+
+/// Name of the [`ScanOperation::is_associative`] attribute.
+pub const SCAN_IS_ASSOCIATIVE_ATTRIBUTE: &str = "is_associative";
+
+/// CHLO [`Operation`] that scans its [`ScanOperation::inputs`] along [`ScanOperation::dimension`], threading a set
+/// of carries through the single-block body region (i.e., [`SingleBlock::body`]). The carries start at
+/// [`ScanOperation::initial_values`] and, at each position along the scan dimension, the body receives one slice of
+/// every input (i.e., the input with the scan dimension removed) followed by the current carries, and returns one
+/// slice of every output followed by the updated carries:
+///
+/// ```text
+/// ^bb0(input_slice_0, ..., input_slice_n, carry_0, ..., carry_m):
+///   return output_slice_0, ..., output_slice_k, new_carry_0, ..., new_carry_m
+/// ```
+///
+/// The operation stacks the output slices along the scan dimension to form [`ScanOperation::outputs`] and returns
+/// the carries produced by the last step as [`ScanOperation::carries`]. Each body argument must be compatible with
+/// the corresponding input slice or initial value type, the number of carries equals the number of initial values,
+/// and at least one input or output must be present. The result types are inferred from the body terminator: each
+/// output has the type of its returned slice with the scan dimension size inserted at [`ScanOperation::dimension`]
+/// and each carry has the type of its returned value.
+///
+/// All inputs must have the same scan dimension size, which may also be stated explicitly using
+/// [`ScanOperation::scan_dimension_size`] (e.g., to provide a static output size when all inputs are dynamic along
+/// the scan dimension). When [`ScanOperation::is_reverse`] is true, the scan visits positions from last to first.
+/// [`ScanOperation::is_associative`] optionally declares whether the body computes an associative reduction, which
+/// allows compilers to use parallel (e.g., work-efficient tree) implementations instead of a sequential loop. This
+/// operation currently has no decomposition into StableHLO.
+///
+/// # Example
+///
+/// The following is an example of a [`ScanOperation`] that computes a cumulative sum along the second dimension,
+/// represented using its [`Display`](std::fmt::Display) rendering:
+///
+/// ```mlir
+/// // %input: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+/// // %init: [0.0, 0.0]
+/// %output, %carry = chlo.scan(%input) inits (%init) dimension=1  {
+/// ^bb0(%input: tensor<2xf32>, %carry: tensor<2xf32>):
+///   %0 = stablehlo.add %input, %carry : tensor<2xf32>
+///   stablehlo.return %0, %0 : tensor<2xf32>, tensor<2xf32>
+/// } : (tensor<2x3xf32>, tensor<2xf32>) -> (tensor<2x3xf32>, tensor<2xf32>)
+/// // %output: [[1.0, 3.0, 6.0], [4.0, 9.0, 15.0]]
+/// // %carry: [6.0, 15.0]
+/// ```
+///
+/// Refer to the [official CHLO specification](https://openxla.org/stablehlo/generated/chlo#chloscan_chloscanop)
+/// and the [XLA `Scan` semantics](https://openxla.org/xla/operation_semantics#scan) for more information.
+pub trait ScanOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + SingleBlock<'o, 'c, 't> {
+    /// Returns an [`Iterator`] over the inputs that are scanned along [`ScanOperation::dimension`].
+    fn inputs(&self) -> Result<impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(SCAN_OPERAND_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        Ok(range.map(|index| self.operand_value(index)))
+    }
+
+    /// Returns an [`Iterator`] over the initial values of the carries.
+    fn initial_values(&self) -> Result<impl Iterator<Item = Result<ValueRef<'o, 'c, 't>, Error>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(SCAN_OPERAND_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        Ok(range.map(|index| self.operand_value(index)))
+    }
+
+    /// Returns an [`Iterator`] over the outputs, which stack the per-step output slices along
+    /// [`ScanOperation::dimension`].
+    fn outputs(&self) -> Result<impl Iterator<Item = Result<OperationResultRef<'o, 'c, 't>, Error>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(SCAN_RESULT_SEGMENT_SIZES_ATTRIBUTE, 0)?;
+        Ok(range.map(|index| self.result(index)))
+    }
+
+    /// Returns an [`Iterator`] over the final carries produced by the last scan step.
+    fn carries(&self) -> Result<impl Iterator<Item = Result<OperationResultRef<'o, 'c, 't>, Error>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(SCAN_RESULT_SEGMENT_SIZES_ATTRIBUTE, 1)?;
+        Ok(range.map(|index| self.result(index)))
+    }
+
+    /// Returns the dimension of the inputs along which the scan is performed.
+    fn dimension(&self) -> Result<usize, Error> {
+        usize::try_from(self.integer_attribute(SCAN_DIMENSION_ATTRIBUTE)?.signed_value())
+            .map_err(|_| Error::invalid_argument("invalid `dimension` attribute in `chlo.scan`"))
+    }
+
+    /// Returns the explicitly specified size of the scan dimension, if one is present.
+    fn scan_dimension_size(&self) -> Result<Option<usize>, Error> {
+        if !self.has_attribute(SCAN_DIMENSION_SIZE_ATTRIBUTE) {
+            return Ok(None);
+        }
+        usize::try_from(self.integer_attribute(SCAN_DIMENSION_SIZE_ATTRIBUTE)?.signed_value())
+            .map(Some)
+            .map_err(|_| Error::invalid_argument("invalid `scan_dim_size` attribute in `chlo.scan`"))
+    }
+
+    /// Returns whether the scan visits positions from last to first, defaulting to false when the attribute is
+    /// absent.
+    fn is_reverse(&self) -> Result<bool, Error> {
+        if self.has_attribute(SCAN_IS_REVERSE_ATTRIBUTE) {
+            Ok(self.boolean_attribute(SCAN_IS_REVERSE_ATTRIBUTE)?.value())
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Returns whether the body is declared to compute an associative reduction, if that property is specified.
+    fn is_associative(&self) -> Result<Option<bool>, Error> {
+        if self.has_attribute(SCAN_IS_ASSOCIATIVE_ATTRIBUTE) {
+            Ok(Some(self.boolean_attribute(SCAN_IS_ASSOCIATIVE_ATTRIBUTE)?.value()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+mlir_op!(Scan);
+mlir_op_trait!(Scan, IsolatedFromAbove);
+mlir_op_trait!(Scan, OneRegion);
+mlir_op_trait!(Scan, SingleBlock);
+mlir_op_trait!(Scan, SingleBlockRegions);
+mlir_op_trait!(Scan, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`ScanOperation`] at the specified [`Location`], inferring the output and carry
+/// types from the terminator of `body`. The number of outputs is the number of terminator operands minus the number
+/// of `initial_values`. Refer to the documentation of [`ScanOperation`] for more information on the operation
+/// semantics and on the required body signature.
+///
+/// # Parameters
+///
+///   - `inputs`: Ranked tensors that are scanned along `dimension`, all with the same scan dimension size.
+///   - `initial_values`: Initial values of the carries, one for each carry that the body threads through the scan.
+///   - `dimension`: Dimension of the inputs along which the scan is performed.
+///   - `scan_dimension_size`: Optional explicit size of the scan dimension, which must match every input with a
+///     static size along `dimension`.
+///   - `is_reverse`: Whether the scan visits positions from last to first. The attribute is only attached when this
+///     is true because false is its default value.
+///   - `is_associative`: Optional declaration of whether `body` computes an associative reduction.
+///   - `body`: Single-block region whose arguments are the input slices followed by the carries and whose
+///     terminator returns the output slices followed by the updated carries.
+///   - `location`: Source location to attach to the operation.
+pub fn scan<
+    'input,
+    'initial_value,
+    'c: 'input + 'initial_value,
+    't: 'c,
+    Input: Value<'input, 'c, 't>,
+    InitialValue: Value<'initial_value, 'c, 't>,
+    L: Location<'c, 't>,
+>(
+    inputs: &[Input],
+    initial_values: &[InitialValue],
+    dimension: usize,
+    scan_dimension_size: Option<usize>,
+    is_reverse: bool,
+    is_associative: Option<bool>,
+    body: DetachedRegion<'c, 't>,
+    location: L,
+) -> Result<DetachedScanOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::chlo()?)?;
+
+    // Result type inference dereferences the body terminator without checking that it exists, so we validate it here
+    // before building the operation. The terminator operand count also determines the size of the output segment.
+    let terminator_operand_count = body
+        .blocks()?
+        .next()
+        .transpose()?
+        .map(|block| block.terminator())
+        .transpose()?
+        .flatten()
+        .map(|terminator| terminator.operand_count())
+        .ok_or_else(|| Error::invalid_argument("the body of `chlo::scan` must end with a terminator"))?;
+    let output_count = terminator_operand_count.checked_sub(initial_values.len()).ok_or_else(|| {
+        Error::invalid_argument("the body of `chlo::scan` must return at least one value for each initial value")
+    })?;
+    let segment_size = |size: usize| {
+        i32::try_from(size).map_err(|_| Error::invalid_argument("`chlo::scan` segment size exceeds the `i32` range"))
+    };
+    let operand_segment_sizes = [segment_size(inputs.len())?, segment_size(initial_values.len())?];
+    let result_segment_sizes = [segment_size(output_count)?, segment_size(initial_values.len())?];
+    let dimension =
+        i64::try_from(dimension).map_err(|_| Error::invalid_argument("`dimension` exceeds the signed 64-bit range"))?;
+
+    let mut builder = OperationBuilder::new("chlo.scan", location)
+        .add_operands(inputs)?
+        .add_operands(initial_values)?
+        .add_attribute(
+            SCAN_OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+            context.dense_i32_array_attribute(&operand_segment_sizes)?,
+        )?
+        .add_attribute(SCAN_RESULT_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&result_segment_sizes)?)?
+        .add_attribute(
+            SCAN_DIMENSION_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(64), dimension),
+        )?;
+    if let Some(scan_dimension_size) = scan_dimension_size {
+        let scan_dimension_size = i64::try_from(scan_dimension_size)
+            .map_err(|_| Error::invalid_argument("`scan_dimension_size` exceeds the signed 64-bit range"))?;
+        builder = builder.add_attribute(
+            SCAN_DIMENSION_SIZE_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(64), scan_dimension_size),
+        )?;
+    }
+    if is_reverse {
+        builder = builder.add_attribute(SCAN_IS_REVERSE_ATTRIBUTE, context.boolean_attribute(true))?;
+    }
+    if let Some(is_associative) = is_associative {
+        builder = builder.add_attribute(SCAN_IS_ASSOCIATIVE_ATTRIBUTE, context.boolean_attribute(is_associative))?;
+    }
+    builder.add_region(body)?.enable_result_type_inference().build().and_then(|operation| unsafe {
+        operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `chlo::scan`"))
+    })
+}
+
 /// CHLO [`Operation`] that multiplies two integer tensors element-wise and returns the most significant `N` bits
 /// of each full `2N`-bit product, where `N` is the operand element bit width. Both operands and the result have
 /// matching shapes and integer element types.
@@ -294,7 +518,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::chlo::attributes::Precision;
-    use crate::dialects::func;
+    use crate::dialects::{func, stable_hlo};
     use crate::{Attribute, Block, Context, Error, OneOperand, Operation, Size};
 
     use super::*;
@@ -503,6 +727,129 @@ mod tests {
         assert!(operation.remove_attribute(TOP_K_IS_STABLE_ATTRIBUTE));
         assert_eq!(operation.is_stable(), Ok(true));
         assert!(operation.verify());
+    }
+
+    #[test]
+    fn test_scan() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let input_type = context
+            .tensor_type(context.float32_type(), &[Size::Static(4), Size::Static(8)], None, location)
+            .unwrap();
+        let carry_type = context.tensor_type(context.float32_type(), &[Size::Static(4)], None, location).unwrap();
+        let module = context.module(location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(input_type, location), (carry_type, location)]);
+                let input = block.argument(0).unwrap();
+                let initial_value = block.argument(1).unwrap();
+                let mut body_block = context.block(&[(carry_type, location), (carry_type, location)]);
+                let sum = stable_hlo::add(body_block.argument(0).unwrap(), body_block.argument(1).unwrap(), location)
+                    .unwrap();
+                let sum = body_block.append_operation(sum).unwrap();
+                body_block
+                    .append_operation(
+                        stable_hlo::r#return(&[sum.result(0).unwrap(), sum.result(0).unwrap()], location).unwrap(),
+                    )
+                    .unwrap();
+                let operation =
+                    scan(&[input], &[initial_value], 1, None, false, None, body_block.try_into().unwrap(), location)
+                        .unwrap();
+                assert_eq!(operation.inputs().unwrap().collect::<Result<Vec<_>, _>>().unwrap(), vec![input]);
+                assert_eq!(
+                    operation.initial_values().unwrap().collect::<Result<Vec<_>, _>>().unwrap(),
+                    vec![initial_value],
+                );
+                let outputs = operation.outputs().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+                let carries = operation.carries().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(carries.len(), 1);
+                assert_eq!(outputs[0].r#type().unwrap(), input_type.as_ref());
+                assert_eq!(carries[0].r#type().unwrap(), carry_type.as_ref());
+                assert_eq!(operation.dimension(), Ok(1));
+                assert_eq!(operation.scan_dimension_size(), Ok(None));
+                assert_eq!(operation.is_reverse(), Ok(false));
+                assert_eq!(operation.is_associative(), Ok(None));
+                assert_eq!(operation.body().unwrap().argument_count(), 2);
+                let operation = block.append_operation(operation).unwrap();
+                block
+                    .append_operation(
+                        func::r#return(&[operation.result(0).unwrap(), operation.result(1).unwrap()], location)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                func::func(
+                    "scan_test",
+                    func::FuncAttributes {
+                        arguments: vec![input_type.into(), carry_type.into()],
+                        results: vec![input_type.into(), carry_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @scan_test(%arg0: tensor<4x8xf32>, %arg1: tensor<4xf32>) \
+                      -> (tensor<4x8xf32>, tensor<4xf32>) {
+                    %0:2 = chlo.scan(%arg0) inits (%arg1) dimension=1  {
+                    ^bb0(%input: tensor<4xf32>, %carry: tensor<4xf32>):
+                      %1 = stablehlo.add %input, %carry : tensor<4xf32>
+                      stablehlo.return %1, %1 : tensor<4xf32>, tensor<4xf32>
+                    } : (tensor<4x8xf32>, tensor<4xf32>) -> (tensor<4x8xf32>, tensor<4xf32>)
+                    return %0#0, %0#1 : tensor<4x8xf32>, tensor<4xf32>
+                  }
+                }
+            "},
+        );
+
+        // Check the optional attributes and the body validation.
+        let block = context.block(&[(input_type, location), (carry_type, location)]);
+        let mut body_block = context.block(&[(carry_type, location), (carry_type, location)]);
+        let sum = stable_hlo::add(body_block.argument(0).unwrap(), body_block.argument(1).unwrap(), location).unwrap();
+        let sum = body_block.append_operation(sum).unwrap();
+        body_block
+            .append_operation(
+                stable_hlo::r#return(&[sum.result(0).unwrap(), sum.result(0).unwrap()], location).unwrap(),
+            )
+            .unwrap();
+        let operation = scan(
+            &[block.argument(0).unwrap()],
+            &[block.argument(1).unwrap()],
+            1,
+            Some(8),
+            true,
+            Some(true),
+            body_block.try_into().unwrap(),
+            location,
+        )
+        .unwrap();
+        assert!(operation.verify());
+        assert_eq!(operation.scan_dimension_size(), Ok(Some(8)));
+        assert_eq!(operation.is_reverse(), Ok(true));
+        assert_eq!(operation.is_associative(), Ok(Some(true)));
+        assert!(matches!(
+            scan(
+                &[block.argument(0).unwrap()],
+                &[block.argument(1).unwrap()],
+                1,
+                None,
+                false,
+                None,
+                context.block(&[(carry_type, location), (carry_type, location)]).try_into().unwrap(),
+                location,
+            ),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "the body of `chlo::scan` must end with a terminator",
+        ));
     }
 
     #[test]
