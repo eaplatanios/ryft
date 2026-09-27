@@ -457,28 +457,11 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Forward-mode rule for [`ReduceOperation`]. The additive reductions ([`Sum`](ReductionKind::Sum) /
-// [`Mean`](ReductionKind::Mean)) are linear in the input, so the tangent is the same reduction applied to the
-// input tangent. [`Max`](ReductionKind::Max) / [`Min`](ReductionKind::Min) route their tangent through a
-// primal-domain argmax mask: the tangent of `reduce_max(x)` along the reduced axes is `reduce_sum(mask * Δx)`, where
-// `mask` equals `1` exactly at the per-reduction extremal positions (ties split evenly, matching the JAX convention).
-// The mask is staged capture-free as ordinary primal operations — a `compare` of the input primal against the
-// broadcast-back reduced value, followed by an ordinary `mul` against the input tangent — so no residual factor is
-// captured. [`Any`](ReductionKind::Any) / [`All`](ReductionKind::All) are Boolean reductions with no tangent and are
-// rejected with [`UnsupportedOperation`](ProgramError::UnsupportedOperation). The shared all-zero fast path handles a
-// zero input tangent before this rule is consulted, so the input tangent reaching every supported case is live.
 impl_differentiable_operation! {
     ReduceOperation,
     jvp<C>
     where
         C: Context<Type = ArrayType>,
-        C::Operation: From<ReduceOperation>
-            + From<BroadcastOperation>
-            + From<CompareOperation<ArrayType>>
-            + From<DivOperation<ArrayType>>
-            + From<MulOperation<ArrayType>>,
         C::Value: Reduce
             + Exp
             + Sub
@@ -490,8 +473,22 @@ impl_differentiable_operation! {
             + Mul
             + Select
             + ZeroLike,
+        C::Operation: From<ReduceOperation>
+            + From<BroadcastOperation>
+            + From<CompareOperation<ArrayType>>
+            + From<DivOperation<ArrayType>>
+            + From<MulOperation<ArrayType>>,
     {
         |operation, context, _driver, inputs| {
+            // The additive reductions (i.e., `Sum` and `Mean`) are linear in the input, so the tangent is the same
+            // reduction applied to the input tangent. `Max` and `Min` route their tangent through a primal-domain
+            // argmax mask: the tangent of `reduce_max(x)` along the reduced axes is `reduce_sum(mask * Δx)`, where
+            // `mask` equals `1` exactly at the per-reduction extremal positions (ties split evenly, matching the JAX
+            // convention). The mask is staged capture-free as ordinary primal operations (a `compare` of the input
+            // primal against the broadcast-back reduced value, followed by an ordinary `mul` against the input tangent)
+            // so no residual factor is captured. `Any` and `All` are Boolean reductions with no tangent and are
+            // rejected with `ProgramError::UnsupportedOperation`. The shared all-zero fast path handles a zero input
+            // tangent before this rule is consulted, so the input tangent reaching every supported case is live.
             check_count!("input", inputs, 1, ProgramError);
             match operation.kind() {
                 ReductionKind::Sum | ReductionKind::Mean => {
@@ -510,7 +507,7 @@ impl_differentiable_operation! {
                 }
                 ReductionKind::LogSumExp => {
                     // Differentiate through the normalized exponential weights. All-negative-infinity slices retain
-                    // their undefined (NaN) derivative instead of concealing it with a special-case weight.
+                    // their undefined (i.e., NaN) derivative instead of concealing it with a special-case weight.
                     let primal_input = inputs[0].primal();
                     let primal = primal_input.reduce(operation.axes(), ReductionKind::LogSumExp)?;
                     let tangent = match inputs[0].tangent() {
@@ -523,15 +520,18 @@ impl_differentiable_operation! {
                             } else {
                                 DataType::F32
                             };
+
                             // Keep normalization and the weighted sum widened, just like the primal reduction.
                             let primal_input = primal_input.convert_element_type(working_data_type)?;
                             let input_tangent = input_tangent.convert_element_type(working_data_type)?;
                             let input_type = primal_input.r#type().into_owned();
                             let output_axes = output_to_input_axis_map(input_type.rank(), operation.axes.as_slice());
-                            // Normalize before adding the maximum back: the rounded logarithmic output can lose the
+
+                            // Normalize before adding the maximum back as the rounded logarithmic output can lose the
                             // normalization term entirely when the inputs share a large finite offset.
                             let maximum = primal_input.reduce(operation.axes(), ReductionKind::Max)?;
-                            // Nonfinite maxima cannot be used as shifts. Preserve zero weights on finite inputs
+
+                            // Non-finite maxima cannot be used as shifts. Preserve zero weights on finite inputs
                             // next to positive infinity, while the infinite inputs retain undefined derivatives.
                             let zero = maximum.zero_like()?;
                             let finite = maximum.sub(&maximum)?.equal(&zero)?;
@@ -552,10 +552,9 @@ impl_differentiable_operation! {
                     Ok(vec![DifferentiationDual::new(primal, tangent)?])
                 }
                 kind @ (ReductionKind::Max | ReductionKind::Min) => {
-                    // Stage the argmax mask from the input primal capture-free: `compare` the input primal against
-                    // the broadcast-back reduced value (an ordinary `compare`/`broadcast`), convert it to the tangent
-                    // type, normalize it by the number of ties, and route the input tangent through that normalized
-                    // mask.
+                    // Stage the argmax mask from the input primal capture-free: `compare` the input primal against the
+                    // broadcast-back reduced value (an ordinary `compare`/`broadcast`), convert it to the tangent type,
+                    // normalize it by the number of ties, and route the input tangent through that normalized mask.
                     let primal_input = inputs[0].primal();
                     let primal = primal_input.reduce(operation.axes(), kind)?;
                     let input_type = primal_input.r#type().into_owned();
@@ -587,9 +586,6 @@ impl_differentiable_operation! {
             }
         }
     },
-    // Sum transposes by broadcasting the cotangent over the reduced axes; Mean also divides by the reduced
-    // element count. Nonlinear reductions instead differentiate through the linear operations staged by their JVP.
-    // A runtime-sized reduced axis requires linearization to retain its extent as a first-class residual.
     transpose<V, O>
     where
         V: Value<Type = ArrayType>,
@@ -598,6 +594,9 @@ impl_differentiable_operation! {
             + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
+            // `Sum` transposes by broadcasting the cotangent over the reduced axes. `Mean` also divides by the reduced
+            // element count. Non-linear reductions instead differentiate through the linear operations staged by their
+            // JVP. A runtime-sized reduced axis requires linearization to retain its extent as a first-class residual.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -606,6 +605,7 @@ impl_differentiable_operation! {
                     message: format!("operation `{}` is not transposable", operation.name()),
                 }.into());
             }
+
             let input_type = inputs[0].r#type();
             let input_shape = input_type.shape();
             match &outputs[0] {
@@ -621,11 +621,12 @@ impl_differentiable_operation! {
                         {
                             return Err(ProgramError::UnsupportedOperation {
                                 message: format!(
-                                    "direct transposition of `{}` with kind `{}` over reduced axis {axis} of \
-                                     {input_shape} requires linearization so that the runtime extent can be \
-                                     retained as a residual",
+                                    "direct transposition of `{}` with kind `{}` over reduced axis {} of {} requires \
+                                     linearization so that the runtime extent can be retained as a residual",
                                     operation.name(),
                                     operation.kind(),
+                                    axis,
+                                    input_shape,
                                 ),
                             }
                             .into());
@@ -634,14 +635,15 @@ impl_differentiable_operation! {
                         if !accumulators[0].is_needed() {
                             return Ok(());
                         }
+
                         let output_type = input_type.cotangent()?;
                         let output_axes = output_to_input_axis_map(input_shape.rank(), &operation.axes);
                         let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
                         let cotangent_input = match operation.kind {
                             ReductionKind::Sum => broadcasted,
                             ReductionKind::Mean => {
-                                // The check above rejected every runtime-sized reduced axis, so each reduced extent is
-                                // statically known here.
+                                // The check above rejected every runtime-sized reduced axis, so each reduced extent
+                                // is statically known here.
                                 let reduced_extents = operation
                                     .axes
                                     .iter()
@@ -660,6 +662,7 @@ impl_differentiable_operation! {
                                     })?
                                 };
                                 let inverse_count = 1.0 / element_count as f64;
+
                                 // Stage a rank-zero literal holding `1 / N` and rely on implicit rank-zero broadcasting
                                 // in the subsequent multiplication to scale the broadcast-back cotangent to the input
                                 // shape.
@@ -671,15 +674,16 @@ impl_differentiable_operation! {
                         };
                         accumulators[0].accumulate(context, MaybeZero::Value(cotangent_input))
                     }
-                    other => Err(TypeError::invalid(format!(
-                        "`{other}` reduction is not directly transposable"
-                    ))
-                    .into()),
+                    other => Err(
+                        TypeError::invalid(format!("`{other}` reduction is not directly transposable")).into(),
+                    ),
                 },
             }
         }
     },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Parent-context JVP rule for [`ReduceOperation`]. Fully static reductions delegate to the homogeneous projected
 // rule. Dynamically shaped numeric reductions retain their exact input extents as ordinary residual values so their
