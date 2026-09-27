@@ -1,10 +1,14 @@
+use crate::programs::{Operation, Type, TypeError};
+
+// TODO(eaplatanios): Review this module and also add a module docstring that follows our established conventions.
+
+pub mod associative_scan;
 pub mod condition;
 pub mod scan;
 pub mod select;
 pub mod r#while;
 
-use crate::programs::{Operation, Type, TypeError};
-
+pub use associative_scan::associative_scan;
 pub use condition::{CONDITION_OPERATION_NAME, ConditionOperation, transpose_primal_condition};
 pub use scan::{SCAN_OPERATION_NAME, ScanOperation, ScanReferenceDischarge, transpose_primal_scan};
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};

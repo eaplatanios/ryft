@@ -913,7 +913,8 @@ mod tests {
         let mesh = cpu_mesh(&client);
         // Forward real sums lower to `chlo.scan` on GPU targets, while reverse sums keep the full-prefix
         // `reduce_window` form. Small integral values keep every `f32` prefix sum exact, so both forms must agree with
-        // the sequential scan bit for bit, including along a scanned axis longer than one CUB block.
+        // the sequential scan bit for bit, including along a scanned axis longer than one thousand elements, which
+        // spans several levels of the parallel scan.
         let (rows, columns) = (3, 1025);
         let values = (0..rows * columns).map(|index| (index % 7) as f32).collect::<Vec<_>>();
         let input = Array::from_host_buffer(

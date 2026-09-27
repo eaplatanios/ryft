@@ -133,8 +133,8 @@ pub use operations::{
     TanhOperation, Tolerance, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
     UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WhileOperation,
     WhilePredicate, WhileTypeSemantics, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME,
-    ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, custom_derivative_at, custom_jvp,
-    custom_vjp, forward_collective_to_parent, transpose_primal_condition, transpose_primal_scan,
+    ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan, custom_derivative_at,
+    custom_jvp, custom_vjp, forward_collective_to_parent, transpose_primal_condition, transpose_primal_scan,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

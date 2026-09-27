@@ -11743,16 +11743,18 @@ fn build_cumulative_body_region<'c, 't>(
 /// inert.
 ///
 /// The window form looks quadratic, but it is the same emission JAX's `cumred_reduce_window_impl` produces, and XLA's
-/// `TryOptimizeAssociativeScan` rewriter is documented to recognize the forward full-prefix-window shape and rewrite
-/// it into a logarithmic-depth parallel scan. Whether the reverse padding is matched by the same rewriter has not
-/// been verified here, so a reverse scan may execute as the window form it is emitted as.
+/// `TryOptimizeAssociativeScan` rewriter recognizes the full-prefix-window shape and rewrites it into a
+/// logarithmic-depth tree of strided `reduce-window`s. On the pinned XLA version, the rewriter matches both the forward
+/// and the reverse padding (observed in the optimized HLO of a CUDA compilation).
 ///
 /// On GPU targets (i.e., when `target_platform` is `"cuda"` or `"rocm"`), a forward [`CumulativeKind::Sum`] over a
 /// statically shaped real numeric operand lowers to a
 /// [`chlo.scan`](https://openxla.org/stablehlo/generated/chlo#chloscan_chloscanop) instead, which is what JAX's
-/// `_cumred_gpu_lowering` emits and what XLA's GPU backend implements with a dedicated (CUB-backed) prefix-sum kernel. The scan carries one running sum per row of the unscanned axes, seeded with the sum
+/// `_cumred_gpu_lowering` emits. The scan carries one running sum per row of the unscanned axes, seeded with the sum
 /// identity, and its body adds each slice to that carry. Reverse, Boolean, and complex sums keep the window form, as
-/// they do in JAX.
+/// they do in JAX. XLA imports the scan as an associative HLO `scan`, which leaves the choice of a scan implementation
+/// to the GPU backend; the pinned XLA version has no dedicated (e.g., CUB-backed) prefix-sum kernel and expands it
+/// into the same logarithmic-depth `reduce-window` tree as the window form.
 fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
     kind: CumulativeKind,
     axis: usize,
