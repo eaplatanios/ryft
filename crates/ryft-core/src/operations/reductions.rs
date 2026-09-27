@@ -1017,15 +1017,16 @@ impl Reduce for Array {
                     // Narrow inputs were already widened above, but reassociation in other backends can still
                     // change the final rounding.
                     let zero = Element::zero()?;
-                    let mut maximums = self.reduce_elements::<Element>(
-                        output_type.clone(),
-                        axes,
-                        Element::max_identity(),
-                        |left, right| Ok(ArrayElement::max(&left, &right)),
-                    )?;
-                    maximums.map_elements_in_place::<Element>(|value| {
-                        Ok(if value.convert_to::<f64>()?.is_finite() { value } else { zero })
-                    })?;
+                    let maximums = self
+                        .reduce_elements::<Element>(
+                            output_type.clone(),
+                            axes,
+                            Element::max_identity(),
+                            |left, right| Ok(ArrayElement::max(&left, &right)),
+                        )?
+                        .map_elements::<Element, Element>(output_type.clone(), |value| {
+                            Ok(if value.convert_to::<f64>()?.is_finite() { value } else { zero })
+                        })?;
 
                     // Accumulate the shifted exponentials of every input element into the output element that its
                     // non-reduced coordinates address, starting each sum from zero. Primitive floating-point types
@@ -1157,23 +1158,6 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 // TODO(eaplatanios): Review from here onwards.
 
 impl Array {
-    /// Replaces every element of this array in place through one typed function. The physical layout is preserved,
-    /// and uniquely owned output buffers are mutated without another payload allocation.
-    fn map_elements_in_place<T: ArrayElement>(
-        &mut self,
-        function: impl Fn(T) -> Result<T, ProgramError>,
-    ) -> Result<(), ProgramError> {
-        debug_assert_eq!(self.r#type().data_type(), T::data_type());
-        let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-        let bytes = self.storage_bytes_mut();
-        for element in 0..addressing.element_count() {
-            let range = addressing.byte_range_for_flat_index(element);
-            let value = T::decode(&bytes[range.clone()]);
-            function(value)?.encode(&mut bytes[range]);
-        }
-        Ok(())
-    }
-
     /// Reduces typed elements directly from addressed input storage into one addressed output buffer. `identity`
     /// initializes every output cell, including those whose reduced axes are empty.
     fn reduce_elements<T: ArrayElement>(
@@ -1223,14 +1207,14 @@ impl Array {
         axes: &[usize],
         mean: bool,
     ) -> Result<Self, ProgramError> {
-        let mut output = self.reduce_elements::<T>(output_type, axes, T::zero()?, T::add)?;
-        if mean {
-            let shape = self.r#type().static_shape().unwrap();
-            let count = axes.iter().map(|axis| shape[*axis]).product::<usize>();
-            let count = if T::data_type().is_integer() { count.max(1) } else { count };
-            output.map_elements_in_place::<T>(|value| value.divide_by_count(count))?;
+        let output = self.reduce_elements::<T>(output_type.clone(), axes, T::zero()?, T::add)?;
+        if !mean {
+            return Ok(output);
         }
-        Ok(output)
+        let shape = self.r#type().static_shape().unwrap();
+        let count = axes.iter().map(|axis| shape[*axis]).product::<usize>();
+        let count = if T::data_type().is_integer() { count.max(1) } else { count };
+        output.map_elements::<T, T>(output_type, |value| value.divide_by_count(count))
     }
 }
 
