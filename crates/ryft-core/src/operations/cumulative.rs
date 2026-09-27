@@ -24,7 +24,7 @@
 //! The identity of each combining operator matters beyond the empty-prefix case: it is what the batching rule writes
 //! over the padding of a bounded ragged scanned axis (refer to [`RaggedMaskIdentity`]), so that padded positions cannot
 //! contribute to any live prefix. Masking is where cumulative batching parts company with a reduction's: a prefix scan
-//! keeps every axis it touches, so it _consumes_ no bounded ragged axis. The operand's ragged axes ride through onto
+//! keeps every axis it touches, so it _consumes_ no bounded ragged axis. The input's ragged axes ride through onto
 //! the result unchanged and the rule reports no consumption evidence. A scan whose axis is not ragged never reaches the
 //! masking hook at all, and so passes through exactly as it would with no ragged metadata.
 //!
@@ -77,10 +77,11 @@ use crate::operations::control_flow::associative_scan::associative_scan;
 use crate::operations::exponential::{LOG_ADD_EXP_OPERATION_NAME, LogAddExp, LogAddExpOperation};
 use crate::operations::extrema::{Max, MaxOperation, Min, MinOperation};
 use crate::operations::logical::OrOperation;
-use crate::operations::manipulation::broadcasting::BroadcastOperation;
+use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::manipulation::concatenation::ConcatenateOperation;
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::slicing::SliceOperation;
+use crate::operations::reductions::multiply_product_elements;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, ProvenanceScope, RegionInterface,
@@ -103,7 +104,9 @@ pub enum CumulativeKind {
 
     /// Prefix product. The identity is `1` and the combiner is multiplication. Real and complex numeric inputs are
     /// supported, as is the payload-free structural zero, every prefix product of which is again zero. Integer inputs
-    /// wrap in their element data type.
+    /// wrap in their element data type. Note that, like [`ReductionKind::Product`](crate::ReductionKind::Product), a
+    /// complex operand that is exactly `1 + 0i` returns the other operand, because complex multiplication by it is not
+    /// exact for infinite components.
     Product,
 
     /// Running maximum. The identity is the element data type's lowest value (i.e., negative infinity for the
@@ -124,7 +127,7 @@ pub enum CumulativeKind {
     /// differently in their last bits.
     ///
     /// Real floating-point and complex inputs are supported. Complex prefixes use the principal logarithm of the
-    /// elementwise [`LogAddExp`] operation, so their imaginary components stay in `[-π, π)`. An operand whose real
+    /// elementwise [`LogAddExp`] operation, so their imaginary components stay in `[-π, π]`. An operand whose real
     /// component is negative infinity has a zero exponential whatever its imaginary component, and so the combiner
     /// returns the other operand unchanged. That shortcut is exact, and it is what keeps complex prefixes over such
     /// operands defined: the elementwise complex combination of two of them would subtract `-∞` from `-∞` and produce
@@ -207,7 +210,7 @@ impl CumulativeOperation {
         self
     }
 
-    /// Returns the scanned axis, in the operand's own coordinate system.
+    /// Returns the scanned axis, in the input's own coordinate system.
     #[inline]
     pub fn axis(&self) -> usize {
         self.axis
@@ -293,8 +296,8 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         // The scanned axis is expressed in the per-item coordinate system and therefore cannot name the inserted batch
-        // dimension, so an axis at or after the batch axis shifts past it. A prefix scan preserves its operand's rank,
-        // and so the output batch axis is the input batch axis itself. A replicated operand carries no inserted batch
+        // dimension, so an axis at or after the batch axis shifts past it. A prefix scan preserves its input's rank,
+        // and so the output batch axis is the input batch axis itself. A replicated input carries no inserted batch
         // dimension, so its scanned axis needs no shift. Ragged axes are packed positions in both cases, and so the
         // masking and rewrapping below use the lifted axis.
         check_count!("input", inputs, 1, ProgramError);
@@ -306,8 +309,10 @@ where
         };
 
         // Padding along a *scanned* ragged axis is neutralized with the identity of the combining operator first, so
-        // that padded positions cannot contribute to any live prefix.
-        let input = match inputs[0].ragged_axes().iter().any(|ragged_axis| ragged_axis.axis() == lifted_axis) {
+        // that padded positions cannot contribute to any live prefix. A payload-free structural zero needs no masking,
+        // because every element of it (padding included) is the same zero, whose every prefix sum or product is zero.
+        let scans_ragged_axis = inputs[0].ragged_axes().iter().any(|ragged_axis| ragged_axis.axis() == lifted_axis);
+        let input = match scans_ragged_axis && !inputs[0].r#type().data_type().is_zero() {
             true => {
                 let identity = match self.kind {
                     CumulativeKind::Sum => RaggedMaskIdentity::Zero,
@@ -328,7 +333,7 @@ where
         )?;
         check_count!("output", outputs, 1, ProgramError);
 
-        // Interpretation carries values rather than batch metadata, so the operand's ragged axes are restored here. A
+        // Interpretation carries values rather than batch metadata, so the input's ragged axes are restored here. A
         // scan consumes none of them, and so the rule reports no consumption evidence.
         let output = ArrayBatch::new(outputs.remove(0).into_value(), output_batch_axis)?
             .with_ragged_axes(input.ragged_axes().to_vec())?;
@@ -343,6 +348,7 @@ impl_differentiable_operation! {
         C: Context<Type = ArrayType>,
         C::Operation: From<CumulativeOperation>
             + From<AddOperation<ArrayType>>
+            + From<BroadcastOperation>
             + From<ConcatenateOperation<ArrayType>>
             + From<LogAddExpOperation<ArrayType>>
             + From<MaxOperation<ArrayType>>
@@ -357,12 +363,12 @@ impl_differentiable_operation! {
         C::Value: Cumulative,
     {
         |operation, context, driver, inputs| {
-            // A cumulative sum is linear in its operand, so its tangent is the same prefix sum of the input tangent.
+            // A cumulative sum is linear in its input, so its tangent is the same prefix sum of the input tangent.
             // Every other kind is nonlinear, so its rule differentiates through the associative-scan decomposition with
             // the kind's own combining operator, and every primitive that construction stages contributes its own
             // forward-mode rule. The composite array universe reaches this rule through the default projected
             // fall-through of `MemberDifferentiableOperation`, because the operation is shape-preserving and its
-            // operand never needs the replication that a broadcasting elementwise member does.
+            // input never needs the replication that a broadcasting elementwise member does.
             check_count!("input", inputs, 1, ProgramError);
             let (axis, kind, reverse) = (operation.axis, operation.kind, operation.reverse);
             let primal_input = inputs[0].primal();
@@ -567,8 +573,8 @@ pub trait Cumulative: Sized {
 impl Cumulative for Array {
     fn cumulative(&self, axis: usize, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError> {
         // The type rule validates the scan and supplies the complete output metadata. The kernels below then decode the
-        // operand's logical elements, run the sequential prefix scan over them with the kind's element-level combining
-        // operator, and re-encode the result into the operand's own type. Accumulation happens in the operand's element
+        // input's logical elements, run the sequential prefix scan over them with the kind's element-level combining
+        // operator, and re-encode the result into the input's own type. Accumulation happens in the input's element
         // data type, so a low-precision payload rounds every partial result exactly as a staged program does.
         let output_type = self.r#type().cumulative(axis, kind)?;
         let data_type = output_type.data_type();
@@ -586,7 +592,7 @@ impl Cumulative for Array {
                     let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
                         match kind {
                             CumulativeKind::Sum => NumericArrayElement::add(left, right),
-                            _ => NumericArrayElement::mul(left, right),
+                            _ => multiply_product_elements(left, right),
                         }
                     })?;
                     Self::from_elements(output_type, scanned.as_slice())
@@ -620,23 +626,21 @@ impl Cumulative for Array {
                     })?;
 
                     // A prefix that no combination produced (i.e., the first element, or one that follows a prefix
-                    // whose real component is negative infinity) is still a raw input, so its phase is wrapped onto
-                    // the principal branch that every combined prefix already lies on. In-range phases are kept as
-                    // they are, so that tiny ones do not round away through the shift by `pi`.
+                    // whose real component is negative infinity) is still a raw input, so its phase is brought onto
+                    // the principal branch `[-π, π]` that every combined prefix already lies on. In-range phases are
+                    // kept as they are, and others are reduced through `atan2` of their sine and cosine, which reduce
+                    // even huge arguments exactly, unlike a floating-point remainder by `2π`.
                     let scanned = match data_type.is_complex() {
                         true => scanned
                             .into_iter()
                             .map(|value| {
                                 let complex = value.convert_to::<Complex<f64>>()?;
                                 let pi = std::f64::consts::PI;
-                                if complex.im >= -pi && complex.im < pi {
+                                if (-pi..=pi).contains(&complex.im) {
                                     return Ok(value);
                                 }
-                                let mut imaginary = (complex.im + pi) % (2.0 * pi);
-                                if imaginary < 0.0 {
-                                    imaginary += 2.0 * pi;
-                                }
-                                Element::from_complex(Complex::new(complex.re, imaginary - pi))
+                                let reduced = complex.im.sin().atan2(complex.im.cos());
+                                Element::from_complex(Complex::new(complex.re, reduced))
                             })
                             .collect::<Result<Vec<_>, ProgramError>>()?,
                         false => scanned,
@@ -749,11 +753,14 @@ type DecompositionTracer<C> = Tracer<TracingContext<<C as Domain>::Constant, <C 
 /// The decomposition is traced once into its own program over the caller's operation family, that program is
 /// differentiated through the instruction-scoped `driver` (which re-enters the active differentiation machinery, so
 /// every primitive the construction stages contributes its *own* forward-mode rule), and the resulting fused program is
-/// replayed in `context` over the operand's primal and tangent. The primal output comes back from the decomposition
-/// too, rather than from the cumulative primitive, because the two are the same value (up to the sign of zero results)
-/// and the fused program computes it on the way to the tangent. When the primal and tangent contexts differ, the
-/// decomposition is linearized instead, its primal half is replayed in the primal context, and its tangent half is
-/// replayed in the tangent context over the transferred residuals.
+/// replayed in `context` over the input's primal and tangent. The primal output comes back from the decomposition too,
+/// rather than from the cumulative primitive, because the fused program computes it on the way to the tangent. The two
+/// agree mathematically but not always bit for bit: the decomposition associates its combinations differently (so
+/// floating-point results can differ in their last bits), turns `-0.0` results into `+0.0` when it interleaves, and
+/// combines complex log-sum-exp prefixes without the primitive's `-∞` guard and without wrapping the first prefix onto
+/// the principal branch. JAX's `_cumulative_jvp_rule` has the same properties. When the primal and tangent contexts
+/// differ, the decomposition is linearized instead, its primal half is replayed in the primal context, and its tangent
+/// half is replayed in the tangent context over the transferred residuals.
 ///
 /// The caller is responsible for the structural-zero tangent shortcut; this function requires a live tangent because
 /// the decomposition is pure overhead when there is nothing to propagate.
@@ -762,8 +769,8 @@ type DecompositionTracer<C> = Tracer<TracingContext<<C as Domain>::Constant, <C 
 ///
 ///   - `context`: [`DifferentiationContext`] that the forward-mode program is replayed in.
 ///   - `driver`: Instruction-scoped [`DifferentiationDriver`] serving the nested differentiation request.
-///   - `primal`: Operand primal.
-///   - `tangent`: Operand tangent.
+///   - `primal`: Input primal.
+///   - `tangent`: Input tangent.
 ///   - `axis`: Scanned axis.
 ///   - `reverse`: Whether the scan accumulates from the end of the scanned axis toward its start.
 ///   - `combine`: Associative combining operator of the kind, staged over the nested trace's values.
@@ -780,6 +787,7 @@ where
     C: Context<Type = ArrayType>,
     D: DifferentiationDriver<C>,
     C::Operation: From<AddOperation<ArrayType>>
+        + From<BroadcastOperation>
         + From<ConcatenateOperation<ArrayType>>
         + From<OrOperation<ArrayType>>
         + From<PadOperation<ArrayType>>
@@ -790,17 +798,26 @@ where
     F: Fn(&DecompositionTracer<C>, &DecompositionTracer<C>) -> Result<DecompositionTracer<C>, ProgramError>,
 {
     // The decomposition is staged under the framework's differentiation scope, so that its instructions are attributed
-    // to this rule rather than only to the `associative_scan` function that stages them.
+    // to this rule rather than only to the `associative_scan` function that stages them. Its manipulation primitives
+    // do not carry an explicit input layout through (layouts are rank-specific), so the output is constrained back onto
+    // the input's layout with an identity broadcast, which is what backends lower as a layout constraint (e.g., XLA's
+    // `LayoutConstraint` custom call, which JAX's `with_layout_constraint` also emits). The primal and tangent outputs
+    // then have exactly the type of the primitive's output.
+    let input_type = primal.r#type().into_owned();
     let (_, decomposition) = TracingContext::<C::Constant, C::Operation>::trace::<_, ArrayType, _>(
         |value: DecompositionTracer<C>| {
             let domain = value.dispatch_domain();
             domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
                 domain.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
-                    associative_scan(&value, axis, reverse, &combine)
+                    let output = associative_scan(&value, axis, reverse, &combine)?;
+                    match input_type.layout() {
+                        Some(_) => output.broadcast(input_type.clone(), &(0..input_type.rank()).collect::<Vec<_>>()),
+                        None => Ok(output),
+                    }
                 })
             })
         },
-        primal.r#type().into_owned(),
+        input_type.clone(),
     )?;
     if std::ptr::eq(context.primal(), context.tangent()) {
         let fused = driver.jvp_program(decomposition.entry_region_ref(), &[0])?;
@@ -1002,7 +1019,7 @@ mod tests {
 
     #[test]
     fn test_cumulative_batching() {
-        // A replicated operand carries no inserted batch dimension, so the scanned axis needs no shift.
+        // A replicated input carries no inserted batch dimension, so the scanned axis needs no shift.
         check_operation_batching!(
             @exact,
             operation = CumulativeOperation::new(0, CumulativeKind::Sum),
@@ -1082,9 +1099,10 @@ mod tests {
         // neutralize that padding with the identity of the kind's combining operator first. Static array batching
         // cannot, and says so (naming that identity) rather than silently scanning padding.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let ragged_axes = vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), variable, vec![0])];
         let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), variable, vec![0])])
+            .with_ragged_axes(ragged_axes.clone())
             .unwrap();
         for (kind, identity) in [
             (CumulativeKind::Sum, "Zero"),
@@ -1106,6 +1124,28 @@ mod tests {
                     ),
                 }),
             );
+        }
+
+        // Every element of a payload-free structural zero, padding included, is the same zero, so its prefix sums and
+        // products need no mask at all (and there is no `one` of that type to write) and pass the ragged axis through.
+        let zero = ArrayBatch::new(
+            Array::new(ArrayType::new_static(DataType::Zero, [2, 3]), Vec::new()).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap()
+        .with_ragged_axes(ragged_axes)
+        .unwrap();
+        for kind in [CumulativeKind::Sum, CumulativeKind::Product] {
+            let (outputs, evidence) = CumulativeOperation::new(0, kind)
+                .batch(
+                    &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                    &EmptyRegionDriver,
+                    std::slice::from_ref(&zero),
+                )
+                .unwrap()
+                .into_parts();
+            assert_eq!(outputs, vec![zero.clone()]);
+            assert!(evidence.is_empty());
         }
 
         // The composite dynamic policy can, and stages the mask ahead of the scan: the padded positions of the scanned
@@ -1469,6 +1509,47 @@ mod tests {
     }
 
     #[test]
+    fn test_cumulative_differentiation_layout() {
+        // The decomposition's manipulation primitives drop an explicit layout, so the rule constrains its output back
+        // onto the input's layout, and the primal and tangent outputs have exactly the primitive's output type. Their
+        // logical values are those of the same derivative without the layout.
+        let laid_out =
+            ArrayType::new_static(DataType::F64, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 16])));
+        let jvp = |r#type: &ArrayType| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(r#type.clone());
+            let outputs = builder
+                .add_instruction(
+                    ArrayOperation::from(CumulativeOperation::new(1, CumulativeKind::Max)),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap()
+                .jvp()
+                .unwrap()
+        };
+        let laid_out_jvp = jvp(&laid_out);
+        assert_eq!(laid_out_jvp.output_types(), vec![laid_out.clone(), laid_out.clone()]);
+        let values = |r#type: &ArrayType, values: &[f64]| Array::from_elements::<f64>(r#type.clone(), values).unwrap();
+        let plain = laid_out.clone().with_layout(None);
+        let laid_out_outputs = laid_out_jvp
+            .interpret(vec![values(&laid_out, &[1.0, 3.0, 2.0, 0.0]), values(&laid_out, &[1.0, 2.0, 3.0, 4.0])])
+            .unwrap();
+        let plain_outputs = jvp(&plain)
+            .interpret(vec![values(&plain, &[1.0, 3.0, 2.0, 0.0]), values(&plain, &[1.0, 2.0, 3.0, 4.0])])
+            .unwrap();
+        assert_eq!(
+            laid_out_outputs.iter().map(|output| output.elements::<f64>()).collect::<Vec<_>>(),
+            plain_outputs.iter().map(|output| output.elements::<f64>()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn test_cumulative_differentiation_reverse_mode() {
         // Summing the prefix sums weights each input by the number of outputs it contributes to, which the transposed
         // sum computes directly. Nonlinear kinds reach reverse mode by transposing the linear operations that their
@@ -1674,7 +1755,7 @@ mod tests {
             Ok(Array::vector(vec![100i8, -56]).unwrap())
         );
 
-        // A zero-length scanned axis has nothing to accumulate and keeps the operand's exact type.
+        // A zero-length scanned axis has nothing to accumulate and keeps the input's exact type.
         let empty = Array::new(ArrayType::new_static(DataType::F32, [0, 2]), Vec::new()).unwrap();
         for kind in [
             CumulativeKind::Sum,
@@ -1695,7 +1776,7 @@ mod tests {
 
     #[test]
     fn test_array_cumulative_element_encodings() {
-        // Accumulation happens in the operand's own encoding, so every partial sum is re-encoded rather than only the
+        // Accumulation happens in the input's own encoding, so every partial sum is re-encoded rather than only the
         // final one. Each increment below is smaller than half a `bf16` step next to one, yet the running sum still
         // climbs by a full step each time, because each partial sum rounds up on its own. Summing the four increments
         // exactly and rounding once would stop one step short, which is what pins per-step re-encoding.
@@ -1765,7 +1846,7 @@ mod tests {
             .unwrap()),
         );
 
-        // The result carries the operand's complete type, including a non-default physical layout.
+        // The result carries the input's complete type, including a non-default physical layout.
         let laid_out =
             ArrayType::new_static(DataType::F32, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![4, 8])));
         assert_eq!(
@@ -1795,7 +1876,7 @@ mod tests {
         let expected = Array::vector(vec![ComplexNumber::new(1.0f32, 5.0); 3]).unwrap();
         assert_eq!(complex.cumulative_min(0), Ok(expected));
 
-        // Selection happens in the operand's own element type, so a low-precision payload is returned bit for bit
+        // Selection happens in the input's own element type, so a low-precision payload is returned bit for bit
         // rather than through a widened intermediate.
         let low_precision_type = ArrayType::new_static(DataType::F8E5M2, [3]);
         assert_eq!(
@@ -1862,7 +1943,7 @@ mod tests {
         );
 
         // Negative infinity is the combining operator's identity, so it neither contributes to nor poisons a later
-        // prefix, while a NaN operand propagates.
+        // prefix, while a NaN input propagates.
         assert_eq!(
             Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0]).unwrap().cumulative_log_sum_exp(0),
             Ok(Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY, 2.0]).unwrap()),
@@ -1871,7 +1952,7 @@ mod tests {
         assert_eq!(with_nan[0], 1.0);
         assert!(with_nan[1].is_nan() && with_nan[2].is_nan());
 
-        // Accumulation happens in the operand's own encoding, so each partial result is rounded to it, and the lowest
+        // Accumulation happens in the input's own encoding, so each partial result is rounded to it, and the lowest
         // values of the supported finite-only formats remain identities for any number of rounded combinations.
         let single_precision = ArrayType::new_static(DataType::F32, [2]);
         assert_eq!(
@@ -1928,7 +2009,7 @@ mod tests {
 
     #[test]
     fn test_array_type_cumulative() {
-        // A prefix scan preserves the complete operand type, including its memory placement and the sharding of the
+        // A prefix scan preserves the complete input type, including its memory placement and the sharding of the
         // unscanned axes, and a dynamic unscanned axis passes through untouched.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input = ArrayType::new_static(DataType::F64, [2, 3])

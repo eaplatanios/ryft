@@ -94,10 +94,10 @@ pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
 
 /// Higher-order operation used by checkpointing/rematerialization.
 ///
-/// [`RematerializeOperation`] has the same primal/forward/backward structure as
-/// [`CustomVjpOperation`](crate::operations::CustomVjpOperation), but it also carries
-/// a derived tangent carrier. That extra program is produced by [`Rematerialize`] for reverse differentiation and
-/// need only support transposition. Forward differentiation independently replays the primal body's executable JVP
+/// [`RematerializeOperation`] has the same primal/forward/backward structure as a
+/// [`CustomDerivativeOperation`](crate::operations::CustomDerivativeOperation) with reverse-mode rules, but it also
+/// carries a derived tangent carrier. That extra program is produced by [`Rematerialize`] for reverse differentiation
+/// and need only support transposition. Forward differentiation independently replays the primal body's executable JVP
 /// rules, while reverse differentiation uses the checkpointed preparation and pullback.
 ///
 /// The `prevent_cse` flag is likewise rematerialization-specific. Backends may lower it as an optimization barrier
@@ -3548,15 +3548,16 @@ mod tests {
             primal
                 .instructions()
                 .iter()
-                .any(|instruction| matches!(instruction.operation(), ArrayOperation::CustomVjp(_))),
-            "the rematerialized primal program should preserve the custom_vjp call",
+                .any(|instruction| matches!(instruction.operation(), ArrayOperation::CustomDerivative(_))),
+            "the rematerialized primal program should preserve the custom derivative call",
         );
         assert_eq!(forward.output_types().len(), 3);
 
         // Checkpointing preserves reverse-only custom rules without presenting their opaque carrier as an executable
         // forward derivative, whether forward differentiation executes immediately or stages a program.
-        let expected = "cannot apply forward-mode differentiation to a custom_vjp call; it supports only reverse-mode \
-                        differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)";
+        let expected = "cannot apply forward-mode differentiation to a `custom_derivative` call that has only \
+                        reverse-mode rules; it supports only reverse-mode differentiation (e.g., `vjp`, \
+                        `value_and_gradient`, or `jacobian_reverse`)";
         assert!(matches!(
             domain.jvp(|input, ()| function.call(input), Array::scalar(2f64).unwrap(), Array::scalar(1f64).unwrap(), ()),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message })) if message == expected,

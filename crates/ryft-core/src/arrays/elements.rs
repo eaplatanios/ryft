@@ -288,11 +288,12 @@ pub trait FloatingPointArrayElement: NumericArrayElement {
 
     /// Computes `log(exp(self) + exp(other))` without forming the potentially overflowing exponentials. Equal-sign
     /// infinities return that infinity, opposite-sign infinities return positive infinity, and NaNs propagate,
-    /// subject to the destination format's representability rules. Complex inputs are shifted by their larger real
-    /// component `m` (i.e., `m + log(exp(self - m) + exp(other - m))`), which never subtracts their imaginary
-    /// components from each other and so keeps both phases exact even when their magnitudes differ widely. Complex
-    /// outputs have imaginary parts in `[-π, π)`. Real formats narrower than `f32` compute the composition in `f32`
-    /// before conversion.
+    /// subject to the destination format's representability rules. Complex inputs factor out the one `p` with the
+    /// larger real component, as `p + ln_1p(exp(q - p))` (which keeps small corrections exact), and form the ratio
+    /// `exp(q - p)` by rotating by `p`'s phase rather than by subtracting the imaginary components from each other
+    /// (which keeps both phases exact even when their magnitudes differ widely). Complex outputs have imaginary parts
+    /// in `[-π, π]`, reduced through `atan2` when they leave that range. Real formats narrower than `f32` compute the
+    /// composition in `f32` before conversion.
     fn log_add_exp(self, other: Self) -> Result<Self, ProgramError>;
 
     /// Computes the logistic function `1 / (1 + exp(-self))`, extended to complex elements by the same expression.
@@ -2201,34 +2202,32 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
             }
 
             fn log_add_exp(self, other: Self) -> Result<Self, ProgramError> {
-                // Shift by the larger real component alone, which bounds both exponentials without subtracting the
-                // imaginary components from each other (that subtraction loses phase when their magnitudes differ).
-                // Infinite shifts keep the lexicographic `max + ln_1p(exp(min - max))` form, which resolves them.
-                let shift = self.re.max(other.re);
-                let output = if shift.is_finite() {
-                    let shift = Complex::new(shift, 0.0);
-                    Complex::ln((self - shift).exp() + (other - shift).exp()) + shift
+                // Factor out the operand `p` with the larger real component, so that `log_add_exp(p, q)` is
+                // `p + ln_1p(exp(q - p))` and keeps `ln_1p`'s accuracy for small corrections. The ratio `exp(q - p)`
+                // is formed as `exp(q - re(p)) · exp(-i im(p))`, which rotates by `p`'s phase instead of subtracting
+                // the imaginary components from each other, since that subtraction loses phase when their magnitudes
+                // differ.
+                let (larger, smaller) = if self.re > other.re || (self.re == other.re && self.im > other.im) {
+                    (self, other)
                 } else {
-                    let (maximum, minimum) = if self.re > other.re || (self.re == other.re && self.im > other.im) {
-                        (self, other)
-                    } else {
-                        (other, self)
-                    };
-                    maximum + FloatingPointArrayElement::ln_1p((minimum - maximum).exp())?
+                    (other, self)
                 };
+                let rotation = Complex::new(larger.im.cos(), larger.im.sin());
+                let ratio = (smaller - Complex::new(larger.re, 0.0)).exp() * rotation.conj();
+                let correction = FloatingPointArrayElement::ln_1p(ratio)?;
 
-                // Wrap the argument onto the principal branch.
+                // A principal phase is kept as the plain sum, which preserves tiny corrections. Any other phase is
+                // reduced through `atan2` of the rotated sum, whose sine and cosine reduce even huge arguments exactly,
+                // unlike a floating-point remainder by `2π`.
+                let imaginary = larger.im + correction.im;
                 let pi = std::f64::consts::PI as $component;
-                if output.im >= -pi && output.im < pi {
-                    return Ok(output);
-                }
-
-                let mut imaginary = (output.im + pi) % (2.0 * pi);
-                if imaginary < 0.0 {
-                    imaginary += 2.0 * pi;
-                }
-
-                Ok(Complex::new(output.re, imaginary - pi))
+                let imaginary = if (-pi..=pi).contains(&imaginary) {
+                    imaginary
+                } else {
+                    let unit = rotation * (ratio + 1.0);
+                    unit.im.atan2(unit.re)
+                };
+                Ok(Complex::new(larger.re + correction.re, imaginary))
             }
 
             #[inline]
@@ -3791,6 +3790,17 @@ mod tests {
         let output = FloatingPointArrayElement::log_add_exp(Complex::new(0.0f64, 4.0), Complex::new(0.0, 4.0)).unwrap();
         assert!((output.re - std::f64::consts::LN_2).abs() < 1e-15);
         assert!((output.im - (4.0 - 2.0 * std::f64::consts::PI)).abs() < 1e-15);
+
+        // A small correction stays exact, like `ln_1p(exp(-40))` for real inputs.
+        let output =
+            FloatingPointArrayElement::log_add_exp(Complex::new(0.0f64, 0.0), Complex::new(-40.0, 0.0)).unwrap();
+        assert_eq!(output, Complex::new((-40.0f64).exp().ln_1p(), 0.0));
+
+        // Phases outside the principal branch are reduced exactly, even for huge arguments.
+        let output =
+            FloatingPointArrayElement::log_add_exp(Complex::new(1.0f64, 1e16), Complex::new(f64::NEG_INFINITY, 0.0))
+                .unwrap();
+        assert_eq!(output, Complex::new(1.0, 1e16f64.sin().atan2(1e16f64.cos())));
 
         // The shift is real, so neither phase is rounded against the other: `exp(1e16 i)` and `exp(i)` keep their exact
         // phases, where the lexicographic `max + ln_1p(exp(min - max))` form would subtract `1e16 - 1`, which rounds

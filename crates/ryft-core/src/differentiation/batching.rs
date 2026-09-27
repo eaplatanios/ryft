@@ -15,10 +15,10 @@ use crate::tracing::{Tracer, TracingContext};
 /// ```
 ///
 /// The capability is shared rather than being operation-specific. [`LinearCallOperation`](crate::LinearCallOperation),
-/// [`CustomVjpOperation`](crate::CustomVjpOperation), and [`RematerializeOperation`](crate::RematerializeOperation)
-/// each pass [`Self::sum_mapped_cotangents`] to [`BatchingPolicy::adapt_batched_program`] while adapting their batched
-/// backward region back to its plain boundary. Operations whose attached regions are all forward-shaped (e.g.,
-/// [`CustomJvpOperation`](crate::CustomJvpOperation)) require plain [`BatchingPolicy`] instead.
+/// [`CustomDerivativeOperation`](crate::CustomDerivativeOperation), and
+/// [`RematerializeOperation`](crate::RematerializeOperation) each pass [`Self::sum_mapped_cotangents`] to
+/// [`BatchingPolicy::adapt_batched_program`] while adapting their batched backward region back to its plain boundary.
+/// Operations whose attached regions are all forward-shaped require plain [`BatchingPolicy`] instead.
 ///
 /// Those batching rules own every universe-independent part of the transformation, structurally batching the attached
 /// regions, aligning their boundaries, threading policy-owned bookkeeping values, and rebuilding the call. The

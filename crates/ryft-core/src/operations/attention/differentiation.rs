@@ -13,7 +13,8 @@ use crate::operations::attention::{
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
-use crate::operations::differentiation::custom_vjp::{CustomVjp, CustomVjpOperation, custom_vjp};
+use crate::operations::differentiation::custom_derivatives::CustomDerivativeOperation;
+use crate::operations::differentiation::custom_vjp::{CustomVjp, custom_vjp};
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError, Typed, Value};
 use crate::tracing::DomainTracer;
@@ -146,7 +147,7 @@ where
     pub fn call<C, V>(&self, inputs: AttentionInputs<V>) -> Result<V, ProgramError>
     where
         C: Context<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
-        C::Operation: From<CustomVjpOperation<ArrayType>>,
+        C::Operation: From<CustomDerivativeOperation<ArrayType>>,
         V: Value<Type = ArrayType, DispatchDomain = C> + ManualVariationAlignment<ArrayType>,
     {
         let signature = inputs.signature();
@@ -263,7 +264,7 @@ mod tests {
         assert_eq!(output, varying);
         assert_eq!(
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["parallel_vary", "parallel_vary", "custom_vjp"],
+            vec!["parallel_vary", "parallel_vary", "custom_derivative"],
         );
     }
 

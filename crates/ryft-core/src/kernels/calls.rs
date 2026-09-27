@@ -1104,8 +1104,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Rematerialize(_)
                 | ArrayOperation::Assert(_)
                 | ArrayOperation::Print(_)
-                | ArrayOperation::CustomJvp(_)
-                | ArrayOperation::CustomVjp(_)
+                | ArrayOperation::CustomDerivative(_)
                 | ArrayOperation::LinearCall(_) => {}
             },
             ArrayIrOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
@@ -1142,8 +1141,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::Condition(_)
             | ArrayIrOperation::While(_)
             | ArrayIrOperation::Scan(_)
-            | ArrayIrOperation::CustomJvp(_)
-            | ArrayIrOperation::CustomVjp(_)
+            | ArrayIrOperation::CustomDerivative(_)
             | ArrayIrOperation::LinearCall(_)
             | ArrayIrOperation::Assert(_)
             | ArrayIrOperation::Rematerialize(_) => {}

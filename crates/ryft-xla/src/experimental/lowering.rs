@@ -11162,11 +11162,10 @@ fn lower_complex_ln_1p_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// `(-∞, -∞) ↦ -∞`, and NaN propagation. Both operands must already carry the same tensor type, which is what the
 /// callers guarantee: the elementwise operation normalizes its broadcast operands, and the
 /// log-sum-exp `cumulative` reducer body applies the same expansion to two scalar block arguments.
-/// Narrow real formats evaluate the entire composition in `f32` before converting back. Complex values use
-/// `m + log(exp(a - m) + exp(b - m))` with `m` their larger real component, which never subtracts their imaginary
-/// components from each other, and fall back to `max(a, b) + ln_1p(exp(min(a, b) - max(a, b)))` (with lexicographic
-/// extrema) where `m` is not finite. Either way, the imaginary part is wrapped to `[-pi, pi)` by
-/// [`lower_principal_phase_to_mlir`].
+/// Narrow real formats evaluate the entire composition in `f32` before converting back. Complex values factor out the
+/// operand `p` with the larger real component, as `p + ln_1p(exp(q - p))`, and form the ratio `exp(q - p)` by rotating
+/// by `p`'s phase rather than by subtracting the imaginary components from each other, exactly like `ryft-core`'s
+/// reference kernel. The imaginary part lies in `[-pi, pi]`, reduced through `atan2` when it leaves that range.
 fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     left: ValueRef<'b, 'c, 't>,
     right: ValueRef<'b, 'c, 't>,
@@ -11196,75 +11195,97 @@ fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
         (left, right)
     };
     if data_type.is_complex() {
-        // Operands with an infinite (or NaN) larger real component keep the lexicographic form, which resolves them.
-        let maximum = lower_extremum_to_mlir(true, data_type, left, right, block, location)?;
-        let minimum = lower_extremum_to_mlir(false, data_type, left, right, block, location)?;
-        let difference = block
-            .append_operation(stable_hlo::subtract(minimum, maximum, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-        let exponential = block
-            .append_operation(stable_hlo::exponential(difference, Accuracy::Default, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-        let correction = lower_complex_ln_1p_to_mlir(exponential, output_type, block, context, location)?;
-        let lexicographic =
-            block.append_operation(stable_hlo::add(maximum, correction, location)?)?.result(0).unwrap().as_ref();
-
-        // Every other operand pair is shifted by its larger real component alone, which never subtracts the imaginary
-        // components from each other. The shift is replaced by zero where it is not finite, which keeps the unused
-        // shifted form free of spurious NaNs without affecting the selected result.
+        // Factor out the operand `p` with the larger real component, so that the output is `p + ln_1p(exp(q - p))`,
+        // which keeps small corrections exact. The ratio `exp(q - p)` is formed as `exp(q - re(p)) · exp(-i im(p))`,
+        // which rotates by `p`'s phase instead of subtracting the imaginary components from each other.
+        let larger = lower_extremum_to_mlir(true, data_type, left, right, block, location)?;
+        let smaller = lower_extremum_to_mlir(false, data_type, left, right, block, location)?;
         let part_type =
             output_type
                 .clone()
                 .with_data_type(if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
         let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
-        let left_real = block.append_operation(stable_hlo::real(left, location)?)?.result(0).unwrap().as_ref();
-        let right_real = block.append_operation(stable_hlo::real(right, location)?)?.result(0).unwrap().as_ref();
-        let shift = block
-            .append_operation(stable_hlo::maximum(left_real, right_real, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-        let finite = block.append_operation(stable_hlo::is_finite(shift, location)?)?.result(0).unwrap().as_ref();
         let zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
+        let larger_real = block.append_operation(stable_hlo::real(larger, location)?)?.result(0).unwrap().as_ref();
+        let larger_imaginary = block.append_operation(stable_hlo::imag(larger, location)?)?.result(0).unwrap().as_ref();
+        let cosine = block
+            .append_operation(stable_hlo::cosine(larger_imaginary, Accuracy::Default, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let sine = block
+            .append_operation(stable_hlo::sine(larger_imaginary, Accuracy::Default, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let negated_sine = block.append_operation(stable_hlo::negate(sine, location)?)?.result(0).unwrap().as_ref();
+        let rotation =
+            block.append_operation(stable_hlo::complex(cosine, sine, location)?)?.result(0).unwrap().as_ref();
+        let inverse_rotation = block
+            .append_operation(stable_hlo::complex(cosine, negated_sine, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
         let shift = block
-            .append_operation(stable_hlo::select(finite, shift, zero, location)?)?
+            .append_operation(stable_hlo::complex(larger_real, zero, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
-        let shift = block.append_operation(stable_hlo::complex(shift, zero, location)?)?.result(0).unwrap().as_ref();
-        let mut exponentials = Vec::with_capacity(2);
-        for operand in [left, right] {
-            let shifted =
-                block.append_operation(stable_hlo::subtract(operand, shift, location)?)?.result(0).unwrap().as_ref();
-            exponentials.push(
-                block
-                    .append_operation(stable_hlo::exponential(shifted, Accuracy::Default, location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref(),
-            );
-        }
-        let sum = block
-            .append_operation(stable_hlo::add(exponentials[0], exponentials[1], location)?)?
+        let shifted =
+            block.append_operation(stable_hlo::subtract(smaller, shift, location)?)?.result(0).unwrap().as_ref();
+        let exponential = block
+            .append_operation(stable_hlo::exponential(shifted, Accuracy::Default, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
-        let logarithm = block
-            .append_operation(stable_hlo::log(sum, Accuracy::Default, location)?)?
+        let ratio = block
+            .append_operation(stable_hlo::multiply(exponential, inverse_rotation, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
-        let shifted = block.append_operation(stable_hlo::add(logarithm, shift, location)?)?.result(0).unwrap().as_ref();
-        let output = block
-            .append_operation(stable_hlo::select(finite, shifted, lexicographic, location)?)?
+        let correction = lower_complex_ln_1p_to_mlir(ratio, output_type, block, context, location)?;
+        let correction_real =
+            block.append_operation(stable_hlo::real(correction, location)?)?.result(0).unwrap().as_ref();
+        let correction_imaginary =
+            block.append_operation(stable_hlo::imag(correction, location)?)?.result(0).unwrap().as_ref();
+        let real = block
+            .append_operation(stable_hlo::add(larger_real, correction_real, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
-        return lower_principal_phase_to_mlir(output, output_type, block, context, location);
+
+        // A principal phase is kept as the plain sum, which preserves tiny corrections. Any other phase is reduced
+        // through `atan2` of the rotated sum `exp(i im(p)) · (1 + ratio)`, whose components come from a sine and cosine
+        // rather than from a floating-point remainder by `2π`.
+        let imaginary = block
+            .append_operation(stable_hlo::add(larger_imaginary, correction_imaginary, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let one = lower_unplaced_constant_output(&[output_type.clone()], 1, block, context, location)?[0];
+        let unit = block.append_operation(stable_hlo::add(ratio, one, location)?)?.result(0).unwrap().as_ref();
+        let unit = block.append_operation(stable_hlo::multiply(rotation, unit, location)?)?.result(0).unwrap().as_ref();
+        let unit_real = block.append_operation(stable_hlo::real(unit, location)?)?.result(0).unwrap().as_ref();
+        let unit_imaginary = block.append_operation(stable_hlo::imag(unit, location)?)?.result(0).unwrap().as_ref();
+        let reduced = block
+            .append_operation(stable_hlo::atan2(unit_imaginary, unit_real, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let imaginary = lower_select_principal_phase_to_mlir(
+            imaginary,
+            reduced,
+            &part_type,
+            part_tensor_type,
+            block,
+            context,
+            location,
+        )?;
+        return Ok(block
+            .append_operation(stable_hlo::complex(real, imaginary, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref());
     }
     let difference = block.append_operation(stable_hlo::subtract(left, right, location)?)?;
     let difference = difference.result(0).expect("stablehlo.subtract should return one result").as_ref();
@@ -11305,10 +11326,10 @@ fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     })
 }
 
-/// Wraps the imaginary component of the complex `value` onto the principal branch `[-pi, pi)`, keeping phases that
-/// already lie on it exactly as they are (in particular, tiny phases that shifting by `pi` would round away). This is
-/// the final step of every complex `log_add_exp` expansion, and it also brings the raw-input prefixes of a complex
-/// log-sum-exp `cumulative` onto the branch that every combined prefix lies on.
+/// Brings the imaginary component of the complex `value` onto the principal branch `[-pi, pi]`, which is where the
+/// raw-input prefixes of a complex log-sum-exp `cumulative` must land to agree with its combined prefixes. Phases that
+/// already lie on the branch are kept exactly as they are, and others are reduced through `atan2` of their sine and
+/// cosine rather than through a floating-point remainder by `2π`, which cannot reduce huge arguments accurately.
 fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
@@ -11316,48 +11337,53 @@ fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-    let data_type = output_type.data_type();
+    let part_type = output_type.clone().with_data_type(if output_type.data_type() == DataType::C64 {
+        DataType::F32
+    } else {
+        DataType::F64
+    });
+    let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
     let real = block.append_operation(stable_hlo::real(value, location)?)?.result(0).unwrap().as_ref();
     let imaginary = block.append_operation(stable_hlo::imag(value, location)?)?.result(0).unwrap().as_ref();
-    let part_type =
-        output_type
-            .clone()
-            .with_data_type(if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
-    let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
-    let pi = lower_f64_constant_splat(std::f64::consts::PI, &part_type, part_tensor_type, block, context, location)?;
-    let two_pi =
-        lower_f64_constant_splat(2.0 * std::f64::consts::PI, &part_type, part_tensor_type, block, context, location)?;
-    let zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
-    let shifted = block.append_operation(stable_hlo::add(imaginary, pi, location)?)?.result(0).unwrap().as_ref();
-    let remainder = block
-        .append_operation(stable_hlo::remainder(shifted, two_pi, location)?)?
+    let sine = block
+        .append_operation(stable_hlo::sine(imaginary, Accuracy::Default, location)?)?
         .result(0)
         .unwrap()
         .as_ref();
-    let negative = block
-        .append_operation(stable_hlo::compare(
-            remainder,
-            zero,
-            stable_hlo::ComparisonDirection::LessThan,
-            stable_hlo::ComparisonType::Float,
-            location,
-        )?)?
+    let cosine = block
+        .append_operation(stable_hlo::cosine(imaginary, Accuracy::Default, location)?)?
         .result(0)
         .unwrap()
         .as_ref();
-    let adjusted = block.append_operation(stable_hlo::add(remainder, two_pi, location)?)?.result(0).unwrap().as_ref();
-    let wrapped = block
-        .append_operation(stable_hlo::select(negative, adjusted, remainder, location)?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
-    let wrapped_imaginary =
-        block.append_operation(stable_hlo::subtract(wrapped, pi, location)?)?.result(0).unwrap().as_ref();
-    // Preserve already-principal phases, particularly tiny phases that adding pi would round away.
+    let reduced = block.append_operation(stable_hlo::atan2(sine, cosine, location)?)?.result(0).unwrap().as_ref();
+    let imaginary = lower_select_principal_phase_to_mlir(
+        imaginary,
+        reduced,
+        &part_type,
+        part_tensor_type,
+        block,
+        context,
+        location,
+    )?;
+    Ok(block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref())
+}
+
+/// Selects the real `phase` where it already lies on the principal branch `[-pi, pi]`, and the `reduced` phase
+/// elsewhere.
+fn lower_select_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
+    phase: ValueRef<'b, 'c, 't>,
+    reduced: ValueRef<'b, 'c, 't>,
+    part_type: &ArrayType,
+    part_tensor_type: TensorTypeRef<'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let pi = lower_f64_constant_splat(std::f64::consts::PI, part_type, part_tensor_type, block, context, location)?;
     let negative_pi = block.append_operation(stable_hlo::negate(pi, location)?)?.result(0).unwrap().as_ref();
     let above_lower = block
         .append_operation(stable_hlo::compare(
-            imaginary,
+            phase,
             negative_pi,
             stable_hlo::ComparisonDirection::GreaterThanOrEqual,
             stable_hlo::ComparisonType::Float,
@@ -11368,9 +11394,9 @@ fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
         .as_ref();
     let below_upper = block
         .append_operation(stable_hlo::compare(
-            imaginary,
+            phase,
             pi,
-            stable_hlo::ComparisonDirection::LessThan,
+            stable_hlo::ComparisonDirection::LessThanOrEqual,
             stable_hlo::ComparisonType::Float,
             location,
         )?)?
@@ -11382,19 +11408,19 @@ fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
         .result(0)
         .unwrap()
         .as_ref();
-    let imaginary = block
-        .append_operation(stable_hlo::select(principal, imaginary, wrapped_imaginary, location)?)?
+    Ok(block
+        .append_operation(stable_hlo::select(principal, phase, reduced, location)?)?
         .result(0)
         .unwrap()
-        .as_ref();
-    Ok(block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref())
+        .as_ref())
 }
 
 /// Lowers the scalar product combiner of a `reduce` or `cumulative` body over `element_type`. Complex operands return
 /// the other operand when one of them is exactly the `1 + 0i` identity that seeds every reduction and pads every
 /// window, because multiplying by it is not exact under complex arithmetic: its zero imaginary component meets the
-/// other operand's infinite components as `0 · ∞ = NaN`. This keeps complex infinities intact, exactly as a product
-/// that starts from its first element (like the `ryft-core` reference kernels) would. Real products multiply directly.
+/// other operand's infinite components as `0 · ∞ = NaN`. This is the same rule that `ryft-core`'s reference kernels
+/// apply to every product (including inputs whose elements are themselves exactly `1 + 0i`), so the two backends agree.
+/// Real products multiply directly.
 fn lower_product_combiner_to_mlir<'b, 'c: 'b, 't: 'c>(
     left: ValueRef<'b, 'c, 't>,
     right: ValueRef<'b, 'c, 't>,
@@ -16514,12 +16540,12 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_jvp_lowering_inlines_only_the_primal_program() {
-        use ryft_core::{CustomJvpOperation, PrintOperation};
+    fn test_custom_derivative_lowering_inlines_only_the_primal_program() {
+        use ryft_core::{CustomDerivativeJvpRule, CustomDerivativeOperation, PrintOperation};
 
-        // A retained `custom_jvp` call lowers only its primal program and threads its effects onto the enclosing
-        // ordered-I/O chain. Nothing from the user-supplied JVP program (marked here by the multiply on the tangent
-        // side) reaches the emitted module.
+        // A retained `custom_derivative` call lowers only its primal program and threads its effects onto the
+        // enclosing ordered-I/O chain, for every rule layout. Nothing from the user-supplied rule programs (marked
+        // here by the multiplies on the tangent and cotangent sides) reaches the emitted module.
         let vector_type = test_vector_type(4);
         let primal = {
             let mut builder = CompositeXlaProgramBuilder::new();
@@ -16547,35 +16573,69 @@ mod tests {
                 )
                 .unwrap()
         };
-        let operation = CustomJvpOperation::new();
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let primal_region = builder.import_region(primal.entry_region_ref());
-        let jvp_region = builder.import_region(jvp.entry_region_ref());
-        let input = builder.add_input(vector_type.clone().into());
-        let output = builder
-            .add_instruction(XlaOperation::CustomJvp(operation), vec![primal_region, jvp_region], vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let input_types = vec![vector_type.clone()];
-        let output_types = vec![vector_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let forward = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(vector_type.clone().into());
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output, input],
+                    vec![Placeholder],
+                    vec![Placeholder, Placeholder],
+                )
+                .unwrap()
+        };
+        let backward = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let residual = builder.add_input(vector_type.clone().into());
+            let cotangent = builder.add_input(vector_type.clone().into());
+            let input_cotangent =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, cotangent], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![input_cotangent],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        for (operation, rules) in [
+            (CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region), vec![&jvp]),
+            (CustomDerivativeOperation::new().with_vjp_rule(), vec![&forward, &backward]),
+            (
+                CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region).with_vjp_rule(),
+                vec![&jvp, &forward, &backward],
+            ),
+        ] {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let mut regions = vec![builder.import_region(primal.entry_region_ref())];
+            regions.extend(rules.into_iter().map(|rule| builder.import_region(rule.entry_region_ref())));
+            let input = builder.add_input(vector_type.clone().into());
+            let output = builder
+                .add_instruction(XlaOperation::CustomDerivative(operation), regions, vec![input], None)
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let input_types = vec![vector_type.clone()];
+            let output_types = vec![vector_type.clone()];
+            let module =
+                to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
 
-        assert_eq!(
-            module,
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
-                    %0 = stablehlo.after_all  : !stablehlo.token
-                    %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "primal"}, has_side_effect = true} : (tensor<4xf32>, !stablehlo.token) -> !stablehlo.token
-                    %2 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
-                    return %2 : tensor<4xf32>
-                  }
-                }
-            "#},
-        );
+            assert_eq!(
+                module,
+                indoc! {r#"
+                    module {
+                      func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                        %0 = stablehlo.after_all  : !stablehlo.token
+                        %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "primal"}, has_side_effect = true} : (tensor<4xf32>, !stablehlo.token) -> !stablehlo.token
+                        %2 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                        return %2 : tensor<4xf32>
+                      }
+                    }
+                "#},
+            );
+        }
     }
 
     #[test]

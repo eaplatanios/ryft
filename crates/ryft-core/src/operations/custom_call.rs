@@ -23,8 +23,6 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver, Member
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
-use crate::operations::differentiation::custom_jvp::CUSTOM_JVP_OPERATION_NAME;
-use crate::operations::differentiation::custom_vjp::CUSTOM_VJP_OPERATION_NAME;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
@@ -834,8 +832,10 @@ impl CustomCallOperation {
     fn no_differentiation_rule_error(&self) -> ProgramError {
         ProgramError::UnsupportedOperation {
             message: format!(
-                "custom call `{}` has no differentiation rule; wrap it with `{}` or `{}` to provide one",
-                self.target_name, CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME,
+                // TODO(eaplatanios): Stop hardcoding mentions for things like `custom_jvp` and `custom_vjp`.
+                "custom call `{}` has no differentiation rule; wrap it with `custom_jvp` or `custom_vjp` to provide \
+                 one",
+                self.target_name,
             ),
         }
     }

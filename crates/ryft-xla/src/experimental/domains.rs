@@ -6260,20 +6260,21 @@ mod tests {
         BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver, CaptureReference, CompareOperation,
         ComparisonDirection, CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher,
         ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
-        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomJvpOperation, Dimension,
-        DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation,
-        DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
-        DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
-        DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
-        DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather,
-        GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization,
-        MulOperation, NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation,
-        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation,
-        ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
-        SelectOperation, Sharding, ShardingDimension, SliceOperation, StagingContext, StaticShape, SubOperation,
-        TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
+        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomDerivativeJvpRule,
+        CustomDerivativeOperation, Dimension, DimensionAddOperation, DimensionDivOperation,
+        DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation, DimensionSize,
+        DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
+        DotOperation, DynamicBroadcastOperation, DynamicGather, DynamicReshape, DynamicReshapeOperation,
+        DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
+        DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode,
+        GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
+        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
+        ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter,
+        ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding,
+        ShardingDimension, SliceOperation, StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation,
+        ZeroOperation, batch, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -12371,13 +12372,15 @@ mod tests {
         };
         assert_eq!(
             XlaDomain::token().bind(
-                XlaOperation::CustomJvp(CustomJvpOperation::new()),
+                XlaOperation::CustomDerivative(
+                    CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region)
+                ),
                 vec![primal.clone(), rule],
                 &[],
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "`custom_jvp` carries reference state that XLA eager execution cannot lower; discharge \
-                          references before lowering"
+                message: "`custom_derivative` carries reference state that XLA eager execution cannot lower; \
+                          discharge references before lowering"
                     .to_string(),
             }),
         );
@@ -12402,13 +12405,15 @@ mod tests {
         };
         assert_eq!(
             XlaDomain::token().bind(
-                XlaOperation::CustomJvp(CustomJvpOperation::new()),
+                XlaOperation::CustomDerivative(
+                    CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region)
+                ),
                 vec![primal, pure_reference_rule],
                 &[],
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "`custom_jvp` carries reference state that XLA eager execution cannot lower; discharge \
-                          references before lowering"
+                message: "`custom_derivative` carries reference state that XLA eager execution cannot lower; \
+                          discharge references before lowering"
                     .to_string(),
             }),
         );

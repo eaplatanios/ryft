@@ -106,9 +106,12 @@ pub enum ReductionKind {
 
     /// Numeric product reduction. The identity is `1` and the combiner is multiplication. Floating-point inputs
     /// narrower than `f32` accumulate in `f32` before conversion back to the input data type. Integer products wrap
-    /// in their input type. Structural zeros are unsupported because their type cannot represent the empty product.
-    /// Differentiation requires a static input shape and replicates reduced dimensions partitioned over explicit mesh
-    /// axes before constructing the pairwise product rule.
+    /// in their input type. Note that, complex multiplication by `1 + 0i` is not exact for infinite components (its
+    /// zero imaginary component meets them as `0 · ∞ = NaN`), so a complex operand that is exactly `1 + 0i` returns
+    /// the other operand instead, which keeps the identity inert and complex infinities intact on every backend.
+    /// Structural zeros are unsupported because their type cannot represent the empty product. Differentiation requires
+    /// a static input shape and replicates reduced dimensions partitioned over explicit mesh axes before constructing
+    /// the pairwise product rule.
     Product,
 
     /// Numeric mean reduction defined as a [`Sum`](Self::Sum) divided by the product of reduced extents. Narrow
@@ -1155,7 +1158,7 @@ impl Reduce for Array {
         match kind {
             ReductionKind::Product => {
                 dispatch_on_array_element_type!(@numeric data_type, |Element| {
-                    self.reduce_elements(output_type, axes, Element::one()?, true, NumericArrayElement::mul)
+                    self.reduce_elements(output_type, axes, Element::one()?, multiply_product_elements)
                 })
             }
             ReductionKind::LogSumExp => {
@@ -1173,7 +1176,6 @@ impl Reduce for Array {
                             output_type.clone(),
                             axes,
                             Element::max_identity(),
-                            false,
                             |left, right| Ok(ArrayElement::max(&left, &right)),
                         )?
                         .map_elements::<Element, Element>(output_type.clone(), |value| {
@@ -1235,7 +1237,6 @@ impl Reduce for Array {
                         output_type.clone(),
                         axes,
                         Element::zero()?,
-                        false,
                         NumericArrayElement::add,
                     )?;
                     if kind == ReductionKind::Sum {
@@ -1252,7 +1253,7 @@ impl Reduce for Array {
                 dispatch_on_array_element_type!(data_type, |Element| {
                     let identity =
                         if kind == ReductionKind::Max { Element::max_identity() } else { Element::min_identity() };
-                    self.reduce_elements(output_type, axes, identity, false, |left, right| {
+                    self.reduce_elements(output_type, axes, identity, |left, right| {
                         Ok(if kind == ReductionKind::Max {
                             ArrayElement::max(&left, &right)
                         } else {
@@ -1261,8 +1262,8 @@ impl Reduce for Array {
                     })
                 })
             }
-            ReductionKind::Any => self.reduce_elements(output_type, axes, false, false, |left, right| Ok(left | right)),
-            ReductionKind::All => self.reduce_elements(output_type, axes, true, false, |left, right| Ok(left & right)),
+            ReductionKind::Any => self.reduce_elements(output_type, axes, false, |left, right| Ok(left | right)),
+            ReductionKind::All => self.reduce_elements(output_type, axes, true, |left, right| Ok(left & right)),
         }
     }
 
@@ -1457,15 +1458,12 @@ impl ArrayType {
 
 impl Array {
     /// Reduces typed elements directly from addressed input storage into one addressed output buffer.
-    /// `identity` initializes every output cell, including those whose reduced axes are empty. When `seed_from_input`
-    /// is true, the first input replaces that identity without combining, preserving complex infinities and signed
-    /// zeros in products.
+    /// `identity` initializes every output cell, including those whose reduced axes are empty.
     fn reduce_elements<T: ArrayElement, F: Fn(T, T) -> Result<T, ProgramError>>(
         &self,
         output_type: ArrayType,
         axes: &[usize],
         identity: T,
-        seed_from_input: bool,
         reduce_fn: F,
     ) -> Result<Self, ProgramError> {
         debug_assert_eq!(self.r#type().data_type(), T::data_type());
@@ -1491,16 +1489,30 @@ impl Array {
             }
             let input_value = T::decode(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
             let output_range = output_addressing.byte_range_unchecked(&output_index);
-            let value = if seed_from_input && axes.iter().all(|axis| input_index[*axis] == 0) {
-                input_value
-            } else {
-                reduce_fn(T::decode(&bytes[output_range.clone()]), input_value)?
-            };
+            let value = reduce_fn(T::decode(&bytes[output_range.clone()]), input_value)?;
             value.encode(&mut bytes[output_range]);
             input_addressing.advance_index(&mut input_index);
         }
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
+}
+
+/// Multiplies two elements of a product reduction or product scan, returning the other operand when a complex operand
+/// is exactly `1 + 0i`. Complex multiplication by that identity is not exact for infinite components (its zero
+/// imaginary component meets them as `0 · ∞ = NaN`), and the XLA lowering of the same products applies the same rule,
+/// so the two backends agree on every input, including inputs whose elements are themselves exactly `1 + 0i`. Real
+/// multiplication by one is already exact.
+pub(crate) fn multiply_product_elements<T: NumericArrayElement>(left: T, right: T) -> Result<T, ProgramError> {
+    if T::data_type().is_complex() {
+        let one = Complex::new(1.0, 0.0);
+        if left.convert_to::<Complex<f64>>()? == one {
+            return Ok(right);
+        }
+        if right.convert_to::<Complex<f64>>()? == one {
+            return Ok(left);
+        }
+    }
+    left.mul(right)
 }
 
 /// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own

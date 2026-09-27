@@ -261,11 +261,12 @@ define_elementwise_operation!(
     /// infinities return positive infinity, and NaNs propagate. Half-precision and smaller formats use `f32`
     /// intermediates and round only the final output back to their element type.
     ///
-    /// Complex inputs factor out their larger real component `m`, as `m + log(exp(a - m) + exp(b - m))`, which never
-    /// subtracts their imaginary components from each other and so keeps both phases exact, and wrap the imaginary
-    /// output into `[-π, π)`. This selects a principal logarithm branch; derivatives apply away from its cut, and
-    /// their weights avoid subtracting imaginary components too. Inputs that carry partial sums are rejected, and
-    /// reduced-axis markers must agree.
+    /// Complex inputs factor out the input `p` with the larger real component, as `p + ln_1p(exp(q - p))`, which keeps
+    /// small corrections exact, and form the ratio `exp(q - p)` by rotating by `p`'s phase rather than by subtracting
+    /// the imaginary components from each other, which keeps both phases exact even when their magnitudes differ
+    /// widely. The imaginary output lies in `[-π, π]`, reduced through `atan2` when it leaves that range. This selects
+    /// a principal logarithm branch; derivatives apply away from its cut, and their weights avoid subtracting
+    /// imaginary components too. Inputs that carry partial sums are rejected, and reduced-axis markers must agree.
     LogAddExpOperation,
     LOG_ADD_EXP_OPERATION_NAME,
     LogAddExp,
@@ -1487,7 +1488,7 @@ mod tests {
 
     #[test]
     fn test_array_log_add_exp_complex() {
-        // Complex outputs wrap their imaginary part into `[-π, π)`.
+        // Complex outputs wrap their imaginary part into `[-π, π]`.
         let input = Array::scalar(ComplexNumber::new(1.0f64, 4.0)).unwrap();
         assert_abs_diff_eq!(
             input.log_add_exp(&input).unwrap(),

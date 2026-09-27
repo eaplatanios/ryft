@@ -1592,7 +1592,8 @@ pub(crate) mod tests {
             vec![scalar],
         )
         .unwrap();
-        assert_eq!(program.instructions()[0].operation().name(), "custom_jvp");
+        assert_eq!(program.instructions()[0].operation().name(), "custom_derivative");
+        assert_eq!(program.instructions()[0].regions().len(), 2);
         assert_eq!(execute_derivative(&program.jvp().unwrap(), &[3.0, 4.0]), vec![3.0, 8.0]);
     }
 
@@ -1635,7 +1636,8 @@ pub(crate) mod tests {
             vec![scalar],
         )
         .unwrap();
-        assert_eq!(program.instructions()[0].operation().name(), "custom_vjp");
+        assert_eq!(program.instructions()[0].operation().name(), "custom_derivative");
+        assert_eq!(program.instructions()[0].regions().len(), 3);
         let context = TracingContext::<XlaConstant, XlaOperation>::new();
         let input = context.input(program.input_types()[0].clone());
         let (_, pullback) = context

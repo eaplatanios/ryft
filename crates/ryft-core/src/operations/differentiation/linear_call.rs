@@ -34,12 +34,12 @@ enum LinearCallInterface<T: DifferentiableType> {
     ForwardAndTranspose,
 
     /// Reverse-only linear map that supplies a transpose program but no executable forward program, so exactly one
-    /// region is attached, named `transpose`. The forward map `u ↦ Lᵣ(u)` therefore exists mathematically but has
-    /// no region boundary to derive the operation interface from, and its input and output types are stored here
-    /// explicitly. Interpreting this form is deliberately an error (i.e., the canonical reverse-only diagnostic).
-    /// The call exists in a linearized program only so that reverse mode can transpose it by replaying the attached
-    /// [`Region`](crate::Region). For example, [`CustomVjpOperation`](crate::CustomVjpOperation) stages this form
-    /// because `custom_vjp` supplies a user-written backward program without a tangent program. Refer to the
+    /// region is attached, named `transpose`. The forward map `u ↦ Lᵣ(u)` therefore exists mathematically but has no
+    /// region boundary to derive the operation interface from, and its input and output types are stored here
+    /// explicitly. Interpreting this form is deliberately an error (i.e., the canonical reverse-only diagnostic). The
+    /// call exists in a linearized program only so that reverse mode can transpose it by replaying the attached
+    /// [`Region`](crate::Region). For example, [`CustomDerivativeOperation`](crate::CustomDerivativeOperation) stages
+    /// this form because `custom_vjp` supplies a user-written backward program without a tangent program. Refer to the
     /// documentation of [`LinearCallOperation`] for how this form relates to [`Self::ForwardAndTranspose`].
     TransposeOnly {
         /// Input [`Type`](crate::Type)s of the unavailable forward map (one per linear operand).
@@ -97,8 +97,8 @@ enum LinearCallInterface<T: DifferentiableType> {
 /// `transpose` [`Region`](crate::Region)s and can be interpreted, lowered, transposed, and differentiated again. The
 /// _transpose-only_ form is the deliberate exception for linear maps that supply only a reverse rule: it stores the
 /// unavailable forward input/output types and attaches only the transpose region, so attempting to execute or
-/// differentiate it in forward mode is an error (e.g., [`CustomVjpOperation`](crate::CustomVjpOperation) stages
-/// this form because it supplies a backward program without a tangent program).
+/// differentiate it in forward mode is an error (e.g., [`CustomDerivativeOperation`](crate::CustomDerivativeOperation)
+/// stages this form for a call whose reverse-mode rules supply a backward program without a tangent program).
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinearCallOperation<T: DifferentiableType> {
     /// Number of leading residual operands.

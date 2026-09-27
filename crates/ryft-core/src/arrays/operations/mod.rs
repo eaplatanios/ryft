@@ -42,17 +42,17 @@ use crate::operations::{
     Abs, AbsOperation, Add, AddOperation, And, AndOperation, Assert, AssertOperation, Atan2, Atan2Operation, Broadcast,
     BroadcastOperation, Ceil, CeilOperation, Clamp, ClampOperation, Compare, CompareOperation, Concatenate,
     ConcatenateOperation, ConditionOperation, ConstantOperation, ConstrainShardingOperation, ConvertElementType,
-    ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeOperation, CustomJvpOperation,
-    CustomVjpOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
-    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
-    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub,
-    DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, Div, DivOperation, Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation,
-    DynamicReshape, DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation,
-    IotaOperation, LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation,
-    Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not,
-    NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation,
+    ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeOperation, CustomDerivativeOperation,
+    DimensionAddOperation, DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
+    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
+    DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation,
+    DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div,
+    DivOperation, Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape,
+    DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf,
+    ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation,
+    LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
+    LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation,
+    OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation,
     ParallelVaryOperation, Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation,
     ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
@@ -177,8 +177,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Print(PrintOperation<ArrayType>),
     Assert(AssertOperation<ArrayType>),
     CustomCall(CustomCallOperation),
-    CustomJvp(CustomJvpOperation<ArrayType>),
-    CustomVjp(CustomVjpOperation<ArrayType>),
+    CustomDerivative(CustomDerivativeOperation<ArrayType>),
     LinearCall(LinearCallOperation<ArrayType>),
 }
 
@@ -411,7 +410,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// regions are programs in the *composite* universe, and no projected view can present them in the member
     /// universe. This variant therefore holds only region-free array operations: the array-operation lift promotes
     /// every region-carrying member payload to its composite carrier — [`Condition`](Self::Condition),
-    /// [`While`](Self::While), [`Scan`](Self::Scan), [`CustomJvp`](Self::CustomJvp), [`CustomVjp`](Self::CustomVjp),
+    /// [`While`](Self::While), [`Scan`](Self::Scan), [`CustomDerivative`](Self::CustomDerivative),
     /// [`LinearCall`](Self::LinearCall) (both interface forms), and [`Rematerialize`](Self::Rematerialize).
     ///
     /// No region-carrying array payload therefore reaches this variant. Should one ever be constructed directly, it is
@@ -526,13 +525,9 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// unsupported until discharge.
     Scan(ScanOperation<ArrayIrValue<A>>),
 
-    /// Composite custom-JVP call whose primal and JVP regions use the complete array IR storage universe. Generic
-    /// differentiation rejects reference members because they have no tangent representation.
-    CustomJvp(CustomJvpOperation<ArrayIrType>),
-
-    /// Composite custom-VJP call whose primal, forward, and backward regions use the complete array IR storage
-    /// universe. Generic differentiation rejects reference members because they have no cotangent representation.
-    CustomVjp(CustomVjpOperation<ArrayIrType>),
+    /// Composite custom derivative call whose primal and rule regions use the complete array IR storage universe.
+    /// Generic differentiation rejects reference members because they have no tangent or cotangent representation.
+    CustomDerivative(CustomDerivativeOperation<ArrayIrType>),
 
     /// Differentiation-owned linear call with ordinary trailing residual operands, in either its executable
     /// forward-and-transpose form or its reverse-only transpose-only form.
@@ -707,12 +702,14 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
                 let captures = operation.captures().iter().cloned().map(ArrayIrValue::Array).collect();
                 Self::Scan(operation.with_captures(captures))
             }
-            ArrayOperation::CustomJvp(operation) => Self::CustomJvp(
-                CustomJvpOperation::new().with_non_differentiated_count(operation.non_differentiated_count()),
-            ),
-            ArrayOperation::CustomVjp(operation) => Self::CustomVjp(
-                CustomVjpOperation::new().with_non_differentiated_count(operation.non_differentiated_count()),
-            ),
+            // The payload stores no types, only the rule layout and the non-differentiated split, both of which carry
+            // over unchanged.
+            ArrayOperation::CustomDerivative(operation) => {
+                let converted = CustomDerivativeOperation::new()
+                    .with_jvp_rule(operation.jvp_rule())
+                    .with_non_differentiated_count(operation.non_differentiated_count());
+                Self::CustomDerivative(if operation.has_vjp_rule() { converted.with_vjp_rule() } else { converted })
+            }
             // The executable form stores no types. The transpose-only form maps its unavailable forward interface into
             // the composite universe, so both reach the carrier that owns the extent-threaded region rule.
             ArrayOperation::LinearCall(operation) => Self::LinearCall(operation.map_types(ArrayIrType::Array)),
@@ -1082,9 +1079,9 @@ mod tests {
     use crate::operations::random::RandomAlgorithm;
     use crate::operations::{
         AddOperation, AssertOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
-        DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionSizeOperation,
-        DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
-        ScanOperation, SinOperation, WhileOperation, ZeroOperation,
+        CustomDerivativeJvpRule, DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation,
+        DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation,
+        ReductionKind, ScanOperation, SinOperation, WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -2433,9 +2430,9 @@ mod tests {
             .unwrap()[0]
     }
 
-    /// Builds the `["primal", "jvp"]` regions of a composite `custom_jvp` implementing `primal(x) = 2 * x` with the
-    /// deliberately wrong rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a surviving custom-derivative boundary stays
-    /// detectable in a transformed program's numbers.
+    /// Builds the `["primal", "jvp"]` regions of a composite `custom_derivative` call with a JVP rule, implementing
+    /// `primal(x) = 2 * x` with the deliberately wrong rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a surviving
+    /// custom-derivative boundary stays detectable in a transformed program's numbers.
     fn composite_custom_jvp_regions() -> Vec<TestProgram> {
         vec![
             composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0)]),
@@ -2445,8 +2442,9 @@ mod tests {
         ]
     }
 
-    /// Builds the `["primal", "forward", "backward"]` regions of a composite `custom_vjp` implementing
-    /// `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, and the deliberately wrong rule `backward(r, ȳ) = 3 * ȳ`.
+    /// Builds the `["primal", "forward", "backward"]` regions of a composite `custom_derivative` call with reverse-mode
+    /// rules, implementing `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, and the deliberately wrong rule
+    /// `backward(r, ȳ) = 3 * ȳ`.
     fn composite_custom_vjp_regions() -> Vec<TestProgram> {
         vec![
             composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0)]),
@@ -2490,16 +2488,24 @@ mod tests {
     #[test]
     fn test_composite_lift_promotes_every_region_carrying_array_payload() {
         // Every region-carrying array payload has a composite carrier, so none of them reaches the region-free
-        // projected `Array` variant. The custom-derivative wrappers and rematerialization carry their
-        // non-differentiated operand split (and rematerialization its lowering hint) across the lift.
-        assert!(matches!(
-            TestOperation::from(ArrayOperation::CustomJvp(CustomJvpOperation::new().with_non_differentiated_count(1))),
-            ArrayIrOperation::CustomJvp(operation) if operation.non_differentiated_count() == 1,
-        ));
-        assert!(matches!(
-            TestOperation::from(ArrayOperation::CustomVjp(CustomVjpOperation::new().with_non_differentiated_count(2))),
-            ArrayIrOperation::CustomVjp(operation) if operation.non_differentiated_count() == 2,
-        ));
+        // projected `Array` variant. Custom-derivative calls carry their rule layout and non-differentiated operand
+        // split, and rematerialization its split and lowering hint, across the lift.
+        for jvp_rule in
+            [CustomDerivativeJvpRule::Absent, CustomDerivativeJvpRule::Region, CustomDerivativeJvpRule::Primal]
+        {
+            for has_vjp_rule in [false, true] {
+                let operation =
+                    CustomDerivativeOperation::new().with_jvp_rule(jvp_rule).with_non_differentiated_count(2);
+                let operation = if has_vjp_rule { operation.with_vjp_rule() } else { operation };
+                assert!(matches!(
+                    TestOperation::from(ArrayOperation::CustomDerivative(operation)),
+                    ArrayIrOperation::CustomDerivative(operation)
+                        if operation.jvp_rule() == jvp_rule
+                            && operation.has_vjp_rule() == has_vjp_rule
+                            && operation.non_differentiated_count() == 2,
+                ));
+            }
+        }
         assert!(matches!(
             TestOperation::from(ArrayOperation::Rematerialize(
                 RematerializeOperation::new().with_prevent_cse(true).with_non_differentiated_count(1),
@@ -2534,11 +2540,13 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_batching_of_a_custom_jvp_payload() {
+    fn test_composite_batching_of_a_custom_derivative_jvp_rule_payload() {
         // The composite carrier batches both regions structurally and threads the first-class mapped extent into
         // them as one additional leading non-differentiated operand of the batched call.
         let (program, batch_axis) = batched_composite_payload(
-            ArrayOperation::CustomJvp(CustomJvpOperation::new()),
+            ArrayOperation::CustomDerivative(
+                CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region),
+            ),
             composite_custom_jvp_regions(),
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2546,7 +2554,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = custom_jvp [non_differentiated_count=1] %0 %1 [
+                let %2:f64[batch] = custom_derivative [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const 2.0
@@ -2572,11 +2580,11 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_batching_of_a_custom_vjp_payload() {
+    fn test_composite_batching_of_a_custom_derivative_vjp_rule_payload() {
         // The backward region receives the threaded extent ahead of its residuals, and its result cotangents align
         // with the differentiated operands only.
         let (program, batch_axis) = batched_composite_payload(
-            ArrayOperation::CustomVjp(CustomVjpOperation::new()),
+            ArrayOperation::CustomDerivative(CustomDerivativeOperation::new().with_vjp_rule()),
             composite_custom_vjp_regions(),
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2584,13 +2592,69 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = custom_vjp [non_differentiated_count=1] %0 %1 [
+                let %2:f64[batch] = custom_derivative [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const 2.0
                             %3:f64[batch] = broadcast [output_axes=[]] %2 %0
                             %4:f64[batch] = mul %1 %3
                         in (%4)
+                    },
+                    forward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const 2.0
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4, %1)
+                    },
+                    backward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
+                        let %3:f64[] = const 3.0
+                            %4:f64[batch] = broadcast [output_axes=[]] %3 %0
+                            %5:f64[batch] = mul %2 %4
+                        in (%5)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_composite_batching_of_a_custom_derivative_payload() {
+        // A call with both a JVP rule and reverse-mode rules rebuilds all four regions around the threaded extent,
+        // keeping every rule attached in region order.
+        let mut regions = composite_custom_jvp_regions();
+        regions.extend(composite_custom_vjp_regions().into_iter().skip(1));
+        let (program, batch_axis) = batched_composite_payload(
+            ArrayOperation::CustomDerivative(
+                CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region).with_vjp_rule(),
+            ),
+            regions,
+        );
+        assert_eq!(batch_axis, BatchAxis::new(0));
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                let %2:f64[batch] = custom_derivative [non_differentiated_count=1] %0 %1 [
+                    primal={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const 2.0
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4)
+                    },
+                    jvp={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
+                        let %3:f64[] = const 2.0
+                            %4:f64[] = const 3.0
+                            %5:f64[batch] = broadcast [output_axes=[]] %3 %0
+                            %6:f64[batch] = mul %1 %5
+                            %7:f64[batch] = broadcast [output_axes=[]] %4 %0
+                            %8:f64[batch] = mul %2 %7
+                        in (%6, %8)
                     },
                     forward={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
@@ -2705,7 +2769,14 @@ mod tests {
             .collect::<Vec<_>>();
         let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let output = builder
-            .add_instruction(ArrayOperation::CustomJvp(CustomJvpOperation::new()), regions, vec![input], None)
+            .add_instruction(
+                ArrayOperation::CustomDerivative(
+                    CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region),
+                ),
+                regions,
+                vec![input],
+                None,
+            )
             .unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -2741,7 +2812,9 @@ mod tests {
                     let context = input.context().clone();
                     Ok(context
                         .bind(
-                            ArrayOperation::CustomJvp(CustomJvpOperation::new()),
+                            ArrayOperation::CustomDerivative(
+                                CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region),
+                            ),
                             composite_custom_jvp_regions(),
                             &[input],
                         )?
@@ -2760,7 +2833,7 @@ mod tests {
         assert_eq!(
             composite_custom_jvp_program().transpose_with_respect_to(&[0], &[]).unwrap_err(),
             DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: "operation `custom_jvp` is not transposable".to_string(),
+                message: "operation `custom_derivative` is not transposable".to_string(),
             }),
         );
     }
@@ -3496,8 +3569,7 @@ mod tests {
             ArrayIrOperation::Condition(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::While(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::Scan(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::CustomJvp(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::CustomVjp(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::CustomDerivative(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::LinearCall(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::Rematerialize(_) => MemberKindSignature::RegionForwarding,
         }
@@ -3646,8 +3718,16 @@ mod tests {
             (ArrayIrOperation::Condition(ConditionOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::While(WhileOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::Scan(ScanOperation::new(1, 4)), MemberKindSignature::RegionForwarding),
-            (ArrayIrOperation::CustomJvp(CustomJvpOperation::new()), MemberKindSignature::RegionForwarding),
-            (ArrayIrOperation::CustomVjp(CustomVjpOperation::new()), MemberKindSignature::RegionForwarding),
+            (
+                ArrayIrOperation::CustomDerivative(
+                    CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region),
+                ),
+                MemberKindSignature::RegionForwarding,
+            ),
+            (
+                ArrayIrOperation::CustomDerivative(CustomDerivativeOperation::new().with_vjp_rule()),
+                MemberKindSignature::RegionForwarding,
+            ),
             (ArrayIrOperation::LinearCall(LinearCallOperation::new(0)), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::Rematerialize(RematerializeOperation::new()), MemberKindSignature::RegionForwarding),
         ];

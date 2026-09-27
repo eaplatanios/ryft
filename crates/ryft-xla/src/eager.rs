@@ -916,44 +916,69 @@ mod tests {
             )
         };
         let reference = |values: &[num_complex::Complex<f64>]| CpuArray::vector(values.to_vec()).unwrap();
+
+        // Components must agree to a small relative tolerance, which cannot hide a lost tiny correction the way an
+        // absolute tolerance would. Zeros and infinities must agree exactly, including their signs, and NaNs must agree
+        // on being NaN.
         let assert_close = |actual: Vec<num_complex::Complex<f64>>, expected: Vec<num_complex::Complex<f64>>| {
             assert_eq!(actual.len(), expected.len());
+            let close = |actual: f64, expected: f64| {
+                if expected.is_nan() {
+                    actual.is_nan()
+                } else if expected == 0.0 || expected.is_infinite() {
+                    actual.to_bits() == expected.to_bits()
+                } else {
+                    (actual - expected).abs() <= 1e-13 * expected.abs()
+                }
+            };
             for (actual, expected) in actual.into_iter().zip(expected) {
-                let close = |actual: f64, expected: f64| {
-                    actual == expected || (actual.is_nan() && expected.is_nan()) || (actual - expected).abs() < 1e-12
-                };
                 assert!(
                     close(actual.re, expected.re) && close(actual.im, expected.im),
-                    "expected {expected} but got {actual}"
+                    "expected {expected:?} but got {actual:?}",
                 );
             }
         };
 
-        // Complex products start from the `1 + 0i` identity, which multiplies exactly, so infinite components survive
-        // instead of meeting its zero imaginary component as `0 · ∞ = NaN`.
-        let infinite = [num_complex::Complex::new(f64::INFINITY, 1.0), num_complex::Complex::new(1.0, 1.0)];
-        assert_close(
-            read(vector(&infinite).reduce_product(&[0]).unwrap()),
-            reference(&infinite).reduce_product(&[0]).unwrap().elements().unwrap(),
-        );
-        assert_close(
-            read(vector(&infinite).cumulative_product(0).unwrap()),
-            reference(&infinite).cumulative_product(0).unwrap().elements().unwrap(),
-        );
+        // Complex products treat an exact `1 + 0i` operand as the identity on both backends, whether it is the identity
+        // that seeds the product or an input element, so infinite components never meet its zero imaginary component as
+        // `0 · ∞ = NaN`, and a lone signed zero is returned exactly.
+        for values in [
+            vec![num_complex::Complex::new(f64::INFINITY, 1.0), num_complex::Complex::new(1.0, 1.0)],
+            vec![num_complex::Complex::new(f64::INFINITY, 0.0), num_complex::Complex::new(1.0, 0.0)],
+            vec![num_complex::Complex::new(-0.0, -0.0)],
+        ] {
+            assert_close(
+                read(vector(&values).reduce_product(&[0]).unwrap()),
+                reference(&values).reduce_product(&[0]).unwrap().elements().unwrap(),
+            );
+            assert_close(
+                read(vector(&values).cumulative_product(0).unwrap()),
+                reference(&values).cumulative_product(0).unwrap().elements().unwrap(),
+            );
+        }
 
-        // Shifting by the larger real component alone keeps both phases when the imaginary components differ widely.
-        let (first, second) = ([num_complex::Complex::new(0.0, 1e16)], [num_complex::Complex::new(-1.0, 1.0)]);
-        assert_close(
-            read(vector(&first).log_add_exp(&vector(&second)).unwrap()),
-            vec![(first[0].exp() + second[0].exp()).ln()],
-        );
+        // `log_add_exp` keeps small corrections and keeps both phases when the imaginary components differ widely.
+        for (left, right) in [
+            (num_complex::Complex::new(0.0, 0.0), num_complex::Complex::new(-40.0, 0.0)),
+            (num_complex::Complex::new(0.0, 1e16), num_complex::Complex::new(-1.0, 1.0)),
+        ] {
+            assert_close(
+                read(vector(&[left]).log_add_exp(&vector(&[right])).unwrap()),
+                reference(&[left]).log_add_exp(&reference(&[right])).unwrap().elements().unwrap(),
+            );
+        }
 
-        // A cumulative log-sum-exp prefix that no combination produced is still wrapped onto the principal branch.
-        let raw = [num_complex::Complex::new(1.0, 4.0), num_complex::Complex::new(f64::NEG_INFINITY, 0.0)];
-        assert_close(
-            read(vector(&raw).cumulative_log_sum_exp(0).unwrap()),
-            reference(&raw).cumulative_log_sum_exp(0).unwrap().elements().unwrap(),
-        );
+        // A cumulative log-sum-exp prefix that no combination produced is still brought onto the principal branch, and
+        // so is one whose phase is huge.
+        for values in [
+            vec![num_complex::Complex::new(1.0, 4.0), num_complex::Complex::new(f64::NEG_INFINITY, 0.0)],
+            vec![num_complex::Complex::new(1.0, 1e16)],
+        ] {
+            assert_close(
+                read(vector(&values).cumulative_log_sum_exp(0).unwrap()),
+                reference(&values).cumulative_log_sum_exp(0).unwrap().elements().unwrap(),
+            );
+        }
     }
 
     #[cfg(feature = "cuda-13")]
