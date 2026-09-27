@@ -69,7 +69,7 @@ use crate::macros::{check_count, dispatch_on_array_element_type, impl_differenti
 use crate::operations::arithmetic::{Div, DivOperation, Mul, MulOperation, Sub};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::comparisons::{Compare, CompareOperation, ComparisonDirection};
-use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
@@ -78,7 +78,9 @@ use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
 use crate::operations::exponential::Exp;
-use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{
+    Broadcast, BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
+};
 use crate::operations::manipulation::conversions::{ConvertElementType, ConvertElementTypeOperation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -683,8 +685,6 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C> MemberDifferentiableOperation<C> for ReduceOperation
 where
     C: Context<Type = ArrayIrType>,
@@ -712,243 +712,153 @@ where
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // Fully static reductions delegate to the homogeneous projected rule. Dynamically shaped numeric reductions
-        // retain their exact input extents as ordinary residual values so their transpose can broadcast cotangents back
-        // to the runtime input shape. Maximum and minimum additionally retain the normalized extremum mask, while mean
-        // computes its divisor from the retained reduced-axis extents.
-        let destinations = context;
-        let context = destinations.primal();
+        // retain their exact input extents as ordinary residual values so their transpose can broadcast cotangents
+        // back to the runtime input shape. Logarithmic sums also delegate, because their projected rule broadcasts
+        // to a static input type and supporting runtime-shaped softmax weights would need its own retained-shape
+        // linearization. Boolean reductions delegate so that they report the projected rule's error.
         check_count!("input", inputs, 1, ProgramError);
-
-        let input = &inputs[0];
-        let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
-
-        // Logarithmic sums retain their projected derivative rule, whose broadcast requires static geometry.
-        // Supporting runtime-shaped softmax weights would need its own retained-shape linearization.
+        let input_type = <&ArrayType>::try_from(inputs[0].primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
             || matches!(self.kind(), ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All)
         {
             let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-            return jvp_projected_operation(destinations, &operation, inputs);
+            return jvp_projected_operation(context, &operation, inputs);
         }
 
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-        let primal = context.bind(operation, Vec::new(), std::slice::from_ref(input.primal()))?.remove(0);
-        let output_primal = primal;
-        let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
+        let output = bind_array(context.primal(), self.clone(), std::slice::from_ref(inputs[0].primal()))?;
+        let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
         let input = &tangent_inputs[0];
-        let context = destinations.tangent();
-        let tangent = match input.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(input_tangent) => {
-                let mut residuals = LinearResiduals::new();
-                let input_shape = residuals.retain_shape(context, input.primal())?;
-                match self.kind() {
-                    ReductionKind::Max | ReductionKind::Min => {
-                        let input_extents = input_shape.dimensions(context, residuals.values())?;
-                        let output_axes = output_to_input_axis_map(input_type.rank(), self.axes());
-                        let mut broadcast_inputs = Vec::with_capacity(1 + input_extents.len());
-                        broadcast_inputs.push(primal.clone());
-                        broadcast_inputs.extend(input_extents.iter().cloned());
-                        let broadcast_primal = context
-                            .bind(
-                                DynamicBroadcastOperation::new(output_axes.clone()),
-                                Vec::new(),
-                                broadcast_inputs.as_slice(),
-                            )?
-                            .remove(0);
-                        let mask = context
-                            .bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    CompareOperation::new(ComparisonDirection::Equal),
-                                ),
-                                Vec::new(),
-                                &[input.primal().clone(), broadcast_primal],
-                            )?
-                            .remove(0);
-                        let numeric_mask = context
-                            .bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    ConvertElementTypeOperation::new(input_type.tangent()?.data_type(), false),
-                                ),
-                                Vec::new(),
-                                &[mask],
-                            )?
-                            .remove(0);
-                        let tie_count = context
-                            .bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    ReduceOperation::new(self.axes().to_vec(), ReductionKind::Sum),
-                                ),
-                                Vec::new(),
-                                std::slice::from_ref(&numeric_mask),
-                            )?
-                            .remove(0);
-                        let mut tie_broadcast_inputs = Vec::with_capacity(1 + input_extents.len());
-                        tie_broadcast_inputs.push(tie_count);
-                        tie_broadcast_inputs.extend(input_extents);
-                        let broadcast_tie_count = context
-                            .bind(
-                                DynamicBroadcastOperation::new(output_axes.clone()),
-                                Vec::new(),
-                                tie_broadcast_inputs.as_slice(),
-                            )?
-                            .remove(0);
-                        let normalized_mask = context
-                            .bind(
-                                <C::Operation as OperationProjection<ArrayType>>::Projected::from(DivOperation::new()),
-                                Vec::new(),
-                                &[numeric_mask, broadcast_tie_count],
-                            )?
-                            .remove(0);
-                        let mask_index = residuals.retain(normalized_mask);
-                        let forward_axes = self.axes().to_vec();
-                        let transpose_shape = input_shape.clone();
-                        let transpose_output_axes = output_axes.clone();
-                        let transpose_target_type = input_type.cotangent()?;
-                        let tangent = LinearCallOperation::stage(
-                            context,
-                            residuals.into_values(),
-                            vec![input_tangent.clone()],
-                            move |residuals, linear_inputs| {
-                                let forward_context = linear_inputs[0].dispatch_domain();
-                                let masked_tangent = forward_context
-                                    .bind(
-                                        <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                            MulOperation::new(),
-                                        ),
-                                        Vec::new(),
-                                        &[residuals[mask_index].clone(), linear_inputs[0].clone()],
-                                    )?
-                                    .remove(0);
-                                forward_context.bind(
-                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                        ReduceOperation::new(forward_axes.clone(), ReductionKind::Sum),
-                                    ),
-                                    Vec::new(),
-                                    &[masked_tangent],
-                                )
-                            },
-                            move |residuals, output_cotangents| {
-                                let transpose_context = output_cotangents[0].dispatch_domain();
-                                let input_extents = transpose_shape.dimensions(&transpose_context, residuals)?;
-                                let mut broadcast_inputs = Vec::with_capacity(1 + input_extents.len());
-                                broadcast_inputs.push(output_cotangents[0].clone());
-                                broadcast_inputs.extend(input_extents);
-                                let broadcasted = transpose_context
-                                    .bind(
-                                        DynamicBroadcastOperation::new(transpose_output_axes.clone())
-                                            .with_output_sharding(transpose_target_type.sharding().cloned()),
-                                        Vec::new(),
-                                        broadcast_inputs.as_slice(),
-                                    )?
-                                    .remove(0);
-                                transpose_context.bind(
-                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                        MulOperation::new(),
-                                    ),
-                                    Vec::new(),
-                                    &[residuals[mask_index].clone(), broadcasted],
-                                )
-                            },
-                        )?
-                        .remove(0);
-                        MaybeZero::Value(tangent)
-                    }
-                    kind @ (ReductionKind::Sum | ReductionKind::Mean) => {
-                        let forward_operation = self.clone();
-                        let transpose_input_type = input_type.cotangent()?;
-                        let transpose_axes = self.axes().to_vec();
-                        let transpose_output_axes =
-                            output_to_input_axis_map(transpose_input_type.rank(), &transpose_axes);
-                        let tangent = LinearCallOperation::stage(
-                            context,
-                            residuals.into_values(),
-                            vec![input_tangent.clone()],
-                            move |_, linear_inputs| {
-                                linear_inputs[0].dispatch_domain().bind(
-                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                        forward_operation,
-                                    ),
-                                    Vec::new(),
-                                    std::slice::from_ref(&linear_inputs[0]),
-                                )
-                            },
-                            move |residuals, output_cotangents| {
-                                let transpose_context = output_cotangents[0].dispatch_domain();
-                                let input_extents = input_shape.dimensions(&transpose_context, residuals)?;
-                                let mut broadcast_inputs = Vec::with_capacity(1 + input_extents.len());
-                                broadcast_inputs.push(output_cotangents[0].clone());
-                                broadcast_inputs.extend(input_extents.iter().cloned());
-                                let broadcasted = transpose_context
-                                    .bind(
-                                        DynamicBroadcastOperation::new(transpose_output_axes.clone())
-                                            .with_output_sharding(transpose_input_type.sharding().cloned()),
-                                        Vec::new(),
-                                        broadcast_inputs.as_slice(),
-                                    )?
-                                    .remove(0);
-                                if kind == ReductionKind::Sum {
-                                    return Ok(vec![broadcasted]);
-                                }
-
-                                let mut element_count = transpose_context
-                                    .bind(
-                                        DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(1)?)),
-                                        Vec::new(),
-                                        &[],
-                                    )?
-                                    .remove(0);
-                                for axis in &transpose_axes {
-                                    let left_type =
-                                        <&DimensionType>::try_from(element_count.r#type().as_ref())?.clone();
-                                    let right_type =
-                                        <&DimensionType>::try_from(input_extents[*axis].r#type().as_ref())?.clone();
-                                    element_count = transpose_context
-                                        .bind(
-                                            DimensionOperation::Mul(DimensionMulOperation::new(
-                                                &left_type,
-                                                &right_type,
-                                            )?),
-                                            Vec::new(),
-                                            &[element_count, input_extents[*axis].clone()],
-                                        )?
-                                        .remove(0);
-                                }
-                                let element_count = transpose_context
-                                    .bind(DimensionToScalarOperation, Vec::new(), &[element_count])?
-                                    .remove(0);
-                                let element_count = transpose_context
-                                    .bind(
-                                        <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                            ConvertElementTypeOperation::new(transpose_input_type.data_type(), false),
-                                        ),
-                                        Vec::new(),
-                                        &[element_count],
-                                    )?
-                                    .remove(0);
-                                transpose_context.bind(
-                                    <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                        DivOperation::new(),
-                                    ),
-                                    Vec::new(),
-                                    &[broadcasted, element_count],
-                                )
-                            },
-                        )?
-                        .remove(0);
-                        MaybeZero::Value(tangent)
-                    }
-                    ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
-                        unreachable!("logarithmic and Boolean reductions delegated above")
-                    }
-                }
+        let input_tangent = match input.tangent() {
+            MaybeZero::Zero(_) => {
+                let tangent = MaybeZero::Zero(output.r#type().tangent()?);
+                return Ok(vec![DifferentiationDual::new(output, tangent)?]);
             }
+            MaybeZero::Value(input_tangent) => input_tangent.clone(),
         };
 
-        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
+        let tangent_context = context.tangent();
+        let mut residuals = LinearResiduals::new();
+        let input_shape = residuals.retain_shape(tangent_context, input.primal())?;
+        let output_axes = output_to_input_axis_map(input_type.rank(), self.axes());
+        let cotangent_type = input_type.cotangent()?;
+        let axes = self.axes().to_vec();
+        let tangent = if matches!(self.kind(), ReductionKind::Max | ReductionKind::Min) {
+            // Stage the extremum mask and its tie count in the primal trace, just like the static rule does.
+            // The forward map sums the masked tangent and divides it by the tie count, which splits the derivative
+            // evenly between tied extrema, and the transpose applies the same division and masking in reverse order.
+            // The reduced output is broadcast back with the input sharding so that the comparison sees two identically
+            // distributed inputs.
+            let input_extents = input_shape.dimensions(tangent_context, residuals.values())?;
+            let broadcast_output = tangent_context
+                .bind(
+                    DynamicBroadcastOperation::new(output_axes.clone())
+                        .with_output_sharding(input_type.sharding().cloned()),
+                    Vec::new(),
+                    &[vec![context.primal_to_tangent(output.clone())?], input_extents].concat(),
+                )?
+                .remove(0);
+            let mask = bind_array(
+                tangent_context,
+                CompareOperation::new(ComparisonDirection::Equal),
+                &[input.primal().clone(), broadcast_output],
+            )?;
+            let mask = bind_array(
+                tangent_context,
+                ConvertElementTypeOperation::new(input_type.tangent()?.data_type(), false),
+                &[mask],
+            )?;
+            let tie_count = bind_array(
+                tangent_context,
+                ReduceOperation::new(axes.clone(), ReductionKind::Sum),
+                std::slice::from_ref(&mask),
+            )?;
+            let mask_index = residuals.retain(mask);
+            let tie_count_index = residuals.retain(tie_count);
+            LinearCallOperation::stage(
+                tangent_context,
+                residuals.into_values(),
+                vec![input_tangent],
+                move |residuals, linear_inputs| {
+                    let context = linear_inputs[0].dispatch_domain();
+                    let masked = bind_array(
+                        &context,
+                        MulOperation::new(),
+                        &[residuals[mask_index].clone(), linear_inputs[0].clone()],
+                    )?;
+                    let sum = bind_array(&context, ReduceOperation::new(axes, ReductionKind::Sum), &[masked])?;
+                    Ok(vec![bind_array(&context, DivOperation::new(), &[sum, residuals[tie_count_index].clone()])?])
+                },
+                move |residuals, output_cotangents| {
+                    let context = output_cotangents[0].dispatch_domain();
+                    let input_extents = input_shape.dimensions(&context, residuals)?;
+                    let cotangent = bind_array(
+                        &context,
+                        DivOperation::new(),
+                        &[output_cotangents[0].clone(), residuals[tie_count_index].clone()],
+                    )?;
+                    let cotangent = cotangent.dynamic_broadcast_with_output_sharding(
+                        input_extents.as_slice(),
+                        output_axes.as_slice(),
+                        cotangent_type.sharding().cloned(),
+                    )?;
+                    Ok(vec![bind_array(&context, MulOperation::new(), &[residuals[mask_index].clone(), cotangent])?])
+                },
+            )?
+        } else {
+            // Only sum and mean reach this branch and both are linear, so the forward map applies this reduction,
+            // including any requested output sharding, to the tangent. The transpose broadcasts the cotangent back
+            // to the retained input shape and mean then divides it by the reduced element count. That count is the
+            // product of the retained reduced-axis extents, which stays exact in dimension arithmetic until it is
+            // converted to the cotangent data type.
+            let forward_operation = self.clone();
+            let kind = self.kind();
+            LinearCallOperation::stage(
+                tangent_context,
+                residuals.into_values(),
+                vec![input_tangent],
+                move |_, linear_inputs| {
+                    Ok(vec![bind_array(&linear_inputs[0].dispatch_domain(), forward_operation, linear_inputs)?])
+                },
+                move |residuals, output_cotangents| {
+                    let context = output_cotangents[0].dispatch_domain();
+                    let input_extents = input_shape.dimensions(&context, residuals)?;
+                    let cotangent = output_cotangents[0].dynamic_broadcast_with_output_sharding(
+                        input_extents.as_slice(),
+                        output_axes.as_slice(),
+                        cotangent_type.sharding().cloned(),
+                    )?;
+                    if kind == ReductionKind::Sum {
+                        return Ok(vec![cotangent]);
+                    }
+
+                    let mut element_count = context.dimension_constant(1)?;
+                    for axis in axes {
+                        let operation = DimensionOperation::Mul(DimensionMulOperation::new(
+                            <&DimensionType>::try_from(element_count.r#type().as_ref())?,
+                            <&DimensionType>::try_from(input_extents[axis].r#type().as_ref())?,
+                        )?);
+                        element_count = context
+                            .bind(operation, Vec::new(), &[element_count, input_extents[axis].clone()])?
+                            .remove(0);
+                    }
+                    let element_count =
+                        context.bind(DimensionToScalarOperation, Vec::new(), &[element_count])?.remove(0);
+                    let element_count = bind_array(
+                        &context,
+                        ConvertElementTypeOperation::new(cotangent_type.data_type(), false),
+                        &[element_count],
+                    )?;
+                    Ok(vec![bind_array(&context, DivOperation::new(), &[cotangent, element_count])?])
+                },
+            )?
+        }
+        .remove(0);
+
+        Ok(vec![DifferentiationDual::new(output, MaybeZero::Value(tangent))?])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Value-level reduction capability.
 ///
@@ -1500,6 +1410,22 @@ pub(crate) fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]
         reduce_mask[*axis] = true;
     }
     (0..input_rank).filter(|axis| !reduce_mask[*axis]).collect()
+}
+
+/// Binds the single-output array operation `operation` in `context`, lifting it into the context's operation family
+/// through that family's [`OperationProjection<ArrayType>`](OperationProjection) member family, and returns its output.
+fn bind_array<C: Context<Type = ArrayIrType>, O>(
+    context: &C,
+    operation: O,
+    inputs: &[C::Value],
+) -> Result<C::Value, ProgramError>
+where
+    C::Operation: OperationProjection<ArrayType, Projected: From<O>>,
+{
+    let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(operation);
+    let mut outputs = context.bind(operation, Vec::new(), inputs)?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
 }
 
 // TODO(eaplatanios): Review this.
@@ -2248,6 +2174,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_reduce_differentiation_dynamic_reduced_axis_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding =
+            Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(4)]))
+                .with_sharding(sharding.clone())
+                .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Max))),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The extremum mask compares the input against the reduced output broadcast back to the runtime input shape.
+        // That broadcast requests the input sharding, just like the static rule's broadcast to the input type, instead
+        // of replicating the sharded reduced axis, so that the comparison inputs are identically distributed.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization
+                .primal()
+                .instructions()
+                .iter()
+                .filter_map(|instruction| match instruction.operation() {
+                    ArrayIrOperation::Broadcast(operation) => Some(operation.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![DynamicBroadcastOperation::new(vec![0]).with_output_sharding(sharding)],
+        );
     }
 
     #[test]
