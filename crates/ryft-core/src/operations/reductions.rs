@@ -685,28 +685,25 @@ impl_differentiable_operation! {
 
 // TODO(eaplatanios): Review from here onwards.
 
-// Parent-context JVP rule for [`ReduceOperation`]. Fully static reductions delegate to the homogeneous projected
-// rule. Dynamically shaped numeric reductions retain their exact input extents as ordinary residual values so their
-// transpose can broadcast cotangents back to the runtime input shape. Maximum and minimum additionally retain the
-// normalized extremum mask, while mean computes its divisor from the retained reduced-axis extents.
 impl<C> MemberDifferentiableOperation<C> for ReduceOperation
 where
     C: Context<Type = ArrayIrType>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<DynamicBroadcastOperation>
         + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<ArrayType>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
-        + From<CompareOperation<ArrayType>>
-        + From<ConvertElementTypeOperation<ArrayType>>
-        + From<DivOperation<ArrayType>>
-        + From<MulOperation<ArrayType>>
-        + From<ReduceOperation>,
+        + OperationProjection<
+            ArrayType,
+            Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+                           + From<CompareOperation<ArrayType>>
+                           + From<ConvertElementTypeOperation<ArrayType>>
+                           + From<DivOperation<ArrayType>>
+                           + From<MulOperation<ArrayType>>
+                           + From<ReduceOperation>,
+        > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -714,11 +711,17 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // Fully static reductions delegate to the homogeneous projected rule. Dynamically shaped numeric reductions
+        // retain their exact input extents as ordinary residual values so their transpose can broadcast cotangents back
+        // to the runtime input shape. Maximum and minimum additionally retain the normalized extremum mask, while mean
+        // computes its divisor from the retained reduced-axis extents.
         let destinations = context;
         let context = destinations.primal();
         check_count!("input", inputs, 1, ProgramError);
+
         let input = &inputs[0];
         let input_type = <&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone();
+
         // Logarithmic sums retain their projected derivative rule, whose broadcast requires static geometry.
         // Supporting runtime-shaped softmax weights would need its own retained-shape linearization.
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
@@ -942,6 +945,7 @@ where
                 }
             }
         };
+
         Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
