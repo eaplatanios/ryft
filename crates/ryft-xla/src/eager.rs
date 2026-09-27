@@ -861,6 +861,120 @@ mod tests {
     }
 
     #[test]
+    fn test_eager_cumulative_log_sum_exp_complex() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // Every window is padded with `-∞ + 0i` initial values, and an operand whose real component is negative
+        // infinity leaves the other one unchanged, so pairs of such operands (including pairs of initial values) never
+        // produce the NaN that the unguarded complex `log_add_exp` expansion computes for them.
+        let first = num_complex::Complex::new(1.0f32, 2.0);
+        let doubled = num_complex::Complex::new(1.0 + std::f32::consts::LN_2, 2.0);
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[4]),
+            mesh.clone(),
+            values_to_bytes(&[
+                first,
+                first,
+                num_complex::Complex::new(f32::NEG_INFINITY, 0.0),
+                num_complex::Complex::new(f32::NEG_INFINITY, 3.0),
+            ])
+            .as_slice(),
+        )
+        .unwrap();
+        let forward = read_c64s(&input.cumulative_log_sum_exp(0).unwrap());
+        for (actual, expected) in forward.into_iter().zip([first, doubled, doubled, doubled]) {
+            assert_c64_close(actual, expected);
+        }
+        let reverse = read_c64s(&input.reverse_cumulative_log_sum_exp(0).unwrap());
+        assert_c64_close(reverse[0], doubled);
+        assert_c64_close(reverse[1], first);
+        for value in &reverse[2..] {
+            assert!(
+                value.re == f32::NEG_INFINITY && !value.im.is_nan(),
+                "expected `-∞` real component but got {value}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_eager_cumulative_sum_on_cuda() {
+        use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        // Forward real sums lower to `chlo.scan` on GPU targets, while reverse sums keep the full-prefix
+        // `reduce_window` form. Small integral values keep every `f32` prefix sum exact, so both forms must agree with
+        // the sequential scan bit for bit, including along a scanned axis longer than one CUB block.
+        let (rows, columns) = (3, 1025);
+        let values = (0..rows * columns).map(|index| (index % 7) as f32).collect::<Vec<_>>();
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F32, &[rows, columns]),
+            mesh.clone(),
+            values_to_bytes(values.as_slice()).as_slice(),
+        )
+        .unwrap();
+        let scan = |reverse: bool| {
+            let mut expected = values.clone();
+            for row in expected.chunks_mut(columns) {
+                match reverse {
+                    true => (0..columns - 1).rev().for_each(|column| row[column] += row[column + 1]),
+                    false => (1..columns).for_each(|column| row[column] += row[column - 1]),
+                }
+            }
+            expected
+        };
+        let read = |array: Array<'_>| {
+            values_from_bytes::<f32>(&shard_host_bytes(array.addressable_shards().next().unwrap()).unwrap())
+        };
+        assert_eq!(read(input.cumulative_sum(1).unwrap()), scan(false));
+        assert_eq!(read(input.reverse_cumulative_sum(1).unwrap()), scan(true));
+
+        // Integer sums take the same `chlo.scan` path, here along the leading axis.
+        let integers = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I32, &[4, 2]),
+            mesh.clone(),
+            values_to_bytes(&[1i32, -2, 3, 4, -5, 6, 7, -8]).as_slice(),
+        )
+        .unwrap();
+        let output = integers.cumulative_sum(0).unwrap();
+        assert_eq!(
+            values_from_bytes::<i32>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap()),
+            vec![1, -2, 4, 2, -1, 8, 6, 0],
+        );
+    }
+
+    #[test]
+    fn test_eager_reduce_log_sum_exp_complex() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        // Complex operands are shifted by the maximum of their real components, and `-∞ + 0i` (the padding of ragged
+        // complex reductions) contributes a zero exponential.
+        let first = num_complex::Complex::new(1.0f32, 0.5);
+        let second = num_complex::Complex::new(3.0f32, -2.0);
+        let shift = num_complex::Complex::new(3.0f32, 0.0);
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[3]),
+            mesh.clone(),
+            values_to_bytes(&[first, second, num_complex::Complex::new(f32::NEG_INFINITY, 0.0)]).as_slice(),
+        )
+        .unwrap();
+        let output = read_c64s(&input.reduce_log_sum_exp(&[0]).unwrap());
+        assert_c64_close(output[0], ((first - shift).exp() + (second - shift).exp()).ln() + shift);
+    }
+
+    #[test]
     fn test_eager_log_add_exp() {
         let client = execution_client();
         let mesh = cpu_mesh(&client);

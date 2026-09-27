@@ -78,6 +78,7 @@ use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
 use crate::operations::manipulation::padding::{Pad, PadOperation};
 use crate::operations::manipulation::slicing::{Slice, SliceOperation};
+use crate::parameters::Parameterized;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, ProvenanceScope, RegionInterface,
@@ -120,14 +121,23 @@ pub enum CumulativeKind {
     /// reduction that [`ReductionKind::LogSumExp`](crate::ReductionKind::LogSumExp) evaluates, so the two can round
     /// differently in their last bits.
     ///
-    /// Padding is filled with the element data type's lowest value, which must be an identity of the rounded pairwise
-    /// [`LogAddExp`] operation. True negative infinity satisfies this contract, as do finite sentinels that round back
-    /// to the other input after each pairwise combination. A binary fold rounds after every pair, so once combining two
+    /// Real floating-point and complex inputs are supported. Complex prefixes use the principal logarithm of the
+    /// elementwise [`LogAddExp`] operation, so their imaginary components stay in `[-π, π)`. An operand whose real
+    /// component is negative infinity has a zero exponential whatever its imaginary component, and so the combiner
+    /// returns the other operand unchanged. That shortcut is exact, and it is what keeps complex prefixes over such
+    /// operands defined: the elementwise complex combination of two of them would subtract `-∞` from `-∞` and produce
+    /// NaN (real combinations already return the other operand). Differentiation goes through the elementwise
+    /// combination instead, so under differentiation such complex prefixes are NaN, as they are in JAX.
+    ///
+    /// Padding is filled with the element data type's lowest real value (i.e., [`RaggedMaskIdentity::LowestReal`]),
+    /// which must be an identity of the rounded pairwise [`LogAddExp`] operation. True negative infinity satisfies this
+    /// contract (paired with a zero imaginary component for complex inputs), as do finite sentinels that round back to
+    /// the other input after each pairwise combination. A binary fold rounds after every pair, so once combining two
     /// sentinel values returns the sentinel, an all-sentinel subtree of any size does too, and such sentinels therefore
     /// remain neutral for any prefix length. [`DataType::F8E8M0FNU`] and [`DataType::F6E2M3FN`] have no suitable
-    /// identity and are rejected, as are all non-floating-point and complex inputs. This criterion intentionally
-    /// differs from that of the log-sum-exp reduction, whose padding must remain neutral after subtracting an
-    /// arbitrary maximum and which therefore requires a format that represents negative infinity.
+    /// identity and are rejected, as are all integer and Boolean inputs. This criterion intentionally differs from that
+    /// of the log-sum-exp reduction, whose padding must remain neutral after subtracting an arbitrary maximum and which
+    /// therefore requires a format that represents negative infinity.
     LogSumExp,
 }
 
@@ -153,8 +163,6 @@ impl Display for CumulativeKind {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents one inclusive prefix scan along a single array axis. Output element `i` along [`axis`](Self::axis) holds
 /// the combination of the input elements `0..=i` under the combining operator selected by [`kind`](Self::kind), or of
 /// the input elements `i..` when [`reverse`](Self::reverse) is set. The output type is the input type, so a cumulative
@@ -174,6 +182,8 @@ pub struct CumulativeOperation {
     /// Refer to the documentation of [`Self::reverse`].
     reverse: bool,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl CumulativeOperation {
     /// Creates a new forward [`CumulativeOperation`] scanning along `axis` with the supplied `kind`. The scanned extent
@@ -296,7 +306,8 @@ where
                 let identity = match self.kind {
                     CumulativeKind::Sum => RaggedMaskIdentity::Zero,
                     CumulativeKind::Product => RaggedMaskIdentity::One,
-                    CumulativeKind::Max | CumulativeKind::LogSumExp => RaggedMaskIdentity::Lowest,
+                    CumulativeKind::Max => RaggedMaskIdentity::Lowest,
+                    CumulativeKind::LogSumExp => RaggedMaskIdentity::LowestReal,
                     CumulativeKind::Min => RaggedMaskIdentity::Highest,
                 };
                 P::mask_identity_input(context, &inputs[0], &[lifted_axis], identity)?
@@ -359,7 +370,10 @@ impl_differentiable_operation! {
             // The primal output of a nonlinear kind comes from the decomposition, which interleaves its halves by
             // adding zero-padded operands. That addition turns a `-0.0` result into `+0.0`, so under differentiation
             // the primal output of an extremum scan over signed zeros can differ from the undifferentiated one in the
-            // sign of a zero (JAX's `_cumulative_jvp_rule` has the same property).
+            // sign of a zero. Similarly, the decomposition combines log-sum-exp prefixes with the unguarded elementwise
+            // `log_add_exp`, so a complex prefix that combines two operands with negative-infinite real components is
+            // NaN there, while the primitive returns the other operand. JAX's `_cumulative_jvp_rule` has both
+            // properties.
             let dual = match kind {
                 CumulativeKind::Sum => {
                     let primal = primal_input.cumulative(axis, kind, reverse)?;
@@ -585,15 +599,19 @@ impl Cumulative for Array {
                 })
             }
             CumulativeKind::LogSumExp => {
-                dispatch_on_array_element_type!(@float data_type, |Element| {
+                dispatch_on_array_element_type!(@float_or_complex data_type, |Element| {
+                    // Converting an element into `f64` keeps only its real component, which is all that decides whether
+                    // its exponential is zero. The guard never changes a real combination.
                     let elements = self.elements::<Element>()?;
-                    let scanned = cumulative_evaluate(
-                        elements.as_slice(),
-                        &shape,
-                        axis,
-                        reverse,
-                        FloatingPointArrayElement::log_add_exp,
-                    )?;
+                    let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
+                        if right.convert_to::<f64>()? == f64::NEG_INFINITY {
+                            Ok(left)
+                        } else if left.convert_to::<f64>()? == f64::NEG_INFINITY {
+                            Ok(right)
+                        } else {
+                            FloatingPointArrayElement::log_add_exp(left, right)
+                        }
+                    })?;
                     Self::from_elements(output_type, scanned.as_slice())
                 })
             }
@@ -647,8 +665,8 @@ impl ArrayType {
             CumulativeKind::Max | CumulativeKind::Min if !data_type.is_numeric() => {
                 Some(Cow::Borrowed("numeric inputs"))
             }
-            CumulativeKind::LogSumExp if !data_type.is_floating_point() => {
-                Some(Cow::Borrowed("real floating-point inputs"))
+            CumulativeKind::LogSumExp if !data_type.is_floating_point() && !data_type.is_complex() => {
+                Some(Cow::Borrowed("floating-point or complex inputs"))
             }
             CumulativeKind::LogSumExp if matches!(data_type, DataType::F8E8M0FNU | DataType::F6E2M3FN) => {
                 Some(Cow::Owned(format!(
@@ -693,8 +711,8 @@ impl ArrayType {
     }
 }
 
-/// Returns the inclusive prefix scan of `value` along `axis` under the associative operator `combine`, built out of
-/// ordinary manipulation primitives instead of out of one [`CumulativeOperation`].
+/// Returns the inclusive prefix scans of the arrays in `values` along `axis` under the associative operator `combine`,
+/// built out of ordinary manipulation primitives instead of out of one [`CumulativeOperation`].
 ///
 /// This is Ryft's port of the log-depth Blelloch construction that JAX's
 /// [`lax.associative_scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.associative_scan.html) implements
@@ -704,73 +722,126 @@ impl ArrayType {
 /// carrying a bespoke gradient formula (JAX's `_cumulative_jvp_rule`). It is also useful on its own for combining
 /// operators that no [`CumulativeKind`] covers.
 ///
+/// Like JAX's, the scan runs over a whole structure of arrays at once: `values` is any [`Parameterized`] structure of
+/// arrays (e.g., a single array, a tuple, a vector, or a derived structure), and `combine` receives and returns
+/// structures shaped like it. This lets one scan carry several arrays that combine jointly, such as a running maximum
+/// together with the position at which it is attained. The arrays are sliced and interleaved along `axis` in lockstep,
+/// so they must all have the same extent along it, while their other dimensions and their data types can differ.
+///
 /// The recursion combines adjacent pairs along `axis`, scans the halved sequence recursively, combines the scanned
 /// halves back against the elements the pairing skipped, and interleaves the two halves into the result. `combine`
 /// always receives its operands in scan order (the accumulated prefix first), so the construction stays correct for
 /// associative operators that are not commutative. A `reverse` scan mirrors the same recursion around the end of the
-/// axis (the pairing simply starts one element in when the extent is odd) instead of reversing the operand before and
-/// after a forward scan, which saves two array reversals per scan. Boolean operands are interleaved with a disjunction
-/// rather than an addition, because Booleans have no addition.
+/// axis (the pairing simply starts one element in when the extent is odd) instead of reversing the operands before and
+/// after a forward scan, which saves two array reversals per array and scan. Boolean arrays are interleaved with a
+/// disjunction rather than an addition, because Booleans have no addition.
 ///
-/// The whole operand shape must be static, because the construction slices at staging-time positions. A scanned axis
-/// shorter than two elements is returned unchanged.
+/// The shape of every array must be static, because the construction slices at staging-time positions. A scanned axis
+/// shorter than two elements leaves the arrays unchanged, and so does a structure that holds no arrays.
 ///
 /// # Parameters
 ///
-///   - `value`: Scanned operand.
-///   - `axis`: Scanned axis.
+///   - `values`: [`Parameterized`] structure of the scanned arrays.
+///   - `axis`: Scanned axis of every array.
 ///   - `reverse`: Whether to accumulate from the end of the scanned axis toward its start.
-///   - `combine`: Associative binary operator, receiving the accumulated prefix and the next elements in scan order.
+///   - `combine`: Associative binary operator over structures shaped like `values`, receiving the accumulated prefix
+///     and the next elements in scan order. It must return as many arrays as `values` holds.
 ///
 /// # Errors
 ///
-/// Returns a [`ProgramError`] if `axis` is out of bounds, if the operand shape is not static, or if staging any of the
-/// primitives of the construction (including those that `combine` stages) fails.
-pub fn associative_scan<V, F>(value: &V, axis: usize, reverse: bool, combine: &F) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
-    V::DispatchDomain: Context<Type = ArrayType> + Zero<V>,
-    F: Fn(&V, &V) -> Result<V, ProgramError>,
-{
-    let value_type = value.r#type().into_owned();
-    let rank = value_type.rank();
-    if axis >= rank {
-        return Err(
-            TypeError::invalid(format!("`associative_scan` axis {axis} is out of bounds for rank {rank}")).into()
-        );
-    }
-    let shape = value_type.static_shape().ok_or_else(|| {
-        TypeError::invalid(format!("`associative_scan` requires a statically shaped operand but got `{value_type}`"))
-    })?;
-
-    // The scopes below are purely diagnostic: they attribute every instruction the decomposition stages, and they are a
-    // no-op under an eager context, which records no instructions at all.
-    let domain = value.dispatch_domain();
-    domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
-        domain.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
-            domain.invoke_with_provenance_scope(ProvenanceScope::new("associative_scan"), || {
-                associative_scan_recursively(value, &shape, axis, reverse, combine)
-            })
-        })
-    })
-}
-
-/// Recursive half of [`associative_scan`], operating on an operand whose shape is already known to be static.
-fn associative_scan_recursively<V, F>(
-    value: &V,
-    shape: &StaticShape,
+/// Returns a [`ProgramError`] if `axis` is out of bounds for any array, if the shape of any array is not static, if
+/// the arrays have different extents along `axis`, if `combine` returns a different number of arrays, or if staging
+/// any of the primitives of the construction (including those that `combine` stages) fails.
+pub fn associative_scan<V, Values, F>(
+    values: &Values,
     axis: usize,
     reverse: bool,
     combine: &F,
-) -> Result<V, ProgramError>
+) -> Result<Values, ProgramError>
 where
     V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
     V::DispatchDomain: Context<Type = ArrayType> + Zero<V>,
-    F: Fn(&V, &V) -> Result<V, ProgramError>,
+    Values: Parameterized<V>,
+    F: Fn(&Values, &Values) -> Result<Values, ProgramError>,
 {
-    let extent = shape[axis];
+    let structure = values.parameter_structure();
+    let arrays = values.parameters().cloned().collect::<Vec<_>>();
+    let shapes = arrays
+        .iter()
+        .map(|array| {
+            let array_type = array.r#type();
+            let rank = array_type.rank();
+            if axis >= rank {
+                return Err(TypeError::invalid(format!(
+                    "`associative_scan` axis {axis} is out of bounds for rank {rank}",
+                )));
+            }
+            array_type.static_shape().ok_or_else(|| {
+                TypeError::invalid(format!(
+                    "`associative_scan` requires statically shaped operands but got `{array_type}`",
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(first) = arrays.first() else {
+        return Ok(Values::from_parameters(structure, arrays)?);
+    };
+    let extent = shapes[0][axis];
+    if let Some(shape) = shapes.iter().find(|shape| shape[axis] != extent) {
+        return Err(TypeError::invalid(format!(
+            "`associative_scan` requires operands with equal extents along axis {axis} but got {extent} and {}",
+            shape[axis],
+        ))
+        .into());
+    }
+
+    // The recursion runs over the flat arrays, so the combining operator is wrapped to rebuild its structured operands
+    // on the way in and to flatten its structured result on the way out.
+    let array_count = arrays.len();
+    let flat_combine = |left: &[V], right: &[V]| -> Result<Vec<V>, ProgramError> {
+        let left = Values::from_parameters(structure.clone(), left.iter().cloned())?;
+        let right = Values::from_parameters(structure.clone(), right.iter().cloned())?;
+        let combined = combine(&left, &right)?;
+        let combined_count = combined.parameter_count();
+        if combined_count != array_count {
+            return Err(TypeError::invalid(format!(
+                "`associative_scan` combining operator must return {array_count} arrays but returned {combined_count}",
+            ))
+            .into());
+        }
+        Ok(combined.into_parameters().collect())
+    };
+
+    // The scopes below are purely diagnostic: they attribute every instruction the decomposition stages, and they are a
+    // no-op under an eager context, which records no instructions at all.
+    let domain = first.dispatch_domain();
+    let scanned = domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
+        domain.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
+            domain.invoke_with_provenance_scope(ProvenanceScope::new("associative_scan"), || {
+                associative_scan_recursively(&arrays, &shapes, axis, reverse, &flat_combine)
+            })
+        })
+    })?;
+    Ok(Values::from_parameters(structure, scanned)?)
+}
+
+/// Recursive half of [`associative_scan`], operating on the flat arrays of the scanned structure, whose shapes are
+/// already known to be static and to agree along `axis`.
+fn associative_scan_recursively<V, F>(
+    values: &[V],
+    shapes: &[StaticShape],
+    axis: usize,
+    reverse: bool,
+    combine: &F,
+) -> Result<Vec<V>, ProgramError>
+where
+    V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
+    V::DispatchDomain: Context<Type = ArrayType> + Zero<V>,
+    F: Fn(&[V], &[V]) -> Result<Vec<V>, ProgramError>,
+{
+    let extent = shapes[0][axis];
     if extent < 2 {
-        return Ok(value.clone());
+        return Ok(values.to_vec());
     }
     let half = extent / 2;
 
@@ -781,8 +852,8 @@ where
         true => extent % 2,
         false => 0,
     };
-    let earlier = scan_slice(value, shape, axis, pair_offset, extent - 1, 2)?;
-    let later = scan_slice(value, shape, axis, pair_offset + 1, extent, 2)?;
+    let earlier = scan_slice(values, shapes, axis, pair_offset, extent - 1, 2)?;
+    let later = scan_slice(values, shapes, axis, pair_offset + 1, extent, 2)?;
     let reduced = match reverse {
         true => combine(&later, &earlier)?,
         false => combine(&earlier, &later)?,
@@ -790,12 +861,15 @@ where
 
     // Scanning the pairwise reductions yields every other output element: the odd positions of a forward scan, and the
     // positions congruent to `pair_offset` of a reverse one.
-    let halved_shape = StaticShape::new({
-        let mut dimensions = shape.dimensions().to_vec();
-        dimensions[axis] = half;
-        dimensions
-    });
-    let aligned = associative_scan_recursively(&reduced, &halved_shape, axis, reverse, combine)?;
+    let halved_shapes = shapes
+        .iter()
+        .map(|shape| {
+            let mut dimensions = shape.dimensions().to_vec();
+            dimensions[axis] = half;
+            StaticShape::new(dimensions)
+        })
+        .collect::<Vec<_>>();
+    let aligned = associative_scan_recursively(&reduced, &halved_shapes, axis, reverse, combine)?;
 
     // Each complementary position extends the aligned result before it by the one element that separates them, except
     // for the position at the scan's own start, which is just the operand element there. An even extent has one fewer
@@ -807,32 +881,40 @@ where
     };
     let (complement, aligned_leads) = match reverse {
         true => {
-            let last = scan_slice(value, shape, axis, extent - 1, extent, 1)?;
+            let last = scan_slice(values, shapes, axis, extent - 1, extent, 1)?;
             let complement = match complement_count {
                 0 => last,
                 _ => {
                     let trimmed = match extent % 2 {
-                        0 => scan_slice(&aligned, &halved_shape, axis, 1, half, 1)?,
+                        0 => scan_slice(&aligned, &halved_shapes, axis, 1, half, 1)?,
                         _ => aligned.clone(),
                     };
                     let start = (pair_offset + 1) % 2;
-                    let operands = scan_slice(value, shape, axis, start, start + 2 * complement_count, 2)?;
-                    V::concatenate([&combine(&trimmed, &operands)?, &last], axis)?
+                    let operands = scan_slice(values, shapes, axis, start, start + 2 * complement_count, 2)?;
+                    combine(&trimmed, &operands)?
+                        .iter()
+                        .zip(&last)
+                        .map(|(combined, last)| V::concatenate([combined, last], axis))
+                        .collect::<Result<Vec<_>, _>>()?
                 }
             };
             (complement, extent % 2 == 0)
         }
         false => {
-            let first = scan_slice(value, shape, axis, 0, 1, 1)?;
+            let first = scan_slice(values, shapes, axis, 0, 1, 1)?;
             let complement = match complement_count {
                 0 => first,
                 _ => {
                     let trimmed = match extent % 2 {
-                        0 => scan_slice(&aligned, &halved_shape, axis, 0, half - 1, 1)?,
+                        0 => scan_slice(&aligned, &halved_shapes, axis, 0, half - 1, 1)?,
                         _ => aligned.clone(),
                     };
-                    let operands = scan_slice(value, shape, axis, 2, (2 + 2 * complement_count).min(extent), 2)?;
-                    V::concatenate([&first, &combine(&trimmed, &operands)?], axis)?
+                    let operands = scan_slice(values, shapes, axis, 2, (2 + 2 * complement_count).min(extent), 2)?;
+                    first
+                        .iter()
+                        .zip(&combine(&trimmed, &operands)?)
+                        .map(|(first, combined)| V::concatenate([first, combined], axis))
+                        .collect::<Result<Vec<_>, _>>()?
                 }
             };
             (complement, false)
@@ -840,45 +922,52 @@ where
     };
 
     match aligned_leads {
-        true => scan_interleave(&aligned, &complement, shape, axis, half, extent - half),
-        false => scan_interleave(&complement, &aligned, shape, axis, extent - half, half),
+        true => scan_interleave(&aligned, &complement, shapes, axis, half, extent - half),
+        false => scan_interleave(&complement, &aligned, shapes, axis, extent - half, half),
     }
 }
 
-/// Returns the elements of `value` at positions `start`, `start + stride`, ... below `limit` along `axis`, keeping
-/// every other axis whole.
+/// Returns the elements of each array in `values` at positions `start`, `start + stride`, ... below `limit` along
+/// `axis`, keeping every other axis whole. `shapes` holds the static shape of each array.
 fn scan_slice<V: Slice>(
-    value: &V,
-    shape: &StaticShape,
+    values: &[V],
+    shapes: &[StaticShape],
     axis: usize,
     start: usize,
     limit: usize,
     stride: usize,
-) -> Result<V, ProgramError> {
-    let mut start_indices = vec![0; shape.rank()];
-    let mut limit_indices = shape.dimensions().to_vec();
-    let mut strides = vec![1; shape.rank()];
-    start_indices[axis] = start;
-    limit_indices[axis] = limit;
-    strides[axis] = stride;
-    value.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())
+) -> Result<Vec<V>, ProgramError> {
+    values
+        .iter()
+        .zip(shapes)
+        .map(|(value, shape)| {
+            let mut start_indices = vec![0; shape.rank()];
+            let mut limit_indices = shape.dimensions().to_vec();
+            let mut strides = vec![1; shape.rank()];
+            start_indices[axis] = start;
+            limit_indices[axis] = limit;
+            strides[axis] = stride;
+            value.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())
+        })
+        .collect()
 }
 
-/// Returns `left` and `right` interleaved along `axis`, starting with `left`. `left` must hold either as many elements
-/// along `axis` as `right` or exactly one more.
+/// Returns each array of `left` interleaved along `axis` with the corresponding array of `right`, starting with the
+/// `left` one, where `shapes` holds the static shapes of the (uninterleaved) scanned arrays. Each `left` array must
+/// hold either as many elements along `axis` as its `right` counterpart or exactly one more.
 ///
 /// Both operands are dilated into the output extent with interior padding (writing zeros into the positions that the
 /// other operand occupies) and then combined with an addition, or with a disjunction for Boolean operands, which have
 /// no addition. The combination is exact because the two dilated operands have disjoint support and zero (i.e.,
 /// `false`) is the identity of both combiners.
 fn scan_interleave<V>(
-    left: &V,
-    right: &V,
-    shape: &StaticShape,
+    left: &[V],
+    right: &[V],
+    shapes: &[StaticShape],
     axis: usize,
     left_count: usize,
     right_count: usize,
-) -> Result<V, ProgramError>
+) -> Result<Vec<V>, ProgramError>
 where
     V: Value<Type = ArrayType> + Add + Or + Pad,
     V::DispatchDomain: Zero<V>,
@@ -889,20 +978,26 @@ where
         ))
         .into());
     }
-    let padding_value = left.dispatch_domain().zero(&left.r#type().scalar_like()?)?;
-    let mut edge_padding_low = vec![0; shape.rank()];
-    let mut edge_padding_high = vec![0; shape.rank()];
-    let mut interior_padding = vec![0; shape.rank()];
-    interior_padding[axis] = 1;
-    edge_padding_high[axis] = i64::from(left_count == right_count);
-    let dilated_left = left.pad(&padding_value, &edge_padding_low, &edge_padding_high, &interior_padding)?;
-    edge_padding_low[axis] = 1;
-    edge_padding_high[axis] = i64::from(left_count != right_count);
-    let dilated_right = right.pad(&padding_value, &edge_padding_low, &edge_padding_high, &interior_padding)?;
-    match left.r#type().data_type() {
-        DataType::Boolean => dilated_left.or(&dilated_right),
-        _ => dilated_left.add(&dilated_right),
-    }
+    left.iter()
+        .zip(right)
+        .zip(shapes)
+        .map(|((left, right), shape)| {
+            let padding_value = left.dispatch_domain().zero(&left.r#type().scalar_like()?)?;
+            let mut edge_padding_low = vec![0; shape.rank()];
+            let mut edge_padding_high = vec![0; shape.rank()];
+            let mut interior_padding = vec![0; shape.rank()];
+            interior_padding[axis] = 1;
+            edge_padding_high[axis] = i64::from(left_count == right_count);
+            let dilated_left = left.pad(&padding_value, &edge_padding_low, &edge_padding_high, &interior_padding)?;
+            edge_padding_low[axis] = 1;
+            edge_padding_high[axis] = i64::from(left_count != right_count);
+            let dilated_right = right.pad(&padding_value, &edge_padding_low, &edge_padding_high, &interior_padding)?;
+            match left.r#type().data_type() {
+                DataType::Boolean => dilated_left.or(&dilated_right),
+                _ => dilated_left.add(&dilated_right),
+            }
+        })
+        .collect()
 }
 
 /// Value that the nested trace staging an [`associative_scan`] decomposition flows.
@@ -1053,6 +1148,8 @@ mod tests {
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
+    use crate::operations::comparisons::{Compare, ComparisonDirection};
+    use crate::operations::control_flow::select::Select;
     use crate::operations::reductions::Reduce;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -1247,7 +1344,7 @@ mod tests {
             (CumulativeKind::Product, "One"),
             (CumulativeKind::Max, "Lowest"),
             (CumulativeKind::Min, "Highest"),
-            (CumulativeKind::LogSumExp, "Lowest"),
+            (CumulativeKind::LogSumExp, "LowestReal"),
         ] {
             assert_eq!(
                 CumulativeOperation::new(0, kind).batch(
@@ -1334,8 +1431,12 @@ mod tests {
         // through the associative-scan decomposition, and their expected tangents are, respectively, the product rule
         // applied to each prefix (a zero input zeroes every later prefix but still passes its own tangent, scaled by
         // the product of the other elements), the tangent of the element that currently attains the extremum (at
-        // tie-free inputs), and the softmax-weighted average of the input tangents over each prefix.
+        // tie-free inputs), and the softmax-weighted average of the input tangents over each prefix, which is the
+        // complex derivative for complex inputs.
         let e = std::f64::consts::E;
+        let complex_first = ComplexNumber::new(0.5f64, 0.25);
+        let complex_second = ComplexNumber::new(-0.3f64, 1.0);
+        let complex_total = complex_first.exp() + complex_second.exp();
         let extrema = Array::vector(vec![3.0, 1.0, 4.0, 1.5, 5.0]).unwrap();
         let ramp = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         for (operation, primals, tangents, primal_outputs, tangent_outputs) in [
@@ -1423,6 +1524,17 @@ mod tests {
                     (1.0 + 2.0 * e + 3.0 * e * e) / (1.0 + e + e * e),
                     (2.0 * e + 3.0 * e * e) / (e + e * e),
                     3.0,
+                ])
+                .unwrap(),
+            ),
+            (
+                CumulativeOperation::new(0, CumulativeKind::LogSumExp),
+                Array::vector(vec![complex_first, complex_second]).unwrap(),
+                Array::vector(vec![ComplexNumber::new(1.0, 0.0), ComplexNumber::new(0.0, 1.0)]).unwrap(),
+                Array::vector(vec![complex_first, complex_total.ln()]).unwrap(),
+                Array::vector(vec![
+                    ComplexNumber::new(1.0, 0.0),
+                    (complex_first.exp() + complex_second.exp() * ComplexNumber::new(0.0, 1.0)) / complex_total,
                 ])
                 .unwrap(),
             ),
@@ -1964,6 +2076,33 @@ mod tests {
         assert_eq!(lowest.cumulative_log_sum_exp(0), Ok(lowest));
         let lowest = Array::vector(vec![f8e4m3fnuz::MIN; 3000]).unwrap();
         assert_eq!(lowest.cumulative_log_sum_exp(0), Ok(lowest));
+
+        // Complex prefixes use the principal logarithm, and an operand whose real component is negative infinity has a
+        // zero exponential, so it leaves the other operand unchanged. That includes a pair of such operands, whose
+        // elementwise complex combination would subtract `-∞` from `-∞` and produce NaN; the reverse scan combines one.
+        let first = ComplexNumber::new(1.0f64, 2.0);
+        let doubled = ComplexNumber::new(1.0 + std::f64::consts::LN_2, 2.0);
+        let complex = Array::vector(vec![
+            first,
+            first,
+            ComplexNumber::new(f64::NEG_INFINITY, 0.0),
+            ComplexNumber::new(f64::NEG_INFINITY, 3.0),
+        ])
+        .unwrap();
+        assert_eq!(
+            complex.cumulative_log_sum_exp(0),
+            Ok(Array::vector(vec![first, doubled, doubled, doubled]).unwrap())
+        );
+        assert_eq!(
+            complex.reverse_cumulative_log_sum_exp(0),
+            Ok(Array::vector(vec![
+                doubled,
+                first,
+                ComplexNumber::new(f64::NEG_INFINITY, 3.0),
+                ComplexNumber::new(f64::NEG_INFINITY, 3.0),
+            ])
+            .unwrap()),
+        );
     }
 
     #[test]
@@ -2058,20 +2197,22 @@ mod tests {
             }
         }
 
-        // The exponential and the logarithm have no meaning for non-floating-point or complex inputs.
-        for data_type in [DataType::I32, DataType::Boolean, DataType::C64, DataType::Token, DataType::Zero] {
+        // The exponential and the logarithm have no meaning for integer, Boolean, or payload-free inputs.
+        for data_type in [DataType::I32, DataType::Boolean, DataType::Token, DataType::Zero] {
             assert_eq!(
                 ArrayType::new_static(data_type, [3, 2]).cumulative(1, CumulativeKind::LogSumExp),
                 Err(TypeError::invalid(format!(
-                    "`cumulative` with kind `log_sum_exp` requires real floating-point inputs but got `{data_type}`",
+                    "`cumulative` with kind `log_sum_exp` requires floating-point or complex inputs but got \
+                     `{data_type}`",
                 ))),
             );
         }
 
         // `f8e8m0fnu` encodes bare positive exponents, so its smallest element exponentiates to one instead of acting
         // as the combining operator's identity, and the lowest `f6e2m3fn` value already changes when combined with one
-        // more copy of itself. These finite sentinels, however, are identities after every rounded pairwise
-        // combination.
+        // more copy of itself. The finite sentinels of the finite-only formats accepted below, however, are identities
+        // after every rounded pairwise combination, and the complex types pair negative infinity with a zero imaginary
+        // component.
         for data_type in [DataType::F8E8M0FNU, DataType::F6E2M3FN] {
             assert_eq!(
                 ArrayType::new_static(data_type, [3, 2]).cumulative(1, CumulativeKind::LogSumExp),
@@ -2081,7 +2222,14 @@ mod tests {
                 ))),
             );
         }
-        for data_type in [DataType::F32, DataType::F4E2M1FN, DataType::F8E4M3B11FNUZ, DataType::F6E3M2FN] {
+        for data_type in [
+            DataType::F32,
+            DataType::F4E2M1FN,
+            DataType::F8E4M3B11FNUZ,
+            DataType::F6E3M2FN,
+            DataType::C64,
+            DataType::C128,
+        ] {
             let input = ArrayType::new_static(data_type, [3, 2]);
             assert_eq!(input.cumulative(1, CumulativeKind::LogSumExp), Ok(input.clone()));
         }
@@ -2170,6 +2318,69 @@ mod tests {
         assert_eq!(
             associative_scan(&matrix, 2, false, &add),
             Err(ProgramError::Type(TypeError::invalid("`associative_scan` axis 2 is out of bounds for rank 2"))),
+        );
+    }
+
+    #[test]
+    fn test_associative_scan_structures() {
+        // A structure of arrays is scanned in lockstep under one combining operator over whole structures, which lets
+        // arrays of different data types and ranks combine jointly. Here, a running maximum carries the position at
+        // which it is attained (keeping the accumulated position on ties) alongside a running sum over a matrix.
+        let running_maximum = |left: &(Array, Array, Array), right: &(Array, Array, Array)| {
+            let (left_maximum, left_position, left_sum) = left;
+            let (right_maximum, right_position, right_sum) = right;
+            let greater = right_maximum.compare(left_maximum, ComparisonDirection::GreaterThan)?;
+            Ok((
+                Array::select(&greater, right_maximum, left_maximum)?,
+                Array::select(&greater, right_position, left_position)?,
+                left_sum.add(right_sum)?,
+            ))
+        };
+        let values = (
+            Array::vector(vec![3.0, 1.0, 4.0, 1.0, 5.0]).unwrap(),
+            Array::vector(vec![0i32, 1, 2, 3, 4]).unwrap(),
+            Array::matrix(5, 2, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]).unwrap(),
+        );
+        assert_eq!(
+            associative_scan(&values, 0, false, &running_maximum),
+            Ok((
+                Array::vector(vec![3.0, 3.0, 4.0, 4.0, 5.0]).unwrap(),
+                Array::vector(vec![0i32, 0, 2, 2, 4]).unwrap(),
+                Array::matrix(5, 2, vec![1.0f32, 2.0, 4.0, 6.0, 9.0, 12.0, 16.0, 20.0, 25.0, 30.0]).unwrap(),
+            )),
+        );
+        assert_eq!(
+            associative_scan(&values, 0, true, &running_maximum),
+            Ok((
+                Array::vector(vec![5.0; 5]).unwrap(),
+                Array::vector(vec![4i32; 5]).unwrap(),
+                Array::matrix(5, 2, vec![25.0f32, 30.0, 24.0, 28.0, 21.0, 24.0, 16.0, 18.0, 9.0, 10.0]).unwrap(),
+            )),
+        );
+
+        // A structure that holds no arrays has nothing to scan.
+        let add_all = |left: &Vec<Array>, right: &Vec<Array>| {
+            left.iter().zip(right).map(|(left, right)| left.add(right)).collect::<Result<Vec<_>, _>>()
+        };
+        assert_eq!(associative_scan(&Vec::<Array>::new(), 0, false, &add_all), Ok(Vec::new()));
+
+        // The arrays are sliced in lockstep, so they must agree on the scanned extent, and the combining operator must
+        // return as many arrays as it receives.
+        let mismatched = vec![Array::vector(vec![1.0; 3]).unwrap(), Array::vector(vec![1.0; 2]).unwrap()];
+        assert_eq!(
+            associative_scan(&mismatched, 0, false, &add_all),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`associative_scan` requires operands with equal extents along axis 0 but got 3 and 2",
+            ))),
+        );
+        let pair = vec![Array::vector(vec![1.0; 3]).unwrap(), Array::vector(vec![2.0; 3]).unwrap()];
+        assert_eq!(
+            associative_scan(&pair, 0, false, &|left: &Vec<Array>, right: &Vec<Array>| {
+                Ok(vec![left[0].add(&right[0])?])
+            }),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`associative_scan` combining operator must return 2 arrays but returned 1",
+            ))),
         );
     }
 

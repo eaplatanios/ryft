@@ -239,14 +239,16 @@ impl<V> RaggedAxis<V> {
 ///
 /// [`Lowest`](Self::Lowest) and [`Highest`](Self::Highest) are the operand data type's lowest and highest values under
 /// the ordering that Ryft's extrema use (i.e., negative and positive infinity for the floating-point formats that have
-/// infinities and the largest-magnitude finite values for the ones that do not, those same extremes in the real
-/// component, paired with a zero imaginary one, for the complex types, `MIN` and `MAX` for the integers, and `false`
-/// and `true` for Booleans). [`One`](Self::One) is the multiplicative identity converted into the operand data type,
-/// and the conversion is verified rather than assumed: an element type that cannot represent the constant exactly (such
-/// as the two-valued [`DataType::I1`](crate::DataType::I1), whose range is `{-1, 0}`) is rejected instead of masked
-/// with a different value. Those three identities also require an element type with a payload, so the payload-free
-/// [`DataType::Token`](crate::DataType::Token) and [`DataType::Zero`](crate::DataType::Zero) element types are
-/// rejected.
+/// infinities and the largest-magnitude finite values for the ones that do not, those same extremes in both components
+/// for the complex types, which order lexicographically, `MIN` and `MAX` for the integers, and `false` and `true` for
+/// Booleans). [`LowestReal`](Self::LowestReal) is the lowest real value embedded in the operand data type, which is
+/// [`Lowest`](Self::Lowest) for every real data type and the lowest real component paired with a zero imaginary one
+/// (i.e., `-∞ + 0i`) for the complex types. [`One`](Self::One) is the multiplicative identity converted into the
+/// operand data type, and the conversion is verified rather than assumed: an element type that cannot represent the
+/// constant exactly (such as the two-valued [`DataType::I1`](crate::DataType::I1), whose range is `{-1, 0}`) is
+/// rejected instead of masked with a different value. Those four identities also require an element type with a
+/// payload, so the payload-free [`DataType::Token`](crate::DataType::Token) and
+/// [`DataType::Zero`](crate::DataType::Zero) element types are rejected.
 ///
 /// [`Zero`](Self::Zero), the additive identity, never reaches that guard in practice. Instead, a masking implementation
 /// takes the operand's own [`ZeroLikeOperation`] for it, which needs no data type reasoning and imposes its own
@@ -262,6 +264,11 @@ pub enum RaggedMaskIdentity {
     /// Lowest value of the operand data type, and the identity of a maximum operation.
     Lowest,
 
+    /// Lowest real value embedded in the operand data type, and the identity of a `log_add_exp` operation. Unlike
+    /// [`Lowest`](Self::Lowest), it has a zero imaginary component for complex types, so its exponential is exactly
+    /// zero instead of depending on how a backend resolves the undefined `cos(-∞)` and `sin(-∞)`.
+    LowestReal,
+
     /// Highest value of the operand data type, and the identity of a minimum operation.
     Highest,
 }
@@ -273,6 +280,7 @@ impl Display for RaggedMaskIdentity {
             Self::Zero => write!(formatter, "zero"),
             Self::One => write!(formatter, "one"),
             Self::Lowest => write!(formatter, "lowest"),
+            Self::LowestReal => write!(formatter, "lowest_real"),
             Self::Highest => write!(formatter, "highest"),
         }
     }
@@ -1770,13 +1778,14 @@ where
 
         // A non-zero identity is written over padding as a broadcast rank-zero constant of the operand's element type,
         // which is built here on the host before anything is staged. The extrema reuse the element-level reduction
-        // identities, so `Lowest` writes exactly the value a maximum reduction starts from. The arithmetic identity is
-        // converted into the element type and the conversion is verified, because an identity that does not survive
-        // it is not an identity: `from_real` lands on whatever the element type's own encoding makes of the requested
-        // constant, which for a narrow type need not be that constant at all (e.g., `1.0` becomes `-1` in the `i1`
-        // type, whose range is `{-1, 0}`), and masking live padding with such a value would corrupt every prefix it
-        // enters. The payload-free element types hold no constant of any kind. The zero identity instead takes the
-        // operand's own zero-like value below and needs no data type reasoning.
+        // identities, so `Lowest` writes exactly the value a maximum reduction starts from, and `LowestReal` projects
+        // that value onto its real component, which is exact and only discards the complex types' infinite imaginary
+        // component. The arithmetic identity is converted into the element type and the conversion is verified, because
+        // an identity that does not survive it is not an identity: `from_real` lands on whatever the element type's own
+        // encoding makes of the requested constant, which for a narrow type need not be that constant at all (e.g.,
+        // `1.0` becomes `-1` in the `i1` type, whose range is `{-1, 0}`), and masking live padding with such a value
+        // would corrupt every prefix it enters. The payload-free element types hold no constant of any kind. The zero
+        // identity instead takes the operand's own zero-like value below and needs no data type reasoning.
         let data_type = packed_type.data_type();
         let identity_scalar = match identity {
             RaggedMaskIdentity::Zero => None,
@@ -1792,6 +1801,9 @@ where
                     RaggedMaskIdentity::Zero => <Element as ArrayElement>::from_real(0.0)?,
                     RaggedMaskIdentity::One => <Element as ArrayElement>::from_real(1.0)?,
                     RaggedMaskIdentity::Lowest => <Element as ArrayElement>::max_identity(),
+                    RaggedMaskIdentity::LowestReal => {
+                        <Element as ArrayElement>::from_real(<Element as ArrayElement>::max_identity().convert_to()?)?
+                    }
                     RaggedMaskIdentity::Highest => <Element as ArrayElement>::min_identity(),
                 };
                 if identity == RaggedMaskIdentity::One && element.convert_to::<f64>()? != 1.0 {
@@ -4059,6 +4071,7 @@ mod tests {
     use std::borrow::Cow;
 
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
@@ -4211,6 +4224,7 @@ mod tests {
         assert_eq!(RaggedMaskIdentity::Zero.to_string(), "zero");
         assert_eq!(RaggedMaskIdentity::One.to_string(), "one");
         assert_eq!(RaggedMaskIdentity::Lowest.to_string(), "lowest");
+        assert_eq!(RaggedMaskIdentity::LowestReal.to_string(), "lowest_real");
         assert_eq!(RaggedMaskIdentity::Highest.to_string(), "highest");
         assert_eq!(format!("{:?}", RaggedMaskIdentity::Lowest), "Lowest");
     }
@@ -5126,9 +5140,13 @@ mod tests {
 
         // Writing an identity over padding needs per-item extents, so a selected ragged axis is rejected for every
         // identity rather than left as padding that the consuming operation would accumulate.
-        for identity in
-            [RaggedMaskIdentity::Zero, RaggedMaskIdentity::One, RaggedMaskIdentity::Lowest, RaggedMaskIdentity::Highest]
-        {
+        for identity in [
+            RaggedMaskIdentity::Zero,
+            RaggedMaskIdentity::One,
+            RaggedMaskIdentity::Lowest,
+            RaggedMaskIdentity::LowestReal,
+            RaggedMaskIdentity::Highest,
+        ] {
             assert_eq!(
                 StaticArrayExtentBatchingPolicy::mask_identity_input(&context, &ragged, &[1], identity),
                 Err(BatchingError::UnsupportedOperation {
@@ -5519,6 +5537,19 @@ mod tests {
         // `[items, 3]` operand and inspects the staged constant or the rejection.
         for (data_type, identity, expected) in [
             (DataType::F32, RaggedMaskIdentity::Lowest, Ok(Array::scalar(f32::NEG_INFINITY).unwrap())),
+            (DataType::F32, RaggedMaskIdentity::LowestReal, Ok(Array::scalar(f32::NEG_INFINITY).unwrap())),
+            // The lowest complex value is infinite in both components, while the lowest real one keeps a zero
+            // imaginary component, so that its exponential is exactly zero.
+            (
+                DataType::C64,
+                RaggedMaskIdentity::Lowest,
+                Ok(Array::scalar(Complex::new(f32::NEG_INFINITY, f32::NEG_INFINITY)).unwrap()),
+            ),
+            (
+                DataType::C64,
+                RaggedMaskIdentity::LowestReal,
+                Ok(Array::scalar(Complex::new(f32::NEG_INFINITY, 0.0)).unwrap()),
+            ),
             (DataType::I8, RaggedMaskIdentity::One, Ok(Array::scalar(1_i8).unwrap())),
             // The two-valued `i1` type holds only `{-1, 0}`, so converting a one into it lands on `-1` instead. Masking
             // padding with that value would corrupt every prefix it enters, so the conversion is rejected.

@@ -5829,6 +5829,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     operation.reverse(),
                     input_values[0],
                     &output_types[0],
+                    lowerer.collective_state.target_platform(),
                     &mut lowerer.block,
                     lowerer.context,
                     lowerer.location,
@@ -11500,7 +11501,7 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// `logsumexp` primitive:
 ///
 /// ```text
-/// m      = reduce_max(x)                      // with a -∞ initial value
+/// m      = reduce_max(real(x))                // with a -∞ initial value
 /// safe_m = select(is_finite(m), m, 0)
 /// result = log(reduce_sum(exp(x - broadcast(safe_m)))) + safe_m
 /// ```
@@ -11508,9 +11509,11 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// Shifting by the maximum is what keeps the exponentials in range, and the `safe_m` substitution is what keeps the
 /// shift itself defined: a raw maximum of `-∞` (the maximum's identity, and therefore the result for an all-`-∞`
 /// slice or an empty reduction) would compute `-∞ - -∞ = NaN`, while substituting zero there leaves `log(0) + 0`,
-/// which is the correct `-∞`. The `+∞` maximum is guarded the same way, and NaN propagates through the sum. The
-/// shift is broadcast back over the reduced axes with the identity map from the output's axes to the operand's
-/// kept axes, so both reductions see the operand's own shape.
+/// which is the correct `-∞`. The `+∞` maximum is guarded the same way, and NaN propagates through the sum. Complex
+/// operands take the maximum of their real components, which alone determine the magnitudes of their exponentials,
+/// and shift by it as a complex value with a zero imaginary component. The shift is broadcast back over the reduced
+/// axes with the identity map from the output's axes to the operand's kept axes, so both reductions see the operand's
+/// own shape.
 fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     axes: &[usize],
     input_value: ValueRef<'b, 'c, 't>,
@@ -11529,6 +11532,8 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             | DataType::F8E3M4
             | DataType::F8E4M3
             | DataType::F8E5M2
+            | DataType::C64
+            | DataType::C128
     ) {
         return Err(LoweringError::UnsupportedOp {
             op: format!(
@@ -11546,11 +11551,18 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             ReductionKind::LogSumExp,
         ),
     })?;
+    let (shift_element_type, maximum_input) = match element_type {
+        DataType::C64 | DataType::C128 => (
+            if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 },
+            block.append_operation(stable_hlo::real(input_value, location)?)?.result(0).unwrap().as_ref(),
+        ),
+        _ => (element_type, input_value),
+    };
     let maximum_initial_value =
-        build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)?;
-    let maximum_body_region = build_reduce_body_region(ReductionKind::Max, element_type, context, location)?;
+        build_reduction_identity_constant(ReductionKind::Max, shift_element_type, block, context, location)?;
+    let maximum_body_region = build_reduce_body_region(ReductionKind::Max, shift_element_type, context, location)?;
     let maximum = block.append_operation(stable_hlo::reduce(
-        &[input_value],
+        &[maximum_input],
         &[maximum_initial_value],
         axes,
         maximum_body_region,
@@ -11559,10 +11571,15 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     let maximum = maximum.result(0).expect("stablehlo.reduce should return one result").as_ref();
     let finite = block.append_operation(stable_hlo::is_finite(maximum, location)?)?;
     let finite = finite.result(0).expect("stablehlo.is_finite should return one result").as_ref();
-    let output_tensor_type = lower_tensor_type(output_array_type, context, location)?;
-    let zero = lower_f64_constant_splat(0.0, output_array_type, output_tensor_type, block, context, location)?;
+    let shift_type = output_array_type.clone().with_data_type(shift_element_type);
+    let shift_tensor_type = lower_tensor_type(&shift_type, context, location)?;
+    let zero = lower_f64_constant_splat(0.0, &shift_type, shift_tensor_type, block, context, location)?;
     let shift = block.append_operation(stable_hlo::select(finite, maximum, zero, location)?)?;
     let shift = shift.result(0).expect("stablehlo.select should return one result").as_ref();
+    let shift = match element_type.is_complex() {
+        true => block.append_operation(stable_hlo::complex(shift, zero, location)?)?.result(0).unwrap().as_ref(),
+        false => shift,
+    };
     let kept_axes = (0..input_tensor_type.rank()).filter(|axis| !axes.contains(axis)).collect::<Vec<_>>();
     let broadcast_shift =
         block.append_operation(stable_hlo::broadcast(shift, input_tensor_type, kept_axes.as_slice(), location)?)?;
@@ -11613,8 +11630,19 @@ fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
         CumulativeKind::Min => {
             build_reduction_identity_constant(ReductionKind::Min, element_type, block, context, location)
         }
-        // Formats with infinity use negative infinity; supported finite-only formats use their lowest value, which
-        // remains an identity after each rounded pairwise combination regardless of prefix length.
+        // Complex types pair negative infinity with a zero imaginary component, whose exponential is exactly zero,
+        // rather than using their lowest value, whose imaginary component is infinite too.
+        CumulativeKind::LogSumExp if element_type.is_complex() => {
+            let part_type =
+                ArrayType::scalar(if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
+            let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+            let real =
+                lower_f64_constant_splat(f64::NEG_INFINITY, &part_type, part_tensor_type, block, context, location)?;
+            let imaginary = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
+            Ok(block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref())
+        }
+        // Real formats with infinity use negative infinity; supported finite-only formats use their lowest value,
+        // which remains an identity after each rounded pairwise combination regardless of prefix length.
         CumulativeKind::LogSumExp => {
             build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
         }
@@ -11649,6 +11677,50 @@ fn build_cumulative_body_region<'c, 't>(
     let left = block_ref.argument(0)?.as_ref();
     let right = block_ref.argument(1)?.as_ref();
     let body_value = match kind {
+        CumulativeKind::LogSumExp if element_type.is_complex() => {
+            // An operand whose real component is negative infinity has a zero exponential, so it leaves the other
+            // operand unchanged. The complex expansion cannot see this when both operands are such values (e.g., the
+            // `-∞ + 0i` initial values that pad every window), because its lexicographic difference is then NaN, so
+            // the body selects around it, just like the eager kernel does.
+            let scalar_type = ArrayType::scalar(element_type);
+            let combined = lower_log_add_exp_to_mlir(left, right, &scalar_type, &mut block_ref, context, location)?;
+            let part_type =
+                ArrayType::scalar(if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
+            let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+            let negative_infinity = lower_f64_constant_splat(
+                f64::NEG_INFINITY,
+                &part_type,
+                part_tensor_type,
+                &mut block_ref,
+                context,
+                location,
+            )?;
+            let mut negative_infinity_masks = Vec::with_capacity(2);
+            for operand in [left, right] {
+                let real =
+                    block_ref.append_operation(stable_hlo::real(operand, location)?)?.result(0).unwrap().as_ref();
+                let mask = block_ref.append_operation(stable_hlo::compare(
+                    real,
+                    negative_infinity,
+                    stable_hlo::ComparisonDirection::Equal,
+                    stable_hlo::ComparisonType::Float,
+                    location,
+                )?)?;
+                negative_infinity_masks.push(mask.result(0).unwrap().as_ref());
+            }
+            let (left_is_negative_infinity, right_is_negative_infinity) =
+                (negative_infinity_masks[0], negative_infinity_masks[1]);
+            let guarded = block_ref
+                .append_operation(stable_hlo::select(left_is_negative_infinity, right, combined, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+            block_ref
+                .append_operation(stable_hlo::select(right_is_negative_infinity, left, guarded, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref()
+        }
         CumulativeKind::LogSumExp => {
             lower_log_add_exp_to_mlir(left, right, &ArrayType::scalar(element_type), &mut block_ref, context, location)?
         }
@@ -11674,12 +11746,20 @@ fn build_cumulative_body_region<'c, 't>(
 /// `TryOptimizeAssociativeScan` rewriter is documented to recognize the forward full-prefix-window shape and rewrite
 /// it into a logarithmic-depth parallel scan. Whether the reverse padding is matched by the same rewriter has not
 /// been verified here, so a reverse scan may execute as the window form it is emitted as.
+///
+/// On GPU targets (i.e., when `target_platform` is `"cuda"` or `"rocm"`), a forward [`CumulativeKind::Sum`] over a
+/// statically shaped real numeric operand lowers to a
+/// [`chlo.scan`](https://openxla.org/stablehlo/generated/chlo#chloscan_chloscanop) instead, which is what JAX's
+/// `_cumred_gpu_lowering` emits and what XLA's GPU backend implements with a dedicated (CUB-backed) prefix-sum kernel. The scan carries one running sum per row of the unscanned axes, seeded with the sum
+/// identity, and its body adds each slice to that carry. Reverse, Boolean, and complex sums keep the window form, as
+/// they do in JAX.
 fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
     kind: CumulativeKind,
     axis: usize,
     reverse: bool,
     input_value: ValueRef<'b, 'c, 't>,
     output_array_type: &ArrayType,
+    target_platform: Option<&str>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -11699,6 +11779,47 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
         return Ok(input_value);
     }
     let element_type = output_array_type.data_type();
+    if kind == CumulativeKind::Sum
+        && !reverse
+        && matches!(target_platform, Some("cuda" | "rocm"))
+        && element_type.is_real()
+        && let Some(shape) = output_array_type.static_shape()
+    {
+        let mut carry_dimensions = shape.dimensions().to_vec();
+        carry_dimensions.remove(axis);
+        let carry_tensor_type =
+            lower_tensor_type(&ArrayType::new_static(element_type, carry_dimensions.clone()), context, location)?;
+        let identity = build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)?;
+        let initial_value = match carry_dimensions.is_empty() {
+            true => identity,
+            false => block
+                .append_operation(stable_hlo::broadcast(identity, carry_tensor_type, &[], location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref(),
+        };
+
+        // The body receives one slice of the operand and the carry, and returns their sum both as the output slice and
+        // as the next carry.
+        let mut body_region = context.region();
+        let mut body_block =
+            body_region.append_block(context.block(&[(carry_tensor_type, location), (carry_tensor_type, location)]))?;
+        let slice = body_block.argument(0)?.as_ref();
+        let carry = body_block.argument(1)?.as_ref();
+        let sum = body_block.append_operation(stable_hlo::add(slice, carry, location)?)?.result(0).unwrap().as_ref();
+        body_block.append_operation(stable_hlo::r#return(&[sum, sum], location)?)?;
+        let scan = block.append_operation(chlo::scan(
+            &[input_value],
+            &[initial_value],
+            axis,
+            None,
+            false,
+            Some(true),
+            body_region,
+            location,
+        )?)?;
+        return Ok(scan.result(0).unwrap().as_ref());
+    }
     // Rounded pairwise identities stay neutral in any binary tree, independent of the window extent.
     if matches!(kind, CumulativeKind::LogSumExp) && matches!(element_type, DataType::F8E8M0FNU | DataType::F6E2M3FN) {
         return Err(LoweringError::UnsupportedOp {
@@ -18326,6 +18447,71 @@ mod tests {
             Err(LoweringError::UnsupportedOp {
                 op: "`cumulative` with kind `log_sum_exp` over dynamically sized axis 0".to_string(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_lowers_cumulative_sum_to_chlo_scan_on_gpu() {
+        // GPU targets lower a forward cumulative sum to `chlo.scan`, whose body adds each slice to the running sum of
+        // its row, seeded with the sum identity broadcast over the unscanned axes. A reverse scan keeps the full-prefix
+        // `reduce_window` form.
+        let lower = |operation: CumulativeOperation, target_platform: &str| {
+            let input_type = ArrayType::new_static(DataType::F32, [2, 4]);
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let output = builder
+                .add_instruction(ArrayOperation::Cumulative(operation), Vec::new(), vec![input], None)
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let types = vec![input_type];
+            let program = unproject_plain_program(program);
+            lower_mlir_module_for_program(&program, &[], &types, &types, "main", None, None, Some(target_platform))
+                .unwrap()
+                .stable_hlo
+        };
+        for target_platform in ["cuda", "rocm"] {
+            assert_eq!(
+                lower(CumulativeOperation::new(1, CumulativeKind::Sum), target_platform),
+                indoc! {"
+                    module {
+                      func.func @main(%arg0: tensor<2x4xf32>) -> tensor<2x4xf32> {
+                        %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                        %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2xf32>
+                        %1:2 = chlo.scan(%arg0) inits (%0) dimension=1  attributes {is_associative = true} {
+                        ^bb0(%input: tensor<2xf32>, %carry: tensor<2xf32>):
+                          %2 = stablehlo.add %input, %carry : tensor<2xf32>
+                          stablehlo.return %2, %2 : tensor<2xf32>, tensor<2xf32>
+                        } : (tensor<2x4xf32>, tensor<2xf32>) -> (tensor<2x4xf32>, tensor<2xf32>)
+                        return %1#0 : tensor<2x4xf32>
+                      }
+                    }
+                "},
+            );
+        }
+        assert_eq!(
+            lower(CumulativeOperation::new(1, CumulativeKind::Sum).with_reverse(true), "cuda"),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x4xf32>) -> tensor<2x4xf32> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = \"stablehlo.reduce_window\"(%arg0, %cst) <{\
+                      padding = dense<[[0, 0], [0, 3]]> : tensor<2x2xi64>, \
+                      window_dimensions = array<i64: 1, 4>\
+                    }> ({
+                    ^bb0(%arg1: tensor<f32>, %arg2: tensor<f32>):
+                      %1 = stablehlo.add %arg1, %arg2 : tensor<f32>
+                      stablehlo.return %1 : tensor<f32>
+                    }) : (tensor<2x4xf32>, tensor<f32>) -> tensor<2x4xf32>
+                    return %0 : tensor<2x4xf32>
+                  }
+                }
+            "},
         );
     }
 

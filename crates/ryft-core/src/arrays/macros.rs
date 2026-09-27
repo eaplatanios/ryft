@@ -27,8 +27,9 @@
 ///   - `@real`: Every integer and floating-point element type (no Booleans and no complex numbers).
 ///   - `@integer`: Every sub-byte and primitive integer element type.
 ///   - `@signed`: Every signed sub-byte and primitive integer element type.
-///   - `@float`: Every low-precision, half-precision, and primitive floating-point element type.
+///   - `@float`: Every low-precision, half-precision, and primitive (real) floating-point element type.
 ///   - `@complex`: Every complex element type.
+///   - `@float_or_complex`: Every real floating-point and complex element type (i.e., the transcendental family).
 ///   - `@boolean_or_integer`: Boolean and every integer element type (i.e., the bitwise and logical family).
 ///
 /// Kernels dispatch after type inference has already validated the operand element class,
@@ -238,6 +239,28 @@ macro_rules! dispatch_on_array_element_type {
         ) $data_type, |$element| $body)
     };
 
+    (@float_or_complex $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
+            (F4E2M1FN, $crate::arrays::elements::f4e2m1fn),
+            (F6E2M3FN, $crate::arrays::elements::f6e2m3fn),
+            (F6E3M2FN, $crate::arrays::elements::f6e3m2fn),
+            (F8E3M4, $crate::arrays::elements::f8e3m4),
+            (F8E4M3, $crate::arrays::elements::f8e4m3),
+            (F8E4M3FN, $crate::arrays::elements::f8e4m3fn),
+            (F8E4M3FNUZ, $crate::arrays::elements::f8e4m3fnuz),
+            (F8E4M3B11FNUZ, $crate::arrays::elements::f8e4m3b11fnuz),
+            (F8E5M2, $crate::arrays::elements::f8e5m2),
+            (F8E5M2FNUZ, $crate::arrays::elements::f8e5m2fnuz),
+            (F8E8M0FNU, $crate::arrays::elements::f8e8m0fnu),
+            (BF16, $crate::arrays::elements::bf16),
+            (F16, $crate::arrays::elements::f16),
+            (F32, f32),
+            (F64, f64),
+            (C64, $crate::arrays::elements::Complex<f32>),
+            (C128, $crate::arrays::elements::Complex<f64>),
+        ) $data_type, |$element| $body)
+    };
+
     (@boolean_or_integer $data_type:expr, |$element:ident| $body:expr $(,)?) => {
         $crate::arrays::macros::dispatch_on_array_element_type!(@arms(
             (Boolean, bool),
@@ -417,15 +440,10 @@ macro_rules! impl_array_elementwise_operation {
         $crate::arrays::macros::dispatch_on_array_element_type!(@real $data_type, |$element| $body)
     };
 
-    // Float capabilities include complex values, while the storage dispatcher separates those classes.
-    (@select [float complex] [] $data_type:expr, |$element:ident| $body:expr $(,)?) => {{
-        let data_type = $data_type;
-        if data_type.is_complex() {
-            $crate::arrays::macros::dispatch_on_array_element_type!(@complex data_type, |$element| $body)
-        } else {
-            $crate::arrays::macros::dispatch_on_array_element_type!(@float data_type, |$element| $body)
-        }
-    }};
+    // Float capabilities include complex values, which is the storage dispatcher's transcendental class.
+    (@select [float complex] [] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
+        $crate::arrays::macros::dispatch_on_array_element_type!(@float_or_complex $data_type, |$element| $body)
+    };
 
     // Intersecting float with real maps to the storage dispatcher's real floating-point class.
     (@select [float real] [] $data_type:expr, |$element:ident| $body:expr $(,)?) => {
@@ -681,6 +699,18 @@ mod tests {
                 data_type,
             );
         });
+
+        all.iter()
+            .copied()
+            .filter(|data_type| data_type.is_floating_point() || data_type.is_complex())
+            .for_each(|data_type| {
+                assert_eq!(
+                    dispatch_on_array_element_type!(@float_or_complex data_type, |Element| {
+                        element_data_type::<Element>()
+                    }),
+                    data_type,
+                );
+            });
 
         all.iter()
             .copied()
