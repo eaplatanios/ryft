@@ -68,18 +68,17 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
-use crate::operations::arithmetic::{Add, AddOperation, Mul, MulOperation};
+use crate::operations::arithmetic::{AddOperation, Mul, MulOperation};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
-use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::control_flow::associative_scan::associative_scan;
 use crate::operations::exponential::{LOG_ADD_EXP_OPERATION_NAME, LogAddExp, LogAddExpOperation};
 use crate::operations::extrema::{Max, MaxOperation, Min, MinOperation};
-use crate::operations::logical::{Or, OrOperation};
+use crate::operations::logical::OrOperation;
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
-use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
-use crate::operations::manipulation::padding::{Pad, PadOperation};
-use crate::operations::manipulation::slicing::{Slice, SliceOperation};
-use crate::parameters::Parameterized;
+use crate::operations::manipulation::concatenation::ConcatenateOperation;
+use crate::operations::manipulation::padding::PadOperation;
+use crate::operations::manipulation::slicing::SliceOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, ProvenanceScope, RegionInterface,
@@ -761,8 +760,17 @@ where
         + OperationProvider<ArrayType, BroadcastOperation, Operation = C::Operation>,
     F: Fn(&DecompositionTracer<C>, &DecompositionTracer<C>) -> Result<DecompositionTracer<C>, ProgramError>,
 {
+    // The decomposition is staged under the framework's differentiation scope, so that its instructions are attributed
+    // to this rule rather than only to the `associative_scan` function that stages them.
     let (_, decomposition) = TracingContext::<C::Constant, C::Operation>::trace::<_, ArrayType, _>(
-        |value: DecompositionTracer<C>| associative_scan(&value, axis, reverse, &combine),
+        |value: DecompositionTracer<C>| {
+            let domain = value.dispatch_domain();
+            domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
+                domain.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
+                    associative_scan(&value, axis, reverse, &combine)
+                })
+            })
+        },
         primal.r#type().into_owned(),
     )?;
     if std::ptr::eq(context.primal(), context.tangent()) {
@@ -860,8 +868,6 @@ mod tests {
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::comparisons::{Compare, ComparisonDirection};
-    use crate::operations::control_flow::select::Select;
     use crate::operations::reductions::Reduce;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -1369,6 +1375,29 @@ mod tests {
                     %49:f64[4] = add %44 %47
                 in (%48, %49)"
             },
+        );
+    }
+
+    #[test]
+    fn test_cumulative_differentiation_associative_scan_provenance() {
+        // The decomposition that a nonlinear kind differentiates through is staged under the framework's
+        // differentiation scope, which wraps the `associative_scan` scope of the function that stages it.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F64, [2]));
+        let outputs = builder
+            .add_instruction(
+                ArrayOperation::from(CumulativeOperation::new(0, CumulativeKind::Max)),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            std::fmt::from_fn(|formatter| jvp.render(formatter, 0, ProgramRenderingMode::WithProvenance)).to_string(),
+            "",
         );
     }
 

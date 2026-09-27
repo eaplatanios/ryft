@@ -1780,12 +1780,10 @@ where
         // which is built here on the host before anything is staged. The extrema reuse the element-level reduction
         // identities, so `Lowest` writes exactly the value a maximum reduction starts from, and `LowestReal` projects
         // that value onto its real component, which is exact and only discards the complex types' infinite imaginary
-        // component. The arithmetic identity is converted into the element type and the conversion is verified, because
-        // an identity that does not survive it is not an identity: `from_real` lands on whatever the element type's own
-        // encoding makes of the requested constant, which for a narrow type need not be that constant at all (e.g.,
-        // `1.0` becomes `-1` in the `i1` type, whose range is `{-1, 0}`), and masking live padding with such a value
-        // would corrupt every prefix it enters. The payload-free element types hold no constant of any kind. The zero
-        // identity instead takes the operand's own zero-like value below and needs no data type reasoning.
+        // component. The arithmetic identity uses the element's canonical one, including the all-ones encoding `-1`
+        // that is the multiplicative identity for `i1` arithmetic modulo two. The payload-free element types hold no
+        // constant of any kind. The zero identity instead takes the operand's own zero-like value below and needs no
+        // data type reasoning.
         let data_type = packed_type.data_type();
         let identity_scalar = match identity {
             RaggedMaskIdentity::Zero => None,
@@ -1799,20 +1797,13 @@ where
             identity => Some(dispatch_on_array_element_type!(data_type, |Element| {
                 let element = match identity {
                     RaggedMaskIdentity::Zero => <Element as ArrayElement>::from_real(0.0)?,
-                    RaggedMaskIdentity::One => <Element as ArrayElement>::from_real(1.0)?,
+                    RaggedMaskIdentity::One => <Element as ArrayElement>::one()?,
                     RaggedMaskIdentity::Lowest => <Element as ArrayElement>::max_identity(),
                     RaggedMaskIdentity::LowestReal => {
                         <Element as ArrayElement>::from_real(<Element as ArrayElement>::max_identity().convert_to()?)?
                     }
                     RaggedMaskIdentity::Highest => <Element as ArrayElement>::min_identity(),
                 };
-                if identity == RaggedMaskIdentity::One && element.convert_to::<f64>()? != 1.0 {
-                    return Err(BatchingError::UnsupportedOperation {
-                        message: format!(
-                            "ragged identity masking cannot represent a `{identity}` constant in type `{data_type}`",
-                        ),
-                    });
-                }
                 Array::scalar(element)?
             })),
         };
@@ -4076,6 +4067,7 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::arrays::dimensions::DimensionValue;
+    use crate::arrays::elements::i1;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::references::ArrayReference;
@@ -5532,7 +5524,7 @@ mod tests {
     fn test_dynamic_array_extent_batching_policy_mask_identity_input_element_types() {
         // A non-zero identity is written over padding as a broadcast rank-zero constant of the operand's element type,
         // built on the host before anything is staged. The extrema reuse the element-level reduction identities, the
-        // arithmetic one must survive conversion into the element type, and the payload-free element types hold no
+        // arithmetic one uses the element's canonical multiplicative identity, and the payload-free types hold no
         // constant of any kind. Each case stages identity masking of the ragged axis 1 (physical bound 3) of one mapped
         // `[items, 3]` operand and inspects the staged constant or the rejection.
         for (data_type, identity, expected) in [
@@ -5550,14 +5542,11 @@ mod tests {
                 RaggedMaskIdentity::LowestReal,
                 Ok(Array::scalar(Complex::new(f32::NEG_INFINITY, 0.0)).unwrap()),
             ),
-            (DataType::I8, RaggedMaskIdentity::One, Ok(Array::scalar(1_i8).unwrap())),
-            // The two-valued `i1` type holds only `{-1, 0}`, so converting a one into it lands on `-1` instead. Masking
-            // padding with that value would corrupt every prefix it enters, so the conversion is rejected.
-            (
-                DataType::I1,
-                RaggedMaskIdentity::One,
-                Err("ragged identity masking cannot represent a `one` constant in type `i1`".to_string()),
-            ),
+            (DataType::I8, RaggedMaskIdentity::One, Ok(Array::scalar(1i8).unwrap())),
+            (DataType::Boolean, RaggedMaskIdentity::One, Ok(Array::scalar(true).unwrap())),
+            (DataType::C64, RaggedMaskIdentity::One, Ok(Array::scalar(Complex::new(1f32, 0.0)).unwrap())),
+            // The all-ones `i1` encoding represents `-1` but is the multiplicative identity modulo two.
+            (DataType::I1, RaggedMaskIdentity::One, Ok(Array::scalar(i1::from_bits(1).unwrap()).unwrap())),
             (
                 DataType::Token,
                 RaggedMaskIdentity::Lowest,

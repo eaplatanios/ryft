@@ -17,18 +17,25 @@ use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::padding::Pad;
 use crate::operations::manipulation::slicing::Slice;
 use crate::parameters::Parameterized;
-use crate::programs::{ProgramError, ProvenanceScope, TypeError, Typed, Value};
+use crate::programs::{ProgramError, ProvenanceScope, TypeError, Value};
 
 /// Returns the inclusive prefix scans of the arrays in `values` along `axis` under the associative operator `combine`,
-/// built out of ordinary manipulation primitives instead of out of one [`CumulativeOperation`].
+/// built out of ordinary manipulation primitives instead of out of one
+/// [`CumulativeOperation`](crate::operations::cumulative::CumulativeOperation).
 ///
 /// This is Ryft's port of the log-depth Blelloch construction that JAX's
 /// [`lax.associative_scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.associative_scan.html) implements
 /// (`jax/_src/lax/control_flow/loops.py`), and it exists here for the reason it is reached for there: a cumulative
 /// operation whose combining operator is nonlinear has no closed-form primitive derivative, so the nonlinear
-/// [`CumulativeKind`]s define their forward mode by differentiating *through* this decomposition rather than by
-/// carrying a bespoke gradient formula (JAX's `_cumulative_jvp_rule`). It is also useful on its own for combining
-/// operators that no [`CumulativeKind`] covers.
+/// [`CumulativeKind`](crate::operations::cumulative::CumulativeKind)s define their forward mode by differentiating
+/// *through* this decomposition rather than by carrying a bespoke gradient formula (JAX's `_cumulative_jvp_rule`). It
+/// is also useful on its own for combining operators that no cumulative kind covers.
+///
+/// For an operator that a cumulative kind does cover (e.g., a running sum or maximum), prefer the
+/// [`Cumulative`](crate::operations::cumulative::Cumulative) capability. It stages a single cumulative instruction
+/// instead of this construction, which keeps programs small and leaves each backend free to choose its own lowering
+/// (e.g., `ryft-xla` lowers forward cumulative sums to `chlo.scan` on GPUs). The two can also round floating-point
+/// results differently in their last bits, because they associate the combinations differently.
 ///
 /// Like JAX's, the scan runs over a whole structure of arrays at once: `values` is any [`Parameterized`] structure of
 /// arrays (e.g., a single array, a tuple, a vector, or a derived structure), and `combine` receives and returns
@@ -124,10 +131,8 @@ where
     // no-op under an eager context, which records no instructions at all.
     let domain = first.dispatch_domain();
     let scanned = domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
-        domain.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
-            domain.invoke_with_provenance_scope(ProvenanceScope::new("associative_scan"), || {
-                associative_scan_recursively(&arrays, &shapes, axis, reverse, &flat_combine)
-            })
+        domain.invoke_with_provenance_scope(ProvenanceScope::new("associative_scan"), || {
+            associative_scan_recursively(&arrays, &shapes, axis, reverse, &flat_combine)
         })
     })?;
     Ok(Values::from_parameters(structure, scanned)?)
@@ -314,6 +319,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayOperation};
+    use crate::contexts::StagingContext;
     use crate::operations::comparisons::{Compare, ComparisonDirection};
     use crate::operations::control_flow::select::Select;
     use crate::operations::cumulative::cumulative_evaluate;
@@ -465,14 +471,14 @@ mod tests {
                 .to_string(),
             indoc! {"
                 lambda %0:f64[2] .
-                let %1:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %0 ; provenance=ryft::differentiation::associative_scan
-                    %2:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %0 ; provenance=ryft::differentiation::associative_scan
-                    %3:f64[1] = add %1 %2 ; provenance=ryft::differentiation::associative_scan
-                    %4:f64[1] = slice [start_indices=[0], limit_indices=[1]] %0 ; provenance=ryft::differentiation::associative_scan
-                    %5:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::associative_scan
-                    %6:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %4 %5 ; provenance=ryft::differentiation::associative_scan
-                    %7:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %3 %5 ; provenance=ryft::differentiation::associative_scan
-                    %8:f64[2] = add %6 %7 ; provenance=ryft::differentiation::associative_scan
+                let %1:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %0 ; provenance=ryft::associative_scan
+                    %2:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %0 ; provenance=ryft::associative_scan
+                    %3:f64[1] = add %1 %2 ; provenance=ryft::associative_scan
+                    %4:f64[1] = slice [start_indices=[0], limit_indices=[1]] %0 ; provenance=ryft::associative_scan
+                    %5:f64[] = zero [type=f64[]] ; provenance=ryft::associative_scan
+                    %6:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %4 %5 ; provenance=ryft::associative_scan
+                    %7:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %3 %5 ; provenance=ryft::associative_scan
+                    %8:f64[2] = add %6 %7 ; provenance=ryft::associative_scan
                 in (%8)"
             },
         );

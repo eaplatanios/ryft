@@ -973,6 +973,27 @@ mod tests {
         .unwrap();
         let output = read_c64s(&input.reduce_log_sum_exp(&[0]).unwrap());
         assert_c64_close(output[0], ((first - shift).exp() + (second - shift).exp()).ln() + shift);
+
+        // Even without reduced axes, the principal logarithm wraps phases outside its branch.
+        let values = [num_complex::Complex::new(1f32, 4.0), num_complex::Complex::new(2f32, -4.0)];
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::C64, &[2]),
+            mesh.clone(),
+            values_to_bytes(&values).as_slice(),
+        )
+        .unwrap();
+        let output = read_c64s(&input.reduce_log_sum_exp(&[]).unwrap());
+        let expected = CpuArray::vector(values.to_vec())
+            .unwrap()
+            .reduce_log_sum_exp(&[])
+            .unwrap()
+            .elements::<num_complex::Complex<f32>>()
+            .unwrap();
+        assert_c64_close(output[0], expected[0]);
+        assert_c64_close(output[1], expected[1]);
+        assert_c64_close(output[0], num_complex::Complex::new(1.0, 4.0 - 2.0 * std::f32::consts::PI));
+        assert_c64_close(output[1], num_complex::Complex::new(2.0, -4.0 + 2.0 * std::f32::consts::PI));
     }
 
     #[test]

@@ -136,7 +136,7 @@ pub enum ReductionKind {
     /// Real floating-point formats that represent negative infinity and complex inputs are supported. Complex inputs
     /// are shifted by the maximum of their real components, which is the only component that affects the magnitude of
     /// an exponential, and their output is the principal logarithm of the shifted sum (so its imaginary component lies
-    /// in `(-π, π]`) plus that shift. The ragged batching rule fills padding with negative infinity (with a zero
+    /// in `[-π, π]`) plus that shift. The ragged batching rule fills padding with negative infinity (with a zero
     /// imaginary component for complex inputs), so its exponential stays zero after subtraction of any finite maximum.
     /// A finite sentinel cannot provide that guarantee, even when it is an identity of rounded pairwise `log_add_exp`:
     /// subtracting a nearby maximum makes padded entries contribute to the inner sum. This reduction is the unweighted,
@@ -669,6 +669,19 @@ impl_differentiable_operation! {
                             // normalization term entirely when the inputs share a large finite offset.
                             let maximum = primal_input.reduce(operation.axes(), ReductionKind::Max)?;
 
+                            // Only the real component controls exponential magnitudes. Subtracting an imaginary
+                            // shift can lose phase differences when imaginary components have different scales.
+                            let maximum = if working_data_type.is_complex() {
+                                let real_data_type = if working_data_type == DataType::C64 {
+                                    DataType::F32
+                                } else {
+                                    DataType::F64
+                                };
+                                maximum.convert_element_type(real_data_type)?.convert_element_type(working_data_type)?
+                            } else {
+                                maximum
+                            };
+
                             // Non-finite maxima cannot be used as shifts. Preserve zero weights on finite inputs
                             // next to positive infinity, while the infinite inputs retain undefined derivatives.
                             let zero = maximum.zero_like()?;
@@ -996,8 +1009,10 @@ where
 /// [`Reduce`] fills the same role for [`ReduceOperation`] that [`Broadcast`] fills for [`BroadcastOperation`]. Concrete
 /// [`Array`]s reduce immediately, while context-carrying values bind a [`ReduceOperation`] through their own context.
 /// The output rank is the input rank minus the number of reduced axes and the remaining axes keep their relative order.
-/// Reducing over no axes validates the reduction and returns the input unchanged. Refer to [`ReductionKind`] for the
-/// identity, accumulation precision, and supported data types of each kind.
+/// Reducing over no axes validates the reduction and returns the input unchanged, except that complex
+/// [`ReductionKind::LogSumExp`] still evaluates its shifted exponential and principal logarithm. For finite inputs,
+/// this wraps the imaginary component to the principal phase. Refer to [`ReductionKind`] for the identity,
+/// accumulation precision, and supported data types of each kind.
 ///
 /// Numeric reductions are differentiable, while [`ReductionKind::Any`] and [`ReductionKind::All`] have no derivative.
 /// Differentiating a [`ReductionKind::Product`] or [`ReductionKind::LogSumExp`] reduction requires a statically shaped
@@ -1021,7 +1036,8 @@ pub trait Reduce: Sized {
     ///
     /// # Parameters
     ///
-    ///   - `axes`: Distinct axes of `self` to collapse, in any order. An empty list reduces nothing and returns `self`.
+    ///   - `axes`: Distinct axes of `self` to collapse, in any order. An empty list preserves the input shape and
+    ///     elements, except that complex [`ReductionKind::LogSumExp`] still evaluates its shifted logarithmic sum.
     ///   - `kind`: [`ReductionKind`] that determines how the elements along `axes` are combined.
     ///
     /// # Errors
@@ -1109,7 +1125,7 @@ pub trait Reduce: Sized {
 
 impl Reduce for Array {
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError> {
-        if axes.is_empty() {
+        if axes.is_empty() && !(kind == ReductionKind::LogSumExp && self.r#type().data_type().is_complex()) {
             ReduceOperation::new(Vec::new(), kind).infer_output_types(&[self.r#type().into_owned()], &[])?;
             return Ok(self.clone());
         }
@@ -1139,7 +1155,7 @@ impl Reduce for Array {
         match kind {
             ReductionKind::Product => {
                 dispatch_on_array_element_type!(@numeric data_type, |Element| {
-                    self.reduce_elements(output_type, axes, Element::one()?, NumericArrayElement::mul)
+                    self.reduce_elements(output_type, axes, Element::one()?, true, NumericArrayElement::mul)
                 })
             }
             ReductionKind::LogSumExp => {
@@ -1157,6 +1173,7 @@ impl Reduce for Array {
                             output_type.clone(),
                             axes,
                             Element::max_identity(),
+                            false,
                             |left, right| Ok(ArrayElement::max(&left, &right)),
                         )?
                         .map_elements::<Element, Element>(output_type.clone(), |value| {
@@ -1218,6 +1235,7 @@ impl Reduce for Array {
                         output_type.clone(),
                         axes,
                         Element::zero()?,
+                        false,
                         NumericArrayElement::add,
                     )?;
                     if kind == ReductionKind::Sum {
@@ -1234,7 +1252,7 @@ impl Reduce for Array {
                 dispatch_on_array_element_type!(data_type, |Element| {
                     let identity =
                         if kind == ReductionKind::Max { Element::max_identity() } else { Element::min_identity() };
-                    self.reduce_elements(output_type, axes, identity, |left, right| {
+                    self.reduce_elements(output_type, axes, identity, false, |left, right| {
                         Ok(if kind == ReductionKind::Max {
                             ArrayElement::max(&left, &right)
                         } else {
@@ -1243,8 +1261,8 @@ impl Reduce for Array {
                     })
                 })
             }
-            ReductionKind::Any => self.reduce_elements(output_type, axes, false, |left, right| Ok(left | right)),
-            ReductionKind::All => self.reduce_elements(output_type, axes, true, |left, right| Ok(left & right)),
+            ReductionKind::Any => self.reduce_elements(output_type, axes, false, false, |left, right| Ok(left | right)),
+            ReductionKind::All => self.reduce_elements(output_type, axes, true, false, |left, right| Ok(left & right)),
         }
     }
 
@@ -1272,7 +1290,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     for V
 {
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError> {
-        if axes.is_empty() {
+        if axes.is_empty() && !(kind == ReductionKind::LogSumExp && self.r#type().data_type().is_complex()) {
             ReduceOperation::new(Vec::new(), kind).infer_output_types(&[self.r#type().into_owned()], &[])?;
             return Ok(self.clone());
         }
@@ -1315,8 +1333,8 @@ impl ArrayType {
     /// sums, and integer means of partial sums are rejected because they do not commute with the pending sum.
     /// The backend partitioner owns cross-shard reductions over sharded dimensions; use
     /// [`ReduceOperation::with_output_sharding`] to request an unreduced output that defers it. The
-    /// [`Layout`](crate::Layout) is dropped as it is rank-specific, and the [`Memory`](crate::Memory)
-    /// placement is preserved.
+    /// [`Layout`](crate::Layout) is dropped when axes are removed as it is rank-specific, and the
+    /// [`Memory`](crate::Memory) placement is preserved. Reducing no axes preserves the complete input type.
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, TypeError> {
         let rank = self.rank();
         let mut reduce_mask = vec![false; rank];
@@ -1394,6 +1412,11 @@ impl ArrayType {
             )));
         }
 
+        // With no removed axes, the original layout and all other metadata remain valid.
+        if axes.is_empty() {
+            return Ok(self.clone());
+        }
+
         let dimensions = self
             .shape()
             .dimensions()
@@ -1434,12 +1457,15 @@ impl ArrayType {
 
 impl Array {
     /// Reduces typed elements directly from addressed input storage into one addressed output buffer.
-    /// `identity` initializes every output cell, including those whose reduced axes are empty.
+    /// `identity` initializes every output cell, including those whose reduced axes are empty. When `seed_from_input`
+    /// is true, the first input replaces that identity without combining, preserving complex infinities and signed
+    /// zeros in products.
     fn reduce_elements<T: ArrayElement, F: Fn(T, T) -> Result<T, ProgramError>>(
         &self,
         output_type: ArrayType,
         axes: &[usize],
         identity: T,
+        seed_from_input: bool,
         reduce_fn: F,
     ) -> Result<Self, ProgramError> {
         debug_assert_eq!(self.r#type().data_type(), T::data_type());
@@ -1465,7 +1491,11 @@ impl Array {
             }
             let input_value = T::decode(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
             let output_range = output_addressing.byte_range_unchecked(&output_index);
-            let value = reduce_fn(T::decode(&bytes[output_range.clone()]), input_value)?;
+            let value = if seed_from_input && axes.iter().all(|axis| input_index[*axis] == 0) {
+                input_value
+            } else {
+                reduce_fn(T::decode(&bytes[output_range.clone()]), input_value)?
+            };
             value.encode(&mut bytes[output_range]);
             input_addressing.advance_index(&mut input_index);
         }
@@ -2345,6 +2375,25 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_differentiation_log_sum_exp_large_imaginary_component() {
+        // A real-only shift preserves both phases, even when subtracting the larger imaginary component would erase
+        // the smaller one. The derivative weights can be computed directly from the safely shifted exponentials.
+        let first = ComplexNumber::new(1000f64, 1e16);
+        let second = ComplexNumber::new(999f64, 1.0);
+        let shift = ComplexNumber::new(1000f64, 0.0);
+        let first_exponential = (first - shift).exp();
+        let second_exponential = (second - shift).exp();
+        let expected = first_exponential / (first_exponential + second_exponential);
+        let (_, tangent) = differentiate_at(Array::vector(vec![first, second]).unwrap())
+            .jvp(Array::vector(vec![ComplexNumber::new(1f64, 0.0), ComplexNumber::new(0f64, 0.0)]).unwrap(), |input| {
+                input.reduce_log_sum_exp(&[0])
+            })
+            .unwrap();
+        let actual = tangent.elements::<ComplexNumber<f64>>().unwrap()[0];
+        assert!((actual - expected).norm() < 1e-12);
+    }
+
+    #[test]
     fn test_reduce_differentiation_log_sum_exp_narrow_floating_point() {
         // The normalization count exceeds the largest finite half value; the derivative must still sum to one.
         let (_, tangent) = differentiate_at(Array::vector(vec![f16::ZERO; 65_536]).unwrap())
@@ -2703,8 +2752,8 @@ mod tests {
 
     #[test]
     fn test_reduce_reduce_empty_axes() {
-        // Reducing no axes returns the input unchanged, but both the concrete and the context-carrying implementations
-        // still validate the element data type against the reduction kind.
+        // Both the concrete and the context-carrying implementations validate the element data type even when no
+        // axes are reduced.
         for (input, kind, message) in [
             (
                 Array::vector(vec![true]).unwrap(),
@@ -2825,6 +2874,24 @@ mod tests {
     fn test_reduce_reduce_log_sum_exp() {
         let vector = Array::vector(vec![0.0, 0.0]).unwrap();
         assert_eq!(vector.reduce_log_sum_exp(&[0]), Ok(Array::scalar(std::f64::consts::LN_2).unwrap()));
+
+        // Complex logarithmic sums still need an operation with no reduced axes: the principal logarithm wraps phase.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output = context.input(ArrayType::new_static(DataType::C128, [2])).reduce_log_sum_exp(&[]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:c128[2] .
+                let %1:c128[2] = reduce [kind=log_sum_exp, axes=[]] %0
+                in (%1)"
+            },
+        );
     }
 
     #[test]
@@ -2885,6 +2952,26 @@ mod tests {
             Ok(Array::scalar(Complex::new(11f32, 2.0)).unwrap()),
         );
 
+        // Singleton complex products preserve infinities and signed zeros exactly, without multiplying by an
+        // artificial identity. Each row is a separate reduction slice.
+        let singletons = Array::matrix(
+            3,
+            1,
+            vec![
+                ComplexNumber::new(f64::INFINITY, 0.0),
+                ComplexNumber::new(0.0, f64::INFINITY),
+                ComplexNumber::new(-0.0, -0.0),
+            ],
+        )
+        .unwrap();
+        assert_eq!(singletons.reduce_product(&[1]).unwrap().storage_bytes(), singletons.storage_bytes());
+        assert_eq!(
+            Array::vector(vec![ComplexNumber::new(f64::INFINITY, 1.0), ComplexNumber::new(1.0, 1.0)])
+                .unwrap()
+                .reduce_product(&[0]),
+            Ok(Array::scalar(ComplexNumber::new(f64::INFINITY, f64::INFINITY)).unwrap()),
+        );
+
         // Widening avoids intermediate half-precision overflow before the final representable product.
         let input = Array::vector(vec![f16::from_f32(256.0), f16::from_f32(256.0), f16::from_f32(0.5)]).unwrap();
         assert_eq!(input.reduce_product(&[0]), Ok(Array::scalar(f16::from_f32(32768.0)).unwrap()));
@@ -2922,7 +3009,7 @@ mod tests {
         let expected = ((1.0f64 - 3.0).exp() + (2.0f64 - 3.0).exp() + 1.0).ln() + 3.0;
         assert_eq!(values.reduce(&[0], ReductionKind::LogSumExp), Ok(Array::scalar(expected).unwrap()));
 
-        // Reducing along no axes is the identity, matching `log(exp(x)) = x`.
+        // Reducing along no axes preserves real inputs.
         assert_eq!(values.reduce(&[], ReductionKind::LogSumExp), Ok(values.clone()));
 
         // Equal inputs keep both shifted exponentials at one even when the naive composition would overflow.
@@ -2971,6 +3058,23 @@ mod tests {
             matrix.reduce(&[1], ReductionKind::LogSumExp),
             Ok(Array::vector(vec![expected, ((-2.0f64).exp() + (-1.0f64).exp() + 1.0).ln() + 6.0]).unwrap()),
         );
+
+        // Without reduced axes, the real component is preserved but the imaginary component still wraps. Keeping an
+        // explicit layout also exercises output addressing when inference preserves the complete input type.
+        let input = Array::from_elements(
+            ArrayType::new_static(DataType::C128, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16]))),
+            &[ComplexNumber::new(1f64, 4.0), ComplexNumber::new(1f64, -4.0)],
+        )
+        .unwrap();
+        let expected = Array::from_elements(
+            input.r#type().into_owned(),
+            &[
+                ComplexNumber::new(0f64, 4.0).exp().ln() + ComplexNumber::new(1f64, 0.0),
+                ComplexNumber::new(0f64, -4.0).exp().ln() + ComplexNumber::new(1f64, 0.0),
+            ],
+        )
+        .unwrap();
+        assert_eq!(input.reduce_log_sum_exp(&[]), Ok(expected));
 
         // Complex inputs are shifted by the maximum of their real components, and the output is the principal logarithm
         // of the shifted sum plus that shift. Negative infinity with a zero imaginary component contributes a zero
@@ -3158,6 +3262,14 @@ mod tests {
         assert_eq!(input.reduce(&[1], ReductionKind::Sum), Ok(ArrayType::new_static(DataType::F64, [2, 4])));
         assert_eq!(input.reduce(&[1], ReductionKind::Product), Ok(ArrayType::new_static(DataType::F64, [2, 4])));
         assert_eq!(input.reduce(&[0, 2], ReductionKind::Max), Ok(ArrayType::new_static(DataType::F64, [3])));
+
+        // No axes are removed, so inference preserves layout as well as shape and the other metadata.
+        let input = input.with_layout(Layout::Strided(StridedLayout::new(vec![96, 32, 8])));
+        assert_eq!(input.reduce(&[], ReductionKind::Product), Ok(input.clone()));
+        check_operation_type_inference!(
+            operation = ReduceOperation::new(Vec::new(), ReductionKind::Product),
+            cases = [{ input_types = [input.clone()], output_types = [input] }],
+        );
     }
 
     #[test]
