@@ -858,34 +858,77 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Value-level reduction capability.
+/// Value-level reduction capability that collapses selected axes of an array using a [`ReductionKind`].
 ///
-/// [`Reduce`] is the receiver-style entry point for staging or executing a [`ReduceOperation`]: it reduces the
-/// receiver along `axes` using the computation selected by [`ReductionKind`], returning a value whose rank is
-/// the input rank minus the number of reduced axes. Differentiating logarithmic sums currently requires statically
-/// shaped inputs; other numeric reductions can retain runtime extents during linearization.
+/// [`Reduce`] fills the same role for [`ReduceOperation`] that [`Broadcast`] fills for [`BroadcastOperation`]. Concrete
+/// [`Array`]s reduce immediately, while context-carrying values bind a [`ReduceOperation`] through their own context.
+/// The output rank is the input rank minus the number of reduced axes and the remaining axes keep their relative order.
+/// Reducing over no axes validates the reduction and returns the input unchanged. Refer to [`ReductionKind`] for the
+/// identity, accumulation precision, and supported data types of each kind.
+///
+/// Numeric reductions are differentiable, while [`ReductionKind::Any`] and [`ReductionKind::All`] have no derivative.
+/// Differentiating a [`ReductionKind::LogSumExp`] reduction currently requires a statically shaped input. The other
+/// numeric kinds retain the runtime extents of their inputs as residuals during linearization, and so they also support
+/// dynamically shaped inputs.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, ProgramError, Reduce, ReductionKind};
+/// # fn main() -> Result<(), ProgramError> {
+/// // Shapes: input [2, 3] -> output [3] when reducing axis 0 and output [2] when reducing axis 1.
+/// let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+/// assert_eq!(input.reduce(&[0], ReductionKind::Sum)?.to_f64s(), vec![5.0, 7.0, 9.0]);
+/// assert_eq!(input.reduce(&[1], ReductionKind::Max)?.to_f64s(), vec![3.0, 6.0]);
+/// # Ok(())
+/// # }
+/// ```
 pub trait Reduce: Sized {
-    /// Reduces `self` along `axes` using `kind`. Returns a [`ProgramError`] if the axes or kind are incompatible
-    /// with `self` or the reduction cannot be recorded in the value's context.
+    /// Reduces `self` along `axes` using the reduction selected by `kind`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axes`: Distinct axes of `self` to collapse, in any order. An empty list reduces nothing and returns `self`.
+    ///   - `kind`: [`ReductionKind`] that determines how the elements along `axes` are combined.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if an axis is out of bounds or repeated, if `kind` does not support the data
+    /// type of `self`, if `kind` cannot reduce the unreduced mesh axes of `self` (i.e., [`ReductionKind::Max`],
+    /// [`ReductionKind::Min`], [`ReductionKind::LogSumExp`], and integer [`ReductionKind::Mean`] reductions),
+    /// or if the context of `self` fails to bind the reduction.
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError>;
 
-    /// Reduces `self` along `axes` using `kind`, requesting `output_sharding` for the output (refer to the
-    /// documentation of [`ReduceOperation::with_output_sharding`]). The default implementation ignores the requested
-    /// sharding and delegates to [`Self::reduce`], which is correct for concrete (single-device) values, for which a
-    /// sharding only describes distribution metadata; staging implementations override this to attach the requested
-    /// sharding to the staged operation.
+    /// Reduces `self` along `axes` using `kind` and requests `output_sharding` for the output. Only
+    /// [`ReductionKind::Sum`] reductions support such a request. For example, requesting an unreduced
+    /// mesh axis that shards a reduced dimension defers the cross-device part of the sum. Refer to
+    /// [`ReduceOperation::with_output_sharding`] for the complete set of valid requests.
+    ///
+    /// Every value validates the request through the type inference of the corresponding [`ReduceOperation`].
+    /// Context-carrying values then attach the request to the staged [`ReduceOperation`]. Concrete [`Array`]s live on
+    /// a single device, where a sharding only describes distribution metadata, and so they compute the same output as
+    /// [`Self::reduce`] once the request has been validated.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axes`: Distinct axes of `self` to collapse, with the same semantics as in [`Self::reduce`].
+    ///   - `kind`: [`ReductionKind`] that determines how the elements along `axes` are combined.
+    ///   - `output_sharding`: Requested [`Sharding`] of the output, which must match the output rank
+    ///     and the mesh of `self`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] under the same conditions as [`Self::reduce`], if `kind` is not
+    /// [`ReductionKind::Sum`], or if `output_sharding` is not a valid request for the type of `self`.
     fn reduce_with_output_sharding(
         &self,
         axes: &[usize],
         kind: ReductionKind,
         output_sharding: &Sharding,
-    ) -> Result<Self, ProgramError> {
-        let _ = output_sharding;
-        self.reduce(axes, kind)
-    }
+    ) -> Result<Self, ProgramError>;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Reduce for Array {
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError> {
@@ -946,6 +989,21 @@ impl Reduce for Array {
         };
         output
     }
+
+    fn reduce_with_output_sharding(
+        &self,
+        axes: &[usize],
+        kind: ReductionKind,
+        output_sharding: &Sharding,
+    ) -> Result<Self, ProgramError> {
+        // A concrete array lives on a single device, so the requested sharding cannot change its elements. The request
+        // must still be valid for the input, just like it must be for a staged reduction, and so we validate it using
+        // the type inference of the same `ReduceOperation` before computing the reduction.
+        ReduceOperation::new(axes.to_vec(), kind)
+            .with_output_sharding(output_sharding.clone())?
+            .infer_output_types(&[self.r#type().into_owned()], &[])?;
+        self.reduce(axes, kind)
+    }
 }
 
 // Any context-carrying value reduces by binding a [`ReduceOperation`] through its own context. The
@@ -987,8 +1045,6 @@ where
         Ok(outputs.remove(0))
     }
 }
-
-// TODO(eaplatanios): Review this module.
 
 /// Value-level capability for one numerically stable `log(sum(exp(x)))` over a set of array axes.
 ///
@@ -2654,6 +2710,43 @@ mod tests {
             ))),
         );
         assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_reduce_with_output_sharding_validates_concrete_arrays() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F64, [2, 3])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let input = Array::from_elements::<f64>(input_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let unreduced = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
+            .unwrap()
+            .with_unreduced_axes(["x"])
+            .unwrap();
+
+        // A valid request computes the same output as the unsharded reduction, because a concrete array lives on a
+        // single device.
+        assert_eq!(
+            input.reduce_with_output_sharding(&[0], ReductionKind::Sum, &unreduced),
+            input.reduce(&[0], ReductionKind::Sum),
+        );
+
+        // Invalid requests are rejected just like they are for staged reductions.
+        assert_eq!(
+            input.reduce_with_output_sharding(&[0], ReductionKind::Max, &unreduced),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`reduce` with kind `max` does not support a requested output sharding (only kind `sum` does)",
+            ))),
+        );
+        assert_eq!(
+            input.reduce_with_output_sharding(&[0], ReductionKind::Sum, &Sharding::replicated(mesh, 2)),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`reduce` output sharding rank (2) does not match the output rank (1)",
+            ))),
+        );
     }
 
     #[test]
