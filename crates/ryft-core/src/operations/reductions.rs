@@ -84,6 +84,9 @@ use crate::programs::{
     TypeError, Typed, Value, ValueProjection,
 };
 
+/// Name of [`ReduceOperation`]. The reduction's [`ReductionKind`] is rendered as its `kind` attribute.
+pub const REDUCE_OPERATION_NAME: &str = "reduce";
+
 /// Kind of reduction performed by a [`ReduceOperation`]. Reductions collapse selected axes while preserving the order
 /// of the remaining axes. Sums, extrema, and Boolean reductions combine elements directly while means and logarithmic
 /// sums of exponentials additionally normalize or transform those elements. Backends may implement reductions of a
@@ -126,7 +129,8 @@ pub enum ReductionKind {
 }
 
 impl ReductionKind {
-    /// Returns the canonical operation name suffix for this [`ReductionKind`].
+    /// Returns the name of this [`ReductionKind`], which program renderings and diagnostics use as the `kind` attribute
+    /// of a [`ReduceOperation`] (e.g., `reduce [kind=sum, axes=[0]]`).
     #[inline]
     pub fn name(self) -> &'static str {
         match self {
@@ -191,8 +195,9 @@ impl ReduceOperation {
         let output_sharding = output_sharding.into();
         if output_sharding.is_some() && self.kind != ReductionKind::Sum {
             return Err(TypeError::invalid(format!(
-                "`{}` does not support a requested output sharding (only `reduce_sum` does)",
-                self.name(),
+                "`{REDUCE_OPERATION_NAME}` with kind `{}` does not support a requested output sharding (only kind `sum` \
+                 does)",
+                self.kind,
             )));
         }
         self.output_sharding = output_sharding;
@@ -230,15 +235,7 @@ impl Operation for ReduceOperation {
 
     #[inline]
     fn name(&self) -> &'static str {
-        match self.kind {
-            ReductionKind::Sum => "reduce_sum",
-            ReductionKind::Mean => "reduce_mean",
-            ReductionKind::LogSumExp => "reduce_log_sum_exp",
-            ReductionKind::Max => "reduce_max",
-            ReductionKind::Min => "reduce_min",
-            ReductionKind::Any => "reduce_any",
-            ReductionKind::All => "reduce_all",
-        }
+        REDUCE_OPERATION_NAME
     }
 
     fn infer_output_types(
@@ -247,7 +244,7 @@ impl Operation for ReduceOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        let output = reduce_abstract(&input_types[0], self.axes.as_slice(), self.kind, self.name())?;
+        let output = reduce_abstract(&input_types[0], self.axes.as_slice(), self.kind)?;
         let Some(output_sharding) = &self.output_sharding else {
             return Ok(vec![output]);
         };
@@ -269,6 +266,7 @@ impl Operation for ReduceOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("kind", self.kind)?;
             operation.field("axes", format_args!("{:?}", self.axes))?;
             if let Some(output_sharding) = &self.output_sharding {
                 operation.field("output_sharding", output_sharding)?;
@@ -518,9 +516,11 @@ impl_differentiable_operation! {
                         {
                             return Err(ProgramError::UnsupportedOperation {
                                 message: format!(
-                                    "direct `{}` transposition over reduced axis {axis} of {input_shape} requires \
-                                     linearization so that the runtime extent can be retained as a residual",
+                                    "direct transposition of `{}` with kind `{}` over reduced axis {axis} of \
+                                     {input_shape} requires linearization so that the runtime extent can be \
+                                     retained as a residual",
                                     operation.name(),
+                                    operation.kind(),
                                 ),
                             }
                             .into());
@@ -873,8 +873,7 @@ impl Reduce for Array {
         let data_type = self.r#type().data_type();
         // Reuse the abstract rule for validation and for the complete output metadata. The concrete kernel below then
         // decodes directly from the input's physical layout into the output's addressed storage.
-        let operation_name = if kind == ReductionKind::LogSumExp { "reduce_log_sum_exp" } else { "reduce" };
-        let output_type = reduce_abstract(self.r#type().as_ref(), axes, kind, operation_name)?;
+        let output_type = reduce_abstract(self.r#type().as_ref(), axes, kind)?;
         if data_type == DataType::Zero {
             return Self::new(output_type, Vec::new());
         }
@@ -1275,28 +1274,26 @@ impl Array {
 /// [`ReduceOperation::with_output_sharding`] to request an unreduced output that defers it. The
 /// [`Layout`](crate::arrays::Layout) is dropped (it is rank-specific) and the [`Memory`](crate::arrays::Memory)
 /// placement is preserved.
-pub fn reduce_abstract(
-    input: &ArrayType,
-    axes: &[usize],
-    kind: ReductionKind,
-    operation_name: &'static str,
-) -> Result<ArrayType, TypeError> {
+pub fn reduce_abstract(input: &ArrayType, axes: &[usize], kind: ReductionKind) -> Result<ArrayType, TypeError> {
     let rank = input.rank();
     let mut reduce_mask = vec![false; rank];
     for axis in axes {
         if *axis >= rank {
-            return Err(TypeError::invalid(format!("`{operation_name}` axis {axis} is out of bounds for rank {rank}")));
+            return Err(TypeError::invalid(format!(
+                "`{REDUCE_OPERATION_NAME}` axis {axis} is out of bounds for rank {rank}",
+            )));
         }
         if reduce_mask[*axis] {
-            return Err(TypeError::invalid(format!("`{operation_name}` contains duplicate axis {axis}")));
+            return Err(TypeError::invalid(format!("`{REDUCE_OPERATION_NAME}` contains duplicate axis {axis}")));
         }
         reduce_mask[*axis] = true;
     }
 
     let data_type = input.data_type();
+
     // Validate axes before the element domain so malformed geometry retains diagnostic precedence.
     if kind == ReductionKind::LogSumExp {
-        validate_log_sum_exp_data_type(data_type, operation_name)?;
+        validate_log_sum_exp_data_type(data_type)?;
     } else {
         let (requirement, supports_kind) = if matches!(kind, ReductionKind::Any | ReductionKind::All) {
             ("Boolean", data_type.is_boolean())
@@ -1307,7 +1304,7 @@ pub fn reduce_abstract(
         };
         if !supports_kind {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` kind `{kind}` requires {requirement} inputs but got `{data_type}`"
+                "`{REDUCE_OPERATION_NAME}` with kind `{kind}` requires {requirement} inputs but got `{data_type}`",
             )));
         }
     }
@@ -1317,7 +1314,9 @@ pub fn reduce_abstract(
             || (kind == ReductionKind::Mean && data_type.is_integer()))
         && input.sharding().is_some_and(|sharding| !sharding.unreduced_axes().is_empty())
     {
-        return Err(TypeError::invalid(format!("`{operation_name}` cannot reduce inputs with unreduced axes",)));
+        return Err(TypeError::invalid(format!(
+            "`{REDUCE_OPERATION_NAME}` with kind `{kind}` cannot reduce inputs with unreduced axes",
+        )));
     }
 
     let dimensions = input
@@ -1327,7 +1326,7 @@ pub fn reduce_abstract(
         .enumerate()
         .filter_map(|(axis, size)| (!reduce_mask[axis]).then_some(size.clone()))
         .collect::<Vec<_>>();
-    let sharding = reduce_sharding(input.sharding(), &reduce_mask, operation_name)?;
+    let sharding = reduce_sharding(input.sharding(), &reduce_mask)?;
     ArrayType::new(data_type, Shape::new(dimensions))
         .with_memory(input.memory())
         .with_sharding(sharding)
@@ -1337,11 +1336,7 @@ pub fn reduce_abstract(
 /// Computes the output [`Sharding`] for a reduction whose reduced axes are marked in `reduce_mask`. The reduced
 /// axes' per-dimension entries are deleted; the remaining entries keep their order and the reduction-state and
 /// manual-axis sets pass through unchanged. Refer to the documentation of [`reduce_abstract`] for the full rule.
-fn reduce_sharding(
-    sharding: Option<&Sharding>,
-    reduce_mask: &[bool],
-    operation_name: &'static str,
-) -> Result<Option<Sharding>, TypeError> {
+fn reduce_sharding(sharding: Option<&Sharding>, reduce_mask: &[bool]) -> Result<Option<Sharding>, TypeError> {
     sharding
         .map(|sharding| {
             let dimensions = sharding
@@ -1355,7 +1350,9 @@ fn reduce_sharding(
                 .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
                 .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
                 .map_err(|error| {
-                    TypeError::invalid(format!("`{operation_name}` output sharding construction failed: {error}"))
+                    TypeError::invalid(format!(
+                        "`{REDUCE_OPERATION_NAME}` output sharding construction failed: {error}"
+                    ))
                 })
         })
         .transpose()
@@ -1375,7 +1372,7 @@ fn validate_reduce_output_sharding(
 
     if output_sharding.rank() != reduced_output.rank() {
         return Err(TypeError::invalid(format!(
-            "`reduce_sum` output sharding rank ({}) does not match the output rank ({})",
+            "`{REDUCE_OPERATION_NAME}` output sharding rank ({}) does not match the output rank ({})",
             output_sharding.rank(),
             reduced_output.rank(),
         )));
@@ -1383,17 +1380,23 @@ fn validate_reduce_output_sharding(
     if let Some(input_sharding) = input.sharding()
         && output_sharding.mesh() != input_sharding.mesh()
     {
-        return Err(TypeError::invalid("`reduce_sum` output sharding must use the same mesh as the input"));
+        return Err(TypeError::invalid(format!(
+            "`{REDUCE_OPERATION_NAME}` output sharding must use the same mesh as the input"
+        )));
     }
     if !output_sharding.reduced_axes().is_empty() {
-        return Err(TypeError::invalid("`reduce_sum` output sharding cannot request reduced axes"));
+        return Err(TypeError::invalid(format!(
+            "`{REDUCE_OPERATION_NAME}` output sharding cannot request reduced axes"
+        )));
     }
     if !output_sharding.varying_manual_axes().is_empty()
         && input
             .sharding()
             .is_none_or(|sharding| output_sharding.varying_manual_axes() != sharding.varying_manual_axes())
     {
-        return Err(TypeError::invalid("`reduce_sum` output sharding cannot change manual variation"));
+        return Err(TypeError::invalid(format!(
+            "`{REDUCE_OPERATION_NAME}` output sharding cannot change manual variation"
+        )));
     }
     let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
     referenced_axes.extend(output_sharding.reduced_axes());
@@ -1406,7 +1409,9 @@ fn validate_reduce_output_sharding(
         .iter()
         .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
     {
-        return Err(TypeError::invalid("`reduce_sum` output sharding cannot reference automatic mesh axes"));
+        return Err(TypeError::invalid(format!(
+            "`{REDUCE_OPERATION_NAME}` output sharding cannot reference automatic mesh axes"
+        )));
     }
 
     if !output_sharding.unreduced_axes().is_empty() {
@@ -1427,10 +1432,10 @@ fn validate_reduce_output_sharding(
             reducible_axes.extend(input_sharding.unreduced_axes().iter().map(String::as_str));
         }
         if !output_sharding.unreduced_axes().iter().all(|name| reducible_axes.contains(name.as_str())) {
-            return Err(TypeError::invalid(
-                "`reduce_sum` output sharding unreduced axes must be among the explicit axes sharding the \
-                          reduced dimensions or the input's unreduced axes",
-            ));
+            return Err(TypeError::invalid(format!(
+                "`{REDUCE_OPERATION_NAME}` output sharding unreduced axes must be among the explicit axes sharding \
+                 the reduced dimensions or the input's unreduced axes",
+            )));
         }
     }
     Ok(())
@@ -1611,10 +1616,11 @@ pub fn reduce_evaluate<T: Clone>(
 
 /// Validates the element data-type domain documented on [`LogSumExp`], which the operation's type
 /// inference and its eager entry points share.
-fn validate_log_sum_exp_data_type(data_type: DataType, operation_name: &str) -> Result<(), TypeError> {
+fn validate_log_sum_exp_data_type(data_type: DataType) -> Result<(), TypeError> {
+    let kind = ReductionKind::LogSumExp;
     if !data_type.is_floating_point() {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` requires real floating-point inputs but got `{data_type}`",
+            "`{REDUCE_OPERATION_NAME}` with kind `{kind}` requires real floating-point inputs but got `{data_type}`",
         )));
     }
     match data_type {
@@ -1626,8 +1632,8 @@ fn validate_log_sum_exp_data_type(data_type: DataType, operation_name: &str) -> 
         | DataType::F8E4M3
         | DataType::F8E5M2 => Ok(()),
         _ => Err(TypeError::invalid(format!(
-            "`{operation_name}` requires a floating-point format that represents negative infinity \
-             but got `{data_type}`",
+            "`{REDUCE_OPERATION_NAME}` with kind `{kind}` requires a floating-point format that represents negative \
+             infinity but got `{data_type}`",
         ))),
     }
 }
@@ -1740,14 +1746,14 @@ mod tests {
         assert_eq!(operation.axes(), &[0, 2]);
         assert_eq!(operation.kind(), ReductionKind::Sum);
         assert_eq!(operation.output_sharding(), None);
-        assert_eq!(operation.to_string(), "reduce_sum [axes=[0, 2]]");
+        assert_eq!(operation.to_string(), "reduce [kind=sum, axes=[0, 2]]");
     }
 
     #[test]
     fn test_reduce_log_sum_exp() {
         assert_eq!(
             ReduceOperation::new(vec![0, 2], ReductionKind::LogSumExp).to_string(),
-            "reduce_log_sum_exp [axes=[0, 2]]",
+            "reduce [kind=log_sum_exp, axes=[0, 2]]",
         );
         assert_eq!(ReduceOperation::new(vec![1], ReductionKind::LogSumExp).axes(), &[1]);
     }
@@ -1765,18 +1771,18 @@ mod tests {
 
         // Every other reduction kind rejects a requested output sharding when the operation is constructed, while
         // still accepting the absence of one.
-        for (kind, name) in [
-            (ReductionKind::Mean, "reduce_mean"),
-            (ReductionKind::LogSumExp, "reduce_log_sum_exp"),
-            (ReductionKind::Max, "reduce_max"),
-            (ReductionKind::Min, "reduce_min"),
-            (ReductionKind::Any, "reduce_any"),
-            (ReductionKind::All, "reduce_all"),
+        for kind in [
+            ReductionKind::Mean,
+            ReductionKind::LogSumExp,
+            ReductionKind::Max,
+            ReductionKind::Min,
+            ReductionKind::Any,
+            ReductionKind::All,
         ] {
             assert_eq!(
                 ReduceOperation::new(vec![0], kind).with_output_sharding(sharding.clone()),
                 Err(TypeError::invalid(format!(
-                    "`{name}` does not support a requested output sharding (only `reduce_sum` does)",
+                    "`reduce` with kind `{kind}` does not support a requested output sharding (only kind `sum` does)",
                 ))),
             );
             assert_eq!(
@@ -1797,7 +1803,7 @@ mod tests {
                 },
                 {
                     input_types = [ArrayType::new_static(DataType::F64, [3])],
-                    error = "`reduce_sum` axis 1 is out of bounds for rank 1",
+                    error = "`reduce` axis 1 is out of bounds for rank 1",
                 },
             ],
         );
@@ -1834,7 +1840,7 @@ mod tests {
                 .unwrap(),
             cases = [{
                 input_types = [input.clone()],
-                error = "`reduce_sum` output sharding unreduced axes must be among the explicit axes sharding the \
+                error = "`reduce` output sharding unreduced axes must be among the explicit axes sharding the \
                          reduced dimensions or the input's unreduced axes",
             }],
         );
@@ -1879,7 +1885,7 @@ mod tests {
                 .unwrap(),
             cases = [{
                 input_types = [input.clone()],
-                error = "`reduce_sum` output sharding cannot request reduced axes",
+                error = "`reduce` output sharding cannot request reduced axes",
             }],
         );
         check_operation_type_inference!(
@@ -1888,7 +1894,7 @@ mod tests {
                 .unwrap(),
             cases = [{
                 input_types = [input],
-                error = "`reduce_sum` output sharding cannot change manual variation",
+                error = "`reduce` output sharding cannot change manual variation",
             }],
         );
     }
@@ -1915,21 +1921,21 @@ mod tests {
             operation = ReduceOperation::new(vec![0], ReductionKind::Max),
             cases = [{
                 input_types = [input.clone()],
-                error = "`reduce_max` cannot reduce inputs with unreduced axes",
+                error = "`reduce` with kind `max` cannot reduce inputs with unreduced axes",
             }],
         );
         check_operation_type_inference!(
             operation = ReduceOperation::new(vec![0], ReductionKind::Min),
             cases = [{
                 input_types = [input.clone()],
-                error = "`reduce_min` cannot reduce inputs with unreduced axes",
+                error = "`reduce` with kind `min` cannot reduce inputs with unreduced axes",
             }],
         );
         check_operation_type_inference!(
             operation = ReduceOperation::new(vec![0], ReductionKind::LogSumExp),
             cases = [{
                 input_types = [input.clone()],
-                error = "`reduce_log_sum_exp` cannot reduce inputs with unreduced axes",
+                error = "`reduce` with kind `log_sum_exp` cannot reduce inputs with unreduced axes",
             }],
         );
         // Integer means truncate before the pending sum and therefore are not linear either.
@@ -1937,7 +1943,7 @@ mod tests {
             operation = ReduceOperation::new(vec![0], ReductionKind::Mean),
             cases = [{
                 input_types = [input.clone().with_data_type(DataType::I32)],
-                error = "`reduce_mean` cannot reduce inputs with unreduced axes",
+                error = "`reduce` with kind `mean` cannot reduce inputs with unreduced axes",
             }],
         );
         check_operation_type_inference!(
@@ -1957,7 +1963,7 @@ mod tests {
                 },
                 {
                     input_types = [ArrayType::new_static(DataType::F64, [3])],
-                    error = "`reduce_log_sum_exp` axis 1 is out of bounds for rank 1",
+                    error = "`reduce` axis 1 is out of bounds for rank 1",
                 },
             ],
         );
@@ -2163,7 +2169,7 @@ mod tests {
                     %9:f32[] = constant [value=-inf]
                     %10:f32[items, 3] = broadcast [output_axes=[]] %9 %3 %4
                     %11:f32[items, 3] = select %8 %1 %10
-                    %12:f32[items] = reduce_log_sum_exp [axes=[1]] %11
+                    %12:f32[items] = reduce [kind=log_sum_exp, axes=[1]] %11
                 in (%12)
             "}
             .trim_end(),
@@ -2224,8 +2230,8 @@ mod tests {
                 tangent_outputs = [Array::scalar(tangent).unwrap()],
                 jvp = indoc! {"
                     lambda %0:f64[3], %1:f64[3] .
-                    let %2:f64[] = reduce_log_sum_exp [axes=[0]] %0
-                        %3:f64[] = reduce_max [axes=[0]] %0
+                    let %2:f64[] = reduce [kind=log_sum_exp, axes=[0]] %0
+                        %3:f64[] = reduce [kind=max, axes=[0]] %0
                         %4:f64[] = zero_like %3
                         %5:f64[] = sub %3 %3
                         %6:bool[] = compare [direction=Equal] %5 %4
@@ -2233,11 +2239,11 @@ mod tests {
                         %8:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %7
                         %9:f64[3] = sub %0 %8
                         %10:f64[3] = exp %9
-                        %11:f64[] = reduce_sum [axes=[0]] %10
+                        %11:f64[] = reduce [kind=sum, axes=[0]] %10
                         %12:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %11
                         %13:f64[3] = div %10 %12
                         %14:f64[3] = mul %13 %1
-                        %15:f64[] = reduce_sum [axes=[0]] %14
+                        %15:f64[] = reduce [kind=sum, axes=[0]] %14
                     in (%2, %15)
                 "},
             }],
@@ -2433,8 +2439,8 @@ mod tests {
                 ),
                 Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                     if message == format!(
-                        "direct `reduce_{kind}` transposition over reduced axis 0 of [batch, 2] requires \
-                         linearization so that the runtime extent can be retained as a residual",
+                        "direct transposition of `reduce` with kind `{kind}` over reduced axis 0 of [batch, 2] \
+                         requires linearization so that the runtime extent can be retained as a residual",
                     ),
             ));
         }
@@ -2695,12 +2701,12 @@ mod tests {
             (
                 Array::vector(vec![true]).unwrap(),
                 ReductionKind::Sum,
-                "`reduce_sum` kind `sum` requires numeric inputs but got `bool`",
+                "`reduce` with kind `sum` requires numeric inputs but got `bool`",
             ),
             (
                 Array::vector(vec![1i32]).unwrap(),
                 ReductionKind::Any,
-                "`reduce_any` kind `any` requires Boolean inputs but got `i32`",
+                "`reduce` with kind `any` requires Boolean inputs but got `i32`",
             ),
         ] {
             assert_eq!(input.reduce(&[], kind), Err(ProgramError::Type(TypeError::invalid(message.to_string()))));
@@ -2775,7 +2781,7 @@ mod tests {
                 &Sharding::replicated(mesh, 1),
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "`reduce_log_sum_exp` does not support a requested output sharding (only `reduce_sum` does)",
+                "`reduce` with kind `log_sum_exp` does not support a requested output sharding (only kind `sum` does)",
             ))),
         );
         assert!(context.builder().borrow().instructions().is_empty());
@@ -2835,14 +2841,12 @@ mod tests {
         // Validation errors are reported rather than panicking.
         assert_eq!(
             values.log_sum_exp(&[1]),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`reduce_log_sum_exp` axis 1 is out of bounds for rank 1".to_string(),
-            ))),
+            Err(ProgramError::Type(TypeError::invalid("`reduce` axis 1 is out of bounds for rank 1".to_string(),))),
         );
         assert_eq!(
             Array::vector(vec![1i32, 2]).unwrap().log_sum_exp(&[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`reduce_log_sum_exp` requires real floating-point inputs but got `i32`".to_string(),
+                "`reduce` with kind `log_sum_exp` requires real floating-point inputs but got `i32`".to_string(),
             ))),
         );
     }
@@ -2861,7 +2865,7 @@ mod tests {
             Array::new(ArrayType::new_static(DataType::Zero, [2]), Vec::new()).unwrap(),
         ] {
             let expected = Err(ProgramError::Type(TypeError::invalid(format!(
-                "`reduce_log_sum_exp` requires real floating-point inputs but got `{}`",
+                "`reduce` with kind `log_sum_exp` requires real floating-point inputs but got `{}`",
                 input.r#type().data_type(),
             ))));
             assert_eq!(input.reduce(&[], ReductionKind::LogSumExp), expected);
@@ -2869,7 +2873,7 @@ mod tests {
             let input_atom = context.builder().borrow_mut().add_input(input.r#type().into_owned());
             let input = context.tracer(input_atom, None);
             let expected = Err(ProgramError::Type(TypeError::invalid(format!(
-                "`reduce_log_sum_exp` requires real floating-point inputs but got `{}`",
+                "`reduce` with kind `log_sum_exp` requires real floating-point inputs but got `{}`",
                 input.r#type().data_type(),
             ))));
             assert_eq!(input.reduce(&[], ReductionKind::LogSumExp), expected);
@@ -2880,14 +2884,8 @@ mod tests {
     #[test]
     fn test_reduce_abstract() {
         let input = ArrayType::new_static(DataType::F64, [2, 3, 4]);
-        assert_eq!(
-            reduce_abstract(&input, &[1], ReductionKind::Sum, "reduce_sum"),
-            Ok(ArrayType::new_static(DataType::F64, [2, 4])),
-        );
-        assert_eq!(
-            reduce_abstract(&input, &[0, 2], ReductionKind::Max, "reduce_max"),
-            Ok(ArrayType::new_static(DataType::F64, [3])),
-        );
+        assert_eq!(reduce_abstract(&input, &[1], ReductionKind::Sum), Ok(ArrayType::new_static(DataType::F64, [2, 4])),);
+        assert_eq!(reduce_abstract(&input, &[0, 2], ReductionKind::Max), Ok(ArrayType::new_static(DataType::F64, [3])),);
     }
 
     #[test]
@@ -2910,7 +2908,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            reduce_abstract(&input, &[0], ReductionKind::Sum, "reduce_sum"),
+            reduce_abstract(&input, &[0], ReductionKind::Sum),
             Ok(ArrayType::new_static(DataType::F64, [3])
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::replicated()])
@@ -2937,11 +2935,11 @@ mod tests {
             ]),
         );
         assert_eq!(
-            reduce_abstract(&input, &[1], ReductionKind::Sum, "reduce_sum"),
+            reduce_abstract(&input, &[1], ReductionKind::Sum),
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Dynamic(width)]),)),
         );
         assert_eq!(
-            reduce_abstract(&input, &[0, 2], ReductionKind::Sum, "reduce_sum"),
+            reduce_abstract(&input, &[0, 2], ReductionKind::Sum),
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))),
         );
     }
@@ -2950,12 +2948,12 @@ mod tests {
     fn test_reduce_abstract_rejects_out_of_bounds_and_duplicate_axes() {
         let input = ArrayType::new_static(DataType::F64, [2, 3]);
         assert_eq!(
-            reduce_abstract(&input, &[2], ReductionKind::Sum, "reduce_sum"),
-            Err(TypeError::invalid("`reduce_sum` axis 2 is out of bounds for rank 2".to_string())),
+            reduce_abstract(&input, &[2], ReductionKind::Sum),
+            Err(TypeError::invalid("`reduce` axis 2 is out of bounds for rank 2".to_string())),
         );
         assert_eq!(
-            reduce_abstract(&input, &[0, 0], ReductionKind::Sum, "reduce_sum"),
-            Err(TypeError::invalid("`reduce_sum` contains duplicate axis 0".to_string())),
+            reduce_abstract(&input, &[0, 0], ReductionKind::Sum),
+            Err(TypeError::invalid("`reduce` contains duplicate axis 0".to_string())),
         );
     }
 
@@ -2963,52 +2961,40 @@ mod tests {
     fn test_reduce_abstract_enforces_reduction_data_types() {
         let numeric = ArrayType::new_static(DataType::F64, [2, 3]);
         assert_eq!(
-            reduce_abstract(&numeric, &[1], ReductionKind::Any, "reduce_any"),
-            Err(TypeError::invalid("`reduce_any` kind `any` requires Boolean inputs but got `f64`".to_string())),
+            reduce_abstract(&numeric, &[1], ReductionKind::Any),
+            Err(TypeError::invalid("`reduce` with kind `any` requires Boolean inputs but got `f64`".to_string())),
         );
         let boolean = ArrayType::new_static(DataType::Boolean, [2, 3]);
         assert_eq!(
-            reduce_abstract(&boolean, &[1], ReductionKind::Sum, "reduce_sum"),
-            Err(TypeError::invalid("`reduce_sum` kind `sum` requires numeric inputs but got `bool`".to_string())),
+            reduce_abstract(&boolean, &[1], ReductionKind::Sum),
+            Err(TypeError::invalid("`reduce` with kind `sum` requires numeric inputs but got `bool`".to_string())),
         );
         assert_eq!(
-            reduce_abstract(&boolean, &[1], ReductionKind::Any, "reduce_any"),
+            reduce_abstract(&boolean, &[1], ReductionKind::Any),
             Ok(ArrayType::new_static(DataType::Boolean, [2])),
         );
         assert_eq!(
-            reduce_abstract(&boolean, &[1], ReductionKind::Max, "reduce_max"),
+            reduce_abstract(&boolean, &[1], ReductionKind::Max),
             Ok(ArrayType::new_static(DataType::Boolean, [2])),
         );
         let token = ArrayType::new_static(DataType::Token, [2, 3]);
         assert_eq!(
-            reduce_abstract(&token, &[1], ReductionKind::Sum, "reduce_sum"),
-            Err(TypeError::invalid("`reduce_sum` kind `sum` requires numeric inputs but got `token`".to_string())),
+            reduce_abstract(&token, &[1], ReductionKind::Sum),
+            Err(TypeError::invalid("`reduce` with kind `sum` requires numeric inputs but got `token`".to_string())),
         );
         // The structural-zero element type represents an already-known zero tangent and remains closed under numeric
         // reductions even though it has no numeric payload bytes.
         let zero = ArrayType::new_static(DataType::Zero, [2, 3]);
-        assert_eq!(
-            reduce_abstract(&zero, &[1], ReductionKind::Sum, "reduce_sum"),
-            Ok(ArrayType::new_static(DataType::Zero, [2])),
-        );
+        assert_eq!(reduce_abstract(&zero, &[1], ReductionKind::Sum), Ok(ArrayType::new_static(DataType::Zero, [2])),);
     }
 
     #[test]
     fn test_reduce_abstract_accepts_lexicographic_complex_extrema() {
         // Complex minimum and maximum use JAX's lexicographic `(real, imaginary)` ordering.
         let complex = ArrayType::new_static(DataType::C64, [2, 3]);
-        assert_eq!(
-            reduce_abstract(&complex, &[1], ReductionKind::Max, "reduce_max"),
-            Ok(ArrayType::new_static(DataType::C64, [2])),
-        );
-        assert_eq!(
-            reduce_abstract(&complex, &[1], ReductionKind::Min, "reduce_min"),
-            Ok(ArrayType::new_static(DataType::C64, [2])),
-        );
-        assert_eq!(
-            reduce_abstract(&complex, &[1], ReductionKind::Sum, "reduce_sum"),
-            Ok(ArrayType::new_static(DataType::C64, [2])),
-        );
+        assert_eq!(reduce_abstract(&complex, &[1], ReductionKind::Max), Ok(ArrayType::new_static(DataType::C64, [2])),);
+        assert_eq!(reduce_abstract(&complex, &[1], ReductionKind::Min), Ok(ArrayType::new_static(DataType::C64, [2])),);
+        assert_eq!(reduce_abstract(&complex, &[1], ReductionKind::Sum), Ok(ArrayType::new_static(DataType::C64, [2])),);
     }
 
     #[test]
@@ -3016,36 +3002,31 @@ mod tests {
         // The reduced axes are dropped and the remaining axes keep their order.
         let input = ArrayType::new_static(DataType::F64, [2, 3, 4]);
         assert_eq!(
-            reduce_abstract(&input, &[1], ReductionKind::LogSumExp, "reduce_log_sum_exp"),
+            reduce_abstract(&input, &[1], ReductionKind::LogSumExp),
             Ok(ArrayType::new_static(DataType::F64, [2, 4])),
         );
         assert_eq!(
-            reduce_abstract(&input, &[0, 2], ReductionKind::LogSumExp, "reduce_log_sum_exp"),
+            reduce_abstract(&input, &[0, 2], ReductionKind::LogSumExp),
             Ok(ArrayType::new_static(DataType::F64, [3])),
         );
-        assert_eq!(reduce_abstract(&input, &[], ReductionKind::LogSumExp, "reduce_log_sum_exp"), Ok(input.clone()));
+        assert_eq!(reduce_abstract(&input, &[], ReductionKind::LogSumExp), Ok(input.clone()));
 
         // Axis validation mirrors the reduction family's.
         assert_eq!(
-            reduce_abstract(&input, &[3], ReductionKind::LogSumExp, "reduce_log_sum_exp"),
-            Err(TypeError::invalid("`reduce_log_sum_exp` axis 3 is out of bounds for rank 3".to_string())),
+            reduce_abstract(&input, &[3], ReductionKind::LogSumExp),
+            Err(TypeError::invalid("`reduce` axis 3 is out of bounds for rank 3".to_string())),
         );
         assert_eq!(
-            reduce_abstract(&input, &[1, 1], ReductionKind::LogSumExp, "reduce_log_sum_exp"),
-            Err(TypeError::invalid("`reduce_log_sum_exp` contains duplicate axis 1".to_string())),
+            reduce_abstract(&input, &[1, 1], ReductionKind::LogSumExp),
+            Err(TypeError::invalid("`reduce` contains duplicate axis 1".to_string())),
         );
 
         // Only real floating-point payloads have the exponential and logarithm this primitive is built from.
         for data_type in [DataType::I32, DataType::Boolean, DataType::C64, DataType::Token, DataType::Zero] {
             assert_eq!(
-                reduce_abstract(
-                    &ArrayType::new_static(data_type, [2, 3]),
-                    &[1],
-                    ReductionKind::LogSumExp,
-                    "reduce_log_sum_exp",
-                ),
+                reduce_abstract(&ArrayType::new_static(data_type, [2, 3]), &[1], ReductionKind::LogSumExp,),
                 Err(TypeError::invalid(format!(
-                    "`reduce_log_sum_exp` requires real floating-point inputs but got `{data_type}`"
+                    "`reduce` with kind `log_sum_exp` requires real floating-point inputs but got `{data_type}`"
                 ))),
             );
         }
@@ -3062,14 +3043,9 @@ mod tests {
             DataType::F8E5M2FNUZ,
         ] {
             assert_eq!(
-                reduce_abstract(
-                    &ArrayType::new_static(data_type, [2, 3]),
-                    &[1],
-                    ReductionKind::LogSumExp,
-                    "reduce_log_sum_exp",
-                ),
+                reduce_abstract(&ArrayType::new_static(data_type, [2, 3]), &[1], ReductionKind::LogSumExp,),
                 Err(TypeError::invalid(format!(
-                    "`reduce_log_sum_exp` requires a floating-point format that represents negative infinity but got \
+                    "`reduce` with kind `log_sum_exp` requires a floating-point format that represents negative infinity but got \
                      `{data_type}`",
                 ))),
             );
@@ -3085,7 +3061,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            reduce_abstract(&sharded, &[0], ReductionKind::LogSumExp, "reduce_log_sum_exp"),
+            reduce_abstract(&sharded, &[0], ReductionKind::LogSumExp),
             Ok(ArrayType::new_static(DataType::F64, [3])
                 .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
                 .unwrap()),

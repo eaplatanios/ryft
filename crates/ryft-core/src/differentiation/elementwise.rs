@@ -796,7 +796,7 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f32[size, 3] .
-                let %1:f32[size] = reduce_sum [axes=[1]] %0
+                let %1:f32[size] = reduce [kind=sum, axes=[1]] %0
                     %2:f32[size, 1] = broadcast [output_type=f32[size, 1], output_axes=[0]] %1
                 in (%2)
             "}

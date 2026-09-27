@@ -5728,7 +5728,7 @@ mod tests {
                     %2:f64[2, 3] = broadcast [output_type=f64[2, 3], output_axes=[]] %1
                     %3:f64[2, 3] = add %0 %2
                     %4:f64[2, 3] = mul %0 %0
-                    %5:f64[3] = reduce_sum [axes=[0]] %3
+                    %5:f64[3] = reduce [kind=sum, axes=[0]] %3
                 in (%5, %4)
             "}
             .trim_end(),
@@ -6310,7 +6310,7 @@ mod tests {
             indoc! {"
                 lambda %0:dimension<2>, %1:f32[2, 3] .
                 let %2:f32[2, 3] = neg %1
-                    %3:f32[3] = reduce_sum [axes=[0]] %2
+                    %3:f32[3] = reduce [kind=sum, axes=[0]] %2
                 in (%3)
             "}
             .trim_end(),

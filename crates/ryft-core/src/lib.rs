@@ -116,11 +116,11 @@ pub use operations::{
     OR_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, PAD_OPERATION_NAME,
     PARALLEL_VARY_OPERATION_NAME, POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation, ParallelReduce,
     ParallelReduceOperation, ParallelReductionKind, ParallelVary, ParallelVaryOperation, Permutation, Pow,
-    PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME, REFERENCE_ADD_UPDATE_OPERATION_NAME,
-    REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME,
-    REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME, RESHAPE_OPERATION_NAME,
-    RESHARD_OPERATION_NAME, REVERSE_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, RaggedDot,
-    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReduceOperation, ReductionKind,
+    PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME, REDUCE_OPERATION_NAME,
+    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
+    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME,
+    RESHAPE_OPERATION_NAME, RESHARD_OPERATION_NAME, REVERSE_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME,
+    RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReduceOperation, ReductionKind,
     ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
     ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem,
@@ -212,6 +212,7 @@ pub(crate) mod tests {
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
+    use crate::operations::differentiation::custom_jvp::tests::LazyCustomJvpOperation;
     use crate::operations::{
         AddOperation, BroadcastOperation, CompareOperation, ConditionOperation, ConstantOperation,
         ConvertElementTypeOperation, DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation,
@@ -255,6 +256,7 @@ pub(crate) mod tests {
         Div(DivOperation<ArrayType>),
         Exp(ExpOperation<ArrayType>),
         CustomCube(CustomCubeOperation),
+        LazyCustomJvp(LazyCustomJvpOperation),
         ConvertElementType(ConvertElementTypeOperation<ArrayType>),
         Broadcast(BroadcastOperation),
         Transpose(TransposeOperation),

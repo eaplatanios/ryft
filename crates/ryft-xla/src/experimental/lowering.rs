@@ -32,12 +32,12 @@ use ryft_core::{
     Instruction, IotaOperation, LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation, LogAddExpOperation, LogOperation,
     LogicalMesh, LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation,
     Operation, PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program,
-    ProgramError, ProjectedValue, Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation,
-    ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation, ReverseOperation, RoundOperation,
-    RsqrtOperation, SCAN_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation,
-    ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation,
-    SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed,
-    Value, WHILE_OPERATION_NAME, WhileOperation,
+    ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode,
+    RaggedDotOperation, ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation, ReverseOperation,
+    RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode,
+    ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation,
+    SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType,
+    TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -11417,8 +11417,11 @@ fn build_reduce_body_region<'c, 't>(
     let body_value = match kind {
         ReductionKind::LogSumExp => {
             return Err(LoweringError::UnsupportedOp {
-                op: "`reduce_log_sum_exp` requires a maximum-shifted expansion instead of a scalar combiner"
-                    .to_string(),
+                op: format!(
+                    "`{REDUCE_OPERATION_NAME}` with kind `{}` requires a maximum-shifted expansion instead of a scalar \
+                     combiner",
+                    ReductionKind::LogSumExp,
+                ),
             });
         }
         ReductionKind::Sum | ReductionKind::Mean => block_ref
@@ -11581,13 +11584,20 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             | DataType::F8E5M2
     ) {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("`reduce_log_sum_exp` requires a format with negative infinity but got `{element_type}`"),
+            op: format!(
+                "`{REDUCE_OPERATION_NAME}` with kind `{}` requires a format with negative infinity but got \
+                 `{element_type}`",
+                ReductionKind::LogSumExp,
+            ),
         });
     }
 
     let input_type = input_value.r#type()?;
     let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| LoweringError::UnsupportedOp {
-        op: format!("`reduce_log_sum_exp` input has non-tensor MLIR type `{input_type}`"),
+        op: format!(
+            "`{REDUCE_OPERATION_NAME}` with kind `{}` input has non-tensor MLIR type `{input_type}`",
+            ReductionKind::LogSumExp,
+        ),
     })?;
     let maximum_initial_value =
         build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)?;
@@ -18456,7 +18466,8 @@ mod tests {
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main"),
             Err(LoweringError::UnsupportedOp {
-                op: "`reduce_log_sum_exp` requires a format with negative infinity but got `f8e4m3fn`".to_string(),
+                op: "`reduce` with kind `log_sum_exp` requires a format with negative infinity but got `f8e4m3fn`"
+                    .to_string(),
             }),
         );
     }

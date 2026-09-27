@@ -1831,7 +1831,7 @@ mod tests {
                     ],
                     pullback = indoc! {"
                         lambda %0:f64[3] .
-                        let %1:f64[] = reduce_sum [axes=[0]] %0
+                        let %1:f64[] = reduce [kind=sum, axes=[0]] %0
                         in (%1, %0)
                     "},
                 },
@@ -2113,7 +2113,7 @@ mod tests {
                     ],
                     pullback = indoc! {"
                         lambda %0:f64[3] .
-                        let %1:f64[] = reduce_sum [axes=[0]] %0
+                        let %1:f64[] = reduce [kind=sum, axes=[0]] %0
                             %2:f64[3] = neg %0
                         in (%1, %2)
                     "},
@@ -2403,7 +2403,7 @@ mod tests {
                     pullback = indoc! {"
                         lambda %0:f64[3], %1:f64[3] .
                         let %2:f64[3] = mul %1 %0
-                            %3:f64[] = reduce_sum [axes=[0]] %2
+                            %3:f64[] = reduce [kind=sum, axes=[0]] %2
                         in (%3)
                     "},
                 },
@@ -2734,7 +2734,7 @@ mod tests {
                     pullback = indoc! {"
                         lambda %0:f64[3], %1:f64[3] .
                         let %2:f64[3] = div %0 %1
-                            %3:f64[] = reduce_sum [axes=[0]] %2
+                            %3:f64[] = reduce [kind=sum, axes=[0]] %2
                         in (%3)
                     "},
                 },

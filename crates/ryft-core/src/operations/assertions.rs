@@ -1868,7 +1868,10 @@ mod tests {
         )
         .unwrap();
         assert!(!program.instructions().iter().any(|instruction| instruction.operation().name() == "sort"));
-        assert!(program.instructions().iter().any(|instruction| instruction.operation().name() == "reduce_min"));
+        assert!(program.instructions().iter().any(|instruction| matches!(
+            instruction.operation(),
+            ArrayIrOperation::Array(ArrayOperation::Reduce(operation)) if operation.kind() == ReductionKind::Min,
+        )));
 
         // Empty, singleton, and larger successful batches all satisfy the assertion.
         assert_eq!(

@@ -3329,7 +3329,7 @@ mod tests {
                     %2:dimension<rows ∈ [1, 5)> = dimension_size [axis=0] %1
                     %3:dimension<rows + rows ∈ [2, 9)> = dimension_add %2 %2
                     %4:f32[rows + rows, rows] = broadcast [output_axes=[1]] %1 %3 %2
-                    %5:f32[rows] = reduce_sum [axes=[0]] %4
+                    %5:f32[rows] = reduce [kind=sum, axes=[0]] %4
                 in (%5)
             "}
             .trim_end(),
@@ -3366,7 +3366,7 @@ mod tests {
         let builder = trace.builder().borrow();
         assert_eq!(
             builder.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["add", "dimension_size", "dimension_add", "broadcast", "reduce_sum"],
+            vec!["add", "dimension_size", "dimension_add", "broadcast", "reduce"],
         );
         assert!(builder.instructions().iter().all(|instruction| instruction.regions().is_empty()));
         let [add, dimension_size, dimension_add, broadcast, reduce] = builder.instructions() else {
@@ -3401,7 +3401,7 @@ mod tests {
                     %3:dimension<rows ∈ [1, 5)> = dimension_size [axis=1] %2
                     %4:dimension<rows + rows ∈ [2, 9)> = dimension_add %3 %3
                     %5:f32[2, rows + rows, rows] = broadcast [output_axes=[0, 2]] %2 %0 %4 %3
-                    %6:f32[2, rows] = reduce_sum [axes=[1]] %5
+                    %6:f32[2, rows] = reduce [kind=sum, axes=[1]] %5
                 in (%6)
             "}
             .trim_end(),

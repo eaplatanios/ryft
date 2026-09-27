@@ -4970,7 +4970,7 @@ fn reduction_data_dependent_padding_discipline(kind: ReductionKind) -> DataDepen
         ReductionKind::Sum | ReductionKind::Max | ReductionKind::Min | ReductionKind::Any | ReductionKind::All => {
             XlaMasked
         }
-        // `reduce_log_sum_exp` expands into maximum and summation reductions over the same axes, so it inherits
+        // A log-sum-exp `reduce` expands into maximum and summation reductions over the same axes, so it inherits
         // the masking contract of exactly those two reduction kinds: XLA masks each reduction's
         // operand with that reduction's own identity, which wipes the padding lanes of the shifted exponentials
         // before they are summed. The rank-2 arm of `data_derived_padding_fixture` executes that expansion with the
@@ -6698,7 +6698,7 @@ mod tests {
             .unwrap()[0];
 
         // The rank-2 `i + j` matrix carries the data-derived extent on an axis that neither the reduction nor the scan
-        // touches, which is the configuration those two disciplines actually admit: `reduce_log_sum_exp` consumes
+        // touches, which is the configuration those two disciplines actually admit: a log-sum-exp `reduce` consumes
         // the static axis and still produces a dynamically shaped output, and the prefix scan consumes the static
         // axis while every row it emits keeps the dynamic extent.
         let rows = builder
@@ -10583,7 +10583,7 @@ mod tests {
             assert_eq!(array_data_dependent_padding_discipline(&operation), RyftMasked);
         }
 
-        // `reduce_log_sum_exp` expands into maximum and summation reductions, so it carries the same masking
+        // A log-sum-exp `reduce` expands into maximum and summation reductions, so it carries the same masking
         // contract as those two reduction kinds.
         assert_eq!(
             array_data_dependent_padding_discipline(&ArrayOperation::Reduce(ReduceOperation::new(
@@ -11347,7 +11347,7 @@ mod tests {
         assert!(matches!(
             domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
             Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == "operation `reduce_mean` cannot consume data-derived dimensions during XLA lowering \
+                if message == "operation `reduce` cannot consume data-derived dimensions during XLA lowering \
                     because mean over a dynamically sized reduction axis is not supported by the XLA lowering",
         ));
 

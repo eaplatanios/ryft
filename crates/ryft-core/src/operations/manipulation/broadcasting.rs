@@ -2814,7 +2814,7 @@ mod tests {
                 input_cotangents = [Array::vector(vec![5.0, 7.0, 9.0]).unwrap()],
                 pullback = indoc! {"
                     lambda %0:f64[2, 3] .
-                    let %1:f64[3] = reduce_sum [axes=[0]] %0
+                    let %1:f64[3] = reduce [kind=sum, axes=[0]] %0
                     in (%1)
                 "},
             }],
@@ -2842,7 +2842,7 @@ mod tests {
                 input_cotangents = [Array::matrix(2, 3, vec![12.0, 44.0, 76.0, 16.0, 48.0, 80.0]).unwrap()],
                 pullback = indoc! {"
                     lambda %0:f64[3, 4, 2] .
-                    let %1:f64[3, 2] = reduce_sum [axes=[1]] %0
+                    let %1:f64[3, 2] = reduce [kind=sum, axes=[1]] %0
                         %2:f64[2, 3] = transpose [permutation=[1, 0]] %1
                     in (%2)
                 "},
@@ -2865,7 +2865,7 @@ mod tests {
                 input_cotangents = [Array::matrix(1, 3, vec![5.0, 7.0, 9.0]).unwrap()],
                 pullback = indoc! {"
                     lambda %0:f64[2, 3] .
-                    let %1:f64[3] = reduce_sum [axes=[0]] %0
+                    let %1:f64[3] = reduce [kind=sum, axes=[0]] %0
                         %2:f64[1, 3] = reshape [shape=[1, 3]] %1
                     in (%2)
                 "},
@@ -4264,7 +4264,7 @@ mod tests {
                 lambda %0:f64[3, 2] .
                 let %1:dimension<3> = const 3
                     %2:dimension<2> = const 2
-                    %3:f64[2] = reduce_sum [axes=[0]] %0
+                    %3:f64[2] = reduce [kind=sum, axes=[0]] %0
                 in (%3)
             "}
             .trim_end(),
@@ -4609,7 +4609,7 @@ mod tests {
                 input_cotangents = [ArrayIrValue::Array(Array::vector(vec![5.0, 7.0, 9.0]).unwrap())],
                 pullback = indoc! {"
                     lambda %0:f64[2, 3], %1:dimension<2>, %2:dimension<3> .
-                    let %3:f64[3] = reduce_sum [axes=[0]] %0
+                    let %3:f64[3] = reduce [kind=sum, axes=[0]] %0
                     in (%3)
                 "},
             }],

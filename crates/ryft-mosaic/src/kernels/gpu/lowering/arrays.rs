@@ -118,6 +118,10 @@ pub(super) fn validate(
             checked_count(operation, &reduction.axes().iter().map(|&axis| input_shape[axis]).collect::<Vec<_>>())?;
             Ok(())
         }
+        ArrayOperation::Reduce(reduction) => Err(unsupported(
+            operation,
+            &format!("kind `{}` or the reduction's metadata has no baseline scalar implementation", reduction.kind()),
+        )),
         ArrayOperation::Dot(dot)
             if dot.accumulation_type().is_none()
                 && dot.output_sharding().is_none()
@@ -700,14 +704,14 @@ mod tests {
         let operation = ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Mean));
         assert!(matches!(
             validate(&operation, &[ArrayType::new_static(DataType::F32, [2])], &ArrayType::scalar(DataType::F32)),
-            Err(Error::Unsupported { operation: "reduce_mean", reason })
-                if reason == "operation or its metadata has no baseline scalar implementation",
+            Err(Error::Unsupported { operation: "reduce", reason })
+                if reason == "kind `mean` or the reduction's metadata has no baseline scalar implementation",
         ));
         let operation = ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::LogSumExp));
         assert!(matches!(
             validate(&operation, &[ArrayType::new_static(DataType::F32, [2])], &ArrayType::scalar(DataType::F32)),
-            Err(Error::Unsupported { operation: "reduce_log_sum_exp", reason })
-                if reason == "operation or its metadata has no baseline scalar implementation",
+            Err(Error::Unsupported { operation: "reduce", reason })
+                if reason == "kind `log_sum_exp` or the reduction's metadata has no baseline scalar implementation",
         ));
     }
 
@@ -720,7 +724,7 @@ mod tests {
                 &[ArrayType::new_static(DataType::F32, [2])],
                 &ArrayType::new_static(DataType::F32, [1]),
             ),
-            Err(Error::Unsupported { operation: "reduce_sum", reason })
+            Err(Error::Unsupported { operation: "reduce", reason })
                 if reason == "result type differs from canonical array inference",
         ));
     }
@@ -732,7 +736,7 @@ mod tests {
             validate(&operation, &[ArrayType::new_static(DataType::F32, [2])], &ArrayType::scalar(DataType::F32))
                 .unwrap_err();
         assert!(matches!(error, Error::Type(_)));
-        assert_eq!(error.to_string(), "`reduce_sum` axis 1 is out of bounds for rank 1");
+        assert_eq!(error.to_string(), "`reduce` axis 1 is out of bounds for rank 1");
     }
 
     #[test]

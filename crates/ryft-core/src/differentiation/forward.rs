@@ -4590,6 +4590,94 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_differentiable_operation_jvp_for_transpose_reverse_over_forward() {
+        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let (tangent, pullback) = context
+            .vjp(
+                |input, ()| {
+                    let context = input.context().clone();
+                    let direction = context.lift(Array::scalar(2f64).unwrap())?;
+                    let (_, tangent) = context.jvp(
+                        |input, ()| {
+                            input
+                                .context()
+                                .bind(CustomCubeOperation, Vec::new(), &[input.clone()])
+                                .map(|mut outputs| outputs.remove(0))
+                        },
+                        input,
+                        direction,
+                        (),
+                    )?;
+                    Ok(tangent)
+                },
+                Array::scalar(3f64).unwrap(),
+                (),
+            )
+            .unwrap();
+
+        // Reverse differentiates the forward rule's coefficient: `d(3x² * 2)/dx = 12x`.
+        assert_eq!(tangent, Array::scalar(54f64).unwrap());
+        assert_eq!(pullback.apply(Array::scalar(1f64).unwrap()), Ok(Array::scalar(36f64).unwrap()));
+    }
+
+    #[test]
+    fn test_differentiable_operation_jvp_for_transpose_forward_over_reverse() {
+        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let (gradient, tangent) = context
+            .jvp(
+                |input, ()| {
+                    let context = input.context().clone();
+                    let (_, pullback) = context.vjp(
+                        |input, ()| {
+                            input
+                                .context()
+                                .bind(CustomCubeOperation, Vec::new(), &[input.clone()])
+                                .map(|mut outputs| outputs.remove(0))
+                        },
+                        input,
+                        (),
+                    )?;
+                    pullback.apply(context.lift(Array::scalar(1f64).unwrap())?)
+                },
+                Array::scalar(3f64).unwrap(),
+                Array::scalar(1f64).unwrap(),
+                (),
+            )
+            .unwrap();
+
+        // Differentiate through the original call, its saved residual, and the backward program together.
+        assert_eq!(gradient, Array::scalar(27f64).unwrap());
+        assert_eq!(tangent, Array::scalar(18f64).unwrap());
+    }
+
+    #[test]
+    fn test_differentiable_operation_jvp_for_transpose_reverse_over_reverse() {
+        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let (gradient, pullback) = context
+            .vjp(
+                |input, ()| {
+                    let context = input.context().clone();
+                    let (_, pullback) = context.vjp(
+                        |input, ()| {
+                            input
+                                .context()
+                                .bind(CustomCubeOperation, Vec::new(), &[input.clone()])
+                                .map(|mut outputs| outputs.remove(0))
+                        },
+                        input,
+                        (),
+                    )?;
+                    pullback.apply(context.lift(Array::scalar(1f64).unwrap())?)
+                },
+                Array::scalar(3f64).unwrap(),
+                (),
+            )
+            .unwrap();
+        assert_eq!(gradient, Array::scalar(27f64).unwrap());
+        assert_eq!(pullback.apply(Array::scalar(1f64).unwrap()), Ok(Array::scalar(18f64).unwrap()));
+    }
+
+    #[test]
     fn test_differentiation_tracer_new() {
         let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
         let primal = Array::scalar(2.0_f64).unwrap();

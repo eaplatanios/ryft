@@ -85,7 +85,7 @@ pub use extrema::{
 pub use logical::*;
 pub use manipulation::*;
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
-pub use reductions::{LogSumExp, Reduce, ReduceOperation, ReductionKind};
+pub use reductions::{LogSumExp, REDUCE_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind};
 pub use references::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_ATOMIC_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
     REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,

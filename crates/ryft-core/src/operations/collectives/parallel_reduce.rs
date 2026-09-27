@@ -765,6 +765,7 @@ mod tests {
     use crate::batching::{BatchAxisSpecification, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::differentiate_at;
+    use crate::operations::reductions::REDUCE_OPERATION_NAME;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ValueProjection};
@@ -1182,7 +1183,7 @@ mod tests {
             let expected_identity_operation = if kind == ParallelReductionKind::Sum { "zero_like" } else { "constant" };
             assert!(operation_names.contains(&expected_identity_operation));
             assert!(operation_names.contains(&"select"));
-            assert_eq!(operation_names.iter().filter(|name| name.starts_with("reduce_")).count(), 2);
+            assert_eq!(operation_names.iter().filter(|name| **name == REDUCE_OPERATION_NAME).count(), 2);
         }
         Ok(())
     }

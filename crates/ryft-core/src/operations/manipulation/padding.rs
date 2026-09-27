@@ -4814,7 +4814,7 @@ mod tests {
                     interior_padding=[1]] %10 %11 %0
                             %13:f64[result] = zero [type=f64[result]] %0
                             %14:f64[result] = select %12 %2 %13
-                            %15:f64[] = reduce_sum [axes=[0]] %14
+                            %15:f64[] = reduce [kind=sum, axes=[0]] %14
                         in (%9, %15)
                     },
                 ]
@@ -5309,7 +5309,7 @@ mod tests {
                     interior_padding=[1]] %10 %11 %0
                             %13:f32[output_size] = zero [type=f32[output_size]] %0
                             %14:f32[output_size] = select %12 %2 %13
-                            %15:f32[] = reduce_sum [axes=[0]] %14
+                            %15:f32[] = reduce [kind=sum, axes=[0]] %14
                         in (%9, %15)
                     },
                     transpose={
@@ -5465,7 +5465,7 @@ mod tests {
                                     interior_padding=[0, 0]] %8 %9 %0 %1
                                 %11:f64[4, columns] = zero [type=f64[4, columns]] %1
                                 %12:f64[4, columns] = select %10 %2 %11
-                                %13:f64[] = reduce_sum [axes=[0, 1]] %12
+                                %13:f64[] = reduce [kind=sum, axes=[0, 1]] %12
                             in (%7, %13)
                         },
                         transpose={
@@ -5610,7 +5610,7 @@ mod tests {
                         %7:bool[8] = pad [edge_padding_low=[1], edge_padding_high=[2], interior_padding=[1]] %5 %6
                         %8:f64[8] = zero [type=f64[8]]
                         %9:f64[8] = select %7 %0 %8
-                        %10:f64[] = reduce_sum [axes=[0]] %9
+                        %10:f64[] = reduce [kind=sum, axes=[0]] %9
                     in (%4, %10)
                 "},
             }],
@@ -5893,7 +5893,7 @@ mod tests {
                         indices_are_sorted=true,
                         unique_indices=true,
                     ] %0 %3 %5
-                    %7:f32[] = reduce_sum [axes=[0, 1]] %6
+                    %7:f32[] = reduce [kind=sum, axes=[0, 1]] %6
                 in (%4, %7)
             "}
             .trim_end(),

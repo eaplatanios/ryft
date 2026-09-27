@@ -6332,7 +6332,7 @@ mod tests {
         let program = batch_while_under_tracing(countdown_operation, countdown_regions, 3);
         let rendered = program.to_string();
         assert_eq!(rendered.matches("= while").count(), 1, "{rendered}");
-        assert!(!rendered.contains("reduce_any"), "{rendered}");
+        assert!(!rendered.contains("reduce [kind=any"), "{rendered}");
         assert!(rendered.contains("%2:bool[3] = compare"), "{rendered}");
         assert_eq!(rendered.matches("sub").count(), 1, "{rendered}");
         let output = program.interpret(Array::vector(vec![3.0, 1.0, 2.0]).unwrap()).unwrap();
@@ -6607,7 +6607,7 @@ mod tests {
         assert_eq!(r#while.inputs(), &[input_ids[0], input_ids[1]]);
         let rendered = program.to_string();
         assert!(rendered.contains("bool[batch]"), "{rendered}");
-        assert!(!rendered.contains("reduce_any"), "{rendered}");
+        assert!(!rendered.contains("reduce [kind=any"), "{rendered}");
 
         // Interpreting the staged loop over batch items [3, 1, 2] counts every item down to 0 under the masked
         // semantics while the loop-invariant extent carry rides through unchanged.
@@ -6669,7 +6669,7 @@ mod tests {
             .unwrap();
         let rendered = program.to_string();
         assert_eq!(rendered.matches("= while").count(), 1, "{rendered}");
-        assert!(!rendered.contains("reduce_any"), "{rendered}");
+        assert!(!rendered.contains("reduce [kind=any"), "{rendered}");
         assert!(!rendered.contains("select"), "{rendered}");
         let (counter_output, value_output) = program
             .interpret((Array::scalar(2.0).unwrap(), Array::vector(vec![1.0, 2.0, 3.0]).unwrap()))
