@@ -3051,7 +3051,8 @@ mod tests {
                 .unwrap();
             let linearization = program.linearize().unwrap();
 
-            assert_eq!(linearization.residual_count(), 2);
+            // Extrema retain the runtime extent, the extremum mask, and the tie count by which the tangent is divided.
+            assert_eq!(linearization.residual_count(), 3);
             let mut primal_outputs =
                 linearization.primal().interpret(vec![ArrayIrValue::Array(Array::vector(values).unwrap())]).unwrap();
             assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_primal).unwrap()));

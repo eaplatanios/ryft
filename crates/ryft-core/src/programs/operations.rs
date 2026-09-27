@@ -558,7 +558,10 @@ pub trait Operation: Clone {
     /// A successful fold guarantees that omitting this operation, including its executable regions, preserves all
     /// observable behavior, possible failures, and transformation semantics (including differentiation). Effects of
     /// input producers remain live. Replacement types may refine inferred output types and substitute their identities,
-    /// but callers must propagate those substitutions.
+    /// but callers must propagate those substitutions. An operation that declares deferred work (refer to the
+    /// [Deferred Work](Effects#deferred-work) section of the [`Effects`] documentation) carries a transformation
+    /// obligation that omitting it would discharge, so [`Self::resolve_fold`] declines it before consulting this
+    /// function and implementations need not check it themselves.
     ///
     /// # Parameters
     ///
@@ -579,9 +582,10 @@ pub trait Operation: Clone {
     /// Applies [`Self::fold`] and resolves its replacements against the already inferred application boundary,
     /// returning `None` when the rule declines to fold. Input replacements must name existing inputs whose types
     /// refine the declared outputs, including relationships between input and output identities, and singleton
-    /// replacements must be materializable by the value family `V` as storable program constants. Callers apply the
-    /// returned replacements without further validation. This is the application half of the folding contract and
-    /// is not meant to be overridden (i.e., operations must typically only customize [`Self::fold`]).
+    /// replacements must be materializable by the value family `V` as storable program constants. Callers apply
+    /// the returned replacements without further validation. Operations that declare deferred work are never folded.
+    /// This is the application half of the folding contract and is not meant to be overridden (i.e., operations must
+    /// typically only customize [`Self::fold`]).
     ///
     /// # Parameters
     ///
@@ -594,10 +598,16 @@ pub trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
         output_types: &[Self::Type],
     ) -> Result<Option<Vec<OperationFoldReplacement<V>>>, TypeError> {
+        // Omitting an operation with deferred work would discharge its unresolved transformation obligation.
+        if self.effects().summary().has_deferred_work() {
+            return Ok(None);
+        }
+
         let Some(outputs) = self.fold(input_types, region_interfaces)? else {
             return Ok(None);
         };
         check_count!("fold output", outputs, output_types.len(), TypeError);
+
         let mut replacements = Vec::with_capacity(outputs.len());
         let mut actual = input_types.to_vec();
         for (output, output_type) in outputs.iter().zip(output_types) {
@@ -628,6 +638,7 @@ pub trait Operation: Clone {
                 }
             }
         }
+
         let declared = input_types.iter().chain(output_types).cloned().collect::<Vec<_>>();
         Self::Type::derive_identity_renaming(&declared, &actual)?;
         Ok(Some(replacements))
@@ -1249,7 +1260,8 @@ where
                         .map(|r#type| <&T>::try_from(r#type).cloned())
                         .collect::<Result<_, _>>()?,
                     interface.effects(),
-                ))
+                )
+                .with_deferred_work(interface.has_deferred_work()))
             })
             .collect::<Result<_, TypeError>>()?,
     ))

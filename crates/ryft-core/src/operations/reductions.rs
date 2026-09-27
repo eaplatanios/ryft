@@ -921,10 +921,11 @@ pub trait Reduce: Sized {
     /// the cross-device part of the sum. Refer to [`ReduceOperation::with_output_sharding`] for the complete set of
     /// valid requests.
     ///
-    /// Every value validates a requested sharding through the type inference of the corresponding [`ReduceOperation`].
-    /// Context-carrying values then attach the request to the staged [`ReduceOperation`]. Concrete [`Array`]s live on
-    /// a single device, where a sharding only describes distribution metadata, and so they compute the same output
-    /// with or without it.
+    /// Every value validates a requested sharding and derives the output type through the type inference of the
+    /// corresponding [`ReduceOperation`]. Context-carrying values attach the request to the staged [`ReduceOperation`],
+    /// leaving the placement to the backend that executes it. Concrete [`Array`]s live on a single device, where a
+    /// sharding only describes distribution metadata, and so they compute the same elements with or without a request,
+    /// while their output type still records the requested sharding.
     ///
     /// # Parameters
     ///
@@ -1043,15 +1044,19 @@ impl Reduce for Array {
     }
 
     fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError> {
-        // A concrete array lives on a single device, so a requested sharding cannot change its elements. The request
-        // must still be valid for the input, just like it must be for a staged reduction, and so we validate it using
-        // the type inference of the same `ReduceOperation` before computing the sum.
-        if output_sharding.is_some() {
-            ReduceOperation::new(axes.to_vec(), ReductionKind::Sum)
-                .with_output_sharding(output_sharding)?
-                .infer_output_types(&[self.r#type().into_owned()], &[])?;
-        }
-        self.reduce(axes, ReductionKind::Sum)
+        // A concrete array lives on a single device, so a requested sharding cannot change its elements and no data has
+        // to move. Its type still records the requested sharding, and that output type comes from the type inference of
+        // the same `ReduceOperation`, so that eager evaluation validates the request and produces exactly the output
+        // type of a staged sum. Sharding does not affect storage, and so the sum's bytes can be reused.
+        let Some(output_sharding) = output_sharding else {
+            return self.reduce(axes, ReductionKind::Sum);
+        };
+        let mut output_types = ReduceOperation::new(axes.to_vec(), ReductionKind::Sum)
+            .with_output_sharding(output_sharding)?
+            .infer_output_types(&[self.r#type().into_owned()], &[])?;
+        check_count!("output", output_types, 1, ProgramError);
+        let output = self.reduce(axes, ReductionKind::Sum)?;
+        Ok(Self::new_unchecked(output_types.remove(0), output.shared_storage().clone()))
     }
 }
 
@@ -2688,7 +2693,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_reduce_sum_validates_concrete_arrays() {
+    fn test_reduce_reduce_sum_concrete_arrays() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input_type = ArrayType::new_static(DataType::F64, [2, 3])
             .with_sharding(
@@ -2702,9 +2707,15 @@ mod tests {
             .with_unreduced_axes(["x"])
             .unwrap();
 
-        // A valid request computes the same output as an unsharded sum, because a concrete array lives on a single
-        // device, while an invalid request is rejected just like it is for staged sums.
-        assert_eq!(input.reduce_sum(&[0], Some(unreduced)), input.reduce(&[0], ReductionKind::Sum));
+        // A valid request computes the same elements as an unsharded sum, because a concrete array lives on a single
+        // device, while its output type records the requested sharding exactly like the output type of a staged sum.
+        // An invalid request is rejected just like it is for staged sums.
+        let output = input.reduce_sum(&[0], Some(unreduced.clone())).unwrap();
+        assert_eq!(
+            output.r#type().as_ref(),
+            &ArrayType::new_static(DataType::F64, [3]).with_sharding(unreduced).unwrap()
+        );
+        assert_eq!(output.elements::<f64>(), Ok(vec![5.0, 7.0, 9.0]));
         assert_eq!(
             input.reduce_sum(&[0], Some(Sharding::replicated(mesh, 2))),
             Err(ProgramError::Type(TypeError::invalid(

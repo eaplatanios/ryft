@@ -1976,12 +1976,15 @@ impl<
 /// }
 /// ```
 pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation<Type = V::Type> {
-    /// Applies this operation's transpose rule to symbolic output cotangents, accumulating `x̄ = Lᵀ(ȳ)` for the linear
-    /// map `y = L(x)`. Each operand has an opaque [`CotangentAccumulator`], and the implementor must check
-    /// [`is_needed`](CotangentAccumulator::is_needed) before computing an expensive contribution, and then submit it
-    /// with [`accumulate`](CotangentAccumulator::accumulate). A rule may submit multiple contributions or none.
+    /// Applies this operation's transpose rule to symbolic output cotangents, accumulating `x̄ = Lᵀ(ȳ)` for the
+    /// linear map `y = L(x)`. Each operand has an opaque [`CotangentAccumulator`], and the implementor must check
+    /// [`is_needed`](CotangentAccumulator::is_needed) before computing an expensive contribution, and then submit
+    /// it with [`accumulate`](CotangentAccumulator::accumulate). A rule may submit multiple contributions or none.
     /// Repeated operands can share storage, so each operand's mathematical contribution must be submitted
-    /// independently.
+    /// independently. Unneeded accumulators do not suppress unrelated obligations. Specifically, an operation
+    /// that carries deferred work (refer to the [Deferred Work](crate::Effects#deferred-work) section of the
+    /// [`Effects`](crate::Effects) documentation for more information on what that is) is still transposed
+    /// with ignored destinations and structural-zero seeds, so that its retained rule runs.
     ///
     /// A rule capable of updating a gradient buffer directly can query [`reference`](CotangentAccumulator::reference).
     /// For example, a slice rule can add its output cotangent into a view of that buffer instead of constructing a
@@ -2071,6 +2074,19 @@ pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>:
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError>;
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
+    /// Returns whether transposition must visit an application of this region even without live output cotangents or
+    /// reference state. That is the case when the region carries deferred work, which propagates only through
+    /// executable computation regions (a constant-time query of the sealed [`EffectsSummary`](crate::EffectsSummary)),
+    /// or when any region in its complete closure, including dormant rule regions, has observable effects (refer to
+    /// [`RegionRef::has_observable_effects_in_closure`], which traverses that closure). Transpose rules of
+    /// region-carrying operations use this query before treating an application without live output cotangents or
+    /// reference state destinations as a zero linear map.
+    pub fn must_transpose(self) -> bool {
+        self.effects().has_deferred_work() || self.has_observable_effects_in_closure()
+    }
 }
 
 impl<
@@ -2663,11 +2679,14 @@ impl<
             if !has_output_adjoint && !has_live_state {
                 // Backward rule effects are absent from execution effect summaries. Keeping the rule live here
                 // lets it preserve those effects without treating a dormant region as an executed forward region.
-                let has_rule_effects = instruction
-                    .regions()
-                    .iter()
-                    .any(|id| self.with_id(*id).unwrap().has_observable_effects_in_closure());
-                if !has_rule_effects {
+                // Deferred work in the instruction or its executable computation regions must also run, because its
+                // transformation obligation materializes only here (dormant rule regions contribute none).
+                let must_transpose = self.instruction_effects(instruction_index)?.has_deferred_work()
+                    || instruction
+                        .regions()
+                        .iter()
+                        .any(|id| self.with_id(*id).unwrap().has_observable_effects_in_closure());
+                if !must_transpose {
                     continue;
                 }
             }

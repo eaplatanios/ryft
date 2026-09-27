@@ -110,7 +110,7 @@ pub use operations::{
     GatherOptions, IOTA_OPERATION_NAME, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed, Indexing, Iota,
     IotaOperation, LINEAR_CALL_OPERATION_NAME, LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME,
     LOGISTIC_OPERATION_NAME, LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation,
-    LogOperation, LogSumExp, Logistic, LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME,
+    LogOperation, Logistic, LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME,
     ManualVariationAlignment, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME,
     NOT_OPERATION_NAME, Neg, NegOperation, Not, NotOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME,
     OR_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, PAD_OPERATION_NAME,
@@ -793,6 +793,10 @@ pub(crate) mod tests {
         /// Region-free unary identity stand-in with the declared observable effect.
         Effectful(EffectClass),
 
+        /// Region-free unary identity stand-in that carries deferred work (i.e., an unresolved transformation
+        /// obligation) without any observable effect.
+        Deferred,
+
         /// Region-carrying operation declaring its region slots. Its inferred output types are the first attached
         /// region's output types, which pins that region interfaces are derived and delivered during inference.
         WithRegions(&'static [RegionSlot]),
@@ -808,6 +812,7 @@ pub(crate) mod tests {
             match self {
                 Self::Add => "add",
                 Self::Effectful(_) => "effectful",
+                Self::Deferred => "deferred",
                 Self::WithRegions(_) => "with_regions",
                 Self::Call => "array_identity",
             }
@@ -815,7 +820,7 @@ pub(crate) mod tests {
 
         fn region_slots(&self) -> &'static [RegionSlot] {
             match self {
-                Self::Add | Self::Effectful(_) => &[],
+                Self::Add | Self::Effectful(_) | Self::Deferred => &[],
                 Self::WithRegions(slots) => slots,
                 Self::Call => const { &[RegionSlot::computation("body")] },
             }
@@ -831,7 +836,7 @@ pub(crate) mod tests {
                     check_count!("input", input_types, 2, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
-                Self::Effectful(_) => {
+                Self::Effectful(_) | Self::Deferred => {
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
@@ -864,10 +869,11 @@ pub(crate) mod tests {
         }
 
         fn effects(&self) -> Cow<'_, Effects> {
-            Cow::Owned(Effects::explicit(match self {
-                Self::Add | Self::WithRegions(_) | Self::Call => EffectClasses::NONE,
-                Self::Effectful(effect) => EffectClasses::single(*effect),
-            }))
+            match self {
+                Self::Add | Self::WithRegions(_) | Self::Call => Cow::Borrowed(Effects::empty()),
+                Self::Effectful(effect) => Cow::Owned(Effects::explicit(EffectClasses::single(*effect))),
+                Self::Deferred => Cow::Owned(Effects::empty().clone().with_deferred_work()),
+            }
         }
     }
 

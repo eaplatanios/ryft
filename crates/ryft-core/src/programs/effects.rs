@@ -325,6 +325,30 @@ pub enum ReferenceEffect {
 /// nested computations, so partial evaluation and rematerialization cannot mistake this additional state for a confined
 /// reference lifecycle.
 ///
+/// # Deferred Work
+///
+/// [`Self::with_deferred_work`] marks an operation that carries an unresolved transformation obligation (e.g.,
+/// a selected backward rule whose effects materialize only when a later transform such as transposition runs it).
+/// Deferred work is not an execution effect. It contributes no [`EffectClass`], so it neither makes the operation
+/// impure nor orders it against other effects. Instead, it is an orthogonal obligation that shared transform
+/// boundaries enforce:
+///
+///   - Folding (i.e., [`Operation::resolve_fold`](crate::Operation::resolve_fold)) and partial evaluation
+///     (i.e., [`PartialEvaluationContext::fold_or_residualize`](crate::PartialEvaluationContext::fold_or_residualize))
+///     never remove or execute the operation early, even when all of its inputs are known.
+///   - Dead code elimination retains the operation even when none of its outputs is used (refer to
+///     [`EffectsSummary::is_retained_when_unused`]). This includes ordinary primal-only programs,
+///     because simplification must preserve a selected obligation.
+///   - Transposition visits the operation even without live output cotangents or reference state, so that its
+///     retained rule runs with ignored destinations and structural-zero seeds.
+///
+/// The declaration is immutable semantic metadata. It must describe the obligation itself rather than a cache state:
+/// populating a callback or specialization cache never clears it, and only replacing the carrier with resolved
+/// operations discharges the obligation. A declaration that depends on the operation payload makes that payload
+/// semantics-bearing metadata, which must render as required by [`Operation::render`](crate::Operation::render).
+/// Merely registering a dormant derivative rule does not create an obligation. Like effect classes, deferred work
+/// propagates through attached computation regions during region sealing but not through dormant rule regions.
+///
 /// # Examples
 ///
 /// Reference operations declare no explicit effect classes. Each of the six primitives
@@ -407,9 +431,19 @@ impl Effects {
             classes,
             has_observable_effects_when_unused: !declared.is_empty() || has_access,
             has_explicit_ordered_state: declared.contains(EffectClass::OrderedState),
+            has_deferred_work: false,
         };
 
         Ok(Self { summary, reference_effects })
+    }
+
+    /// Returns this [`Effects`] declaration marked as carrying deferred work (i.e., an unresolved transformation
+    /// obligation). Refer to the [Deferred Work](Self#deferred-work) section for the semantics and the
+    /// declaration contract.
+    #[inline]
+    pub fn with_deferred_work(mut self) -> Self {
+        self.summary.has_deferred_work = true;
+        self
     }
 
     /// Returns the shared empty [`Effects`] declaration of pure [`Operation`](crate::Operation)s that neither
@@ -562,8 +596,9 @@ static EMPTY_EFFECTS: Effects = Effects { summary: EffectsSummary::PURE, referen
 
 /// Aggregate summary of [`Effects`] that survives union across [`Instruction`](crate::Instruction)s and
 /// [`Region`](crate::Region)s without index translation. It records the aggregate [`EffectClasses`], whether unused
-/// results permit elimination, and whether an executable instruction directly declares [`EffectClass::OrderedState`].
-/// The latter distinction cannot be recovered from the classes once reference effects derive the same class.
+/// results permit elimination, whether an executable instruction directly declares [`EffectClass::OrderedState`], and
+/// whether an executable instruction carries deferred work. The explicit ordered-state distinction cannot be recovered
+/// from the classes once reference effects derive the same class.
 ///
 /// The observability information reflects the runtime contract for references: a read operation may synchronize with
 /// pending backend work or report a reference-state failure, so every access is observable even when unused, while an
@@ -581,6 +616,10 @@ pub struct EffectsSummary {
 
     /// Whether an operation directly declares [`EffectClass::OrderedState`], independently of its reference effects.
     has_explicit_ordered_state: bool,
+
+    /// Whether an operation carries deferred work. Refer to the [Deferred Work](Effects#deferred-work) section of
+    /// the [`Effects`] documentation for more information.
+    has_deferred_work: bool,
 }
 
 impl EffectsSummary {
@@ -590,6 +629,7 @@ impl EffectsSummary {
         classes: EffectClasses::NONE,
         has_observable_effects_when_unused: false,
         has_explicit_ordered_state: false,
+        has_deferred_work: false,
     };
 
     /// Returns the aggregate [`EffectClasses`] of this [`EffectsSummary`].
@@ -612,15 +652,30 @@ impl EffectsSummary {
         self.has_explicit_ordered_state
     }
 
-    /// Returns the union of this [`EffectsSummary`] with `other`, combining [`EffectClasses`] and retaining either flag
-    /// when either side sets it. An enclosing operation cannot suppress an observable nested effect or an explicit
-    /// ordered-state declaration.
+    /// Returns whether any executable instruction carries deferred work (i.e., an unresolved transformation
+    /// obligation). Deferred work contributes no [`EffectClass`]. Refer to the [Deferred Work](Effects#deferred-work)
+    /// section of the [`Effects`] documentation for the transform contract.
+    pub const fn has_deferred_work(self) -> bool {
+        self.has_deferred_work
+    }
+
+    /// Returns whether dead-code elimination must retain an application whose outputs are unused, which is
+    /// the case when it has [observable effects when unused](Self::has_observable_effects_when_unused) or
+    /// [deferred work](Self::has_deferred_work).
+    pub const fn is_retained_when_unused(self) -> bool {
+        self.has_observable_effects_when_unused || self.has_deferred_work
+    }
+
+    /// Returns the union of this [`EffectsSummary`] with `other`, combining [`EffectClasses`] and retaining each flag
+    /// when either side sets it. An enclosing operation cannot suppress an observable nested effect, an explicit
+    /// ordered-state declaration, or nested deferred work.
     pub const fn union(self, other: EffectsSummary) -> EffectsSummary {
         EffectsSummary {
             classes: self.classes.union(other.classes),
             has_observable_effects_when_unused: self.has_observable_effects_when_unused
                 || other.has_observable_effects_when_unused,
             has_explicit_ordered_state: self.has_explicit_ordered_state || other.has_explicit_ordered_state,
+            has_deferred_work: self.has_deferred_work || other.has_deferred_work,
         }
     }
 }
@@ -956,6 +1011,25 @@ mod tests {
     }
 
     #[test]
+    fn test_effects_with_deferred_work() {
+        let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo));
+        let deferred = Effects::empty().clone().with_deferred_work();
+        let deferred_io = io.clone().with_deferred_work();
+
+        // Deferred work is an obligation orthogonal to execution effects: it adds no effect class, keeps the
+        // declaration pure, and leaves the declared classes and reference effects unchanged.
+        assert_eq!(deferred.classes(), EffectClasses::NONE);
+        assert!(deferred.is_pure());
+        assert!(deferred.summary().has_deferred_work());
+        assert!(!deferred.summary().has_observable_effects_when_unused());
+        assert!(!Effects::empty().summary().has_deferred_work());
+        assert_eq!(deferred_io.classes(), io.classes());
+        assert_eq!(deferred_io.reference_effects(), io.reference_effects());
+        assert!(deferred_io.summary().has_deferred_work());
+        assert_ne!(deferred_io, io);
+    }
+
+    #[test]
     fn test_effects_validate_application() {
         let array = ArrayIrType::from(ArrayType::scalar(DataType::F32));
         let reference = ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)));
@@ -1065,6 +1139,36 @@ mod tests {
         assert!(mixed.summary().has_explicit_ordered_state());
         assert!(read.summary().union(mixed.summary()).has_explicit_ordered_state());
         assert!(mixed.summary().union(read.summary()).has_explicit_ordered_state());
+    }
+
+    #[test]
+    fn test_effects_summary_has_deferred_work() {
+        let deferred = Effects::empty().clone().with_deferred_work();
+        let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo));
+
+        // Union retains nested deferred work regardless of the side that carries it, without adding effect classes.
+        assert!(!EffectsSummary::PURE.has_deferred_work());
+        assert!(deferred.summary().has_deferred_work());
+        assert!(EffectsSummary::PURE.union(deferred.summary()).has_deferred_work());
+        assert!(deferred.summary().union(EffectsSummary::PURE).has_deferred_work());
+        assert!(!io.summary().has_deferred_work());
+        assert!(io.summary().union(deferred.summary()).has_deferred_work());
+        assert_eq!(io.summary().union(deferred.summary()).classes(), io.summary().classes());
+    }
+
+    #[test]
+    fn test_effects_summary_is_retained_when_unused() {
+        let allocation =
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap();
+        let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo));
+        let deferred = Effects::empty().clone().with_deferred_work();
+
+        // Dead-code elimination retains observable effects and deferred work, but not pure or allocation-only work.
+        assert!(!EffectsSummary::PURE.is_retained_when_unused());
+        assert!(!allocation.summary().is_retained_when_unused());
+        assert!(io.summary().is_retained_when_unused());
+        assert!(deferred.summary().is_retained_when_unused());
+        assert!(allocation.summary().union(deferred.summary()).is_retained_when_unused());
     }
 
     #[test]

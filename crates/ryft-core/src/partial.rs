@@ -1129,6 +1129,8 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     ///     an ordered operation has been staged, every later ordered operation is staged too, even when all of its
     ///     inputs are known, and reference operations under an eager known side follow the context's
     ///     [`ReferencePlacement`].
+    ///   - An operation that carries deferred work over the same scope is always residualized, even when all of its
+    ///     inputs are known. Refer to [`PartialEvaluationContext::fold_or_residualize`] for more information.
     ///
     /// There are situations where overriding this function can result in improved performance and better partitioning
     /// of a computation into known and unknown parts. For example, a `condition` instruction whose predicate is
@@ -1486,6 +1488,12 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// substitutions prove that the operation has no observable behavior to execute; they preserve input
     /// materialization and do not alter previously recorded effect ordering.
     ///
+    /// An operation that carries deferred work, directly or in one of its executable computation regions, is always
+    /// residualized, even when all of its inputs are known, because folding it would discharge its unresolved
+    /// transformation obligation (refer to the [Deferred Work](crate::Effects#deferred-work) section of the
+    /// [`Effects`](crate::Effects) documentation). Dormant rule regions do not contribute deferred work.
+    /// Rules that call this function therefore need not check deferred work themselves.
+    ///
     /// # Effect Placement Contract
     ///
     /// Known inputs permit folding only when doing so preserves effect order. Once an ordered operation is deferred,
@@ -1567,14 +1575,14 @@ impl<C: Context> PartialEvaluationContext<C> {
             }
         }
 
-        // Combine the operation's effect classes with those of its executable computation regions. Dormant
-        // derivative rules and other non-computation regions do not contribute effects when this operation runs.
-        let effects = regions
+        // Combine the operation's effects with those of its executable computation regions. Dormant derivative rules
+        // and other non-computation regions do not contribute effects or deferred work when this operation runs.
+        let summary = regions
             .iter()
             .enumerate()
             .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
-            .fold(operation.effects().summary(), |effects, (_, region)| effects.union(region.effects()))
-            .classes();
+            .fold(operation.effects().summary(), |effects, (_, region)| effects.union(region.effects()));
+        let effects = summary.classes();
 
         // Check reference placement only if the cheaper conditions have not already required residual execution.
         // Under eager specialization, reference accesses and root forwarding must remain residual so they do not
@@ -1594,7 +1602,9 @@ impl<C: Context> PartialEvaluationContext<C> {
                     }))
         };
 
+        // Deferred work always remains residual because folding it would discharge its transformation obligation.
         if !inputs.iter().all(PartialEvaluationValue::is_known)
+            || summary.has_deferred_work()
             || !self.can_fold_effects(effects)
             || must_defer_references()
         {
@@ -3776,6 +3786,38 @@ mod tests {
             .fold_or_residualize(TestRegionOperation::Effectful(EffectClass::OrderedIo), Vec::new(), &[known])
             .unwrap();
         assert!(retained[0].is_known());
+        assert_eq!(outer.builder().borrow().instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_fold_or_residualize_residualizes_deferred_work() {
+        use crate::programs::RegionSlot;
+        use crate::tests::TestRegionOperation;
+
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let output = builder.add_instruction(TestRegionOperation::Deferred, Vec::new(), vec![input], None).unwrap()[0];
+        let body = builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let outer = TracingContext::<Array, TestRegionOperation>::new();
+        let context = PartialEvaluationContext::new(outer.clone());
+        let known = PartialEvaluationValue::known(outer.input(ArrayType::scalar(DataType::F32)));
+
+        // Deferred work stays residual even when all inputs are known, whether the operation declares it directly
+        // or carries it in an executable computation region, because folding it would discharge its obligation.
+        let direct = context.fold_or_residualize(TestRegionOperation::Deferred, Vec::new(), &[known.clone()]).unwrap();
+        assert!(direct[0].is_unknown());
+        let computation = TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] });
+        let computation = context.fold_or_residualize(computation, vec![body.clone()], &[known.clone()]).unwrap();
+        assert!(computation[0].is_unknown());
+        assert_eq!(context.builder.borrow().instructions().len(), 2);
+        assert!(outer.builder().borrow().instructions().is_empty());
+
+        // A dormant rule region (i.e., a registered but unselected derivative) creates no obligation,
+        // so its application folds into the known-side context.
+        let rule = TestRegionOperation::WithRegions(const { &[RegionSlot::rule("derivative")] });
+        let rule = context.fold_or_residualize(rule, vec![body], &[known]).unwrap();
+        assert!(rule[0].is_known());
+        assert_eq!(context.builder.borrow().instructions().len(), 2);
         assert_eq!(outer.builder().borrow().instructions().len(), 1);
     }
 

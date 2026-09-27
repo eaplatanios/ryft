@@ -430,8 +430,9 @@ where
         // discarded contexts and remain safe (see the effect placement contract on
         // `PartialEvaluationContext::fold_or_residualize`). Every reference operation is `OrderedState`, so a body
         // touching references is never pure and no probe below can execute a reference operation, hoist a reference
-        // carry, or change the active context's effect-ordering state.
-        if !body.effects().classes().is_empty() {
+        // carry, or change the active context's effect-ordering state. A body with deferred work skips invariance
+        // probing for the same reason, because every probe round would residualize its obligation again.
+        if !body.effects().classes().is_empty() || body.effects().has_deferred_work() {
             let time_varying_known = inputs.iter().any(PartialEvaluationValue::is_known);
             if time_varying_known {
                 return split_scan_by_knownness(context, self, body, inputs, |input_known| {
@@ -2808,7 +2809,8 @@ where
     let needs_unknown_scan =
         partition_outputs.iter().any(|output| matches!(output, PartialEvaluationOutput::Unknown(_)))
             || (0..carry_count).any(|index| !carry_known[index])
-            || !residual_program.effects().classes().is_empty();
+            || !residual_program.effects().classes().is_empty()
+            || residual_program.effects().has_deferred_work();
     if needs_unknown_scan {
         let mut builder = ProgramBuilder::<V, O>::new();
         let index_atom = builder.add_input(body_input_types[0].clone());
@@ -3364,10 +3366,10 @@ where
 {
     // A scan with only zero output cotangents and no live reference carry is a zero linear map. A live reference carry
     // keeps the rule live regardless, because the accumulated state cotangent flows through the reversed body even
-    // when no ordinary output cotangent does.
+    // when no ordinary output cotangent does. A body with deferred work or observable rule effects also keeps it live.
     if outputs.iter().all(MaybeZero::is_zero)
         && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.has_observable_effects_in_closure()
+        && !driver.region(0)?.must_transpose()
     {
         return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
     }
@@ -3514,11 +3516,12 @@ where
 {
     // A scan with only zero output cotangents and no live reference carry is a zero linear map, so every operand
     // cotangent is zero. A live reference carry keeps the rule live, because its accumulated state cotangent flows
-    // through the reversed body even when no ordinary output cotangent does.
+    // through the reversed body even when no ordinary output cotangent does. A body with deferred work or observable
+    // rule effects also keeps it live.
     check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
         && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.has_observable_effects_in_closure()
+        && !driver.region(0)?.must_transpose()
     {
         return inputs
             .iter()

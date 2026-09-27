@@ -1317,10 +1317,11 @@ pub fn transpose_primal_shard_map<
 
     // A shard_map with no live output cotangents and no live reference operand is a zero linear map, so every operand
     // cotangent is zero. A live reference operand keeps the shard map live, because its accumulated state cotangent
-    // flows through the transposed body even when no ordinary output cotangent does.
+    // flows through the transposed body even when no ordinary output cotangent does. A body with deferred work or
+    // observable rule effects also keeps it live.
     if outputs.iter().all(MaybeZero::is_zero)
         && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.has_observable_effects_in_closure()
+        && !driver.region(0)?.must_transpose()
     {
         return inputs
             .iter()

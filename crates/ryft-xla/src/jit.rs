@@ -1860,13 +1860,13 @@ mod tests {
         CumulativeLogSumExp, CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension,
         DimensionBounds, DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers,
         DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian,
-        LogSumExp, LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike,
-        ParallelVaryOperation, Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Reduce, ReductionKind,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend,
-        ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin,
-        StopGradient, StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection,
-        WhileOperation, ZeroLike, differentiate_at,
+        LogicalMesh, Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation,
+        Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
+        StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
+        ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -2323,7 +2323,8 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
-            compile(|value| value.log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            compile(|value| value.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone())
+                .unwrap();
         let gradient = compiled.gradient(&engine).unwrap();
 
         // Rounding the primal output at a large offset must not erase the derivative's normalization.
@@ -2350,7 +2351,8 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
-            compile(|value| value.log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            compile(|value| value.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone())
+                .unwrap();
         let differentiated = compiled.jvp(&engine).unwrap();
         // The normalization count exceeds the largest finite `f16`, so derivative intermediates must stay widened.
         let input =
@@ -2396,7 +2398,7 @@ mod tests {
         // The compiled guarded expansion returns `log(4)` for four equal zeros, and the same value shifted by the
         // maximum for four equal thousands, where a shift-free `sum(exp(x))` would have overflowed `f32` outright.
         let reduced: CompiledXlaFunction<'_, ArrayType, ArrayType> =
-            compile(|x| x.log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            compile(|x| x.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let output = engine.interpret(&reduced.executable_function(), source([0.0; 4])).unwrap();
         assert_close(&read_f32_array(&client, &output), &[4.0f32.ln()]);
         let output = engine.interpret(&reduced.executable_function(), source([1000.0; 4])).unwrap();

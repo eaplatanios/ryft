@@ -78,7 +78,8 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 /// [`Context::bind`]. [`Operation::infer_output_types`] validates the loop contract over the
 /// attached [`RegionInterface`]s: the condition and body share the loop-carried state input signature, the condition
 /// returns exactly one Boolean predicate, the body returns the state signature, and a batched (per-item) predicate
-/// requires both regions to be pure because observable effects cannot be masked for finished batch items.
+/// requires both regions to be pure and free of deferred work because neither observable effects nor transformation
+/// obligations can be masked for finished batch items.
 ///
 /// **Iteration bounds are semantic.** A while loop built with [`Self::with_iteration_bound`] runs **at most** `bound`
 /// iterations *by definition*: a loop whose condition would keep it running longer is truncated after `bound` body
@@ -1052,10 +1053,12 @@ impl WhileTypeSemantics for ArrayIrType {
 /// Validates the loop contract over the two attached region interfaces (`["condition", "body"]` region order) and
 /// returns them. The loop-carried state signature is the body's input signature: the condition must consume the same
 /// state and return exactly one Boolean predicate valid for that state under [`WhileTypeSemantics`], the body must
-/// return the state signature, and a batched (per-item) predicate requires both regions to be pure — the loop keeps
-/// running for still-active items after others finish, so the condition and body re-execute over every item each
-/// iteration and observable effects cannot be masked back out for the finished items the way values can. This
-/// mirrors JAX's `_while_loop_batching_rule`, which rejects IO effects once the predicate is batched.
+/// return the state signature, and a batched (per-item) predicate requires both regions to be pure and free of deferred
+/// work — the loop keeps running for still-active items after others finish, so the condition and body re-execute over
+/// every item each iteration, and neither observable effects nor transformation obligations (refer to the
+/// [Deferred Work](crate::Effects#deferred-work) section of [`Effects`](crate::Effects)) can be masked back out for the
+/// finished items the way values can. This mirrors JAX's `_while_loop_batching_rule`, which rejects IO effects once
+/// the predicate is batched.
 fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
     region_interfaces: &'i [RegionInterface<T>],
 ) -> Result<(&'i RegionInterface<T>, &'i RegionInterface<T>), TypeError> {
@@ -1080,6 +1083,14 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
         return Err(TypeError::invalid(format!(
             "`{WHILE_OPERATION_NAME}` loop with a batched predicate must be pure because observable effects cannot be \
                       masked for finished batch items"
+        )));
+    }
+    if T::is_batched_predicate(&condition_output_types[0])
+        && (condition_interface.has_deferred_work() || body_interface.has_deferred_work())
+    {
+        return Err(TypeError::invalid(format!(
+            "`{WHILE_OPERATION_NAME}` loop with a batched predicate cannot carry deferred work because finished batch \
+             items would repeat its transformation obligation"
         )));
     }
     Ok((condition_interface, body_interface))
@@ -1169,8 +1180,12 @@ where
         // placement contract on `PartialEvaluationContext::fold_or_residualize`). Every reference operation is
         // `OrderedState`, so a loop touching references is never pure and no probe below can execute a reference
         // operation, fold a reference carry across the loop boundary, or change the active context's effect-ordering
-        // state.
-        if !condition.effects().classes().is_empty() || !body.effects().classes().is_empty() {
+        // state. Deferred work skips both for the same reason: every probe would residualize its obligation again.
+        if !condition.effects().classes().is_empty()
+            || !body.effects().classes().is_empty()
+            || condition.effects().has_deferred_work()
+            || body.effects().has_deferred_work()
+        {
             return context.fold_or_residualize(
                 O::from(*operation),
                 vec![condition.to_program(), body.to_program()],
@@ -1336,12 +1351,15 @@ where
 {
     let condition = driver.region(0)?;
     let body = driver.region(1)?;
-    // The split's known loop re-runs the known part of every iteration, so it is only sound for pure loops. Every
-    // reference operation is `OrderedState`, so a loop touching references never reaches the split's probes.
+    // The split's known loop re-runs the known part of every iteration, so it is only sound for pure loops without
+    // deferred work. Every reference operation is `OrderedState`, so a loop touching references never reaches the
+    // split's probes.
     if inputs.iter().any(PartialEvaluationValue::is_known)
         && !inputs.iter().all(PartialEvaluationValue::is_known)
         && condition.effects().classes().is_empty()
         && body.effects().classes().is_empty()
+        && !condition.effects().has_deferred_work()
+        && !body.effects().has_deferred_work()
         && let Some(outputs) = split_while_by_closed_knownness(context, operation, condition, body, inputs, driver)?
     {
         return Ok(outputs);
@@ -6285,6 +6303,46 @@ mod tests {
                           masked for finished batch items"
                     .to_string()
             )),
+        );
+    }
+
+    #[test]
+    fn test_while_rejects_batched_predicate_with_deferred_work() {
+        // Finished batch items keep re-executing the condition and body, so a region carrying deferred work would
+        // repeat its transformation obligation for items whose values are masked back. Type inference therefore
+        // rejects deferred work in either region of a batched-predicate loop, while a scalar predicate (the loop exits
+        // for all items at once) imposes no such restriction.
+        let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let batched_predicate = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
+        let condition = |predicate: &ArrayType| {
+            RegionInterface::new(vec![state_type.clone()], vec![predicate.clone()], EffectClasses::NONE)
+        };
+        let body = RegionInterface::new(vec![state_type.clone()], vec![state_type.clone()], EffectClasses::NONE);
+        let error = Err(TypeError::invalid(
+            "`while` loop with a batched predicate cannot carry deferred work because finished batch items would \
+             repeat its transformation obligation"
+                .to_string(),
+        ));
+        assert_eq!(
+            WhileOperation::new().infer_output_types(
+                std::slice::from_ref(&state_type),
+                &[condition(&batched_predicate), body.clone().with_deferred_work(true)],
+            ),
+            error,
+        );
+        assert_eq!(
+            WhileOperation::new().infer_output_types(
+                std::slice::from_ref(&state_type),
+                &[condition(&batched_predicate).with_deferred_work(true), body.clone()],
+            ),
+            error,
+        );
+        assert_eq!(
+            WhileOperation::new().infer_output_types(
+                std::slice::from_ref(&state_type),
+                &[condition(&ArrayType::scalar(DataType::Boolean)), body.with_deferred_work(true)],
+            ),
+            Ok(vec![state_type.clone()]),
         );
     }
 

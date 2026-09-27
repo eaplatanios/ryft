@@ -198,22 +198,28 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArraySliceAxis, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationError,
         ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver, differentiate_at,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::arithmetic::{AddOperation, MulOperation};
+    use crate::operations::control_flow::condition::{ConditionOperation, transpose_primal_condition};
+    use crate::operations::differentiation::linear_call::LinearCallOperation;
     use crate::operations::manipulation::padding::PadOperation;
     use crate::operations::manipulation::slicing::SliceOperation;
     use crate::operations::references::{ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceWrite};
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::parameters::Placeholder;
-    use crate::partial::PartialValue;
+    use crate::partial::{
+        PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+        PartiallyEvaluatableOperation,
+    };
     use crate::programs::{
-        Effects, MaybeZero, Operation, OperationProvider, Program, ProgramBuilder, ReferenceAccessDescriptor,
-        ReferenceAccessOperation, RegionInterface, TypeError, TypeIdentityRenaming, Typed,
+        AtomId, Effects, InputRegionProvenance, MaybeZero, Operation, OperationProvider, OutputRegionProvenance,
+        Program, ProgramBuilder, ReferenceAccessDescriptor, ReferenceAccessOperation, RegionInterface, RegionSlot,
+        TypeError, TypeIdentityRenaming, Typed,
     };
     use crate::specialization::SpecializationCache;
     use crate::tracing::{Tracer, TracingContext};
@@ -255,12 +261,16 @@ mod tests {
         }
     }
 
-    /// Region-free scalar-slice carrier plus the ordinary operations emitted by its retained backward callback.
+    /// Region-free retained-rule carriers plus the ordinary operations emitted by their backward callbacks.
     /// This deliberately supports direct transposition, not a new general-purpose operation family.
     #[derive(Clone, Debug)]
     enum RetainedRuleOperation {
         Base(ArrayIrOperation<Array>),
+        Computation,
+        Condition(ConditionOperation<ArrayIrValue<Array>>),
+        LinearCall(LinearCallOperation<ArrayIrType>),
         Slice { definition: Arc<RetainedRuleDefinition>, cached: bool },
+        DeferredEffect { definition: Arc<RetainedRuleDefinition> },
     }
 
     impl Operation for RetainedRuleOperation {
@@ -269,7 +279,21 @@ mod tests {
         fn name(&self) -> &'static str {
             match self {
                 Self::Base(operation) => operation.name(),
+                Self::Condition(operation) => operation.name(),
+                Self::LinearCall(operation) => operation.name(),
+                Self::Computation => "retained_computation",
                 Self::Slice { .. } => "retained_slice",
+                Self::DeferredEffect { .. } => "deferred_effect",
+            }
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            const COMPUTATION_REGIONS: &[RegionSlot] = &[RegionSlot::computation("body")];
+            match self {
+                Self::Computation => COMPUTATION_REGIONS,
+                Self::Condition(operation) => operation.region_slots(),
+                Self::LinearCall(operation) => operation.region_slots(),
+                _ => &[],
             }
         }
 
@@ -280,6 +304,10 @@ mod tests {
         ) -> Result<Vec<Self::Type>, TypeError> {
             match self {
                 Self::Base(operation) => operation.infer_output_types(inputs, regions),
+                Self::Condition(operation) => operation.infer_output_types(inputs, regions),
+                Self::LinearCall(operation) => operation.infer_output_types(inputs, regions),
+                Self::Computation => Ok(regions[0].output_types().to_vec()),
+                Self::DeferredEffect { .. } => Ok(vec![inputs[1].clone()]),
                 Self::Slice { .. } => {
                     ArrayIrOperation::<Array>::from(ArrayOperation::Slice(SliceOperation::new(vec![1], vec![2])))
                         .infer_output_types(inputs, regions)
@@ -287,18 +315,46 @@ mod tests {
             }
         }
 
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+            match self {
+                Self::Base(operation) => operation.input_region_provenance(region_index, input_index),
+                Self::Condition(operation) => operation.input_region_provenance(region_index, input_index),
+                Self::Computation if region_index == 0 => InputRegionProvenance::Input { index: input_index },
+                _ => InputRegionProvenance::None,
+            }
+        }
+
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+            match self {
+                Self::Base(operation) => operation.output_region_provenance(output_index),
+                Self::Condition(operation) => operation.output_region_provenance(output_index),
+                Self::LinearCall(operation) => operation.output_region_provenance(output_index),
+                Self::Computation => vec![OutputRegionProvenance { region_index: 0, output_index }],
+                _ => Vec::new(),
+            }
+        }
+
         fn effects(&self) -> Cow<'_, Effects> {
             match self {
                 Self::Base(operation) => operation.effects(),
-                Self::Slice { .. } => Cow::Borrowed(Effects::empty()),
+                Self::Condition(operation) => operation.effects(),
+                Self::LinearCall(operation) => operation.effects(),
+                Self::DeferredEffect { .. } => Cow::Owned(Effects::empty().clone().with_deferred_work()),
+                Self::Slice { .. } | Self::Computation => Cow::Borrowed(Effects::empty()),
             }
         }
 
         fn render(&self, formatter: &mut Formatter<'_>, indentation: usize) -> std::fmt::Result {
             match self {
                 Self::Base(operation) => operation.render(formatter, indentation),
+                Self::Condition(operation) => operation.render(formatter, indentation),
+                Self::LinearCall(operation) => operation.render(formatter, indentation),
+                Self::Computation => write!(formatter, "retained_computation"),
+                Self::DeferredEffect { definition } => {
+                    write!(formatter, "deferred_effect [definition={}]", definition.label)
+                }
                 Self::Slice { definition, cached } => {
-                    write!(formatter, "retained_slice [definition={}, cached={cached}]", definition.label)
+                    write!(formatter, "retained_slice [definition={}, cached={}]", definition.label, cached)
                 }
             }
         }
@@ -321,6 +377,18 @@ mod tests {
         }
     }
 
+    impl From<ConditionOperation<ArrayIrValue<Array>>> for RetainedRuleOperation {
+        fn from(operation: ConditionOperation<ArrayIrValue<Array>>) -> Self {
+            Self::Condition(operation)
+        }
+    }
+
+    impl From<LinearCallOperation<ArrayIrType>> for RetainedRuleOperation {
+        fn from(operation: LinearCallOperation<ArrayIrType>) -> Self {
+            Self::LinearCall(operation)
+        }
+    }
+
     // Only static array shapes are used where structural cotangent zeros must be materialized.
     impl ResidualZeroProvider<ArrayIrType> for RetainedRuleOperation {}
 
@@ -330,7 +398,10 @@ mod tests {
         fn base_input_count(&self) -> usize {
             match self {
                 Self::Base(operation) => operation.base_input_count(),
+                Self::LinearCall(_) => 0,
                 Self::Slice { .. } => 1,
+                Self::DeferredEffect { .. } | Self::Computation => 2,
+                Self::Condition(_) => 3,
             }
         }
 
@@ -340,7 +411,11 @@ mod tests {
         ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
             match self {
                 Self::Base(operation) => operation.reference_access_descriptor(input_index),
-                Self::Slice { .. } => None,
+                Self::Slice { .. }
+                | Self::DeferredEffect { .. }
+                | Self::Computation
+                | Self::Condition(_)
+                | Self::LinearCall(_) => None,
             }
         }
 
@@ -353,7 +428,11 @@ mod tests {
                 Self::Base(operation) => {
                     operation.with_reference_access_transforms(input_index, transforms).map(Self::Base)
                 }
-                Self::Slice { .. } => Err(ProgramError::UnsupportedOperation {
+                Self::Slice { .. }
+                | Self::DeferredEffect { .. }
+                | Self::Computation
+                | Self::Condition(_)
+                | Self::LinearCall(_) => Err(ProgramError::UnsupportedOperation {
                     message: "retained slice has no reference input".to_string(),
                 }),
             }
@@ -363,12 +442,16 @@ mod tests {
     impl InterpretableOperation<EagerContext<ArrayIrValue<Array>, Self>> for RetainedRuleOperation {
         fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<Array>, Self>>>(
             &self,
-            _context: &EagerContext<ArrayIrValue<Array>, Self>,
-            _driver: &D,
+            context: &EagerContext<ArrayIrValue<Array>, Self>,
+            driver: &D,
             inputs: &[ArrayIrValue<Array>],
         ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
             let operation = match self {
                 Self::Base(operation) => operation.clone(),
+                Self::Computation => return driver.interpret_region(context, 0, inputs.to_vec()),
+                Self::Condition(operation) => return operation.interpret(context, driver, inputs),
+                Self::LinearCall(operation) => return operation.interpret(context, driver, inputs),
+                Self::DeferredEffect { .. } => return Ok(vec![inputs[1].clone()]),
                 Self::Slice { .. } => {
                     ArrayIrOperation::from(ArrayOperation::Slice(SliceOperation::new(vec![1], vec![2])))
                 }
@@ -377,15 +460,52 @@ mod tests {
         }
     }
 
+    // Every carrier other than the production condition uses the default rule, whose shared folding boundary
+    // residualizes deferred work without carrier-specific checks.
+    impl<C: Context<Type = ArrayIrType, Constant = ArrayIrValue<Array>, Operation = Self>>
+        PartiallyEvaluatableOperation<C> for RetainedRuleOperation
+    {
+        fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+            &self,
+            context: &PartialEvaluationContext<C>,
+            driver: &D,
+            inputs: &[PartialEvaluationValue<C::Value>],
+        ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+            if let Self::Condition(operation) = self {
+                return operation.partially_evaluate(context, driver, inputs);
+            }
+            context.fold_or_residualize(
+                self.clone(),
+                driver.regions().map(|region| region.to_program()).collect(),
+                inputs,
+            )
+        }
+    }
+
     impl TransposableOperation<ArrayIrValue<Array>, Self> for RetainedRuleOperation {
         fn transpose<D: TranspositionDriver<ArrayIrValue<Array>, Self>>(
             &self,
             context: &mut TranspositionContext<ArrayIrValue<Array>, Self>,
-            _driver: &D,
+            driver: &D,
             inputs: &[PartialValue<RetainedRuleTracer>],
             outputs: &[MaybeZero<RetainedRuleTracer>],
             accumulators: &[CotangentAccumulator],
         ) -> Result<(), DifferentiationError> {
+            if let Self::Condition(_) = self {
+                // Use the production branch transform with the same destination construction as its type-family rule.
+                let destinations = context.cotangent_destinations(driver, inputs, accumulators)?;
+                let contributions = transpose_primal_condition(context, driver, inputs, outputs, &destinations)?;
+                for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+                    accumulator.accumulate(context, contribution)?;
+                }
+                return Ok(());
+            }
+            if let Self::LinearCall(operation) = self {
+                return operation.transpose(context, driver, inputs, outputs, accumulators);
+            }
+            if let Self::DeferredEffect { definition } = self {
+                return (definition.callback)(context, inputs, outputs, accumulators);
+            }
             let Self::Slice { definition, cached } = self else {
                 return Err(ProgramError::UnsupportedOperation {
                     message: "experiment only transposes retained slice carriers".to_string(),
@@ -427,7 +547,11 @@ mod tests {
                     let program = source.transpose_with_respect_to(&[0], &[kind])?;
                     let program = program.map_operations(|operation| match operation {
                         Self::Base(operation) => Ok(operation.clone()),
-                        Self::Slice { .. } => {
+                        Self::Slice { .. }
+                        | Self::DeferredEffect { .. }
+                        | Self::Computation
+                        | Self::Condition(_)
+                        | Self::LinearCall(_) => {
                             Err(ProgramError::MalformedProgram("cached rule retained its callback".to_string()))
                         }
                     })?;
@@ -456,6 +580,357 @@ mod tests {
             .add_instruction(RetainedRuleOperation::Slice { definition, cached: true }, Vec::new(), vec![input], None)
             .unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Retains an effect that exists only in a dropped-output, ignored-gradient specialization.
+    fn deferred_effect_definition() -> Arc<RetainedRuleDefinition> {
+        Arc::new(RetainedRuleDefinition {
+            label: "ignored_zero_effect",
+            callback: Arc::new(|context, inputs, outputs, accumulators| {
+                if !accumulators[1].is_needed() && matches!(&outputs[0], MaybeZero::Zero(_)) {
+                    let stash = inputs[0].as_known().unwrap().clone();
+                    let increment = context.lift(ArrayIrValue::Array(Array::scalar(1.0f64)?))?;
+                    context.bind(
+                        RetainedRuleOperation::Base(ReferenceAddUpdateOperation::new().into()),
+                        Vec::new(),
+                        &[stash, increment],
+                    )?;
+                }
+                Ok(())
+            }),
+            cache: SpecializationCache::new(8),
+        })
+    }
+
+    #[test]
+    fn test_custom_derivative_retained_callback_disconnected_transposition() {
+        let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, RetainedRuleOperation>::new();
+        let reference = builder.add_input(ArrayIrValue::Reference(stash.clone()).r#type().into_owned());
+        let tangent = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        builder
+            .add_instruction(
+                RetainedRuleOperation::DeferredEffect { definition: deferred_effect_definition() },
+                Vec::new(),
+                vec![reference, tangent],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                Vec::new(),
+                vec![Placeholder, Placeholder],
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Reference(stash.clone()),
+                ArrayIrValue::Array(Array::scalar(3.0f64).unwrap()),
+            ]),
+            Ok(Vec::new()),
+        );
+        assert_eq!(stash.read(), Ok(Array::scalar(0.0f64).unwrap()));
+        assert!(program.entry_region_ref().effects().has_deferred_work());
+
+        // Simplification retains the selected obligation even though the carrier's output is unused and its primal
+        // execution has no observable effect.
+        assert_eq!(
+            program.simplified().unwrap().to_string(),
+            indoc! {"
+                lambda %0:ref<f64[]>, %1:f64[] .
+                let %2:f64[] = deferred_effect [definition=ignored_zero_effect] %0 %1
+                in ()
+            "}
+            .trim_end(),
+        );
+        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(stash.read(), Ok(Array::scalar(0.0f64).unwrap()));
+        assert_eq!(transposed.interpret(vec![ArrayIrValue::Reference(stash.clone())]), Ok(Vec::new()));
+        assert_eq!(stash.read(), Ok(Array::scalar(1.0f64).unwrap()));
+        assert_eq!(transposed.interpret(vec![ArrayIrValue::Reference(stash.clone())]), Ok(Vec::new()));
+        assert_eq!(stash.read(), Ok(Array::scalar(2.0f64).unwrap()));
+    }
+
+    #[test]
+    fn test_custom_derivative_retained_callback_disconnected_partial_evaluation() {
+        let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
+        let context = PartialEvaluationContext::new(EagerContext::<ArrayIrValue<Array>, RetainedRuleOperation>::new());
+        let tangent = context.unknown_input(ArrayType::scalar(DataType::F64).into(), 0);
+        context
+            .residualize(
+                RetainedRuleOperation::DeferredEffect { definition: deferred_effect_definition() },
+                Vec::new(),
+                &[PartialEvaluationValue::known(ArrayIrValue::Reference(stash.clone())), tangent],
+            )
+            .unwrap();
+        let evaluation = context.into_evaluation(Vec::new()).unwrap();
+        let transposed =
+            evaluation.program().transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(stash.read(), Ok(Array::scalar(0.0f64).unwrap()));
+        assert_eq!(transposed.interpret(vec![ArrayIrValue::Reference(stash.clone())]), Ok(Vec::new()));
+        assert_eq!(stash.read(), Ok(Array::scalar(1.0f64).unwrap()));
+    }
+
+    #[test]
+    fn test_custom_derivative_retained_callback_known_computation_partial_evaluation() {
+        let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
+        let reference_type = ArrayIrValue::Reference(stash.clone()).r#type().into_owned();
+        let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
+        let mut body = ProgramBuilder::<ArrayIrValue<Array>, RetainedRuleOperation>::new();
+        let reference = body.add_input(reference_type.clone());
+        let tangent = body.add_input(tangent_type.clone());
+        body.add_instruction(
+            RetainedRuleOperation::DeferredEffect { definition: deferred_effect_definition() },
+            Vec::new(),
+            vec![reference, tangent],
+            None,
+        )
+        .unwrap();
+        let body = body
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                Vec::new(),
+                vec![Placeholder, Placeholder],
+                Vec::new(),
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, RetainedRuleOperation>::new();
+        let region = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(reference_type.clone());
+        let tangent = builder.add_input(tangent_type.clone());
+        builder
+            .add_instruction(RetainedRuleOperation::Computation, vec![region], vec![reference, tangent], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                Vec::new(),
+                vec![Placeholder, Placeholder],
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(program.entry_region_ref().effects().has_deferred_work());
+        let parent = TracingContext::<ArrayIrValue<Array>, RetainedRuleOperation>::new();
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &parent,
+                &[PartialValue::Known(parent.input(reference_type)), PartialValue::Known(parent.input(tangent_type))],
+            )
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:ref<f64[]>, %1:f64[] .
+                let () = retained_computation %0 %1 [
+                    body={
+                        lambda %0:ref<f64[]>, %1:f64[] .
+                        let %2:f64[] = deferred_effect [definition=ignored_zero_effect] %0 %1
+                        in ()
+                    },
+                ]
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert!(evaluation.program().entry_region_ref().effects().has_deferred_work());
+        assert_eq!(
+            evaluation.program().interpret(vec![
+                ArrayIrValue::Reference(stash.clone()),
+                ArrayIrValue::Array(Array::scalar(3.0f64).unwrap()),
+            ]),
+            Ok(Vec::new()),
+        );
+        assert_eq!(stash.read(), Ok(Array::scalar(0.0f64).unwrap()));
+    }
+
+    #[test]
+    fn test_custom_derivative_retained_callback_condition_transposition() {
+        let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
+        let reference_type = ArrayIrValue::Reference(stash.clone()).r#type().into_owned();
+        let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
+        let mut true_branch = ProgramBuilder::<ArrayIrValue<Array>, RetainedRuleOperation>::new();
+        let tangent = true_branch.add_input(tangent_type.clone());
+        let reference = true_branch.add_input(reference_type.clone());
+        true_branch
+            .add_instruction(
+                RetainedRuleOperation::DeferredEffect { definition: deferred_effect_definition() },
+                Vec::new(),
+                vec![reference, tangent],
+                None,
+            )
+            .unwrap();
+        let true_branch = true_branch
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                Vec::new(),
+                vec![Placeholder, Placeholder],
+                Vec::new(),
+            )
+            .unwrap();
+        let mut false_branch = ProgramBuilder::<ArrayIrValue<Array>, RetainedRuleOperation>::new();
+        false_branch.add_input(tangent_type.clone());
+        false_branch.add_input(reference_type.clone());
+        let false_branch = false_branch
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                Vec::new(),
+                vec![Placeholder, Placeholder],
+                Vec::new(),
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, RetainedRuleOperation>::new();
+        let true_region = builder.import_region(true_branch.entry_region_ref());
+        let false_region = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayIrValue::Array(Array::scalar(true).unwrap()).r#type().into_owned());
+        let tangent = builder.add_input(tangent_type);
+        let reference = builder.add_input(reference_type);
+        builder
+            .add_instruction(
+                RetainedRuleOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, tangent, reference],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                Vec::new(),
+                vec![Placeholder, Placeholder, Placeholder],
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(program.entry_region_ref().effects().has_deferred_work());
+        let parent = TracingContext::<ArrayIrValue<Array>, RetainedRuleOperation>::new();
+        let known_inputs = program
+            .input_types()
+            .into_iter()
+            .map(|input_type| PartialValue::Known(parent.input(input_type)))
+            .collect::<Vec<_>>();
+        let evaluation = program.partially_evaluate_in_context(&parent, &known_inputs).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:ref<f64[]> .
+                let () = condition %0 %1 %2 [
+                    true={
+                        lambda %0:f64[], %1:ref<f64[]> .
+                        let %2:f64[] = deferred_effect [definition=ignored_zero_effect] %1 %0
+                        in ()
+                    },
+                    false={
+                        lambda %0:f64[], %1:ref<f64[]> .
+                        in ()
+                    },
+                ]
+                in ()
+            "}
+            .trim_end(),
+        );
+        assert!(evaluation.program().entry_region_ref().effects().has_deferred_work());
+        let transposed =
+            evaluation.program().transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(stash.read(), Ok(Array::scalar(0.0f64).unwrap()));
+        assert_eq!(
+            transposed.interpret(vec![
+                ArrayIrValue::Array(Array::scalar(false).unwrap()),
+                ArrayIrValue::Reference(stash.clone()),
+            ]),
+            Ok(Vec::new()),
+        );
+        assert_eq!(stash.read(), Ok(Array::scalar(0.0f64).unwrap()));
+        assert_eq!(
+            transposed.interpret(vec![
+                ArrayIrValue::Array(Array::scalar(true).unwrap()),
+                ArrayIrValue::Reference(stash.clone()),
+            ]),
+            Ok(Vec::new()),
+        );
+        assert_eq!(stash.read(), Ok(Array::scalar(1.0f64).unwrap()));
+    }
+
+    #[test]
+    fn test_custom_derivative_retained_callback_linear_call_transposition() {
+        type RetainedRuleBuilder = ProgramBuilder<ArrayIrValue<Array>, RetainedRuleOperation>;
+
+        let stash = ArrayReference::new(Array::scalar(0.0f64).unwrap());
+        let reference_type = ArrayIrValue::Reference(stash.clone()).r#type().into_owned();
+        let tangent_type: ArrayIrType = ArrayType::scalar(DataType::F64).into();
+        let transpose_only =
+            LinearCallOperation::transpose_only(1, vec![tangent_type.clone()], vec![tangent_type.clone()]);
+
+        // Builds a backward program over `(reference, seed)` that returns its seed after the instructions that
+        // `populate` appends.
+        let backward = |populate: &dyn Fn(&mut RetainedRuleBuilder, AtomId, AtomId)| {
+            let mut builder = RetainedRuleBuilder::new();
+            let reference = builder.add_input(reference_type.clone());
+            let seed = builder.add_input(tangent_type.clone());
+            populate(&mut builder, reference, seed);
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![seed],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let deferred_effect = |builder: &mut RetainedRuleBuilder, reference: AtomId, seed: AtomId| {
+            builder
+                .add_instruction(
+                    RetainedRuleOperation::DeferredEffect { definition: deferred_effect_definition() },
+                    Vec::new(),
+                    vec![reference, seed],
+                    None,
+                )
+                .unwrap();
+        };
+
+        // Builds a program over `(reference, tangent)` that applies a transpose-only linear call, with the reference
+        // as its residual, whose backward program is `backward`.
+        let linear_call = |backward: Program<ArrayIrValue<Array>, RetainedRuleOperation, Vec<_>, Vec<_>>| {
+            let mut builder = RetainedRuleBuilder::new();
+            let backward = builder.import_program(backward);
+            let reference = builder.add_input(reference_type.clone());
+            let tangent = builder.add_input(tangent_type.clone());
+            let output = builder
+                .add_instruction(transpose_only.clone(), vec![backward], vec![reference, tangent], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+
+        // The backward program is a dormant rule of the forward call, so the forward program carries no obligation.
+        // Transposition selects it, and its deferred work must be staged even though the ignored destination makes
+        // every accumulator unneeded, which would otherwise let the linear call skip its backward program.
+        let program = linear_call(backward(&deferred_effect));
+        assert!(!program.entry_region_ref().effects().has_deferred_work());
+        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:ref<f64[]> .
+                let %2:f64[] = deferred_effect [definition=ignored_zero_effect] %1 %0
+                in ()
+            "}
+            .trim_end(),
+        );
+
+        // Deferred work that exists only in a dormant alternative of the selected backward program (i.e., the rule
+        // region of a nested linear call) creates no obligation, so the backward program is still skipped.
+        let program = linear_call(backward(&|builder, reference, seed| {
+            let nested = builder.import_program(backward(&deferred_effect));
+            builder.add_instruction(transpose_only.clone(), vec![nested], vec![reference, seed], None).unwrap();
+        }));
+        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:ref<f64[]> .
+                in ()
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

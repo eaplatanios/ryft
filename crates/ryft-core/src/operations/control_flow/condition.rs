@@ -416,6 +416,14 @@ where
                     ),
                 });
             }
+            if true_region.effects().has_deferred_work() || false_region.effects().has_deferred_work() {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate and branches that \
+                         carry deferred work because transformation obligations cannot be selected per batch item",
+                    ),
+                });
+            }
             // Batch-varying predicate: batch both branches item-agnostically through the region access and merge
             // their outputs per batch item via `Select`.
             return Ok(batch_condition_with_interpreter(
@@ -599,6 +607,14 @@ where
                 message: format!(
                     "cannot batch a {CONDITION_OPERATION_NAME} with a batch-varying predicate and effectful branches \
                      because observable effects cannot be selected per batch item",
+                ),
+            });
+        }
+        if true_region.effects().has_deferred_work() || false_region.effects().has_deferred_work() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate and branches that \
+                     carry deferred work because transformation obligations cannot be selected per batch item",
                 ),
             });
         }
@@ -1209,9 +1225,13 @@ where
         }
         ordinals
     };
+    // A branch residual with effects or deferred work must survive even when the condition returns no residual values,
+    // because simplification retains that work and dropping the condition would discard it.
     let needs_residual_condition = residual_output_ordinals.iter().any(Option::is_some)
         || !true_split.residual_program.effects().classes().is_empty()
-        || !false_split.residual_program.effects().classes().is_empty();
+        || !false_split.residual_program.effects().classes().is_empty()
+        || true_split.residual_program.effects().has_deferred_work()
+        || false_split.residual_program.effects().has_deferred_work();
     let residual_outputs = if needs_residual_condition {
         let build_residual_branch = |own: &ConditionBranchSplit<V, O>,
                                      own_edges_first: bool|
@@ -1548,12 +1568,13 @@ where
 {
     // A condition with no live output cotangents and no live reference operand is a zero linear map, so every operand
     // cotangent is zero. A live reference operand keeps the rule live, because its accumulated state cotangent flows
-    // through the transposed branches even when no ordinary output cotangent does.
+    // through the transposed branches even when no ordinary output cotangent does. Branches with deferred work or
+    // observable rule effects also keep it live, so that their obligations run with structural-zero seeds.
     check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
         && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.has_observable_effects_in_closure()
-        && !driver.region(1)?.has_observable_effects_in_closure()
+        && !driver.region(0)?.must_transpose()
+        && !driver.region(1)?.must_transpose()
     {
         return inputs
             .iter()

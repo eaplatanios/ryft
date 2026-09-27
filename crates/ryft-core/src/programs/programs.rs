@@ -658,7 +658,10 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// assertion, I/O, or opaque state effects, or reference accesses, whether intrinsic or in an attached computation
     /// region) are kept alive together with the instructions producing their inputs even when no program output
     /// consumes their results, in their original relative order, so that simplification never eliminates or reorders
-    /// observable [`EffectClass`](crate::EffectClass)es. A reference allocation that nothing accesses has no such
+    /// observable [`EffectClass`](crate::EffectClass)es. [`Instruction`]s that carry deferred work (refer to the
+    /// [Deferred Work](crate::Effects#deferred-work) section of the [`Effects`](crate::Effects) documentation for more
+    /// information) are kept alive the same way, including in ordinary primal-only programs, so that simplification
+    /// never discharges a selected transformation obligation. A reference allocation that nothing accesses has no such
     /// consequence and is removed like pure work when none of its outputs is used, together with its dead alias family.
     pub fn simplified(&self) -> Result<Self, ProgramError>
     where
@@ -694,12 +697,12 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                 }
 
                 // Make sure that effectful instructions and their transitive dependencies are processed in original
-                // instruction order before the outputs, so that instructions with observable effects survive even
-                // when dead and ordered effects keep their relative order.
+                // instruction order before the outputs, so that instructions with observable effects or deferred work
+                // survive even when dead and ordered effects keep their relative order.
                 for (instruction_index, instruction) in region.instructions.iter().enumerate() {
                     if !self
                         .instruction_effects(InstructionId::new(RegionId::new(region_index), instruction_index))?
-                        .has_observable_effects_when_unused()
+                        .is_retained_when_unused()
                     {
                         continue;
                     }
@@ -782,8 +785,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// contribute to the [`Program`]'s output removed. Unlike [`Self::simplified`], this method moves live [`Atom`]s,
     /// [`Instruction`]s, and parameter structures into the returned [`Program`] instead of cloning them. This avoids
     /// copying constants and operations that are discarded during simplification. The behavior of [`Self::simplified`]
-    /// around effects applies here too: instructions with effects that remain observable when their outputs are unused
-    /// survive in their original relative order even when no program output consumes those outputs.
+    /// around effects applies here too: instructions with effects that remain observable when their outputs are unused,
+    /// or that carry deferred work, survive in their original relative order even when no program output consumes those
+    /// outputs.
     pub fn into_simplified(self) -> Result<Self, ProgramError> {
         let expected_input_count = self.input_structure.parameter_count();
         check_count!("input", self.input_ids(), expected_input_count, ProgramError);
@@ -805,7 +809,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                     .filter(|(instruction_index, _)| {
                         self.instruction_effects(InstructionId::new(RegionId::new(region_index), *instruction_index))
                             .unwrap()
-                            .has_observable_effects_when_unused()
+                            .is_retained_when_unused()
                     })
                     .map(|(instruction_index, instruction)| (instruction_index, instruction.outputs().to_vec()))
                     .collect::<Vec<_>>()
@@ -917,10 +921,11 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
 
     /// Rebuilds this [`Program`] as a flat subprogram over a chosen input/output boundary. The rebuilt program
     /// keeps only the [`Instruction`]s reachable from `outputs`, from the provided `keep_alive` atoms, or from
-    /// observable effects, and lifts embedded constants directly into the result. Entries of `inputs` that are not
-    /// reachable from any requested output, keep-alive atom, or effectful instruction are dropped. The returned index
-    /// vector lists, in order, the positions of `inputs` that remain live and become the public inputs of the rebuilt
-    /// program, so that callers can map rebuilt inputs back to the original boundary.
+    /// observable effects or deferred work (refer to [`Self::simplified`]), and lifts embedded constants directly into
+    /// the result. Entries of `inputs` that are not reachable from any requested output, keep-alive atom, or retained
+    /// instruction are dropped. The returned index vector lists, in order, the positions of `inputs` that remain live
+    /// and become the public inputs of the rebuilt program, so that callers can map rebuilt inputs back to the original
+    /// boundary.
     ///
     /// Each [`Atom::Variable`] reachable from an output or keep-alive atom must either appear in `inputs` or be
     /// produced by an [`Instruction`] of this program. Reaching any other source variable (e.g., an original program
@@ -1197,8 +1202,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
 
     /// Analyzes entry-region liveness for a filtered program boundary. `inputs` must be a deduplicated collection of
     /// [`Atom::Variable`]s. Reverse reachability begins at `outputs`, the provided `keep_alive` atoms, and every
-    /// effectful instruction, including instructions without outputs. Reaching a variable that is neither listed in
-    /// `inputs` nor produced by an [`Instruction`] is reported as a [`ProgramError::MalformedProgram`].
+    /// instruction with observable effects or deferred work, including instructions without outputs. Reaching a
+    /// variable that is neither listed in `inputs` nor produced by an [`Instruction`] is reported as a
+    /// [`ProgramError::MalformedProgram`].
     fn analyze_liveness(
         &self,
         inputs: &[AtomId],
@@ -1228,7 +1234,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             .filter(|(instruction_index, _)| {
                 self.instruction_effects(InstructionId::new(self.entry, *instruction_index))
                     .unwrap()
-                    .has_observable_effects_when_unused()
+                    .is_retained_when_unused()
             })
             .map(|(instruction_index, _)| instruction_index)
             .collect::<Vec<_>>();
@@ -3076,11 +3082,13 @@ mod tests {
     fn test_program_simplified_composes_nested_effect_summaries() {
         // A region-carrying operation whose own declaration is allocation-only, so that whether an output-dead
         // application is retained is decided entirely by the summaries of its attached regions. `Effectful`
-        // supplies each explicit effect class for the bodies and `Native` supplies the reference primitives.
+        // supplies each explicit effect class for the bodies, `Deferred` supplies deferred work, and `Native`
+        // supplies the reference primitives.
         #[derive(Clone, Debug)]
         enum TestOperation {
             Native(ArrayIrOperation<Array>),
             Effectful(EffectClass),
+            Deferred,
             AllocateWith(&'static [RegionSlot]),
         }
 
@@ -3097,13 +3105,14 @@ mod tests {
                 match self {
                     Self::Native(operation) => operation.name(),
                     Self::Effectful(_) => "effectful",
+                    Self::Deferred => "deferred",
                     Self::AllocateWith(_) => "allocate_with",
                 }
             }
 
             fn region_slots(&self) -> &'static [RegionSlot] {
                 match self {
-                    Self::Native(_) | Self::Effectful(_) => &[],
+                    Self::Native(_) | Self::Effectful(_) | Self::Deferred => &[],
                     Self::AllocateWith(slots) => slots,
                 }
             }
@@ -3115,7 +3124,7 @@ mod tests {
             ) -> Result<Vec<ArrayIrType>, TypeError> {
                 match self {
                     Self::Native(operation) => operation.infer_output_types(input_types, region_interfaces),
-                    Self::Effectful(_) => Ok(input_types.to_vec()),
+                    Self::Effectful(_) | Self::Deferred => Ok(input_types.to_vec()),
                     Self::AllocateWith(_) => match input_types {
                         [ArrayIrType::Array(r#type)] => Ok(vec![ReferenceType::new(r#type.clone()).into()]),
                         _ => Err(TypeError::invalid("`allocate_with` expects one array input")),
@@ -3127,6 +3136,7 @@ mod tests {
                 match self {
                     Self::Native(operation) => operation.effects(),
                     Self::Effectful(effect) => Cow::Owned(Effects::explicit(EffectClasses::single(*effect))),
+                    Self::Deferred => Cow::Owned(Effects::empty().clone().with_deferred_work()),
                     Self::AllocateWith(_) => Cow::Owned(
                         Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }]).unwrap(),
                     ),
@@ -3193,8 +3203,17 @@ mod tests {
             vec!["allocate_with"],
         );
 
-        // A dormant rule region is not executed by the application, so its effects do not retain it.
+        // Nested deferred work retains the enclosing application like an observable effect, even though it adds no
+        // effect class, because simplification must not discharge a selected transformation obligation.
+        let deferred = |builder: &mut ProgramBuilder<TestValue, TestOperation>, input: AtomId| {
+            builder.add_instruction(TestOperation::Deferred, Vec::new(), vec![input], None).unwrap();
+        };
+        assert_eq!(simplified(COMPUTATION, &deferred), vec!["allocate_with"]);
+
+        // A dormant rule region is not executed by the application, so neither its effects nor its deferred work
+        // (i.e., a registered but unselected derivative) retain it.
         assert_eq!(simplified(RULE, &effectful(EffectClass::OrderedIo)), Vec::<&str>::new());
+        assert_eq!(simplified(RULE, &deferred), Vec::<&str>::new());
     }
 
     #[test]
@@ -3635,6 +3654,59 @@ mod tests {
         assert_eq!(filtered.to_string(), expected);
         let (program, input) = build_program();
         let (filtered, live) = program.into_filtered(&[input], &[input], &[]).unwrap();
+        assert_eq!(live, vec![0]);
+        assert_eq!(filtered.to_string(), expected);
+    }
+
+    #[test]
+    fn test_program_filtered_retains_deferred_work() {
+        // Zero-output operation that carries only deferred work, so no result atom or effect class can root it.
+        #[derive(Clone, Debug)]
+        struct DeferredOperation;
+
+        impl Operation for DeferredOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "deferred"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(Vec::new())
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                Cow::Owned(Effects::empty().clone().with_deferred_work())
+            }
+        }
+
+        // Deferred work is an implicit liveness root for both the borrowing and the consuming projection,
+        // which keep the input it consumes live even though no requested output depends on it.
+        let build_program = || {
+            let mut builder = ProgramBuilder::<Array, DeferredOperation>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            builder.add_instruction(DeferredOperation, Vec::new(), vec![input], None).unwrap();
+            let program = builder.build::<Array, Vec<Array>>(Vec::new(), Placeholder, Vec::new()).unwrap();
+            (program, input)
+        };
+        let expected = indoc! {"
+            lambda %0:f64[] .
+            let () = deferred %0
+            in ()
+        "}
+        .trim_end();
+        let (program, input) = build_program();
+        assert_eq!(program.simplified().unwrap().to_string(), expected);
+        let (filtered, live) = program.filtered(&[input], &[], &[]).unwrap();
+        assert_eq!(live, vec![0]);
+        assert_eq!(filtered.to_string(), expected);
+        let (program, input) = build_program();
+        let (filtered, live) = program.into_filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.to_string(), expected);
     }

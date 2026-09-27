@@ -771,10 +771,12 @@ impl<
 
         let transpose = driver.region(if self.is_transpose_only() { 0 } else { 1 })?;
 
-        // Unrequested gradients can omit a pure backward program, but its observable effects must still execute
-        // even when all seeds are structural zeros or none of the linear inputs requests a cotangent.
+        // Unrequested gradients can omit a pure backward program, but its observable effects must still execute and
+        // its deferred work must still be staged even when all seeds are structural zeros or none of the linear inputs
+        // requests a cotangent. The backward program is selected here, so its own summary decides; deferred work that
+        // exists only in its dormant alternatives (i.e., nested rule regions) creates no obligation.
         if (outputs.iter().all(MaybeZero::is_zero) || !accumulators.iter().any(CotangentAccumulator::is_needed))
-            && !transpose.effects().has_observable_effects_when_unused()
+            && !transpose.effects().is_retained_when_unused()
         {
             return Ok(());
         }

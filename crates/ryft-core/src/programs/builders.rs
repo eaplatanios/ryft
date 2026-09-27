@@ -701,11 +701,9 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                 .iter()
                 .map(|region_id| {
                     let region = &self.regions[region_id.index()];
-                    RegionInterface::new(
-                        region.input_types(),
-                        region.output_types(),
-                        self.regions.effects(*region_id).unwrap().classes(),
-                    )
+                    let effects = self.regions.effects(*region_id).unwrap();
+                    RegionInterface::new(region.input_types(), region.output_types(), effects.classes())
+                        .with_deferred_work(effects.has_deferred_work())
                 })
                 .collect()
         };
@@ -960,7 +958,7 @@ mod tests {
     use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceEffect};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::InstructionId;
-    use crate::programs::operations::OperationFoldOutput;
+    use crate::programs::operations::{OperationFoldOutput, OperationFormatter};
     use crate::programs::provenance::ProvenanceScope;
     use crate::programs::references::ReferenceType;
     use crate::programs::regions::{OutputRegionProvenance, RegionSlot};
@@ -1776,6 +1774,67 @@ mod tests {
         assert_eq!(constant.r#type().variable().name(), "value ^ 0");
         assert_eq!(constant.r#type().bounds(), DimensionBounds::new(1, Some(2)).unwrap());
         assert!(builder.instructions().is_empty());
+    }
+
+    #[test]
+    fn test_program_builder_add_instruction_or_fold_retains_deferred_work() {
+        // Identity whose folding rule would forward its input, optionally declaring deferred work.
+        #[derive(Clone)]
+        struct ForwardingOperation {
+            has_deferred_work: bool,
+        }
+
+        impl Operation for ForwardingOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "forwarding"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(input_types.to_vec())
+            }
+
+            fn fold(
+                &self,
+                _input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Option<Vec<OperationFoldOutput>>, TypeError> {
+                Ok(Some(vec![OperationFoldOutput::Input(0)]))
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                if self.has_deferred_work {
+                    Cow::Owned(Effects::empty().clone().with_deferred_work())
+                } else {
+                    Cow::Borrowed(Effects::empty())
+                }
+            }
+
+            fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+                OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+                    operation.field("has_deferred_work", self.has_deferred_work)?;
+                    Ok(())
+                })
+            }
+        }
+
+        // An ordinary forwarding application folds to its input, while one that declares deferred work is recorded
+        // because omitting it would discharge its unresolved transformation obligation.
+        let mut builder = ProgramBuilder::<Array, ForwardingOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let operation = ForwardingOperation { has_deferred_work: false };
+        assert_eq!(builder.add_instruction_or_fold(operation, Vec::new(), vec![input], None).unwrap(), vec![input]);
+        assert!(builder.instructions().is_empty());
+        let operation = ForwardingOperation { has_deferred_work: true };
+        let outputs = builder.add_instruction_or_fold(operation, Vec::new(), vec![input], None).unwrap();
+        assert_eq!(outputs, vec![AtomId::new(1)]);
+        assert_eq!(builder.instructions().len(), 1);
     }
 
     #[test]

@@ -107,7 +107,7 @@ bonus first-class kind (so RMSNorm's `mean(x^2)` needs no helper).
 
 | Primitive (JAX) | Used by | State | Notes |
 |---|---|---|---|
-| `lax.reduce_sum` | softmax denominator, cross-entropy sum, grad norm | ✅ | `value.reduce(&axes, ReductionKind::Sum)`; also `reduce_with_output_sharding` |
+| `lax.reduce_sum` | softmax denominator, cross-entropy sum, grad norm | ✅ | `value.reduce(&axes, ReductionKind::Sum)`; also `value.reduce_sum(&axes, output_sharding)` |
 | `mean` | RMSNorm `mean(x^2)` | ✅ | first-class `ReductionKind::Mean` |
 | `lax.reduce_max` / `reduce_min` | softmax numerical stability | ✅ | `ReductionKind::Max` / `Min` |
 | `any` / `all` | mask diagnostics | ✅ | `ReductionKind::Any` / `All` |

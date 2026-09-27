@@ -319,11 +319,11 @@ mod tests {
         ConvertElementType, ConvertElementTypeOperation, Cos, CumulativeLogSumExp, CumulativeMax, CumulativeMin,
         CumulativeProduct, CumulativeSum, DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension,
         DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather, GatherDimensionNumbers, GatherMode,
-        GatherOptions, Ln1p, Log, LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min,
-        OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round,
-        Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind, Shape, Sharding,
-        ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError,
-        UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
+        GatherOptions, Ln1p, Log, LogAddExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min, OneLike, Pad,
+        Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter,
+        ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin,
+        Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch,
+        differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -987,7 +987,7 @@ mod tests {
         // reference kernels is what pins those expansions to the semantics `ryft-core` documents.
         assert_parity(&left.ln_1p().unwrap(), &reference_left.ln_1p().unwrap());
         assert_parity(&left.log_add_exp(&right).unwrap(), &reference_left.log_add_exp(&reference_right).unwrap());
-        assert_parity(&left.log_sum_exp(&[0]).unwrap(), &reference_left.log_sum_exp(&[0]).unwrap());
+        assert_parity(&left.reduce_log_sum_exp(&[0]).unwrap(), &reference_left.reduce_log_sum_exp(&[0]).unwrap());
 
         // The `log_add_exp` expansion routes same-sign infinities and NaN operands through its plain `a + b` arm, so
         // `+inf` absorbs, `-inf` is the identity, and NaN is contagious. Those values cannot pass through a

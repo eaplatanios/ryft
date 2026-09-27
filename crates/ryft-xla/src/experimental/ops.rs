@@ -1519,11 +1519,12 @@ pub fn transpose_primal_jit_call<
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
     // A jitted call with no live output cotangents and no live reference operand is a zero linear map, so every
     // operand cotangent is zero. A live reference operand keeps the call live, because its accumulated state cotangent
-    // flows through the transposed callee even when no ordinary output cotangent does.
+    // flows through the transposed callee even when no ordinary output cotangent does. A callee with deferred work or
+    // observable rule effects also keeps it live.
     check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
         && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.has_observable_effects_in_closure()
+        && !driver.region(0)?.must_transpose()
     {
         return inputs
             .iter()

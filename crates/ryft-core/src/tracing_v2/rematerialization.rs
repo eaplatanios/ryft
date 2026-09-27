@@ -1695,6 +1695,11 @@ fn validate_storage_operation<T: Type, O: Operation<Type = T>>(
             message: format!("storage operation `{operation_name}` must be pure but declares effects"),
         });
     }
+    if operation.effects().summary().has_deferred_work() {
+        return Err(RematerializationError::InvalidStorageOperation {
+            message: format!("storage operation `{operation_name}` must not carry deferred work"),
+        });
+    }
     let mut output_types = operation.infer_output_types(std::slice::from_ref(input_type), &[]).map_err(|error| {
         RematerializationError::InvalidStorageOperation {
             message: format!(
@@ -1828,13 +1833,15 @@ impl PrimalReferenceAccesses {
 
             // Only pure instructions and state confined to known local roots may be recomputed. Nested I/O and
             // explicit ordered state also appear in this summary, so neither can be hidden by local reference access.
+            // Recomputing deferred work would repeat its transformation obligation, so it is never recomputable.
             let effects = primal.instruction_effects(instruction).unwrap();
             recomputable.push(
-                effects.classes().is_empty()
-                    || (!effects.has_explicit_ordered_state()
-                        && !accesses_external_root
-                        && !roots.is_empty()
-                        && effects.classes() == EffectClasses::single(EffectClass::OrderedState)),
+                !effects.has_deferred_work()
+                    && (effects.classes().is_empty()
+                        || (!effects.has_explicit_ordered_state()
+                            && !accesses_external_root
+                            && !roots.is_empty()
+                            && effects.classes() == EffectClasses::single(EffectClass::OrderedState))),
             );
         }
         Self { local_roots, mutations, recomputable }

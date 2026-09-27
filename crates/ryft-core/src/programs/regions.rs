@@ -845,11 +845,13 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     where
         O: Operation<Type = V::Type>,
     {
-        RegionInterface::new(self.input_types(), self.output_types(), self.effects().classes())
+        let effects = self.effects();
+        RegionInterface::new(self.input_types(), self.output_types(), effects.classes())
+            .with_deferred_work(effects.has_deferred_work())
     }
 
-    /// Returns the recursively derived [`EffectsSummary`] of the rooted [`Region`]. The resulting summary accounts for
-    /// the region's instructions and their attached computation regions, while excluding dormant rule regions.
+    /// Returns the recursively derived [`EffectsSummary`] of the rooted [`Region`]. The resulting summary accounts
+    /// for the region's instructions and their attached computation regions, while excluding dormant rule regions.
     #[inline]
     pub fn effects(self) -> EffectsSummary {
         self.arena.effects(self.id).unwrap()
@@ -1161,14 +1163,14 @@ impl RegionSlot {
 
 /// Read-only boundary summary of a sealed [`Region`], as seen by [`Operation`] type inference. A [`RegionInterface`]
 /// preserves the exact [`Region::input_ids`] and [`Region::output_ids`] order and carries the region's recursively
-/// derived [`EffectClasses`], so that region-carrying operations can validate and consume the boundary contracts of
-/// their attached regions (e.g., a condition operation checking that its branches agree, or a while operation rejecting
-/// an effectful body when its predicate is batched) without ever seeing the region contents. [`ProgramBuilder`]s derive
-/// [`RegionInterface`]s from their own region arenas immediately before invoking [`Operation::infer_output_types`] and
-/// never store them. Final [`Program`] validation independently derives them again so that callers cannot inject stale
-/// interface metadata into an [`Instruction`]. Note, though, that constructing a [`RegionInterface`] directly is still
-/// allowed as passing synthetic interfaces to [`Operation::infer_output_types`] performs a pure hypothetical inference
-/// and cannot mutate or create a [`Program`].
+/// derived [`EffectClasses`] and deferred work obligation, so that region-carrying operations can validate and consume
+/// the boundary contracts of their attached regions (e.g., a condition operation checking that its branches agree, or
+/// a while operation rejecting an effectful body or deferred work when its predicate is batched) without ever seeing
+/// the region contents. [`ProgramBuilder`]s derive [`RegionInterface`]s from their own region arenas immediately before
+/// invoking [`Operation::infer_output_types`] and never store them. Final [`Program`] validation independently derives
+/// them again so that callers cannot inject stale interface metadata into an [`Instruction`]. Note, though,
+/// that constructing a [`RegionInterface`] directly is still allowed as passing synthetic interfaces to
+/// [`Operation::infer_output_types`] performs a pure hypothetical inference and cannot mutate or create a [`Program`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegionInterface<T: Type> {
     /// [`Type`]s derived from the [`Region`]'s input [`Atom`]s, in [`Region::input_ids`] order.
@@ -1179,13 +1181,26 @@ pub struct RegionInterface<T: Type> {
 
     /// [`EffectClasses`] of the [`Region`], derived recursively from its [`Instruction`]s and their attached regions.
     effects: EffectClasses,
+
+    /// Whether the [`Region`] carries deferred work, derived like [`Self::effects`].
+    /// Refer to [`EffectsSummary::has_deferred_work`] for more information.
+    has_deferred_work: bool,
 }
 
 impl<T: Type> RegionInterface<T> {
-    /// Creates a new [`RegionInterface`].
+    /// Creates a new [`RegionInterface`] that carries no deferred work.
+    /// Refer to [`Self::with_deferred_work`] for how to set it.
     #[inline]
     pub fn new(input_types: Vec<T>, output_types: Vec<T>, effects: EffectClasses) -> Self {
-        Self { input_types, output_types, effects }
+        Self { input_types, output_types, effects, has_deferred_work: false }
+    }
+
+    /// Returns this [`RegionInterface`] with the provided deferred work obligation. Refer to the documentation
+    /// of [`Self::has_deferred_work`] for information on the semantics of this field.
+    #[inline]
+    pub fn with_deferred_work(mut self, has_deferred_work: bool) -> Self {
+        self.has_deferred_work = has_deferred_work;
+        self
     }
 
     /// Returns the [`Type`]s of the [`Region`]'s inputs, in [`Region::input_ids`] order.
@@ -1205,6 +1220,13 @@ impl<T: Type> RegionInterface<T> {
     #[inline]
     pub fn effects(&self) -> EffectClasses {
         self.effects
+    }
+
+    /// Returns whether the [`Region`] carries deferred work, derived recursively from its [`Instruction`]s and their
+    /// attached computation regions. Refer to [`EffectsSummary::has_deferred_work`] for more information.
+    #[inline]
+    pub fn has_deferred_work(&self) -> bool {
+        self.has_deferred_work
     }
 }
 
@@ -2578,6 +2600,38 @@ mod tests {
             program.entry(),
         ));
         assert_eq!(program.entry_region_ref().instruction_effects(2), Err(error));
+
+        // Deferred work propagates through computation regions like effect classes, without adding a class,
+        // while a dormant rule region (i.e., a registered but unselected derivative) contributes nothing.
+        let deferred = RegionId::new(0);
+        let computation = RegionId::new(1);
+        let rule = RegionId::new(2);
+        let with_region = |slots: &'static [RegionSlot]| {
+            Region::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(TestRegionOperation::WithRegions(slots), Vec::new(), Vec::new(), vec![deferred])],
+            )
+        };
+        let arena = RegionArena::from_regions(vec![
+            Region::<Array, TestRegionOperation>::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(TestRegionOperation::Deferred, Vec::new(), Vec::new(), Vec::new())],
+            ),
+            with_region(const { &[RegionSlot::computation("body")] }),
+            with_region(const { &[RegionSlot::rule("rule")] }),
+        ])
+        .unwrap();
+        let summary = RegionRef::new(&arena, computation).unwrap().instruction_effects(0).unwrap();
+        assert_eq!(summary.classes(), EffectClasses::NONE);
+        assert!(summary.has_deferred_work());
+        assert!(summary.is_retained_when_unused());
+        let summary = RegionRef::new(&arena, rule).unwrap().instruction_effects(0).unwrap();
+        assert!(!summary.has_deferred_work());
+        assert!(!summary.is_retained_when_unused());
     }
 
     #[test]
@@ -2818,6 +2872,33 @@ mod tests {
         assert_eq!(materialized.instructions()[0].regions(), materialized.instructions()[1].regions());
         assert_eq!(materialized.input_types(), vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(materialized.output_types(), vec![ArrayType::scalar(DataType::F64)]);
+    }
+
+    #[test]
+    fn test_region_interface() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let interface = RegionInterface::new(
+            vec![scalar.clone()],
+            vec![scalar.clone()],
+            EffectClasses::single(EffectClass::OrderedIo),
+        );
+        assert_eq!(interface.input_types(), &[scalar.clone()]);
+        assert_eq!(interface.output_types(), &[scalar.clone()]);
+        assert_eq!(interface.effects(), EffectClasses::single(EffectClass::OrderedIo));
+        assert!(!interface.has_deferred_work());
+        assert!(interface.clone().with_deferred_work(true).has_deferred_work());
+        assert_ne!(interface.clone().with_deferred_work(true), interface);
+
+        // Interfaces derived from sealed regions carry the region's deferred-work obligation,
+        // which type inference receives alongside its effect classes.
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = builder.add_input(scalar.clone());
+        let output = builder.add_instruction(TestRegionOperation::Deferred, Vec::new(), vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let interface = program.entry_region_ref().interface();
+        assert_eq!(interface.effects(), EffectClasses::NONE);
+        assert!(interface.has_deferred_work());
     }
 
     #[test]

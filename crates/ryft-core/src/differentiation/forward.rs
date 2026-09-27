@@ -2511,6 +2511,9 @@ where
         // describes only a view. Retain dimensions of ordinary primal inputs without introducing reference reads.
         // Without reference state, only disconnected tangent inputs require additional zero-construction residuals.
         let has_references = tangent_program.entry_region_ref().contains_references_in_closure();
+
+        // Deferred work can consume a tangent without returning its cotangent. Geometry must therefore follow output
+        // liveness, matching the trailing-residual mapping recovered during transposition.
         let tangent_live_sets = tangent_program.live_sets();
         let differentiable_primal_inputs = arguments
             .input_indices
@@ -3161,6 +3164,9 @@ where
     // programs, disconnected tangent inputs alone require extra zero geometry.
     let mut program = evaluation.program;
     let has_references = program.entry_region_ref().contains_references_in_closure();
+
+    // A tangent retained only by deferred work can still receive a structural-zero cotangent. Keep its geometry using
+    // output liveness, matching transposition's reconstruction of the trailing residual boundary.
     let live_sets = program.live_sets();
     let differentiable_primal_inputs = input_values
         .iter()
