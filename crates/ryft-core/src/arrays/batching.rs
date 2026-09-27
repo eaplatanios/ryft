@@ -243,16 +243,16 @@ impl<V> RaggedAxis<V> {
 /// for the complex types, which order lexicographically, `MIN` and `MAX` for the integers, and `false` and `true` for
 /// Booleans). [`LowestReal`](Self::LowestReal) is the lowest real value embedded in the operand data type, which is
 /// [`Lowest`](Self::Lowest) for every real data type and the lowest real component paired with a zero imaginary one
-/// (i.e., `-∞ + 0i`) for the complex types. [`One`](Self::One) is the multiplicative identity converted into the
-/// operand data type, and the conversion is verified rather than assumed: an element type that cannot represent the
-/// constant exactly (such as the two-valued [`DataType::I1`](crate::DataType::I1), whose range is `{-1, 0}`) is
-/// rejected instead of masked with a different value. Those four identities also require an element type with a
-/// payload, so the payload-free [`DataType::Token`](crate::DataType::Token) and
-/// [`DataType::Zero`](crate::DataType::Zero) element types are rejected.
+/// (i.e., `-∞ + 0i`) for the complex types. [`One`](Self::One) is the element type's canonical multiplicative identity
+/// (i.e., [`ArrayElement::one`]): `true` for Booleans, `1 + 0i` for the complex types, and the all-ones encoding `-1`
+/// for the two-valued [`DataType::I1`](crate::DataType::I1), which is the multiplicative identity of its arithmetic
+/// modulo two. Those four identities require an element type with a payload, so the payload-free
+/// [`DataType::Token`](crate::DataType::Token) and [`DataType::Zero`](crate::DataType::Zero)
+/// element types are rejected.
 ///
-/// [`Zero`](Self::Zero), the additive identity, never reaches that guard in practice. Instead, a masking implementation
-/// takes the operand's own [`ZeroLikeOperation`] for it, which needs no data type reasoning and imposes its own
-/// contract.
+/// [`Zero`](Self::Zero), the additive identity, never reaches that rejection in practice. Instead, a masking
+/// implementation takes the operand's own [`ZeroLikeOperation`] for it, which needs no data type reasoning and
+/// imposes its own contract.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RaggedMaskIdentity {
     /// Additive identity, and the identity of both a summation and a contraction.

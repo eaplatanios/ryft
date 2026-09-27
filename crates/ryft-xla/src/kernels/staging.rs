@@ -13,15 +13,15 @@ use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
     Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom,
     AtomId, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, ConstantOperation,
-    Context, CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, Domain, Effects, InputRegionProvenance,
-    Instruction, InterpretableOperation, InterpretationDriver, MaybeZero, Operation, OutputRegionProvenance,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
-    ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionInterface, RegionSlot, Tracer,
-    TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value,
+    Context, CotangentAccumulator, CustomDerivativeJvpRule, CustomDerivativeOperation, DifferentiableOperation,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    Domain, Effects, InputRegionProvenance, Instruction, InterpretableOperation, InterpretationDriver, MaybeZero,
+    Operation, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessDescriptor,
+    ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionInterface,
+    RegionSlot, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
+    TypeError, TypeIdentityRenaming, Typed, Value,
 };
 
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
@@ -548,9 +548,9 @@ where
 }
 
 /// Stages a native kernel primal with an explicit canonical JVP region. The JVP receives primal inputs followed by
-/// active tangents and returns primal results followed by their tangents, as checked by
-/// [`ryft_core::CustomJvpOperation`]. The supplied rule owns derivative semantics; the mutable kernel body is never
-/// implicitly differentiated.
+/// active tangents and returns primal results followed by their tangents, as checked by a [`CustomDerivativeOperation`]
+/// with a JVP rule region. The supplied rule owns derivative semantics; the mutable kernel body is never implicitly
+/// differentiated.
 pub fn stage_kernel_with_jvp<C, Extension>(
     context: &C,
     definition: &KernelDefinition<Extension>,
@@ -562,7 +562,7 @@ where
     Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        ryft_core::CustomJvpOperation::<ArrayIrType>::new(),
+        CustomDerivativeOperation::<ArrayIrType>::new().with_jvp_rule(CustomDerivativeJvpRule::Region),
         vec![kernel_primal(definition)?, jvp.clone()],
         inputs,
     )
@@ -570,7 +570,8 @@ where
 
 /// Stages a native kernel primal with explicit canonical forward and backward VJP regions. The forward region returns
 /// primal outputs and residuals; the backward region receives residuals and output cotangents and returns input
-/// cotangents. [`ryft_core::CustomVjpOperation`] validates these boundaries and retains its reverse-mode-only contract.
+/// cotangents. A [`CustomDerivativeOperation`] with reverse-mode rules validates these boundaries and retains its
+/// reverse-mode-only contract.
 /// A forward rule may itself stage a kernel when its primal must execute natively during differentiation.
 pub fn stage_kernel_with_vjp<C, Extension>(
     context: &C,
@@ -584,7 +585,7 @@ where
     Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        ryft_core::CustomVjpOperation::<ArrayIrType>::new(),
+        CustomDerivativeOperation::<ArrayIrType>::new().with_vjp_rule(),
         vec![kernel_primal(definition)?, forward.clone(), backward.clone()],
         inputs,
     )

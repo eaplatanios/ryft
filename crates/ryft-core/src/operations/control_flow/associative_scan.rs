@@ -9,6 +9,7 @@
 // TODO(eaplatanios): Review this module.
 
 use crate::arrays::{ArrayType, DataType, StaticShape};
+use crate::axes::Axis;
 use crate::contexts::Context;
 use crate::operations::arithmetic::Add;
 use crate::operations::constants::zero::Zero;
@@ -52,12 +53,13 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Value};
 /// disjunction rather than an addition, because Booleans have no addition.
 ///
 /// The shape of every array must be static, because the construction slices at staging-time positions. A scanned axis
-/// shorter than two elements leaves the arrays unchanged, and so does a structure that holds no arrays.
+/// shorter than two elements leaves the arrays unchanged, and so does a structure that holds no arrays. A negative
+/// `axis` counts from the end of the shape of the first array, and the resulting position is scanned in every array.
 ///
 /// # Parameters
 ///
 ///   - `values`: [`Parameterized`] structure of the scanned arrays.
-///   - `axis`: Scanned axis of every array.
+///   - `axis`: Scanned [`Axis`] of every array, normalized against the rank of the first array.
 ///   - `reverse`: Whether to accumulate from the end of the scanned axis toward its start.
 ///   - `combine`: Associative binary operator over structures shaped like `values`, receiving the accumulated prefix
 ///     and the next elements in scan order. It must return as many arrays as `values` holds.
@@ -67,9 +69,9 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Value};
 /// Returns a [`ProgramError`] if `axis` is out of bounds for any array, if the shape of any array is not static, if
 /// the arrays have different extents along `axis`, if `combine` returns a different number of arrays, or if staging
 /// any of the primitives of the construction (including those that `combine` stages) fails.
-pub fn associative_scan<V, Values, F>(
+pub fn associative_scan<V, Values, A: Into<Axis>, F>(
     values: &Values,
-    axis: usize,
+    axis: A,
     reverse: bool,
     combine: &F,
 ) -> Result<Values, ProgramError>
@@ -81,6 +83,13 @@ where
 {
     let structure = values.parameter_structure();
     let arrays = values.parameters().cloned().collect::<Vec<_>>();
+    let Some(first) = arrays.first() else {
+        return Ok(Values::from_parameters(structure, arrays)?);
+    };
+    let axis = axis
+        .into()
+        .normalize(first.r#type().rank())
+        .map_err(|error| TypeError::invalid(format!("`associative_scan` {error}")))?;
     let shapes = arrays
         .iter()
         .map(|array| {
@@ -98,9 +107,6 @@ where
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let Some(first) = arrays.first() else {
-        return Ok(Values::from_parameters(structure, arrays)?);
-    };
     let extent = shapes[0][axis];
     if let Some(shape) = shapes.iter().find(|shape| shape[axis] != extent) {
         return Err(TypeError::invalid(format!(
@@ -383,10 +389,18 @@ mod tests {
             Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]).unwrap()),
         );
 
+        // Negative axes count from the end of the shape.
+        assert_eq!(associative_scan(&matrix, -1, false, &add), associative_scan(&matrix, 1, false, &add));
+        assert_eq!(associative_scan(&matrix, -2, true, &add), associative_scan(&matrix, 0, true, &add));
+
         // The construction slices at staging-time positions, so it needs an in-bounds axis.
         assert_eq!(
             associative_scan(&matrix, 2, false, &add),
             Err(ProgramError::Type(TypeError::invalid("`associative_scan` axis 2 is out of bounds for rank 2"))),
+        );
+        assert_eq!(
+            associative_scan(&matrix, -3, false, &add),
+            Err(ProgramError::Type(TypeError::invalid("`associative_scan` axis -3 is out of bounds for rank 2"))),
         );
     }
 
@@ -432,6 +446,19 @@ mod tests {
             left.iter().zip(right).map(|(left, right)| left.add(right)).collect::<Result<Vec<_>, _>>()
         };
         assert_eq!(associative_scan(&Vec::<Array>::new(), 0, false, &add_all), Ok(Vec::new()));
+
+        // A negative axis is normalized against the rank of the first array, and that position is scanned in every
+        // array, so every array must have it.
+        let mixed_ranks =
+            vec![Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).unwrap(), Array::vector(vec![5.0, 6.0]).unwrap()];
+        assert_eq!(
+            associative_scan(&mixed_ranks, -2, false, &add_all),
+            Ok(vec![Array::matrix(2, 2, vec![1.0, 2.0, 4.0, 6.0]).unwrap(), Array::vector(vec![5.0, 11.0]).unwrap()]),
+        );
+        assert_eq!(
+            associative_scan(&mixed_ranks, -1, false, &add_all),
+            Err(ProgramError::Type(TypeError::invalid("`associative_scan` axis 1 is out of bounds for rank 1"))),
+        );
 
         // The arrays are sliced in lockstep, so they must agree on the scanned extent, and the combining operator must
         // return as many arrays as it receives.

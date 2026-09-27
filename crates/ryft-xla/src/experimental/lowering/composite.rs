@@ -1436,8 +1436,7 @@ where
         ArrayIrOperation::Condition(_)
         | ArrayIrOperation::While(_)
         | ArrayIrOperation::Scan(_)
-        | ArrayIrOperation::CustomJvp(_)
-        | ArrayIrOperation::CustomVjp(_)
+        | ArrayIrOperation::CustomDerivative(_)
         | ArrayIrOperation::LinearCall(_)
         | ArrayIrOperation::Rematerialize(_) => Err(LoweringError::UnsupportedOp {
             op: format!(

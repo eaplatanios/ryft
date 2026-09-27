@@ -23,8 +23,8 @@ use ryft_core::operations::sort::{SORT_OPERATION_NAME, SortDirection, SortOperat
 use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
-    CUMULATIVE_OPERATION_NAME, CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME, CaptureReference, CeilOperation,
-    ClampOperation, ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CosOperation, CumulativeKind,
+    CUMULATIVE_OPERATION_NAME, CUSTOM_DERIVATIVE_OPERATION_NAME, CaptureReference, CeilOperation, ClampOperation,
+    ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CosOperation, CumulativeKind,
     DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DivOperation,
     DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
     ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, Instruction, IotaOperation,
@@ -5714,7 +5714,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 lowerer.context,
                 lowerer.location,
             ),
-            ArrayOperation::CustomJvp(_) | ArrayOperation::CustomVjp(_) | ArrayOperation::Rematerialize(_) => {
+            ArrayOperation::CustomDerivative(_) | ArrayOperation::Rematerialize(_) => {
                 Err(ProgramError::UnsupportedOperation {
                     message: "higher-order operation must be stored directly in the enclosing backend operation family"
                         .to_string(),
@@ -9872,39 +9872,29 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Condition(_) => lowerer.lower_condition(regions, input_values),
         XlaOperation::While(operation) => lowerer.lower_while(operation, regions, input_values),
         XlaOperation::Scan(operation) => lowerer.lower_scan(operation, regions, input_values),
-        XlaOperation::CustomJvp(_) => {
-            let [primal, _jvp] = regions else {
+        XlaOperation::CustomDerivative(operation) => {
+            let [primal, ..] = regions else {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("{} expected 2 attached regions but got {}", CUSTOM_JVP_OPERATION_NAME, regions.len(),),
+                    op: format!("{CUSTOM_DERIVATIVE_OPERATION_NAME} expected a primal region but got no regions"),
                 });
             };
-            // Custom-JVP regions are traced through fresh-root contexts whose local capture tables are discarded, so
-            // they can never legally reference the enclosing function's captures (the trace boundary rejects bodies
-            // that register captures). Lowering them with an empty capture namespace turns any capture-referencing
-            // constant that still sneaks in into a loud `MissingCapturedConstant` error instead of silently aliasing
-            // whatever value occupies the referenced slot of the enclosing capture prefix. Nested-traced regions
-            // (`while`/`scan`/`condition`/`linear_call`) share the enclosing capture scope and keep inheriting it.
-            lower_nested_program_inline(
-                primal,
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-                &[],
-                false,
-                lowerer.nested_functions.as_ref(),
-                &lowerer.collective_state,
-                &mut lowerer.effect_tokens,
-            )
-        }
-        XlaOperation::CustomVjp(_) => {
-            let [primal, _forward, _backward] = regions else {
+            if regions.len() != operation.region_slots().len() {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("{} expected 3 attached regions but got {}", CUSTOM_VJP_OPERATION_NAME, regions.len(),),
+                    op: format!(
+                        "{} expected {} attached regions but got {}",
+                        CUSTOM_DERIVATIVE_OPERATION_NAME,
+                        operation.region_slots().len(),
+                        regions.len(),
+                    ),
                 });
-            };
-            // Custom-VJP regions are traced through fresh-root contexts and lower with an empty capture namespace;
-            // refer to the `CustomJvp` arm above for the rationale.
+            }
+            // Custom derivative regions are traced through fresh-root contexts whose local capture tables are
+            // discarded, so they can never legally reference the enclosing function's captures (the trace boundary
+            // rejects bodies that register captures). Lowering the primal region with an empty capture namespace turns
+            // any capture-referencing constant that still sneaks in into a loud `MissingCapturedConstant` error instead
+            // of silently aliasing whatever value occupies the referenced slot of the enclosing capture prefix. The rule
+            // regions are dormant under lowering. Nested-traced regions (`while`/`scan`/`condition`/`linear_call`)
+            // share the enclosing capture scope and keep inheriting it.
             lower_nested_program_inline(
                 primal,
                 input_values,
@@ -9929,7 +9919,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 });
             };
             // Rematerialized regions are traced through fresh-root contexts and lower with an empty capture
-            // namespace; refer to the `CustomJvp` arm above for the rationale.
+            // namespace; refer to the `CustomDerivative` arm above for the rationale.
             lower_nested_program_inline(
                 primal,
                 input_values,
@@ -11173,8 +11163,10 @@ fn lower_complex_ln_1p_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// callers guarantee: the elementwise operation normalizes its broadcast operands, and the
 /// log-sum-exp `cumulative` reducer body applies the same expansion to two scalar block arguments.
 /// Narrow real formats evaluate the entire composition in `f32` before converting back. Complex values use
-/// `max(a, b) + ln_1p(exp(min(a, b) - max(a, b)))`, with lexicographic extrema and an imaginary part wrapped
-/// to `[-pi, pi)`.
+/// `m + log(exp(a - m) + exp(b - m))` with `m` their larger real component, which never subtracts their imaginary
+/// components from each other, and fall back to `max(a, b) + ln_1p(exp(min(a, b) - max(a, b)))` (with lexicographic
+/// extrema) where `m` is not finite. Either way, the imaginary part is wrapped to `[-pi, pi)` by
+/// [`lower_principal_phase_to_mlir`].
 fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     left: ValueRef<'b, 'c, 't>,
     right: ValueRef<'b, 'c, 't>,
@@ -11204,6 +11196,7 @@ fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
         (left, right)
     };
     if data_type.is_complex() {
+        // Operands with an infinite (or NaN) larger real component keep the lexicographic form, which resolves them.
         let maximum = lower_extremum_to_mlir(true, data_type, left, right, block, location)?;
         let minimum = lower_extremum_to_mlir(false, data_type, left, right, block, location)?;
         let difference = block
@@ -11217,91 +11210,61 @@ fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             .unwrap()
             .as_ref();
         let correction = lower_complex_ln_1p_to_mlir(exponential, output_type, block, context, location)?;
-        let output =
+        let lexicographic =
             block.append_operation(stable_hlo::add(maximum, correction, location)?)?.result(0).unwrap().as_ref();
-        let real = block.append_operation(stable_hlo::real(output, location)?)?.result(0).unwrap().as_ref();
-        let imaginary = block.append_operation(stable_hlo::imag(output, location)?)?.result(0).unwrap().as_ref();
+
+        // Every other operand pair is shifted by its larger real component alone, which never subtracts the imaginary
+        // components from each other. The shift is replaced by zero where it is not finite, which keeps the unused
+        // shifted form free of spurious NaNs without affecting the selected result.
         let part_type =
             output_type
                 .clone()
                 .with_data_type(if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
         let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
-        let pi =
-            lower_f64_constant_splat(std::f64::consts::PI, &part_type, part_tensor_type, block, context, location)?;
-        let two_pi = lower_f64_constant_splat(
-            2.0 * std::f64::consts::PI,
-            &part_type,
-            part_tensor_type,
-            block,
-            context,
-            location,
-        )?;
+        let left_real = block.append_operation(stable_hlo::real(left, location)?)?.result(0).unwrap().as_ref();
+        let right_real = block.append_operation(stable_hlo::real(right, location)?)?.result(0).unwrap().as_ref();
+        let shift = block
+            .append_operation(stable_hlo::maximum(left_real, right_real, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let finite = block.append_operation(stable_hlo::is_finite(shift, location)?)?.result(0).unwrap().as_ref();
         let zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
-        let shifted = block.append_operation(stable_hlo::add(imaginary, pi, location)?)?.result(0).unwrap().as_ref();
-        let remainder = block
-            .append_operation(stable_hlo::remainder(shifted, two_pi, location)?)?
+        let shift = block
+            .append_operation(stable_hlo::select(finite, shift, zero, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
-        let negative = block
-            .append_operation(stable_hlo::compare(
-                remainder,
-                zero,
-                stable_hlo::ComparisonDirection::LessThan,
-                stable_hlo::ComparisonType::Float,
-                location,
-            )?)?
+        let shift = block.append_operation(stable_hlo::complex(shift, zero, location)?)?.result(0).unwrap().as_ref();
+        let mut exponentials = Vec::with_capacity(2);
+        for operand in [left, right] {
+            let shifted =
+                block.append_operation(stable_hlo::subtract(operand, shift, location)?)?.result(0).unwrap().as_ref();
+            exponentials.push(
+                block
+                    .append_operation(stable_hlo::exponential(shifted, Accuracy::Default, location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref(),
+            );
+        }
+        let sum = block
+            .append_operation(stable_hlo::add(exponentials[0], exponentials[1], location)?)?
             .result(0)
             .unwrap()
             .as_ref();
-        let adjusted =
-            block.append_operation(stable_hlo::add(remainder, two_pi, location)?)?.result(0).unwrap().as_ref();
-        let wrapped = block
-            .append_operation(stable_hlo::select(negative, adjusted, remainder, location)?)?
+        let logarithm = block
+            .append_operation(stable_hlo::log(sum, Accuracy::Default, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
-        let wrapped_imaginary =
-            block.append_operation(stable_hlo::subtract(wrapped, pi, location)?)?.result(0).unwrap().as_ref();
-        // Preserve already-principal phases, particularly tiny phases that adding pi would round away.
-        let negative_pi = block.append_operation(stable_hlo::negate(pi, location)?)?.result(0).unwrap().as_ref();
-        let above_lower = block
-            .append_operation(stable_hlo::compare(
-                imaginary,
-                negative_pi,
-                stable_hlo::ComparisonDirection::GreaterThanOrEqual,
-                stable_hlo::ComparisonType::Float,
-                location,
-            )?)?
+        let shifted = block.append_operation(stable_hlo::add(logarithm, shift, location)?)?.result(0).unwrap().as_ref();
+        let output = block
+            .append_operation(stable_hlo::select(finite, shifted, lexicographic, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
-        let below_upper = block
-            .append_operation(stable_hlo::compare(
-                imaginary,
-                pi,
-                stable_hlo::ComparisonDirection::LessThan,
-                stable_hlo::ComparisonType::Float,
-                location,
-            )?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-        let principal = block
-            .append_operation(stable_hlo::and(above_lower, below_upper, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-        let imaginary = block
-            .append_operation(stable_hlo::select(principal, imaginary, wrapped_imaginary, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-        return Ok(block
-            .append_operation(stable_hlo::complex(real, imaginary, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref());
+        return lower_principal_phase_to_mlir(output, output_type, block, context, location);
     }
     let difference = block.append_operation(stable_hlo::subtract(left, right, location)?)?;
     let difference = difference.result(0).expect("stablehlo.subtract should return one result").as_ref();
@@ -11342,6 +11305,132 @@ fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     })
 }
 
+/// Wraps the imaginary component of the complex `value` onto the principal branch `[-pi, pi)`, keeping phases that
+/// already lie on it exactly as they are (in particular, tiny phases that shifting by `pi` would round away). This is
+/// the final step of every complex `log_add_exp` expansion, and it also brings the raw-input prefixes of a complex
+/// log-sum-exp `cumulative` onto the branch that every combined prefix lies on.
+fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let data_type = output_type.data_type();
+    let real = block.append_operation(stable_hlo::real(value, location)?)?.result(0).unwrap().as_ref();
+    let imaginary = block.append_operation(stable_hlo::imag(value, location)?)?.result(0).unwrap().as_ref();
+    let part_type =
+        output_type
+            .clone()
+            .with_data_type(if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
+    let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+    let pi = lower_f64_constant_splat(std::f64::consts::PI, &part_type, part_tensor_type, block, context, location)?;
+    let two_pi =
+        lower_f64_constant_splat(2.0 * std::f64::consts::PI, &part_type, part_tensor_type, block, context, location)?;
+    let zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
+    let shifted = block.append_operation(stable_hlo::add(imaginary, pi, location)?)?.result(0).unwrap().as_ref();
+    let remainder = block
+        .append_operation(stable_hlo::remainder(shifted, two_pi, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let negative = block
+        .append_operation(stable_hlo::compare(
+            remainder,
+            zero,
+            stable_hlo::ComparisonDirection::LessThan,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let adjusted = block.append_operation(stable_hlo::add(remainder, two_pi, location)?)?.result(0).unwrap().as_ref();
+    let wrapped = block
+        .append_operation(stable_hlo::select(negative, adjusted, remainder, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let wrapped_imaginary =
+        block.append_operation(stable_hlo::subtract(wrapped, pi, location)?)?.result(0).unwrap().as_ref();
+    // Preserve already-principal phases, particularly tiny phases that adding pi would round away.
+    let negative_pi = block.append_operation(stable_hlo::negate(pi, location)?)?.result(0).unwrap().as_ref();
+    let above_lower = block
+        .append_operation(stable_hlo::compare(
+            imaginary,
+            negative_pi,
+            stable_hlo::ComparisonDirection::GreaterThanOrEqual,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let below_upper = block
+        .append_operation(stable_hlo::compare(
+            imaginary,
+            pi,
+            stable_hlo::ComparisonDirection::LessThan,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let principal = block
+        .append_operation(stable_hlo::and(above_lower, below_upper, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let imaginary = block
+        .append_operation(stable_hlo::select(principal, imaginary, wrapped_imaginary, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    Ok(block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref())
+}
+
+/// Lowers the scalar product combiner of a `reduce` or `cumulative` body over `element_type`. Complex operands return
+/// the other operand when one of them is exactly the `1 + 0i` identity that seeds every reduction and pads every
+/// window, because multiplying by it is not exact under complex arithmetic: its zero imaginary component meets the
+/// other operand's infinite components as `0 · ∞ = NaN`. This keeps complex infinities intact, exactly as a product
+/// that starts from its first element (like the `ryft-core` reference kernels) would. Real products multiply directly.
+fn lower_product_combiner_to_mlir<'b, 'c: 'b, 't: 'c>(
+    left: ValueRef<'b, 'c, 't>,
+    right: ValueRef<'b, 'c, 't>,
+    element_type: DataType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let product = block.append_operation(stable_hlo::multiply(left, right, location)?)?.result(0).unwrap().as_ref();
+    if !element_type.is_complex() {
+        return Ok(product);
+    }
+    let one = lower_unplaced_constant_output(&[ArrayType::scalar(element_type)], 1, block, context, location)?[0];
+    let mut identity_masks = Vec::with_capacity(2);
+    for operand in [left, right] {
+        let mask = block.append_operation(stable_hlo::compare(
+            operand,
+            one,
+            stable_hlo::ComparisonDirection::Equal,
+            stable_hlo::ComparisonType::Float,
+            location,
+        )?)?;
+        identity_masks.push(mask.result(0).unwrap().as_ref());
+    }
+    let guarded = block
+        .append_operation(stable_hlo::select(identity_masks[1], left, product, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    Ok(block
+        .append_operation(stable_hlo::select(identity_masks[0], right, guarded, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref())
+}
+
 /// Builds a reduction-body region for [`stable_hlo::reduce`] over the given scalar `element_type`. The generated
 /// region has one block taking two scalar tensor arguments of `tensor<{element_type}>` and produces one scalar result
 /// through the combiner matching the reduction kind.
@@ -11374,7 +11463,7 @@ fn build_reduce_body_region<'c, 't>(
             .expect("stablehlo.add should return one result")
             .as_ref(),
         ReductionKind::Product => {
-            block_ref.append_operation(stable_hlo::multiply(lhs, rhs, location)?)?.result(0).unwrap().as_ref()
+            lower_product_combiner_to_mlir(lhs, rhs, element_type, &mut block_ref, context, location)?
         }
         ReductionKind::Max | ReductionKind::Min => {
             lower_extremum_to_mlir(kind == ReductionKind::Max, element_type, lhs, rhs, &mut block_ref, location)?
@@ -11724,11 +11813,7 @@ fn build_cumulative_body_region<'c, 't>(
         CumulativeKind::LogSumExp => {
             lower_log_add_exp_to_mlir(left, right, &ArrayType::scalar(element_type), &mut block_ref, context, location)?
         }
-        _ => block_ref
-            .append_operation(stable_hlo::multiply(left, right, location)?)?
-            .result(0)
-            .expect("stablehlo.multiply should return one result")
-            .as_ref(),
+        _ => lower_product_combiner_to_mlir(left, right, element_type, &mut block_ref, context, location)?,
     };
     block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
     Ok(region)
@@ -11852,7 +11937,11 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
         body_region,
         location,
     )?)?;
-    Ok(result.result(0).expect("stablehlo.reduce_window should return one result").as_ref())
+    let result = result.result(0).expect("stablehlo.reduce_window should return one result").as_ref();
+    match kind == CumulativeKind::LogSumExp && element_type.is_complex() {
+        true => lower_principal_phase_to_mlir(result, output_array_type, block, context, location),
+        false => Ok(result),
+    }
 }
 
 /// Lowers gather with its explicit index-vector axis. Fill mode masks whole out-of-bounds windows, and clip mode

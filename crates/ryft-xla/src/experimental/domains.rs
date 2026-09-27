@@ -5134,8 +5134,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::StopGradient(_)
         | ArrayOperation::Tag(_)
         | ArrayOperation::Rematerialize(_)
-        | ArrayOperation::CustomJvp(_)
-        | ArrayOperation::CustomVjp(_)
+        | ArrayOperation::CustomDerivative(_)
         | ArrayOperation::LinearCall(_) => Propagated,
     }
 }
@@ -5188,8 +5187,7 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         | XlaOperation::Condition(_)
         | XlaOperation::While(_)
         | XlaOperation::Scan(_)
-        | XlaOperation::CustomJvp(_)
-        | XlaOperation::CustomVjp(_)
+        | XlaOperation::CustomDerivative(_)
         | XlaOperation::LinearCall(_)
         | XlaOperation::Rematerialize(_)
         | XlaOperation::JitCall(_) => Propagated,

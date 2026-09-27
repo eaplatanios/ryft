@@ -37,7 +37,7 @@ use crate::macros::{
 use crate::operations::Accuracy;
 use crate::operations::arithmetic::{Add, Div, Mul, Sub};
 use crate::operations::comparisons::{Compare, ComparisonDirection};
-use crate::operations::complex::Real;
+use crate::operations::complex::{Complex, Real};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;
@@ -261,9 +261,11 @@ define_elementwise_operation!(
     /// infinities return positive infinity, and NaNs propagate. Half-precision and smaller formats use `f32`
     /// intermediates and round only the final output back to their element type.
     ///
-    /// Complex inputs factor out the lexicographically larger input, evaluate the correction in component precision,
-    /// and wrap the imaginary output into `[-π, π)`. This selects a principal logarithm branch; derivatives apply
-    /// away from its cut. Inputs that carry partial sums are rejected, and reduced-axis markers must agree.
+    /// Complex inputs factor out their larger real component `m`, as `m + log(exp(a - m) + exp(b - m))`, which never
+    /// subtracts their imaginary components from each other and so keeps both phases exact, and wrap the imaginary
+    /// output into `[-π, π)`. This selects a principal logarithm branch; derivatives apply away from its cut, and
+    /// their weights avoid subtracting imaginary components too. Inputs that carry partial sums are rejected, and
+    /// reduced-axis markers must agree.
     LogAddExpOperation,
     LOG_ADD_EXP_OPERATION_NAME,
     LogAddExp,
@@ -283,6 +285,7 @@ impl_differentiable_operation! {
             + Sub
             + Mul
             + Real
+            + Complex
             + Exp
             + LogAddExp
             + And
@@ -351,6 +354,29 @@ impl_differentiable_operation! {
             };
 
             let output_exponent = replace_infinity(aligned_primal, real_output)?;
+
+            // Subtracting a complex output from a complex input also subtracts their imaginary components, which
+            // loses the input's phase when the two differ widely in magnitude. Complex weights therefore split the
+            // exponential around the real component `s` of the output, as `exp(input - s) · exp(s - output)`, which
+            // is identical in exact arithmetic but only ever subtracts real components. Real weights keep the single
+            // exponential.
+            let (output_exponent, output_phase) = if target.is_complex() {
+                let shift = real(&output_exponent)?;
+                let shift = shift.complex(&shift.zero_like()?)?;
+                let phase = shift.sub(&output_exponent)?.exp()?;
+                (shift, Some(phase))
+            } else {
+                (output_exponent, None)
+            };
+
+            let weight = |input: C::Value| -> Result<C::Value, DifferentiationError> {
+                let weight = input.sub(&output_exponent)?.exp()?;
+                Ok(match &output_phase {
+                    Some(phase) => weight.mul(phase)?,
+                    None => weight,
+                })
+            };
+
             let left_term = left
                 .tangent()
                 .as_value()
@@ -358,10 +384,10 @@ impl_differentiable_operation! {
                     let input = context.primal_to_tangent(left.primal().clone())?.align_tangent(&target, &primal)?;
                     let component = real(&input)?;
                     let input = replace_infinity(input, component)?;
-                    let weight = input.sub(&output_exponent)?.exp()?;
-                    Ok::<_, DifferentiationError>(weight.mul(&tangent.align_tangent(&target, &primal)?)?)
+                    Ok::<_, DifferentiationError>(weight(input)?.mul(&tangent.align_tangent(&target, &primal)?)?)
                 })
                 .transpose()?;
+
             let right_term = right
                 .tangent()
                 .as_value()
@@ -369,15 +395,16 @@ impl_differentiable_operation! {
                     let input = context.primal_to_tangent(right.primal().clone())?.align_tangent(&target, &primal)?;
                     let component = real(&input)?;
                     let input = replace_infinity(input, component)?;
-                    let weight = input.sub(&output_exponent)?.exp()?;
-                    Ok::<_, DifferentiationError>(weight.mul(&tangent.align_tangent(&target, &primal)?)?)
+                    Ok::<_, DifferentiationError>(weight(input)?.mul(&tangent.align_tangent(&target, &primal)?)?)
                 })
                 .transpose()?;
+
             let tangent = match (left_term, right_term) {
                 (Some(left), Some(right)) => MaybeZero::Value(left.add(&right)?),
                 (Some(value), None) | (None, Some(value)) => MaybeZero::Value(value),
                 (None, None) => MaybeZero::Zero(target),
             };
+
             Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
         }
     },
@@ -1356,6 +1383,24 @@ mod tests {
             epsilon = 1e-15,
         );
         assert_abs_diff_eq!(tangent, Array::scalar(ComplexNumber::new(1.0, 0.0)).unwrap(), epsilon = 1e-15);
+
+        // Inputs whose imaginary components differ widely in magnitude keep both phases in the output and in the
+        // coefficients, which are the softmax weights of their exponentials. Subtracting `1e16` from `1` would round
+        // to a multiple of two and shift the smaller input's phase by a full radian.
+        let first = ComplexNumber::new(0.0f64, 1e16);
+        let second = ComplexNumber::new(-1.0f64, 1.0);
+        let total = first.exp() + second.exp();
+        let (output, tangent) = differentiate_at((Array::scalar(first).unwrap(), Array::scalar(second).unwrap()))
+            .jvp(
+                (
+                    Array::scalar(ComplexNumber::new(0.0f64, 0.0)).unwrap(),
+                    Array::scalar(ComplexNumber::new(1.0, 0.0)).unwrap(),
+                ),
+                |(left, right)| left.log_add_exp(&right),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(output, Array::scalar(total.ln()).unwrap(), epsilon = 1e-15);
+        assert_abs_diff_eq!(tangent, Array::scalar(second.exp() / total).unwrap(), epsilon = 1e-15);
     }
 
     #[test]

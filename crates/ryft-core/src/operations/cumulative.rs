@@ -53,6 +53,8 @@
 use std::borrow::Cow;
 use std::fmt::Display;
 
+use num_complex::Complex;
+
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayType, DataType, Dimension, FloatingPointArrayElement,
     NumericArrayElement, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity, ShardingDimension, StaticShape,
@@ -126,8 +128,12 @@ pub enum CumulativeKind {
     /// component is negative infinity has a zero exponential whatever its imaginary component, and so the combiner
     /// returns the other operand unchanged. That shortcut is exact, and it is what keeps complex prefixes over such
     /// operands defined: the elementwise complex combination of two of them would subtract `-∞` from `-∞` and produce
-    /// NaN (real combinations already return the other operand). Differentiation goes through the elementwise
-    /// combination instead, so under differentiation such complex prefixes are NaN, as they are in JAX.
+    /// NaN (real combinations already return the other operand). A prefix that no combination produced (i.e., the
+    /// first one, or one following a prefix whose real component is negative infinity) is wrapped onto the same
+    /// principal branch, so that every prefix, and in particular the last one, agrees with the matching
+    /// [`ReductionKind::LogSumExp`](crate::ReductionKind::LogSumExp) reduction. Differentiation goes through the
+    /// elementwise combination instead, so under differentiation such complex prefixes are NaN, and the first prefix
+    /// is the raw first input.
     ///
     /// Padding is filled with the element data type's lowest real value (i.e., [`RaggedMaskIdentity::LowestReal`]),
     /// which must be an identity of the rounded pairwise [`LogAddExp`] operation. True negative infinity satisfies this
@@ -372,8 +378,8 @@ impl_differentiable_operation! {
             // the primal output of an extremum scan over signed zeros can differ from the undifferentiated one in the
             // sign of a zero. Similarly, the decomposition combines log-sum-exp prefixes with the unguarded elementwise
             // `log_add_exp`, so a complex prefix that combines two operands with negative-infinite real components is
-            // NaN there, while the primitive returns the other operand. JAX's `_cumulative_jvp_rule` has both
-            // properties.
+            // NaN there, while the primitive returns the other operand, and its first complex prefix is the raw first
+            // input, while the primitive wraps it onto the principal branch.
             let dual = match kind {
                 CumulativeKind::Sum => {
                     let primal = primal_input.cumulative(axis, kind, reverse)?;
@@ -612,6 +618,29 @@ impl Cumulative for Array {
                             FloatingPointArrayElement::log_add_exp(left, right)
                         }
                     })?;
+
+                    // A prefix that no combination produced (i.e., the first element, or one that follows a prefix
+                    // whose real component is negative infinity) is still a raw input, so its phase is wrapped onto
+                    // the principal branch that every combined prefix already lies on. In-range phases are kept as
+                    // they are, so that tiny ones do not round away through the shift by `pi`.
+                    let scanned = match data_type.is_complex() {
+                        true => scanned
+                            .into_iter()
+                            .map(|value| {
+                                let complex = value.convert_to::<Complex<f64>>()?;
+                                let pi = std::f64::consts::PI;
+                                if complex.im >= -pi && complex.im < pi {
+                                    return Ok(value);
+                                }
+                                let mut imaginary = (complex.im + pi) % (2.0 * pi);
+                                if imaginary < 0.0 {
+                                    imaginary += 2.0 * pi;
+                                }
+                                Element::from_complex(Complex::new(complex.re, imaginary - pi))
+                            })
+                            .collect::<Result<Vec<_>, ProgramError>>()?,
+                        false => scanned,
+                    };
                     Self::from_elements(output_type, scanned.as_slice())
                 })
             }
@@ -1860,7 +1889,8 @@ mod tests {
         // zero exponential, so it leaves the other operand unchanged. That includes a pair of such operands, whose
         // elementwise complex combination would subtract `-∞` from `-∞` and produce NaN; the reverse scan combines one.
         let first = ComplexNumber::new(1.0f64, 2.0);
-        let doubled = ComplexNumber::new(1.0 + std::f64::consts::LN_2, 2.0);
+        let doubled = FloatingPointArrayElement::log_add_exp(first, first).unwrap();
+        assert!((doubled - ComplexNumber::new(1.0 + std::f64::consts::LN_2, 2.0)).norm() < 1e-15);
         let complex = Array::vector(vec![
             first,
             first,
@@ -1882,6 +1912,18 @@ mod tests {
             ])
             .unwrap()),
         );
+
+        // A prefix that no combination produced is still wrapped onto the principal branch, like every combined prefix
+        // and like the matching log-sum-exp reduction.
+        let raw = Array::vector(vec![ComplexNumber::new(1.0f64, 4.0), ComplexNumber::new(f64::NEG_INFINITY, 0.0)])
+            .unwrap()
+            .cumulative_log_sum_exp(0)
+            .unwrap()
+            .elements::<ComplexNumber<f64>>()
+            .unwrap();
+        for value in raw {
+            assert!((value - ComplexNumber::new(1.0, 4.0 - 2.0 * std::f64::consts::PI)).norm() < 1e-15);
+        }
     }
 
     #[test]

@@ -23,9 +23,9 @@ use ryft_core::{
     CaptureConstant, CaptureReference, CeilOperation, ClampOperation, CompareOperation, CompiledCallOperation,
     ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, ConstrainShardingOperation, Context,
     ConvertElementTypeOperation, CosOperation, CotangentDestinationKind, CotangentDestinations, CumulativeOperation,
-    CustomJvpOperation, CustomVjpOperation, DataType, DifferentiableOperation, DifferentiableType,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
+    CustomDerivativeOperation, DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension,
+    DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
     DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
     DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
     DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
@@ -506,11 +506,8 @@ where
     /// Backend-owned scan whose attached body region can contain XLA operations.
     Scan(ScanOperation<Constant>),
 
-    /// Backend-owned custom JVP call whose attached regions can contain XLA operations.
-    CustomJvp(CustomJvpOperation<ArrayIrType>),
-
-    /// Backend-owned custom VJP call whose attached regions can contain XLA operations.
-    CustomVjp(CustomVjpOperation<ArrayIrType>),
+    /// Backend-owned custom derivative call whose attached regions can contain XLA operations.
+    CustomDerivative(CustomDerivativeOperation<ArrayIrType>),
 
     /// Differentiation-owned call to an explicitly transposable linear map with ordinary trailing residual
     /// operands. This variant carries both carrier forms: the forward-and-transpose form lowers by inlining its
@@ -684,8 +681,7 @@ where
                         .with_captures(captures),
                 )
             }
-            ArrayIrOperation::CustomJvp(operation) => Self::CustomJvp(operation),
-            ArrayIrOperation::CustomVjp(operation) => Self::CustomVjp(operation),
+            ArrayIrOperation::CustomDerivative(operation) => Self::CustomDerivative(operation),
             ArrayIrOperation::LinearCall(operation) => Self::LinearCall(operation),
             ArrayIrOperation::Rematerialize(operation) => Self::Rematerialize(operation),
         }
@@ -911,8 +907,7 @@ where
             | Self::Condition(_)
             | Self::While(_)
             | Self::Scan(_)
-            | Self::CustomJvp(_)
-            | Self::CustomVjp(_)
+            | Self::CustomDerivative(_)
             | Self::LinearCall(_)
             | Self::Rematerialize(_)
             | Self::JitCall(_)

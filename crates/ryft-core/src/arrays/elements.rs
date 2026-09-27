@@ -288,8 +288,11 @@ pub trait FloatingPointArrayElement: NumericArrayElement {
 
     /// Computes `log(exp(self) + exp(other))` without forming the potentially overflowing exponentials. Equal-sign
     /// infinities return that infinity, opposite-sign infinities return positive infinity, and NaNs propagate,
-    /// subject to the destination format's representability rules. Complex outputs have imaginary parts in
-    /// `[-pi, pi)`. Real formats narrower than `f32` compute the composition in `f32` before conversion.
+    /// subject to the destination format's representability rules. Complex inputs are shifted by their larger real
+    /// component `m` (i.e., `m + log(exp(self - m) + exp(other - m))`), which never subtracts their imaginary
+    /// components from each other and so keeps both phases exact even when their magnitudes differ widely. Complex
+    /// outputs have imaginary parts in `[-π, π)`. Real formats narrower than `f32` compute the composition in `f32`
+    /// before conversion.
     fn log_add_exp(self, other: Self) -> Result<Self, ProgramError>;
 
     /// Computes the logistic function `1 / (1 + exp(-self))`, extended to complex elements by the same expression.
@@ -2198,14 +2201,23 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
             }
 
             fn log_add_exp(self, other: Self) -> Result<Self, ProgramError> {
-                let (maximum, minimum) = if self.re > other.re || (self.re == other.re && self.im > other.im) {
-                    (self, other)
+                // Shift by the larger real component alone, which bounds both exponentials without subtracting the
+                // imaginary components from each other (that subtraction loses phase when their magnitudes differ).
+                // Infinite shifts keep the lexicographic `max + ln_1p(exp(min - max))` form, which resolves them.
+                let shift = self.re.max(other.re);
+                let output = if shift.is_finite() {
+                    let shift = Complex::new(shift, 0.0);
+                    Complex::ln((self - shift).exp() + (other - shift).exp()) + shift
                 } else {
-                    (other, self)
+                    let (maximum, minimum) = if self.re > other.re || (self.re == other.re && self.im > other.im) {
+                        (self, other)
+                    } else {
+                        (other, self)
+                    };
+                    maximum + FloatingPointArrayElement::ln_1p((minimum - maximum).exp())?
                 };
 
-                // Subtract before exponentiating, then wrap the argument onto the principal branch.
-                let output = maximum + FloatingPointArrayElement::ln_1p((minimum - maximum).exp())?;
+                // Wrap the argument onto the principal branch.
                 let pi = std::f64::consts::PI as $component;
                 if output.im >= -pi && output.im < pi {
                     return Ok(output);
@@ -3777,8 +3789,16 @@ mod tests {
         );
 
         let output = FloatingPointArrayElement::log_add_exp(Complex::new(0.0f64, 4.0), Complex::new(0.0, 4.0)).unwrap();
-        assert_eq!(output.re, std::f64::consts::LN_2);
-        assert_eq!(output.im, 4.0 - 2.0 * std::f64::consts::PI);
+        assert!((output.re - std::f64::consts::LN_2).abs() < 1e-15);
+        assert!((output.im - (4.0 - 2.0 * std::f64::consts::PI)).abs() < 1e-15);
+
+        // The shift is real, so neither phase is rounded against the other: `exp(1e16 i)` and `exp(i)` keep their exact
+        // phases, where the lexicographic `max + ln_1p(exp(min - max))` form would subtract `1e16 - 1`, which rounds
+        // to a multiple of two and so shifts the smaller operand's phase by a full radian.
+        let (first, second) = (Complex::new(0.0f64, 1e16), Complex::new(-1.0f64, 1.0));
+        let output = FloatingPointArrayElement::log_add_exp(first, second).unwrap();
+        let expected = (first.exp() + second.exp()).ln();
+        assert!((output - expected).norm() < 1e-15, "expected {expected} but got {output}");
         let output =
             FloatingPointArrayElement::log_add_exp(Complex::new(0.0f64, 1e-20), Complex::new(0.0, 1e-20)).unwrap();
         assert_eq!(output.im, 1e-20);
