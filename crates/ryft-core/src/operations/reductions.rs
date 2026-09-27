@@ -1098,6 +1098,84 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 
 // TODO(eaplatanios): Review from here onwards.
 
+impl Array {
+    /// Replaces every element of this array in place through one typed function. The physical layout is preserved,
+    /// and uniquely owned output buffers are mutated without another payload allocation.
+    fn map_elements_in_place<T: ArrayElement>(
+        &mut self,
+        function: impl Fn(T) -> Result<T, ProgramError>,
+    ) -> Result<(), ProgramError> {
+        debug_assert_eq!(self.r#type().data_type(), T::data_type());
+        let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let bytes = self.storage_bytes_mut();
+        for element in 0..addressing.element_count() {
+            let range = addressing.byte_range_for_flat_index(element);
+            let value = T::decode(&bytes[range.clone()]);
+            function(value)?.encode(&mut bytes[range]);
+        }
+        Ok(())
+    }
+
+    /// Reduces typed elements directly from addressed input storage into one addressed output buffer. `identity`
+    /// initializes every output cell, including those whose reduced axes are empty.
+    fn reduce_elements<T: ArrayElement>(
+        &self,
+        output_type: ArrayType,
+        axes: &[usize],
+        identity: T,
+        combine: impl Fn(T, T) -> Result<T, ProgramError>,
+    ) -> Result<Self, ProgramError> {
+        debug_assert_eq!(self.r#type().data_type(), T::data_type());
+        debug_assert_eq!(output_type.data_type(), T::data_type());
+        let input_shape = self.r#type().static_shape().unwrap();
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut reduce_mask = vec![false; input_shape.rank()];
+        axes.iter().for_each(|axis| reduce_mask[*axis] = true);
+
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        for output in 0..output_addressing.element_count() {
+            identity.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output)]);
+        }
+
+        let mut input_index = vec![0usize; input_shape.rank()];
+        let mut output_index = vec![0usize; output_type.rank()];
+        for _ in 0..input_addressing.element_count() {
+            let mut output_axis = 0usize;
+            for axis in 0..input_shape.rank() {
+                if !reduce_mask[axis] {
+                    output_index[output_axis] = input_index[axis];
+                    output_axis += 1;
+                }
+            }
+            let input_value = T::decode(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
+            let output_range = output_addressing.byte_range_unchecked(&output_index);
+            let value = combine(T::decode(&bytes[output_range.clone()]), input_value)?;
+            value.encode(&mut bytes[output_range]);
+            input_addressing.advance_index(&mut input_index);
+        }
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
+    }
+
+    /// Accumulates a sum, optionally dividing each output by the reduced element count. Integer arithmetic wraps
+    /// in the element type and retains zero for empty means; floating-point and complex empty means produce NaNs.
+    fn reduce_sum_or_mean_elements<T: ElementDivideByCount>(
+        &self,
+        output_type: ArrayType,
+        axes: &[usize],
+        mean: bool,
+    ) -> Result<Self, ProgramError> {
+        let mut output = self.reduce_elements::<T>(output_type, axes, T::zero()?, T::add)?;
+        if mean {
+            let shape = self.r#type().static_shape().unwrap();
+            let count = axes.iter().map(|axis| shape[*axis]).product::<usize>();
+            let count = if T::data_type().is_integer() { count.max(1) } else { count };
+            output.map_elements_in_place::<T>(|value| value.divide_by_count(count))?;
+        }
+        Ok(output)
+    }
+}
+
 /// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own because a
 /// mean lowers to a sum followed by a division by the reduced element count.
 trait ElementDivideByCount: NumericArrayElement {
@@ -1271,84 +1349,6 @@ macro_rules! impl_element_divide_by_count_for_complex {
 
 impl_element_divide_by_count_for_complex!(f32);
 impl_element_divide_by_count_for_complex!(f64);
-
-impl Array {
-    /// Replaces every element of this array in place through one typed function. The physical layout is preserved,
-    /// and uniquely owned output buffers are mutated without another payload allocation.
-    fn map_elements_in_place<T: ArrayElement>(
-        &mut self,
-        function: impl Fn(T) -> Result<T, ProgramError>,
-    ) -> Result<(), ProgramError> {
-        debug_assert_eq!(self.r#type().data_type(), T::data_type());
-        let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-        let bytes = self.storage_bytes_mut();
-        for element in 0..addressing.element_count() {
-            let range = addressing.byte_range_for_flat_index(element);
-            let value = T::decode(&bytes[range.clone()]);
-            function(value)?.encode(&mut bytes[range]);
-        }
-        Ok(())
-    }
-
-    /// Reduces typed elements directly from addressed input storage into one addressed output buffer. `identity`
-    /// initializes every output cell, including those whose reduced axes are empty.
-    fn reduce_elements<T: ArrayElement>(
-        &self,
-        output_type: ArrayType,
-        axes: &[usize],
-        identity: T,
-        combine: impl Fn(T, T) -> Result<T, ProgramError>,
-    ) -> Result<Self, ProgramError> {
-        debug_assert_eq!(self.r#type().data_type(), T::data_type());
-        debug_assert_eq!(output_type.data_type(), T::data_type());
-        let input_shape = self.r#type().static_shape().unwrap();
-        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-        let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let mut reduce_mask = vec![false; input_shape.rank()];
-        axes.iter().for_each(|axis| reduce_mask[*axis] = true);
-
-        let mut bytes = vec![0; output_addressing.storage_byte_len()];
-        for output in 0..output_addressing.element_count() {
-            identity.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output)]);
-        }
-
-        let mut input_index = vec![0usize; input_shape.rank()];
-        let mut output_index = vec![0usize; output_type.rank()];
-        for _ in 0..input_addressing.element_count() {
-            let mut output_axis = 0usize;
-            for axis in 0..input_shape.rank() {
-                if !reduce_mask[axis] {
-                    output_index[output_axis] = input_index[axis];
-                    output_axis += 1;
-                }
-            }
-            let input_value = T::decode(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
-            let output_range = output_addressing.byte_range_unchecked(&output_index);
-            let value = combine(T::decode(&bytes[output_range.clone()]), input_value)?;
-            value.encode(&mut bytes[output_range]);
-            input_addressing.advance_index(&mut input_index);
-        }
-        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
-    }
-
-    /// Accumulates a sum, optionally dividing each output by the reduced element count. Integer arithmetic wraps
-    /// in the element type and retains zero for empty means; floating-point and complex empty means produce NaNs.
-    fn reduce_sum_or_mean_elements<T: ElementDivideByCount>(
-        &self,
-        output_type: ArrayType,
-        axes: &[usize],
-        mean: bool,
-    ) -> Result<Self, ProgramError> {
-        let mut output = self.reduce_elements::<T>(output_type, axes, T::zero()?, T::add)?;
-        if mean {
-            let shape = self.r#type().static_shape().unwrap();
-            let count = axes.iter().map(|axis| shape[*axis]).product::<usize>();
-            let count = if T::data_type().is_integer() { count.max(1) } else { count };
-            output.map_elements_in_place::<T>(|value| value.divide_by_count(count))?;
-        }
-        Ok(output)
-    }
-}
 
 /// Returns the output [`ArrayType`] produced by reducing `input` along `axes` with `kind`.
 ///
