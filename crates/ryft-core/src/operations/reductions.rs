@@ -391,7 +391,7 @@ impl<D: Domain<Type = ArrayType, Value: Reduce>> InterpretableOperation<D> for R
     }
 }
 
-impl<C: Context<Type = ArrayType>, Operation: From<ReduceOperation>> PartiallyEvaluatableOperation<C>
+impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>> PartiallyEvaluatableOperation<C>
     for ReduceOperation
 {
 }
@@ -982,21 +982,22 @@ pub trait Reduce: Sized {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Reduce for Array {
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError> {
         if axes.is_empty() {
             ReduceOperation::new(Vec::new(), kind).infer_output_types(&[self.r#type().into_owned()], &[])?;
             return Ok(self.clone());
         }
+
         let data_type = self.r#type().data_type();
-        // Reuse the abstract rule for validation and for the complete output metadata. The concrete kernel below then
-        // decodes directly from the input's physical layout into the output's addressed storage.
+
+        // Reuse the abstract rule for validation and for the complete output metadata. The concrete kernel below
+        // then decodes directly from the input's physical layout into the output's addressed storage.
         let output_type = reduce_abstract(self.r#type().as_ref(), axes, kind)?;
         if data_type == DataType::Zero {
             return Self::new(output_type, Vec::new());
         }
+
         // Narrow floating-point reductions accumulate and normalize in `f32`. Rounding only the final output
         // avoids losing small contributions and overflowing the element count used by a mean.
         if data_type.is_floating_point()
@@ -1005,7 +1006,8 @@ impl Reduce for Array {
         {
             return self.convert_element_type(DataType::F32)?.reduce(axes, kind)?.convert_element_type(data_type);
         }
-        let output = match kind {
+
+        match kind {
             ReductionKind::LogSumExp => {
                 dispatch_on_array_element_type!(@float data_type, |Element| {
                     self.log_sum_exp_elements::<Element>(output_type, axes)
@@ -1022,11 +1024,8 @@ impl Reduce for Array {
             }
             ReductionKind::Max | ReductionKind::Min => {
                 dispatch_on_array_element_type!(data_type, |Element| {
-                    let identity = if kind == ReductionKind::Max {
-                        <Element as ArrayElement>::max_identity()
-                    } else {
-                        <Element as ArrayElement>::min_identity()
-                    };
+                    let identity =
+                        if kind == ReductionKind::Max { Element::max_identity() } else { Element::min_identity() };
                     self.reduce_elements::<Element>(output_type, axes, identity, |left, right| {
                         Ok(if kind == ReductionKind::Max {
                             ArrayElement::max(&left, &right)
@@ -1040,8 +1039,7 @@ impl Reduce for Array {
                 self.reduce_elements::<bool>(output_type, axes, false, |left, right| Ok(left | right))
             }
             ReductionKind::All => self.reduce_elements::<bool>(output_type, axes, true, |left, right| Ok(left & right)),
-        };
-        output
+        }
     }
 
     fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError> {
@@ -1057,15 +1055,12 @@ impl Reduce for Array {
     }
 }
 
-// Any context-carrying value reduces by binding a [`ReduceOperation`] through its own context. The
-// `From<ReduceOperation>` bound makes this disjoint from the eager value types (whose context operation is
-// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType>> Reduce for V
-where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReduceOperation>,
+// Any context-carrying value reduces by binding a `ReduceOperation` through its context. The `From<ReduceOperation>`
+// bound makes this disjoint from the eager value types (whose context operation is `ConstantOperation`), so it covers
+// the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<ReduceOperation>>>> Reduce
+    for V
 {
-    #[inline]
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError> {
         if axes.is_empty() {
             ReduceOperation::new(Vec::new(), kind).infer_output_types(&[self.r#type().into_owned()], &[])?;
@@ -1080,7 +1075,6 @@ where
         Ok(outputs.remove(0))
     }
 
-    #[inline]
     fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError> {
         // Without a requested sharding, a sum is an ordinary reduction. A requested sharding is staged even when no
         // axes are reduced, because it may still change how the output is distributed.
@@ -1096,6 +1090,8 @@ where
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own because a
 /// mean lowers to a sum followed by a division by the reduced element count.
