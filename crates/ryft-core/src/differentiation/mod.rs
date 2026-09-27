@@ -21,8 +21,8 @@
 //!   - [`DifferentiationBuilder::linearize`] runs the primal computation once and returns its value together with a
 //!     reusable [`Pushforward`] that can be applied to many tangent inputs without repeating nonlinear primal work.
 //!   - [`DifferentiationBuilder::vjp`] runs the primal computation and returns a reusable [`Pullback`] mapping output
-//!     cotangents to input cotangents. Conceptually, `vjp = linearize + transpose` and corresponds to what is known as
-//!     the Vector-Jacobian Product (VJP).
+//!     cotangents to input cotangents. It prepares a derivative carrier using reverse-specific rules, then transposes
+//!     that carrier to compute the Vector-Jacobian Product (VJP). By default, preparation uses the standard JVP rules.
 //!   - [`DifferentiationBuilder::value_and_gradient`] and [`DifferentiationBuilder::gradient`] are scalar-output
 //!     conveniences that seed the pullback with one.
 //!   - [`DifferentiationBuilder::jacobian_forward`] and [`DifferentiationBuilder::jacobian_reverse`] materialize
@@ -88,11 +88,16 @@
 //!
 //! # Reverse Mode Differentiation
 //!
-//! Reverse mode differentiation reuses forward linearization instead of maintaining an independent nonlinear trace.
-//! The linearized tangent program is transposed by applying [`TransposableOperation`] rules in reverse dataflow order,
+//! Reverse mode differentiation reuses the forward partitioning machinery while selecting
+//! [`DifferentiableOperation::jvp_for_transpose`]. Its default delegates to the standard JVP rule while an override
+//! can choose a separate primal preparation and residual policy without changing public forward linearization. The
+//! resulting derivative carrier is transposed by applying [`TransposableOperation`] rules in reverse dataflow order,
 //! and the result is a [`Pullback`] that accepts output cotangents, consumes saved residuals, and accumulates input
 //! cotangents. This architecture keeps primal execution, residualization, and linear algebra as separate, composable
-//! concerns.
+//! concerns. Nested region requests preserve rule selection, and the two derivative rules use distinct cache keys.
+//! Differentiating a selected rule body starts an ordinary transform of that body; the rule selection does not change
+//! the surrounding transform. A caller explicitly transposing a public forward linearization still gets the transpose
+//! of that selected JVP, rather than an independently registered reverse rule.
 //!
 //! # Gradients of Reference Inputs
 //!
@@ -367,6 +372,27 @@ impl From<DifferentiationError> for ProgramError {
             error => ProgramError::custom(error),
         }
     }
+}
+
+/// Selects which derivative rule a [`DifferentiationContext`] applies when constructing a derivative
+/// program. [`Self::Jvp`] selects [`DifferentiableOperation::jvp`] for executable forward derivatives, while
+/// [`Self::JvpForTranspose`] selects [`DifferentiableOperation::jvp_for_transpose`] for derivatives that will be
+/// transposed by reverse-mode differentiation. Both use the same dual propagation and partitioning machinery; this
+/// selection is independent of the policy that determines where primal and tangent operations execute or are staged.
+///
+/// Context projection and recursive region drivers preserve the selected rule so that nested operations use the same
+/// contract as their enclosing derivative construction. Transform cache keys also include this selection: the two
+/// rules may compute different primal intermediates, save different residuals, or produce different tangent programs,
+/// so an artifact derived with one rule cannot generally be reused for the other. A separate differentiation transform
+/// applied to a generated rule program selects its own rule rather than inheriting the enclosing transform's choice.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DifferentiationRule {
+    /// Use [`DifferentiableOperation::jvp`] to construct an executable JVP or reusable pushforward.
+    Jvp,
+
+    /// Use [`DifferentiableOperation::jvp_for_transpose`] to construct primal outputs and a derivative program that
+    /// supports transposition but need not support execution as a pushforward.
+    JvpForTranspose,
 }
 
 /// Position of a value at a differentiation boundary, numbered within its flattened parameter group.
@@ -854,11 +880,12 @@ impl<Input, ContextState>
     /// [JAX's `vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.vjp.html). Applying the pullback maps an output
     /// cotangent tree to the corresponding input cotangent tree at the builder's fixed primal point.
     ///
-    /// Reverse mode differentiation first performs the partial-evaluation-backed linearization described by
-    /// [`linearize`](Self::linearize) and then transposes its linear program by applying [`TransposableOperation`]
-    /// rules in reverse dataflow order. The returned pullback closes that transposed program over the saved
-    /// linearization residuals, so [`Pullback::apply`] handles residual arguments and reconstructs the structured
-    /// input cotangents. Callers only provide output cotangents.
+    /// Reverse mode uses the partitioning machinery of [`linearize`](Self::linearize), selecting
+    /// [`DifferentiableOperation::jvp_for_transpose`] before primal work executes. Its default delegates to
+    /// the standard JVP rule while overrides can select independent residuals and backward implementations.
+    /// [`TransposableOperation`] rules transpose the prepared derivative carrier in reverse dataflow order. The
+    /// returned pullback closes that program over the saved residuals, so [`Pullback::apply`] handles residual
+    /// arguments and reconstructs the structured input cotangents. Callers only provide output cotangents.
     ///
     /// # Parameters
     ///
@@ -1573,10 +1600,10 @@ impl<Input, Capture, ContextState>
 
     /// Reverse-mode-differentiates `function` with respect to the active primal while holding runtime captures fixed.
     ///
-    /// For `y = f(x; c)`, this returns `f(x; c)` and the reusable map
-    /// `ȳ ↦ x̄ = (∂f/∂x)(x; c)ᵀ · ȳ`. Reverse mode linearizes the function and transposes only the active
-    /// tangent program. Captures may remain among the residual values closed over by the [`Pullback`], but callers
-    /// provide only output cotangents and receive cotangents only for `x`; no capture cotangent tree is constructed.
+    /// For `y = f(x; c)`, this returns `f(x; c)` and the reusable map `ȳ ↦ x̄ = (∂f/∂x)(x; c)ᵀ · ȳ`. Reverse mode
+    /// selects [`DifferentiableOperation::jvp_for_transpose`] and transposes the active derivative carrier. Captures
+    /// may remain among the residuals closed over by the [`Pullback`], but callers provide only output cotangents and
+    /// receive cotangents only for `x`; no capture cotangent tree is constructed.
     ///
     /// The active primal tree, not the capture tree, must contain at least one leaf.
     ///
