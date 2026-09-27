@@ -44,20 +44,20 @@ use pretty_assertions::assert_eq;
 use ryft_core::{
     AddOperation, Array, ArrayIrType, ArrayIrValue, ArrayType, AtomId, BatchAxis, BatchAxisSpecification,
     BatchableOperation, BatchableReferenceTransform, BatchableType, BatchedOutputs, BatchingContext, BatchingDriver,
-    BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BoundReferenceTransform, BoundaryPreservingBatchedProgram,
-    BroadcastOperation, CompareOperation, ConstantOperation, Context, ConvertElementTypeOperation,
-    CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentSeed, DataType,
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, DivOperation, Domain, EagerContext, EffectClass, EffectClasses,
-    Effects, ExpOperation, ExternalReferenceBinding, InputRegionProvenance, InstructionId, InterpretableOperation,
-    InterpretationDriver, MaybeZero, MemberDifferentiableOperation, MemberTransposableOperation, MulOperation,
-    NegOperation, NoIdentity, NoReferenceTransform, OneLikeOperation, OneOperation, Operation, OperationFormatter,
-    OperationProvider, OutputRegionProvenance, ParallelVaryOperation, Parameter, PartialValue,
-    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError,
-    ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, ReduceOperation, Reference,
-    ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
+    BoundReferenceTransform, BoundaryPreservingBatchedProgram, BroadcastOperation, CompareOperation, ConstantOperation,
+    Context, ConvertElementTypeOperation, CotangentAccumulator, CotangentDestination, CotangentDestinationKind,
+    CotangentSeed, DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, DivOperation, Domain,
+    EagerContext, EffectClass, EffectClasses, Effects, ExpOperation, ExternalReferenceBinding, InputRegionProvenance,
+    InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero, MemberDifferentiableOperation,
+    MemberTransposableOperation, MulOperation, NegOperation, NoIdentity, NoReferenceTransform, OneLikeOperation,
+    OneOperation, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance, ParallelVaryOperation,
+    Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
+    ProgramBuilder, ProgramError, ProjectedContext, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver,
+    ReduceOperation, Reference, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation,
+    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceBoundary, ReferenceBoundaryError,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
     ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceMemberType, ReferenceNew, ReferenceNewOperation,
@@ -1365,22 +1365,30 @@ impl<C: Context<Type = RegisterIrType>> BatchingPolicy<C> for RegisterBatching {
 
 // The register universe batches region-free operations only; recursion into nested programs is left unsupported.
 impl<C: Context<Type = RegisterIrType>> RecursiveBatchingPolicy<C> for RegisterBatching {
-    fn batch_region(
-        _context: &BatchingContext<C, Self>,
+    fn batching_level(context: &BatchingContext<C, Self>) -> BatchingLevel<RegisterIrType> {
+        BatchingLevel::new(
+            BatchingLevelExtent::Static(*context.axis_extent()),
+            context.axis_name().map(str::to_string),
+            context.axis_sharding().clone(),
+        )
+    }
+
+    fn batch_program_at_level(
+        _level: &BatchingLevel<RegisterIrType>,
         _region: RegionRef<'_, C::Constant, C::Operation>,
-        _inputs: Vec<Self::Batch>,
-    ) -> Result<Vec<Self::Batch>, BatchingError> {
+        _input_axes: &[BatchAxis],
+        _output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<Self::BatchedProgram, BatchingError> {
         Err(BatchingError::UnsupportedOperation {
             message: "the register universe batches region-free operations only".to_string(),
         })
     }
 
-    fn batch_program(
+    fn batch_region(
         _context: &BatchingContext<C, Self>,
         _region: RegionRef<'_, C::Constant, C::Operation>,
-        _input_axes: &[BatchAxis],
-        _output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<Self::BatchedProgram, BatchingError> {
+        _inputs: Vec<Self::Batch>,
+    ) -> Result<Vec<Self::Batch>, BatchingError> {
         Err(BatchingError::UnsupportedOperation {
             message: "the register universe batches region-free operations only".to_string(),
         })
@@ -2364,6 +2372,8 @@ fn test_downstream_reference_universe_vjp_with_a_local_allocation() {
 
 #[test]
 fn test_downstream_reference_operation_providers_support_value_only_composite_families() {
+    use ryft_core::{ConcatenateOperation, PadOperation, SliceOperation, UpdateSliceOperation};
+
     // A downstream family can use the core composite type without supporting reference operations. Owning the
     // providers on the operation family lets it opt into ordinary gradients without an orphan-rule conflict.
     /// Ordinary array primitives needed by elementwise differentiation and its shape alignment rules.
@@ -2385,6 +2395,10 @@ fn test_downstream_reference_operation_providers_support_value_only_composite_fa
         Transpose(TransposeOperation),
         Reshape(ReshapeOperation),
         Reduce(ReduceOperation),
+        Concatenate(ConcatenateOperation<ArrayType>),
+        Slice(SliceOperation),
+        UpdateSlice(UpdateSliceOperation),
+        Pad(PadOperation<ArrayType>),
         Reshard(ReshardOperation),
         Compare(CompareOperation<ArrayType>),
         Div(DivOperation<ArrayType>),

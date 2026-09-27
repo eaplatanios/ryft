@@ -2182,14 +2182,81 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_reduce_product() {
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+        let input_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|value| value.reduce_product(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let gradient = compiled.gradient(&engine).unwrap();
+
+        // A zero factor retains the product of the other factors in its derivative; two zeros erase every term.
+        for (values, expected, expected_gradient) in [
+            ([2f32, 3., 4.], 24., vec![12., 8., 6.]),
+            ([0f32, 3., 4.], 0., vec![12., 0., 0.]),
+            ([0f32, 0., 4.], 0., vec![0., 0., 0.]),
+        ] {
+            let input =
+                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
+            let output = engine.interpret(&compiled.executable_function(), input.clone()).unwrap();
+            assert_eq!(read_f32_array(&client, &output), vec![expected]);
+            let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+            assert_eq!(read_f32_array(&client, &output), expected_gradient);
+        }
+    }
+
+    #[test]
+    fn test_compile_reduce_product_sharded_gradient() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
+        let engine = XlaDomain::new(&client);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|value| value.reduce_product(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let gradient = compiled.gradient(&engine).unwrap();
+
+        // Each input cotangent depends on factors held by the other device, including the sole zero's cotangent.
+        for (values, expected) in
+            [([2f32, 3., 4., 5.], vec![60f32, 40., 30., 24.]), ([0f32, 3., 4., 5.], vec![60f32, 0., 0., 0.])]
+        {
+            let input =
+                Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
+            let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+            assert_eq!(output.sharding(), input_type.sharding().unwrap());
+            let mut observed = Vec::new();
+            for device in client.addressable_devices().unwrap().iter().take(2) {
+                let bytes = output
+                    .device_shard(device.id().unwrap())
+                    .unwrap()
+                    .buffer()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap();
+                observed.extend(values_from_bytes::<f32>(&bytes));
+            }
+            assert_eq!(observed, expected);
+        }
+    }
+
+    #[test]
     fn test_compile_reduce_narrow_floating_point() {
         let client = execution_client();
         let mesh = single_device_mesh(&client);
         let engine = XlaDomain::new(&client);
 
-        // The larger mean requires both a widened accumulator and a widened divisor.
+        // Product retains the small growth of each factor; the larger mean also needs a widened divisor.
         for (kind, count, input, expected) in [
             (ReductionKind::Sum, 4096, 1f32, 4096f32),
+            (ReductionKind::Product, 4096, 1.0009765625f32, 54.5f32),
             (ReductionKind::Mean, 4096, 1f32, 1f32),
             (ReductionKind::Mean, 70000, 1f32, 1f32),
             (ReductionKind::LogSumExp, 4096, 0f32, 8.3203125f32),
@@ -2248,6 +2315,8 @@ mod tests {
         // Complex storage interleaves the real and imaginary components. Infinite real components force extrema
         // to compare the imaginary component against the identity rather than deciding on the real component.
         for (kind, components, expected) in [
+            (ReductionKind::Product, vec![2f32, 4., 6., 8.], vec![-20f32, 40.]),
+            (ReductionKind::Product, vec![], vec![1f32, 0.]),
             (ReductionKind::Mean, vec![2f32, 4., 6., 8.], vec![4f32, 6.]),
             (ReductionKind::Max, vec![f32::NEG_INFINITY, -1., f32::NEG_INFINITY, -1.], vec![f32::NEG_INFINITY, -1.]),
             (ReductionKind::Min, vec![f32::INFINITY, 1., f32::INFINITY, 1.], vec![f32::INFINITY, 1.]),

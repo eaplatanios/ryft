@@ -214,11 +214,11 @@ pub(crate) mod tests {
     use crate::macros::check_count;
     use crate::operations::differentiation::custom_rules::{CustomRuleOperation, CustomRuleTransposeOperation};
     use crate::operations::{
-        AddOperation, BroadcastOperation, CompareOperation, ConditionOperation, ConstantOperation,
-        ConvertElementTypeOperation, DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation,
-        OneLikeOperation, OneOperation, ParallelVaryOperation, ReduceOperation, ReferenceReadOperation,
-        ReferenceWriteOperation, ReshapeOperation, ReshardOperation, SelectOperation, SubOperation, TransposeOperation,
-        ZeroLikeOperation, ZeroOperation,
+        AddOperation, BroadcastOperation, CompareOperation, ConcatenateOperation, ConditionOperation,
+        ConstantOperation, ConvertElementTypeOperation, DivOperation, ExpOperation, LinearCallOperation, MulOperation,
+        NegOperation, OneLikeOperation, OneOperation, PadOperation, ParallelVaryOperation, ReduceOperation,
+        ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation, ReshardOperation, SelectOperation,
+        SliceOperation, SubOperation, TransposeOperation, UpdateSliceOperation, ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Parameter;
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -265,6 +265,10 @@ pub(crate) mod tests {
         Transpose(TransposeOperation),
         Reshape(ReshapeOperation),
         Reduce(ReduceOperation),
+        Concatenate(ConcatenateOperation<ArrayType>),
+        Slice(SliceOperation),
+        UpdateSlice(UpdateSliceOperation),
+        Pad(PadOperation<ArrayType>),
         Reshard(ReshardOperation),
         Compare(CompareOperation<ArrayType>),
         Select(SelectOperation<ArrayType>),

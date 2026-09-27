@@ -130,15 +130,6 @@ pub(crate) mod tests {
     impl<C: Context, P: RecursiveBatchingPolicy<C>> BatchingDriver<C, P>
         for CountingBatchingDriver<'_, C::Constant, C::Operation>
     {
-        fn batch_region(
-            &self,
-            context: &BatchingContext<C, P>,
-            index: usize,
-            inputs: Vec<P::Batch>,
-        ) -> Result<Vec<P::Batch>, BatchingError> {
-            RecursiveBatchingDriver::new(self.regions).batch_region(context, index, inputs)
-        }
-
         fn batch_program(
             &self,
             context: &BatchingContext<C, P>,
@@ -148,6 +139,15 @@ pub(crate) mod tests {
         ) -> Result<P::BatchedProgram, BatchingError> {
             self.batch_program_calls.set(self.batch_program_calls.get() + 1);
             RecursiveBatchingDriver::new(self.regions).batch_program(context, region, input_axes, output_axes_policy)
+        }
+
+        fn batch_region(
+            &self,
+            context: &BatchingContext<C, P>,
+            index: usize,
+            inputs: Vec<P::Batch>,
+        ) -> Result<Vec<P::Batch>, BatchingError> {
+            RecursiveBatchingDriver::new(self.regions).batch_region(context, index, inputs)
         }
 
         fn restore_batch(

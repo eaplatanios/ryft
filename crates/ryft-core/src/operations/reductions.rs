@@ -3,8 +3,8 @@
 //! values alike, so the same code executes immediately or records into a program depending on the value it runs on. A
 //! [`ReductionKind`] selects the computation:
 //!
-//!   - **Numeric Reductions:** [`Sum`](ReductionKind::Sum) adds the reduced elements, and
-//!     [`Mean`](ReductionKind::Mean) additionally divides that sum by the number of reduced elements.
+//!   - **Numeric Reductions:** [`Sum`](ReductionKind::Sum) adds and [`Product`](ReductionKind::Product) multiplies
+//!     the reduced elements. [`Mean`](ReductionKind::Mean) divides their sum by the number of reduced elements.
 //!   - **Extrema:** [`Max`](ReductionKind::Max) and [`Min`](ReductionKind::Min) select the largest and smallest
 //!     reduced elements, propagating NaNs, ordering negative zero below positive zero, and comparing complex
 //!     elements by their real parts first and their imaginary parts second.
@@ -14,18 +14,18 @@
 //!     conjunction of Boolean elements.
 //!
 //! The reduced axes are removed from the output shape, and the remaining axes keep their order, as for StableHLO's
-//! [`reduce`](https://openxla.org/stablehlo/spec#reduce). Sums, extrema, and Boolean reductions start from the identity
-//! of their combiner (e.g., `0` for sums and the smallest value of the element type for maxima), so reducing an empty
-//! axis produces that identity. Bounded ragged-axis reductions support sums and logarithmic sums of exponentials;
-//! their padding is replaced by zero or negative infinity, respectively. Other kinds reject ragged reduced axes.
-//! Narrow floating-point sums, means, and logarithmic sums of exponentials compute in `f32` before converting the
-//! output back to the input data type. Empty floating-point and complex means compute NaNs before output conversion.
+//! [`reduce`](https://openxla.org/stablehlo/spec#reduce). Sums, products, extrema, and Boolean reductions start from
+//! their combiner identity (e.g., `0` for sums and `1` for products), so an empty axis produces that identity. Bounded
+//! ragged-axis reductions support sums, products, and logarithmic sums of exponentials; padding is replaced by zero,
+//! one, or negative infinity, respectively. Other kinds reject ragged reduced axes. Narrow floating-point sums,
+//! products, means, and logarithmic sums of exponentials compute in `f32` before converting the output back to the
+//! input data type. Empty floating-point and complex means compute NaNs before output conversion.
 //!
 //! Floating-point and complex sums and means are linear: their transposes broadcast the cotangent over the reduced
 //! axes, dividing it by the number of reduced elements for means. Extrema route the tangent through selected elements,
-//! splitting it evenly between ties. Extrema and logarithmic sums of exponentials are differentiable but nonlinear;
-//! logarithmic sums currently require statically shaped inputs for differentiation. Boolean reductions are not
-//! differentiable.
+//! splitting it evenly between ties. Products use the product rule without dividing by input elements, including at
+//! zeros. Products, extrema, and logarithmic sums are differentiable but nonlinear. Products and logarithmic sums
+//! currently require statically shaped inputs for differentiation. Boolean reductions are not differentiable.
 //!
 //! # Example
 //!
@@ -65,7 +65,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
-use crate::operations::arithmetic::{Div, DivOperation, Mul, MulOperation, Sub};
+use crate::operations::arithmetic::{Add, Div, DivOperation, Mul, MulOperation, Sub};
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::comparisons::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -80,7 +80,10 @@ use crate::operations::exponential::Exp;
 use crate::operations::manipulation::broadcasting::{
     Broadcast, BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
 };
+use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::conversions::{ConvertElementType, ConvertElementTypeOperation};
+use crate::operations::manipulation::slicing::Slice;
+use crate::operations::sharding::Reshard;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,
@@ -99,6 +102,13 @@ pub enum ReductionKind {
     /// Numeric sum reduction. The identity is `0` and the combiner is addition. Floating-point inputs narrower
     /// than `f32` accumulate in `f32`. Also, formats without a zero representation cannot supply the identity.
     Sum,
+
+    /// Numeric product reduction. The identity is `1` and the combiner is multiplication. Floating-point inputs
+    /// narrower than `f32` accumulate in `f32` before conversion back to the input data type. Integer products wrap
+    /// in their input type. Structural zeros are unsupported because their type cannot represent the empty product.
+    /// Differentiation requires a static input shape and replicates reduced dimensions partitioned over explicit mesh
+    /// axes before constructing the pairwise product rule.
+    Product,
 
     /// Numeric mean reduction defined as a [`Sum`](Self::Sum) divided by the product of reduced extents. Narrow
     /// floating-point inputs accumulate and divide in `f32` before conversion back to the input data type. Empty
@@ -156,6 +166,7 @@ impl ReductionKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Sum => "sum",
+            Self::Product => "product",
             Self::Mean => "mean",
             Self::LogSumExp => "log_sum_exp",
             Self::Max => "max",
@@ -449,6 +460,7 @@ where
             .collect::<Vec<_>>();
 
         let masked = match self.kind {
+            ReductionKind::Product => P::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::One)?,
             ReductionKind::LogSumExp => {
                 P::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::Lowest)?
             }
@@ -480,22 +492,26 @@ impl_differentiable_operation! {
     jvp<C>
     where
         C: Context<Type = ArrayType>,
-        C::Value: Reduce
-            + Exp
+        C::Value: ZeroLike
+            + Add
             + Sub
-            + Broadcast
-            + Compare<C::Value>
-            + ConvertElementType
-            + Div
-            + ElementwiseDerivativeAlignment<ArrayType>
             + Mul
+            + Div
+            + Exp
+            + Reduce
+            + Broadcast
+            + Concatenate
+            + Slice
+            + Reshard
+            + ConvertElementType
+            + Compare<C::Value>
             + Select
-            + ZeroLike,
-        C::Operation: From<ReduceOperation>
-            + From<BroadcastOperation>
-            + From<CompareOperation<ArrayType>>
+            + ElementwiseDerivativeAlignment<ArrayType>,
+        C::Operation: From<MulOperation<ArrayType>>
             + From<DivOperation<ArrayType>>
-            + From<MulOperation<ArrayType>>,
+            + From<ReduceOperation>
+            + From<BroadcastOperation>
+            + From<CompareOperation<ArrayType>>,
     {
         |operation, context, _driver, inputs| {
             // The additive reductions (i.e., `Sum` and `Mean`) are linear in the input, so the tangent is the same
@@ -520,6 +536,98 @@ impl_differentiable_operation! {
                     let tangent = match inputs[0].tangent() {
                         MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                         MaybeZero::Value(tangent) => MaybeZero::Value(reduce(tangent)?),
+                    };
+                    Ok(vec![DifferentiationDual::new(primal, tangent)?])
+                }
+                ReductionKind::Product => {
+                    let primal = inputs[0].primal().reduce(operation.axes(), ReductionKind::Product)?;
+                    let tangent = match inputs[0].tangent() {
+                        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                        MaybeZero::Value(input_tangent) => {
+                            let input_type = inputs[0].primal().r#type();
+                            if input_type.shape().dimensions().iter()
+                                .any(|dimension| dimension.value().is_none())
+                            {
+                                return Err(ProgramError::UnsupportedOperation {
+                                    message: format!(
+                                        "differentiating `{REDUCE_OPERATION_NAME}` with kind `product` requires \
+                                         a static input shape",
+                                    ),
+                                }.into());
+                            }
+
+                            // Multiply pairs of dual values in a balanced tree. The product rule uses no division or
+                            // zero-dependent branches, so both first and higher derivatives remain valid at zeros.
+                            // Keep narrow floating-point intermediates widened, just like the primal reduction.
+                            let tangent_data_type = input_tangent.r#type().data_type();
+                            let working_data_type = if tangent_data_type.is_floating_point()
+                                && !matches!(tangent_data_type, DataType::F32 | DataType::F64)
+                            {
+                                DataType::F32
+                            } else {
+                                tangent_data_type
+                            };
+                            let mut factors = context.primal_to_tangent(inputs[0].primal().clone())?
+                                .convert_element_type(working_data_type)?;
+                            let mut tangents = input_tangent.convert_element_type(working_data_type)?;
+
+                            // Pairwise slicing eventually produces extent-one axes. Explicitly partitioned reduced
+                            // axes must first be replicated so every level has a legal shape; the reshard transpose
+                            // restores the input cotangent's placement. Keep all non-reduced placements unchanged.
+                            for value in [&mut factors, &mut tangents] {
+                                let value_type = value.r#type().into_owned();
+                                if let Some(sharding) = value_type.sharding() {
+                                    let mut dimensions = sharding.dimensions().to_vec();
+                                    for &axis in operation.axes() {
+                                        if let ShardingDimension::Sharded(names) = &dimensions[axis] {
+                                            let names = names.iter().filter(|name| {
+                                                sharding.mesh().axis_type(name) != Some(MeshAxisType::Explicit)
+                                            }).cloned().collect::<Vec<_>>();
+                                            dimensions[axis] = if names.is_empty() {
+                                                ShardingDimension::Replicated
+                                            } else {
+                                                ShardingDimension::Sharded(names)
+                                            };
+                                        }
+                                    }
+                                    if dimensions != sharding.dimensions() {
+                                        let target = sharding.with_dimensions(dimensions)
+                                            .map_err(|error| TypeError::invalid(error.to_string()))?;
+                                        *value = value.reshard(&target)?;
+                                    }
+                                }
+                            }
+
+                            for &axis in operation.axes() {
+                                let mut extent = input_type.shape().dimension(axis).value().unwrap();
+                                while extent > 1 {
+                                    let paired_extent = extent - extent % 2;
+                                    let left = factors.slice_axis(axis, 0, paired_extent, 2)?;
+                                    let right = factors.slice_axis(axis, 1, paired_extent, 2)?;
+                                    let left_tangent = tangents.slice_axis(axis, 0, paired_extent, 2)?;
+                                    let right_tangent = tangents.slice_axis(axis, 1, paired_extent, 2)?;
+                                    let next_factors = left.mul(&right)?;
+                                    let next_tangents = left_tangent.mul(&right)?.add(&left.mul(&right_tangent)?)?;
+
+                                    // An odd final element is carried unchanged to the next level.
+                                    if extent % 2 != 0 {
+                                        let last_factor = factors.slice_axis(axis, extent - 1, extent, 1)?;
+                                        let last_tangent = tangents.slice_axis(axis, extent - 1, extent, 1)?;
+                                        factors = C::Value::concatenate([&next_factors, &last_factor], axis)?;
+                                        tangents = C::Value::concatenate([&next_tangents, &last_tangent], axis)?;
+                                    } else {
+                                        factors = next_factors;
+                                        tangents = next_tangents;
+                                    }
+                                    extent = extent.div_ceil(2);
+                                }
+                            }
+
+                            // Each reduced axis is now a singleton or empty. Summation removes those axes and also
+                            // gives the empty product its zero tangent without introducing an arbitrary primal factor.
+                            MaybeZero::Value(tangents.reduce(operation.axes(), ReductionKind::Sum)?
+                                .convert_element_type(tangent_data_type)?)
+                        }
                     };
                     Ok(vec![DifferentiationDual::new(primal, tangent)?])
                 }
@@ -735,13 +843,17 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // Fully static reductions delegate to the homogeneous projected rule. Dynamically shaped numeric reductions
         // retain their exact input extents as ordinary residual values so their transpose can broadcast cotangents
-        // back to the runtime input shape. Logarithmic sums also delegate, because their projected rule broadcasts
-        // to a static input type and supporting runtime-shaped softmax weights would need its own retained-shape
-        // linearization. Boolean reductions delegate so that they report the projected rule's error.
+        // back to the runtime input shape. Products delegate to their statically shaped pairwise rule. Logarithmic
+        // sums also delegate, because their projected rule broadcasts to a static input type and supporting
+        // runtime-shaped softmax weights would need its own retained-shape linearization. Boolean reductions
+        // delegate so that they report the projected rule's error.
         check_count!("input", inputs, 1, ProgramError);
         let input_type = <&ArrayType>::try_from(inputs[0].primal().r#type().as_ref())?.clone();
         if input_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
-            || matches!(self.kind(), ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All)
+            || matches!(
+                self.kind(),
+                ReductionKind::Product | ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All
+            )
         {
             let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
             return jvp_projected_operation(context, &operation, inputs);
@@ -881,9 +993,9 @@ where
 /// identity, accumulation precision, and supported data types of each kind.
 ///
 /// Numeric reductions are differentiable, while [`ReductionKind::Any`] and [`ReductionKind::All`] have no derivative.
-/// Differentiating a [`ReductionKind::LogSumExp`] reduction currently requires a statically shaped input. The other
-/// numeric kinds retain the runtime extents of their inputs as residuals during linearization, and so they also support
-/// dynamically shaped inputs.
+/// Differentiating a [`ReductionKind::Product`] or [`ReductionKind::LogSumExp`] reduction requires a statically shaped
+/// input. The other numeric kinds retain the runtime extents of their inputs as residuals during linearization, and
+/// so they also support dynamically shaped inputs.
 ///
 /// # Example
 ///
@@ -908,9 +1020,9 @@ pub trait Reduce: Sized {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if an axis is out of bounds or repeated, if `kind` does not support the data
-    /// type of `self`, if `kind` cannot reduce the unreduced mesh axes of `self` (i.e., [`ReductionKind::Max`],
-    /// [`ReductionKind::Min`], [`ReductionKind::LogSumExp`], and integer [`ReductionKind::Mean`] reductions),
-    /// or if the context of `self` fails to bind the reduction.
+    /// type of `self`, if `kind` cannot reduce the unreduced mesh axes of `self` (i.e., [`ReductionKind::Product`],
+    /// [`ReductionKind::Max`], [`ReductionKind::Min`], [`ReductionKind::LogSumExp`], and integer
+    /// [`ReductionKind::Mean`] reductions), or if the context of `self` fails to bind the reduction.
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError>;
 
     /// Sums `self` along `axes` using [`ReductionKind::Sum`], optionally requesting `output_sharding` for the output.
@@ -936,6 +1048,13 @@ pub trait Reduce: Sized {
     /// Returns a [`ProgramError`] under the same conditions as [`Self::reduce`] or if `output_sharding` is not a valid
     /// request for the type of `self`.
     fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError>;
+
+    /// Multiplies `self` along `axes` using [`ReductionKind::Product`]. Refer to [`Self::reduce`] for the semantics
+    /// of `axes` and for the errors that this function may return. An empty reduced extent produces `1`.
+    #[inline]
+    fn reduce_product(&self, axes: &[usize]) -> Result<Self, ProgramError> {
+        self.reduce(axes, ReductionKind::Product)
+    }
 
     /// Averages `self` along `axes` using [`ReductionKind::Mean`]. Refer to [`Self::reduce`] for the semantics of
     /// `axes` and for the errors that this function may return.
@@ -1000,13 +1119,22 @@ impl Reduce for Array {
         // Narrow floating-point reductions accumulate and normalize in `f32`. Rounding only the final output
         // avoids losing small contributions and overflowing the element count used by a mean.
         if data_type.is_floating_point()
-            && !matches!(data_type, DataType::F32 | DataType::F64 | DataType::F8E8M0FNU)
-            && matches!(kind, ReductionKind::Sum | ReductionKind::Mean | ReductionKind::LogSumExp)
+            && !matches!(data_type, DataType::F32 | DataType::F64)
+            && (data_type != DataType::F8E8M0FNU || kind == ReductionKind::Product)
+            && matches!(
+                kind,
+                ReductionKind::Sum | ReductionKind::Product | ReductionKind::Mean | ReductionKind::LogSumExp
+            )
         {
             return self.convert_element_type(DataType::F32)?.reduce(axes, kind)?.convert_element_type(data_type);
         }
 
         match kind {
+            ReductionKind::Product => {
+                dispatch_on_array_element_type!(@numeric data_type, |Element| {
+                    self.reduce_elements(output_type, axes, Element::one()?, NumericArrayElement::mul)
+                })
+            }
             ReductionKind::LogSumExp => {
                 dispatch_on_array_element_type!(@float data_type, |Element| {
                     // Compute `log(sum(exp(input)))` by subtracting the maximum of each reduced slice before
@@ -1080,7 +1208,7 @@ impl Reduce for Array {
                         output_type.clone(),
                         axes,
                         Element::zero()?,
-                        Element::add,
+                        NumericArrayElement::add,
                     )?;
                     if kind == ReductionKind::Sum {
                         Ok(sum)
@@ -1168,16 +1296,17 @@ impl ArrayType {
     ///
     ///   - `axes` are unique and within `0..self.rank()`, and
     ///   - `kind` matches the input data type (i.e., Boolean for `Any`/`All`, Boolean or numeric for `Max`/`Min`,
-    ///     and numeric for `Sum`/`Mean`; logarithmic sums require the real floating-point domain documented on
-    ///     [`ReductionKind::LogSumExp`]).
+    ///     and numeric for `Sum`/`Product`/`Mean`; logarithmic sums require the real floating-point domain documented
+    ///     on [`ReductionKind::LogSumExp`]).
     ///
     /// The reduced axes are removed from the output shape and non-reduced axes keep their order. The output
     /// [`Sharding`] drops the reduced axes' per-dimension [`ShardingDimension`] entries while retaining the remaining
-    /// entries in order. Reduction-state and manual-axis sets pass through unchanged; extrema, logarithmic sums, and
-    /// integer means of partial sums are rejected because they do not commute with the pending sum. The backend
-    /// partitioner owns cross-shard reductions over sharded dimensions; use [`ReduceOperation::with_output_sharding`]
-    /// to request an unreduced output that defers it. The [`Layout`](crate::Layout) is dropped as it is rank-specific,
-    /// and the [`Memory`](crate::Memory) placement is preserved.
+    /// entries in order. Reduction-state and manual-axis sets pass through unchanged; products, extrema, logarithmic
+    /// sums, and integer means of partial sums are rejected because they do not commute with the pending sum.
+    /// The backend partitioner owns cross-shard reductions over sharded dimensions; use
+    /// [`ReduceOperation::with_output_sharding`] to request an unreduced output that defers it. The
+    /// [`Layout`](crate::Layout) is dropped as it is rank-specific, and the [`Memory`](crate::Memory)
+    /// placement is preserved.
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, TypeError> {
         let rank = self.rank();
         let mut reduce_mask = vec![false; rank];
@@ -1227,6 +1356,9 @@ impl ArrayType {
                 ("Boolean", data_type.is_boolean())
             } else if matches!(kind, ReductionKind::Max | ReductionKind::Min) {
                 ("Boolean or numeric", data_type.is_boolean() || data_type.is_numeric() || data_type == DataType::Zero)
+            } else if kind == ReductionKind::Product {
+                // A structural zero cannot represent the multiplicative identity of an empty product.
+                ("numeric", data_type.is_numeric())
             } else {
                 ("numeric", data_type.is_numeric() || data_type == DataType::Zero)
             };
@@ -1239,8 +1371,10 @@ impl ArrayType {
         }
 
         if !axes.is_empty()
-            && (matches!(kind, ReductionKind::Max | ReductionKind::Min | ReductionKind::LogSumExp)
-                || (kind == ReductionKind::Mean && data_type.is_integer()))
+            && (matches!(
+                kind,
+                ReductionKind::Product | ReductionKind::Max | ReductionKind::Min | ReductionKind::LogSumExp
+            ) || (kind == ReductionKind::Mean && data_type.is_integer()))
             && self.sharding().is_some_and(|sharding| !sharding.unreduced_axes().is_empty())
         {
             return Err(TypeError::invalid(format!(
@@ -1532,6 +1666,7 @@ mod tests {
     fn test_reduction_kind_name() {
         for (kind, name) in [
             (ReductionKind::Sum, "sum"),
+            (ReductionKind::Product, "product"),
             (ReductionKind::Mean, "mean"),
             (ReductionKind::LogSumExp, "log_sum_exp"),
             (ReductionKind::Max, "max"),
@@ -1567,6 +1702,7 @@ mod tests {
         // Every other reduction kind rejects a requested output sharding when the operation is constructed, while
         // still accepting the absence of one.
         for kind in [
+            ReductionKind::Product,
             ReductionKind::Mean,
             ReductionKind::LogSumExp,
             ReductionKind::Max,
@@ -1745,6 +1881,11 @@ mod tests {
     #[test]
     fn test_reduce_partial_evaluation() {
         check_operation_partial_evaluation!(
+            operation = ReduceOperation::new(vec![0], ReductionKind::Product),
+            inputs = [Array::vector(vec![2f32, 3.0, 4.0]).unwrap()],
+            expected = Array::scalar(24f32).unwrap(),
+        );
+        check_operation_partial_evaluation!(
             operation = ReduceOperation::new(vec![0], ReductionKind::LogSumExp),
             inputs = [Array::vector(vec![0.0, 0.0]).unwrap()],
             expected = Array::scalar(std::f64::consts::LN_2).unwrap(),
@@ -1753,6 +1894,16 @@ mod tests {
 
     #[test]
     fn test_reduce_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = ReduceOperation::new(vec![0], ReductionKind::Product),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 1), Array::matrix(3, 2, vec![2f32, 5.0, 3.0, 6.0, 4.0, 7.0]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![24f32, 210.0]).unwrap())],
+            }],
+        );
+
         // Replicated inputs reduce once for every batch item, while mapped inputs reduce each batch item independently.
         // For the mapped case, the physical input is [3 batch items, 2 rows, 3 columns] mapped at axis 0, and so the
         // per-item axis 1 (i.e., the columns) is physical axis 2.
@@ -1765,6 +1916,7 @@ mod tests {
                 outputs = [(@replicated, Array::vector(vec![3.0, 3.0]).unwrap())],
             }],
         );
+
         check_operation_batching!(
             @exact,
             operation = ReduceOperation::new(vec![1], ReductionKind::Sum),
@@ -1809,6 +1961,69 @@ mod tests {
                 ).unwrap())],
                 outputs = [(@mapped(axis = 0), Array::vector(vec![14.0, 22.0, 30.0]).unwrap())],
             }],
+        );
+    }
+
+    #[test]
+    fn test_reduce_batching_product_reduced_ragged_axis() {
+        // Neutralize padding with one and consume the reduced ragged extent.
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+        let batch_extent = trace.input(DimensionType::from(items.clone()).into());
+        let packed = trace.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
+                .into(),
+        );
+        let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(trace.clone()),
+            batch_extent,
+        );
+        let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected().unwrap(), variable.clone(), vec![0])])
+            .unwrap();
+
+        // The per-item reduced axis 0 is the packed axis 1 that carries the ragged extents.
+        let (outputs, evidence) = ReduceOperation::new(vec![0], ReductionKind::Product)
+            .batch(&context, &EmptyRegionDriver, &[input])
+            .unwrap()
+            .into_parts();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert!(outputs[0].ragged_axes().is_empty());
+        assert_eq!(evidence, vec![variable]);
+
+        let output_id = outputs.into_iter().next().unwrap().into_value().into_value().atom_id().unwrap();
+        drop(context);
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output_id],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<items ∈ [1, 9)>, %1:f32[items, 3], %2:i32[items] .
+                let %3:dimension<items ∈ [1, 9)> = dimension_size [axis=0] %1
+                    %4:dimension<3> = constant [value=3]
+                    %5:i32[3] = iota [type=i32[3], dimension=0]
+                    %6:i32[items, 3] = broadcast [output_axes=[1]] %5 %3 %4
+                    %7:i32[items, 3] = broadcast [output_axes=[0]] %2 %3 %4
+                    %8:bool[items, 3] = compare [direction=LessThan] %6 %7
+                    %9:f32[] = constant [value=1.0]
+                    %10:f32[items, 3] = broadcast [output_axes=[]] %9 %3 %4
+                    %11:f32[items, 3] = select %8 %1 %10
+                    %12:f32[items] = reduce [kind=product, axes=[1]] %11
+                in (%12)
+            "}
+            .trim_end(),
         );
     }
 
@@ -1921,6 +2136,98 @@ mod tests {
                 }],
             );
         }
+    }
+
+    #[test]
+    fn test_reduce_differentiation_product() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = ReduceOperation::new(vec![0], ReductionKind::Product),
+            cases = [{
+                primals = [Array::vector(vec![1.0f64, 3.0, 2.0]).unwrap()],
+                tangents = [Array::vector(vec![2.0f64, 4.0, 6.0]).unwrap()],
+                primal_outputs = [Array::scalar(6.0f64).unwrap()],
+                tangent_outputs = [Array::scalar(38.0f64).unwrap()],
+            }, {
+                primals = [Array::vector(vec![0.0f64, 3.0, 2.0]).unwrap()],
+                tangents = [Array::vector(vec![2.0f64, 4.0, 6.0]).unwrap()],
+                primal_outputs = [Array::scalar(0.0f64).unwrap()],
+                tangent_outputs = [Array::scalar(12.0f64).unwrap()],
+            }, {
+                primals = [Array::vector(vec![0.0f64, 0.0, 2.0]).unwrap()],
+                tangents = [Array::vector(vec![2.0f64, 4.0, 6.0]).unwrap()],
+                primal_outputs = [Array::scalar(0.0f64).unwrap()],
+                tangent_outputs = [Array::scalar(0.0f64).unwrap()],
+            }],
+        );
+
+        // The empty product is constant, so its tangent is zero even for an explicitly materialized empty seed.
+        let input = Array::vector(Vec::<f64>::new()).unwrap();
+        let (output, tangent) =
+            differentiate_at(input.clone()).jvp(input, |input| Ok(input.reduce_product(&[0])?)).unwrap();
+        assert_eq!(output.elements::<f64>(), Ok(vec![1.0]));
+        assert_eq!(tangent.elements::<f64>(), Ok(vec![0.0]));
+
+        // Zero factors do not erase the mixed second derivative of the underlying polynomial.
+        let input = Array::vector(vec![0.0f64, 0.0, 2.0]).unwrap();
+        let hessian = differentiate_at(input).hessian(|input| Ok(input.reduce_product(&[0])?)).unwrap();
+        assert_eq!(
+            hessian.iter_blocks().next().unwrap().value().elements::<f64>(),
+            Ok(vec![0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        );
+
+        // Reducing several axes preserves the remaining axes and applies the product rule across every factor.
+        let input = Array::from_elements(
+            ArrayType::new_static(DataType::F64, [2, 2, 2]),
+            &[1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        )
+        .unwrap();
+        let (_, gradient) = differentiate_at(input)
+            .value_and_gradient(|input| Ok(input.reduce_product(&[0, 2])?.reduce_sum(&[0], None)?))
+            .unwrap();
+        assert_eq!(gradient.elements::<f64>(), Ok(vec![60.0, 30.0, 224.0, 168.0, 12.0, 10.0, 96.0, 84.0]));
+    }
+
+    #[test]
+    fn test_reduce_differentiation_product_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F64, [4]).with_sharding(sharding).unwrap();
+        let input = Array::from_elements(input_type.clone(), &[1.0f64, 2.0, 3.0, 4.0]).unwrap();
+        let (output, gradient) =
+            differentiate_at(input).value_and_gradient(|input| Ok(input.reduce_product(&[0])?)).unwrap();
+        assert_eq!(output.elements::<f64>(), Ok(vec![24.0]));
+        assert_eq!(gradient.r#type().as_ref(), &input_type);
+        assert_eq!(gradient.elements::<f64>(), Ok(vec![24.0, 12.0, 8.0, 6.0]));
+    }
+
+    #[test]
+    fn test_reduce_differentiation_product_dynamic_shape() {
+        let extent = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Product))),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The product rule constructs a finite slicing tree, so a live derivative needs known input extents.
+        assert!(matches!(program.linearize(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "differentiating `reduce` with kind `product` requires a static input shape",
+        ));
     }
 
     #[test]
@@ -2338,9 +2645,14 @@ mod tests {
     fn test_reduce_transposition_nonlinear_kinds() {
         // Only the additive reductions are linear. Every other kind is differentiated through the linear operations
         // staged by its JVP instead, and so direct transposition rejects it.
-        for kind in
-            [ReductionKind::LogSumExp, ReductionKind::Max, ReductionKind::Min, ReductionKind::Any, ReductionKind::All]
-        {
+        for kind in [
+            ReductionKind::Product,
+            ReductionKind::LogSumExp,
+            ReductionKind::Max,
+            ReductionKind::Min,
+            ReductionKind::Any,
+            ReductionKind::All,
+        ] {
             let context = TracingContext::<Array, ArrayOperation<Array>>::new();
             let output_cotangent = {
                 let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
@@ -2470,6 +2782,14 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_reduce_product() {
+        let matrix = Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(matrix.reduce_product(&[1]), Ok(Array::vector(vec![6f32, 120.0]).unwrap()));
+        assert_eq!(matrix.reduce_product(&[1, 0]), Ok(Array::scalar(720f32).unwrap()));
+        assert_eq!(matrix.reduce_product(&[]), Ok(matrix.clone()));
+    }
+
+    #[test]
     fn test_reduce_reduce_mean() {
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(matrix.reduce_mean(&[1]), Ok(Array::vector(vec![2.0, 5.0]).unwrap()));
@@ -2527,6 +2847,31 @@ mod tests {
         assert_eq!(booleans.reduce(&[0], ReductionKind::All).unwrap().elements::<bool>(), Ok(vec![false]));
         assert_eq!(booleans.reduce(&[0], ReductionKind::Max).unwrap().elements::<bool>(), Ok(vec![true]));
         assert_eq!(booleans.reduce(&[0], ReductionKind::Min).unwrap().elements::<bool>(), Ok(vec![false]));
+    }
+
+    #[test]
+    fn test_array_reduce_product() {
+        // Empty products use one, and integer products wrap in their declared element type.
+        assert_eq!(Array::vector(Vec::<f32>::new()).unwrap().reduce_product(&[0]), Ok(Array::scalar(1f32).unwrap()));
+        assert_eq!(Array::vector(vec![100i8, 3]).unwrap().reduce_product(&[0]), Ok(Array::scalar(44i8).unwrap()),);
+        assert_eq!(
+            Array::vector(vec![Complex::new(1f32, 2.0), Complex::new(3.0, -4.0)]).unwrap().reduce_product(&[0]),
+            Ok(Array::scalar(Complex::new(11f32, 2.0)).unwrap()),
+        );
+
+        // Widening avoids intermediate half-precision overflow before the final representable product.
+        let input = Array::vector(vec![f16::from_f32(256.0), f16::from_f32(256.0), f16::from_f32(0.5)]).unwrap();
+        assert_eq!(input.reduce_product(&[0]), Ok(Array::scalar(f16::from_f32(32768.0)).unwrap()));
+        assert_eq!(Array::vector(vec![0f32, 3.0, 4.0]).unwrap().reduce_product(&[0]), Ok(Array::scalar(0f32).unwrap()));
+        assert!(
+            Array::vector(vec![0f32, f32::INFINITY])
+                .unwrap()
+                .reduce_product(&[0])
+                .unwrap()
+                .elements::<f32>()
+                .unwrap()[0]
+                .is_nan()
+        );
     }
 
     #[test]
@@ -2762,6 +3107,7 @@ mod tests {
     fn test_array_type_reduce() {
         let input = ArrayType::new_static(DataType::F64, [2, 3, 4]);
         assert_eq!(input.reduce(&[1], ReductionKind::Sum), Ok(ArrayType::new_static(DataType::F64, [2, 4])));
+        assert_eq!(input.reduce(&[1], ReductionKind::Product), Ok(ArrayType::new_static(DataType::F64, [2, 4])));
         assert_eq!(input.reduce(&[0, 2], ReductionKind::Max), Ok(ArrayType::new_static(DataType::F64, [3])));
     }
 
@@ -2834,7 +3180,7 @@ mod tests {
 
     #[test]
     fn test_array_type_reduce_enforces_reduction_data_types() {
-        // Boolean reductions require Boolean inputs, additive reductions require numeric inputs, and extrema accept
+        // Boolean reductions require Boolean inputs, arithmetic reductions require numeric inputs, and extrema accept
         // both, including complex inputs, which they order lexicographically by `(real, imaginary)`.
         let numeric = ArrayType::new_static(DataType::F64, [2, 3]);
         assert_eq!(
@@ -2846,12 +3192,19 @@ mod tests {
             boolean.reduce(&[1], ReductionKind::Sum),
             Err(TypeError::invalid("`reduce` with kind `sum` requires numeric inputs but got `bool`")),
         );
+        assert_eq!(
+            boolean.reduce(&[1], ReductionKind::Product),
+            Err(TypeError::invalid("`reduce` with kind `product` requires numeric inputs but got `bool`")),
+        );
         assert_eq!(boolean.reduce(&[1], ReductionKind::Any), Ok(ArrayType::new_static(DataType::Boolean, [2])));
         assert_eq!(boolean.reduce(&[1], ReductionKind::Max), Ok(ArrayType::new_static(DataType::Boolean, [2])));
         let complex = ArrayType::new_static(DataType::C64, [2, 3]);
         assert_eq!(complex.reduce(&[1], ReductionKind::Max), Ok(ArrayType::new_static(DataType::C64, [2])));
         assert_eq!(complex.reduce(&[1], ReductionKind::Min), Ok(ArrayType::new_static(DataType::C64, [2])));
         assert_eq!(complex.reduce(&[1], ReductionKind::Sum), Ok(ArrayType::new_static(DataType::C64, [2])));
+        assert_eq!(complex.reduce(&[1], ReductionKind::Product), Ok(ArrayType::new_static(DataType::C64, [2])));
+        let unsigned = ArrayType::new_static(DataType::U8, [2, 3]);
+        assert_eq!(unsigned.reduce(&[1], ReductionKind::Product), Ok(ArrayType::new_static(DataType::U8, [2])));
         let token = ArrayType::new_static(DataType::Token, [2, 3]);
         assert_eq!(
             token.reduce(&[1], ReductionKind::Sum),
@@ -2859,9 +3212,13 @@ mod tests {
         );
 
         // The structural-zero element type represents an already-known zero tangent and remains closed under numeric
-        // reductions even though it has no numeric payload bytes.
+        // sums even though it has no numeric payload bytes. Products require a representable identity of one.
         let zero = ArrayType::new_static(DataType::Zero, [2, 3]);
         assert_eq!(zero.reduce(&[1], ReductionKind::Sum), Ok(ArrayType::new_static(DataType::Zero, [2])));
+        assert_eq!(
+            zero.reduce(&[1], ReductionKind::Product),
+            Err(TypeError::invalid("`reduce` with kind `product` requires numeric inputs but got `zero`")),
+        );
 
         // Only real floating-point formats have the exponential and logarithm that logarithmic sums are built from.
         for data_type in [DataType::I32, DataType::Boolean, DataType::C64, DataType::Token, DataType::Zero] {
@@ -2908,8 +3265,9 @@ mod tests {
         assert_eq!(input.reduce(&[0], ReductionKind::Sum), Ok(output.clone()));
         assert_eq!(input.reduce(&[0], ReductionKind::Mean), Ok(output));
 
-        // Extrema and logarithmic sums do not commute with that sum, and integer means truncate before it.
+        // Products, extrema, and logarithmic sums do not commute with that sum, and integer means truncate before it.
         for (input, kind) in [
+            (input.clone(), ReductionKind::Product),
             (input.clone(), ReductionKind::Max),
             (input.clone(), ReductionKind::Min),
             (input.clone(), ReductionKind::LogSumExp),
@@ -2924,6 +3282,7 @@ mod tests {
         }
 
         // Reducing no axes leaves the pending sum untouched, and so even extrema accept unreduced inputs.
+        assert_eq!(input.reduce(&[], ReductionKind::Product), Ok(input.clone()));
         assert_eq!(input.reduce(&[], ReductionKind::Max), Ok(input.clone()));
     }
 }

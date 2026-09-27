@@ -1005,14 +1005,6 @@ pub trait BatchingDriver<C: Context, P: BatchingPolicy<C>>: RegionDriver<C::Cons
         })
     }
 
-    /// Batches the region at `index` over the provided batched values by re-entering the active batching transform.
-    fn batch_region(
-        &self,
-        context: &BatchingContext<C, P>,
-        index: usize,
-        inputs: Vec<P::Batch>,
-    ) -> Result<Vec<P::Batch>, BatchingError>;
-
     /// Batches `region` structurally at the provided input batch axes and output-axes policy, returning the rewritten
     /// standalone program and its inferred output batch axes.
     fn batch_program(
@@ -1022,6 +1014,14 @@ pub trait BatchingDriver<C: Context, P: BatchingPolicy<C>>: RegionDriver<C::Cons
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<P::BatchedProgram, BatchingError>;
+
+    /// Batches the region at `index` over the provided batched values by re-entering the active batching transform.
+    fn batch_region(
+        &self,
+        context: &BatchingContext<C, P>,
+        index: usize,
+        inputs: Vec<P::Batch>,
+    ) -> Result<Vec<P::Batch>, BatchingError>;
 
     /// Restores a batch carrier for an output returned by a rebuilt region-carrying operation. Recursive drivers
     /// delegate to [`RecursiveBatchingPolicy::restore_batch`] so a policy can recover carrier-only metadata erased by
@@ -1066,16 +1066,6 @@ pub trait BatchingDriver<C: Context, P: BatchingPolicy<C>>: RegionDriver<C::Cons
 
 impl<C: Context, P: BatchingPolicy<C>> BatchingDriver<C, P> for EmptyRegionDriver {
     #[inline]
-    fn batch_region(
-        &self,
-        _context: &BatchingContext<C, P>,
-        _index: usize,
-        _inputs: Vec<P::Batch>,
-    ) -> Result<Vec<P::Batch>, BatchingError> {
-        Err(ProgramError::MalformedProgram("empty region driver cannot batch a region".to_string()).into())
-    }
-
-    #[inline]
     fn batch_program(
         &self,
         _context: &BatchingContext<C, P>,
@@ -1084,6 +1074,16 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingDriver<C, P> for EmptyRegionDrive
         _output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<P::BatchedProgram, BatchingError> {
         Err(ProgramError::MalformedProgram("empty region driver cannot batch a program".to_string()).into())
+    }
+
+    #[inline]
+    fn batch_region(
+        &self,
+        _context: &BatchingContext<C, P>,
+        _index: usize,
+        _inputs: Vec<P::Batch>,
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        Err(ProgramError::MalformedProgram("empty region driver cannot batch a region".to_string()).into())
     }
 
     #[inline]
@@ -1165,16 +1165,6 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
     }
 
     #[inline]
-    fn batch_region(
-        &self,
-        context: &BatchingContext<C, P>,
-        index: usize,
-        inputs: Vec<P::Batch>,
-    ) -> Result<Vec<P::Batch>, BatchingError> {
-        P::batch_region(context, self.region(index)?, inputs)
-    }
-
-    #[inline]
     fn batch_program(
         &self,
         context: &BatchingContext<C, P>,
@@ -1183,6 +1173,16 @@ impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<P::BatchedProgram, BatchingError> {
         P::batch_program(context, region, input_axes, output_axes_policy)
+    }
+
+    #[inline]
+    fn batch_region(
+        &self,
+        context: &BatchingContext<C, P>,
+        index: usize,
+        inputs: Vec<P::Batch>,
+    ) -> Result<Vec<P::Batch>, BatchingError> {
+        P::batch_region(context, self.region(index)?, inputs)
     }
 
     #[inline]

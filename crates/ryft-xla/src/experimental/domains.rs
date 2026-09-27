@@ -4967,9 +4967,12 @@ fn reduction_data_dependent_padding_discipline(kind: ReductionKind) -> DataDepen
     use DataDependentPaddingDiscipline::{Unsupported, XlaMasked};
 
     match kind {
-        ReductionKind::Sum | ReductionKind::Max | ReductionKind::Min | ReductionKind::Any | ReductionKind::All => {
-            XlaMasked
-        }
+        ReductionKind::Sum
+        | ReductionKind::Product
+        | ReductionKind::Max
+        | ReductionKind::Min
+        | ReductionKind::Any
+        | ReductionKind::All => XlaMasked,
         // A log-sum-exp `reduce` expands into maximum and summation reductions over the same axes, so it inherits
         // the masking contract of exactly those two reduction kinds: XLA masks each reduction's
         // operand with that reduction's own identity, which wipes the padding lanes of the shifted exponentials
@@ -6634,7 +6637,7 @@ mod tests {
             .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
             .unwrap()[0];
         let iota = builder
-            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
+            .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
             .unwrap()[0];
         let indices = builder
             .add_instruction(IotaOperation::new(index_type, 0).unwrap(), Vec::new(), vec![dimension], None)
@@ -6654,6 +6657,13 @@ mod tests {
             .unwrap()[1];
         let sum = builder
             .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![iota], None)
+            .unwrap()[0];
+        // Shift the iota to nonzero factors so including physical padding changes the product.
+        let ones =
+            builder.add_instruction(OneOperation::new(dynamic_type), Vec::new(), vec![dimension], None).unwrap()[0];
+        let factors = builder.add_instruction(AddOperation::new(), Vec::new(), vec![iota, ones], None).unwrap()[0];
+        let product = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Product), Vec::new(), vec![factors], None)
             .unwrap()[0];
         let maximum = builder
             .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Max), Vec::new(), vec![iota], None)
@@ -6724,9 +6734,11 @@ mod tests {
                     dot,
                     log_sum_exp,
                     cumulative_sum,
+                    product,
                 ],
                 vec![Placeholder],
                 vec![
+                    Placeholder,
                     Placeholder,
                     Placeholder,
                     Placeholder,
@@ -10524,6 +10536,7 @@ mod tests {
 
         for kind in [
             ReductionKind::Sum,
+            ReductionKind::Product,
             ReductionKind::LogSumExp,
             ReductionKind::Max,
             ReductionKind::Min,
@@ -10674,6 +10687,7 @@ mod tests {
         assert_eq!(read_booleans(&client, &small[7]), vec![true]);
         assert_eq!(read_booleans(&client, &small[8]), vec![true]);
         assert_eq!(read_f32s(&client, &small[9]), vec![1.0]);
+        assert_eq!(read_f32s(&client, &small[12]), vec![2.0]);
 
         // Row `i` of the `i + j` matrix reduces to `i + ln(1 + e + e² + e³)`, so exactly the live rows appear and a
         // physical suffix row would show up as an extra element. The tolerance is here because the expansion runs
@@ -10701,6 +10715,7 @@ mod tests {
         assert_eq!(read_booleans(&client, &at_bound[7]), vec![true]);
         assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
         assert_eq!(read_f32s(&client, &at_bound[9]), vec![14.0]);
+        assert_eq!(read_f32s(&client, &at_bound[12]), vec![24.0]);
 
         // At the bound the reduction and the scan grow by exactly the two extra live rows, which is what rules out a
         // padded row silently participating at the smaller size.
@@ -10863,6 +10878,7 @@ mod tests {
         assert_eq!(read_booleans(&client, &small[7]), vec![true]);
         assert_eq!(read_booleans(&client, &small[8]), vec![true]);
         assert_eq!(read_f32s(&client, &small[9]), vec![1.0]);
+        assert_eq!(read_f32s(&client, &small[12]), vec![2.0]);
 
         let at_bound = execute(4);
         assert_eq!(read_f32s(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
@@ -10875,6 +10891,7 @@ mod tests {
         assert_eq!(read_booleans(&client, &at_bound[7]), vec![true]);
         assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
         assert_eq!(read_f32s(&client, &at_bound[9]), vec![14.0]);
+        assert_eq!(read_f32s(&client, &at_bound[12]), vec![24.0]);
     }
 
     #[cfg(feature = "cuda-13")]

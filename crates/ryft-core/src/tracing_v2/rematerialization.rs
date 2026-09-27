@@ -3401,10 +3401,11 @@ mod tests {
 
         use crate::differentiation::forward::tests::CustomCubeOperation;
         use crate::operations::{
-            AddOperation, BroadcastOperation, CompareOperation, ConstantOperation, ConvertElementTypeOperation,
-            DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation, OneLikeOperation,
-            OneOperation, ParallelVaryOperation, ReduceOperation, ReshapeOperation, ReshardOperation, SelectOperation,
-            SubOperation, TransposeOperation, ZeroLikeOperation, ZeroOperation,
+            AddOperation, BroadcastOperation, CompareOperation, ConcatenateOperation, ConstantOperation,
+            ConvertElementTypeOperation, DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation,
+            OneLikeOperation, OneOperation, PadOperation, ParallelVaryOperation, ReduceOperation, ReshapeOperation,
+            ReshardOperation, SelectOperation, SliceOperation, SubOperation, TransposeOperation, UpdateSliceOperation,
+            ZeroLikeOperation, ZeroOperation,
         };
         use crate::programs::{
             NoReferenceTransform, NoReferent, OperationProvider, ReferenceAccessDescriptor, ReferenceAccessOperation,
@@ -3432,6 +3433,10 @@ mod tests {
             Transpose(TransposeOperation),
             Reshape(ReshapeOperation),
             Reduce(ReduceOperation),
+            Concatenate(ConcatenateOperation<ArrayType>),
+            Slice(SliceOperation),
+            UpdateSlice(UpdateSliceOperation),
+            Pad(PadOperation<ArrayType>),
             Reshard(ReshardOperation),
             Compare(CompareOperation<ArrayType>),
             Select(SelectOperation<ArrayType>),

@@ -13,12 +13,11 @@
 //! Element `i` along the scanned axis of the output holds the combination of the input elements `0..=i`
 //! (i.e., an inclusive prefix), or of the input elements `i..` (i.e., an inclusive suffix, still in the
 //! original output order) when the scan runs in reverse. The output has exactly the input type, so unlike
-//! a [`ReduceOperation`](crate::ReduceOperation), a cumulative operation keeps the scanned axis, and
-//! unlike the control-flow [`ScanOperation`](crate::ScanOperation), it applies one fixed combining
-//! operator rather than an arbitrary loop body. The operations mirror JAX's cumulative operations (e.g.,
-//! [`jax.lax.cumsum`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cumsum.html)). The scanned dimension
-//! must be static and unsharded, and floating-point reassociation can make a sequential eager scan and a compiled
-//! parallel scan round differently in their last bits.
+//! a [`ReduceOperation`](crate::ReduceOperation), a cumulative operation keeps the scanned axis, and unlike the
+//! control-flow [`ScanOperation`](crate::ScanOperation), it applies one fixed combining operator rather than an
+//! arbitrary loop body. The scanned dimension must be static and unsharded, the non-linear kinds reject unreduced
+//! inputs, and floating-point reassociation can make a sequential eager scan and a compiled parallel scan round
+//! differently in their last bits.
 //!
 //! # Batching
 //!
@@ -51,6 +50,7 @@
 //! # }
 //! ```
 
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use crate::arrays::{
@@ -73,6 +73,7 @@ use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::exponential::{LOG_ADD_EXP_OPERATION_NAME, LogAddExp, LogAddExpOperation};
 use crate::operations::extrema::{Max, MaxOperation, Min, MinOperation};
+use crate::operations::logical::{Or, OrOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
 use crate::operations::manipulation::padding::{Pad, PadOperation};
@@ -103,15 +104,15 @@ pub enum CumulativeKind {
     Product,
 
     /// Running maximum. The identity is the element data type's lowest value (i.e., negative infinity for the
-    /// floating-point formats that have infinities). Only real numeric inputs are supported: complex numbers are
-    /// unordered and therefore have no maximum, as for the elementwise [`Max`] operation. Exceptional values follow
-    /// that operation too: NaNs propagate and `-0.0` orders below `+0.0`.
+    /// floating-point formats that have infinities). Real and complex numeric inputs are supported, with the ordering
+    /// and exceptional-value semantics of the elementwise [`Max`] operation: complex inputs compare their real parts
+    /// first and their imaginary parts second, NaNs propagate, and `-0.0` orders below `+0.0`.
     Max,
 
     /// Running minimum. The identity is the element data type's highest value (i.e., positive infinity for the
-    /// floating-point formats that have infinities). Only real numeric inputs are supported: complex numbers are
-    /// unordered and therefore have no minimum, as for the elementwise [`Min`] operation. Exceptional values follow
-    /// that operation too: NaNs propagate and `-0.0` orders below `+0.0`.
+    /// floating-point formats that have infinities). Real and complex numeric inputs are supported, with the ordering
+    /// and exceptional-value semantics of the elementwise [`Min`] operation: complex inputs compare their real parts
+    /// first and their imaginary parts second, NaNs propagate, and `-0.0` orders below `+0.0`.
     Min,
 
     /// Running numerically stable `log(sum(exp(x)))`. Each prefix is accumulated by folding the pairwise [`LogAddExp`]
@@ -161,7 +162,7 @@ impl Display for CumulativeKind {
 ///
 /// `reverse` belongs to the payload rather than being spelled by the caller as a pair of reversals precisely because it
 /// makes a cumulative sum closed under transposition: the adjoint of a forward prefix sum is a reverse prefix sum of
-/// the output cotangent and vice versa, just like JAX's `_cumsum_transpose_rule`.
+/// the output cotangent and vice versa.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CumulativeOperation {
     /// Refer to the documentation of [`Self::axis`].
@@ -330,6 +331,7 @@ impl_differentiable_operation! {
             + From<MaxOperation<ArrayType>>
             + From<MinOperation<ArrayType>>
             + From<MulOperation<ArrayType>>
+            + From<OrOperation<ArrayType>>
             + From<PadOperation<ArrayType>>
             + From<SliceOperation>
             + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>
@@ -354,6 +356,10 @@ impl_differentiable_operation! {
                 let tangent = MaybeZero::Zero(primal.r#type().tangent()?);
                 return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
             };
+            // The primal output of a nonlinear kind comes from the decomposition, which interleaves its halves by
+            // adding zero-padded operands. That addition turns a `-0.0` result into `+0.0`, so under differentiation
+            // the primal output of an extremum scan over signed zeros can differ from the undifferentiated one in the
+            // sign of a zero (JAX's `_cumulative_jvp_rule` has the same property).
             let dual = match kind {
                 CumulativeKind::Sum => {
                     let primal = primal_input.cumulative(axis, kind, reverse)?;
@@ -552,11 +558,7 @@ impl Cumulative for Array {
             return Self::new(output_type, Vec::new());
         }
 
-        let shape = output_type.static_shape().ok_or_else(|| {
-            TypeError::invalid(format!(
-                "`{CUMULATIVE_OPERATION_NAME}` requires a statically shaped operand but got `{output_type}`",
-            ))
-        })?;
+        let shape = output_type.static_shape().unwrap();
         match kind {
             CumulativeKind::Sum | CumulativeKind::Product => {
                 dispatch_on_array_element_type!(@numeric data_type, |Element| {
@@ -571,7 +573,7 @@ impl Cumulative for Array {
                 })
             }
             CumulativeKind::Max | CumulativeKind::Min => {
-                dispatch_on_array_element_type!(@real data_type, |Element| {
+                dispatch_on_array_element_type!(@numeric data_type, |Element| {
                     let elements = self.elements::<Element>()?;
                     let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
                         Ok(match kind {
@@ -624,9 +626,11 @@ impl ArrayType {
     ///   - `kind` supports the element data type of `self`, as documented on [`CumulativeKind`];
     ///   - `axis` is within `0..self.rank()`;
     ///   - the scanned dimension is [`Dimension::Static`], because a prefix scan is defined by the exact number of
-    ///     elements that it accumulates over; and
-    ///   - the scanned dimension is unsharded, mirroring JAX's cumulative sharding rule, because a prefix crosses shard
-    ///     boundaries and a cumulative operation carries no cross-shard communication of its own.
+    ///     elements that it accumulates over;
+    ///   - the scanned dimension is unsharded, because a prefix crosses shard boundaries and a cumulative operation
+    ///     carries no cross-shard communication of its own; and
+    ///   - `self` has no unreduced mesh axes unless `kind` is [`CumulativeKind::Sum`], because only a prefix sum
+    ///     commutes with the pending cross-device sum of an unreduced value.
     ///
     /// A dynamically sized scanned axis could be supported in the future by physicalizing the scan at the dimension's
     /// declared upper bound and masking the elements past each runtime extent with the kind's identity, which is the
@@ -634,20 +638,22 @@ impl ArrayType {
     /// it would silently change the operation's cost model, and so it belongs to an explicit dynamic-scan surface.
     fn cumulative(&self, axis: usize, kind: CumulativeKind) -> Result<Self, TypeError> {
         // The element data type is validated before the scan geometry, and the diagnostic names the kind, because the
-        // supported data types differ across kinds (e.g., summation accepts complex inputs while extrema do not).
+        // supported data types differ across kinds (e.g., summation accepts the structural zero while extrema do not).
         let data_type = self.data_type();
-        let requirement = match kind {
+        let requirement: Option<Cow<'static, str>> = match kind {
             CumulativeKind::Sum | CumulativeKind::Product if !data_type.is_numeric() && data_type != DataType::Zero => {
-                Some("numeric inputs".to_string())
+                Some(Cow::Borrowed("numeric inputs"))
             }
-            CumulativeKind::Max | CumulativeKind::Min if !data_type.is_real() => {
-                Some("real numeric inputs".to_string())
+            CumulativeKind::Max | CumulativeKind::Min if !data_type.is_numeric() => {
+                Some(Cow::Borrowed("numeric inputs"))
             }
             CumulativeKind::LogSumExp if !data_type.is_floating_point() => {
-                Some("real floating-point inputs".to_string())
+                Some(Cow::Borrowed("real floating-point inputs"))
             }
             CumulativeKind::LogSumExp if matches!(data_type, DataType::F8E8M0FNU | DataType::F6E2M3FN) => {
-                Some(format!("a floating-point format whose lowest value is a `{LOG_ADD_EXP_OPERATION_NAME}` identity"))
+                Some(Cow::Owned(format!(
+                    "a floating-point format whose lowest value is a `{LOG_ADD_EXP_OPERATION_NAME}` identity",
+                )))
             }
             _ => None,
         };
@@ -677,6 +683,12 @@ impl ArrayType {
                  sharded",
             )));
         }
+        if kind != CumulativeKind::Sum && self.sharding().is_some_and(|sharding| !sharding.unreduced_axes().is_empty())
+        {
+            return Err(TypeError::invalid(format!(
+                "`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` cannot scan inputs with unreduced axes",
+            )));
+        }
         Ok(self.clone())
     }
 }
@@ -696,8 +708,9 @@ impl ArrayType {
 /// halves back against the elements the pairing skipped, and interleaves the two halves into the result. `combine`
 /// always receives its operands in scan order (the accumulated prefix first), so the construction stays correct for
 /// associative operators that are not commutative. A `reverse` scan mirrors the same recursion around the end of the
-/// axis (the pairing simply starts one element in when the extent is odd), which is what lets it work without an
-/// array-reversal primitive.
+/// axis (the pairing simply starts one element in when the extent is odd) instead of reversing the operand before and
+/// after a forward scan, which saves two array reversals per scan. Boolean operands are interleaved with a disjunction
+/// rather than an addition, because Booleans have no addition.
 ///
 /// The whole operand shape must be static, because the construction slices at staging-time positions. A scanned axis
 /// shorter than two elements is returned unchanged.
@@ -715,7 +728,7 @@ impl ArrayType {
 /// primitives of the construction (including those that `combine` stages) fails.
 pub fn associative_scan<V, F>(value: &V, axis: usize, reverse: bool, combine: &F) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + Add + Concatenate + Pad + Slice,
+    V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
     V::DispatchDomain: Context<Type = ArrayType> + Zero<V>,
     F: Fn(&V, &V) -> Result<V, ProgramError>,
 {
@@ -751,7 +764,7 @@ fn associative_scan_recursively<V, F>(
     combine: &F,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + Add + Concatenate + Pad + Slice,
+    V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
     V::DispatchDomain: Context<Type = ArrayType> + Zero<V>,
     F: Fn(&V, &V) -> Result<V, ProgramError>,
 {
@@ -854,9 +867,10 @@ fn scan_slice<V: Slice>(
 /// Returns `left` and `right` interleaved along `axis`, starting with `left`. `left` must hold either as many elements
 /// along `axis` as `right` or exactly one more.
 ///
-/// Both operands are dilated into the output extent with interior padding (writing the padding identity into the
-/// positions the other operand occupies) and added, which is JAX's `_interleave`. The addition is exact because the two
-/// dilated operands have disjoint support and the padding is the additive identity.
+/// Both operands are dilated into the output extent with interior padding (writing zeros into the positions that the
+/// other operand occupies) and then combined with an addition, or with a disjunction for Boolean operands, which have
+/// no addition. The combination is exact because the two dilated operands have disjoint support and zero (i.e.,
+/// `false`) is the identity of both combiners.
 fn scan_interleave<V>(
     left: &V,
     right: &V,
@@ -866,7 +880,7 @@ fn scan_interleave<V>(
     right_count: usize,
 ) -> Result<V, ProgramError>
 where
-    V: Value<Type = ArrayType> + Add + Pad,
+    V: Value<Type = ArrayType> + Add + Or + Pad,
     V::DispatchDomain: Zero<V>,
 {
     if left_count != right_count && left_count != right_count + 1 {
@@ -885,7 +899,10 @@ where
     edge_padding_low[axis] = 1;
     edge_padding_high[axis] = i64::from(left_count != right_count);
     let dilated_right = right.pad(&padding_value, &edge_padding_low, &edge_padding_high, &interior_padding)?;
-    dilated_left.add(&dilated_right)
+    match left.r#type().data_type() {
+        DataType::Boolean => dilated_left.or(&dilated_right),
+        _ => dilated_left.add(&dilated_right),
+    }
 }
 
 /// Value that the nested trace staging an [`associative_scan`] decomposition flows.
@@ -897,12 +914,11 @@ type DecompositionTracer<C> = Tracer<TracingContext<<C as Domain>::Constant, <C 
 /// The decomposition is traced once into its own program over the caller's operation family, that program is
 /// differentiated through the instruction-scoped `driver` (which re-enters the active differentiation machinery, so
 /// every primitive the construction stages contributes its *own* forward-mode rule), and the resulting fused program is
-/// replayed in `context` over the operand's primal and tangent. This mirrors JAX's `_cumulative_jvp_rule`, which is
-/// literally `api.jvp(partial(associative_scan, combine_fn, ...), primals, tangents)`: the primal output comes back
-/// from the decomposition too, rather than from the cumulative primitive, because the two are the same value and the
-/// fused program computes it on the way to the tangent. When the primal and tangent contexts differ, the decomposition
-/// is linearized instead, its primal half is replayed in the primal context, and its tangent half is replayed in the
-/// tangent context over the transferred residuals.
+/// replayed in `context` over the operand's primal and tangent. The primal output comes back from the decomposition
+/// too, rather than from the cumulative primitive, because the two are the same value (up to the sign of zero results)
+/// and the fused program computes it on the way to the tangent. When the primal and tangent contexts differ, the
+/// decomposition is linearized instead, its primal half is replayed in the primal context, and its tangent half is
+/// replayed in the tangent context over the transferred residuals.
 ///
 /// The caller is responsible for the structural-zero tangent shortcut; this function requires a live tangent because
 /// the decomposition is pure overhead when there is nothing to propagate.
@@ -930,6 +946,7 @@ where
     D: DifferentiationDriver<C>,
     C::Operation: From<AddOperation<ArrayType>>
         + From<ConcatenateOperation<ArrayType>>
+        + From<OrOperation<ArrayType>>
         + From<PadOperation<ArrayType>>
         + From<SliceOperation>
         + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>
@@ -1315,8 +1332,9 @@ mod tests {
     fn test_cumulative_differentiation() {
         // Sums are linear, so their tangent is the same scan of the input tangent. The other kinds differentiate
         // through the associative-scan decomposition, and their expected tangents are, respectively, the product rule
-        // applied to each prefix, the tangent of the element that currently attains the extremum (at tie-free inputs),
-        // and the softmax-weighted average of the input tangents over each prefix.
+        // applied to each prefix (a zero input zeroes every later prefix but still passes its own tangent, scaled by
+        // the product of the other elements), the tangent of the element that currently attains the extremum (at
+        // tie-free inputs), and the softmax-weighted average of the input tangents over each prefix.
         let e = std::f64::consts::E;
         let extrema = Array::vector(vec![3.0, 1.0, 4.0, 1.5, 5.0]).unwrap();
         let ramp = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
@@ -1341,6 +1359,13 @@ mod tests {
                 Array::vector(vec![1.0, 1.0, 1.0, 1.0]).unwrap(),
                 Array::vector(vec![1.0, 2.0, 6.0, 24.0]).unwrap(),
                 Array::vector(vec![1.0, 3.0, 11.0, 50.0]).unwrap(),
+            ),
+            (
+                CumulativeOperation::new(0, CumulativeKind::Product),
+                Array::vector(vec![2.0, 0.0, 3.0]).unwrap(),
+                Array::vector(vec![1.0, 1.0, 1.0]).unwrap(),
+                Array::vector(vec![2.0, 0.0, 0.0]).unwrap(),
+                Array::vector(vec![1.0, 2.0, 6.0]).unwrap(),
             ),
             (
                 CumulativeOperation::new(0, CumulativeKind::Product).with_reverse(true),
@@ -1435,11 +1460,24 @@ mod tests {
     }
 
     #[test]
+    fn test_cumulative_differentiation_extrema_ties() {
+        // Running extrema are not differentiable where elements tie. The decomposition inherits the convention of the
+        // elementwise extrema, which split the tangent evenly between tied elements.
+        for kind in [CumulativeKind::Max, CumulativeKind::Min] {
+            let (primal, tangent) = differentiate_at(Array::vector(vec![1.0, 1.0]).unwrap())
+                .jvp(Array::vector(vec![1.0, 3.0]).unwrap(), |input| Ok(input.cumulative(0, kind, false)?))
+                .unwrap();
+            assert_eq!(primal, Array::vector(vec![1.0, 1.0]).unwrap());
+            assert_eq!(tangent, Array::vector(vec![1.0, 2.0]).unwrap());
+        }
+    }
+
+    #[test]
     fn test_cumulative_differentiation_associative_scan_decomposition() {
         // A nonlinear kind's forward mode differentiates *through* the decomposition, so the fused program holds no
         // `cumulative` instruction at all: it is the parallel-prefix construction (two halving levels over a
         // length-four axis) with each of its primitives' own rules interleaved. The primal half is recomputed there
-        // rather than taken from the primitive, exactly as in JAX's `_cumulative_jvp_rule`.
+        // rather than taken from the primitive.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F64, [4]));
         let outputs = builder
@@ -1818,6 +1856,25 @@ mod tests {
 
     #[test]
     fn test_array_cumulative_extrema() {
+        // Complex elements compare their real parts first and their imaginary parts second.
+        let complex = Array::vector(vec![
+            ComplexNumber::new(1.0f32, 5.0),
+            ComplexNumber::new(2.0, -3.0),
+            ComplexNumber::new(2.0, 4.0),
+        ])
+        .unwrap();
+        assert_eq!(
+            complex.cumulative_max(0),
+            Ok(Array::vector(vec![
+                ComplexNumber::new(1.0f32, 5.0),
+                ComplexNumber::new(2.0, -3.0),
+                ComplexNumber::new(2.0, 4.0),
+            ])
+            .unwrap()),
+        );
+        let expected = Array::vector(vec![ComplexNumber::new(1.0f32, 5.0); 3]).unwrap();
+        assert_eq!(complex.cumulative_min(0), Ok(expected));
+
         // Selection happens in the operand's own element type, so a low-precision payload is returned bit for bit
         // rather than through a widened intermediate.
         let low_precision_type = ArrayType::new_static(DataType::F8E5M2, [3]);
@@ -1985,17 +2042,17 @@ mod tests {
             );
         }
 
-        // Extrema accept only real numeric inputs, because complex numbers are unordered.
+        // Extrema accept real and complex numeric inputs, which they order like the elementwise extrema.
         for kind in [CumulativeKind::Max, CumulativeKind::Min] {
-            for data_type in [DataType::F64, DataType::I32] {
+            for data_type in [DataType::F64, DataType::I32, DataType::C64] {
                 let input = ArrayType::new_static(data_type, [3, 2]);
                 assert_eq!(input.cumulative(1, kind), Ok(input.clone()));
             }
-            for data_type in [DataType::C64, DataType::Boolean, DataType::Token, DataType::Zero] {
+            for data_type in [DataType::Boolean, DataType::Token, DataType::Zero] {
                 assert_eq!(
                     ArrayType::new_static(data_type, [3, 2]).cumulative(1, kind),
                     Err(TypeError::invalid(format!(
-                        "`cumulative` with kind `{kind}` requires real numeric inputs but got `{data_type}`",
+                        "`cumulative` with kind `{kind}` requires numeric inputs but got `{data_type}`",
                     ))),
                 );
             }
@@ -2037,6 +2094,25 @@ mod tests {
     }
 
     #[test]
+    fn test_array_type_cumulative_unreduced_inputs() {
+        // A prefix sum commutes with the pending cross-device sum of an unreduced input, and so it keeps its unreduced
+        // axes. The other kinds do not commute with that sum, and so they reject unreduced inputs.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(input.cumulative(0, CumulativeKind::Sum), Ok(input.clone()));
+        for kind in [CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min, CumulativeKind::LogSumExp] {
+            assert_eq!(
+                input.cumulative(0, kind),
+                Err(TypeError::invalid(format!(
+                    "`cumulative` with kind `{kind}` cannot scan inputs with unreduced axes"
+                ))),
+            );
+        }
+    }
+
+    #[test]
     fn test_associative_scan() {
         // The decomposition is checked against the sequential scan of the same combiner, over both parities of the
         // scanned extent and in both directions. Summation pins the positions each output accumulates over, and the
@@ -2063,6 +2139,18 @@ mod tests {
             }
         }
 
+        // Boolean operands are interleaved with a disjunction, because Booleans have no addition.
+        let or = |left: &Array, right: &Array| left.or(right);
+        let booleans = Array::vector(vec![false, false, true, false, false]).unwrap();
+        assert_eq!(
+            associative_scan(&booleans, 0, false, &or),
+            Ok(Array::vector(vec![false, false, true, true, true]).unwrap()),
+        );
+        assert_eq!(
+            associative_scan(&booleans, 0, true, &or),
+            Ok(Array::vector(vec![true, true, true, false, false]).unwrap()),
+        );
+
         // The construction scans one axis of a higher-rank operand independently per row.
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
@@ -2087,8 +2175,8 @@ mod tests {
 
     #[test]
     fn test_associative_scan_provenance() {
-        // Every instruction that the decomposition stages carries the nested framework scopes, which attribute it to the
-        // associative-scan decomposition in renderings that include provenance.
+        // Every instruction that the decomposition stages carries the nested framework scopes, which attribute it to
+        // the associative-scan decomposition in renderings that include provenance.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::new_static(DataType::F64, [2]));
         let output = associative_scan(&input, 0, false, &|left, right| left.add(right)).unwrap();

@@ -11372,6 +11372,9 @@ fn build_reduce_body_region<'c, 't>(
             .result(0)
             .expect("stablehlo.add should return one result")
             .as_ref(),
+        ReductionKind::Product => {
+            block_ref.append_operation(stable_hlo::multiply(lhs, rhs, location)?)?.result(0).unwrap().as_ref()
+        }
         ReductionKind::Max | ReductionKind::Min => {
             lower_extremum_to_mlir(kind == ReductionKind::Max, element_type, lhs, rhs, &mut block_ref, location)?
         }
@@ -11403,9 +11406,10 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
     let element_type = output_array_type.data_type();
-    if matches!(kind, ReductionKind::Sum | ReductionKind::Mean | ReductionKind::LogSumExp)
+    if matches!(kind, ReductionKind::Sum | ReductionKind::Product | ReductionKind::Mean | ReductionKind::LogSumExp)
         && element_type.is_floating_point()
-        && !matches!(element_type, DataType::F32 | DataType::F64 | DataType::F8E8M0FNU)
+        && !matches!(element_type, DataType::F32 | DataType::F64)
+        && (element_type != DataType::F8E8M0FNU || kind == ReductionKind::Product)
         && (kind != ReductionKind::LogSumExp
             || matches!(
                 element_type,
@@ -12278,6 +12282,7 @@ fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
     if element_type.is_complex() {
         let real = match kind {
             ReductionKind::Sum | ReductionKind::Mean => 0.0,
+            ReductionKind::Product => 1.0,
             ReductionKind::Max => f64::NEG_INFINITY,
             ReductionKind::Min => f64::INFINITY,
             ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
@@ -12288,8 +12293,13 @@ fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
         let part_type = ArrayType::scalar(part_data_type);
         let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
         let real_value = lower_f64_constant_splat(real, &part_type, part_tensor_type, block, context, location)?;
-        // Lexicographic extrema need both components at the same bound, including when real components tie.
-        let complex = block.append_operation(stable_hlo::complex(real_value, real_value, location)?)?;
+        // Products use `1 + 0i`; lexicographic extrema need both components at the same bound.
+        let imaginary_value = if kind == ReductionKind::Product {
+            lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?
+        } else {
+            real_value
+        };
+        let complex = block.append_operation(stable_hlo::complex(real_value, imaginary_value, location)?)?;
         return Ok(complex.result(0).expect("stablehlo.complex should return one result").as_ref());
     }
     let attribute = build_reduction_identity_attribute(kind, element_type, scalar_tensor_type, context)?;
@@ -12298,7 +12308,7 @@ fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Builds a dense-elements attribute holding the identity element of the given reduction kind at
-/// the given element type. `Sum` and `Mean` use zero; `Max` and `Min` use the bounds returned by
+/// the given element type. `Sum` and `Mean` use zero, `Product` uses one, and `Max` and `Min` use the bounds returned by
 /// [`float_reduction_identity_bounds`] at float element types and the bounds returned by
 /// [`integer_reduction_identity_bounds`] at integer element types. Boolean `Any`/`Max` use `false`, while Boolean
 /// `All`/`Min` use `true`. Every other combination fails with [`LoweringError::UnsupportedDataType`].
@@ -12311,6 +12321,7 @@ fn build_reduction_identity_attribute<'c, 't>(
     if let Some((minimum, maximum)) = float_reduction_identity_bounds(element_type) {
         let identity = match kind {
             ReductionKind::Sum | ReductionKind::Mean if element_type != DataType::F8E8M0FNU => 0.0,
+            ReductionKind::Product => 1.0,
             ReductionKind::Max => minimum,
             ReductionKind::Min => maximum,
             ReductionKind::Sum | ReductionKind::Mean => {
@@ -12325,6 +12336,7 @@ fn build_reduction_identity_attribute<'c, 't>(
     if let Some((minimum, maximum)) = integer_reduction_identity_bounds(element_type) {
         let identity = match kind {
             ReductionKind::Sum | ReductionKind::Mean => 0,
+            ReductionKind::Product => 1,
             ReductionKind::Max => minimum,
             ReductionKind::Min => maximum,
             ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
@@ -18039,6 +18051,24 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_bf16_reduce_product() {
+        assert_eq!(
+            lowered_reduce_module(DataType::BF16, ReductionKind::Product, vec![0], vec![2, 3]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<3xbf16> {
+                    %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                    %1 = stablehlo.reduce(%0 init: %cst) applies stablehlo.multiply across dimensions = [0] : (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>
+                    %2 = stablehlo.convert %1 : (tensor<3xf32>) -> tensor<3xbf16>
+                    return %2 : tensor<3xbf16>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
     fn test_to_mlir_module_for_plain_program_lowers_cumulative_sum_as_a_full_prefix_reduce_window() {
         // A forward scan pads `(n - 1, 0)` on the scanned axis so that the full-extent window ending at output
         // position `i` covers input positions `0..=i`, with the padded positions made inert by the summation
@@ -18604,6 +18634,22 @@ mod tests {
                   func.func @main(%arg0: tensor<4xi64>) -> tensor<i64> {
                     %c = stablehlo.constant dense<0> : tensor<i64>
                     %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.add across dimensions = [0] : (tensor<4xi64>, tensor<i64>) -> tensor<i64>
+                    return %0 : tensor<i64>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_i64_reduce_product() {
+        assert_eq!(
+            lowered_reduce_module(DataType::I64, ReductionKind::Product, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xi64>) -> tensor<i64> {
+                    %c = stablehlo.constant dense<1> : tensor<i64>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.multiply across dimensions = [0] : (tensor<4xi64>, tensor<i64>) -> tensor<i64>
                     return %0 : tensor<i64>
                   }
                 }
