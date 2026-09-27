@@ -167,8 +167,6 @@ pub struct ReduceOperation {
     output_sharding: Option<Sharding>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ReduceOperation {
     /// Creates a new [`ReduceOperation`] reducing along `axes` with the supplied `kind`. The input shape is not part
     /// of the operation payload. Instead, it is recoverable from the staged input types wherever a rule needs it.
@@ -190,14 +188,12 @@ impl ReduceOperation {
     ///
     /// Returns a [`TypeError`] if `output_sharding` requests a sharding and this reduction's kind is not
     /// [`ReductionKind::Sum`].
-    #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Result<Self, TypeError> {
         let output_sharding = output_sharding.into();
         if output_sharding.is_some() && self.kind != ReductionKind::Sum {
             return Err(TypeError::invalid(format!(
-                "`{REDUCE_OPERATION_NAME}` with kind `{}` does not support a requested output sharding (only kind `sum` \
-                 does)",
-                self.kind,
+                "`{}` with kind `{}` does not support a requested output sharding (only kind `sum` does)",
+                REDUCE_OPERATION_NAME, self.kind,
             )));
         }
         self.output_sharding = output_sharding;
@@ -248,7 +244,9 @@ impl Operation for ReduceOperation {
         let Some(output_sharding) = &self.output_sharding else {
             return Ok(vec![output]);
         };
+
         validate_reduce_output_sharding(&input_types[0], self.axes.as_slice(), output_sharding, &output)?;
+
         // A placement request cannot discharge manual variation or manufacture reduction state.
         let output_sharding = output_sharding
             .clone()
@@ -261,6 +259,7 @@ impl Operation for ReduceOperation {
                 )
             })
             .map_err(|error| TypeError::invalid(error.to_string()))?;
+
         Ok(vec![output.with_sharding(output_sharding).map_err(|error| TypeError::invalid(error.to_string()))?])
     }
 
@@ -283,9 +282,9 @@ impl<D: Domain<Type = ArrayType, Value: Reduce>> InterpretableOperation<D> for R
         _driver: &I,
         inputs: &[D::Value],
     ) -> Result<Vec<D::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
         // The requested output sharding flows through the capability method so that interpretation over staging
         // values (e.g., during program batching) preserves it; concrete values ignore it.
+        check_count!("input", inputs, 1, ProgramError);
         Ok(vec![match &self.output_sharding {
             Some(output_sharding) => {
                 inputs[0].clone().reduce_with_output_sharding(self.axes.as_slice(), self.kind, output_sharding)?
@@ -295,12 +294,12 @@ impl<D: Domain<Type = ArrayType, Value: Reduce>> InterpretableOperation<D> for R
     }
 }
 
-// Partial evaluation defers to the default fold-or-residualize behavior of
-// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReduceOperation where
-    C::Operation: From<ReduceOperation>
+impl<C: Context<Type = ArrayType>, Operation: From<ReduceOperation>> PartiallyEvaluatableOperation<C>
+    for ReduceOperation
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Batching rule for [`ReduceOperation`]: the reduced axes are expressed in the per-item coordinate system, so the
 // rule lifts them past the inserted batch dimension with `lift_reduce_axes` and re-interprets the lifted reduction
@@ -328,8 +327,8 @@ where
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
         let (lifted_axes, output_axis) = lift_reduce_axes(self.axes.as_slice(), batch_axis);
-        // A requested output sharding gains the mapped axis's sharding at the new output batch axis, mirroring the
-        // dot batch rule.
+
+        // A requested output sharding gains the mapped axis's sharding at the new output batch axis.
         let lifted_output_sharding = match &self.output_sharding {
             Some(output_sharding) => {
                 Some(output_sharding.batched(output_axis, ArrayBatch::sharding_for_inputs(inputs)?)?)
@@ -338,6 +337,7 @@ where
         };
         let lifted_operation =
             ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(lifted_output_sharding)?;
+
         batch_reducing_operation(
             context,
             &lifted_operation,
