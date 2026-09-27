@@ -173,17 +173,30 @@ impl ReduceOperation {
         Self { axes, kind, output_sharding: None }
     }
 
-    /// Returns this [`ReduceOperation`] with the requested output sharding. This is only supported for
-    /// [`ReductionKind::Sum`] reductions. Other reduction kinds reject this attribute at type checking time (i.e., this
-    /// function will still return successfully).
-    /// The request must match the output rank and input mesh and cannot reference automatic mesh axes. Requested
-    /// unreduced axes defer cross-device sums and must be explicit axes that shard a reduced dimension or are already
-    /// unreduced on the input. Reduced axes cannot be requested: inference preserves the input's reduced state and
-    /// manual variation independently of placement. An explicit manual-variation request must match the input.
+    /// Returns this [`ReduceOperation`] with the requested output sharding, or without a requested output sharding
+    /// when `output_sharding` is [`None`]. Only [`ReductionKind::Sum`] reductions support a requested output sharding.
+    ///
+    /// The rest of the request depends on the input type, so type inference validates it. Specifically, it must match
+    /// the output rank and the input mesh and cannot reference automatic mesh axes. Requested unreduced axes defer
+    /// cross-device sums and must be explicit axes that shard a reduced dimension or are already unreduced on the
+    /// input. Reduced axes cannot be requested, because inference preserves the input's reduced state and manual
+    /// variation independently of placement, and an explicit manual-variation request must match the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] if `output_sharding` requests a sharding and this reduction's kind is not
+    /// [`ReductionKind::Sum`].
     #[inline]
-    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
-        self.output_sharding = output_sharding.into();
-        self
+    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Result<Self, TypeError> {
+        let output_sharding = output_sharding.into();
+        if output_sharding.is_some() && self.kind != ReductionKind::Sum {
+            return Err(TypeError::invalid(format!(
+                "`{}` does not support a requested output sharding (only `reduce_sum` does)",
+                self.name(),
+            )));
+        }
+        self.output_sharding = output_sharding;
+        Ok(self)
     }
 
     /// Returns the axes reduced by this [`ReduceOperation`].
@@ -206,6 +219,7 @@ impl ReduceOperation {
 }
 
 impl Display for ReduceOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -237,7 +251,7 @@ impl Operation for ReduceOperation {
         let Some(output_sharding) = &self.output_sharding else {
             return Ok(vec![output]);
         };
-        validate_reduce_output_sharding(&input_types[0], self.axes.as_slice(), self.kind, output_sharding, &output)?;
+        validate_reduce_output_sharding(&input_types[0], self.axes.as_slice(), output_sharding, &output)?;
         // A placement request cannot discharge manual variation or manufacture reduction state.
         let output_sharding = output_sharding
             .clone()
@@ -325,7 +339,7 @@ where
             None => None,
         };
         let lifted_operation =
-            ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(lifted_output_sharding);
+            ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(lifted_output_sharding)?;
         batch_reducing_operation(
             context,
             &lifted_operation,
@@ -943,7 +957,7 @@ where
         output_sharding: &Sharding,
     ) -> Result<Self, ProgramError> {
         let mut outputs = self.dispatch_domain().bind(
-            ReduceOperation::new(axes.to_vec(), kind).with_output_sharding(output_sharding.clone()),
+            ReduceOperation::new(axes.to_vec(), kind).with_output_sharding(output_sharding.clone())?,
             Vec::new(),
             std::slice::from_ref(self),
         )?;
@@ -1347,24 +1361,18 @@ fn reduce_sharding(
         .transpose()
 }
 
-/// Validates a requested output placement for [`ReductionKind::Sum`]. Rank and mesh must agree with the inferred
-/// output, and only explicit axes may defer cross-device summation. Reduced state and manual variation belong to
-/// the input's semantics and cannot be manufactured or discharged by a placement request.
+/// Validates a requested output placement for [`ReductionKind::Sum`], the only kind that
+/// [`ReduceOperation::with_output_sharding`] accepts a request for. Rank and mesh must agree with the inferred output,
+/// and only explicit axes may defer cross-device summation. Reduced state and manual variation belong to the input's
+/// semantics and cannot be manufactured or discharged by a placement request.
 fn validate_reduce_output_sharding(
     input: &ArrayType,
     axes: &[usize],
-    kind: ReductionKind,
     output_sharding: &Sharding,
     reduced_output: &ArrayType,
 ) -> Result<(), TypeError> {
     use crate::arrays::{MeshAxisType, ShardingDimension};
 
-    if kind != ReductionKind::Sum {
-        return Err(TypeError::invalid(format!(
-            "`reduce_{}` does not support a requested output sharding (only `reduce_sum` does)",
-            kind.name()
-        )));
-    }
     if output_sharding.rank() != reduced_output.rank() {
         return Err(TypeError::invalid(format!(
             "`reduce_sum` output sharding rank ({}) does not match the output rank ({})",
@@ -1745,6 +1753,40 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_operation_with_output_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 1);
+
+        // A sum accepts a requested output sharding, and passing `None` clears it again.
+        let operation =
+            ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(sharding.clone()).unwrap();
+        assert_eq!(operation.output_sharding(), Some(&sharding));
+        assert_eq!(operation.with_output_sharding(None).unwrap().output_sharding(), None);
+
+        // Every other reduction kind rejects a requested output sharding when the operation is constructed, while
+        // still accepting the absence of one.
+        for (kind, name) in [
+            (ReductionKind::Mean, "reduce_mean"),
+            (ReductionKind::LogSumExp, "reduce_log_sum_exp"),
+            (ReductionKind::Max, "reduce_max"),
+            (ReductionKind::Min, "reduce_min"),
+            (ReductionKind::Any, "reduce_any"),
+            (ReductionKind::All, "reduce_all"),
+        ] {
+            assert_eq!(
+                ReduceOperation::new(vec![0], kind).with_output_sharding(sharding.clone()),
+                Err(TypeError::invalid(format!(
+                    "`{name}` does not support a requested output sharding (only `reduce_sum` does)",
+                ))),
+            );
+            assert_eq!(
+                ReduceOperation::new(vec![0], kind).with_output_sharding(None),
+                Ok(ReduceOperation::new(vec![0], kind)),
+            );
+        }
+    }
+
+    #[test]
     fn test_reduce_type_inference() {
         check_operation_type_inference!(
             operation = ReduceOperation::new(vec![1], ReductionKind::Sum),
@@ -1778,7 +1820,9 @@ mod tests {
 
         // The requested partial sum may defer only a sum that the input placement actually requires.
         check_operation_type_inference!(
-            operation = ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(unreduced.clone()),
+            operation = ReduceOperation::new(vec![0], ReductionKind::Sum)
+                .with_output_sharding(unreduced.clone())
+                .unwrap(),
             cases = [{
                 input_types = [input.clone()],
                 output_types = [ArrayType::new_static(DataType::F64, [3]).with_sharding(unreduced.clone()).unwrap()],
@@ -1786,18 +1830,12 @@ mod tests {
         );
         check_operation_type_inference!(
             operation = ReduceOperation::new(vec![0], ReductionKind::Sum)
-                .with_output_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["y"]).unwrap()),
+                .with_output_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["y"]).unwrap())
+                .unwrap(),
             cases = [{
                 input_types = [input.clone()],
                 error = "`reduce_sum` output sharding unreduced axes must be among the explicit axes sharding the \
                          reduced dimensions or the input's unreduced axes",
-            }],
-        );
-        check_operation_type_inference!(
-            operation = ReduceOperation::new(vec![0], ReductionKind::Max).with_output_sharding(unreduced),
-            cases = [{
-                input_types = [input],
-                error = "`reduce_max` does not support a requested output sharding (only `reduce_sum` does)",
             }],
         );
     }
@@ -1822,7 +1860,8 @@ mod tests {
         // A placement request leaves the input's semantic state intact without staging a collective.
         check_operation_type_inference!(
             operation = ReduceOperation::new(vec![0], ReductionKind::Sum)
-                .with_output_sharding(Sharding::replicated(mesh.clone(), 0)),
+                .with_output_sharding(Sharding::replicated(mesh.clone(), 0))
+                .unwrap(),
             cases = [{
                 input_types = [input],
                 output_types = [ArrayType::scalar(DataType::F32)
@@ -1836,7 +1875,8 @@ mod tests {
             .unwrap();
         check_operation_type_inference!(
             operation = ReduceOperation::new(vec![0], ReductionKind::Sum)
-                .with_output_sharding(Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["x"]).unwrap()),
+                .with_output_sharding(Sharding::replicated(mesh.clone(), 0).with_reduced_axes(["x"]).unwrap())
+                .unwrap(),
             cases = [{
                 input_types = [input.clone()],
                 error = "`reduce_sum` output sharding cannot request reduced axes",
@@ -1844,7 +1884,8 @@ mod tests {
         );
         check_operation_type_inference!(
             operation = ReduceOperation::new(vec![0], ReductionKind::Sum)
-                .with_output_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap()),
+                .with_output_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
+                .unwrap(),
             cases = [{
                 input_types = [input],
                 error = "`reduce_sum` output sharding cannot change manual variation",
@@ -1902,30 +1943,6 @@ mod tests {
         check_operation_type_inference!(
             operation = ReduceOperation::new(vec![], ReductionKind::Max),
             cases = [{ input_types = [input.clone()], output_types = [input] }],
-        );
-    }
-
-    #[test]
-    fn test_reduce_type_inference_log_sum_exp_output_sharding() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh, 1);
-        let input = ArrayType::new_static(DataType::F64, [2]);
-        check_operation_type_inference!(
-            operation = ReduceOperation::new(vec![], ReductionKind::LogSumExp).with_output_sharding(sharding.clone()),
-            cases = [{
-                input_types = [input.clone()],
-                error = "`reduce_log_sum_exp` does not support a requested output sharding (only `reduce_sum` does)",
-            }],
-        );
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input_atom = context.builder().borrow_mut().add_input(input);
-        assert_eq!(
-            context
-                .tracer(input_atom, None)
-                .reduce_with_output_sharding(&[], ReductionKind::LogSumExp, &sharding),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`reduce_log_sum_exp` does not support a requested output sharding (only `reduce_sum` does)",
-            ))),
         );
     }
 
@@ -2370,7 +2387,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(unreduced.clone())],
+            vec![ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(unreduced.clone()).unwrap()],
         );
         assert_eq!(
             linearization
@@ -2382,7 +2399,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(unreduced.clone())],
+            vec![ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(unreduced.clone()).unwrap()],
         );
     }
 
@@ -2740,8 +2757,28 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
-            vec![ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(unreduced.clone())],
+            vec![ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(unreduced.clone()).unwrap()],
         );
+    }
+
+    #[test]
+    fn test_reduce_with_output_sharding_rejects_non_sum_reductions() {
+        // Staging a reduction with a requested output sharding constructs the operation, so a non-sum reduction is
+        // rejected before anything is staged.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input_atom = context.builder().borrow_mut().add_input(ArrayType::new_static(DataType::F64, [2]));
+        assert_eq!(
+            context.tracer(input_atom, None).reduce_with_output_sharding(
+                &[],
+                ReductionKind::LogSumExp,
+                &Sharding::replicated(mesh, 1),
+            ),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`reduce_log_sum_exp` does not support a requested output sharding (only `reduce_sum` does)",
+            ))),
+        );
+        assert!(context.builder().borrow().instructions().is_empty());
     }
 
     #[test]
