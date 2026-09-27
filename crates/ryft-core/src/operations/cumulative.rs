@@ -1397,7 +1397,45 @@ mod tests {
         let jvp = program.jvp().unwrap();
         assert_eq!(
             std::fmt::from_fn(|formatter| jvp.render(formatter, 0, ProgramRenderingMode::WithProvenance)).to_string(),
-            "",
+            indoc! {"
+                lambda %0:f64[2], %1:f64[2] .
+                let %2:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %3:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %4:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %5:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %6:f64[1] = max %2 %4 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %7:bool[1] = compare [direction=GreaterThan] %2 %4 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %8:bool[1] = compare [direction=Equal] %2 %4 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %9:f64[1] = one_like %2 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %10:f64[1] = add %9 %9 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %11:f64[1] = div %9 %10 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %12:f64[1] = zero_like %2 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %13:f64[1] = select %8 %11 %12 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %14:f64[1] = select %7 %9 %13 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %15:f64[1] = mul %14 %3 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %16:bool[1] = compare [direction=GreaterThan] %4 %2 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %17:bool[1] = compare [direction=Equal] %4 %2 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %18:f64[1] = one_like %4 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %19:f64[1] = add %18 %18 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %20:f64[1] = div %18 %19 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %21:f64[1] = zero_like %4 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %22:f64[1] = select %17 %20 %21 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %23:f64[1] = select %16 %18 %22 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %24:f64[1] = mul %23 %5 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %25:f64[1] = add %15 %24 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %26:f64[1] = slice [start_indices=[0], limit_indices=[1]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %27:f64[1] = slice [start_indices=[0], limit_indices=[1]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %28:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::ryft::associative_scan
+                    %29:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %26 %28 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %30:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::ryft::associative_scan
+                    %31:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %27 %30 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %32:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %6 %28 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %33:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::ryft::associative_scan
+                    %34:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %25 %33 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %35:f64[2] = add %29 %32 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %36:f64[2] = add %31 %34 ; provenance=ryft::differentiation::ryft::associative_scan
+                in (%35, %36)"
+            },
         );
     }
 
