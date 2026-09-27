@@ -1075,11 +1075,23 @@ impl Reduce for Array {
             }
             ReductionKind::Sum | ReductionKind::Mean => {
                 dispatch_on_array_element_type!(@numeric data_type, |Element| {
-                    self.reduce_sum_or_mean_elements::<Element>(
-                        output_type,
+                    // A mean is a sum divided by the reduced element count. Integer arithmetic wraps in the element
+                    // type, and so an empty integer mean divides by one to retain its zero sum, while empty
+                    // floating-point and complex means divide by zero and produce NaNs.
+                    let sum = self.reduce_elements::<Element>(
+                        output_type.clone(),
                         axes,
-                        kind == ReductionKind::Mean,
-                    )
+                        Element::zero()?,
+                        Element::add,
+                    )?;
+                    if kind == ReductionKind::Sum {
+                        Ok(sum)
+                    } else {
+                        let shape = self.r#type().static_shape().unwrap();
+                        let count = axes.iter().map(|axis| shape[*axis]).product::<usize>();
+                        let count = if Element::data_type().is_integer() { count.max(1) } else { count };
+                        sum.map_elements::<Element, Element>(output_type, |value| value.divide_by_count(count))
+                    }
                 })
             }
             ReductionKind::Max | ReductionKind::Min => {
@@ -1197,24 +1209,6 @@ impl Array {
             input_addressing.advance_index(&mut input_index);
         }
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
-    }
-
-    /// Accumulates a sum, optionally dividing each output by the reduced element count. Integer arithmetic wraps
-    /// in the element type and retains zero for empty means; floating-point and complex empty means produce NaNs.
-    fn reduce_sum_or_mean_elements<T: ElementDivideByCount>(
-        &self,
-        output_type: ArrayType,
-        axes: &[usize],
-        mean: bool,
-    ) -> Result<Self, ProgramError> {
-        let output = self.reduce_elements::<T>(output_type.clone(), axes, T::zero()?, T::add)?;
-        if !mean {
-            return Ok(output);
-        }
-        let shape = self.r#type().static_shape().unwrap();
-        let count = axes.iter().map(|axis| shape[*axis]).product::<usize>();
-        let count = if T::data_type().is_integer() { count.max(1) } else { count };
-        output.map_elements::<T, T>(output_type, |value| value.divide_by_count(count))
     }
 }
 
