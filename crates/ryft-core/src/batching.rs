@@ -847,13 +847,6 @@ pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
     /// Returns the context-neutral [`BatchingLevel`] that `context` introduces.
     fn batching_level(context: &BatchingContext<C, Self>) -> BatchingLevel<C::Type>;
 
-    /// Replays `region` through the provided [`BatchingContext`].
-    fn batch_region(
-        context: &BatchingContext<C, Self>,
-        region: RegionRef<'_, C::Constant, C::Operation>,
-        inputs: Vec<Self::Batch>,
-    ) -> Result<Vec<Self::Batch>, BatchingError>;
-
     /// Structurally batches `region` at the provided [`BatchingLevel`] and returns the resulting transformed
     /// [`BatchedProgram`]. This is the complete structural batching transform: it depends on no live
     /// [`BatchingContext`], so it can batch a program that is traced long after the level was recorded (e.g., a
@@ -884,6 +877,13 @@ pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
     ) -> Result<Self::BatchedProgram, BatchingError> {
         Self::batch_program_at_level(&Self::batching_level(context), region, input_axes, output_axes_policy)
     }
+
+    /// Replays `region` through the provided [`BatchingContext`].
+    fn batch_region(
+        context: &BatchingContext<C, Self>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<Self::Batch>,
+    ) -> Result<Vec<Self::Batch>, BatchingError>;
 
     /// Restores the batch carrier for a value returned across an opaque batched-region boundary, which erases carrier
     /// metadata because transform state cannot ride on program values. The carrier is rebuilt from the two sources that
@@ -2809,20 +2809,20 @@ mod tests {
                 )
             }
 
-            fn batch_region(
-                _context: &BatchingContext<C, Self>,
-                _region: RegionRef<'_, C::Constant, C::Operation>,
-                _inputs: Vec<Self::Batch>,
-            ) -> Result<Vec<Self::Batch>, BatchingError> {
-                Err(BatchingError::UnsupportedOperation { message: "the evidence fixture has no regions".to_string() })
-            }
-
             fn batch_program_at_level(
                 _level: &BatchingLevel<ArrayType>,
                 _region: RegionRef<'_, C::Constant, C::Operation>,
                 _input_axes: &[BatchAxis],
                 _output_axes_policy: ProgramBatchingOutputAxesPolicy,
             ) -> Result<Self::BatchedProgram, BatchingError> {
+                Err(BatchingError::UnsupportedOperation { message: "the evidence fixture has no regions".to_string() })
+            }
+
+            fn batch_region(
+                _context: &BatchingContext<C, Self>,
+                _region: RegionRef<'_, C::Constant, C::Operation>,
+                _inputs: Vec<Self::Batch>,
+            ) -> Result<Vec<Self::Batch>, BatchingError> {
                 Err(BatchingError::UnsupportedOperation { message: "the evidence fixture has no regions".to_string() })
             }
         }

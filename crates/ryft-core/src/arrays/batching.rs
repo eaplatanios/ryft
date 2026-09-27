@@ -26,9 +26,9 @@ use crate::arrays::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Dim
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedOutputs, BatchedProgram,
-    BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BatchingPolicyProjection,
-    BatchingTracer, BoundaryPreservingBatchedProgram, InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy,
-    RecursiveBatchingDriver, RecursiveBatchingPolicy,
+    BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent,
+    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram,
+    InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
 };
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
@@ -2125,6 +2125,35 @@ where
         + From<BroadcastOperation>,
 {
     #[inline]
+    fn batching_level(context: &BatchingContext<C, ArrayBatchingPolicy>) -> BatchingLevel<ArrayType> {
+        BatchingLevel::new(
+            BatchingLevelExtent::Static(*context.axis_extent()),
+            context.axis_name().map(str::to_string),
+            context.axis_sharding().clone(),
+        )
+    }
+
+    fn batch_program_at_level(
+        level: &BatchingLevel<ArrayType>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<Self::BatchedProgram, BatchingError> {
+        let BatchingLevelExtent::Static(extent) = level.extent() else {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "homogeneous array batching requires a static batch extent".to_string(),
+            });
+        };
+        region.batched_with_axis_name(
+            *extent,
+            level.axis_name().map(str::to_string),
+            level.axis_sharding().clone(),
+            input_axes,
+            output_axes_policy,
+        )
+    }
+
+    #[inline]
     fn batch_region(
         context: &BatchingContext<C, ArrayBatchingPolicy>,
         region: RegionRef<'_, C::Constant, C::Operation>,
@@ -2155,22 +2184,6 @@ where
                 )?;
                 Ok(outputs)
             },
-        )
-    }
-
-    #[inline]
-    fn batch_program(
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
-        region: RegionRef<'_, C::Constant, C::Operation>,
-        input_axes: &[BatchAxis],
-        output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<Self::BatchedProgram, BatchingError> {
-        region.batched_with_axis_name(
-            *context.axis_extent(),
-            context.axis_name().map(str::to_string),
-            context.axis_sharding().clone(),
-            input_axes,
-            output_axes_policy,
         )
     }
 
@@ -2476,46 +2489,17 @@ where
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
 {
-    fn batch_region(
-        context: &BatchingContext<C, Self>,
-        region: RegionRef<'_, C::Constant, C::Operation>,
-        inputs: Vec<Self::Batch>,
-    ) -> Result<Vec<Self::Batch>, BatchingError> {
-        // Regions are replayed through the checked constant and operation boundaries.
-        let region_mappings = RegionReplayMappings::new();
-        region.interpret_with(
-            inputs,
-            |_, constant| {
-                // Constants are lifted through the checked constructor. The infallible replicated wrapper would let
-                // a reference-typed capture constant ride through structural batching unchanged.
-                <Self as BatchingPolicy<C>>::batch(context.parent().lift(constant.clone())?, BatchAxis::replicated())
-            },
-            |instruction, instruction_inputs| {
-                // Run the batching rule inside the source instruction's recorded origin so that every staged
-                // instruction records where it came from.
-                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
-                let (outputs, evidence) = context
-                    .invoke_with_provenance_origin(instruction.provenance().clone(), || {
-                        instruction.operation().batch(
-                            context,
-                            &RecursiveBatchingDriver::new(&regions),
-                            instruction_inputs,
-                        )
-                    })?
-                    .into_parts();
-                <Self as BatchingPolicy<C>>::validate_operation_outputs(
-                    instruction.operation().name(),
-                    instruction_inputs,
-                    outputs.as_slice(),
-                    &evidence,
-                )?;
-                Ok(outputs)
-            },
+    #[inline]
+    fn batching_level(context: &BatchingContext<C, Self>) -> BatchingLevel<ArrayIrType> {
+        BatchingLevel::new(
+            BatchingLevelExtent::Dynamic(context.axis_extent().r#type().into_owned()),
+            context.axis_name().map(str::to_string),
+            context.axis_sharding().clone(),
         )
     }
 
-    fn batch_program(
-        context: &BatchingContext<C, Self>,
+    fn batch_program_at_level(
+        level: &BatchingLevel<ArrayIrType>,
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
@@ -2523,10 +2507,10 @@ where
         // There is deliberately no `ArrayIrBatchingTransform` analogous to `ArrayBatchingTransform` here. Homogeneous
         // array batching is determined entirely by a sealed region plus static host metadata, including a `usize`
         // mapped extent, so that complete request can key a region-owned artifact directly. Array IR batching instead
-        // receives `context.axis_extent()` as a live `C::Value` (i.e., a single static assignment value owned by the
-        // caller's current parent context). Such a value is neither stable cache-key material nor something a retained
-        // region artifact may capture. This function already makes the required template/runtime split: it converts
-        // only the live extent's _type_ into a fresh leading input/output of the transformed program, while each
+        // receives its extent as a live `C::Value` (i.e., a single static assignment value owned by the caller's
+        // current parent context). Such a value is neither stable cache-key material nor something a retained region
+        // artifact may capture. This function makes the required template/runtime split: the level carries only the
+        // live extent's _type_, which becomes a fresh leading input/output of the transformed program, while each
         // consumer supplies the current extent through `BatchingPolicy::boundary_operands` and removes the bookkeeping
         // output through `BatchingPolicy::adapt_batched_program`. A future cache could therefore retain this widened,
         // context-neutral template. It would need its own marker and a complete normalized key containing the extent
@@ -2534,8 +2518,12 @@ where
         // remain a per-call boundary operand. The current measured cache consumer is the simpler homogeneous path, so
         // adding that separate specialization mechanism here would be premature rather than technically impossible.
         check_count!("input", input_axes, region.input_types().len(), ProgramError);
-        let extent_type = context.axis_extent().r#type();
-        let extent_type = <&DimensionType>::try_from(extent_type.as_ref())?.clone();
+        let BatchingLevelExtent::Dynamic(extent_type) = level.extent() else {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "array IR batching requires a first-class batch extent".to_string(),
+            });
+        };
+        let extent_type = <&DimensionType>::try_from(extent_type)?.clone();
         let extent_dimension = extent_type.to_dimension();
         let parent_context = TracingContext::<C::Constant, C::Operation>::new();
         let builder = parent_context.builder().clone();
@@ -2547,8 +2535,8 @@ where
             let extent = parent_context.input(extent_type.into());
             let extent_atom_id = extent.atom_id()?;
             let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent_context, extent)
-                .with_axis_name(context.axis_name().map(str::to_string))
-                .with_axis_sharding(context.axis_sharding().clone());
+                .with_axis_name(level.axis_name().map(str::to_string))
+                .with_axis_sharding(level.axis_sharding().clone());
             let inputs = region
                 .input_types()
                 .iter()
@@ -2561,7 +2549,7 @@ where
                         let position = axis.normalize(batched_rank).map_err(|_| {
                             BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis }
                         })?;
-                        array_type.batched(position, extent_dimension.clone(), context.axis_sharding().clone())
+                        array_type.batched(position, extent_dimension.clone(), level.axis_sharding().clone())
                     };
                     let batched_type = match (unbatched_type, batch_axis.axis()) {
                         (ArrayIrType::Array(array_type), Some(axis)) => {
@@ -2622,6 +2610,44 @@ where
             .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
             .into_simplified()?;
         Ok(ThreadedExtentBatchedProgram::new(program, output_axes)?)
+    }
+
+    fn batch_region(
+        context: &BatchingContext<C, Self>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<Self::Batch>,
+    ) -> Result<Vec<Self::Batch>, BatchingError> {
+        // Regions are replayed through the checked constant and operation boundaries.
+        let region_mappings = RegionReplayMappings::new();
+        region.interpret_with(
+            inputs,
+            |_, constant| {
+                // Constants are lifted through the checked constructor. The infallible replicated wrapper would let
+                // a reference-typed capture constant ride through structural batching unchanged.
+                <Self as BatchingPolicy<C>>::batch(context.parent().lift(constant.clone())?, BatchAxis::replicated())
+            },
+            |instruction, instruction_inputs| {
+                // Run the batching rule inside the source instruction's recorded origin so that every staged
+                // instruction records where it came from.
+                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                let (outputs, evidence) = context
+                    .invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                        instruction.operation().batch(
+                            context,
+                            &RecursiveBatchingDriver::new(&regions),
+                            instruction_inputs,
+                        )
+                    })?
+                    .into_parts();
+                <Self as BatchingPolicy<C>>::validate_operation_outputs(
+                    instruction.operation().name(),
+                    instruction_inputs,
+                    outputs.as_slice(),
+                    &evidence,
+                )?;
+                Ok(outputs)
+            },
+        )
     }
 
     fn restore_batch(
@@ -5741,35 +5767,57 @@ mod tests {
     }
 
     #[test]
-    fn test_array_batching_policy_batch_region() -> Result<(), BatchingError> {
-        // The homogeneous replay interprets the region over `ArrayBatch` carriers: constants are lifted into the parent
-        // and replicated, and every instruction runs through its batching rule against the eager parent.
-        let parent = DomainTracingContext::<TestArrayContext>::new();
-        let builder = parent.builder().clone();
-        let input_atom = builder
-            .borrow_mut()
-            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
-        let input = parent.tracer(input_atom, None);
-        let shifted = input.clone() + parent.lift(Array::scalar(1.0).unwrap())?;
-        let squared = input.clone() * input;
-        let program = builder.borrow().clone().build::<Array, Vec<Array>>(
-            vec![shifted.atom_id()?, squared.atom_id()?],
-            Placeholder,
-            vec![Placeholder, Placeholder],
-        )?;
+    fn test_array_batching_policy_batching_level() {
+        let context = BatchingContext::new(TestArrayContext::new(), 3)
+            .with_axis_name("items".to_string())
+            .with_axis_sharding(ShardingDimension::Replicated);
+        assert_eq!(
+            <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::batching_level(&context),
+            BatchingLevel::new(
+                BatchingLevelExtent::Static(3),
+                Some("items".to_string()),
+                ShardingDimension::Replicated,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_array_batching_policy_batch_program_at_level() -> Result<(), BatchingError> {
+        // Batching at a recorded level needs no live context and matches batching under the context that produced it.
+        let (_, program) = TestArrayContext::trace(|x| Ok(x.clone() * x), ArrayType::scalar(DataType::F64))?;
         let context = BatchingContext::new(TestArrayContext::new(), 2);
-        let outputs = <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::batch_region(
+        let level = <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::batching_level(&context);
+        let batched = <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::batch_program_at_level(
+            &level,
+            program.entry_region_ref(),
+            &[BatchAxis::new(0)],
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let expected = <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::batch_program(
             &context,
             program.entry_region_ref(),
-            vec![ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(), Some(0))?],
+            &[BatchAxis::new(0)],
+            ProgramBatchingOutputAxesPolicy::Natural,
         )?;
-        assert_eq!(
-            outputs,
-            vec![
-                ArrayBatch::new(Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap(), Some(0))?,
-                ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 4.0, 9.0, 16.0, 25.0, 36.0]).unwrap(), Some(0))?,
-            ],
+        assert_eq!(batched.output_axes(), expected.output_axes());
+        assert_eq!(batched.into_parts().0.to_string(), expected.into_parts().0.to_string());
+
+        // A first-class extent has no homogeneous representation.
+        let dynamic = BatchingLevel::new(
+            BatchingLevelExtent::Dynamic(ArrayType::scalar(DataType::I64)),
+            None,
+            ShardingDimension::Replicated,
         );
+        assert!(matches!(
+            <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::batch_program_at_level(
+                &dynamic,
+                program.entry_region_ref(),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "homogeneous array batching requires a static batch extent",
+        ));
         Ok(())
     }
 
@@ -5809,6 +5857,39 @@ mod tests {
                 in (%3, %4)
             "}
             .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_batching_policy_batch_region() -> Result<(), BatchingError> {
+        // The homogeneous replay interprets the region over `ArrayBatch` carriers: constants are lifted into the parent
+        // and replicated, and every instruction runs through its batching rule against the eager parent.
+        let parent = DomainTracingContext::<TestArrayContext>::new();
+        let builder = parent.builder().clone();
+        let input_atom = builder
+            .borrow_mut()
+            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
+        let input = parent.tracer(input_atom, None);
+        let shifted = input.clone() + parent.lift(Array::scalar(1.0).unwrap())?;
+        let squared = input.clone() * input;
+        let program = builder.borrow().clone().build::<Array, Vec<Array>>(
+            vec![shifted.atom_id()?, squared.atom_id()?],
+            Placeholder,
+            vec![Placeholder, Placeholder],
+        )?;
+        let context = BatchingContext::new(TestArrayContext::new(), 2);
+        let outputs = <ArrayBatchingPolicy as RecursiveBatchingPolicy<TestArrayContext>>::batch_region(
+            &context,
+            program.entry_region_ref(),
+            vec![ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(), Some(0))?],
+        )?;
+        assert_eq!(
+            outputs,
+            vec![
+                ArrayBatch::new(Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap(), Some(0))?,
+                ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 4.0, 9.0, 16.0, 25.0, 36.0]).unwrap(), Some(0))?,
+            ],
         );
         Ok(())
     }
@@ -6364,43 +6445,77 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_batching_policy_batch_region() -> Result<(), ProgramError> {
-        // The composite replay interprets a region over `ArrayIrBatch` carriers against the parent context: constants
-        // are lifted through the checked constructor and replicated, and each instruction runs its batching rule
-        // followed by the ragged-dimension validation of its outputs.
+    fn test_array_ir_batching_policy_batching_level() -> Result<(), ProgramError> {
+        // The level retains the first-class extent's type, never its value.
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);
+        let parent = ArrayIrTraceContext::new();
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            parent.clone(),
+            parent.input(DimensionType::from(items.clone()).into()),
+        )
+        .with_axis_name("items".to_string());
+        assert_eq!(
+            <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<ArrayIrTraceContext>>::batching_level(&context),
+            BatchingLevel::new(
+                BatchingLevelExtent::Dynamic(DimensionType::from(items).into()),
+                Some("items".to_string()),
+                ShardingDimension::Replicated,
+            ),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_batch_program_at_level() -> Result<(), ProgramError> {
+        // Batching at a recorded level needs no live context and matches batching under the context that produced it.
         let trace = ArrayIrTraceContext::new();
         let input = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
-        let constant = trace.constant(ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()));
-        let negated = trace
-            .bind(ArrayIrOperation::Array(ArrayOperation::Neg(NegOperation::new())), Vec::new(), &[input])?
+        let doubled = trace
+            .bind(
+                ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())),
+                Vec::new(),
+                &[input.clone(), input],
+            )?
             .remove(0);
         let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-            vec![negated.atom_id()?, constant.atom_id()?],
+            vec![doubled.atom_id()?],
             vec![Placeholder],
-            vec![Placeholder, Placeholder],
+            vec![Placeholder],
         )?;
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);
+        let parent = ArrayIrTraceContext::new();
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
-            ArrayIrEagerContext::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+            parent.clone(),
+            parent.input(DimensionType::from(items).into()),
         );
-        let outputs = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<ArrayIrEagerContext>>::batch_region(
+        let level = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<ArrayIrTraceContext>>::batching_level(&context);
+        let batched = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<ArrayIrTraceContext>>::batch_program_at_level(
+            &level,
+            program.entry_region_ref(),
+            &[BatchAxis::new(0)],
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let expected = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<ArrayIrTraceContext>>::batch_program(
             &context,
             program.entry_region_ref(),
-            vec![ArrayIrBatch::new(
-                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
-                BatchAxis::new(0),
-            )?],
+            &[BatchAxis::new(0)],
+            ProgramBatchingOutputAxesPolicy::Natural,
         )?;
-        assert_eq!(
-            outputs,
-            vec![
-                ArrayIrBatch::new(
-                    ArrayIrValue::Array(Array::matrix(2, 3, vec![-1.0_f32, -2.0, -3.0, -4.0, -5.0, -6.0]).unwrap()),
-                    BatchAxis::new(0),
-                )?,
-                ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap())),
-            ],
-        );
+        assert_eq!(batched.output_axes(), expected.output_axes());
+        assert_eq!(batched.into_parts().0.to_string(), expected.into_parts().0.to_string());
+
+        // A host extent has no first-class representation in this policy.
+        let fixed = BatchingLevel::new(BatchingLevelExtent::Static(2), None, ShardingDimension::Replicated);
+        assert!(matches!(
+            <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<ArrayIrTraceContext>>::batch_program_at_level(
+                &fixed,
+                program.entry_region_ref(),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            ),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "array IR batching requires a first-class batch extent",
+        ));
         Ok(())
     }
 
@@ -6526,6 +6641,47 @@ mod tests {
         assert!(matches!(&outputs[0], ArrayIrValue::Dimension(value) if value.extent() == 2));
         assert!(matches!(&outputs[1], ArrayIrValue::Dimension(value) if value.extent() == 2));
         assert_eq!(outputs[2], ArrayIrValue::Array(Array::matrix(2, 2, vec![4.0_f32, 27.0, 32.0, 25.0]).unwrap()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_batch_region() -> Result<(), ProgramError> {
+        // The composite replay interprets a region over `ArrayIrBatch` carriers against the parent context: constants
+        // are lifted through the checked constructor and replicated, and each instruction runs its batching rule
+        // followed by the ragged-dimension validation of its outputs.
+        let trace = ArrayIrTraceContext::new();
+        let input = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
+        let constant = trace.constant(ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap()));
+        let negated = trace
+            .bind(ArrayIrOperation::Array(ArrayOperation::Neg(NegOperation::new())), Vec::new(), &[input])?
+            .remove(0);
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![negated.atom_id()?, constant.atom_id()?],
+            vec![Placeholder],
+            vec![Placeholder, Placeholder],
+        )?;
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            ArrayIrEagerContext::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let outputs = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<ArrayIrEagerContext>>::batch_region(
+            &context,
+            program.entry_region_ref(),
+            vec![ArrayIrBatch::new(
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()),
+                BatchAxis::new(0),
+            )?],
+        )?;
+        assert_eq!(
+            outputs,
+            vec![
+                ArrayIrBatch::new(
+                    ArrayIrValue::Array(Array::matrix(2, 3, vec![-1.0_f32, -2.0, -3.0, -4.0, -5.0, -6.0]).unwrap()),
+                    BatchAxis::new(0),
+                )?,
+                ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(1.0_f32).unwrap())),
+            ],
+        );
         Ok(())
     }
 
