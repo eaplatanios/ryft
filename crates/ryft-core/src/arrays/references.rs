@@ -1474,33 +1474,63 @@ impl RootIndexSelection {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// One value carrier through which a reference transform path maps between a shared root and one of its views.
+/// Array operations through which an [`ArrayReferenceTransformPath`] reads the value that it selects from a root.
 ///
-/// Reading the selected value and reconstructing the root with update-slice each exist exactly once, on
-/// [`ArrayReferenceTransformPath`], generically over this carrier: the eager carrier operates on concrete values with
-/// the array-manipulation capabilities, while reference discharge binds the identical operation sequence through its
-/// context. Keeping one traversal guarantees the staged and eager semantics cannot drift apart. Static transforms lower
-/// to the carrier's slice and reshape; a dynamic index transform hands the carrier its index through the path's
-/// [`Binding`](Self::Binding).
+/// Array references are accessed in two different settings. An eager [`ArrayReference`] reads and writes concrete
+/// array values directly through their array-manipulation capabilities (e.g., [`Slice`] and [`Reshape`]), while
+/// [`ArrayReferenceDischarge`] rewrites staged accesses into array operations that it binds into a program context,
+/// whose operation family may be a backend-owned superset of the core array IR. This trait abstracts over the two,
+/// so that the traversals which map a root to the value that a path selects (e.g.,
+/// [`intermediates_in`](ArrayReferenceTransformPath::intermediates_in)) are written once, generically over their
+/// carrier, and eager and discharged accesses cannot drift apart.
+///
+/// A static transform lowers to [`slice`](Self::slice), followed for an index by a [`reshape`](Self::reshape) that
+/// removes the indexed axis, whereas a dynamic index lowers to [`dynamic_index`](Self::dynamic_index), which receives
+/// the binding that supplies the index. Writing lives in the separate [`TransformWriteCarrier`], so that read-only
+/// traversals do not require update capabilities (e.g., [`ArrayReference::read`] only requires [`Reshape`] and
+/// [`Slice`]).
 trait TransformReadCarrier {
-    /// Value representation carried through the traversal.
+    /// Representation of the values that the traversal reads and produces: concrete array values for eager handles,
+    /// and context values for reference discharge.
     type Value;
 
-    /// What a dynamic index of the traversed path is closed over.
+    /// Value that supplies a dynamic index of the traversed path (i.e., the uninhabited [`NoReferenceTransformBinding`]
+    /// for eager paths, which carry only static transforms, and the context value that holds the index for reference
+    /// discharge).
     type Binding;
 
-    /// Returns the carried value's array type, borrowing from the carrier or the value where possible.
+    /// Returns the [`ArrayType`] of `value`, which the traversal uses to validate each static transform and compute
+    /// its slice bounds. The type is borrowed from the carrier or from `value` where possible.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if `value` is not an array (e.g., a reference-typed context value).
     fn array_type<'c>(&'c self, value: &'c Self::Value) -> Result<Cow<'c, ArrayType>, ProgramError>;
 
-    /// Takes one unit-stride slice of `input`, from the inclusive `starts` to the exclusive `limits`.
+    /// Returns the unit-stride slice of `input` that starts at `starts` (inclusive) and ends at `limits` (exclusive),
+    /// with one entry per axis of `input`.
+    ///
+    /// # Errors
+    ///
+    /// Forwards the error of a slice that does not apply to `input`.
     fn slice(&self, input: &Self::Value, starts: Vec<usize>, limits: Vec<usize>) -> Result<Self::Value, ProgramError>;
 
-    /// Reshapes `input` to `shape`.
+    /// Returns `input` reshaped to `shape`. The traversal uses it to remove the size-one axis that an index leaves
+    /// behind after slicing, and to restore that axis before writing a value back.
+    ///
+    /// # Errors
+    ///
+    /// Forwards the error of a reshape that does not apply to `input`.
     fn reshape(&self, input: &Self::Value, shape: Shape) -> Result<Self::Value, ProgramError>;
 
-    /// Selects the index that `binding` closes over on `axis` of `input` and removes that axis.
+    /// Returns the elements of `input` at the runtime position that `binding` supplies on `axis`, with that axis
+    /// removed. A negative position counts from the end of `axis` once, and the result is then clamped to the valid
+    /// range of `axis`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if `input` does not have a static shape or `axis` is out of bounds for its rank, and
+    /// forwards the errors of the operations that perform the selection.
     fn dynamic_index(
         &self,
         input: &Self::Value,
@@ -1509,9 +1539,20 @@ trait TransformReadCarrier {
     ) -> Result<Self::Value, ProgramError>;
 }
 
-/// A [`TransformReadCarrier`] that can also write a selected value back into its parent.
+/// A [`TransformReadCarrier`] that can also write a selected value back into its parent, which the traversals that
+/// rebuild a root after a mutation need (e.g., [`reconstruct_in`](ArrayReferenceTransformPath::reconstruct_in)). Each
+/// function of this trait inverts one read function of [`TransformReadCarrier`]: [`update_slice`](Self::update_slice)
+/// inverts [`slice`](TransformReadCarrier::slice), and [`dynamic_update_index`](Self::dynamic_update_index) inverts
+/// [`dynamic_index`](TransformReadCarrier::dynamic_index). It is a separate trait so that read-only traversals do not
+/// require update capabilities from the carried values.
 trait TransformWriteCarrier: TransformReadCarrier {
-    /// Returns `target` with `update` written at `starts`.
+    /// Returns `target` with `update` written into the slice that starts at `starts`, which inverts
+    /// [`slice`](TransformReadCarrier::slice). `update` has the shape of that slice, so the traversal
+    /// restores the size-one axis of an index before calling this function.
+    ///
+    /// # Errors
+    ///
+    /// Forwards the error of an update that does not apply to `target`.
     fn update_slice(
         &self,
         target: &Self::Value,
@@ -1519,8 +1560,15 @@ trait TransformWriteCarrier: TransformReadCarrier {
         starts: Vec<usize>,
     ) -> Result<Self::Value, ProgramError>;
 
-    /// Returns `target` with `update` written at the index that `binding` closes over on `axis`, the inverse of
-    /// [`dynamic_index`](TransformReadCarrier::dynamic_index).
+    /// Returns `target` with `update` written at the runtime position that `binding` supplies on `axis`, which
+    /// inverts [`dynamic_index`](TransformReadCarrier::dynamic_index). `update` has the shape of the value that
+    /// `dynamic_index` selects (i.e., without `axis`), and the position is wrapped and clamped exactly as in
+    /// `dynamic_index`, so that a write replaces the elements that the corresponding read selects.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if `target` does not have a static shape or `axis` is out of bounds for its rank,
+    /// and forwards the errors of the operations that perform the update.
     fn dynamic_update_index(
         &self,
         target: &Self::Value,
@@ -1529,6 +1577,8 @@ trait TransformWriteCarrier: TransformReadCarrier {
         binding: &Self::Binding,
     ) -> Result<Self::Value, ProgramError>;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Stateless eager carrier over one concrete array value family. Eager paths carry only static transforms, so the
 /// dynamic-index hooks are unreachable by type.
