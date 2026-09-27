@@ -2807,15 +2807,15 @@ mod tests {
     use crate::operations::control_flow::tests::CountingBatchingDriver;
     use crate::operations::debugging::PrintOperation;
     use crate::operations::references::{
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceWriteOperation,
+        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation,
     };
     use crate::parameters::Parameter;
     use crate::programs::{
         BindingRegionDriver, EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope,
         ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType,
     };
-    use crate::tracing::{DomainTracingContext, TracingContext};
+    use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
     use super::*;
 
@@ -3213,6 +3213,54 @@ mod tests {
     }
 
     #[test]
+    fn test_while_traced_carry_joins_operand_alias_family() {
+        type TestContext = TracingContext<TestIrValue, TestIrOperation>;
+        type TestTracer = Tracer<TestContext>;
+
+        // A `while` declares no reference effects of its own; it states that its carry output denotes the same
+        // reference as its carry input through `reference_output_identity_input` instead. Tracing honors that hook,
+        // so the loop's result belongs to its operand's alias family, and an access through it after the allocation
+        // is frozen is reported at the access that performs it.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar_type.clone()));
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        condition_builder.add_input(reference_type.clone());
+        let predicate = condition_builder.add_constant(TestIrValue::Array(Array::scalar(false).unwrap()));
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let carry = body_builder.add_input(reference_type);
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![carry], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let error = TestContext::trace(
+            |input: TestTracer| {
+                let context = input.context().clone();
+                let reference = input.reference_new()?;
+                let carried = context
+                    .bind(
+                        WhileOperation::new(),
+                        vec![condition.clone(), body.clone()],
+                        std::slice::from_ref(&reference),
+                    )?
+                    .remove(0);
+                reference.freeze()?;
+                carried.read()
+            },
+            ArrayIrType::Array(scalar_type),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::MalformedProgram(
+                "`reference_read` reads a reference whose alias family `reference_freeze` already consumed".to_string(),
+            ),
+        );
+    }
+
+    #[test]
     fn test_while_interprets_until_condition_is_false() {
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let condition_input = condition_builder.add_input(ArrayType::scalar(DataType::F64));
@@ -3245,6 +3293,88 @@ mod tests {
     /// equals its init), so `ksq` folds to the constant `9` and the body shrinks from four instructions to three, with
     /// the final `k` folded to the constant `3` inside the residual while body. A bound terminates the loop
     /// deterministically. Interpreting the residual program reproduces the original while over the same inputs.
+    #[test]
+    fn test_while_interprets_fresh_local_allocations_per_invocation() {
+        // Both regions allocate a local reference on every invocation. The body initializes its reference from a
+        // constant and accumulates the carried state into it, so an allocation that persisted across iterations would
+        // accumulate into a stale value and diverge from `state + 1` after the first iteration. The carried predicates
+        // shift by one position per iteration, so the loop runs exactly three times.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let boolean_type = ArrayType::scalar(DataType::Boolean);
+        let condition = {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let state = builder.add_input(array_type.clone().into());
+            let predicate = builder.add_input(boolean_type.clone().into());
+            builder.add_input(boolean_type.clone().into());
+            builder.add_input(boolean_type.clone().into());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap();
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 4], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let state = builder.add_input(array_type.clone().into());
+            builder.add_input(boolean_type.clone().into());
+            let second = builder.add_input(boolean_type.clone().into());
+            let third = builder.add_input(boolean_type.clone().into());
+            let one = builder.add_constant(TestIrValue::Array(Array::vector(vec![1.0f32, 1.0]).unwrap()));
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![one], None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, state], None)
+                .unwrap();
+            let state =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            let done = builder.add_constant(TestIrValue::Array(Array::scalar(false).unwrap()));
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                    vec![state, second, third, done],
+                    vec![Placeholder; 4],
+                    vec![Placeholder; 4],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let inputs = vec![
+            builder.add_input(array_type.into()),
+            builder.add_input(boolean_type.clone().into()),
+            builder.add_input(boolean_type.clone().into()),
+            builder.add_input(boolean_type.into()),
+        ];
+        let outputs = builder
+            .add_instruction(
+                TestIrOperation::While(WhileOperation::new()),
+                vec![condition_region, body_region],
+                inputs,
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 4], vec![Placeholder; 4])
+            .unwrap();
+        let predicate = |value| TestIrValue::Array(Array::scalar(value).unwrap());
+        assert_eq!(
+            program.interpret(vec![
+                TestIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+                predicate(true),
+                predicate(true),
+                predicate(true),
+            ]),
+            Ok(vec![
+                TestIrValue::Array(Array::vector(vec![4.0f32, 5.0]).unwrap()),
+                predicate(false),
+                predicate(false),
+                predicate(false),
+            ]),
+        );
+    }
+
     #[test]
     fn test_while_program_rendering_includes_condition_and_body() {
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();

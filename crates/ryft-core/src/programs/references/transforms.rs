@@ -16,7 +16,7 @@ use crate::programs::values::ValueId;
 /// Represents whether two views of the same reference allocation cover separate parts, exactly the same part, or
 /// potentially overlapping parts, as determined by [`ReferenceTransform::overlap`]. Both paths apply transforms
 /// starting from the complete allocation. For example, `root[0]` and `root[1]` address different elements and are
-/// disjoint, while `root[i]` and `root[j]` may overlap when the values of `i` and `j` are unknown. Each symbolic index
+/// disjoint, while `root[i]` and `root[j]` may overlap when the values of `i` and `j` are unknown. Each dynamic index
 /// in a path has a binding identifying the program value that supplies it; that binding does not imply that the index's
 /// runtime value is known.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -27,8 +27,8 @@ pub enum ReferenceViewOverlap {
     /// The two paths _provably_ address exactly the same part of the root.
     Same,
 
-    /// The two paths may overlap: they address intersecting parts, or a transform depends on a symbol whose binding
-    /// cannot prove the paths identical or disjoint.
+    /// The two paths may overlap: they address intersecting parts, or a transform depends on a dynamic input whose
+    /// binding cannot prove the paths identical or disjoint.
     MayOverlap,
 }
 
@@ -83,9 +83,9 @@ pub trait ReferenceTransform: 'static + Clone + Debug + Display + PartialEq + Eq
     /// allocation's root, meaning its entire referenced value, rather than to an intermediate view. For example, an
     /// access that selects `[2]` through a view of `root[1]` is compared through the full path `root[1][2]`, not `[2]`.
     /// Views of `root[0]` and `root[1]` are disjoint, while views of `root[i]` and `root[j]` may overlap when their
-    /// indices are unknown. Equal symbol bindings identify the same program value, but different bindings do not prove
-    /// that the runtime values differ. Comparing symbolic views must also account for the transforms themselves,
-    /// including any clamping.
+    /// indices are unknown. Equal bindings identify the same program value, but different bindings do not prove that
+    /// the runtime values differ. Comparing views with dynamic indices must also account for the transforms
+    /// themselves, including any clamping.
     ///
     /// Note that an empty path covers the complete allocation, two empty paths are considered
     /// [`Same`](ReferenceViewOverlap::Same), and an empty path may overlap with a path covering only part of the
@@ -151,8 +151,8 @@ impl<Transform: ReferenceTransform, Binding> BoundReferenceTransform<Transform, 
         &self.transform
     }
 
-    /// Returns the binding of each symbol of the [`ReferenceTransform`], in the order returned
-    /// by [`ReferenceTransform::binding_count`].
+    /// Returns the binding of each dynamic input of the [`ReferenceTransform`], in the order counted by
+    /// [`ReferenceTransform::binding_count`].
     #[inline]
     pub fn bindings(&self) -> &[Binding] {
         self.bindings.as_slice()
@@ -162,7 +162,7 @@ impl<Transform: ReferenceTransform, Binding> BoundReferenceTransform<Transform, 
 /// Sequence of [`BoundReferenceTransform`]s from a reference root to one derived reference
 /// (i.e., a view), in the order they are applied. `Transform` is the type of each transform, such as
 /// [`ArrayReferenceTransform`](crate::ArrayReferenceTransform), and `Binding` represents the inputs needed by a
-/// symbolic transform. Each [`BoundReferenceTransform`] pairs a `Transform` with a vector of `Binding`s.
+/// transform with dynamic indices. Each [`BoundReferenceTransform`] pairs a `Transform` with a vector of `Binding`s.
 /// The path stores these bound transforms, but neither the root allocation nor its identity. Instead,
 /// [`ReferenceAnalysis`](crate::ReferenceAnalysis) identifies the root when analyzing a [`Program`](crate::Program).
 ///
@@ -604,11 +604,11 @@ pub(crate) mod tests {
     #[test]
     fn test_reference_transform_path_with_bound_transform() {
         let row = TestPath::root().with_transform(index(0, 1));
-        let symbolic = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let dynamic_index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
         let bound = row
             .clone()
-            .with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))]);
-        assert_eq!(bound.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &symbolic]);
+            .with_bound_transform(dynamic_index.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))]);
+        assert_eq!(bound.transforms().collect::<Vec<_>>(), vec![&index(0, 1), &dynamic_index]);
         assert_eq!(bound.bound_transforms()[1].bindings(), &[ValueId::new(RegionId::new(0), AtomId::new(3))]);
         assert_eq!(row.transforms().collect::<Vec<_>>(), vec![&index(0, 1)]);
 
@@ -616,16 +616,17 @@ pub(crate) mod tests {
         assert_eq!(
             bound,
             row.clone()
-                .with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))])
+                .with_bound_transform(dynamic_index.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))]),
         );
         assert_ne!(
             bound,
             row.clone()
-                .with_bound_transform(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(4))])
+                .with_bound_transform(dynamic_index.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(4))]),
         );
         assert_ne!(
             bound,
-            row.clone().with_bound_transform(symbolic, vec![ValueId::new(RegionId::new(1), AtomId::new(0))])
+            row.clone()
+                .with_bound_transform(dynamic_index, vec![ValueId::new(RegionId::new(1), AtomId::new(0))]),
         );
 
         // Paths used as map keys distinguish bindings as well as transforms.
@@ -737,15 +738,15 @@ pub(crate) mod tests {
         assert_eq!(TestPath::root().overlap(&row_0, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(TestPath::root().overlap(&TestPath::root(), &root), ReferenceViewOverlap::Same);
 
-        // Symbolic transforms agree when their input bindings agree. Different bindings may still select the same row.
-        let symbolic =
+        // Dynamic indices agree when their input bindings agree. Different bindings may still select the same row.
+        let dynamically_indexed =
             TestPath::root().with_bound_transform(dynamic(), vec![ValueId::new(RegionId::new(0), AtomId::new(0))]);
         let other =
             TestPath::root().with_bound_transform(dynamic(), vec![ValueId::new(RegionId::new(1), AtomId::new(0))]);
-        assert_eq!(symbolic.overlap(&symbolic, &root), ReferenceViewOverlap::Same);
-        assert_eq!(symbolic.overlap(&TestPath::root(), &root), ReferenceViewOverlap::MayOverlap);
-        assert_eq!(symbolic.overlap(&row_1, &root), ReferenceViewOverlap::MayOverlap);
-        assert_eq!(symbolic.overlap(&other, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(dynamically_indexed.overlap(&dynamically_indexed, &root), ReferenceViewOverlap::Same);
+        assert_eq!(dynamically_indexed.overlap(&TestPath::root(), &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(dynamically_indexed.overlap(&row_1, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(dynamically_indexed.overlap(&other, &root), ReferenceViewOverlap::MayOverlap);
     }
 
     #[test]

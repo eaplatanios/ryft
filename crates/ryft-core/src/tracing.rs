@@ -1070,11 +1070,14 @@ mod tests {
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::{AddOperation, NegOperation, OneLike, OneOperation, ZeroLike, ZeroOperation};
+    use crate::operations::{
+        AddOperation, NegOperation, OneLike, OneOperation, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew,
+        ReferenceRead, ReferenceSwap, ReferenceWrite, ZeroLike, ZeroOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        AtomId, Operation, ProgramError, ReferenceBoundary, ReferenceType, ReferenceView, RegionInterface, TypeError,
-        Typed,
+        AtomId, EffectClass, EffectClasses, Operation, ProgramError, ReferenceBoundary, ReferenceType, ReferenceView,
+        RegionInterface, TypeError, Typed,
     };
     use crate::tests::{TestArrayContext, TestArrayOperation};
 
@@ -1137,6 +1140,39 @@ mod tests {
             .unwrap();
         assert_eq!(output, Array::scalar(2.0 * 2.0 + (-2.0)).unwrap());
         assert_eq!(program.interpret(Array::scalar(3.0).unwrap()), Ok(Array::scalar(3.0 * 3.0 + (-3.0)).unwrap()));
+    }
+
+    #[test]
+    fn test_context_interpret_and_trace_with_reference_state() {
+        // Interpreting the traced program allocates fresh reference state on every run, so its outputs reflect the
+        // reads, swaps, writes, and updates in program order each time, and the program declares ordered state.
+        let inputs = (
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![5.0f32, 6.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+        );
+        let (outputs, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
+            .interpret_and_trace(
+                |(initial, replacement, written, update)| {
+                    let reference = initial.reference_new()?;
+                    let snapshot = reference.read()?;
+                    let previous = reference.swap(&replacement)?;
+                    reference.write(&written)?;
+                    reference.add_update(&update)?;
+                    Ok((snapshot, previous, reference.freeze()?))
+                },
+                inputs.clone(),
+            )
+            .unwrap();
+        let expected = (
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![6.0f32, 8.0]).unwrap()),
+        );
+        assert_eq!(outputs, expected);
+        assert_eq!(program.interpret(inputs), Ok(expected));
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
     }
 
     #[test]
@@ -1574,6 +1610,69 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`add` input types are not broadcast-compatible",
         ));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_rejects_consumed_reference_accesses() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type TestTracer = Tracer<TestContext>;
+
+        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 2]));
+        let consumed = "`reference_read` reads a reference whose alias family `reference_freeze` already consumed";
+
+        // Every clone of one tracer names the same staged atom, so a handle cloned before the freeze is invalidated
+        // with the rest of the alias family, and its next access is reported against the operation that performs it,
+        // not against the freeze and not at discharge.
+        let error = TestContext::trace(
+            |input: TestTracer| {
+                let reference = input.reference_new()?;
+                let alias = reference.clone();
+                reference.freeze()?;
+                alias.read()
+            },
+            array_type.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error, ProgramError::MalformedProgram(consumed.to_string()));
+
+        // Consumption invalidates a view exactly as it invalidates the allocation, because accesses through the view
+        // are staged against the same root.
+        let error = TestContext::trace(
+            |input: TestTracer| {
+                let reference = input.reference_new()?;
+                let row =
+                    ReferenceView::<_, ArrayReferenceTransform, TestTracer>::new(reference.clone())?.index(0, 0)?;
+                reference.freeze()?;
+                row.read()
+            },
+            array_type.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error, ProgramError::MalformedProgram(consumed.to_string()));
+
+        // Independent allocations stay independent, so consuming one says nothing about the other.
+        let (_, program) = TestContext::trace(
+            |inputs: Vec<TestTracer>| {
+                let first = inputs[0].reference_new()?;
+                let second = inputs[1].reference_new()?;
+                let frozen = first.freeze()?;
+                Ok(vec![frozen, second.read()?])
+            },
+            vec![array_type.clone(), array_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2], %1:f32[2, 2] .
+                let %2:ref<f32[2, 2]> = reference_new %0
+                    %3:ref<f32[2, 2]> = reference_new %1
+                    %4:f32[2, 2] = reference_freeze %2
+                    %5:f32[2, 2] = reference_read %3
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

@@ -10,11 +10,11 @@ use ryft_macros::Parameter;
 
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::forward::{
-    DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer, Pushforward,
+    DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer, Pushforward, linearize_for_rule,
 };
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::{ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole};
-use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError};
+use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError, DifferentiationRule};
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
 use crate::operations::{
@@ -3107,12 +3107,15 @@ pub trait ReverseModeDifferentiate:
         > + From<AddOperation<Self::Type>>,
     >
 {
-    /// Reverse-mode-differentiates `function` at `primals`, returning the primal output and a reusable [`Pullback`],
+    /// Reverse-mode-differentiates `function` at `primal`, returning the primal output and a reusable [`Pullback`],
     /// with this [`Context`] executing (or staging) the primal-side operations. Refer to the documentation of
     /// [`DifferentiationBuilder::vjp`](crate::DifferentiationBuilder::vjp) for the reverse-mode transform.
-    /// The returned [`Pullback`] retains the linear program and transposes it on its first application under the
-    /// [`CotangentDestination`]s chosen then (refer to the documentation of [`Pullback`]), so transposition errors
-    /// surface on that first application rather than here.
+    ///
+    /// This function constructs the derivative program using [`DifferentiableOperation::jvp_for_transpose`], whose
+    /// default delegates to [`DifferentiableOperation::jvp`]. Overrides may choose different saved residuals and
+    /// derivative programs without changing public forward linearization. The returned pullback retains the derivative
+    /// program and transposes it on its first application for the [`CotangentDestination`]s chosen then (refer to the
+    /// documentation of [`Pullback`]), so transposition errors surface on that first application rather than here.
     #[allow(clippy::type_complexity)]
     fn vjp<
         F: FnOnce(
@@ -3130,7 +3133,8 @@ pub trait ReverseModeDifferentiate:
     ) -> Result<(Output::To<Self::Value>, Pullback<Self, Input, Output::To<Self::Value>>), DifferentiationError> {
         let input_structure = primal.parameter_structure();
         let primal_input_values = primal.parameters().cloned().collect::<Vec<_>>();
-        let (output, pushforward) = self.linearize(function, primal, capture)?;
+        let (output, pushforward) =
+            linearize_for_rule(self, function, primal, capture, DifferentiationRule::JvpForTranspose)?;
         let pullback = Pullback::from_pushforward(pushforward, &primal_input_values, input_structure)?;
         Ok((output, pullback))
     }

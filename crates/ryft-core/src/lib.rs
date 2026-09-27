@@ -236,7 +236,7 @@ pub(crate) mod tests {
     /// operation types. Broadcast and transpose support staged batching alignment. Differentiation's shared alignment
     /// rules also require conversion, reduction, reshape, and reshard. Reduction derivatives require comparison,
     /// division, subtraction, exponentiation, and selection. These dependencies apply to the operation family even
-    /// when a particular scalar test emits none of those operations. Custom reverse-preparation tests additionally
+    /// when a particular scalar test emits none of those operations. Tests of `jvp_for_transpose` additionally
     /// use the cube fixture, conditional regions, and a retained linear call. All regions use the fixed `Array` value
     /// family, so no value type parameter is needed.
     #[derive(Clone, Debug, Operation)]

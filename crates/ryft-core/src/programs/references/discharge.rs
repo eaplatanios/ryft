@@ -8899,6 +8899,57 @@ mod tests {
     }
 
     #[test]
+    fn test_program_discharge_references_preserves_jvp() {
+        // A program that allocates, writes, reads, accumulates into, and freezes a local reference has the same fused
+        // JVP boundary and values as its discharged reference-free equivalent.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let initial = builder.add_input(array_type.clone().into());
+        let replacement = builder.add_input(array_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap();
+        let read =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, initial], None)
+            .unwrap();
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![read, frozen],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        let discharged =
+            program.clone().discharge_references(0).unwrap().into_program_without_external_references().unwrap();
+        let discharged_jvp = discharged.jvp().unwrap();
+        assert_eq!(jvp.input_types(), discharged_jvp.input_types());
+        assert_eq!(jvp.output_types(), discharged_jvp.output_types());
+
+        let inputs = vec![
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![5.0f32, 6.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![7.0f32, 8.0]).unwrap()),
+        ];
+        let expected = vec![
+            ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![4.0f32, 6.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![7.0f32, 8.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![12.0f32, 14.0]).unwrap()),
+        ];
+        assert_eq!(jvp.interpret(inputs.clone()), Ok(expected.clone()));
+        assert_eq!(discharged_jvp.interpret(inputs), Ok(expected));
+    }
+
+    #[test]
     fn test_program_discharge_references_omits_a_dead_constant() {
         // A program that touches references is replayed into a fresh trace through the shared program replay path,
         // which lifts only the constants something still consumes, so a constant nothing reads does not survive the

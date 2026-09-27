@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use proc_macro2::TokenStream;
-use quote::{ToTokens, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::visit_mut::VisitMut;
 
 use crate::helpers::attributes::Attribute;
@@ -1452,7 +1452,7 @@ impl OperationEnum {
             .collect()
     }
 
-    /// Generates the forward-mode (JVP) dispatcher of the `DifferentiableOperation` derive output.
+    /// Generates `jvp` and `jvp_for_transpose` dispatchers for `DifferentiableOperation`.
     ///
     /// The generated implementation is generic over a `__DifferentiationContext` staging context pinned to the enum's
     /// primary type, program constant type, and the enum itself as its operation family. Every variant forwards to its
@@ -1547,105 +1547,129 @@ impl OperationEnum {
             #differentiation_self_type: #ryft::OperationProvider<#primary_type, #ryft::ZeroOperation<#primary_type>, Operation = #differentiation_self_type>
         });
 
-        let jvp_arms = variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            let operation_type = &variant.program_payload_type;
-            let receiver = variant.receiver();
-            match &variant.class {
-                OperationVariantClass::CompositeNative => quote! {
-                    Self::#variant_ident(operation) => {
-                        <#operation_type as #ryft::DifferentiableOperation<__DifferentiationContext>>::jvp(
-                            #receiver,
-                            context,
-                            driver,
-                            inputs,
-                        )
-                    },
-                },
-                OperationVariantClass::ProjectedMember { structural: false, .. }
-                | OperationVariantClass::MixedMember { structural: false, .. } => quote! {
-                    Self::#variant_ident(operation) => {
-                        <#operation_type as #ryft::MemberDifferentiableOperation<__DifferentiationContext>>::
-                            jvp_in_parent(#receiver, context, driver, inputs)
-                    },
-                },
-                // A structural mixed payload is constant with respect to its parent-universe operands, but its zero
-                // tangent still needs the runtime geometry those operands carry. Stage the primal and the member zero
-                // over the same operands so the geometry stays available to both. Each output's zero tangent is staged
-                // in the computational member universe that output belongs to, and an output outside every such
-                // universe (e.g., a structural member output) has a zero differential space and needs no instruction.
-                OperationVariantClass::MixedMember { member_type, structural: true } => {
-                    let tangent_universe_arms = self.tangent_universes(member_type).into_iter().map(|member_type| {
-                        quote! {
-                            if let ::std::result::Result::Ok(output_type) =
-                                <&#member_type as ::std::convert::TryFrom<&#primary_type>>::try_from(&output_type)
-                            {
-                                let tangent_type =
-                                    <#member_type as #ryft::DifferentiableType>::tangent(output_type)?;
-                                let tangent_inputs = primal_inputs
-                                    .iter()
-                                    .map(|value| context.primal_to_tangent(value.clone()))
-                                    .collect::<::std::result::Result<::std::vec::Vec<_>, _>>()?;
-                                let mut tangents = context.tangent().bind(
-                                    <#differentiation_self_type as ::std::convert::From<
-                                        #ryft::ZeroOperation<#member_type>,
-                                    >>::from(#ryft::ZeroOperation::new(tangent_type)),
-                                    ::std::vec::Vec::new(),
-                                    tangent_inputs.as_slice(),
-                                )?;
-                                #ryft::check_count!("output", tangents, 1, ProgramError);
-                                return #ryft::DifferentiationDual::new(
-                                    primal,
-                                    #ryft::MaybeZero::Value(tangents.remove(0)),
+        let differentiation_methods = [("jvp", "jvp_in_parent"), ("jvp_for_transpose", "jvp_for_transpose_in_parent")]
+            .map(|(method, member_method)| {
+                let method = format_ident!("{method}");
+                let member_method = format_ident!("{member_method}");
+                let rule_arms = variants.iter().map(|variant| {
+                    let variant_ident = &variant.ident;
+                    let operation_type = &variant.program_payload_type;
+                    let receiver = variant.receiver();
+                    match &variant.class {
+                        OperationVariantClass::CompositeNative => quote! {
+                            Self::#variant_ident(operation) => {
+                                <#operation_type as #ryft::DifferentiableOperation<__DifferentiationContext>>::#method(
+                                    #receiver,
+                                    context,
+                                    driver,
+                                    inputs,
                                 )
-                                .map_err(::std::convert::Into::into);
+                            },
+                        },
+                        OperationVariantClass::ProjectedMember { structural: false, .. }
+                        | OperationVariantClass::MixedMember { structural: false, .. } => quote! {
+                            Self::#variant_ident(operation) => {
+                                <#operation_type as #ryft::MemberDifferentiableOperation<__DifferentiationContext>>::
+                                    #member_method(#receiver, context, driver, inputs)
+                            },
+                        },
+                        // A structural mixed payload is constant with respect to its parent-universe operands, but its zero
+                        // tangent still needs the runtime geometry those operands carry. Stage the primal and the member zero
+                        // over the same operands so the geometry stays available to both. Each output's zero tangent is staged
+                        // in the computational member universe that output belongs to, and an output outside every such
+                        // universe (e.g., a structural member output) has a zero differential space and needs no instruction.
+                        OperationVariantClass::MixedMember { member_type, structural: true } => {
+                            let tangent_universe_arms = self.tangent_universes(member_type).into_iter().map(|member_type| {
+                                quote! {
+                                    if let ::std::result::Result::Ok(output_type) =
+                                        <&#member_type as ::std::convert::TryFrom<&#primary_type>>::try_from(&output_type)
+                                    {
+                                        let tangent_type =
+                                            <#member_type as #ryft::DifferentiableType>::tangent(output_type)?;
+                                        let tangent_inputs = primal_inputs
+                                            .iter()
+                                            .map(|value| context.primal_to_tangent(value.clone()))
+                                            .collect::<::std::result::Result<::std::vec::Vec<_>, _>>()?;
+                                        let mut tangents = context.tangent().bind(
+                                            <#differentiation_self_type as ::std::convert::From<
+                                                #ryft::ZeroOperation<#member_type>,
+                                            >>::from(#ryft::ZeroOperation::new(tangent_type)),
+                                            ::std::vec::Vec::new(),
+                                            tangent_inputs.as_slice(),
+                                        )?;
+                                        #ryft::check_count!("output", tangents, 1, ProgramError);
+                                        return #ryft::DifferentiationDual::new(
+                                            primal,
+                                            #ryft::MaybeZero::Value(tangents.remove(0)),
+                                        )
+                                        .map_err(::std::convert::Into::into);
+                                    }
+                                }
+                            });
+                            quote! {
+                                Self::#variant_ident(operation) => {
+                                    let primal_inputs = inputs
+                                        .iter()
+                                        .map(|input| input.primal().clone())
+                                        .collect::<::std::vec::Vec<_>>();
+                                    let input_types = primal_inputs
+                                        .iter()
+                                        .map(|input| #ryft::Typed::r#type(input).into_owned())
+                                        .collect::<::std::vec::Vec<_>>();
+                                    let output_types = <#operation_type as #ryft::MemberOperation<#primary_type>>::
+                                        infer_parent_output_types(#receiver, input_types.as_slice(), &[])?;
+                                    let primals =
+                                        context.primal().bind(self.clone(), ::std::vec::Vec::new(), primal_inputs.as_slice())?;
+                                    #ryft::check_count!("output", primals, output_types.len(), ProgramError);
+                                    primals
+                                        .into_iter()
+                                        .zip(output_types)
+                                        .map(|(primal, output_type)| {
+                                            #(#tangent_universe_arms)*
+                                            #ryft::DifferentiationDual::new_with_zero_tangent(primal)
+                                        })
+                                        .collect()
+                                },
                             }
                         }
-                    });
-                    quote! {
-                        Self::#variant_ident(operation) => {
-                            let primal_inputs = inputs
-                                .iter()
-                                .map(|input| input.primal().clone())
-                                .collect::<::std::vec::Vec<_>>();
-                            let input_types = primal_inputs
-                                .iter()
-                                .map(|input| #ryft::Typed::r#type(input).into_owned())
-                                .collect::<::std::vec::Vec<_>>();
-                            let output_types = <#operation_type as #ryft::MemberOperation<#primary_type>>::
-                                infer_parent_output_types(#receiver, input_types.as_slice(), &[])?;
-                            let primals =
-                                context.primal().bind(self.clone(), ::std::vec::Vec::new(), primal_inputs.as_slice())?;
-                            #ryft::check_count!("output", primals, output_types.len(), ProgramError);
-                            primals
-                                .into_iter()
-                                .zip(output_types)
-                                .map(|(primal, output_type)| {
-                                    #(#tangent_universe_arms)*
-                                    #ryft::DifferentiationDual::new_with_zero_tangent(primal)
-                                })
-                                .collect()
+                        OperationVariantClass::ProjectedMember { structural: true, .. } => quote! {
+                            Self::#variant_ident(_) => {
+                                context.primal()
+                                    .bind(
+                                        self.clone(),
+                                        ::std::vec::Vec::new(),
+                                        &inputs
+                                            .iter()
+                                            .map(|input| input.primal().clone())
+                                            .collect::<::std::vec::Vec<_>>(),
+                                    )?
+                                    .into_iter()
+                                    .map(#ryft::DifferentiationDual::new_with_zero_tangent)
+                                    .collect()
+                            },
                         },
                     }
+                });
+                quote! {
+                    fn #method<__D: #ryft::DifferentiationDriver<__DifferentiationContext>, __Policy: #ryft::DifferentiationPolicy<__DifferentiationContext>>(
+                        &self,
+                        context: &#ryft::DifferentiationContext<__DifferentiationContext, __Policy>,
+                        driver: &__D,
+                        inputs: &[#ryft::DifferentiationDual<
+                            <__DifferentiationContext as #ryft::Domain>::Value,
+                        >],
+                    ) -> ::std::result::Result<
+                        ::std::vec::Vec<#ryft::DifferentiationDual<
+                            <__DifferentiationContext as #ryft::Domain>::Value,
+                        >>,
+                        #ryft::DifferentiationError,
+                    > {
+                        match self {
+                            #(#rule_arms)*
+                        }
+                    }
                 }
-                OperationVariantClass::ProjectedMember { structural: true, .. } => quote! {
-                    Self::#variant_ident(_) => {
-                        context.primal()
-                            .bind(
-                                self.clone(),
-                                ::std::vec::Vec::new(),
-                                &inputs
-                                    .iter()
-                                    .map(|input| input.primal().clone())
-                                    .collect::<::std::vec::Vec<_>>(),
-                            )?
-                            .into_iter()
-                            .map(#ryft::DifferentiationDual::new_with_zero_tangent)
-                            .collect()
-                    },
-                },
-            }
-        });
+            });
         let (differentiation_impl_generics, _, differentiation_where_clause) =
             differentiation_generics.split_for_impl();
 
@@ -1656,23 +1680,7 @@ impl OperationEnum {
                 for #differentiation_self_type
             #differentiation_where_clause
             {
-                fn jvp<__D: #ryft::DifferentiationDriver<__DifferentiationContext>, __Policy: #ryft::DifferentiationPolicy<__DifferentiationContext>>(
-                    &self,
-                    context: &#ryft::DifferentiationContext<__DifferentiationContext, __Policy>,
-                    driver: &__D,
-                    inputs: &[#ryft::DifferentiationDual<
-                        <__DifferentiationContext as #ryft::Domain>::Value,
-                    >],
-                ) -> ::std::result::Result<
-                    ::std::vec::Vec<#ryft::DifferentiationDual<
-                        <__DifferentiationContext as #ryft::Domain>::Value,
-                    >>,
-                    #ryft::DifferentiationError,
-                > {
-                    match self {
-                        #(#jvp_arms)*
-                    }
-                }
+                #(#differentiation_methods)*
             }
         })
     }
@@ -2462,7 +2470,7 @@ fn value_bound_argument(bound: &syn::TypeParamBound) -> Option<syn::Type> {
 
 #[cfg(test)]
 mod tests {
-    use quote::{ToTokens, quote};
+    use quote::{ToTokens, format_ident, quote};
 
     use super::*;
 

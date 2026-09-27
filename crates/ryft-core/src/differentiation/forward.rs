@@ -13,7 +13,7 @@ use crate::differentiation::zeros::{
     ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole,
     capture_and_validate_zero_residual_values,
 };
-use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError};
+use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationError, DifferentiationRule};
 use crate::macros::check_count;
 use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
@@ -940,6 +940,8 @@ where
 /// dispatch constructs a driver for one operation application and passes it directly to that operation's
 /// [`jvp`](DifferentiableOperation::jvp) rule. [`RegionDriver`] provides structural region access, while this
 /// trait adds differentiation-specific recursion. Region-free applications receive a driver with no regions.
+/// During reverse-mode differentiation, both fused and partitioned recursive requests use
+/// [`DifferentiableOperation::jvp_for_transpose`] instead of [`DifferentiableOperation::jvp`].
 ///
 /// Structural transform requests accept borrowed [`RegionRef`]s directly, allowing the same request to serve both a
 /// region selected from this driver and the entry region of a program rebuilt by an operation rule. Implementations
@@ -948,7 +950,10 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     /// Builds a fused forward mode differentiation program of `region` and returns a shared handle to it. The
     /// `input_indices` select which region inputs to differentiate with respect to and specify their tangent-input
     /// order. Unselected inputs receive structural-zero tangents. All primal inputs remain available to the program.
-    /// Selected inputs whose differential spaces contain only zero do not contribute tangent arguments.
+    /// Selected inputs whose differential spaces contain only zero do not contribute tangent arguments. During
+    /// reverse-mode differentiation, this uses [`DifferentiableOperation::jvp_for_transpose`] and may produce
+    /// transpose-only carriers; callers must retain those carriers for partitioning and transposition instead of
+    /// executing them as forward derivatives.
     ///
     /// For example, for ordinary differentiable inputs and `y = f(x₀, x₁, x₂)`, selecting `[2, 0]` gives:
     ///
@@ -988,7 +993,9 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     /// Linearizes `region` into separate primal and tangent programs. As in [`Self::jvp_program`], `input_indices`
     /// select which region inputs to differentiate with respect to. All primal inputs remain available to the primal
     /// program. The tangent program receives the selected input tangents in the supplied order, omitting zero
-    /// differential spaces, followed by the residual values saved by the primal program.
+    /// differential spaces, followed by the residual values saved by the primal program. During reverse-mode
+    /// differentiation, [`DifferentiableOperation::jvp_for_transpose`] determines the saved residuals and the
+    /// tangent program, which need only support transposition.
     ///
     /// For example, for ordinary differentiable inputs and `y = f(x₀, x₁, x₂)`, selecting `[2, 0]` gives:
     ///
@@ -1119,11 +1126,15 @@ impl<C: Context> DifferentiationDriver<C> for EmptyRegionDriver {
 
 /// [`DifferentiationDriver`] scoped to one [`Operation`] application. It borrows the application's complete region
 /// driver, which preserves the operation-defined ordering of owned regions, borrowed regions, and shared callees
-/// without materializing a combined region collection. Recursive requests are answered through
-/// [`RegionRef::jvp_shared`] and [`RegionRef::linearize_shared`].
+/// without materializing a combined region collection. Recursive requests are answered through rule-specific cached
+/// fused and partitioned construction. Public region transforms always select forward rules; recursive requests from
+/// reverse-mode differentiation retain separate artifacts.
 struct RecursiveDifferentiationDriver<'r, D> {
     /// Application-scoped region driver, in operation-defined order.
     driver: &'r D,
+
+    /// Rule selection inherited from the enclosing differentiation context.
+    rule: DifferentiationRule,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
@@ -1155,7 +1166,7 @@ where
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_indices: &[usize],
     ) -> Result<Arc<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>, DifferentiationError> {
-        region.jvp_shared(input_indices)
+        region.jvp_shared_for_rule(input_indices, self.rule)
     }
 
     #[inline]
@@ -1164,7 +1175,7 @@ where
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_indices: &[usize],
     ) -> Result<Linearization<C::Constant, C::Operation>, DifferentiationError> {
-        region.linearize_shared(input_indices)
+        region.linearize_shared_for_rule(input_indices, self.rule)
     }
 
     #[inline]
@@ -1192,24 +1203,25 @@ where
 // TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
 //  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
 //  context type is built from `Self` (E0284); the equality is enforced per method through `where` clauses instead.
-/// Represents [`Operation`]s that support forward-mode differentiation (i.e., computing Jacobian-Vector Products
-/// or JVPs). Reading an operation as a function `y = f(x₁, …, xₙ)` from its operands to its outputs, the
-/// [`jvp`](Self::jvp) function propagates [`DifferentiationDual`]s through it. Each input dual `(xᵢ, ẋᵢ)` pairs an
-/// operand with its tangent (i.e., perturbation direction), and the function returns one dual `(yⱼ, ẏⱼ)` per output,
-/// where `y = f(x)` is the primal result and `ẏ = Σᵢ (∂f/∂xᵢ)(x) · ẋᵢ` is the directional derivative of `f` at `x`
-/// along the input tangents. For example, the `jvp` implementation for the sine operation maps `(x, ẋ)` to `(sin x,
-/// cos x · ẋ)`. Both halves use ordinary operations bound through [`DifferentiationContext`]. Shared destinations
-/// execute or stage a fused JVP while linearization uses separate destinations so that primal effects run once and
-/// tangent effects run with each pushforward. Users must transfer primal coefficients through
-/// [`DifferentiationContext::primal_to_tangent`] before combining them with tangents.
-/// Structural zero tangents flow between implementations as [`MaybeZero::Zero`]s and stage nothing.
+/// Represents [`Operation`]s that support Jacobian-Vector Products (JVPs), with a separately overridable rule for
+/// constructing derivatives intended for transposition. Reading an operation as a function `y = f(x₁, …, xₙ)` from its
+/// inputs to its outputs, the [`jvp`](Self::jvp) function propagates [`DifferentiationDual`]s through it. Each input
+/// dual `(xᵢ, ẋᵢ)` pairs an input with its tangent (i.e., perturbation direction), and the function returns one dual
+/// `(yⱼ, ẏⱼ)` per output, where `y = f(x)` is the primal result and `ẏ = Σᵢ (∂f/∂xᵢ)(x) · ẋᵢ` is the directional
+/// derivative of `f` at `x` along the input tangents. For example, the `jvp` implementation for the sine operation
+/// maps `(x, ẋ)` to `(sin x, cos x · ẋ)`. Both halves use ordinary operations bound through [`DifferentiationContext`].
+/// Shared destinations execute or stage a fused JVP while linearization uses separate destinations so that primal
+/// effects run once and tangent effects run with each pushforward. Users must transfer primal coefficients through
+/// [`DifferentiationContext::primal_to_tangent`] before combining them with tangents. Structural zero tangents flow
+/// between implementations as [`MaybeZero::Zero`]s and stage nothing.
 ///
 /// ## Deriving Differentiable Operation Enums
 ///
-/// `#[derive(Operation)]` generates a [`DifferentiableOperation`] dispatcher when the enum specifies
-/// `#[ryft(dispatch(differentiation))]`. This selection enables forward-mode differentiation only. Enums that also
-/// need reverse-mode differentiation independently select `transposition`, whose dispatcher reverse mode is built
-/// on. It follows the operation derivation's enum-shape inference rules and generates:
+/// `#[derive(Operation)]` generates a [`DifferentiableOperation`] dispatcher when the enum
+/// specifies `#[ryft(dispatch(differentiation))]`. It forwards both [`jvp`](Self::jvp) and
+/// [`jvp_for_transpose`](Self::jvp_for_transpose). Enums that also need reverse-mode differentiation independently
+/// select `transposition`, whose dispatcher reverse mode is built on. It follows the operation derivation's enum-shape
+/// inference rules and generates:
 ///
 ///   - An `impl DifferentiableOperation<C> for Enum` that is generic over a [`StagingContext`] `C` pinned to the enum's
 ///     primary type, program constant type, and the enum itself as its operation family. Every variant forwards
@@ -1259,15 +1271,62 @@ pub trait DifferentiableOperation<C: Context>: Operation {
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
     where
         Self: Operation<Type = C::Type>;
+
+    /// Applies this operation's derivative rule for subsequent transposition during reverse-mode differentiation.
+    /// Like [`Self::jvp`], this function maps input duals to output duals, with primal and tangent operations bound
+    /// through `context` and the returned vector aligned with this operation's outputs. The tangent computation
+    /// represents the derivative to transpose; this function does not consume output cotangents or compute input
+    /// cotangents itself.
+    ///
+    /// Reverse-mode differentiation uses this rule before computing primal outputs and saving residuals. Immediate
+    /// forward-mode differentiation and public [`linearize`](ForwardModeDifferentiate::linearize) instead use
+    /// [`Self::jvp`], whose tangent computation must support execution as a pushforward. This rule's tangent
+    /// computation need only support transposition (e.g., it may retain a custom backward program in a transpose-only
+    /// [`LinearCallOperation`](crate::LinearCallOperation), which cannot be executed as a pushforward. Callers
+    /// constructing an executable JVP must therefore use [`Self::jvp`]).
+    ///
+    /// The default delegates to [`Self::jvp`], deriving reverse mode from the same derivative rule as forward mode.
+    /// Override this function when reverse mode needs a custom backward program or different primal preparation and
+    /// saved residuals. For example, a forward rule for `x³` can save `3x²`, while this rule saves `x` and defers
+    /// computing `3x²` to the backward program. Keep the default when transposing the ordinary JVP provides the
+    /// desired behavior. An override does not change forward-mode differentiation; the implementor is responsible
+    /// for consistency between the separately defined derivative rules.
+    ///
+    /// Primal outputs and observable primal effects must preserve the operation's declared semantics. Transfer
+    /// saved values through [`DifferentiationContext::primal_to_tangent`], as in a JVP rule. Overrides follow the
+    /// deterministic structural-rule contract of [`Self::jvp`] because their derived programs are also cached. Nested
+    /// requests through `driver` preserve selection of this rule during reverse-mode differentiation. Differentiation
+    /// of the selected primal or backward programs themselves follows the transform explicitly applied to those programs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`DifferentiationContext`] selecting where primal and tangent operations are bound and how saved
+    ///     primal values become available to the derivative computation that will be transposed.
+    ///   - `driver`: Instruction-scoped [`DifferentiationDriver`] that exposes attached [`Region`]s and preserves
+    ///     selection of this rule for nested derivative construction.
+    ///   - `inputs`: Input [`DifferentiationDual`]s aligned with this operation's inputs.
+    #[inline]
+    fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+    where
+        Self: Operation<Type = C::Type>,
+    {
+        self.jvp(context, driver, inputs)
+    }
 }
 
-/// Forward-mode rule for a homogeneous member [`Operation`] whose Jacobian-Vector Product (JVP) must execute in the
-/// parent [`Context`] enclosing its projection. If this operation has member type `T` and the enclosing context has
-/// type `U`, [`jvp_projected_operation`] converts every input from the enclosing value type to the member value type,
-/// applies the ordinary member rule in [`ProjectedContext<C, T>`](ProjectedContext), and converts its outputs back. A
-/// rule executed that way can work only with values of member type `T`. This trait instead gives the rule the original
-/// values and the projected context's parent `C` itself, allowing the rule to use values from other members of `U`
-/// when constructing the derivative.
+/// Derivative rules for a homogeneous member [`Operation`] whose [`jvp`](DifferentiableOperation::jvp) or
+/// [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule must execute in the parent [`Context`]
+/// enclosing its projection. If this operation has member type `T` and the enclosing context has type `U`,
+/// [`jvp_projected_operation`] converts every input from the enclosing value type to the member value type,
+/// applies the ordinary member rule in [`ProjectedContext<C, T>`](ProjectedContext), and converts its outputs back.
+/// A rule executed that way can work only with values of member type `T`. This trait instead gives the rule the
+/// original values and the projected context's parent `C` itself, allowing the rule to use values from other members
+/// of `U` when constructing the derivative.
 ///
 /// This distinction matters whenever the primal operation belongs to one projected member but its linearization must
 /// retain values belonging to another member of the enclosing type universe. Implementing [`DifferentiableOperation`]
@@ -1296,6 +1355,19 @@ pub trait MemberDifferentiableOperation<C: Context>: Operation<Type: Differentia
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
+
+    /// Applies this projected member's derivative rule for subsequent transposition in the parent context enclosing
+    /// its projection, using that parent's own values. The default delegates to [`Self::jvp_in_parent`]. Overrides
+    /// follow the primal, residual, and transposition contract of [`DifferentiableOperation::jvp_for_transpose`].
+    #[inline]
+    fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        self.jvp_in_parent(context, driver, inputs)
+    }
 }
 
 /// [`DifferentiationDual`] flowing through a forward-mode [`DifferentiationContext`]. The function being differentiated
@@ -1471,6 +1543,14 @@ pub struct DifferentiationContext<C: Context, P: DifferentiationPolicy<C> = Fuse
     /// Optional tangent [`Context`].
     tangent: Option<C>,
 
+    /// Selects whether operations bound through this context invoke [`DifferentiableOperation::jvp`] to construct
+    /// executable forward derivatives or [`DifferentiableOperation::jvp_for_transpose`] to construct derivatives for
+    /// transposition. Keeping this selection in the context lets both paths share the same dual propagation machinery
+    /// while choosing different derivative programs and saved residuals. Projection and nested region drivers preserve
+    /// the selection, independently of the policy controlling where primal and tangent operations execute or are
+    /// staged.
+    rule: DifferentiationRule,
+
     /// Phantom marker pinning the [`DifferentiationPolicy`] type.
     policy: PhantomData<P>,
 }
@@ -1504,7 +1584,16 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     #[inline]
     pub fn new(primal: C) -> Self {
         let tangent = P::tangent_context(&primal);
-        Self { primal, tangent, policy: PhantomData }
+        Self { primal, tangent, rule: DifferentiationRule::Jvp, policy: PhantomData }
+    }
+
+    /// Returns this [`DifferentiationContext`] with the provided [`DifferentiationRule`] for subsequent derivative
+    /// construction. Preserves the primal and tangent contexts and their existing work. Existing clones retain their
+    /// own rule; projections and nested region drivers created from the returned context inherit the provided rule.
+    #[inline]
+    pub(crate) fn with_rule(mut self, rule: DifferentiationRule) -> Self {
+        self.rule = rule;
+        self
     }
 
     /// Returns the [`Context`] that computes primal values and also computes tangent values when using the
@@ -1538,6 +1627,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
         DifferentiationContext {
             primal: ProjectedContext::new(self.primal().clone()),
             tangent: self.tangent.as_ref().map(|tangent| ProjectedContext::new(tangent.clone())),
+            rule: self.rule,
             policy: PhantomData,
         }
     }
@@ -1663,8 +1753,13 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
         } else {
             // Borrow the complete region driver directly, preserving operation-defined ordering without collecting
             // it into temporary storage.
-            let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver };
-            operation.jvp(self, &differentiation_driver, inputs)?
+            let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver, rule: self.rule };
+            match self.rule {
+                DifferentiationRule::Jvp => operation.jvp(self, &differentiation_driver, inputs)?,
+                DifferentiationRule::JvpForTranspose => {
+                    operation.jvp_for_transpose(self, &differentiation_driver, inputs)?
+                }
+            }
         };
 
         Ok(outputs)
@@ -1866,11 +1961,24 @@ where
     ///
     ///   - `input_indices`: Unique input indices in tangent input order. Zero differential spaces are omitted.
     ///     An empty slice selects no inputs.
+    #[inline]
     pub fn jvp_shared(
         &self,
         input_indices: &[usize],
     ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
-        let arguments = JvpAndLinearizationTransformArguments::new(*self, input_indices)?;
+        self.jvp_shared_for_rule(input_indices, DifferentiationRule::Jvp)
+    }
+
+    /// Returns a shared fused derivative program for this region using the provided [`DifferentiationRule`]. Follows
+    /// the input-selection contract of [`Self::jvp_shared`], with the rule included in the cache key. When the rule is
+    /// [`DifferentiationRule::JvpForTranspose`], the tangent computation need only support transposition.
+    pub(crate) fn jvp_shared_for_rule(
+        &self,
+        input_indices: &[usize],
+        rule: DifferentiationRule,
+    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
+        let mut arguments = JvpAndLinearizationTransformArguments::new(*self, input_indices)?;
+        arguments.rule = rule;
         let artifact = (*self).transform::<JvpTransform, _, DifferentiationError>(arguments, |region, arguments| {
             Ok(TransformArtifact::new(vec![Arc::new(region.jvp_impl(arguments)?)], ()))
         })?;
@@ -1901,7 +2009,7 @@ where
             // together with every tracer created from it below, leaving the standalone `builder` handle above as the
             // sole owner of the shared builder `Rc` for the `Rc::try_unwrap` that follows this block.
             let context = context;
-            let differentiation_context = DifferentiationContext::fused(context.clone());
+            let differentiation_context = DifferentiationContext::fused(context.clone()).with_rule(arguments.rule);
 
             // Track the primal tracer and symbolic tangent for each source atom. Tangents of atoms not connected to an
             // input tangent (i.e., constants and dead inputs) are derived lazily as structural zeros typed with the
@@ -2008,12 +2116,20 @@ where
                             })
                             .collect::<Result<Vec<_>, DifferentiationError>>()
                     } else {
-                        let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver };
-                        instruction.operation().jvp(
-                            &differentiation_context,
-                            &differentiation_driver,
-                            input_duals.as_slice(),
-                        )
+                        let differentiation_driver =
+                            RecursiveDifferentiationDriver { driver: &driver, rule: arguments.rule };
+                        match arguments.rule {
+                            DifferentiationRule::Jvp => instruction.operation().jvp(
+                                &differentiation_context,
+                                &differentiation_driver,
+                                input_duals.as_slice(),
+                            ),
+                            DifferentiationRule::JvpForTranspose => instruction.operation().jvp_for_transpose(
+                                &differentiation_context,
+                                &differentiation_driver,
+                                input_duals.as_slice(),
+                            ),
+                        }
                     }
                 })?;
 
@@ -2141,8 +2257,22 @@ where
     ///
     ///   - `input_indices`: Unique input indices in tangent input order. Zero differential spaces are omitted.
     ///     An empty slice selects no inputs.
+    #[inline]
     pub fn linearize_shared(&self, input_indices: &[usize]) -> Result<Linearization<V, O>, DifferentiationError> {
-        let arguments = JvpAndLinearizationTransformArguments::new(*self, input_indices)?;
+        self.linearize_shared_for_rule(input_indices, DifferentiationRule::Jvp)
+    }
+
+    /// Returns a cached [`Linearization`] of this region using the provided [`DifferentiationRule`]. Follows the
+    /// input-selection contract of [`Self::linearize_shared`], with the rule included in the cache key. The selected
+    /// rule determines the saved residuals and tangent program, which need only support transposition when the rule is
+    /// [`DifferentiationRule::JvpForTranspose`].
+    pub(crate) fn linearize_shared_for_rule(
+        &self,
+        input_indices: &[usize],
+        rule: DifferentiationRule,
+    ) -> Result<Linearization<V, O>, DifferentiationError> {
+        let mut arguments = JvpAndLinearizationTransformArguments::new(*self, input_indices)?;
+        arguments.rule = rule;
         let artifact =
             (*self).transform::<LinearizationTransform, _, DifferentiationError>(arguments, |region, arguments| {
                 let (primal, tangent, residual_count) = region.linearize_impl(arguments)?.into_parts();
@@ -2171,7 +2301,8 @@ where
         let primal_context = TracingContext::<V, O>::new();
         let primal_builder = primal_context.builder().clone();
         let primal_evaluation_context = PartialEvaluationContext::new(primal_context.clone());
-        let differentiation_context = DifferentiationContext::partitioned(primal_evaluation_context.clone());
+        let differentiation_context =
+            DifferentiationContext::partitioned(primal_evaluation_context.clone()).with_rule(arguments.rule);
         let evaluation_context = differentiation_context.tangent().clone();
 
         // Allocate unknown tangents in selection order before constructing input duals in primal order. Both the
@@ -2666,7 +2797,8 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
 
 /// Extension trait carrying the value-level *forward-mode* differentiation transforms on every [`Context`], mirroring
 /// how [`Batch`](crate::Batch) carries batching. [`ReverseModeDifferentiate`](crate::ReverseModeDifferentiate) is its
-/// sibling that builds reverse mode on top of it (i.e., `vjp = linearize + transpose`).
+/// sibling that shares its partitioning machinery while selecting [`DifferentiableOperation::jvp_for_transpose`]
+/// to construct derivatives for transposition.
 ///
 /// This trait is blanket-implemented for every [`Context`] whose type family is [`DifferentiableType`] and has no
 /// items of its own to implement. Every entry point is a defaulted method whose `where` clause carries its remaining
@@ -2800,6 +2932,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     /// the primal output and a reusable [`Pushforward`], with this [`Context`] executing or staging primal-side work.
     /// Refer to the documentation of [`DifferentiationBuilder::linearize`](crate::DifferentiationBuilder::linearize)
     /// for the forward-mode transform.
+    #[allow(clippy::type_complexity)]
+    #[inline]
     fn linearize<
         F: FnOnce(
             Input::To<LinearizationTracer<Self>>,
@@ -2819,234 +2953,258 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + ResidualZeroProvider<Self::Type, Operation = Self::Operation>,
     {
-        if primal.parameters().next().is_none() {
-            return Err(DifferentiationError::EmptyInput);
-        }
+        linearize_for_rule(self, function, primal, capture, DifferentiationRule::Jvp)
+    }
+}
 
-        let primal_references = ReferenceBoundary::new_for_differentiation(
-            self,
-            primal.parameters(),
-            std::iter::empty(),
-            capture.parameters(),
-        )?;
+/// Linearizes `function` at `primal` using the provided [`DifferentiationRule`], returning its primal outputs and
+/// a [`Pushforward`] containing the saved residuals and derivative program. Shares boundary validation, partial
+/// evaluation, geometry retention, and reference-lifetime handling with public linearization. When the rule is
+/// [`DifferentiationRule::JvpForTranspose`], the derivative program need only support transposition and must not be
+/// assumed executable as a pushforward.
+#[allow(clippy::type_complexity)]
+pub(crate) fn linearize_for_rule<
+    C: Context<Type: DifferentiableType>,
+    F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Result<Output, ProgramError>,
+    Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    Output: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+>(
+    context: &C,
+    function: F,
+    primal: Input,
+    capture: Capture,
+    rule: DifferentiationRule,
+) -> Result<(Output::To<C::Value>, Pushforward<C, Input, Output::To<C::Value>>), DifferentiationError>
+where
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
+{
+    if primal.parameters().next().is_none() {
+        return Err(DifferentiationError::EmptyInput);
+    }
 
-        let input_structure = primal.parameter_structure();
-        let input_values = primal.into_parameters().collect::<Vec<_>>();
-        let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+    let primal_references = ReferenceBoundary::new_for_differentiation(
+        context,
+        primal.parameters(),
+        std::iter::empty(),
+        capture.parameters(),
+    )?;
 
-        // Active primals receive unknown tangent inputs. Captures are known primal inputs paired with structural zeros,
-        // so they can be residualized when needed without increasing the pushforward's tangent arity.
-        let primal_evaluation_context = PartialEvaluationContext::new(self.clone());
-        let differentiation_context = DifferentiationContext::partitioned(primal_evaluation_context.clone());
-        let evaluation_context = differentiation_context.tangent().clone();
-        let mut tangent_index = 0usize;
+    let input_structure = primal.parameter_structure();
+    let input_values = primal.into_parameters().collect::<Vec<_>>();
+    let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
 
-        // Retain the primals for the geometry capture below; only the values stamped into duals need cloning.
-        let input_duals = input_values
-            .iter()
-            .cloned()
-            .map(|value| {
-                let primal_type = value.r#type().into_owned();
-                let tangent_type = primal_type.tangent()?;
-                let tangent = if !tangent_type.is_zero_space() {
-                    let tangent = evaluation_context.unknown_input(tangent_type.clone(), tangent_index);
-                    tangent_index += 1;
-                    MaybeZero::Value(PartialTracer::new(evaluation_context.clone(), tangent))
-                } else {
-                    MaybeZero::Zero(tangent_type)
-                };
-                let dual = DifferentiationDual::new(
-                    PartialTracer::new(primal_evaluation_context.clone(), PartialEvaluationValue::known_input(value)),
-                    tangent,
-                )?;
-                Ok::<_, ProgramError>(DifferentiationTracer::new(dual, differentiation_context.clone()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let tangent_input_count = tangent_index;
-        let input = Input::To::<LinearizationTracer<Self>>::from_parameters(input_structure, input_duals)?;
-        let capture_structure = capture.parameter_structure();
-        let capture_duals = capture
-            .into_parameters()
-            .map(|value| -> Result<_, DifferentiationError> {
-                let primal =
-                    PartialTracer::new(primal_evaluation_context.clone(), PartialEvaluationValue::known_input(value));
-                Ok(DifferentiationTracer::new(
-                    DifferentiationDual::new_with_zero_tangent(primal)?,
-                    differentiation_context.clone(),
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let capture = Capture::To::<LinearizationTracer<Self>>::from_parameters(capture_structure, capture_duals)?;
-        let output = function(input, capture)?;
+    // Active primals receive unknown tangent inputs. Captures are known primal inputs paired with structural zeros,
+    // so they can be residualized when needed without increasing the pushforward's tangent arity.
+    let primal_evaluation_context = PartialEvaluationContext::new(context.clone());
+    let differentiation_context =
+        DifferentiationContext::partitioned(primal_evaluation_context.clone()).with_rule(rule);
+    let evaluation_context = differentiation_context.tangent().clone();
+    let mut tangent_index = 0usize;
 
-        // Split each output dual into its known primal value and its tangent. Primal work depends only on known primal
-        // inputs, so every primal half must have folded to a known value.
-        let output_structure = output.parameter_structure();
-        let output_duals = output.into_parameters().collect::<Vec<_>>();
-
-        // Force structural zeros into the residual program. Calling `Zero` normally would allow partial evaluation to
-        // keep the result known, but a reusable pushforward must expose every non-zero-space tangent output as a Single
-        // Static Assignment (SSA) value.
-        let mut primal_outputs = Vec::with_capacity(output_duals.len());
-        let mut tangent_outputs = Vec::with_capacity(output_duals.len());
-        let mut output_types = Vec::with_capacity(output_duals.len());
-        for (output_index, output_dual) in output_duals.into_iter().enumerate() {
-            let (primal, tangent) = output_dual.into_dual().into_parts();
-            let primal = match primal.into_value()?.value() {
-                PartialValue::Known(value) => value.clone(),
-                PartialValue::Unknown(_) => {
-                    return Err(ProgramError::MalformedProgram(
-                        "linearization produced an unknown primal output but primal work depends only on the known \
-                         primal inputs"
-                            .to_string(),
-                    )
-                    .into());
-                }
+    // Retain the primals for the geometry capture below; only the values stamped into duals need cloning.
+    let input_duals = input_values
+        .iter()
+        .cloned()
+        .map(|value| {
+            let primal_type = value.r#type().into_owned();
+            let tangent_type = primal_type.tangent()?;
+            let tangent = if !tangent_type.is_zero_space() {
+                let tangent = evaluation_context.unknown_input(tangent_type.clone(), tangent_index);
+                tangent_index += 1;
+                MaybeZero::Value(PartialTracer::new(evaluation_context.clone(), tangent))
+            } else {
+                MaybeZero::Zero(tangent_type)
             };
-            let tangent_type = tangent.r#type().into_owned();
-            output_types.push(primal.r#type().into_owned());
-            if tangent_type.is_zero_space() {
-                primal_outputs.push(primal);
-                continue;
-            }
+            let dual = DifferentiationDual::new(
+                PartialTracer::new(primal_evaluation_context.clone(), PartialEvaluationValue::known_input(value)),
+                tangent,
+            )?;
+            Ok::<_, ProgramError>(DifferentiationTracer::new(dual, differentiation_context.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tangent_input_count = tangent_index;
+    let input = Input::To::<LinearizationTracer<C>>::from_parameters(input_structure, input_duals)?;
+    let capture_structure = capture.parameter_structure();
+    let capture_duals = capture
+        .into_parameters()
+        .map(|value| -> Result<_, DifferentiationError> {
+            let primal =
+                PartialTracer::new(primal_evaluation_context.clone(), PartialEvaluationValue::known_input(value));
+            Ok(DifferentiationTracer::new(
+                DifferentiationDual::new_with_zero_tangent(primal)?,
+                differentiation_context.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let capture = Capture::To::<LinearizationTracer<C>>::from_parameters(capture_structure, capture_duals)?;
+    let output = function(input, capture)?;
 
-            // A reference output rooted in a captured (i.e., plumbing) reference has no tangent reference to expose
-            // and is rejected with a boundary diagnostic instead of failing inside the zero residualization below.
-            if primal.r#type().is_reference() && tangent.is_zero() {
-                return Err(ProgramError::InvalidArgument {
-                    message: format!(
-                        "output {output_index} is a reference rooted in a reference that carries no tangent \
-                         (a captured or inactive reference); pass that reference as a differentiated input instead",
-                    ),
-                }
+    // Split each output dual into its known primal value and its tangent. Primal work depends only on known primal
+    // inputs, so every primal half must have folded to a known value.
+    let output_structure = output.parameter_structure();
+    let output_duals = output.into_parameters().collect::<Vec<_>>();
+
+    // Force structural zeros into the residual program. Calling `Zero` normally would allow partial evaluation to
+    // keep the result known, but a reusable pushforward must expose every non-zero-space tangent output as a Single
+    // Static Assignment (SSA) value.
+    let mut primal_outputs = Vec::with_capacity(output_duals.len());
+    let mut tangent_outputs = Vec::with_capacity(output_duals.len());
+    let mut output_types = Vec::with_capacity(output_duals.len());
+    for (output_index, output_dual) in output_duals.into_iter().enumerate() {
+        let (primal, tangent) = output_dual.into_dual().into_parts();
+        let primal = match primal.into_value()?.value() {
+            PartialValue::Known(value) => value.clone(),
+            PartialValue::Unknown(_) => {
+                return Err(ProgramError::MalformedProgram(
+                    "linearization produced an unknown primal output but primal work depends only on the known \
+                     primal inputs"
+                        .to_string(),
+                )
                 .into());
             }
-
-            let tangent = match tangent {
-                MaybeZero::Value(tracer) => {
-                    let value = tracer.into_value()?;
-                    match value.value() {
-                        PartialValue::Unknown(_) => value,
-                        PartialValue::Known(_) => {
-                            return Err(ProgramError::MalformedProgram(
-                                "linearization produced a known tangent output; differentiation rules must represent \
-                                 input-independent zero tangents structurally"
-                                    .to_string(),
-                            )
-                            .into());
-                        }
-                    }
-                }
-                MaybeZero::Zero(r#type) => {
-                    let residuals = capture_and_validate_zero_residual_values(
-                        self,
-                        &primal,
-                        &r#type,
-                        "pushforward output tangent",
-                    )?;
-                    residualize_zero_from_residual_values(&evaluation_context, r#type, residuals)?
-                }
-            };
+        };
+        let tangent_type = tangent.r#type().into_owned();
+        output_types.push(primal.r#type().into_owned());
+        if tangent_type.is_zero_space() {
             primal_outputs.push(primal);
-            tangent_outputs.push(tangent);
+            continue;
         }
-        let tangent_reconstruction = ZeroSpaceBoundaryReconstruction::capture(
-            self,
-            primal_outputs.as_slice(),
-            output_types.as_slice(),
-            ZeroSpaceBoundaryRole::OutputTangent,
-        )?;
-        let output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
 
-        // All tracer-stamped context clones are dropped here, so the accumulated pushforward program can be finalized.
-        drop(differentiation_context);
-
-        let primal_evaluation = primal_evaluation_context.into_evaluation(Vec::new())?;
-        if !primal_evaluation.program.instructions().is_empty() {
-            return Err(ProgramError::MalformedProgram(
-                "linearization deferred an operation bound to the primal destination".to_string(),
-            )
+        // A reference output rooted in a captured (i.e., plumbing) reference has no tangent reference to expose
+        // and is rejected with a boundary diagnostic instead of failing inside the zero residualization below.
+        if primal.r#type().is_reference() && tangent.is_zero() {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "output {output_index} is a reference rooted in a reference that carries no tangent \
+                     (a captured or inactive reference); pass that reference as a differentiated input instead",
+                ),
+            }
             .into());
         }
-        drop(primal_evaluation);
 
-        let evaluation = evaluation_context.into_evaluation(tangent_outputs)?;
-
-        // The pushforward program's inputs are the leading active tangent unknowns
-        // followed by captured residual values.
-        let mut residuals = Vec::with_capacity(evaluation.inputs.len().saturating_sub(tangent_input_count));
-        for (index, input) in evaluation.inputs.iter().enumerate() {
-            match input {
-                PartialEvaluationInput::Unknown(ordinal) if index < tangent_input_count && *ordinal == index => {}
-                PartialEvaluationInput::Known(value) if index >= tangent_input_count => residuals.push(value.clone()),
-                _ => {
-                    return Err(ProgramError::MalformedProgram(
-                        "linearization produced a pushforward program whose tangent inputs do not lead its residuals"
-                            .to_string(),
-                    )
-                    .into());
+        let tangent = match tangent {
+            MaybeZero::Value(tracer) => {
+                let value = tracer.into_value()?;
+                match value.value() {
+                    PartialValue::Unknown(_) => value,
+                    PartialValue::Known(_) => {
+                        return Err(ProgramError::MalformedProgram(
+                            "linearization produced a known tangent output; differentiation rules must represent \
+                             input-independent zero tangents structurally"
+                                .to_string(),
+                        )
+                        .into());
+                    }
                 }
             }
-        }
-
-        // Preserve allocation geometry for reference adjoints, including live inputs whose outputs describe only a
-        // view. Only ordinary inputs supply these extra dimensions as reading a primal reference solely for geometry
-        // could move a synchronization or lifecycle error ahead of the original computation. For reference-free
-        // programs, disconnected tangent inputs alone require extra zero geometry.
-        let mut program = evaluation.program;
-        let has_references = program.entry_region_ref().contains_references_in_closure();
-        let live_sets = program.live_sets();
-        let differentiable_primal_inputs = input_values
-            .iter()
-            .map(|value| Ok((value.r#type().tangent()?, value)))
-            .collect::<Result<Vec<_>, DifferentiationError>>()?
-            .into_iter()
-            .filter_map(|(tangent_type, value)| (!tangent_type.is_zero_space()).then_some(value));
-        let mut zero_residuals = Vec::new();
-        for ((primal, tangent_input), tangent_input_atom) in differentiable_primal_inputs
-            .zip(program.inputs().take(tangent_input_count))
-            .zip(program.input_ids().iter().copied().take(tangent_input_count))
-        {
-            let tangent_type = tangent_input.r#type().into_owned();
-            if tangent_type.is_reference() || (!has_references && live_sets.atoms()[tangent_input_atom.index()]) {
-                continue;
+            MaybeZero::Zero(r#type) => {
+                let residuals =
+                    capture_and_validate_zero_residual_values(context, &primal, &r#type, "pushforward output tangent")?;
+                residualize_zero_from_residual_values(&evaluation_context, r#type, residuals)?
             }
-            let values = capture_and_validate_zero_residual_values(
-                self,
-                primal,
-                &tangent_type,
-                &format!("transposition zero for input type {}", primal.r#type()),
-            )?;
-            zero_residuals.extend(values);
-        }
-
-        if !zero_residuals.is_empty() {
-            let mut builder = ProgramBuilder::<Self::Constant, Self::Operation>::new();
-            let old_input_count = program.input_ids().len();
-            let inputs = program
-                .input_types()
-                .into_iter()
-                .chain(zero_residuals.iter().map(|value| value.r#type().into_owned()))
-                .map(|r#type| builder.add_input(r#type))
-                .collect::<Vec<_>>();
-            let outputs = builder.splice_program(&program, &inputs[..old_input_count])?;
-            let output_count = outputs.len();
-            program = builder.build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])?;
-            residuals.extend(zero_residuals);
-        }
-
-        let pushforward = Pushforward::new(
-            self.clone(),
-            program,
-            residuals,
-            tangent_reconstruction,
-            input_types,
-            output_types,
-            primal_references,
-            output_structure,
-        )?;
-        Ok((output, pushforward))
+        };
+        primal_outputs.push(primal);
+        tangent_outputs.push(tangent);
     }
+    let tangent_reconstruction = ZeroSpaceBoundaryReconstruction::capture(
+        context,
+        primal_outputs.as_slice(),
+        output_types.as_slice(),
+        ZeroSpaceBoundaryRole::OutputTangent,
+    )?;
+    let output = Output::To::<C::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
+
+    // All tracer-stamped context clones are dropped here, so the accumulated pushforward program can be finalized.
+    drop(differentiation_context);
+
+    let primal_evaluation = primal_evaluation_context.into_evaluation(Vec::new())?;
+    if !primal_evaluation.program.instructions().is_empty() {
+        return Err(ProgramError::MalformedProgram(
+            "linearization deferred an operation bound to the primal destination".to_string(),
+        )
+        .into());
+    }
+    drop(primal_evaluation);
+
+    let evaluation = evaluation_context.into_evaluation(tangent_outputs)?;
+
+    // The pushforward program's inputs are the leading active tangent unknowns
+    // followed by captured residual values.
+    let mut residuals = Vec::with_capacity(evaluation.inputs.len().saturating_sub(tangent_input_count));
+    for (index, input) in evaluation.inputs.iter().enumerate() {
+        match input {
+            PartialEvaluationInput::Unknown(ordinal) if index < tangent_input_count && *ordinal == index => {}
+            PartialEvaluationInput::Known(value) if index >= tangent_input_count => residuals.push(value.clone()),
+            _ => {
+                return Err(ProgramError::MalformedProgram(
+                    "linearization produced a pushforward program whose tangent inputs do not lead its residuals"
+                        .to_string(),
+                )
+                .into());
+            }
+        }
+    }
+
+    // Preserve allocation geometry for reference adjoints, including live inputs whose outputs describe only a
+    // view. Only ordinary inputs supply these extra dimensions as reading a primal reference solely for geometry
+    // could move a synchronization or lifecycle error ahead of the original computation. For reference-free
+    // programs, disconnected tangent inputs alone require extra zero geometry.
+    let mut program = evaluation.program;
+    let has_references = program.entry_region_ref().contains_references_in_closure();
+    let live_sets = program.live_sets();
+    let differentiable_primal_inputs = input_values
+        .iter()
+        .map(|value| Ok((value.r#type().tangent()?, value)))
+        .collect::<Result<Vec<_>, DifferentiationError>>()?
+        .into_iter()
+        .filter_map(|(tangent_type, value)| (!tangent_type.is_zero_space()).then_some(value));
+    let mut zero_residuals = Vec::new();
+    for ((primal, tangent_input), tangent_input_atom) in differentiable_primal_inputs
+        .zip(program.inputs().take(tangent_input_count))
+        .zip(program.input_ids().iter().copied().take(tangent_input_count))
+    {
+        let tangent_type = tangent_input.r#type().into_owned();
+        if tangent_type.is_reference() || (!has_references && live_sets.atoms()[tangent_input_atom.index()]) {
+            continue;
+        }
+        let values = capture_and_validate_zero_residual_values(
+            context,
+            primal,
+            &tangent_type,
+            &format!("transposition zero for input type {}", primal.r#type()),
+        )?;
+        zero_residuals.extend(values);
+    }
+
+    if !zero_residuals.is_empty() {
+        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+        let old_input_count = program.input_ids().len();
+        let inputs = program
+            .input_types()
+            .into_iter()
+            .chain(zero_residuals.iter().map(|value| value.r#type().into_owned()))
+            .map(|r#type| builder.add_input(r#type))
+            .collect::<Vec<_>>();
+        let outputs = builder.splice_program(&program, &inputs[..old_input_count])?;
+        let output_count = outputs.len();
+        program = builder.build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])?;
+        residuals.extend(zero_residuals);
+    }
+
+    let pushforward = Pushforward::new(
+        context.clone(),
+        program,
+        residuals,
+        tangent_reconstruction,
+        input_types,
+        output_types,
+        primal_references,
+        output_structure,
+    )?;
+    Ok((output, pushforward))
 }
 
 impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
@@ -3108,8 +3266,14 @@ pub fn jvp_projected_operation<
             }
         })
         .collect::<Result<Vec<_>, DifferentiationError>>()?;
-    operation
-        .jvp(&context.project::<T>(), &EmptyRegionDriver, projected_inputs.as_slice())?
+    let projected_context = context.project::<T>();
+    let outputs = match context.rule {
+        DifferentiationRule::Jvp => operation.jvp(&projected_context, &EmptyRegionDriver, &projected_inputs)?,
+        DifferentiationRule::JvpForTranspose => {
+            operation.jvp_for_transpose(&projected_context, &EmptyRegionDriver, &projected_inputs)?
+        }
+    };
+    outputs
         .into_iter()
         .map(|output| {
             let (primal, tangent) = output.into_parts();
@@ -3224,6 +3388,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for Lineari
 struct JvpAndLinearizationTransformArguments {
     /// Selected input indices in tangent input order, excluding zero differential spaces.
     input_indices: Vec<usize>,
+
+    /// Distinguishes artifacts constructed with JVP rules from those constructed with JVP-for-transpose rules.
+    rule: DifferentiationRule,
 }
 
 impl JvpAndLinearizationTransformArguments {
@@ -3257,7 +3424,7 @@ impl JvpAndLinearizationTransformArguments {
                 indices.push(index);
             }
         }
-        Ok(Self { input_indices: indices })
+        Ok(Self { input_indices: indices, rule: DifferentiationRule::Jvp })
     }
 }
 
@@ -3456,7 +3623,8 @@ mod tests {
                 ));
             }
         }
-        let arguments = JvpAndLinearizationTransformArguments { input_indices: vec![0] };
+        let arguments =
+            JvpAndLinearizationTransformArguments { input_indices: vec![0], rule: DifferentiationRule::Jvp };
         format!(
             "nondeterministic transform rule detected for `{}` with arguments `{arguments:?}`: re-derivation \
              produced a different artifact than the region cache retained, but region transforms must be deterministic \
@@ -3803,13 +3971,32 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![first, second], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let region = program.entry_region_ref();
-        let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver };
+        let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
         let differentiated =
             DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::jvp_program(&driver, region, &[1, 0])
                 .unwrap();
 
         // The driver preserves the requested order and shares the region's existing cached program.
         assert!(Arc::ptr_eq(&differentiated, &region.jvp_shared(&[1, 0]).unwrap()));
+        let reverse_driver =
+            RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::JvpForTranspose };
+        let reverse = DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::jvp_program(
+            &reverse_driver,
+            region,
+            &[1, 0],
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&differentiated, &reverse));
+        assert_eq!(reverse.to_string(), differentiated.to_string());
+        assert!(Arc::ptr_eq(
+            &reverse,
+            &DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::jvp_program(
+                &reverse_driver,
+                region,
+                &[1, 0],
+            )
+            .unwrap()
+        ));
         assert_eq!(
             differentiated.input_types(),
             vec![
@@ -3835,13 +4022,32 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![first, second], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let region = program.entry_region_ref();
-        let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver };
+        let driver = RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::Jvp };
         let linearization = DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::linearize_program(
             &driver,
             region,
             &[1, 0],
         )
         .unwrap();
+        let reverse_driver =
+            RecursiveDifferentiationDriver { driver: &EmptyRegionDriver, rule: DifferentiationRule::JvpForTranspose };
+        let reverse = DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::linearize_program(
+            &reverse_driver,
+            region,
+            &[1, 0],
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&linearization.primal, &reverse.primal));
+        assert!(!Arc::ptr_eq(&linearization.tangent, &reverse.tangent));
+        assert_eq!(reverse.primal().to_string(), linearization.primal().to_string());
+        let repeated = DifferentiationDriver::<EagerContext<Array, TestArrayOperation>>::linearize_program(
+            &reverse_driver,
+            region,
+            &[1, 0],
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&reverse.primal, &repeated.primal));
+        assert!(Arc::ptr_eq(&reverse.tangent, &repeated.tangent));
         assert_eq!(
             linearization.tangent().input_types(),
             vec![ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
@@ -3960,7 +4166,8 @@ mod tests {
         let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(EagerContext::<
             ArrayIrValue<Array>,
             ArrayIrOperation<Array>,
-        >::new()));
+        >::new()))
+        .with_rule(DifferentiationRule::JvpForTranspose);
         let primal = context.primal().lift(ArrayIrValue::Array(Array::scalar(3.0_f32).unwrap())).unwrap();
         let transferred = context.primal_to_tangent(primal.clone()).unwrap();
         let unknown = PartialTracer::new(
@@ -3968,6 +4175,8 @@ mod tests {
             context.tangent().unknown_input(ArrayType::scalar(DataType::F32).into(), 0),
         );
         let projected = context.project::<ArrayType>();
+        assert_eq!(projected.rule, DifferentiationRule::JvpForTranspose);
+        assert_eq!(projected.clone().rule, DifferentiationRule::JvpForTranspose);
         assert!(!std::ptr::eq(projected.primal(), projected.tangent()));
         assert_eq!(projected.tangent().parent().import_known(&unknown), Ok(unknown));
         assert_eq!(
@@ -4426,7 +4635,7 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
         program.entry_region_ref().insert_transform_artifact_for_testing::<JvpTransform, _>(
-            JvpAndLinearizationTransformArguments { input_indices: vec![0] },
+            JvpAndLinearizationTransformArguments { input_indices: vec![0], rule: DifferentiationRule::Jvp },
             TransformArtifact::new(vec![unrelated.clone()], ()),
         );
 
@@ -4804,7 +5013,7 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
         program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            JvpAndLinearizationTransformArguments { input_indices: vec![0] },
+            JvpAndLinearizationTransformArguments { input_indices: vec![0], rule: DifferentiationRule::Jvp },
             TransformArtifact::new(vec![unrelated.clone(), unrelated.clone()], 0),
         );
 
@@ -4847,7 +5056,7 @@ mod tests {
         // is not a structural function of its operation would leave behind.
         let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
         program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            JvpAndLinearizationTransformArguments { input_indices: vec![0] },
+            JvpAndLinearizationTransformArguments { input_indices: vec![0], rule: DifferentiationRule::Jvp },
             TransformArtifact::new(vec![primal.clone(), tangent.clone()], residual_count),
         );
 
@@ -4885,7 +5094,7 @@ mod tests {
         // that is not a structural function of the constants it embeds would leave behind.
         let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
         program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            JvpAndLinearizationTransformArguments { input_indices: vec![0] },
+            JvpAndLinearizationTransformArguments { input_indices: vec![0], rule: DifferentiationRule::Jvp },
             TransformArtifact::new(vec![primal.clone(), tangent.clone()], residual_count),
         );
 

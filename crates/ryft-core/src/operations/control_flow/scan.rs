@@ -4643,6 +4643,55 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_interprets_fresh_local_allocations_per_iteration() {
+        // The body allocates a local reference from each item and accumulates the carry into it, so every iteration
+        // must start from a fresh allocation. An allocation that persisted across iterations would accumulate into the
+        // previous iteration's value instead of the current item, and the carries would diverge after the first item.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let body = {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let carry = builder.add_input(scalar_type.clone().into());
+            let item = builder.add_input(scalar_type.clone().into());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![item], None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, carry], None)
+                .unwrap();
+            let next =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                    vec![next, next],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body_region = builder.import_region(body.entry_region_ref());
+        let carry = builder.add_input(scalar_type.into());
+        let items = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
+        let outputs = builder
+            .add_instruction(ScanOperation::new(1, 3), vec![body_region], vec![carry, items], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.interpret(vec![
+                TestIrValue::Array(Array::scalar(1.0f32).unwrap()),
+                TestIrValue::Array(Array::vector(vec![1.0f32, 3.0, 4.0]).unwrap()),
+            ]),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar(9.0f32).unwrap()),
+                TestIrValue::Array(Array::vector(vec![2.0f32, 5.0, 9.0]).unwrap()),
+            ]),
+        );
+    }
+
+    #[test]
     fn test_scan_with_added_carries() {
         // Widening appends the requested carries and preserves every other payload field, including the visit order,
         // the lowering-only unroll factor, and the capture environment.

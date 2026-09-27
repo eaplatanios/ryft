@@ -772,6 +772,29 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_swap_interpretation_updates_external_program_inputs() {
+        // A program interprets a reference input as the caller's allocation, so the swap is visible to the caller once
+        // the program returns, and the forwarded output is that same reference.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let external = builder.add_input(ReferenceType::new(array_type.clone()).into());
+        let replacement = builder.add_input(array_type.into());
+        builder
+            .add_instruction(TestIrReferenceSwapOperation::new(), Vec::new(), vec![external, replacement], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![external], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let reference = TestIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()).reference_new().unwrap();
+        assert_eq!(
+            program.interpret(vec![reference.clone(), TestIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap())]),
+            Ok(vec![reference.clone()]),
+        );
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap())));
+    }
+
+    #[test]
     fn test_reference_swap_partial_evaluation() {
         // Program replay uses the `Stage` placement: a swap stages regardless of input knowledge, its previous value
         // is an unknown of the residual program, the live handle is passed to that program as a known reference input,

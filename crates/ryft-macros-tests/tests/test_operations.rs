@@ -721,6 +721,16 @@ trait DifferentiableOperation<C: Context>: Operation<Type = C::Type> {
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
+
+    /// Uses the JVP rule unless the payload overrides its derivative rule for transposition.
+    fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        self.jvp(context, driver, inputs)
+    }
 }
 
 /// Stand-in for `ryft_core::Linearization`.
@@ -1696,6 +1706,15 @@ mod mixed_members {
             let primal = context.bind(self.clone(), Vec::new(), primals.as_slice())?.remove(0);
             Ok(vec![DifferentiationDual::new(primal, inputs[0].tangent().clone())?])
         }
+
+        fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            _context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            _inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, ryft::DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation { message: "mixed reverse preparation".to_string() }.into())
+        }
     }
 
     impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>>>
@@ -1892,6 +1911,15 @@ mod mixed_members {
                 .map(DifferentiationDual::new_with_zero_tangent)
                 .collect()
         }
+
+        fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            _context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            _inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, ryft::DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation { message: "projected reverse preparation".to_string() }.into())
+        }
     }
 
     impl<A: Value<Type = ArrayType>, V: Value<Type = ArrayIrType>>
@@ -2001,6 +2029,25 @@ mod mixed_members {
         let dimension_cotangent_type = ArrayIrType::from(dimension_type).cotangent().unwrap();
         assert_eq!(second_cotangent_type, &dimension_cotangent_type);
         assert_eq!(fourth_cotangent_type, &dimension_cotangent_type);
+    }
+
+    #[test]
+    fn test_operation_generates_member_reverse_preparation_dispatch() {
+        type Operation = MixedProgramOperation<Array>;
+
+        let context = DifferentiationContext::fused(TracingContext::<ArrayIrValue<Array>, Operation>::new());
+        let mixed = Operation::from(InterleavedOperation);
+        assert!(matches!(
+            mixed.jvp_for_transpose(&context, &EmptyRegionDriver, &[]),
+            Err(ryft::DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "mixed reverse preparation",
+        ));
+        let projected = Operation::Array(MixedMemberOperation::Interleaved(InterleavedOperation));
+        assert!(matches!(
+            projected.jvp_for_transpose(&context, &EmptyRegionDriver, &[]),
+            Err(ryft::DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "projected reverse preparation",
+        ));
     }
 
     #[test]
@@ -2193,6 +2240,15 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Ok(vec![DifferentiationDual { label: "special", marker: PhantomData }])
     }
+
+    fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        _context: &DifferentiationContext<C, P>,
+        _driver: &D,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Ok(vec![DifferentiationDual { label: "reverse", marker: PhantomData }])
+    }
 }
 
 impl<V, O> TransposableOperation<V, O> for SpecialOperation
@@ -2240,6 +2296,18 @@ fn test_operation_propagates_differentiation_payload_bounds() {
 
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].label, "special");
+}
+
+#[test]
+fn test_operation_generates_reverse_preparation_dispatch() {
+    type Operation = DifferentiableArrayOperation<Factor>;
+
+    let context = DifferentiationContext::fused(TestContext::<Factor, Operation> { marker: PhantomData });
+    let operation = Operation::from(SpecialOperation);
+    let outputs = operation.jvp_for_transpose(&context, &EmptyRegionDriver, &[]).unwrap();
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].label, "reverse");
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]

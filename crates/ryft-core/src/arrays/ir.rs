@@ -287,7 +287,6 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::arrays::operations::ArrayIrOperation;
-    use crate::arrays::references::ArrayReferenceViewError;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::captures::CaptureReference;
@@ -485,8 +484,12 @@ mod tests {
     fn test_array_ir_reference_value_identity_renaming() {
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let source = DimensionVariable::new("source", bounds);
+        let second = DimensionVariable::new("second", bounds);
         let target = DimensionVariable::new("target", bounds);
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
+        let source_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(source.clone()), Dimension::Dynamic(second.clone())]),
+        );
         let reference = ArrayReference::new(CaptureReference::new(0, source_type));
         let value = ArrayIrValue::Reference(reference.clone());
 
@@ -499,7 +502,8 @@ mod tests {
             Ok(&reference),
         );
 
-        // A bijective handle-local renaming preserves resource identity and reconstructs values in both directions.
+        // A bijective renaming delegates to the reference handle, which aliases the same allocation under the renamed
+        // referent type and leaves the original value unchanged.
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(source.clone(), target.clone()).unwrap();
         let renamed_value = value.rename_type_identities(&renaming).unwrap();
@@ -508,53 +512,26 @@ mod tests {
                 &renamed_value,
             )
             .unwrap();
-        assert_eq!(renamed.id(), reference.id());
-        assert!(!renamed.is_storage_root());
-        let Err(error) = renamed.lock_storage() else {
-            panic!("identity-renamed reference must not expose a storage transaction guard")
-        };
-        assert_eq!(error.downcast_custom::<ArrayReferenceViewError>(), Some(&ArrayReferenceViewError::NotStorageRoot));
+        assert_eq!(renamed, &reference);
         assert_eq!(
             renamed.r#type().referent(),
-            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target.clone())])),
+            &ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(target.clone()), Dimension::Dynamic(second.clone())]),
+            ),
         );
         assert_eq!(
             <ArrayIrValue<CaptureReference<ArrayType>> as ValueProjection<ReferenceType<ArrayType>>>::projected(&value),
             Ok(&reference),
         );
 
-        // A non-bijective mapping cannot reconstruct stored root metadata, so it is rejected before any alias exists.
-        let second = DimensionVariable::new("second", bounds);
-        let two_axis_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Dimension::Dynamic(source.clone()), Dimension::Dynamic(second.clone())]),
-        );
-        let two_axis_reference = ArrayReference::new(CaptureReference::new(1, two_axis_type));
-        let mut non_bijective = TypeIdentityRenaming::new();
-        non_bijective.insert(source.clone(), target.clone()).unwrap();
-        non_bijective.insert(second.clone(), target).unwrap();
+        // A renaming that the reference handle rejects is rejected by the value as well.
+        let mut merging = TypeIdentityRenaming::new();
+        merging.insert(source, target.clone()).unwrap();
+        merging.insert(second, target).unwrap();
         assert_eq!(
-            two_axis_reference.rename_type_identities(&non_bijective),
+            value.rename_type_identities(&merging),
             Err(TypeError::invalid("type identities `source` and `second` are both renamed to `target`")),
-        );
-
-        // The collision is reported in the caller's direction, so a handle that already carries a bijective
-        // handle-local mapping names its own identities rather than the root identities behind them. Deriving the
-        // inverse mapping first would instead surface the same rejection backwards, as one target renamed from two
-        // sources.
-        let left = DimensionVariable::new("left", bounds);
-        let right = DimensionVariable::new("right", bounds);
-        let mut bijective = TypeIdentityRenaming::new();
-        bijective.insert(source, left.clone()).unwrap();
-        bijective.insert(second, right.clone()).unwrap();
-        let derived = two_axis_reference.rename_type_identities(&bijective).unwrap();
-        let merged = DimensionVariable::new("merged", bounds);
-        let mut collapsing = TypeIdentityRenaming::new();
-        collapsing.insert(left, merged.clone()).unwrap();
-        collapsing.insert(right, merged).unwrap();
-        assert_eq!(
-            derived.rename_type_identities(&collapsing),
-            Err(TypeError::invalid("type identities `left` and `right` are both renamed to `merged`")),
         );
     }
 

@@ -1160,4 +1160,47 @@ mod tests {
         );
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
     }
+
+    #[test]
+    fn test_reference_read_staging_records_one_instruction_per_access() {
+        // Each dynamically indexed read stages exactly one instruction with its reference and index inputs and one
+        // transform, so repeated accesses add no metadata beyond their own instructions.
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let root = builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [8])).into());
+        let index = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let outputs = (0..3)
+            .map(|_| {
+                builder
+                    .add_instruction(
+                        TestIrReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+                            axis: 0,
+                            index: ArrayReferenceTransformIndex::Dynamic,
+                        }]),
+                        Vec::new(),
+                        vec![root, index],
+                        None,
+                    )
+                    .unwrap()[0]
+            })
+            .collect::<Vec<_>>();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 3])
+            .unwrap();
+        assert_eq!(program.instructions().len(), 3);
+        assert_eq!(program.atoms().len(), 5);
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.inputs().len()).collect::<Vec<_>>(),
+            vec![2, 2, 2],
+        );
+        assert_eq!(
+            program
+                .instructions()
+                .iter()
+                .map(|instruction| {
+                    instruction.operation().reference_access_descriptor(0).unwrap().transforms().len()
+                })
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1],
+        );
+    }
 }

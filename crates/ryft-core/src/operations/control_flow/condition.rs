@@ -2127,6 +2127,112 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_interprets_branch_local_reference_allocations() {
+        // Only the taken branch allocates and reads its local reference, and that allocation never leaves the branch,
+        // so both predicates interpret to the input value.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+
+        let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_input = true_builder.add_input(array_type.clone().into());
+        let true_reference = true_builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![true_input], None)
+            .unwrap()[0];
+        let true_output = true_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![true_reference], None)
+            .unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![true_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let false_input = false_builder.add_input(array_type.clone().into());
+        let false_branch = false_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![false_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_region = builder.import_region(true_branch.entry_region_ref());
+        let false_region = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(array_type.into());
+        let output = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let value = TestValue::Array(Array::vector(vec![2.0f32, 4.0]).unwrap());
+        assert_eq!(
+            program.interpret(vec![TestValue::Array(Array::scalar(true).unwrap()), value.clone()]),
+            Ok(vec![value.clone()]),
+        );
+        assert_eq!(
+            program.interpret(vec![TestValue::Array(Array::scalar(false).unwrap()), value.clone()]),
+            Ok(vec![value]),
+        );
+    }
+
+    #[test]
+    fn test_condition_interprets_references_forwarded_into_branches() {
+        // A reference allocated before the condition enters each branch as an input, so both branches read the
+        // caller's allocation, through both program interpretation and region interpretation in an explicit context.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let reference_type = ReferenceType::new(array_type.clone());
+        let build_branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            let output =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let true_branch = build_branch();
+        let false_branch = build_branch();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_region = builder.import_region(true_branch.entry_region_ref());
+        let false_region = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let initial = builder.add_input(array_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, reference],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let context = EagerContext::<TestValue, TestOperation>::new();
+        let value = TestValue::Array(Array::vector(vec![2.0f32, 4.0]).unwrap());
+        for predicate in [true, false] {
+            assert_eq!(
+                program.interpret(vec![TestValue::Array(Array::scalar(predicate).unwrap()), value.clone()]),
+                Ok(vec![value.clone()]),
+            );
+            assert_eq!(
+                program.entry_region_ref().interpret_in_context(
+                    &context,
+                    vec![TestValue::Array(Array::scalar(predicate).unwrap()), value.clone()],
+                ),
+                Ok(vec![value.clone()]),
+            );
+        }
+    }
+
+    #[test]
     fn test_condition_transposition_reference_operand_destinations() {
         // Both branches receive the cotangent reference of the reference operand: the taken branch's transpose acts on
         // it in place (`add_update` reads the destination into `x̄`, `write` swaps a zero into it).
