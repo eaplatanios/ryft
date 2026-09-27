@@ -1578,10 +1578,8 @@ trait TransformWriteCarrier: TransformReadCarrier {
     ) -> Result<Self::Value, ProgramError>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Stateless eager carrier over one concrete array value family. Eager paths carry only static transforms, so the
-/// dynamic-index hooks are unreachable by type.
+/// Stateless eager carrier over one concrete array value family. Eager paths carry only static transforms,
+/// so the dynamic-index hooks are unreachable by type.
 struct EagerTransformCarrier<A>(PhantomData<A>);
 
 impl<A: Value<Type = ArrayType> + Reshape + Slice> TransformReadCarrier for EagerTransformCarrier<A> {
@@ -1643,11 +1641,6 @@ struct ContextTransformCarrier<'c, C> {
 
 impl<C: Context<Type = ArrayIrType>> ContextTransformCarrier<'_, C> {
     /// Binds one single-result operation of the traversal into the context and returns its result.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Context-family operation to bind.
-    ///   - `inputs`: Inputs of the application, in operation-defined order.
     fn bind(&self, operation: C::Operation, inputs: &[&C::Value]) -> Result<C::Value, ProgramError> {
         let inputs = inputs.iter().map(|input| (*input).clone()).collect::<Vec<_>>();
         let mut outputs = self.context.bind(operation, Vec::new(), inputs.as_slice())?;
@@ -1657,11 +1650,6 @@ impl<C: Context<Type = ArrayIrType>> ContextTransformCarrier<'_, C> {
 
     /// Binds one single-result array operation of the traversal, lifted into the context's operation family through
     /// its [`OperationProjection<ArrayType>`](OperationProjection) member family, and returns its result.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Array operation to bind.
-    ///   - `inputs`: Inputs of the application, in operation-defined order.
     fn bind_array<O>(&self, operation: O, inputs: &[&C::Value]) -> Result<C::Value, ProgramError>
     where
         C::Operation: OperationProjection<ArrayType, Projected: From<O>>,
@@ -1699,6 +1687,7 @@ where
         let input_type = self.array_type(input)?.into_owned();
         let mut sizes = ArrayReferenceTransform::indexed_shape(axis, &input_type)?.dimensions().to_vec();
         sizes[axis] = 1;
+
         // Unselected axes span their complete extent, so dynamic slicing clamps their start to zero. Reusing
         // the scalar index there avoids constructing redundant zero values in the context's value family.
         let mut inputs = vec![input];
@@ -1735,6 +1724,7 @@ where
         dimensions[axis] = 1;
         let rank = dimensions.len();
         let update = self.reshape(update, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))?;
+
         // Restore the indexed axis before writing back. Full-size axes clamp to zero just as in the read path,
         // while the selected axis uses the same runtime index and clamping extent as the original index transform.
         let mut inputs = vec![target, &update];
@@ -1789,11 +1779,10 @@ mod tests {
     /// Context that records immutable array reconstruction.
     type TestContext = TracingContext<TestValue, TestOperation>;
 
-    /// Reference operations over the array IR used by the reference program fixtures.
     type TestNew = ReferenceNewOperation<ArrayType, ArrayIrType>;
     type TestRead = ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>;
     type TestWrite = ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>;
-    type TestSwap = ReferenceSwapOperation<ArrayType, ArrayIrType, crate::arrays::references::ArrayReferenceTransform>;
+    type TestSwap = ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>;
     type TestAddUpdate = ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>;
     type TestFreeze = ReferenceFreezeOperation<ArrayType, ArrayIrType>;
 
