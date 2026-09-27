@@ -19,7 +19,7 @@ use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     InputRegionProvenance, Operation, OperationFormatter, OutputRegionProvenance, Program, ProgramError,
-    ReferenceBoundary, RegionInterface, RegionSlot, Type, TypeError, Typed, Value,
+    ReferenceBoundary, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value,
 };
 use crate::tracing::{DomainTracer, Trace};
 
@@ -350,91 +350,14 @@ impl<
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // Apply the user-supplied pushforward directly. For `f(p, x) = y`, region 1 implements:
-        //
-        //   j(p, x, ẋ) = (f(p, x), (∂f/∂x)(p, x) · ẋ) = (y, ẏ).
-        //
-        // Feed every primal value, followed only by the differentiated inputs' tangents; `p` has no tangent slot in the
-        // rule, so a non-zero tangent for a numeric `p` is rejected below. Replay stages the rule's ordinary primitive
-        // operations directly in the active context, so it introduces no symbolic capture. Consequently, reverse mode
-        // differentiation can transpose the resulting linear map in `ẋ` exactly like any other tangent program, and
-        // no nested differentiation request or special reverse rule is needed here.
-        let jvp_region = driver.region(1)?;
-        let output_types = jvp_region.output_types();
-        let output_count = output_types.len() / 2;
-        let (_, differentiated_inputs) = self.split_inputs(inputs)?;
-
-        // The rule region is replayed directly rather than differentiated, so the replayed inputs are validated as
-        // defense in depth (refer to the documentation of `validate_custom_derivative_replay`).
-        validate_custom_derivative_replay(
+        replay_custom_jvp_rule(
             CUSTOM_JVP_OPERATION_NAME,
             self.non_differentiated_count,
-            context.primal(),
+            context,
+            driver,
+            driver.region(1)?,
             inputs,
-            &output_types[..output_count],
-        )?;
-        check_count!("input", jvp_region.input_types(), inputs.len() + differentiated_inputs.len(), ProgramError);
-
-        // The JVP region consumes `(primals..., differentiated_input_tangents...)`, so feed every dual primal followed
-        // by the differentiated duals' tangents.
-        let mut jvp_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-
-        // The user's JVP region takes every differentiated input tangent as a real region input, so materialize
-        // structural zeros against their own primal, which names every runtime quantity a reference-bearing tangent
-        // type omits; static inputs keep the nullary zero.
-        for input in differentiated_inputs {
-            let source = context.primal_to_tangent(input.primal().clone())?;
-            jvp_inputs.push(C::Operation::materialize_zero_from_residual_sources(
-                context.tangent(),
-                input.tangent().clone(),
-                std::iter::once(&source),
-            )?);
-        }
-
-        // A fused differentiation context stages primal and tangent work in the same context, so the rule replays
-        // there directly. Otherwise, partition the rule into its known part, which depends only on the primal inputs
-        // and computes the primal outputs, and its tangent part, and replay each part in its own context.
-        let shares_context = std::ptr::eq(context.primal(), context.tangent());
-        let mut outputs = if shares_context {
-            jvp_region.interpret_in_context(context.primal(), jvp_inputs)?
-        } else {
-            let mut known = vec![true; inputs.len()];
-            known.resize(jvp_inputs.len(), false);
-            let partition = driver.partition_jvp_program(jvp_region, &known, &(0..output_count).collect::<Vec<_>>())?;
-            partition.interpret_in_context(context, &jvp_inputs, output_count)?
-        };
-        check_count!("output", outputs, 2 * output_count, ProgramError);
-        let tangents = outputs.split_off(output_count);
-        outputs
-            .into_iter()
-            .zip(tangents)
-            .enumerate()
-            .map(|(index, (primal, tangent))| {
-                // Replaying a stored rule loses the structural-zero representation. Recover it from a literal zero
-                // or a zero-producing instruction, without treating every known tangent as zero: a non-zero constant
-                // tangent is affine and must still be rejected by linearization. Replay has already preserved effects.
-                let output = jvp_region.output_ids()[output_count + index];
-                let is_zero = jvp_region.atoms()[output.index()].as_constant().is_some_and(Value::is_zero)
-                    || jvp_region.instructions().iter().any(|instruction| {
-                        instruction
-                            .outputs()
-                            .iter()
-                            .position(|candidate| *candidate == output)
-                            .is_some_and(|index| instruction.operation().is_zero(index))
-                    })
-                    // Only partitioning needs to recover zeros produced by constant folding. Inspecting arbitrary
-                    // eager tangent results would otherwise add a full array scan to each ordinary JVP call.
-                    || (!shares_context
-                        && context.tangent().resolve(&tangent).into_constant().is_some_and(|value| value.is_zero()));
-
-                // Keep a materialized dynamic zero when its reconstruction requires runtime dimension values.
-                if is_zero && C::Operation::zero_residual_types(tangent.r#type().as_ref()).is_empty() {
-                    DifferentiationDual::new_with_zero_tangent(primal)
-                } else {
-                    DifferentiationDual::new(primal, tangent)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()
+        )
     }
 }
 
@@ -784,6 +707,122 @@ pub(super) fn validate_custom_derivative_replay<C: Context<Type: DifferentiableT
         });
     }
     Ok(())
+}
+
+/// Replays the flat custom JVP rule `jvp_region`, which computes `(p, x, ẋ) ↦ (y, ẏ)`, for an operation whose
+/// leading `non_differentiated_count` inputs `p` are not differentiated. This is the shared forward-mode rule of
+/// [`CustomJvpOperation`] and of other custom-rule operations that obtain their JVP program differently (e.g., by
+/// tracing a retained callback lazily). A fused [`DifferentiationContext`] replays the rule directly, while a
+/// partitioned one replays its known and tangent parts in their own contexts. Structural-zero output tangents are
+/// recovered from literal zeros and zero-producing instructions of the rule.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the operation applying the rule, used in diagnostics.
+///   - `non_differentiated_count`: Number of leading inputs that parameterize the rule without being differentiated.
+///   - `context`: [`DifferentiationContext`] in which the rule is applied.
+///   - `driver`: Instruction-scoped [`DifferentiationDriver`] used to partition the rule.
+///   - `jvp_region`: Rule program over every primal input followed by the differentiated inputs' tangents, returning
+///     the primal outputs followed by their tangents.
+///   - `inputs`: Input [`DifferentiationDual`]s aligned with the operation's inputs.
+pub(super) fn replay_custom_jvp_rule<
+    C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>
+        + Zero<C::Value>,
+    P: DifferentiationPolicy<C>,
+    D: DifferentiationDriver<C>,
+>(
+    operation_name: &str,
+    non_differentiated_count: usize,
+    context: &DifferentiationContext<C, P>,
+    driver: &D,
+    jvp_region: RegionRef<'_, C::Constant, C::Operation>,
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+    // Apply the user-supplied pushforward directly. For `f(p, x) = y`, the rule implements:
+    //
+    //   j(p, x, ẋ) = (f(p, x), (∂f/∂x)(p, x) · ẋ) = (y, ẏ).
+    //
+    // Feed every primal value, followed only by the differentiated inputs' tangents; `p` has no tangent slot in the
+    // rule, so a non-zero tangent for a numeric `p` is rejected below. Replay stages the rule's ordinary primitive
+    // operations directly in the active context, so it introduces no symbolic capture. Consequently, reverse mode
+    // differentiation can transpose the resulting linear map in `ẋ` exactly like any other tangent program, and
+    // no nested differentiation request or special reverse rule is needed here.
+    let output_types = jvp_region.output_types();
+    let output_count = output_types.len() / 2;
+    validate_non_differentiated_count(operation_name, non_differentiated_count, inputs.len())?;
+    let differentiated_inputs = &inputs[non_differentiated_count..];
+
+    // The rule region is replayed directly rather than differentiated, so the replayed inputs are validated as
+    // defense in depth (refer to the documentation of `validate_custom_derivative_replay`).
+    validate_custom_derivative_replay(
+        operation_name,
+        non_differentiated_count,
+        context.primal(),
+        inputs,
+        &output_types[..output_count],
+    )?;
+    check_count!("input", jvp_region.input_types(), inputs.len() + differentiated_inputs.len(), ProgramError);
+
+    // The JVP region consumes `(primals..., differentiated_input_tangents...)`, so feed every dual primal followed
+    // by the differentiated duals' tangents.
+    let mut jvp_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+
+    // The user's JVP region takes every differentiated input tangent as a real region input, so materialize
+    // structural zeros against their own primal, which names every runtime quantity a reference-bearing tangent
+    // type omits; static inputs keep the nullary zero.
+    for input in differentiated_inputs {
+        let source = context.primal_to_tangent(input.primal().clone())?;
+        jvp_inputs.push(C::Operation::materialize_zero_from_residual_sources(
+            context.tangent(),
+            input.tangent().clone(),
+            std::iter::once(&source),
+        )?);
+    }
+
+    // A fused differentiation context stages primal and tangent work in the same context, so the rule replays
+    // there directly. Otherwise, partition the rule into its known part, which depends only on the primal inputs
+    // and computes the primal outputs, and its tangent part, and replay each part in its own context.
+    let shares_context = std::ptr::eq(context.primal(), context.tangent());
+    let mut outputs = if shares_context {
+        jvp_region.interpret_in_context(context.primal(), jvp_inputs)?
+    } else {
+        let mut known = vec![true; inputs.len()];
+        known.resize(jvp_inputs.len(), false);
+        let partition = driver.partition_jvp_program(jvp_region, &known, &(0..output_count).collect::<Vec<_>>())?;
+        partition.interpret_in_context(context, &jvp_inputs, output_count)?
+    };
+    check_count!("output", outputs, 2 * output_count, ProgramError);
+    let tangents = outputs.split_off(output_count);
+    outputs
+        .into_iter()
+        .zip(tangents)
+        .enumerate()
+        .map(|(index, (primal, tangent))| {
+            // Replaying a stored rule loses the structural-zero representation. Recover it from a literal zero
+            // or a zero-producing instruction, without treating every known tangent as zero: a non-zero constant
+            // tangent is affine and must still be rejected by linearization. Replay has already preserved effects.
+            let output = jvp_region.output_ids()[output_count + index];
+            let is_zero = jvp_region.atoms()[output.index()].as_constant().is_some_and(Value::is_zero)
+                || jvp_region.instructions().iter().any(|instruction| {
+                    instruction
+                        .outputs()
+                        .iter()
+                        .position(|candidate| *candidate == output)
+                        .is_some_and(|index| instruction.operation().is_zero(index))
+                })
+                // Only partitioning needs to recover zeros produced by constant folding. Inspecting arbitrary
+                // eager tangent results would otherwise add a full array scan to each ordinary JVP call.
+                || (!shares_context
+                    && context.tangent().resolve(&tangent).into_constant().is_some_and(|value| value.is_zero()));
+
+            // Keep a materialized dynamic zero when its reconstruction requires runtime dimension values.
+            if is_zero && C::Operation::zero_residual_types(tangent.r#type().as_ref()).is_empty() {
+                DifferentiationDual::new_with_zero_tangent(primal)
+            } else {
+                DifferentiationDual::new(primal, tangent)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 /// Removes the tangent inputs that a traced JVP rule declares for the leading `non_differentiated_count` inputs.

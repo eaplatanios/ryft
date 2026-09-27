@@ -604,11 +604,8 @@ impl_differentiable_operation! {
                     };
                     Ok(vec![DifferentiationDual::new(primal, tangent)?])
                 }
-                kind => Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "array operation `reduce with kind {kind:?}` is not supported by the forward-mode \
-                         linearization slice; any and all are not differentiable",
-                    ),
+                kind @ (ReductionKind::Any | ReductionKind::All) => Err(ProgramError::UnsupportedOperation {
+                    message: format!("`{REDUCE_OPERATION_NAME}` with kind `{kind}` is not differentiable"),
                 }
                 .into()),
             }
@@ -623,95 +620,89 @@ impl_differentiable_operation! {
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // `Sum` transposes by broadcasting the cotangent over the reduced axes. `Mean` also divides by the reduced
-            // element count. Non-linear reductions instead differentiate through the linear operations staged by their
-            // JVP. A runtime-sized reduced axis requires linearization to retain its extent as a first-class residual.
+            // element count. Every other kind is non-linear and is instead differentiated through the linear operations
+            // staged by its JVP, so it is rejected here regardless of its cotangent. A runtime-sized reduced axis
+            // requires linearization to retain its extent as a first-class residual.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
-            if operation.kind == ReductionKind::LogSumExp {
+            if !matches!(operation.kind, ReductionKind::Sum | ReductionKind::Mean) {
                 return Err(ProgramError::UnsupportedOperation {
-                    message: format!("operation `{}` is not transposable", operation.name()),
-                }.into());
+                    message: format!(
+                        "`{}` with kind `{}` is not directly transposable",
+                        operation.name(),
+                        operation.kind(),
+                    ),
+                }
+                .into());
             }
 
+            let MaybeZero::Value(cotangent) = &outputs[0] else {
+                return Ok(());
+            };
+
+            // Replicating the cotangent back over a reduced axis requires that axis's extent, which a directly
+            // transposed program cannot observe as it holds no primal value that carries it.
             let input_type = inputs[0].r#type();
             let input_shape = input_type.shape();
-            match &outputs[0] {
-                MaybeZero::Zero(_) => Ok(()),
-                MaybeZero::Value(cotangent) => match operation.kind {
-                    ReductionKind::Sum | ReductionKind::Mean => {
-                        // Replicating the cotangent back over a reduced axis requires that axis's extent, which a
-                        // directly transposed program cannot observe as it holds no primal value that carries it.
-                        if let Some(axis) = operation
-                            .axes
-                            .iter()
-                            .find(|axis| matches!(input_shape.dimension(**axis), Dimension::Dynamic(_)))
-                        {
-                            return Err(ProgramError::UnsupportedOperation {
-                                message: format!(
-                                    "direct transposition of `{}` with kind `{}` over reduced axis {} of {} requires \
-                                     linearization so that the runtime extent can be retained as a residual",
-                                    operation.name(),
-                                    operation.kind(),
-                                    axis,
-                                    input_shape,
-                                ),
-                            }
-                            .into());
-                        }
-
-                        if !accumulators[0].is_needed() {
-                            return Ok(());
-                        }
-
-                        let output_type = input_type.cotangent()?;
-
-                        // The cotangent axes are the input axes that the reduction keeps, in order,
-                        // and so broadcasting maps them back there.
-                        let output_axes =
-                            (0..input_shape.rank()).filter(|axis| !operation.axes.contains(axis)).collect::<Vec<_>>();
-
-                        let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
-                        let cotangent_input = match operation.kind {
-                            ReductionKind::Sum => broadcasted,
-                            ReductionKind::Mean => {
-                                // The check above rejected every runtime-sized reduced axis, so each reduced extent
-                                // is statically known here.
-                                let reduced_extents = operation
-                                    .axes
-                                    .iter()
-                                    .map(|axis| input_shape.dimension(*axis).value().unwrap())
-                                    .collect::<Vec<_>>();
-                                let element_count = if reduced_extents.contains(&0) {
-                                    0
-                                } else {
-                                    reduced_extents.iter().try_fold(1usize, |count, extent| {
-                                        count.checked_mul(*extent).ok_or_else(|| {
-                                            TypeError::invalid(format!(
-                                                "mean transpose reduced element count overflows `usize` for \
-                                                 input shape `{input_shape}`",
-                                            ))
-                                        })
-                                    })?
-                                };
-                                let inverse_count = 1.0 / element_count as f64;
-
-                                // Stage a rank-zero literal holding `1 / N` and rely on implicit rank-zero broadcasting
-                                // in the subsequent multiplication to scale the broadcast-back cotangent to the input
-                                // shape.
-                                let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
-                                let factor = context.fill(&factor_type, inverse_count)?;
-                                factor.mul(&broadcasted)?
-                            }
-                            _ => unreachable!("outer match handled the only two supported kinds"),
-                        };
-                        accumulators[0].accumulate(context, MaybeZero::Value(cotangent_input))
-                    }
-                    other => Err(
-                        TypeError::invalid(format!("`{other}` reduction is not directly transposable")).into(),
+            if let Some(axis) =
+                operation.axes.iter().find(|axis| matches!(input_shape.dimension(**axis), Dimension::Dynamic(_)))
+            {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "direct transposition of `{}` with kind `{}` over reduced axis {} of {} requires \
+                         linearization so that the runtime extent can be retained as a residual",
+                        operation.name(),
+                        operation.kind(),
+                        axis,
+                        input_shape,
                     ),
-                },
+                }
+                .into());
             }
+
+            if !accumulators[0].is_needed() {
+                return Ok(());
+            }
+
+            // The cotangent axes are the input axes that the reduction keeps, in order, and so broadcasting maps them
+            // back there.
+            let output_type = input_type.cotangent()?;
+            let output_axes =
+                (0..input_shape.rank()).filter(|axis| !operation.axes.contains(axis)).collect::<Vec<_>>();
+            let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
+            let cotangent_input = if operation.kind == ReductionKind::Sum {
+                broadcasted
+            } else {
+                // The check above rejected every runtime-sized reduced axis, so each reduced extent is statically
+                // known here. A zero extent makes the element count zero without multiplying the other extents, which
+                // could otherwise overflow.
+                let reduced_extents = operation
+                    .axes
+                    .iter()
+                    .map(|axis| input_shape.dimension(*axis).value().unwrap())
+                    .collect::<Vec<_>>();
+                let element_count = if reduced_extents.contains(&0) {
+                    0
+                } else {
+                    reduced_extents.iter().try_fold(1usize, |count, extent| {
+                        count.checked_mul(*extent).ok_or_else(|| {
+                            TypeError::invalid(format!(
+                                "mean transpose reduced element count overflows `usize` for input shape \
+                                 `{input_shape}`",
+                            ))
+                        })
+                    })?
+                };
+                let inverse_count = 1.0 / element_count as f64;
+
+                // Stage a rank-zero literal holding `1 / N` and rely on implicit rank-zero broadcasting in the
+                // subsequent multiplication to scale the broadcast-back cotangent to the input shape.
+                let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
+                let factor = context.fill(&factor_type, inverse_count)?;
+                factor.mul(&broadcasted)?
+            };
+            accumulators[0].accumulate(context, MaybeZero::Value(cotangent_input))
         }
     },
 }
