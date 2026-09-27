@@ -24272,7 +24272,7 @@ mod tests {
     #[test]
     fn test_rematerialized_pullback_lowers_without_a_rematerialization_boundary() {
         use ryft_core::tracing_v2::rematerialize;
-        use ryft_core::{Context, DomainTracer, Trace};
+        use ryft_core::{Context, CotangentDestinationKind, DomainTracer, Trace, TracingContext};
 
         // Rematerialization retains its custom transpose in a linear call. The production lowerer inlines that
         // call's executable region. The default recompute policy saves only `x`, so the pullback recomputes
@@ -24301,7 +24301,12 @@ mod tests {
             })
             .with_prevent_cse(prevent_cse);
             let (_, program) = XlaDomain::trace(|x| function.call(x), ArrayIrType::Array(scalar_type.clone())).unwrap();
-            let pullback = program.into_flat_program().linearize().unwrap().pullback().unwrap();
+            let context = TracingContext::<XlaConstant, XlaOperation>::new();
+            let input = context.input(ArrayIrType::Array(scalar_type.clone()));
+            let (_, pullback) = context
+                .vjp(|input, ()| program.interpret_in_context(input.context(), input.clone()), input, ())
+                .unwrap();
+            let pullback = pullback.transposed_program(&[CotangentDestinationKind::Return]).unwrap();
             let stablehlo = to_mlir_module_for_program(
                 &pullback,
                 &[],

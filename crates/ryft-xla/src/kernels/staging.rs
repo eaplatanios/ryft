@@ -1597,6 +1597,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_stage_kernel_with_vjp() {
+        use ryft_core::{CotangentDestinationKind, ReverseModeDifferentiate, StagingContext};
+
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
         let mut forward = XlaProgramBuilder::new();
@@ -1633,8 +1635,12 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(program.instructions()[0].operation().name(), "custom_vjp");
-        let linearization = program.linearize().unwrap();
-        let backward = linearization.tangent().transpose().unwrap();
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let input = context.input(program.input_types()[0].clone());
+        let (_, pullback) = context
+            .vjp(|input, ()| program.interpret_in_context(input.context(), vec![input.clone()]), input, ())
+            .unwrap();
+        let backward = pullback.transposed_program(&[CotangentDestinationKind::Return]).unwrap();
         assert_eq!(execute_derivative(&backward, &[2.0]), vec![6.0]);
     }
 

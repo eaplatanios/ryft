@@ -1289,7 +1289,7 @@ pub trait DifferentiableOperation<C: Context>: Operation {
     /// constructing an executable JVP must therefore use [`Self::jvp`] with a forward-selected context and driver.
     ///
     /// The default delegates to [`Self::jvp`], deriving reverse mode from the same derivative rule as forward mode.
-    /// Override this function when reverse mode needs a custom backward program or different primal preparation and
+    /// Override this function when reverse mode needs a custom backward program or different primal computations and
     /// saved residuals. For example, a forward rule for `x³` can save `3x²`, while this rule saves `x` and defers
     /// computing `3x²` to the backward program. Keep the default when transposing the ordinary JVP provides the
     /// desired behavior. An override does not change forward-mode differentiation; the implementor is responsible
@@ -3211,6 +3211,7 @@ where
         primal_references,
         output_structure,
     )?;
+
     Ok((output, pushforward))
 }
 
@@ -3256,11 +3257,11 @@ pub fn jvp_projected_operation<
     DifferentiationRule::Jvp.apply_projected(context, operation, inputs)
 }
 
-/// Applies a member operation's reverse-preparation rule through a projected composite context. This is the counterpart
-/// of [`jvp_projected_operation`] for [`DifferentiableOperation::jvp_for_transpose`]; it has the same projection
-/// requirements and diagnostics, but the resulting tangent computation need only support transposition. The named
-/// adapter selects the reverse rule even when [`DifferentiationContext::rule`] is `Jvp`. It does not change the
-/// context's selection for recursive differentiation.
+/// Applies a member operation's [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule through a
+/// projected composite context. It has the same projection requirements and diagnostics as [`jvp_projected_operation`],
+/// but the resulting tangent computation need only support transposition. The named adapter selects the reverse rule
+/// even when [`DifferentiationContext::rule`] is `Jvp`. It does not change the context's selection for recursive
+/// differentiation.
 ///
 /// # Errors
 ///
@@ -3542,21 +3543,21 @@ pub(crate) mod tests {
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;
 
-    /// Test operation computing `x³` with independently prepared forward and reverse derivatives. Its JVP rule computes
-    /// and saves `3x²`, while its [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule saves only `x`
-    /// and retains a backward program that computes `3x²` when the pullback is applied. Both rules produce the same
-    /// derivative values, but their saved residuals and preparation work differ, allowing tests to detect accidental
+    /// Test operation computing `x³` with independent JVP and JVP-for-transpose rules. Its JVP rule computes
+    /// and saves `3x²`, while its [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule saves only
+    /// `x` and retains a backward program that computes `3x²` when the pullback is applied. Both rules produce the same
+    /// derivative values, but their saved residuals and primal computations differ, allowing tests to detect accidental
     /// use of the JVP rule during reverse-mode differentiation. The fixture exercises this distinction through reusable
     /// differentiation, nested control flow, batching, and higher-order differentiation without requiring the unified
     /// custom-operation registration API.
     #[derive(Clone, Debug)]
-    pub(crate) struct PreparedCubeOperation;
+    pub(crate) struct CustomCubeOperation;
 
-    impl Operation for PreparedCubeOperation {
+    impl Operation for CustomCubeOperation {
         type Type = ArrayType;
 
         fn name(&self) -> &'static str {
-            "prepared_cube"
+            "custom_cube"
         }
 
         fn infer_output_types(
@@ -3569,7 +3570,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl<C: Domain<Type = ArrayType, Value: Mul>> InterpretableOperation<C> for PreparedCubeOperation {
+    impl<C: Domain<Type = ArrayType, Value: Mul>> InterpretableOperation<C> for CustomCubeOperation {
         fn interpret<D: InterpretationDriver<C>>(
             &self,
             _context: &C,
@@ -3580,10 +3581,10 @@ pub(crate) mod tests {
         }
     }
 
-    impl<C: Context<Type = ArrayType, Operation: From<Self>>> PartiallyEvaluatableOperation<C> for PreparedCubeOperation {}
+    impl<C: Context<Type = ArrayType, Operation: From<Self>>> PartiallyEvaluatableOperation<C> for CustomCubeOperation {}
 
     impl<C: Context<Type = ArrayType, Operation: From<Self>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
-        for PreparedCubeOperation
+        for CustomCubeOperation
     {
         fn batch<D: BatchingDriver<C, P>>(
             &self,
@@ -3603,7 +3604,7 @@ pub(crate) mod tests {
                                + From<AddOperation<ArrayType>>
                                + From<LinearCallOperation<ArrayType>>,
             >,
-    > DifferentiableOperation<C> for PreparedCubeOperation
+    > DifferentiableOperation<C> for CustomCubeOperation
     {
         fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
             &self,
@@ -3663,7 +3664,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl_non_transposable_operation!(PreparedCubeOperation);
+    impl_non_transposable_operation!(CustomCubeOperation);
 
     // Index 3 is otherwise unused by the shared member fixtures. Its malformed provider tests that the callable
     // boundary validates residual capture before attempting to construct a zero.
@@ -4303,7 +4304,7 @@ pub(crate) mod tests {
             context.jvp(
                 |input, ()| input
                     .context()
-                    .bind(PreparedCubeOperation, vec![], &[input.clone()])
+                    .bind(CustomCubeOperation, vec![], &[input.clone()])
                     .map(|mut outputs| outputs.remove(0)),
                 input.clone(),
                 Array::scalar(2f64).unwrap(),
@@ -4317,7 +4318,7 @@ pub(crate) mod tests {
                 |input, ()| {
                     input
                         .context()
-                        .bind(PreparedCubeOperation, vec![], &[input.clone()])
+                        .bind(CustomCubeOperation, vec![], &[input.clone()])
                         .map(|mut outputs| outputs.remove(0))
                 },
                 input.clone(),
@@ -4334,7 +4335,7 @@ pub(crate) mod tests {
                 |input, ()| {
                     input
                         .context()
-                        .bind(PreparedCubeOperation, vec![], &[input.clone()])
+                        .bind(CustomCubeOperation, vec![], &[input.clone()])
                         .map(|mut outputs| outputs.remove(0))
                 },
                 input,
@@ -4351,7 +4352,7 @@ pub(crate) mod tests {
     fn test_differentiable_operation_jvp_for_transpose_primal_work() {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(PreparedCubeOperation, vec![], vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(CustomCubeOperation, vec![], vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let forward_jvp = program.entry_region_ref().jvp_shared(&[0]).unwrap();
@@ -4433,7 +4434,7 @@ pub(crate) mod tests {
     fn test_differentiable_operation_jvp_for_transpose_nested_condition() {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(PreparedCubeOperation, vec![], vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(CustomCubeOperation, vec![], vec![input], None).unwrap()[0];
         let branch =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
@@ -4526,7 +4527,7 @@ pub(crate) mod tests {
     fn test_differentiable_operation_jvp_for_transpose_after_batching() {
         let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(PreparedCubeOperation, vec![], vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(CustomCubeOperation, vec![], vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let (batched, output_axes) = program
@@ -4560,7 +4561,7 @@ pub(crate) mod tests {
                 |input, ()| {
                     input
                         .context()
-                        .bind(PreparedCubeOperation, vec![], &[input.clone()])
+                        .bind(CustomCubeOperation, vec![], &[input.clone()])
                         .map(|mut outputs| outputs.remove(0))
                 },
                 Array::scalar(3f64).unwrap(),

@@ -502,8 +502,8 @@ impl<
         //   L_(p,r): ẋ ↦ ẏ.
         //
         // `LinearCallOperation` knows only how to transpose that map: its transpose replays `backward(p, r, ȳ) = x̄`.
-        // Reverse mode transposes it without execution; executable forward requests reject in `jvp` before this
-        // preparation begins. Passing `p` and `r` as the carrier's leading residual inputs keeps the path capture-free
+        // Reverse mode transposes it without execution; executable forward requests reject in `jvp` before the forward
+        // region is replayed. Passing `p` and `r` as the carrier's leading residual inputs keeps the path capture-free
         // and exposes every dependency as an ordinary Single Static Assignment (SSA) edge.
         //
         // The attached regions are `["primal", "forward", "backward"]` and the primal interface provides
@@ -812,9 +812,9 @@ impl<
 ///   - **Numerical Stability:** Replace an unstable or wasteful automatically derived gradient with a handwritten one.
 ///
 /// Active forward-mode differentiation and reusable forward linearization reject a custom VJP call before executing
-/// its forward preparation, because no pushforward rule was supplied. This rejection also occurs when constructing
-/// staged forward derivatives, rather than waiting for their execution. Calls with no active derivative inputs can
-/// still execute their primal directly.
+/// its forward rule, because no pushforward rule was supplied. This rejection also occurs when constructing staged
+/// forward derivatives, rather than waiting for their execution. Calls with no active derivative inputs can still
+/// execute their primal directly.
 ///
 /// The generated pullback contains the backward program's operations and can itself be differentiated when
 /// those operations and the residual-producing computation support the requested transforms. This includes
@@ -1771,7 +1771,7 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_differentiation_rejects_forward_mode() {
-        // A custom VJP supplies no executable tangent rule. Forward mode rejects before reverse preparation begins,
+        // A custom VJP supplies no executable tangent rule. Forward mode rejects before the forward rule executes,
         // with the same custom-VJP diagnostic whether evaluating immediately or constructing staged derivatives.
         assert!(matches!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| {
@@ -1790,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_vjp_differentiation_rejects_forward_before_preparation() {
+    fn test_custom_vjp_differentiation_rejects_forward_before_rule_execution() {
         let function = custom_vjp(
             |(counter, input): (ArrayIrTracer, ArrayIrTracer)| {
                 counter.add_update(&input)?;
@@ -1843,8 +1843,8 @@ mod tests {
         ));
         assert_eq!(counter.read(), Ok(Array::scalar(0.0f32).unwrap()));
 
-        // Reverse preparation still executes the state update exactly once. Reusing the pullback executes only
-        // the identity backward rule and preserves the saved caller-owned reference.
+        // Constructing the VJP still executes the forward rule's state update exactly once. Reusing the pullback
+        // executes only the identity backward rule and preserves the saved caller-owned reference.
         let (value, pullback) = differentiate_at(inputs).vjp(|inputs| function.call(inputs)).unwrap();
         assert_eq!(value, ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()));
         assert_eq!(counter.read(), Ok(Array::scalar(3.0f32).unwrap()));
@@ -1880,8 +1880,8 @@ mod tests {
                 .unwrap()
         };
 
-        // Reverse preparation replays a forward region with local state inside a dormant nested custom rule.
-        // It preserves the nested primal semantics without trying to differentiate the preparation itself.
+        // The JVP-for-transpose rule replays a forward region with local state inside a dormant nested custom rule.
+        // It preserves the nested primal semantics without differentiating the forward region itself.
         let forward = nested_custom_derivative_state_program(&scalar_type, false);
         assert!(forward.entry_region_ref().contains_effect_in_closure(EffectClass::OrderedState));
         let program = custom_derivative_call_program(

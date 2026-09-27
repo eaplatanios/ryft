@@ -1713,7 +1713,7 @@ mod mixed_members {
             _driver: &D,
             _inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, ryft::DifferentiationError> {
-            Err(ProgramError::UnsupportedOperation { message: "mixed reverse preparation".to_string() }.into())
+            Err(ProgramError::UnsupportedOperation { message: "mixed `jvp_for_transpose` rule".to_string() }.into())
         }
     }
 
@@ -1918,7 +1918,7 @@ mod mixed_members {
             _driver: &D,
             _inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, ryft::DifferentiationError> {
-            Err(ProgramError::UnsupportedOperation { message: "projected reverse preparation".to_string() }.into())
+            Err(ProgramError::UnsupportedOperation { message: "projected `jvp_for_transpose` rule".to_string() }.into())
         }
     }
 
@@ -2032,7 +2032,7 @@ mod mixed_members {
     }
 
     #[test]
-    fn test_operation_generates_member_reverse_preparation_dispatch() {
+    fn test_operation_generates_member_jvp_for_transpose_dispatch() {
         type Operation = MixedProgramOperation<Array>;
 
         let context = DifferentiationContext::fused(TracingContext::<ArrayIrValue<Array>, Operation>::new());
@@ -2040,13 +2040,13 @@ mod mixed_members {
         assert!(matches!(
             mixed.jvp_for_transpose(&context, &EmptyRegionDriver, &[]),
             Err(ryft::DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "mixed reverse preparation",
+                if message == "mixed `jvp_for_transpose` rule",
         ));
         let projected = Operation::Array(MixedMemberOperation::Interleaved(InterleavedOperation));
         assert!(matches!(
             projected.jvp_for_transpose(&context, &EmptyRegionDriver, &[]),
             Err(ryft::DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "projected reverse preparation",
+                if message == "projected `jvp_for_transpose` rule",
         ));
     }
 
@@ -2299,7 +2299,7 @@ fn test_operation_propagates_differentiation_payload_bounds() {
 }
 
 #[test]
-fn test_operation_generates_reverse_preparation_dispatch() {
+fn test_operation_generates_jvp_for_transpose_dispatch() {
     type Operation = DifferentiableArrayOperation<Factor>;
 
     let context = DifferentiationContext::fused(TestContext::<Factor, Operation> { marker: PhantomData });

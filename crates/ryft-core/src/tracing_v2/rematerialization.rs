@@ -8,10 +8,12 @@
 //!
 //! # Derivation Pipeline
 //!
-//! Each [`Rematerialize::call`] traces the wrapped body, linearizes it (see
-//! [`Program::linearize`](Program::linearize) — the linearization's primal sub-program computes the body
-//! outputs followed by every demanded residual), and then derives the three programs of one staged
-//! [`RematerializeOperation`] as pure graph rewrites of the linearization's sub-programs:
+//! Each [`Rematerialize::call`] traces the wrapped body and constructs its derivative for transposition using
+//! [`DifferentiableOperation::jvp_for_transpose`]. The resulting primal sub-program computes the body outputs
+//! followed by every demanded residual. Three programs of one staged [`RematerializeOperation`] are then derived as
+//! pure graph rewrites of these sub-programs. Forward differentiation independently replays the primal body's
+//! executable JVP rules. The checkpoint policy controls which residuals reverse mode saves; reusable forward
+//! linearization retains the residuals selected by those executable JVP rules.
 //!
 //!   1. **Classification** builds one [`RematerializationCandidate`] per classifiable instruction-produced residual —
 //!      lazily following each producing operation's
@@ -68,8 +70,8 @@ use crate::batching::{
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
-    TransposableOperation,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationRule,
+    ResidualZeroProvider, TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
@@ -83,7 +85,7 @@ use crate::programs::{
     Atom, AtomId, EffectClass, EffectClasses, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
     OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode,
     ReferenceAccessOperation, ReferenceAnalysis, ReferenceMemberType, ReferenceRoot, ReferenceTransform, Region,
-    RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
+    RegionId, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -94,9 +96,9 @@ pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
 ///
 /// [`RematerializeOperation`] has the same primal/forward/backward structure as
 /// [`CustomVjpOperation`](crate::operations::CustomVjpOperation), but it also carries
-/// a derived tangent program. That extra program is not user-authored custom-VJP state: it is produced by
-/// [`Rematerialize`] so forward-mode differentiation can replay the rematerialized pushforward while reverse mode
-/// replays the rematerialized pullback.
+/// a derived tangent carrier. That extra program is produced by [`Rematerialize`] for reverse differentiation and
+/// need only support transposition. Forward differentiation independently replays the primal body's executable JVP
+/// rules, while reverse differentiation uses the checkpointed preparation and pullback.
 ///
 /// The `prevent_cse` flag is likewise rematerialization-specific. Backends may lower it as an optimization barrier
 /// around rematerialized tangent/pullback outputs so compiler common-subexpression elimination does not undo the
@@ -458,6 +460,48 @@ where
     C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<LinearCallOperation<C::Type>>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // Forward differentiation follows the primal body's executable rules independently of the residuals and
+        // opaque carriers selected for checkpointed reverse differentiation.
+        let primal = driver.region(0)?;
+        check_count!("input", inputs, primal.input_types().len(), ProgramError);
+        let (non_differentiated_inputs, _) = self.split_inputs(inputs)?;
+        if let Some(input) = non_differentiated_inputs
+            .iter()
+            .find(|input| !input.tangent().is_zero() && !input.tangent().r#type().is_zero_space())
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{} cannot propagate the nonzero tangent of type `{}` supplied for one of its {} leading \
+                     non-differentiated inputs, because its rule has no tangent slot for them",
+                    self.name(),
+                    input.tangent().r#type(),
+                    non_differentiated_inputs.len(),
+                ),
+            }
+            .into());
+        }
+        primal.interpret_with::<_, DifferentiationError, _, _>(
+            inputs.to_vec(),
+            |_, constant| DifferentiationDual::new_with_zero_tangent(context.primal().lift(constant.clone())?),
+            |instruction, inputs| {
+                let programs = instruction
+                    .regions()
+                    .iter()
+                    .map(|region| primal.with_id(*region).map(RegionRef::to_program))
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                context.primal().invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                    driver.bind_jvp_operation(context, instruction.operation(), programs, inputs)
+                })
+            },
+        )
+    }
+
+    fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
         driver: &D,
@@ -2251,9 +2295,11 @@ fn validate_rematerialized_body<V: Value, O: Operation<Type = V::Type>>(
 /// differentiation through the staged call therefore stores exactly the saved values — nothing interior — and both
 /// derived programs are pruned of unreachable instructions, so saved residuals are genuinely not recomputed.
 ///
-/// Unlike user-authored custom VJPs, the expansion also carries a derived *tangent program*, so forward-mode
-/// differentiation works through rematerialized calls — matching `jax.checkpoint`, which supports `jvp`.
-/// Un-differentiated calls replay the lean primal program and pay for neither residual computation nor saving.
+/// Forward differentiation replays the retained primal body using its executable JVP rules, independently of the
+/// checkpoint policy and JVP-for-transpose rules. It is supported when the body supports forward differentiation; a
+/// reverse-only custom VJP inside the body still rejects an active forward request. The stored tangent program is a
+/// reverse carrier and need only support transposition. Undifferentiated calls replay the lean primal program and
+/// pay for neither residual computation nor saving.
 ///
 /// Each [`call`](Self::call) caches its derivation inside the wrapper keyed by the flat input types — the analogue
 /// of JAX caching traced rules on `(function, avals)` — so repeated calls with equal input types stage the
@@ -2471,7 +2517,9 @@ where
         // outputs followed by every linearization residual (its trailing `residual_count` outputs), and its tangent
         // sub-program is the linear tangent map over `[input_tangents..., residuals...]`. The three derived programs
         // below all replay these two sub-programs, so the residual order is fixed once here and shared across them.
-        let linearization = primal.linearize()?;
+        let linearization = primal
+            .entry_region_ref()
+            .linearize_shared_for_rule(&(0..input_count).collect::<Vec<_>>(), DifferentiationRule::JvpForTranspose)?;
         let residual_count = linearization.residual_count();
         let residual_atoms = linearization.primal().output_ids()[output_count..].to_vec();
         let residual_types = linearization.primal().output_types().split_off(output_count);
@@ -2644,9 +2692,9 @@ where
             &plan,
         )?;
 
-        // Assemble the tangent program `(inputs..., saved..., input_tangents...) -> output_tangents` the same way
-        // from the linearization's tangent sub-program `(input_tangents..., residuals...)`, so that forward-mode
-        // differentiation works through the rematerialized call (JAX's `jax.checkpoint` also supports `jvp`).
+        // Assemble the reverse derivative carrier `(inputs..., saved..., input_tangents...) -> output_tangents`
+        // from the preparation's tangent sub-program `(input_tangents..., residuals...)`. This program need only
+        // support transposition; public forward differentiation independently replays the original primal body.
         let tangent = assemble_reconstruction_program(
             linearization.primal(),
             &accesses,
@@ -3341,6 +3389,36 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialize_call_independent_derivative_rules() {
+        use crate::differentiation::forward::tests::CustomCubeOperation;
+        use crate::tests::TestArrayOperation;
+
+        let function = rematerialize::<EagerContext<Array, TestArrayOperation>, _, _, _>(
+            |input: DomainTracer<EagerContext<Array, TestArrayOperation>>| {
+                input
+                    .dispatch_domain()
+                    .bind(CustomCubeOperation, vec![], &[input.clone()])
+                    .map(|mut outputs| outputs.remove(0))
+            },
+        )
+        .with_policy(EverythingSaveable);
+        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let input = Array::scalar(3f64).unwrap();
+        assert_eq!(
+            context.jvp(|input, ()| function.call(input), input.clone(), Array::scalar(2f64).unwrap(), ()),
+            Ok((Array::scalar(27f64).unwrap(), Array::scalar(54f64).unwrap())),
+        );
+        let (output, pushforward) = context.linearize(|input, ()| function.call(input), input.clone(), ()).unwrap();
+        assert_eq!(output, Array::scalar(27f64).unwrap());
+        assert_eq!(pushforward.residuals(), &[Array::scalar(27f64).unwrap()]);
+        assert_eq!(pushforward.apply(Array::scalar(2f64).unwrap()), Ok(Array::scalar(54f64).unwrap()));
+        let (output, pullback) = context.vjp(|input, ()| function.call(input), input, ()).unwrap();
+        assert_eq!(output, Array::scalar(27f64).unwrap());
+        assert_eq!(pullback.residuals(), &[Array::scalar(3f64).unwrap()]);
+        assert_eq!(pullback.apply(Array::scalar(2f64).unwrap()), Ok(Array::scalar(54f64).unwrap()));
+    }
+
+    #[test]
     fn test_rematerialization_preserves_custom_vjp_semantics_and_keeps_the_boundary_opaque() {
         use crate::operations::custom_vjp;
 
@@ -3387,6 +3465,23 @@ mod tests {
             "the rematerialized primal program should preserve the custom_vjp call",
         );
         assert_eq!(forward.output_types().len(), 3);
+
+        // Checkpointing preserves reverse-only custom rules without presenting their opaque carrier as an executable
+        // forward derivative, whether forward differentiation executes immediately or stages a program.
+        let expected = "cannot apply forward-mode differentiation to a custom_vjp call; it supports only reverse-mode \
+                        differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)";
+        assert!(matches!(
+            domain.jvp(|input, ()| function.call(input), Array::scalar(2f64).unwrap(), Array::scalar(1f64).unwrap(), ()),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message })) if message == expected,
+        ));
+        assert!(matches!(
+            program.entry_region_ref().jvp(&[0]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message })) if message == expected,
+        ));
+        assert!(matches!(
+            program.entry_region_ref().linearize(&[0]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message })) if message == expected,
+        ));
     }
 
     #[test]
@@ -5172,8 +5267,8 @@ mod tests {
                 .unwrap();
         assert_eq!(value, reference_test_scalar(6.0));
 
-        // The generated rematerialization tangent region receives the saved primal reference as known plumbing
-        // and the derivative reference as an unknown input. The callable boundary rejects binding those two
+        // Forward linearization retains the primal reference as known plumbing and the derivative reference as
+        // an unknown input. The callable boundary rejects binding those two
         // formal positions to the same allocation before replaying any tangent work.
         assert!(matches!(
             pushforward.apply((ArrayIrValue::Reference(reference.clone()), reference_test_scalar(1.0))),

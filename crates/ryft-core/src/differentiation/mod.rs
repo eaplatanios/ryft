@@ -21,8 +21,9 @@
 //!   - [`DifferentiationBuilder::linearize`] runs the primal computation once and returns its value together with a
 //!     reusable [`Pushforward`] that can be applied to many tangent inputs without repeating nonlinear primal work.
 //!   - [`DifferentiationBuilder::vjp`] runs the primal computation and returns a reusable [`Pullback`] mapping output
-//!     cotangents to input cotangents. It prepares a derivative carrier using reverse-specific rules, then transposes
-//!     that carrier to compute the Vector-Jacobian Product (VJP). By default, preparation uses the standard JVP rules.
+//!     cotangents to input cotangents. It constructs a derivative program using
+//!     [`DifferentiableOperation::jvp_for_transpose`], then transposes that program to compute the Vector-Jacobian
+//!     Product (VJP). The default rule delegates to [`DifferentiableOperation::jvp`].
 //!   - [`DifferentiationBuilder::value_and_gradient`] and [`DifferentiationBuilder::gradient`] are scalar-output
 //!     conveniences that seed the pullback with one.
 //!   - [`DifferentiationBuilder::jacobian_forward`] and [`DifferentiationBuilder::jacobian_reverse`] materialize
@@ -90,7 +91,7 @@
 //!
 //! Reverse mode differentiation reuses the forward partitioning machinery while selecting
 //! [`DifferentiableOperation::jvp_for_transpose`]. Its default delegates to the standard JVP rule while an override
-//! can choose a separate primal preparation and residual policy without changing public forward linearization. The
+//! can choose different primal computations and saved residuals without changing public forward linearization. The
 //! resulting derivative carrier is transposed by applying [`TransposableOperation`] rules in reverse dataflow order,
 //! and the result is a [`Pullback`] that accepts output cotangents, consumes saved residuals, and accumulates input
 //! cotangents. This architecture keeps primal execution, residualization, and linear algebra as separate, composable
@@ -986,7 +987,7 @@ impl<Input, ContextState>
     /// Reverse mode uses the partitioning machinery of [`linearize`](Self::linearize), selecting
     /// [`DifferentiableOperation::jvp_for_transpose`] before primal work executes. Its default delegates to
     /// the standard JVP rule while overrides can select independent residuals and backward implementations.
-    /// [`TransposableOperation`] rules transpose the prepared derivative carrier in reverse dataflow order. The
+    /// [`TransposableOperation`] rules transpose the resulting derivative program in reverse dataflow order. The
     /// returned pullback closes that program over the saved residuals, so [`Pullback::apply`] handles residual
     /// arguments and reconstructs the structured input cotangents. Callers only provide output cotangents.
     ///
