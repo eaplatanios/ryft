@@ -301,16 +301,6 @@ impl<C: Context<Type = ArrayType>, Operation: From<ReduceOperation>> PartiallyEv
 
 // TODO(eaplatanios): Review from here onwards.
 
-// Batching rule for [`ReduceOperation`]: the reduced axes are expressed in the per-item coordinate system, so the
-// rule lifts them past the inserted batch dimension with `lift_reduce_axes` and re-interprets the lifted reduction
-// over the physical batched value, with a requested output sharding gaining the mapped axis's sharding at the new
-// output batch axis position (mirroring the dot batching rule).
-//
-// Reducing a bounded ragged axis away is the one array rule that legitimately consumes an input's per-item extents:
-// [`RaggedArrayExtentBatchingPolicy::mask_reduction_input`] first replaces the padding along that axis with the
-// reduction's identity, so the output no longer depends on those extents. The rule reports each such
-// [`DimensionVariable`](crate::arrays::DimensionVariable) as its [`BatchedOutputs`] evidence, which is how the
-// carrier-invariant validation boundary tells a deliberate consumption apart from a silently dropped extent.
 impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ReduceOperation
 where
@@ -322,6 +312,16 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // The reduced axes are expressed in the per-item coordinate system, so the rule lifts them past the inserted
+        // batch dimension with `lift_reduce_axes` and re-interprets the lifted reduction over the physical batched
+        // value, with a requested output sharding gaining the mapped axis's sharding at the new output batch axis
+        // position.
+        //
+        // Reducing a bounded ragged axis away is the one array rule that legitimately consumes an input's per-item
+        // extents: `RaggedArrayExtentBatchingPolicy::mask_reduction_input` first replaces the padding along that axis
+        // with the reduction's identity, so the output no longer depends on those extents. The rule reports each such
+        // `DimensionVariable` as its `BatchedOutputs` evidence, which is how the carrier-invariant validation boundary
+        // tells a deliberate consumption apart from a silently dropped extent.
         check_count!("input", inputs, 1, ProgramError);
         let Some(batch_axis) = inputs[0].batch_axis_position() else {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
@@ -329,28 +329,50 @@ where
         let (lifted_axes, output_axis) = lift_reduce_axes(self.axes.as_slice(), batch_axis);
 
         // A requested output sharding gains the mapped axis's sharding at the new output batch axis.
-        let lifted_output_sharding = match &self.output_sharding {
+        let output_sharding = match &self.output_sharding {
             Some(output_sharding) => {
                 Some(output_sharding.batched(output_axis, ArrayBatch::sharding_for_inputs(inputs)?)?)
             }
             None => None,
         };
-        let lifted_operation =
-            ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(lifted_output_sharding)?;
+        let operation = ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(output_sharding)?;
 
-        batch_reducing_operation(
+        let input = &inputs[0];
+        let reduced_axes = operation.axes();
+
+        // The consumed extents are collected from the unmasked input, because masking rewrites the payload while
+        // leaving in place the ragged metadata that the validation boundary is told about.
+        let consumed_ragged_dimensions = input
+            .ragged_axes()
+            .iter()
+            .filter(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
+            .map(|ragged_axis| ragged_axis.dimension().clone())
+            .collect::<Vec<_>>();
+
+        let masked = match self.kind {
+            ReductionKind::LogSumExp => {
+                P::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::Lowest)?
+            }
+            _ => P::mask_reduction_input(context, input, reduced_axes, self.kind)?,
+        };
+
+        // Ragged axes outside the reduced axes survive onto the output.
+        let remaining_ragged_axes = masked
+            .ragged_axes()
+            .iter()
+            .cloned()
+            .filter_map(|ragged_axis| ragged_axis.reduced(reduced_axes))
+            .collect::<Vec<_>>();
+        let output_batch_axis = BatchAxis::from_position(output_axis);
+        let mut outputs = operation.interpret_with_batch_axes(
             context,
-            &lifted_operation,
-            &inputs[0],
-            lifted_operation.axes(),
-            output_axis,
-            |input| match self.kind {
-                ReductionKind::LogSumExp => {
-                    P::mask_identity_input(context, input, lifted_operation.axes(), RaggedMaskIdentity::Lowest)
-                }
-                _ => P::mask_reduction_input(context, input, lifted_operation.axes(), self.kind),
-            },
-        )
+            std::slice::from_ref(&masked),
+            std::slice::from_ref(&output_batch_axis),
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        let output = ArrayBatch::new(outputs.remove(0).into_value(), output_batch_axis)?
+            .with_ragged_axes(remaining_ragged_axes)?;
+        Ok(BatchedOutputs::new(vec![output], consumed_ragged_dimensions))
     }
 }
 
@@ -1439,66 +1461,6 @@ fn validate_reduce_output_sharding(
         }
     }
     Ok(())
-}
-
-/// Applies the batching skeleton shared by the primitives that collapse a set of array axes, given an operation whose
-/// axes have already been lifted past the inserted batch dimension.
-///
-/// Collapsing an axis is what makes it legitimate to *consume* an input's per-item extents along a reduced bounded
-/// ragged axis: the padding is first neutralized by `mask`, so the output no longer depends on those extents, and each
-/// consumed [`DimensionVariable`] is then reported as the rule's [`BatchedOutputs`] evidence, which is how the
-/// carrier-invariant validation boundary tells a deliberate consumption apart from a silently dropped extent. The
-/// evidence is collected from the *unmasked* input, because masking rewrites the payload while leaving the ragged
-/// metadata that the boundary is told about in place. Ragged axes outside `reduced_axes` survive onto the output.
-///
-/// This skeleton is specific to axis-collapsing primitives. A prefix scan, for instance, masks the very same way but
-/// keeps the axis it touches, and so consumes nothing and reports no evidence.
-///
-/// # Parameters
-///
-///   - `context`: Active [`BatchingContext`] for the transform level being applied.
-///   - `operation`: Lifted operation, interpreted over the physical batched value.
-///   - `input`: Input batch, as the rule received it.
-///   - `reduced_axes`: Collapsed axes of `operation`, in the physical batched coordinate system.
-///   - `output_axis`: Position of the batch axis in the output.
-///   - `mask`: Neutralizes the input's ragged padding along `reduced_axes` with the operation's own identity.
-pub(crate) fn batch_reducing_operation<C, P, O, Mask>(
-    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-    operation: &O,
-    input: &ArrayBatch<C::Value>,
-    reduced_axes: &[usize],
-    output_axis: usize,
-    mask: Mask,
-) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
-where
-    C: Context<Type = ArrayType>,
-    P: RaggedArrayExtentBatchingPolicy<C>,
-    O: InterpretableOperation<C>,
-    Mask: FnOnce(&ArrayBatch<C::Value>) -> Result<ArrayBatch<C::Value>, BatchingError>,
-{
-    let consumed_ragged_dimensions = input
-        .ragged_axes()
-        .iter()
-        .filter(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
-        .map(|ragged_axis| ragged_axis.dimension().clone())
-        .collect::<Vec<_>>();
-    let masked = mask(input)?;
-    let remaining_ragged_axes = masked
-        .ragged_axes()
-        .iter()
-        .cloned()
-        .filter_map(|ragged_axis| ragged_axis.reduced(reduced_axes))
-        .collect::<Vec<_>>();
-    let output_batch_axis = BatchAxis::from_position(output_axis);
-    let mut outputs = operation.interpret_with_batch_axes(
-        context,
-        std::slice::from_ref(&masked),
-        std::slice::from_ref(&output_batch_axis),
-    )?;
-    check_count!("output", outputs, 1, ProgramError);
-    let output =
-        ArrayBatch::new(outputs.remove(0).into_value(), output_batch_axis)?.with_ragged_axes(remaining_ragged_axes)?;
-    Ok(BatchedOutputs::new(vec![output], consumed_ragged_dimensions))
 }
 
 /// Lifts a reduce's `axes` through one batching level inserted at `batch_axis`.
