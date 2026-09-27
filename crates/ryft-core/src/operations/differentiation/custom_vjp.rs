@@ -885,11 +885,17 @@ impl<
 ///     otherwise it preserves the call and its attached rules for later differentiation,
 ///   - _batching_ preserves the call around axis-reconciled batched copies of all three programs, so that the custom
 ///     derivative survives batching applied _before_ differentiation, and it sums the cotangents that the batched
-///     backward program produces for replicated inputs over the batch axis, and
+///     backward program produces for replicated inputs over the batch axis,
 ///   - _reverse-mode differentiation_ replays the forward program for the primal outputs and residuals and stages a
 ///     transpose-only linear call whose transpose replays the backward program, so reverse mode uses exactly the
 ///     user-supplied gradient. Executable forward derivatives reject before replaying the forward program, including
-///     when constructing staged derivatives, and the original custom call is never transposed.
+///     when constructing staged derivatives (and thus when reverse mode is applied over forward mode), and the
+///     original custom call is never transposed, and
+///   - _higher-order differentiation_ differentiates the backward program's ordinary operations, because the pullback
+///     replays that program inline. Both forward and reverse mode apply to a pullback, with respect to the primal
+///     inputs (through the saved residuals) and to the cotangent seeds, even when the backward program is nonlinear in
+///     its seeds. Transposing a pullback again requires the backward program to be linear in its seeds and is rejected
+///     otherwise.
 ///
 /// # Parameters
 ///
@@ -1767,6 +1773,50 @@ mod tests {
                 .interpret(vec![Array::scalar(3.0).unwrap(), Array::scalar(1.0).unwrap()]),
             Ok(vec![Array::scalar(9.0).unwrap(), Array::scalar(6.0).unwrap()]),
         );
+
+        // Transposing the pullback again transposes the backward program's ordinary operations, which requires the
+        // backward program to be linear in its seed. The seed-non-linear rule is therefore rejected.
+        assert!(matches!(
+            custom_pullback.transpose(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message
+                    == "operation `mul` does not support transposition for input pattern [left = linear, \
+                        right = linear]",
+        ));
+    }
+
+    #[test]
+    fn test_custom_vjp_differentiation_re_transposition() {
+        // A seed-linear backward program can be transposed again. The pullback contains the backward program's ordinary
+        // operations rather than the transpose-only carrier, so the result is the forward map `ẋ ↦ 3 cos(x) ẋ` of the
+        // custom rule.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let primal = builder.import_program(sin_program(&scalar_type));
+        let forward = builder.import_program(sin_forward_program(&scalar_type));
+        let backward = builder.import_program(tripled_sin_backward_program(&scalar_type));
+        let input = builder.add_input(scalar_type);
+        let output = builder
+            .add_instruction(CustomVjpOperation::new(), vec![primal, forward, backward], vec![input], None)
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let linearization = program
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let residuals = linearization.primal().interpret(vec![Array::scalar(0.7).unwrap()]).unwrap();
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.interpret(vec![Array::scalar(1.0).unwrap(), residuals[1].clone()]),
+            Ok(vec![Array::scalar(3.0 * 0.7f64.cos()).unwrap()]),
+        );
+        let re_transposed = pullback.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            re_transposed.interpret(vec![Array::scalar(1.0).unwrap(), residuals[1].clone()]),
+            Ok(vec![Array::scalar(3.0 * 0.7f64.cos()).unwrap()]),
+        );
     }
 
     #[test]
@@ -1783,6 +1833,31 @@ mod tests {
                     tripled_sin_backward_program(&scalar_type),
                 ];
                 Ok(x.context().bind(operation, regions, &[x.clone()])?.remove(0))
+            }),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == FORWARD_MODE_REJECTION,
+        ));
+    }
+
+    #[test]
+    fn test_custom_vjp_differentiation_rejects_reverse_over_forward() {
+        // Reverse differentiation of a directional derivative first applies forward mode to the custom VJP call,
+        // which is rejected with the same diagnostic as immediate forward mode.
+        assert!(matches!(
+            differentiate_at(Array::scalar(2.0).unwrap()).vjp(|x| {
+                let direction = x.context().lift(Array::scalar(1.0).unwrap())?;
+                Ok(differentiate_at(x)
+                    .jvp(direction, |y| {
+                        let scalar_type = ArrayType::scalar(DataType::F64);
+                        let operation = ArrayOperation::CustomVjp(CustomVjpOperation::new());
+                        let regions = vec![
+                            sin_program(&scalar_type),
+                            sin_forward_program(&scalar_type),
+                            tripled_sin_backward_program(&scalar_type),
+                        ];
+                        Ok(y.context().bind(operation, regions, &[y.clone()])?.remove(0))
+                    })?
+                    .1)
             }),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == FORWARD_MODE_REJECTION,

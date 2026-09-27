@@ -646,10 +646,13 @@ impl<
 ///   - _partial evaluation_ folds a call when its inputs are known and effect-ordering constraints permit execution
 ///     and it otherwise preserves the call and its attached JVP rule for later differentiation,
 ///   - _batching_ preserves the call around axis-reconciled batched copies of both programs, so that the custom
-///     derivative survives batching applied _before_ differentiation, and
+///     derivative survives batching applied _before_ differentiation,
 ///   - _differentiation_ replays the JVP program instead of differentiating the primal body. The replayed rule consists
 ///     of ordinary primitive operations, so reverse mode transposes the linear map in `ẋ` that it computes, exactly
-///     like any other tangent program, and the staged call itself is never transposed.
+///     like any other tangent program, and the staged call itself is never transposed, and
+///   - _higher-order differentiation_ differentiates those replayed operations, so every combination of forward and
+///     reverse mode applies to the resulting derivatives, including differentiation of a pullback with respect to its
+///     cotangent seeds and transposing a pullback again (which restores the tangent map).
 ///
 /// # Parameters
 ///
@@ -2176,6 +2179,108 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(gradient, Array::scalar(2.0 * 0.7f64.cos()).unwrap());
         assert_eq!(second_derivative, Array::scalar(-2.0 * 0.7f64.sin()).unwrap());
+    }
+
+    #[test]
+    fn test_custom_jvp_differentiation_forward_over_reverse() {
+        // Forward differentiation of the gradient differentiates the ordinary operations that the JVP rule replayed
+        // into the pullback, so the doubled rule yields the second derivative `-2 sin(x)`.
+        let (gradient, second_derivative) = differentiate_at(Array::scalar(0.7).unwrap())
+            .jvp(Array::scalar(1.0).unwrap(), |x| {
+                Ok(differentiate_at(x)
+                    .gradient(|y| {
+                        let scalar_type = ArrayType::scalar(DataType::F64);
+                        let operation = ArrayOperation::CustomJvp(CustomJvpOperation::new());
+                        let regions = vec![sin_program(&scalar_type), doubled_sin_jvp_program(&scalar_type)];
+                        y.context().bind(operation, regions, &[y.clone()]).unwrap().remove(0)
+                    })
+                    .unwrap())
+            })
+            .unwrap();
+        assert_eq!(gradient, Array::scalar(2.0 * 0.7f64.cos()).unwrap());
+        assert_eq!(second_derivative, Array::scalar(-2.0 * 0.7f64.sin()).unwrap());
+    }
+
+    #[test]
+    fn test_custom_jvp_differentiation_reverse_over_forward() {
+        // Reverse differentiation of the directional derivative differentiates the rule's replayed coefficient.
+        let (tangent, second_derivative) = differentiate_at(Array::scalar(0.7).unwrap())
+            .value_and_gradient(|x| {
+                let direction = x.context().lift(Array::scalar(1.0).unwrap()).unwrap();
+                differentiate_at(x)
+                    .jvp(direction, |y| {
+                        let scalar_type = ArrayType::scalar(DataType::F64);
+                        let operation = ArrayOperation::CustomJvp(CustomJvpOperation::new());
+                        let regions = vec![sin_program(&scalar_type), doubled_sin_jvp_program(&scalar_type)];
+                        Ok(y.context().bind(operation, regions, &[y.clone()])?.remove(0))
+                    })
+                    .unwrap()
+                    .1
+            })
+            .unwrap();
+        assert_eq!(tangent, Array::scalar(2.0 * 0.7f64.cos()).unwrap());
+        assert_eq!(second_derivative, Array::scalar(-2.0 * 0.7f64.sin()).unwrap());
+    }
+
+    #[test]
+    fn test_custom_jvp_differentiation_forward_over_forward() {
+        let (tangent, second_derivative) = differentiate_at(Array::scalar(0.7).unwrap())
+            .jvp(Array::scalar(1.0).unwrap(), |x| {
+                let direction = x.context().lift(Array::scalar(1.0).unwrap())?;
+                Ok(differentiate_at(x)
+                    .jvp(direction, |y| {
+                        let scalar_type = ArrayType::scalar(DataType::F64);
+                        let operation = ArrayOperation::CustomJvp(CustomJvpOperation::new());
+                        let regions = vec![sin_program(&scalar_type), doubled_sin_jvp_program(&scalar_type)];
+                        Ok(y.context().bind(operation, regions, &[y.clone()])?.remove(0))
+                    })
+                    .unwrap()
+                    .1)
+            })
+            .unwrap();
+        assert_eq!(tangent, Array::scalar(2.0 * 0.7f64.cos()).unwrap());
+        assert_eq!(second_derivative, Array::scalar(-2.0 * 0.7f64.sin()).unwrap());
+    }
+
+    #[test]
+    fn test_custom_jvp_differentiation_pullback() {
+        // The pullback of a JVP-only rule is linear in its seed, so its derivative with respect to the seed is the
+        // custom coefficient `2 cos(x)`.
+        let (cotangent, seed_derivative) = differentiate_at(Array::scalar(3.0).unwrap())
+            .jvp(Array::scalar(1.0).unwrap(), |seed| {
+                let input = seed.context().lift(Array::scalar(0.7).unwrap())?;
+                let (_, pullback) = differentiate_at(input)
+                    .vjp(|y| {
+                        let scalar_type = ArrayType::scalar(DataType::F64);
+                        let operation = ArrayOperation::CustomJvp(CustomJvpOperation::new());
+                        let regions = vec![sin_program(&scalar_type), doubled_sin_jvp_program(&scalar_type)];
+                        Ok(y.context().bind(operation, regions, &[y.clone()])?.remove(0))
+                    })
+                    .unwrap();
+                pullback.apply(seed)
+            })
+            .unwrap();
+        assert_eq!(cotangent, Array::scalar(2.0 * 0.7f64.cos() * 3.0).unwrap());
+        assert_eq!(seed_derivative, Array::scalar(2.0 * 0.7f64.cos()).unwrap());
+
+        // Transposing the pullback again transposes its ordinary linear operations and restores the tangent map.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let primal = builder.import_program(sin_program(&scalar_type));
+        let jvp = builder.import_program(doubled_sin_jvp_program(&scalar_type));
+        let input = builder.add_input(scalar_type);
+        let output =
+            builder.add_instruction(CustomJvpOperation::new(), vec![primal, jvp], vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let linearization = program.linearize().unwrap();
+        let residuals = linearization.primal().interpret(vec![Array::scalar(0.7).unwrap()]).unwrap();
+        let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+        let retransposed = pullback.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            retransposed.interpret(vec![Array::scalar(1.0).unwrap(), residuals[1].clone()]),
+            linearization.tangent().interpret(vec![Array::scalar(1.0).unwrap(), residuals[1].clone()]),
+        );
     }
 
     #[test]

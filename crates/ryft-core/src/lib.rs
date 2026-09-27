@@ -204,7 +204,9 @@ pub(crate) mod tests {
 
     use crate::arrays::{Array, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::forward::tests::CustomCubeOperation;
+    use crate::differentiation::forward::tests::{
+        CustomCubeOperation, CustomWeightedCubeOperation, NestedRuleOperation, RuleMarkerOperation,
+    };
     use crate::differentiation::{
         CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext,
         DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation,
@@ -239,7 +241,8 @@ pub(crate) mod tests {
     /// rules also require conversion, reduction, reshape, and reshard. Reduction derivatives require comparison,
     /// division, subtraction, exponentiation, and selection. These dependencies apply to the operation family even
     /// when a particular scalar test emits none of those operations. Tests of `jvp_for_transpose` additionally
-    /// use the cube fixture, conditional regions, and a retained linear call. All regions use the fixed `Array` value
+    /// use the scalar and weighted cube fixtures, the rule-marker fixtures for nested rule selection, conditional
+    /// regions, and a retained linear call. All regions use the fixed `Array` value
     /// family, so no value type parameter is needed.
     #[derive(Clone, Debug, Operation)]
     #[ryft(type = ArrayType, constant = Array, dispatch(batching, differentiation, transposition))]
@@ -256,6 +259,9 @@ pub(crate) mod tests {
         Div(DivOperation<ArrayType>),
         Exp(ExpOperation<ArrayType>),
         CustomCube(CustomCubeOperation),
+        CustomWeightedCube(CustomWeightedCubeOperation),
+        RuleMarker(RuleMarkerOperation),
+        NestedRule(NestedRuleOperation),
         LazyCustomJvp(LazyCustomJvpOperation),
         ConvertElementType(ConvertElementTypeOperation<ArrayType>),
         Broadcast(BroadcastOperation),
