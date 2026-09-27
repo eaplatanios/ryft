@@ -10,13 +10,13 @@
 //!   - **Logarithmic Sums of Exponentials:** [`LogSumExp`](CumulativeKind::LogSumExp) computes a running
 //!     `log(sum(exp(x)))` without overflowing for large finite inputs.
 //!
-//! Element `i` along the scanned axis of the output holds the combination of the input elements `0..=i` (i.e., an
-//! inclusive prefix), or of the input elements `i..` (i.e., an inclusive suffix, still in the original output order)
-//! when the scan runs in reverse. The output has exactly the input type, so unlike a
-//! [`ReduceOperation`](crate::operations::reductions::ReduceOperation), a cumulative operation keeps the scanned axis,
-//! and unlike the control-flow [`ScanOperation`](crate::operations::control_flow::scan::ScanOperation), it applies one
-//! fixed combining operator rather than an arbitrary loop body. The operations mirror JAX's cumulative operations
-//! (e.g., [`jax.lax.cumsum`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cumsum.html)). The scanned dimension
+//! Element `i` along the scanned axis of the output holds the combination of the input elements `0..=i`
+//! (i.e., an inclusive prefix), or of the input elements `i..` (i.e., an inclusive suffix, still in the
+//! original output order) when the scan runs in reverse. The output has exactly the input type, so unlike
+//! a [`ReduceOperation`](crate::ReduceOperation), a cumulative operation keeps the scanned axis, and
+//! unlike the control-flow [`ScanOperation`](crate::ScanOperation), it applies one fixed combining
+//! operator rather than an arbitrary loop body. The operations mirror JAX's cumulative operations (e.g.,
+//! [`jax.lax.cumsum`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.cumsum.html)). The scanned dimension
 //! must be static and unsharded, and floating-point reassociation can make a sequential eager scan and a compiled
 //! parallel scan round differently in their last bits.
 //!
@@ -25,19 +25,18 @@
 //! The identity of each combining operator matters beyond the empty-prefix case: it is what the batching rule writes
 //! over the padding of a bounded ragged scanned axis (refer to [`RaggedMaskIdentity`]), so that padded positions cannot
 //! contribute to any live prefix. Masking is where cumulative batching parts company with a reduction's: a prefix scan
-//! keeps every axis it touches, so it *consumes* no bounded ragged axis. The operand's ragged axes ride through onto
+//! keeps every axis it touches, so it _consumes_ no bounded ragged axis. The operand's ragged axes ride through onto
 //! the result unchanged and the rule reports no consumption evidence. A scan whose axis is not ragged never reaches the
 //! masking hook at all, and so passes through exactly as it would with no ragged metadata.
 //!
 //! # Differentiation
 //!
-//! [`CumulativeKind::Sum`] is the one *linear* kind, so a cumulative sum differentiates and transposes as itself: its
+//! [`CumulativeKind::Sum`] is the one _linear_ kind, so a cumulative sum differentiates and transposes as itself: its
 //! tangent is the same prefix sum of the input tangent, and its transpose is the prefix sum in the opposite direction.
-//! The nonlinear kinds have no closed-form primitive derivative and none is invented for them: their forward-mode
+//! The non-linear kinds have no closed-form primitive derivative and none is invented for them: their forward-mode
 //! rules differentiate through the parallel-prefix [`associative_scan`] decomposition, so each derivative is assembled
 //! from the rules of the primitives that construction stages. None of them is directly transposable, and reverse mode
-//! reaches them by transposing those staged primitives instead. This is exactly how JAX defines the same operations
-//! (`_cumulative_jvp_rule`).
+//! reaches them by transposing those staged primitives instead.
 //!
 //! # Example
 //!
@@ -51,8 +50,6 @@
 //! # Ok(())
 //! # }
 //! ```
-
-// TODO(eaplatanios): Review this module.
 
 use std::fmt::Display;
 
@@ -119,8 +116,8 @@ pub enum CumulativeKind {
 
     /// Running numerically stable `log(sum(exp(x)))`. Each prefix is accumulated by folding the pairwise [`LogAddExp`]
     /// operation, which is stable over the whole real range but is a different expression from the max-shifted
-    /// reduction that [`ReductionKind::LogSumExp`](crate::operations::reductions::ReductionKind::LogSumExp) evaluates,
-    /// so the two can round differently in their last bits.
+    /// reduction that [`ReductionKind::LogSumExp`](crate::ReductionKind::LogSumExp) evaluates, so the two can round
+    /// differently in their last bits.
     ///
     /// Padding is filled with the element data type's lowest value, which must be an identity of the rounded pairwise
     /// [`LogAddExp`] operation. True negative infinity satisfies this contract, as do finite sentinels that round back
@@ -128,8 +125,8 @@ pub enum CumulativeKind {
     /// sentinel values returns the sentinel, an all-sentinel subtree of any size does too, and such sentinels therefore
     /// remain neutral for any prefix length. [`DataType::F8E8M0FNU`] and [`DataType::F6E2M3FN`] have no suitable
     /// identity and are rejected, as are all non-floating-point and complex inputs. This criterion intentionally
-    /// differs from that of the log-sum-exp reduction, whose padding must remain neutral after subtracting an arbitrary
-    /// maximum and which therefore requires a format that represents negative infinity.
+    /// differs from that of the log-sum-exp reduction, whose padding must remain neutral after subtracting an
+    /// arbitrary maximum and which therefore requires a format that represents negative infinity.
     LogSumExp,
 }
 
@@ -154,6 +151,8 @@ impl Display for CumulativeKind {
         write!(formatter, "{}", self.name())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents one inclusive prefix scan along a single array axis. Output element `i` along [`axis`](Self::axis) holds
 /// the combination of the input elements `0..=i` under the combining operator selected by [`kind`](Self::kind), or of
@@ -1040,7 +1039,7 @@ mod tests {
     use crate::operations::reductions::Reduce;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, Provenance, ValueProjection};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, ValueProjection};
 
     use super::*;
 
@@ -2088,8 +2087,8 @@ mod tests {
 
     #[test]
     fn test_associative_scan_provenance() {
-        // Every instruction that the decomposition stages carries the nested framework scopes, which is purely
-        // diagnostic: the canonical semantic rendering stays suffix-free and the values are unaffected.
+        // Every instruction that the decomposition stages carries the nested framework scopes, which attribute it to the
+        // associative-scan decomposition in renderings that include provenance.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::new_static(DataType::F64, [2]));
         let output = associative_scan(&input, 0, false, &|left, right| left.add(right)).unwrap();
@@ -2102,7 +2101,18 @@ mod tests {
         assert_eq!(
             std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithProvenance))
                 .to_string(),
-            "PLACEHOLDER",
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %0 ; provenance=ryft::differentiation::associative_scan
+                    %2:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %0 ; provenance=ryft::differentiation::associative_scan
+                    %3:f64[1] = add %1 %2 ; provenance=ryft::differentiation::associative_scan
+                    %4:f64[1] = slice [start_indices=[0], limit_indices=[1]] %0 ; provenance=ryft::differentiation::associative_scan
+                    %5:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::associative_scan
+                    %6:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %4 %5 ; provenance=ryft::differentiation::associative_scan
+                    %7:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %3 %5 ; provenance=ryft::differentiation::associative_scan
+                    %8:f64[2] = add %6 %7 ; provenance=ryft::differentiation::associative_scan
+                in (%8)"
+            },
         );
     }
 
