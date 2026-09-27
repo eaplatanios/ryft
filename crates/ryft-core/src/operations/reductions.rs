@@ -9,8 +9,7 @@
 //!     reduced elements, propagating NaNs, ordering negative zero below positive zero, and comparing complex
 //!     elements by their real parts first and their imaginary parts second.
 //!   - **Logarithmic Sums of Exponentials:** [`LogSumExp`](ReductionKind::LogSumExp) computes `log(sum(exp(x)))`
-//!     without overflowing for large finite inputs. The [`LogSumExp`] value capability provides it as a function of
-//!     its own.
+//!     without overflowing for large finite inputs.
 //!   - **Boolean Reductions:** [`Any`](ReductionKind::Any) and [`All`](ReductionKind::All) compute the disjunction and
 //!     conjunction of Boolean elements.
 //!
@@ -109,8 +108,26 @@ pub enum ReductionKind {
     /// returns an error during eager evaluation.
     Mean,
 
-    /// Numerically stable logarithm of a sum of exponentials. Only real floating-point formats with negative infinity
-    /// are supported. Refer to [`LogSumExp`] for the guarded computation and data-type limits.
+    /// Numerically stable logarithm of a sum of exponentials, `log(sum(exp(x)))`. The computation guards the maximum
+    /// shift before exponentiating, avoiding overflow for large finite inputs:
+    ///
+    /// ```text
+    /// m      = reduce_max(x)                      // with a -∞ initial value
+    /// safe_m = select(isfinite(m), m, 0)
+    /// output = log(reduce_sum(exp(x - safe_m))) + safe_m
+    /// ```
+    ///
+    /// The `safe_m` substitution is what the guard buys. Shifting by a raw maximum of `-∞` (the identity of a maximum,
+    /// and therefore the output for an all-`-∞` slice or an empty reduction) would compute `-∞ - -∞ = NaN`.
+    /// Substituting zero there leaves `log(0) + 0 = -∞`, which is the correct value of an empty or all-zero
+    /// sum of exponentials. A maximum of `+∞` is guarded the same way, and a NaN input propagates as usual.
+    ///
+    /// Only real floating-point formats that represent negative infinity are supported. The ragged batching rule fills
+    /// padding with negative infinity so its exponential stays zero after subtraction of any finite maximum. A finite
+    /// sentinel cannot provide that guarantee, even when it is an identity of rounded pairwise `log_add_exp`:
+    /// subtracting a nearby maximum makes padded entries contribute to the inner sum. This reduction is the unweighted,
+    /// unmasked subset of [`jax.nn.logsumexp`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.logsumexp.html);
+    /// weights, masks, sign outputs, and complex inputs are not supported.
     LogSumExp,
 
     /// Maximum reduction. Boolean inputs use disjunction, real numeric inputs propagate NaNs and order negative zero
@@ -363,14 +380,13 @@ impl<D: Domain<Type = ArrayType, Value: Reduce>> InterpretableOperation<D> for R
         _driver: &I,
         inputs: &[D::Value],
     ) -> Result<Vec<D::Value>, ProgramError> {
-        // The requested output sharding flows through the capability method so that interpretation over staging
-        // values (e.g., during program batching) preserves it; concrete values ignore it.
+        // The requested output sharding flows through `Reduce::reduce_sum` so that interpretation over staging values
+        // (e.g., during program batching) preserves it. Only sums can carry a requested output sharding, and so every
+        // other kind reduces through `Reduce::reduce`.
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![match &self.output_sharding {
-            Some(output_sharding) => {
-                inputs[0].clone().reduce_with_output_sharding(self.axes.as_slice(), self.kind, output_sharding)?
-            }
-            None => inputs[0].clone().reduce(self.axes.as_slice(), self.kind)?,
+        Ok(vec![match self.kind {
+            ReductionKind::Sum => inputs[0].reduce_sum(self.axes.as_slice(), self.output_sharding.clone())?,
+            kind => inputs[0].reduce(self.axes.as_slice(), kind)?,
         }])
     }
 }
@@ -494,11 +510,11 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             match operation.kind() {
                 ReductionKind::Sum | ReductionKind::Mean => {
-                    let reduce = |value: &C::Value| match operation.output_sharding() {
-                        Some(output_sharding) => {
-                            value.reduce_with_output_sharding(operation.axes(), operation.kind(), output_sharding)
-                        }
-                        None => value.reduce(operation.axes(), operation.kind()),
+                    // Only sums can carry a requested output sharding, and the tangent sum must request the same one
+                    // as the primal sum so that differentiation does not change how the output is distributed.
+                    let reduce = |value: &C::Value| match operation.kind() {
+                        ReductionKind::Sum => value.reduce_sum(operation.axes(), operation.output_sharding().cloned()),
+                        kind => value.reduce(operation.axes(), kind),
                     };
                     let primal = reduce(inputs[0].primal())?;
                     let tangent = match inputs[0].tangent() {
@@ -899,33 +915,71 @@ pub trait Reduce: Sized {
     /// or if the context of `self` fails to bind the reduction.
     fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Result<Self, ProgramError>;
 
-    /// Reduces `self` along `axes` using `kind` and requests `output_sharding` for the output. Only
-    /// [`ReductionKind::Sum`] reductions support such a request. For example, requesting an unreduced
-    /// mesh axis that shards a reduced dimension defers the cross-device part of the sum. Refer to
-    /// [`ReduceOperation::with_output_sharding`] for the complete set of valid requests.
+    /// Sums `self` along `axes` using [`ReductionKind::Sum`], optionally requesting `output_sharding` for the output.
+    /// Sums are the only reductions that support a requested output sharding, which is why this is the only shortcut
+    /// function that takes one. For example, requesting an unreduced mesh axis that shards a reduced dimension defers
+    /// the cross-device part of the sum. Refer to [`ReduceOperation::with_output_sharding`] for the complete set of
+    /// valid requests.
     ///
-    /// Every value validates the request through the type inference of the corresponding [`ReduceOperation`].
+    /// Every value validates a requested sharding through the type inference of the corresponding [`ReduceOperation`].
     /// Context-carrying values then attach the request to the staged [`ReduceOperation`]. Concrete [`Array`]s live on
-    /// a single device, where a sharding only describes distribution metadata, and so they compute the same output as
-    /// [`Self::reduce`] once the request has been validated.
+    /// a single device, where a sharding only describes distribution metadata, and so they compute the same output
+    /// with or without it.
     ///
     /// # Parameters
     ///
     ///   - `axes`: Distinct axes of `self` to collapse, with the same semantics as in [`Self::reduce`].
-    ///   - `kind`: [`ReductionKind`] that determines how the elements along `axes` are combined.
-    ///   - `output_sharding`: Requested [`Sharding`] of the output, which must match the output rank
-    ///     and the mesh of `self`.
+    ///   - `output_sharding`: Requested [`Sharding`] of the output, which must match the output rank and the mesh
+    ///     of `self`, or [`None`] to infer the output sharding from the input.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] under the same conditions as [`Self::reduce`], if `kind` is not
-    /// [`ReductionKind::Sum`], or if `output_sharding` is not a valid request for the type of `self`.
-    fn reduce_with_output_sharding(
-        &self,
-        axes: &[usize],
-        kind: ReductionKind,
-        output_sharding: &Sharding,
-    ) -> Result<Self, ProgramError>;
+    /// Returns a [`ProgramError`] under the same conditions as [`Self::reduce`] or if `output_sharding` is not a valid
+    /// request for the type of `self`.
+    fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError>;
+
+    /// Averages `self` along `axes` using [`ReductionKind::Mean`]. Refer to [`Self::reduce`] for the semantics of
+    /// `axes` and for the errors that this function may return.
+    #[inline]
+    fn reduce_mean(&self, axes: &[usize]) -> Result<Self, ProgramError> {
+        self.reduce(axes, ReductionKind::Mean)
+    }
+
+    /// Computes the numerically stable `log(sum(exp(self)))` along `axes` using [`ReductionKind::LogSumExp`], whose
+    /// documentation describes the guarded computation and its data-type limits. Refer to [`Self::reduce`] for the
+    /// semantics of `axes` and for the errors that this function may return.
+    #[inline]
+    fn reduce_log_sum_exp(&self, axes: &[usize]) -> Result<Self, ProgramError> {
+        self.reduce(axes, ReductionKind::LogSumExp)
+    }
+
+    /// Computes the maximum of `self` along `axes` using [`ReductionKind::Max`]. Refer to [`Self::reduce`] for the
+    /// semantics of `axes` and for the errors that this function may return.
+    #[inline]
+    fn reduce_max(&self, axes: &[usize]) -> Result<Self, ProgramError> {
+        self.reduce(axes, ReductionKind::Max)
+    }
+
+    /// Computes the minimum of `self` along `axes` using [`ReductionKind::Min`]. Refer to [`Self::reduce`] for the
+    /// semantics of `axes` and for the errors that this function may return.
+    #[inline]
+    fn reduce_min(&self, axes: &[usize]) -> Result<Self, ProgramError> {
+        self.reduce(axes, ReductionKind::Min)
+    }
+
+    /// Computes the disjunction of the Boolean elements of `self` along `axes` using [`ReductionKind::Any`]. Refer to
+    /// [`Self::reduce`] for the semantics of `axes` and for the errors that this function may return.
+    #[inline]
+    fn reduce_any(&self, axes: &[usize]) -> Result<Self, ProgramError> {
+        self.reduce(axes, ReductionKind::Any)
+    }
+
+    /// Computes the conjunction of the Boolean elements of `self` along `axes` using [`ReductionKind::All`]. Refer to
+    /// [`Self::reduce`] for the semantics of `axes` and for the errors that this function may return.
+    #[inline]
+    fn reduce_all(&self, axes: &[usize]) -> Result<Self, ProgramError> {
+        self.reduce(axes, ReductionKind::All)
+    }
 }
 
 // TODO(eaplatanios): Review from here onwards.
@@ -990,19 +1044,16 @@ impl Reduce for Array {
         output
     }
 
-    fn reduce_with_output_sharding(
-        &self,
-        axes: &[usize],
-        kind: ReductionKind,
-        output_sharding: &Sharding,
-    ) -> Result<Self, ProgramError> {
-        // A concrete array lives on a single device, so the requested sharding cannot change its elements. The request
+    fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError> {
+        // A concrete array lives on a single device, so a requested sharding cannot change its elements. The request
         // must still be valid for the input, just like it must be for a staged reduction, and so we validate it using
-        // the type inference of the same `ReduceOperation` before computing the reduction.
-        ReduceOperation::new(axes.to_vec(), kind)
-            .with_output_sharding(output_sharding.clone())?
-            .infer_output_types(&[self.r#type().into_owned()], &[])?;
-        self.reduce(axes, kind)
+        // the type inference of the same `ReduceOperation` before computing the sum.
+        if output_sharding.is_some() {
+            ReduceOperation::new(axes.to_vec(), ReductionKind::Sum)
+                .with_output_sharding(output_sharding)?
+                .infer_output_types(&[self.r#type().into_owned()], &[])?;
+        }
+        self.reduce(axes, ReductionKind::Sum)
     }
 }
 
@@ -1030,59 +1081,19 @@ where
     }
 
     #[inline]
-    fn reduce_with_output_sharding(
-        &self,
-        axes: &[usize],
-        kind: ReductionKind,
-        output_sharding: &Sharding,
-    ) -> Result<Self, ProgramError> {
+    fn reduce_sum(&self, axes: &[usize], output_sharding: Option<Sharding>) -> Result<Self, ProgramError> {
+        // Without a requested sharding, a sum is an ordinary reduction. A requested sharding is staged even when no
+        // axes are reduced, because it may still change how the output is distributed.
+        if output_sharding.is_none() {
+            return self.reduce(axes, ReductionKind::Sum);
+        }
         let mut outputs = self.dispatch_domain().bind(
-            ReduceOperation::new(axes.to_vec(), kind).with_output_sharding(output_sharding.clone())?,
+            ReduceOperation::new(axes.to_vec(), ReductionKind::Sum).with_output_sharding(output_sharding)?,
             Vec::new(),
             std::slice::from_ref(self),
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
-    }
-}
-
-/// Value-level capability for one numerically stable `log(sum(exp(x)))` over a set of array axes.
-///
-/// [`LogSumExp`] delegates to [`Reduce`] with [`ReductionKind::LogSumExp`]: the reduced axes are removed from the
-/// output shape and the remaining axes keep their order.
-///
-/// The computation guards the maximum shift before exponentiating, avoiding overflow for large finite inputs:
-///
-/// ```text
-/// m      = reduce_max(x)                      // with a -∞ initial value
-/// safe_m = select(isfinite(m), m, 0)
-/// output = log(reduce_sum(exp(x - safe_m))) + safe_m
-/// ```
-///
-/// The `safe_m` substitution is what the guard buys. Shifting by a raw maximum of `-∞` (the identity of a maximum, and
-/// therefore the output for an all-`-∞` slice or an empty reduction) would compute `-∞ - -∞ = NaN`; substituting zero
-/// there leaves `log(0) + 0 = -∞`, which is the correct value of an empty or all-zero sum of exponentials. A maximum
-/// of `+∞` is guarded the same way, and a NaN input propagates as usual.
-///
-/// Only real floating-point formats that represent negative infinity are supported. The ragged batching rule fills
-/// padding with negative infinity so its exponential stays zero after subtraction of any finite maximum. A finite
-/// sentinel cannot provide that guarantee, even when it is an identity of rounded pairwise log-add-exp: subtracting
-/// a nearby maximum makes padded entries contribute to the inner sum. This operation is the unweighted, unmasked
-/// subset of [`jax.nn.logsumexp`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.logsumexp.html); weights, masks,
-/// sign outputs, and complex inputs are not supported.
-///
-/// Reducing no axes returns the input unchanged after validating its element data type. Differentiation currently
-/// requires statically shaped inputs.
-pub trait LogSumExp: Sized {
-    /// Computes `log(sum(exp(self)))` over `axes` using [`ReductionKind::LogSumExp`]. The reduced axes are removed
-    /// from the output; invalid axes and unsupported element data types return a [`ProgramError`].
-    fn log_sum_exp(&self, axes: &[usize]) -> Result<Self, ProgramError>;
-}
-
-impl<V: Reduce> LogSumExp for V {
-    #[inline]
-    fn log_sum_exp(&self, axes: &[usize]) -> Result<Self, ProgramError> {
-        self.reduce(axes, ReductionKind::LogSumExp)
     }
 }
 
@@ -1343,7 +1354,7 @@ impl Array {
 /// Validates that:
 ///   - `axes` are unique and within `0..rank(input)`;
 ///   - `kind` matches the input data type (Boolean for Any/All, Boolean or numeric for Max/Min, and numeric for
-///     Sum/Mean; logarithmic sums require the real floating-point domain documented on [`LogSumExp`]).
+///     Sum/Mean; logarithmic sums require the real floating-point domain documented on [`ReductionKind::LogSumExp`]).
 ///
 /// The reduced axes are removed from the output shape; non-reduced axes keep their order. The output [`Sharding`]
 /// drops the reduced axes' per-dimension [`ShardingDimension`] entries while
@@ -1373,7 +1384,7 @@ pub fn reduce_abstract(input: &ArrayType, axes: &[usize], kind: ReductionKind) -
     // Validate axes before the element domain so malformed geometry retains diagnostic precedence.
     if kind == ReductionKind::LogSumExp {
         // Logarithmic sums are built from exponentials and logarithms, so they require the real floating-point domain
-        // documented on `LogSumExp`, restricted to formats that represent the negative infinity that the
+        // documented on `ReductionKind::LogSumExp`, restricted to formats that represent the negative infinity that the
         // maximum-shifted evaluation starts from.
         if !data_type.is_floating_point() {
             return Err(TypeError::invalid(format!(
@@ -1483,8 +1494,6 @@ where
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
 }
-
-// TODO(eaplatanios): Review this.
 
 impl Array {
     /// Computes `log(sum(exp(input)))` by subtracting a finite maximum before exponentiating. Nonfinite maxima
@@ -2133,7 +2142,7 @@ mod tests {
     fn test_reduce_differentiation_log_sum_exp_large_offset() {
         // Rounding the primal erases log(2), but must not erase the normalization of the derivative weights.
         let (primal, tangent) = differentiate_at(Array::vector(vec![1e20f64, 1e20]).unwrap())
-            .jvp(Array::vector(vec![1.0f64, 1.0]).unwrap(), |input| input.log_sum_exp(&[0]))
+            .jvp(Array::vector(vec![1.0f64, 1.0]).unwrap(), |input| input.reduce_log_sum_exp(&[0]))
             .unwrap();
         assert_eq!(primal.elements::<f64>(), Ok(vec![1e20]));
         assert_eq!(tangent.elements::<f64>(), Ok(vec![1.0]));
@@ -2143,7 +2152,7 @@ mod tests {
     fn test_reduce_differentiation_log_sum_exp_narrow_floating_point() {
         // The normalization count exceeds the largest finite half value; the derivative must still sum to one.
         let (_, tangent) = differentiate_at(Array::vector(vec![f16::ZERO; 65_536]).unwrap())
-            .jvp(Array::vector(vec![f16::ONE; 65_536]).unwrap(), |input| input.log_sum_exp(&[0]))
+            .jvp(Array::vector(vec![f16::ONE; 65_536]).unwrap(), |input| input.reduce_log_sum_exp(&[0]))
             .unwrap();
         assert_eq!(tangent.elements::<f16>(), Ok(vec![f16::ONE]));
     }
@@ -2151,7 +2160,7 @@ mod tests {
     #[test]
     fn test_reduce_differentiation_log_sum_exp_infinity() {
         let (_, pullback) = differentiate_at(Array::vector(vec![f64::INFINITY, 0.0]).unwrap())
-            .vjp(|input| input.log_sum_exp(&[0]))
+            .vjp(|input| input.reduce_log_sum_exp(&[0]))
             .unwrap();
         let elements = pullback.apply(Array::scalar(1.0f64).unwrap()).unwrap().elements::<f64>().unwrap();
         assert!(elements[0].is_nan());
@@ -2294,7 +2303,7 @@ mod tests {
 
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(input_type);
-        let output = input.reduce_with_output_sharding(&[0], ReductionKind::Sum, &unreduced).unwrap();
+        let output = input.reduce_sum(&[0], Some(unreduced.clone())).unwrap();
         let program = context
             .builder()
             .borrow()
@@ -2642,13 +2651,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_with_output_sharding() {
-        use std::rc::Rc;
-
-        use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-        use crate::parameters::Placeholder;
-        use crate::tracing::TracingContext;
-
+    fn test_reduce_reduce_sum() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input_type = ArrayType::new_static(DataType::F64, [2, 3])
             .with_sharding(
@@ -2661,59 +2664,35 @@ mod tests {
             .with_unreduced_axes(["x"])
             .unwrap();
 
-        // Staging `reduce_with_output_sharding` on a tracer must carry the requested sharding through the capability,
-        // the staged `ReduceOperation`, and the `ArrayOperation::Reduce` variant into the built program.
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let builder = context.builder().clone();
-        let input_atom = builder.borrow_mut().add_input(input_type);
-        let output = context
-            .tracer(input_atom, None)
-            .reduce_with_output_sharding(&[0], ReductionKind::Sum, &unreduced)
-            .unwrap();
-        let output_atom = output.atom_id().unwrap();
-        drop(output);
-        drop(context);
+        // Without a requested sharding, `reduce_sum` is an ordinary sum reduction.
+        let input = Array::from_elements::<f64>(input_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(input.reduce_sum(&[0], None), input.reduce(&[0], ReductionKind::Sum));
 
-        let program = Rc::try_unwrap(builder)
-            .expect("staging should not retain the builder")
-            .into_inner()
-            .build::<Vec<Array>, Vec<Array>>(vec![output_atom], vec![Placeholder], vec![Placeholder])
+        // A requested sharding is carried through the staged `ReduceOperation` into the built program.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output = context.input(input_type).reduce_sum(&[0], Some(unreduced)).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            program
-                .instructions()
-                .iter()
-                .filter_map(|instruction| match instruction.operation() {
-                    ArrayOperation::Reduce(operation) => Some(operation.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            vec![ReduceOperation::new(vec![0], ReductionKind::Sum).with_output_sharding(unreduced.clone()).unwrap()],
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] .
+                let %1:f64[3][sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}}] = reduce [
+                    kind=sum,
+                    axes=[0],
+                    output_sharding={mesh<['x'=2:explicit]>, [{}], unreduced={'x'}},
+                ] %0
+                in (%1)"
+            },
         );
     }
 
     #[test]
-    fn test_reduce_with_output_sharding_rejects_non_sum_reductions() {
-        // Staging a reduction with a requested output sharding constructs the operation, so a non-sum reduction is
-        // rejected before anything is staged.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input_atom = context.builder().borrow_mut().add_input(ArrayType::new_static(DataType::F64, [2]));
-        assert_eq!(
-            context.tracer(input_atom, None).reduce_with_output_sharding(
-                &[],
-                ReductionKind::LogSumExp,
-                &Sharding::replicated(mesh, 1),
-            ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`reduce` with kind `log_sum_exp` does not support a requested output sharding (only kind `sum` does)",
-            ))),
-        );
-        assert!(context.builder().borrow().instructions().is_empty());
-    }
-
-    #[test]
-    fn test_reduce_with_output_sharding_validates_concrete_arrays() {
+    fn test_reduce_reduce_sum_validates_concrete_arrays() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let input_type = ArrayType::new_static(DataType::F64, [2, 3])
             .with_sharding(
@@ -2727,22 +2706,11 @@ mod tests {
             .with_unreduced_axes(["x"])
             .unwrap();
 
-        // A valid request computes the same output as the unsharded reduction, because a concrete array lives on a
-        // single device.
+        // A valid request computes the same output as an unsharded sum, because a concrete array lives on a single
+        // device, while an invalid request is rejected just like it is for staged sums.
+        assert_eq!(input.reduce_sum(&[0], Some(unreduced)), input.reduce(&[0], ReductionKind::Sum));
         assert_eq!(
-            input.reduce_with_output_sharding(&[0], ReductionKind::Sum, &unreduced),
-            input.reduce(&[0], ReductionKind::Sum),
-        );
-
-        // Invalid requests are rejected just like they are for staged reductions.
-        assert_eq!(
-            input.reduce_with_output_sharding(&[0], ReductionKind::Max, &unreduced),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`reduce` with kind `max` does not support a requested output sharding (only kind `sum` does)",
-            ))),
-        );
-        assert_eq!(
-            input.reduce_with_output_sharding(&[0], ReductionKind::Sum, &Sharding::replicated(mesh, 2)),
+            input.reduce_sum(&[0], Some(Sharding::replicated(mesh, 2))),
             Err(ProgramError::Type(TypeError::invalid(
                 "`reduce` output sharding rank (2) does not match the output rank (1)",
             ))),
@@ -2750,63 +2718,74 @@ mod tests {
     }
 
     #[test]
-    fn test_log_sum_exp() {
+    fn test_reduce_reduce_mean() {
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(matrix.reduce_mean(&[1]), Ok(Array::vector(vec![2.0, 5.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_reduce_reduce_log_sum_exp() {
         // The expected values below spell out the guarded construction the primitive documents (shift by the safe
         // maximum, sum the exponentials, take the logarithm, add the shift back) so that they pin that construction
         // rather than an equivalent-in-exact-arithmetic alternative.
         let values = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         let expected = ((1.0f64 - 3.0).exp() + (2.0f64 - 3.0).exp() + 1.0).ln() + 3.0;
-        assert_eq!(values.log_sum_exp(&[0]), Ok(Array::scalar(expected).unwrap()));
+        assert_eq!(values.reduce_log_sum_exp(&[0]), Ok(Array::scalar(expected).unwrap()));
 
         // Reducing along no axes is the identity, matching `log(exp(x)) = x`, but only for the inputs the staged
         // operation accepts: the shortcut still validates the element data type.
-        assert_eq!(values.log_sum_exp(&[]), Ok(values.clone()));
+        assert_eq!(values.reduce_log_sum_exp(&[]), Ok(values.clone()));
 
         // Equal inputs keep both shifted exponentials at one even when the naive composition would overflow.
         assert_eq!(
-            Array::vector(vec![0.0, 0.0]).unwrap().log_sum_exp(&[0]),
+            Array::vector(vec![0.0, 0.0]).unwrap().reduce_log_sum_exp(&[0]),
             Ok(Array::scalar(std::f64::consts::LN_2).unwrap()),
         );
         assert_eq!(
-            Array::vector(vec![1000.0, 1000.0]).unwrap().log_sum_exp(&[0]),
+            Array::vector(vec![1000.0, 1000.0]).unwrap().reduce_log_sum_exp(&[0]),
             Ok(Array::scalar(1000.0 + std::f64::consts::LN_2).unwrap()),
         );
 
         // The guard's reason to exist: an all-`-∞` slice and an empty reduction both pin to `-∞` (`log(0) + 0`)
         // instead of the `-∞ - -∞ = NaN` that shifting by the raw maximum would produce.
         assert_eq!(
-            Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY]).unwrap().log_sum_exp(&[0]),
+            Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY]).unwrap().reduce_log_sum_exp(&[0]),
             Ok(Array::scalar(f64::NEG_INFINITY).unwrap()),
         );
         assert_eq!(
-            Array::new(ArrayType::new_static(DataType::F64, [0]), Vec::new()).unwrap().log_sum_exp(&[0]),
+            Array::new(ArrayType::new_static(DataType::F64, [0]), Vec::new()).unwrap().reduce_log_sum_exp(&[0]),
             Ok(Array::scalar(f64::NEG_INFINITY).unwrap()),
         );
 
         // A `+∞` element saturates the output, and NaN propagates.
         assert_eq!(
-            Array::vector(vec![1.0, f64::INFINITY]).unwrap().log_sum_exp(&[0]),
+            Array::vector(vec![1.0, f64::INFINITY]).unwrap().reduce_log_sum_exp(&[0]),
             Ok(Array::scalar(f64::INFINITY).unwrap()),
         );
         assert!(
-            Array::vector(vec![1.0, f64::NAN]).unwrap().log_sum_exp(&[0]).unwrap().elements::<f64>().unwrap()[0]
+            Array::vector(vec![1.0, f64::NAN])
+                .unwrap()
+                .reduce_log_sum_exp(&[0])
+                .unwrap()
+                .elements::<f64>()
+                .unwrap()[0]
                 .is_nan(),
         );
 
         // Reducing one axis of a matrix leaves the other, in order.
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
-            matrix.log_sum_exp(&[1]),
+            matrix.reduce_log_sum_exp(&[1]),
             Ok(Array::vector(vec![expected, ((-2.0f64).exp() + (-1.0f64).exp() + 1.0).ln() + 6.0]).unwrap()),
         );
 
         // Validation errors are reported rather than panicking.
         assert_eq!(
-            values.log_sum_exp(&[1]),
+            values.reduce_log_sum_exp(&[1]),
             Err(ProgramError::Type(TypeError::invalid("`reduce` axis 1 is out of bounds for rank 1".to_string()))),
         );
         assert_eq!(
-            Array::vector(vec![1i32, 2]).unwrap().log_sum_exp(&[0]),
+            Array::vector(vec![1i32, 2]).unwrap().reduce_log_sum_exp(&[0]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`reduce` with kind `log_sum_exp` requires real floating-point inputs but got `i32`".to_string(),
             ))),
@@ -2814,13 +2793,13 @@ mod tests {
     }
 
     #[test]
-    fn test_log_sum_exp_half_precision_accumulation() {
+    fn test_reduce_reduce_log_sum_exp_half_precision_accumulation() {
         let zeros = Array::vector(vec![f16::ZERO; 4096]).unwrap();
-        assert_eq!(zeros.log_sum_exp(&[0]).unwrap().elements::<f16>(), Ok(vec![f16::from_f32(8.3203125)]));
+        assert_eq!(zeros.reduce_log_sum_exp(&[0]).unwrap().elements::<f16>(), Ok(vec![f16::from_f32(8.3203125)]));
     }
 
     #[test]
-    fn test_log_sum_exp_empty_axes() {
+    fn test_reduce_reduce_log_sum_exp_empty_axes() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         for input in [
             Array::vector(vec![1i32, 2]).unwrap(),
@@ -2831,7 +2810,7 @@ mod tests {
                 input.r#type().data_type(),
             ))));
             assert_eq!(input.reduce(&[], ReductionKind::LogSumExp), expected);
-            assert_eq!(input.log_sum_exp(&[]), expected);
+            assert_eq!(input.reduce_log_sum_exp(&[]), expected);
             let input_atom = context.builder().borrow_mut().add_input(input.r#type().into_owned());
             let input = context.tracer(input_atom, None);
             let expected = Err(ProgramError::Type(TypeError::invalid(format!(
@@ -2839,8 +2818,32 @@ mod tests {
                 input.r#type().data_type(),
             ))));
             assert_eq!(input.reduce(&[], ReductionKind::LogSumExp), expected);
-            assert_eq!(input.log_sum_exp(&[]), expected);
+            assert_eq!(input.reduce_log_sum_exp(&[]), expected);
         }
+    }
+
+    #[test]
+    fn test_reduce_reduce_max() {
+        let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0]).unwrap();
+        assert_eq!(matrix.reduce_max(&[0]), Ok(Array::vector(vec![4.0, 5.0, 6.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_reduce_reduce_min() {
+        let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0]).unwrap();
+        assert_eq!(matrix.reduce_min(&[0]), Ok(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_reduce_reduce_any() {
+        let matrix = Array::matrix(2, 3, vec![false, true, false, false, false, false]).unwrap();
+        assert_eq!(matrix.reduce_any(&[1]), Ok(Array::vector(vec![true, false]).unwrap()));
+    }
+
+    #[test]
+    fn test_reduce_reduce_all() {
+        let matrix = Array::matrix(2, 3, vec![true, true, true, true, false, true]).unwrap();
+        assert_eq!(matrix.reduce_all(&[1]), Ok(Array::vector(vec![true, false]).unwrap()));
     }
 
     #[test]
