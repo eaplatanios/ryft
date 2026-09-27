@@ -153,54 +153,55 @@ impl Display for ReductionKind {
 /// axes; non-reduced axes keep their relative order.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReduceOperation {
-    /// Axes to reduce. Refer to the documentation of [`Self::axes`].
+    /// Refer to the documentation of [`Self::axes`].
     axes: Vec<usize>,
 
-    /// Kind of reduction. Refer to the documentation of [`Self::kind`].
+    /// Refer to the documentation of [`Self::kind`].
     kind: ReductionKind,
 
-    /// Optional requested output [`Sharding`]. Refer to the documentation of [`Self::with_output_sharding`].
+    /// Refer to the documentation of [`Self::with_output_sharding`].
     output_sharding: Option<Sharding>,
 }
 
 // TODO(eaplatanios): Review from here onwards.
 
 impl ReduceOperation {
-    /// Creates a new [`ReduceOperation`] reducing along `axes` with the supplied `kind`. The input
-    /// shape is not part of the operation payload: it is recoverable from the staged input types
-    /// wherever a rule needs it.
+    /// Creates a new [`ReduceOperation`] reducing along `axes` with the supplied `kind`. The input shape is not part
+    /// of the operation payload. Instead, it is recoverable from the staged input types wherever a rule needs it.
     #[inline]
     pub fn new(axes: Vec<usize>, kind: ReductionKind) -> Self {
         Self { axes, kind, output_sharding: None }
     }
 
-    /// Returns the axes reduced by this operation.
-    #[inline]
-    pub fn axes(&self) -> &[usize] {
-        self.axes.as_slice()
-    }
-
-    /// Returns the kind of reduction.
-    #[inline]
-    pub fn kind(&self) -> ReductionKind {
-        self.kind
-    }
-
-    /// Returns the requested output sharding, if any.
-    #[inline]
-    pub fn output_sharding(&self) -> Option<&Sharding> {
-        self.output_sharding.as_ref()
-    }
-
-    /// Requests the output placement of a [`ReductionKind::Sum`]; other reduction kinds reject this attribute.
+    /// Returns this [`ReduceOperation`] with the requested output sharding. This is only supported for
+    /// [`ReductionKind::Sum`] reductions. Other reduction kinds reject this attribute at type checking time (i.e., this
+    /// function will still return successfully).
     /// The request must match the output rank and input mesh and cannot reference automatic mesh axes. Requested
     /// unreduced axes defer cross-device sums and must be explicit axes that shard a reduced dimension or are already
     /// unreduced on the input. Reduced axes cannot be requested: inference preserves the input's reduced state and
     /// manual variation independently of placement. An explicit manual-variation request must match the input.
     #[inline]
-    pub fn with_output_sharding(mut self, output_sharding: impl Into<Option<Sharding>>) -> Self {
+    pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.output_sharding = output_sharding.into();
         self
+    }
+
+    /// Returns the axes reduced by this [`ReduceOperation`].
+    #[inline]
+    pub fn axes(&self) -> &[usize] {
+        self.axes.as_slice()
+    }
+
+    /// Returns the kind of reduction used by this [`ReduceOperation`].
+    #[inline]
+    pub fn kind(&self) -> ReductionKind {
+        self.kind
+    }
+
+    /// Returns the requested output sharding, if any, for this [`ReduceOperation`].
+    #[inline]
+    pub fn output_sharding(&self) -> Option<&Sharding> {
+        self.output_sharding.as_ref()
     }
 }
 
