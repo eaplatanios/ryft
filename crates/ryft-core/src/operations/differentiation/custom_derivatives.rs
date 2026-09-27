@@ -609,6 +609,111 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_derivative_retained_callback_after_un_projection() {
+        /// Array-member payload retaining a callback declared in the canonical composite tracing universe.
+        #[derive(Clone, Debug)]
+        struct RetainedMemberSlice(Arc<RetainedRuleDefinition>);
+
+        impl Operation for RetainedMemberSlice {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "retained_member_slice"
+            }
+
+            fn infer_output_types(
+                &self,
+                inputs: &[ArrayType],
+                regions: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                SliceOperation::new(vec![1], vec![2]).infer_output_types(inputs, regions)
+            }
+        }
+
+        impl From<RetainedMemberSlice> for RetainedRuleOperation {
+            fn from(operation: RetainedMemberSlice) -> Self {
+                Self::Slice { definition: operation.0, cached: true }
+            }
+        }
+
+        let trace_count = Arc::new(AtomicUsize::new(0));
+        let definition = Arc::new(RetainedRuleDefinition {
+            label: "converted_slice_at_one",
+            callback: Arc::new({
+                let trace_count = trace_count.clone();
+                move |context, inputs, outputs, accumulators| {
+                    trace_count.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        inputs[0].r#type().as_ref(),
+                        &ArrayIrType::Array(ArrayType::new_static(DataType::F64, [4])),
+                    );
+                    let MaybeZero::Value(seed) = &outputs[0] else { unreachable!() };
+                    let reference = accumulators[0].reference(context)?.unwrap();
+                    let operation =
+                        ReferenceAddUpdateOperation::new().with_transforms(vec![ArrayReferenceTransform::Slice {
+                            axes: vec![ArraySliceAxis::new(1, 1, 1)],
+                        }]);
+                    context.bind(
+                        RetainedRuleOperation::Base(operation.into()),
+                        Vec::new(),
+                        &[reference, seed.clone()],
+                    )?;
+                    Ok(())
+                }
+            }),
+            cache: SpecializationCache::new(8),
+        });
+        let retained = Arc::downgrade(&definition);
+        let mut builder = ProgramBuilder::<Array, RetainedMemberSlice>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F64, [4]));
+        let output = builder
+            .add_instruction(RetainedMemberSlice(definition.clone()), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let member =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(trace_count.load(Ordering::SeqCst), 0);
+
+        // This canonical conversion changes the stored value and type families as well as the operation payload.
+        // It carries an already composite-typed callback; it does not make a Rust closure domain-polymorphic.
+        let converted = member.into_unprojected::<ArrayIrValue<Array>, RetainedRuleOperation>().unwrap();
+        let RetainedRuleOperation::Slice { definition: converted_definition, .. } =
+            converted.instructions()[0].operation()
+        else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(&definition, converted_definition));
+        assert_eq!(trace_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            converted.interpret(vec![Array::vector(vec![2.0f64, 4.0, 6.0, 8.0]).unwrap().into()]),
+            Ok(vec![Array::vector(vec![4.0f64]).unwrap().into()]),
+        );
+        assert_eq!(trace_count.load(Ordering::SeqCst), 0);
+        drop(definition);
+
+        let buffered = converted.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        assert_eq!(trace_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            buffered.to_string(),
+            indoc! {"
+                lambda %0:f64[1], %1:ref<f64[4]> .
+                let () = reference_add_update [transforms=[slice(axes=[1:2])]] %1 %0
+                in ()
+            "}
+            .trim_end(),
+        );
+        let seed = ArrayIrValue::Array(Array::vector(vec![3.0f64]).unwrap());
+        let buffer = ArrayReference::new(Array::vector(vec![10.0f64, 20.0, 30.0, 40.0]).unwrap());
+        assert_eq!(buffered.interpret(vec![seed, buffer.clone().into()]), Ok(vec![]));
+        assert_eq!(buffer.read(), Ok(Array::vector(vec![10.0f64, 23.0, 30.0, 40.0]).unwrap()));
+        let repeated =
+            converted.clone().transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        assert_eq!(repeated.to_string(), buffered.to_string());
+        assert_eq!(trace_count.load(Ordering::SeqCst), 1);
+        drop(converted);
+        assert!(retained.upgrade().is_none());
+    }
+
+    #[test]
     fn test_custom_derivative_builder_with_non_differentiated_count() {
         // The leading counter is plumbing for a custom JVP rule: it reaches both closures at its usual position
         // and the rule leaves the tangent placeholder of the counter unused.
