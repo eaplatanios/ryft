@@ -1011,7 +1011,65 @@ impl Reduce for Array {
         match kind {
             ReductionKind::LogSumExp => {
                 dispatch_on_array_element_type!(@float data_type, |Element| {
-                    self.log_sum_exp_elements::<Element>(output_type, axes)
+                    // Compute `log(sum(exp(input)))` by subtracting the maximum of each reduced slice before
+                    // exponentiating. Non-finite maxima are replaced by zero, so that NaNs and infinities propagate
+                    // through the exponentials instead of producing `-∞ - -∞ = NaN` for all-`-∞` or empty slices.
+                    // Narrow inputs were already widened above, but reassociation in other backends can still
+                    // change the final rounding.
+                    let zero = Element::zero()?;
+                    let mut maximums = self.reduce_elements::<Element>(
+                        output_type.clone(),
+                        axes,
+                        Element::max_identity(),
+                        |left, right| Ok(ArrayElement::max(&left, &right)),
+                    )?;
+                    maximums.map_elements_in_place::<Element>(|value| {
+                        Ok(if value.convert_to::<f64>()?.is_finite() { value } else { zero })
+                    })?;
+
+                    // Accumulate the shifted exponentials of every input element into the output element that its
+                    // non-reduced coordinates address, starting each sum from zero. Primitive floating-point types
+                    // have inherent `exp` and `log` functions that shadow the fallible element functions, and so we
+                    // call the latter through `FloatingPointArrayElement` explicitly.
+                    let input_shape = self.r#type().static_shape().unwrap();
+                    let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+                    let output_addressing = ArrayAddressing::new(output_type.clone())?;
+                    let mut reduce_mask = vec![false; input_shape.rank()];
+                    axes.iter().for_each(|axis| reduce_mask[*axis] = true);
+                    let mut bytes = vec![0; output_addressing.storage_byte_len()];
+                    for output in 0..output_addressing.element_count() {
+                        zero.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output)]);
+                    }
+                    let mut input_index = vec![0usize; input_shape.rank()];
+                    let mut output_index = vec![0usize; output_type.rank()];
+                    for _ in 0..input_addressing.element_count() {
+                        let mut output_axis = 0usize;
+                        for axis in 0..input_shape.rank() {
+                            if !reduce_mask[axis] {
+                                output_index[output_axis] = input_index[axis];
+                                output_axis += 1;
+                            }
+                        }
+                        let input_range = input_addressing.byte_range_unchecked(&input_index);
+                        let input_value = Element::decode(&self.storage_bytes()[input_range]);
+                        let output_range = output_addressing.byte_range_unchecked(&output_index);
+                        let maximum = Element::decode(&maximums.storage_bytes()[output_range.clone()]);
+                        let shifted = FloatingPointArrayElement::exp(input_value.sub(maximum)?)?;
+                        let sum = Element::decode(&bytes[output_range.clone()]).add(shifted)?;
+                        sum.encode(&mut bytes[output_range]);
+                        input_addressing.advance_index(&mut input_index);
+                    }
+
+                    // Take the logarithm of each sum and add its maximum back.
+                    for output in 0..output_addressing.element_count() {
+                        let range = output_addressing.byte_range_for_flat_index(output);
+                        let maximum = Element::decode(&maximums.storage_bytes()[range.clone()]);
+                        let sum = Element::decode(&bytes[range.clone()]);
+                        let value = FloatingPointArrayElement::log(sum)?.add(maximum)?;
+                        value.encode(&mut bytes[range]);
+                    }
+
+                    Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
                 })
             }
             ReductionKind::Sum | ReductionKind::Mean => {
@@ -1494,65 +1552,6 @@ where
     let mut outputs = context.bind(operation, Vec::new(), inputs)?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
-}
-
-impl Array {
-    /// Computes `log(sum(exp(input)))` by subtracting a finite maximum before exponentiating. Nonfinite maxima
-    /// are replaced by zero so NaNs and infinities propagate through the exponentials. Narrow inputs are widened
-    /// by the caller; backend reassociation can still change the final rounding.
-    fn log_sum_exp_elements<T: FloatingPointArrayElement>(
-        &self,
-        output_type: ArrayType,
-        axes: &[usize],
-    ) -> Result<Self, ProgramError> {
-        debug_assert_eq!(self.r#type().data_type(), T::data_type());
-        debug_assert_eq!(output_type.data_type(), T::data_type());
-        let zero = T::zero()?;
-        let mut maximums = self.reduce_elements::<T>(output_type.clone(), axes, T::max_identity(), |left, right| {
-            Ok(ArrayElement::max(&left, &right))
-        })?;
-        maximums.map_elements_in_place::<T>(|value| {
-            Ok(if value.convert_to::<f64>()?.is_finite() { value } else { zero })
-        })?;
-
-        let input_shape = self.r#type().static_shape().unwrap();
-        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-        let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let mut reduce_mask = vec![false; input_shape.rank()];
-        axes.iter().for_each(|axis| reduce_mask[*axis] = true);
-
-        let mut bytes = vec![0; output_addressing.storage_byte_len()];
-        for output in 0..output_addressing.element_count() {
-            zero.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output)]);
-        }
-
-        let mut input_index = vec![0usize; input_shape.rank()];
-        let mut output_index = vec![0usize; output_type.rank()];
-        for _ in 0..input_addressing.element_count() {
-            let mut output_axis = 0usize;
-            for axis in 0..input_shape.rank() {
-                if !reduce_mask[axis] {
-                    output_index[output_axis] = input_index[axis];
-                    output_axis += 1;
-                }
-            }
-            let input_value = T::decode(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
-            let output_range = output_addressing.byte_range_unchecked(&output_index);
-            let maximum = T::decode(&maximums.storage_bytes()[output_range.clone()]);
-            let shifted = input_value.sub(maximum)?.exp()?;
-            let sum = T::decode(&bytes[output_range.clone()]).add(shifted)?;
-            sum.encode(&mut bytes[output_range]);
-            input_addressing.advance_index(&mut input_index);
-        }
-
-        for output in 0..output_addressing.element_count() {
-            let range = output_addressing.byte_range_for_flat_index(output);
-            let maximum = T::decode(&maximums.storage_bytes()[range.clone()]);
-            let value = T::decode(&bytes[range.clone()]).log()?.add(maximum)?;
-            value.encode(&mut bytes[range]);
-        }
-        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
-    }
 }
 
 #[cfg(test)]
