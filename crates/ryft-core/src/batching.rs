@@ -96,7 +96,7 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::programs::{
     BindingRegionDriver, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, Provenance,
     ProvenanceScope, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceIdentity,
-    RegionDriver, RegionRef, Type, TypeError, Typed, Value, ValueProjection,
+    RegionDriver, RegionRef, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -329,6 +329,75 @@ impl From<usize> for BatchAxisSpecification {
     #[inline]
     fn from(extent: usize) -> Self {
         Self::with_extent(extent)
+    }
+}
+
+/// Extent of the batch axis introduced at a [`BatchingLevel`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BatchingLevelExtent<T> {
+    /// Host extent that was fixed when the level was created (e.g., by a homogeneous array policy).
+    Static(usize),
+
+    /// First-class extent value of the provided type. Its runtime value is not part of the level and is instead
+    /// supplied as a leading boundary operand. Refer to the documentation of [`BatchingPolicy::boundary_operands`]
+    /// for more information on dynamic batching extents.
+    Dynamic(T),
+}
+
+/// Description of one batching level (i.e., everything that a [`RecursiveBatchingPolicy`] needs to structurally batch a
+/// nested [`Program`] at that level, without a live [`BatchingContext`]). An operation whose nested programs are traced
+/// only after the operation itself was batched records the level through [`BatchingDriver::batching_level`] and later
+/// batches those programs with [`RecursiveBatchingPolicy::batch_program_at_level`]. A level never contains a runtime
+/// value: first-class extents contribute only their type, and their value reaches batched programs as the leading
+/// boundary operand that [`BatchingPolicy::boundary_operands`] supplies to every consumer of that policy's batched
+/// programs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BatchingLevel<T> {
+    /// Extent of the batch axis introduced at this level.
+    extent: BatchingLevelExtent<T>,
+
+    /// Name that operations (e.g., collectives) can use to refer to the batch axis, or [`None`] for an anonymous axis.
+    axis_name: Option<String>,
+
+    /// Sharding placement assigned to every newly materialized batch axis.
+    axis_sharding: ShardingDimension,
+}
+
+impl<T> BatchingLevel<T> {
+    /// Creates a new [`BatchingLevel`].
+    #[inline]
+    pub fn new(extent: BatchingLevelExtent<T>, axis_name: Option<String>, axis_sharding: ShardingDimension) -> Self {
+        Self { extent, axis_name, axis_sharding }
+    }
+
+    /// Returns the extent of the batch axis introduced at this [`BatchingLevel`].
+    #[inline]
+    pub fn extent(&self) -> &BatchingLevelExtent<T> {
+        &self.extent
+    }
+
+    /// Returns the name of the batch axis introduced at this [`BatchingLevel`], or [`None`] for an anonymous axis.
+    #[inline]
+    pub fn axis_name(&self) -> Option<&str> {
+        self.axis_name.as_deref()
+    }
+
+    /// Returns the sharding placement assigned to every newly materialized batch axis.
+    #[inline]
+    pub fn axis_sharding(&self) -> &ShardingDimension {
+        &self.axis_sharding
+    }
+}
+
+impl<T: Type> BatchingLevel<T> {
+    /// Returns this [`BatchingLevel`] after simultaneously renaming the type identities of its first-class extent
+    /// type, as specified by the provided [`TypeIdentityRenaming`].
+    pub fn rename_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        let extent = match &self.extent {
+            BatchingLevelExtent::Static(extent) => BatchingLevelExtent::Static(*extent),
+            BatchingLevelExtent::Dynamic(r#type) => BatchingLevelExtent::Dynamic(r#type.rename_identities(renaming)?),
+        };
+        Ok(Self { extent, axis_name: self.axis_name.clone(), axis_sharding: self.axis_sharding.clone() })
     }
 }
 
@@ -775,6 +844,9 @@ where
 /// are neutral with respect to the underlying value kind (each policy owns the mechanics required to replay its
 /// own [`Operation`] universe).
 pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
+    /// Returns the context-neutral [`BatchingLevel`] that `context` introduces.
+    fn batching_level(context: &BatchingContext<C, Self>) -> BatchingLevel<C::Type>;
+
     /// Replays `region` through the provided [`BatchingContext`].
     fn batch_region(
         context: &BatchingContext<C, Self>,
@@ -782,13 +854,36 @@ pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
         inputs: Vec<Self::Batch>,
     ) -> Result<Vec<Self::Batch>, BatchingError>;
 
-    /// Structurally batches `region` and returns the resulting transformed [`BatchedProgram`].
+    /// Structurally batches `region` at the provided [`BatchingLevel`] and returns the resulting transformed
+    /// [`BatchedProgram`]. This is the complete structural batching transform: it depends on no live
+    /// [`BatchingContext`], so it can batch a program that is traced long after the level was recorded (e.g., a
+    /// custom derivative rule that is traced lazily when a batched call is first differentiated). A level whose
+    /// extent representation this policy does not support is rejected with [`BatchingError::UnsupportedOperation`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `level`: [`BatchingLevel`] at which to batch `region`, normally obtained from [`Self::batching_level`].
+    ///   - `region`: Region to batch.
+    ///   - `input_axes`: [`BatchAxis`] for each input of `region`.
+    ///   - `output_axes_policy`: [`ProgramBatchingOutputAxesPolicy`] for packaging the batched program outputs.
+    fn batch_program_at_level(
+        level: &BatchingLevel<C::Type>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<Self::BatchedProgram, BatchingError>;
+
+    /// Structurally batches `region` at the level that `context` introduces and returns the resulting transformed
+    /// [`BatchedProgram`]. This composes [`Self::batching_level`] with [`Self::batch_program_at_level`].
+    #[inline]
     fn batch_program(
         context: &BatchingContext<C, Self>,
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<Self::BatchedProgram, BatchingError>;
+    ) -> Result<Self::BatchedProgram, BatchingError> {
+        Self::batch_program_at_level(&Self::batching_level(context), region, input_axes, output_axes_policy)
+    }
 
     /// Restores the batch carrier for a value returned across an opaque batched-region boundary, which erases carrier
     /// metadata because transform state cannot ride on program values. The carrier is rebuilt from the two sources that
@@ -896,6 +991,20 @@ pub trait BatchingEntrypointPolicy<C: Context>: BatchingPolicy<C> {
 /// operation rule. [`RegionDriver`] provides its structural region access, while this trait adds batching-specific
 /// recursion. Region-free applications expose a region count of zero through the same contract.
 pub trait BatchingDriver<C: Context, P: BatchingPolicy<C>>: RegionDriver<C::Constant, C::Operation> {
+    /// Returns the context-neutral [`BatchingLevel`] that `context` introduces. Recursive drivers delegate to
+    /// [`RecursiveBatchingPolicy::batching_level`], which is how a region-carrying rule written against the
+    /// policy-neutral [`BatchingPolicy`] contract records a level for nested programs that it traces later, without
+    /// bounding itself by [`RecursiveBatchingPolicy`] (a bound that would cycle with the policy's own operation
+    /// requirements). The default rejects the request, because a driver without recursive access to a policy cannot
+    /// batch nested programs at arbitrary levels.
+    #[inline]
+    fn batching_level(&self, context: &BatchingContext<C, P>) -> Result<BatchingLevel<C::Type>, BatchingError> {
+        let _ = context;
+        Err(BatchingError::UnsupportedOperation {
+            message: "this batching driver cannot batch nested programs".to_string(),
+        })
+    }
+
     /// Batches the region at `index` over the provided batched values by re-entering the active batching transform.
     fn batch_region(
         &self,
@@ -1050,6 +1159,11 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, D: RegionDriver<V, O>>
 impl<C: Context, P: RecursiveBatchingPolicy<C>, D: RegionDriver<C::Constant, C::Operation>> BatchingDriver<C, P>
     for RecursiveBatchingDriver<'_, D>
 {
+    #[inline]
+    fn batching_level(&self, context: &BatchingContext<C, P>) -> Result<BatchingLevel<C::Type>, BatchingError> {
+        Ok(P::batching_level(context))
+    }
+
     #[inline]
     fn batch_region(
         &self,
@@ -2687,6 +2801,14 @@ mod tests {
         }
 
         impl<C: Context<Type = ArrayType>> RecursiveBatchingPolicy<C> for EvidenceBatching {
+            fn batching_level(context: &BatchingContext<C, Self>) -> BatchingLevel<ArrayType> {
+                BatchingLevel::new(
+                    BatchingLevelExtent::Static(*context.axis_extent()),
+                    context.axis_name().map(str::to_string),
+                    context.axis_sharding().clone(),
+                )
+            }
+
             fn batch_region(
                 _context: &BatchingContext<C, Self>,
                 _region: RegionRef<'_, C::Constant, C::Operation>,
@@ -2695,8 +2817,8 @@ mod tests {
                 Err(BatchingError::UnsupportedOperation { message: "the evidence fixture has no regions".to_string() })
             }
 
-            fn batch_program(
-                _context: &BatchingContext<C, Self>,
+            fn batch_program_at_level(
+                _level: &BatchingLevel<ArrayType>,
                 _region: RegionRef<'_, C::Constant, C::Operation>,
                 _input_axes: &[BatchAxis],
                 _output_axes_policy: ProgramBatchingOutputAxesPolicy,
