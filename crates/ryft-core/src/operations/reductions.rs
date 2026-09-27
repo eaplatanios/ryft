@@ -1018,7 +1018,7 @@ impl Reduce for Array {
                     // change the final rounding.
                     let zero = Element::zero()?;
                     let maximums = self
-                        .reduce_elements::<Element>(
+                        .reduce_elements(
                             output_type.clone(),
                             axes,
                             Element::max_identity(),
@@ -1078,7 +1078,7 @@ impl Reduce for Array {
                     // A mean is a sum divided by the reduced element count. Integer arithmetic wraps in the element
                     // type, and so an empty integer mean divides by one to retain its zero sum, while empty
                     // floating-point and complex means divide by zero and produce NaNs.
-                    let sum = self.reduce_elements::<Element>(
+                    let sum = self.reduce_elements(
                         output_type.clone(),
                         axes,
                         Element::zero()?,
@@ -1098,7 +1098,7 @@ impl Reduce for Array {
                 dispatch_on_array_element_type!(data_type, |Element| {
                     let identity =
                         if kind == ReductionKind::Max { Element::max_identity() } else { Element::min_identity() };
-                    self.reduce_elements::<Element>(output_type, axes, identity, |left, right| {
+                    self.reduce_elements(output_type, axes, identity, |left, right| {
                         Ok(if kind == ReductionKind::Max {
                             ArrayElement::max(&left, &right)
                         } else {
@@ -1107,10 +1107,8 @@ impl Reduce for Array {
                     })
                 })
             }
-            ReductionKind::Any => {
-                self.reduce_elements::<bool>(output_type, axes, false, |left, right| Ok(left | right))
-            }
-            ReductionKind::All => self.reduce_elements::<bool>(output_type, axes, true, |left, right| Ok(left & right)),
+            ReductionKind::Any => self.reduce_elements(output_type, axes, false, |left, right| Ok(left | right)),
+            ReductionKind::All => self.reduce_elements(output_type, axes, true, |left, right| Ok(left & right)),
         }
     }
 
@@ -1167,17 +1165,15 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Array {
-    /// Reduces typed elements directly from addressed input storage into one addressed output buffer. `identity`
-    /// initializes every output cell, including those whose reduced axes are empty.
-    fn reduce_elements<T: ArrayElement>(
+    /// Reduces typed elements directly from addressed input storage into one addressed output buffer.
+    /// `identity` initializes every output cell, including those whose reduced axes are empty.
+    fn reduce_elements<T: ArrayElement, F: Fn(T, T) -> Result<T, ProgramError>>(
         &self,
         output_type: ArrayType,
         axes: &[usize],
         identity: T,
-        combine: impl Fn(T, T) -> Result<T, ProgramError>,
+        reduce_fn: F,
     ) -> Result<Self, ProgramError> {
         debug_assert_eq!(self.r#type().data_type(), T::data_type());
         debug_assert_eq!(output_type.data_type(), T::data_type());
@@ -1186,12 +1182,10 @@ impl Array {
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let mut reduce_mask = vec![false; input_shape.rank()];
         axes.iter().for_each(|axis| reduce_mask[*axis] = true);
-
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         for output in 0..output_addressing.element_count() {
             identity.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output)]);
         }
-
         let mut input_index = vec![0usize; input_shape.rank()];
         let mut output_index = vec![0usize; output_type.rank()];
         for _ in 0..input_addressing.element_count() {
@@ -1204,13 +1198,15 @@ impl Array {
             }
             let input_value = T::decode(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
             let output_range = output_addressing.byte_range_unchecked(&output_index);
-            let value = combine(T::decode(&bytes[output_range.clone()]), input_value)?;
+            let value = reduce_fn(T::decode(&bytes[output_range.clone()]), input_value)?;
             value.encode(&mut bytes[output_range]);
             input_addressing.advance_index(&mut input_index);
         }
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own because a
 /// mean lowers to a sum followed by a division by the reduced element count.
