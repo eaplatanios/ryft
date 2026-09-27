@@ -6325,8 +6325,8 @@ mod tests {
         // batching rule stages exactly one `while` whose condition returns the batched `bool[3]` predicate directly
         // (the relaxed predicate contract, mirroring JAX's `_while_loop_batching_rule`) instead of unrolling (the
         // body's single `sub` appears exactly once in the staged trace) and without building any masking program data
-        // (no `reduce_any` in the staged form; interpretation and lowering own the masked semantics). Batch items
-        // [3, 1, 2] terminate after 3, 1, and 2 iterations, and inactive batch items carry their final state,
+        // (no `reduce` with kind `any` in the staged form; interpretation and lowering own the masked semantics). Batch
+        // items [3, 1, 2] terminate after 3, 1, and 2 iterations, and inactive batch items carry their final state,
         // matching the eager operational path batch item for batch item.
         let (countdown_operation, countdown_regions) = countdown_while_operation();
         let program = batch_while_under_tracing(countdown_operation, countdown_regions, 3);
@@ -6630,8 +6630,8 @@ mod tests {
     fn test_while_batching_stages_plain_loops_for_replicated_predicates_under_tracing() {
         // vmap-under-tracing of a loop whose predicate depends only on a replicated counter: the staged batching
         // rule batches the condition and body at the state batch axes and stages one plain `while` — no mask
-        // machinery (`reduce_any` / per-element `select`) appears in the staged program. Two iterations double the
-        // batched value twice: [1, 2, 3] -> [4, 8, 12], with the replicated counter ending at 0.
+        // machinery (`reduce` with kind `any` / per-element `select`) appears in the staged program. Two iterations
+        // double the batched value twice: [1, 2, 3] -> [4, 8, 12], with the replicated counter ending at 0.
         let parent = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let builder = parent.builder().clone();
         let counter_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));

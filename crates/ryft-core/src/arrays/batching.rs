@@ -1709,7 +1709,11 @@ where
             && input.ragged_axes().iter().any(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
         {
             return Err(BatchingError::UnsupportedOperation {
-                message: format!("ragged reduction kind {kind} is not supported; use reduce_sum"),
+                message: format!(
+                    "ragged reduction kind `{}` is not supported; use kind `{}`",
+                    kind,
+                    ReductionKind::Sum,
+                ),
             });
         }
         Self::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::Zero)
@@ -5314,7 +5318,7 @@ mod tests {
         assert_eq!(
             DynamicArrayExtentBatchingPolicy::mask_reduction_input(&context, &input, &[1], ReductionKind::Max),
             Err(BatchingError::UnsupportedOperation {
-                message: "ragged reduction kind max is not supported; use reduce_sum".to_string(),
+                message: "ragged reduction kind `max` is not supported; use kind `sum`".to_string(),
             }),
         );
         assert_eq!(
