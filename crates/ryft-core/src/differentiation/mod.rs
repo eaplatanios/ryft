@@ -71,15 +71,15 @@
 //! # Differentiation Pipeline
 //!
 //! Residuals are runtime values from the chosen linearization point. The reusable programs describe derivative
-//! structure, while each [`Pushforward`] or [`Pullback`] binds that structure to the residual values captured for one
-//! invocation. Refer to [`Linearization`] for a rendered diagram of the complete forward/reverse pipeline.
+//! structure, while each [`Pushforward`] or [`Pullback`] binds that structure to the residual values captured
+//! for one invocation. Refer to [`Linearization`] for a rendered diagram of the complete forward/reverse pipeline.
 //!
 //! # Forward Mode Differentiation
 //!
-//! [`DifferentiationDual`] pairs each primal with a [`MaybeZero`](crate::programs::MaybeZero) tangent, and a
-//! [`DifferentiationTracer`] carries that dual through a [`DifferentiationContext`]. When an operation is bound, its
-//! [`DifferentiableOperation`] rule receives primal and tangent inputs, stages or evaluates the primal operation, and
-//! produces tangent outputs. Symbolic zero tangents avoid materializing unnecessary zero arrays.
+//! [`DifferentiationDual`] pairs each primal with a [`MaybeZero`] tangent, and a [`DifferentiationTracer`] carries that
+//! dual through a [`DifferentiationContext`]. When an operation is bound, its [`DifferentiableOperation`] rule receives
+//! primal and tangent inputs, stages or evaluates the primal operation, and produces tangent outputs. Symbolic zero
+//! tangents avoid materializing unnecessary zero arrays.
 //!
 //! [`DifferentiationBuilder::linearize`] composes differentiation with [`PartialEvaluationContext`]. The primal is
 //! known and the tangent is unknown. Nonlinear primal work is evaluated once, values needed by the tangent computation
@@ -122,8 +122,8 @@
 //! [`DifferentiableType`] may describe a tangent or cotangent space containing only zero. Such leaves remain present
 //! in public primal structures but need no Single Static Assignment (SSA) slots in linear tangent or pullback programs.
 //! Derivative entry points omit those internal slots, preserve their boundary positions as metadata, and reconstruct
-//! typed zeros when rebuilding public results. [`MaybeZero`](crate::MaybeZero) likewise lets operation rules propagate
-//! symbolic zeros without materializing arrays.
+//! typed zeros when rebuilding public results. [`MaybeZero`] likewise lets operation rules propagate symbolic zeros
+//! without materializing arrays.
 //!
 //! # Structural Transform Reuse
 //!
@@ -144,19 +144,20 @@
 //! [`DifferentiableOperation`] for primitive JVP rules. Rules should express tangent behavior through the provided
 //! context and preserve symbolic zeros where possible. Implement [`MemberDifferentiableOperation`] when a homogeneous
 //! member operation needs values from its projection's parent context while constructing its derivative. Ordinary
-//! homogeneous projected rules should use [`jvp_projected_operation`]. Implement [`TransposableOperation`] for linear
-//! primitives that may occur in a homogeneous pushforward. A member payload whose parent instruction has a mixed
-//! signature needs no separate rule, because [`transpose_mixed_operation`] delegates that instruction's member-typed
-//! data operands, wherever they sit in its operand list, to that same homogeneous rule. Higher-order
-//! [`Operation`](crate::Operation) logic belongs with the operation whose instruction attaches to the nested
-//! [`Region`](crate::Region). Wrapper operation enums should provide family dispatch and forward to those
-//! payload rules.
+//! homogeneous projected rules should forward their named hooks through [`jvp_projected_operation`] and
+//! [`jvp_for_transpose_projected_operation`]. The context's [`rule`](DifferentiationContext::rule) identifies the
+//! selection inherited by recursive drivers; explicit hook calls do not change it. Implement [`TransposableOperation`]
+//! for linear primitives that may occur in a homogeneous pushforward. A member payload whose parent instruction has a
+//! mixed signature needs no separate rule, because [`transpose_mixed_operation`] delegates that instruction's
+//! member-typed data operands, wherever they sit in its operand list, to that same homogeneous rule. Higher-order
+//! [`Operation`] logic belongs with the operation whose instruction attaches to the nested [`Region`](crate::Region).
+//! Wrapper operation enums should provide family dispatch and forward to those payload rules.
 
 use std::fmt::{Debug, Display, Formatter};
 
 use thiserror::Error;
 
-use crate::contexts::Context;
+use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::hessian::hessian_in_context;
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
@@ -168,8 +169,9 @@ use crate::operations::{
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    OperationProvider, ProgramError, ReferenceAccessOperation, ReferenceBoundary, ReferenceBoundaryError,
-    ReferenceMemberType, ReferenceTransform, TypeError, Value,
+    EmptyRegionDriver, MaybeZero, Operation, OperationProjection, OperationProvider, ProgramError,
+    ReferenceAccessOperation, ReferenceBoundary, ReferenceBoundaryError, ReferenceMemberType, ReferenceTransform,
+    TypeError, Value, ValueProjection,
 };
 use crate::tracing::TracingContext;
 
@@ -191,7 +193,7 @@ pub use forward::{
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy,
     DifferentiationTracer, ForwardModeDifferentiate, FusedDifferentiationPolicy, Linearization, LinearizationContext,
     LinearizationTracer, MemberDifferentiableOperation, PartitionedDifferentiationPolicy, Pushforward,
-    jvp_projected_operation,
+    jvp_for_transpose_projected_operation, jvp_projected_operation,
 };
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
@@ -206,20 +208,21 @@ pub use zeros::{ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpace
 
 /// Represents differentiation-related errors.
 ///
-/// [`DifferentiationError`] forms normalized conversion cycles with [`TypeError`] and [`ProgramError`]. Every
-/// differentiation surface including
-/// the value-level entry points (i.e., `jvp`, `linearize`, `vjp`, etc.), the program-level transforms (i.e.,
-/// `Program::jvp`, `Program::linearize`, `Program::transpose`, etc.), and the per-operation rule traits (i.e.,
-/// [`DifferentiableOperation`] and [`TransposableOperation`]), returns [`DifferentiationError`], while the errors those
-/// rules produce *through* the kernel (i.e., binding and staging operations) are [`ProgramError`]s. The paired [`From`]
-/// implementations keep these cycles normalized instead of letting the error types nest: converting to [`ProgramError`]
-/// unwraps a [`DifferentiationError::Program`] back into the program error that it carries and wraps every other
-/// variant in [`ProgramError::Custom`], while converting to [`DifferentiationError`] unwraps a [`ProgramError::Custom`]
-/// payload holding a [`DifferentiationError`] and wraps every other program error in [`DifferentiationError::Program`].
-/// Roundtrips therefore never nest one error type inside the other, and `?` re-types errors correctly at both
-/// boundaries. Outside of these conversions, a [`DifferentiationError`] carried by a [`ProgramError`] can be recovered
-/// using [`ProgramError::downcast_custom`]. Type inference uses the analogous [`TypeError::Custom`] carrier so a
-/// failed tangent or cotangent mapping keeps its concrete differentiation error across an operation-inference boundary.
+/// [`DifferentiationError`] forms normalized conversion cycles with [`TypeError`] and [`ProgramError`].
+/// Every differentiation surface including the value-level entry points (i.e., `jvp`, `linearize`, `vjp`, etc.),
+/// the program-level transforms (i.e., [`Program::jvp`](crate::Program::jvp),
+/// [`Program::linearize`](crate::Program::linearize), [`Program::transpose`](crate::Program::transpose), etc.),
+/// and the per-operation rule traits (i.e., [`DifferentiableOperation`] and [`TransposableOperation`]), returns
+/// [`DifferentiationError`], while the errors those rules produce _through_ the kernel (i.e., binding and staging
+/// operations) are [`ProgramError`]s. The paired [`From`] implementations keep these cycles normalized instead of
+/// letting the error types nest: converting to [`ProgramError`] unwraps a [`DifferentiationError::Program`] back into
+/// the program error that it carries and wraps every other variant in [`ProgramError::Custom`], while converting to
+/// [`DifferentiationError`] unwraps a [`ProgramError::Custom`] payload holding a [`DifferentiationError`] and wraps
+/// every other program error in [`DifferentiationError::Program`]. Roundtrips therefore never nest one error type
+/// inside the other, and `?` re-types errors correctly at both boundaries. Outside of these conversions, a
+/// [`DifferentiationError`] carried by a [`ProgramError`] can be recovered using [`ProgramError::downcast_custom`].
+/// Type inference uses the analogous [`TypeError::Custom`] carrier so a failed tangent or cotangent mapping keeps
+/// its concrete differentiation error across an operation-inference boundary.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
 pub enum DifferentiationError {
     /// Error returned when a differentiation entry point is invoked on an active input with no leaf values/parameters.
@@ -386,13 +389,113 @@ impl From<DifferentiationError> for ProgramError {
 /// so an artifact derived with one rule cannot generally be reused for the other. A separate differentiation transform
 /// applied to a generated rule program selects its own rule rather than inheriting the enclosing transform's choice.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum DifferentiationRule {
+pub enum DifferentiationRule {
     /// Use [`DifferentiableOperation::jvp`] to construct an executable JVP or reusable pushforward.
     Jvp,
 
     /// Use [`DifferentiableOperation::jvp_for_transpose`] to construct primal outputs and a derivative program that
     /// supports transposition but need not support execution as a pushforward.
     JvpForTranspose,
+}
+
+impl DifferentiationRule {
+    /// Dispatches the selected native rule without changing the context or recursive driver.
+    #[inline]
+    pub(crate) fn apply<
+        O: Operation<Type = C::Type> + DifferentiableOperation<C>,
+        C: Context,
+        D: DifferentiationDriver<C>,
+        P: DifferentiationPolicy<C>,
+    >(
+        self,
+        operation: &O,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        match self {
+            Self::Jvp => operation.jvp(context, driver, inputs),
+            Self::JvpForTranspose => operation.jvp_for_transpose(context, driver, inputs),
+        }
+    }
+
+    /// Dispatches the selected parent-universe member rule without changing the context or recursive driver.
+    #[inline]
+    pub(crate) fn apply_member<
+        O: MemberDifferentiableOperation<C>,
+        C: Context,
+        D: DifferentiationDriver<C>,
+        P: DifferentiationPolicy<C>,
+    >(
+        self,
+        operation: &O,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        match self {
+            Self::Jvp => operation.jvp_in_parent(context, driver, inputs),
+            Self::JvpForTranspose => operation.jvp_for_transpose_in_parent(context, driver, inputs),
+        }
+    }
+
+    /// Projects inputs, applies the explicitly selected member rule, and lifts its outputs into the parent universe.
+    pub(crate) fn apply_projected<
+        T: DifferentiableType,
+        O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
+        C: Context<
+                Type: DifferentiableType + From<T>,
+                Value: ValueProjection<T, Projected: Value<Type = T>>,
+                Constant: ValueProjection<T, Projected: Value<Type = T>>,
+                Operation: OperationProjection<T>,
+            >,
+        P: DifferentiationPolicy<C>,
+    >(
+        self,
+        context: &DifferentiationContext<C, P>,
+        operation: &O,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        if !operation.region_slots().is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "projected operation `{}` carries regions and cannot be differentiated through its member family; \
+                     differentiate it through a composite carrier for that operation instead",
+                    operation.name(),
+                ),
+            }
+            .into());
+        }
+        let projected_inputs = inputs
+            .iter()
+            .map(|input| {
+                let primal = <C::Value as ValueProjection<T>>::into_projected(input.primal().clone())?;
+                match input.tangent() {
+                    MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
+                    MaybeZero::Value(value) => {
+                        let tangent = <C::Value as ValueProjection<T>>::into_projected(value.clone())?;
+                        DifferentiationDual::new(primal, tangent)
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
+        let projected_context = context.project::<T>();
+        let outputs = self.apply(operation, &projected_context, &EmptyRegionDriver, &projected_inputs)?;
+        outputs
+            .into_iter()
+            .map(|output| {
+                let (primal, tangent) = output.into_parts();
+                let primal = <C::Value as ValueProjection<T>>::from_projected(primal);
+                let tangent = match tangent {
+                    MaybeZero::Zero(r#type) => MaybeZero::Zero(C::Type::from(r#type)),
+                    MaybeZero::Value(value) => {
+                        MaybeZero::Value(<C::Value as ValueProjection<T>>::from_projected(value))
+                    }
+                };
+                DifferentiationDual::new(primal, tangent)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
 }
 
 /// Position of a value at a differentiation boundary, numbered within its flattened parameter group.

@@ -945,7 +945,10 @@ where
 ///
 /// Structural transform requests accept borrowed [`RegionRef`]s directly, allowing the same request to serve both a
 /// region selected from this driver and the entry region of a program rebuilt by an operation rule. Implementations
-/// must recursively dispatch each nested instruction with the driver for that nested application.
+/// must recursively dispatch each nested instruction with the driver for that nested application. Rules can inspect
+/// [`DifferentiationContext::rule`] to determine whether recursively derived programs must support execution. Calling
+/// a named operation rule directly does not change the driver's selection; use a separate forward transform when an
+/// executable nested derivative is required during reverse construction.
 pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operation> {
     /// Builds a fused forward mode differentiation program of `region` and returns a shared handle to it. The
     /// `input_indices` select which region inputs to differentiate with respect to and specify their tangent-input
@@ -1282,8 +1285,8 @@ pub trait DifferentiableOperation<C: Context>: Operation {
     /// forward-mode differentiation and public [`linearize`](ForwardModeDifferentiate::linearize) instead use
     /// [`Self::jvp`], whose tangent computation must support execution as a pushforward. This rule's tangent
     /// computation need only support transposition (e.g., it may retain a custom backward program in a transpose-only
-    /// [`LinearCallOperation`](crate::LinearCallOperation), which cannot be executed as a pushforward. Callers
-    /// constructing an executable JVP must therefore use [`Self::jvp`]).
+    /// [`LinearCallOperation`](crate::LinearCallOperation), which cannot be executed as a pushforward). Callers
+    /// constructing an executable JVP must therefore use [`Self::jvp`] with a forward-selected context and driver.
     ///
     /// The default delegates to [`Self::jvp`], deriving reverse mode from the same derivative rule as forward mode.
     /// Override this function when reverse mode needs a custom backward program or different primal preparation and
@@ -1296,7 +1299,8 @@ pub trait DifferentiableOperation<C: Context>: Operation {
     /// saved values through [`DifferentiationContext::primal_to_tangent`], as in a JVP rule. Overrides follow the
     /// deterministic structural-rule contract of [`Self::jvp`] because their derived programs are also cached. Nested
     /// requests through `driver` preserve selection of this rule during reverse-mode differentiation. Differentiation
-    /// of the selected primal or backward programs themselves follows the transform explicitly applied to those programs.
+    /// of the selected primal or backward programs themselves follows the transform explicitly applied to those
+    /// programs.
     ///
     /// # Parameters
     ///
@@ -1339,7 +1343,8 @@ pub trait DifferentiableOperation<C: Context>: Operation {
 /// for the member operation family, and the member and mixed operations they stage) rather than this trait imposing
 /// one fixed vocabulary on every implementation. Operation-family dispatchers should use this trait only for projected
 /// members whose derivative requires parent-universe values. Members whose inputs, outputs, and derivative all remain
-/// within `T` should continue using [`jvp_projected_operation`].
+/// within `T` should use [`jvp_projected_operation`] and [`jvp_for_transpose_projected_operation`] in their
+/// respective named hooks. A parent dispatcher must forward both hooks to preserve member overrides.
 pub trait MemberDifferentiableOperation<C: Context>: Operation<Type: DifferentiableType> {
     /// Applies this projected member's Jacobian-Vector Product (JVP) rule (i.e., its [`DifferentiableOperation::jvp`])
     /// in the parent context enclosing the member's projection, using that parent's own values.
@@ -1610,6 +1615,19 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
         self.tangent.as_ref().unwrap_or(&self.primal)
     }
 
+    /// Returns the [`DifferentiationRule`] selected by this transform and its recursive region driver. A default
+    /// [`DifferentiableOperation::jvp_for_transpose`] implementation delegates to `jvp` without changing this
+    /// selection, so a `jvp` implementation can still observe [`DifferentiationRule::JvpForTranspose`]. Programs
+    /// returned by its driver then need only support transposition and must not be executed as pushforwards.
+    ///
+    /// Explicit calls to named operation rules and projection adapters select that named rule, independently of
+    /// this value. They do not change the context or its driver; start a separate forward transform to derive an
+    /// executable nested program while constructing a reverse rule.
+    #[inline]
+    pub fn rule(&self) -> DifferentiationRule {
+        self.rule
+    }
+
     /// Returns a projected view of this [`DifferentiationContext`] for a member type, preserving its primal/tangent
     /// separation and value transfer policy. The projected contexts share the existing contexts' state (i.e.,
     /// projection does not create a new tangent computation or discard values already transferred to it).
@@ -1754,12 +1772,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
             // Borrow the complete region driver directly, preserving operation-defined ordering without collecting
             // it into temporary storage.
             let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver, rule: self.rule };
-            match self.rule {
-                DifferentiationRule::Jvp => operation.jvp(self, &differentiation_driver, inputs)?,
-                DifferentiationRule::JvpForTranspose => {
-                    operation.jvp_for_transpose(self, &differentiation_driver, inputs)?
-                }
-            }
+            self.rule.apply(operation, self, &differentiation_driver, inputs)?
         };
 
         Ok(outputs)
@@ -2118,18 +2131,12 @@ where
                     } else {
                         let differentiation_driver =
                             RecursiveDifferentiationDriver { driver: &driver, rule: arguments.rule };
-                        match arguments.rule {
-                            DifferentiationRule::Jvp => instruction.operation().jvp(
-                                &differentiation_context,
-                                &differentiation_driver,
-                                input_duals.as_slice(),
-                            ),
-                            DifferentiationRule::JvpForTranspose => instruction.operation().jvp_for_transpose(
-                                &differentiation_context,
-                                &differentiation_driver,
-                                input_duals.as_slice(),
-                            ),
-                        }
+                        arguments.rule.apply(
+                            instruction.operation(),
+                            &differentiation_context,
+                            &differentiation_driver,
+                            input_duals.as_slice(),
+                        )
                     }
                 })?;
 
@@ -3214,7 +3221,9 @@ impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 /// [`Region`]-free and every operand and result belongs to the same projectable member type `T`. It projects primal
 /// values and live tangent values into the member value family, carries structural-zero tangents as types without
 /// materializing values, runs the member's existing [`DifferentiableOperation`] rule, and lifts the resulting duals
-/// back into the composite value family.
+/// back into the composite value family. This named adapter always selects [`DifferentiableOperation::jvp`], including
+/// when the context is constructing a reverse derivative. Use [`jvp_for_transpose_projected_operation`] to select the
+/// reverse rule explicitly.
 ///
 /// Operations whose derivative crosses member types or whose rule needs attached regions require an explicit composite
 /// Jacobian-Vector Product (JVP) rule instead. A member operation that declares [`RegionSlot`](crate::RegionSlot)s is
@@ -3228,6 +3237,7 @@ impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 ///     operations.
 ///   - `operation`: Region-free operation expressed in the projected member operation family.
 ///   - `inputs`: Composite [`DifferentiationDual`]s corresponding to the operation's operands.
+#[inline]
 pub fn jvp_projected_operation<
     T: DifferentiableType,
     O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
@@ -3235,7 +3245,7 @@ pub fn jvp_projected_operation<
             Type: DifferentiableType + From<T>,
             Value: ValueProjection<T, Projected: Value<Type = T>>,
             Constant: ValueProjection<T, Projected: Value<Type = T>>,
-            Operation: OperationProjection<T, Projected = O>,
+            Operation: OperationProjection<T>,
         >,
     P: DifferentiationPolicy<C>,
 >(
@@ -3243,48 +3253,37 @@ pub fn jvp_projected_operation<
     operation: &O,
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-    if !operation.region_slots().is_empty() {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "projected operation `{}` carries regions and cannot be differentiated through its member family; \
-                 differentiate it through a composite carrier for that operation instead",
-                operation.name(),
-            ),
-        }
-        .into());
-    }
-    let projected_inputs = inputs
-        .iter()
-        .map(|input| {
-            let primal = <C::Value as ValueProjection<T>>::into_projected(input.primal().clone())?;
-            match input.tangent() {
-                MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
-                MaybeZero::Value(value) => {
-                    let tangent = <C::Value as ValueProjection<T>>::into_projected(value.clone())?;
-                    DifferentiationDual::new(primal, tangent)
-                }
-            }
-        })
-        .collect::<Result<Vec<_>, DifferentiationError>>()?;
-    let projected_context = context.project::<T>();
-    let outputs = match context.rule {
-        DifferentiationRule::Jvp => operation.jvp(&projected_context, &EmptyRegionDriver, &projected_inputs)?,
-        DifferentiationRule::JvpForTranspose => {
-            operation.jvp_for_transpose(&projected_context, &EmptyRegionDriver, &projected_inputs)?
-        }
-    };
-    outputs
-        .into_iter()
-        .map(|output| {
-            let (primal, tangent) = output.into_parts();
-            let primal = <C::Value as ValueProjection<T>>::from_projected(primal);
-            let tangent = match tangent {
-                MaybeZero::Zero(r#type) => MaybeZero::Zero(C::Type::from(r#type)),
-                MaybeZero::Value(value) => MaybeZero::Value(<C::Value as ValueProjection<T>>::from_projected(value)),
-            };
-            DifferentiationDual::new(primal, tangent)
-        })
-        .collect::<Result<Vec<_>, _>>()
+    DifferentiationRule::Jvp.apply_projected(context, operation, inputs)
+}
+
+/// Applies a member operation's reverse-preparation rule through a projected composite context. This is the counterpart
+/// of [`jvp_projected_operation`] for [`DifferentiableOperation::jvp_for_transpose`]; it has the same projection
+/// requirements and diagnostics, but the resulting tangent computation need only support transposition. The named
+/// adapter selects the reverse rule even when [`DifferentiationContext::rule`] is `Jvp`. It does not change the
+/// context's selection for recursive differentiation.
+///
+/// # Errors
+///
+/// Returns an error if the operation carries regions, an input cannot be projected into the member family, or the
+/// selected member rule fails. Callers must retain the resulting tangent computation for transposition rather than
+/// execute it as a pushforward.
+#[inline]
+pub fn jvp_for_transpose_projected_operation<
+    T: DifferentiableType,
+    O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
+    C: Context<
+            Type: DifferentiableType + From<T>,
+            Value: ValueProjection<T, Projected: Value<Type = T>>,
+            Constant: ValueProjection<T, Projected: Value<Type = T>>,
+            Operation: OperationProjection<T>,
+        >,
+    P: DifferentiationPolicy<C>,
+>(
+    context: &DifferentiationContext<C, P>,
+    operation: &O,
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+    DifferentiationRule::JvpForTranspose.apply_projected(context, operation, inputs)
 }
 
 /// Captures the program atoms needed to materialize a zero of `r#type` and verifies the provider's declaration.
@@ -3429,7 +3428,7 @@ impl JvpAndLinearizationTransformArguments {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::rc::Rc;
 
     use approx::assert_abs_diff_eq;
@@ -3439,19 +3438,27 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        ShardingDimension,
+    };
+    use crate::batching::{
+        BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+        BatchingPolicy, ProgramBatchingOutputAxesPolicy,
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
+    use crate::differentiation::reverse::{CotangentDestinationKind, ReverseModeDifferentiate};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+    use crate::macros::impl_non_transposable_operation;
     use crate::operations::{
-        AddOperation, ConditionOperation, MulOperation, NegOperation, PrintOperation, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceWriteOperation, StopGradient, StopGradientOperation, ZeroOperation,
+        AddOperation, ConditionOperation, LinearCallOperation, Mul, MulOperation, NegOperation, PrintOperation,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+        ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation, StopGradient, StopGradientOperation,
+        ZeroOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
         Concretizable, Operation, OperationProvider, ProgramBuilder, ReferenceError, ReferenceType, ReferenceView,
-        RegionId,
+        RegionId, RegionInterface,
     };
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
@@ -3464,8 +3471,193 @@ mod tests {
 
     use super::*;
 
+    /// Reports the named rule and inherited recursion selection without performing derivative work.
+    #[derive(Clone, Debug)]
+    struct RuleProbeOperation;
+
+    impl Operation for RuleProbeOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            "rule_probe"
+        }
+
+        fn infer_output_types(
+            &self,
+            inputs: &[ArrayType],
+            _regions: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            Ok(inputs.to_vec())
+        }
+    }
+
+    impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for RuleProbeOperation {
+        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            _inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation { message: format!("forward with {:?}", context.rule()) }.into())
+        }
+
+        fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            _inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation { message: format!("reverse with {:?}", context.rule()) }.into())
+        }
+    }
+
+    impl<C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C> for RuleProbeOperation {
+        fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            _inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation { message: format!("parent forward with {:?}", context.rule()) }
+                .into())
+        }
+
+        fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            _inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            Err(ProgramError::UnsupportedOperation { message: format!("parent reverse with {:?}", context.rule()) }
+                .into())
+        }
+    }
+
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;
+
+    /// Test operation computing `x³` with independently prepared forward and reverse derivatives. Its JVP rule computes
+    /// and saves `3x²`, while its [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule saves only `x`
+    /// and retains a backward program that computes `3x²` when the pullback is applied. Both rules produce the same
+    /// derivative values, but their saved residuals and preparation work differ, allowing tests to detect accidental
+    /// use of the JVP rule during reverse-mode differentiation. The fixture exercises this distinction through reusable
+    /// differentiation, nested control flow, batching, and higher-order differentiation without requiring the unified
+    /// custom-operation registration API.
+    #[derive(Clone, Debug)]
+    pub(crate) struct PreparedCubeOperation;
+
+    impl Operation for PreparedCubeOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            "prepared_cube"
+        }
+
+        fn infer_output_types(
+            &self,
+            inputs: &[ArrayType],
+            _regions: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            assert_eq!(inputs.len(), 1);
+            Ok(inputs.to_vec())
+        }
+    }
+
+    impl<C: Domain<Type = ArrayType, Value: Mul>> InterpretableOperation<C> for PreparedCubeOperation {
+        fn interpret<D: InterpretationDriver<C>>(
+            &self,
+            _context: &C,
+            _driver: &D,
+            inputs: &[C::Value],
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            Ok(vec![inputs[0].mul(&inputs[0])?.mul(&inputs[0])?])
+        }
+    }
+
+    impl<C: Context<Type = ArrayType, Operation: From<Self>>> PartiallyEvaluatableOperation<C> for PreparedCubeOperation {}
+
+    impl<C: Context<Type = ArrayType, Operation: From<Self>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
+        for PreparedCubeOperation
+    {
+        fn batch<D: BatchingDriver<C, P>>(
+            &self,
+            context: &BatchingContext<C, P>,
+            _driver: &D,
+            inputs: &[P::Batch],
+        ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+            let output = context.parent().bind(self.clone(), vec![], &[P::value(&inputs[0]).clone()])?.remove(0);
+            Ok(vec![P::batch(output, P::batch_axis(&inputs[0]))?].into())
+        }
+    }
+
+    impl<
+        C: Context<
+                Type = ArrayType,
+                Operation: From<MulOperation<ArrayType>>
+                               + From<AddOperation<ArrayType>>
+                               + From<LinearCallOperation<ArrayType>>,
+            >,
+    > DifferentiableOperation<C> for PreparedCubeOperation
+    {
+        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            let input = inputs[0].primal();
+            let squared =
+                context.primal().bind(MulOperation::new(), vec![], &[input.clone(), input.clone()])?.remove(0);
+            let primal =
+                context.primal().bind(MulOperation::new(), vec![], &[squared.clone(), input.clone()])?.remove(0);
+            let doubled =
+                context.primal().bind(AddOperation::new(), vec![], &[squared.clone(), squared.clone()])?.remove(0);
+            let coefficient = context.primal().bind(AddOperation::new(), vec![], &[doubled, squared])?.remove(0);
+            let coefficient = context.primal_to_tangent(coefficient)?;
+            let tangent = context
+                .tangent()
+                .bind(MulOperation::new(), vec![], &[coefficient, inputs[0].tangent().as_value().unwrap().clone()])?
+                .remove(0);
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+
+        fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+            &self,
+            context: &DifferentiationContext<C, P>,
+            _driver: &D,
+            inputs: &[DifferentiationDual<C::Value>],
+        ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+            let input = inputs[0].primal();
+            let squared =
+                context.primal().bind(MulOperation::new(), vec![], &[input.clone(), input.clone()])?.remove(0);
+            let primal = context.primal().bind(MulOperation::new(), vec![], &[squared, input.clone()])?.remove(0);
+            let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+            let residual = builder.add_input(input.r#type().into_owned());
+            let seed = builder.add_input(input.r#type().into_owned());
+            let squared = builder.add_instruction(MulOperation::new(), vec![], vec![residual, residual], None)?[0];
+            let doubled = builder.add_instruction(AddOperation::new(), vec![], vec![squared, squared], None)?[0];
+            let coefficient = builder.add_instruction(AddOperation::new(), vec![], vec![doubled, squared], None)?[0];
+            let cotangent = builder.add_instruction(MulOperation::new(), vec![], vec![coefficient, seed], None)?[0];
+            let backward = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+                vec![cotangent],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )?;
+            let carrier = LinearCallOperation::transpose_only(
+                1,
+                vec![input.r#type().into_owned()],
+                vec![input.r#type().into_owned()],
+            );
+            let residual = context.primal_to_tangent(input.clone())?;
+            let tangent = context
+                .tangent()
+                .bind(carrier, vec![backward], &[residual, inputs[0].tangent().as_value().unwrap().clone()])?
+                .remove(0);
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    }
+
+    impl_non_transposable_operation!(PreparedCubeOperation);
 
     // Index 3 is otherwise unused by the shared member fixtures. Its malformed provider tests that the callable
     // boundary validates residual capture before attempting to construct a zero.
@@ -4066,6 +4258,297 @@ mod tests {
     }
 
     #[test]
+    fn test_differentiation_rule_apply() {
+        let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new())
+            .with_rule(DifferentiationRule::JvpForTranspose);
+        assert!(matches!(
+            DifferentiationRule::Jvp.apply(&RuleProbeOperation, &context, &EmptyRegionDriver, &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "forward with JvpForTranspose",
+        ));
+        assert!(matches!(
+            context.rule().apply(&RuleProbeOperation, &context, &EmptyRegionDriver, &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "reverse with JvpForTranspose",
+        ));
+    }
+
+    #[test]
+    fn test_differentiation_rule_apply_member() {
+        let context = DifferentiationContext::fused(EagerContext::<TestValue, TestOperation>::new());
+        assert!(matches!(
+            DifferentiationRule::JvpForTranspose.apply_member(&RuleProbeOperation, &context, &EmptyRegionDriver, &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "parent reverse with Jvp",
+        ));
+        let context = context.with_rule(DifferentiationRule::JvpForTranspose);
+        assert!(matches!(
+            DifferentiationRule::Jvp.apply_member(&RuleProbeOperation, &context, &EmptyRegionDriver, &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "parent forward with JvpForTranspose",
+        ));
+    }
+
+    #[test]
+    fn test_differentiable_operation_jvp_for_transpose_independent_residuals() {
+        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let input = Array::scalar(3f64).unwrap();
+        assert_eq!(
+            context.jvp(
+                |input, ()| input
+                    .context()
+                    .bind(PreparedCubeOperation, vec![], &[input.clone()])
+                    .map(|mut outputs| outputs.remove(0)),
+                input.clone(),
+                Array::scalar(2f64).unwrap(),
+                (),
+            ),
+            Ok((Array::scalar(27f64).unwrap(), Array::scalar(54f64).unwrap())),
+        );
+
+        let (output, pushforward) = context
+            .linearize(
+                |input, ()| {
+                    input
+                        .context()
+                        .bind(PreparedCubeOperation, vec![], &[input.clone()])
+                        .map(|mut outputs| outputs.remove(0))
+                },
+                input.clone(),
+                (),
+            )
+            .unwrap();
+        assert_eq!(output, Array::scalar(27f64).unwrap());
+        assert_eq!(pushforward.residuals(), &[Array::scalar(27f64).unwrap()]);
+        assert_eq!(pushforward.apply(Array::scalar(2f64).unwrap()).unwrap(), Array::scalar(54f64).unwrap());
+        assert_eq!(pushforward.apply(Array::scalar(4f64).unwrap()).unwrap(), Array::scalar(108f64).unwrap());
+
+        let (output, pullback) = context
+            .vjp(
+                |input, ()| {
+                    input
+                        .context()
+                        .bind(PreparedCubeOperation, vec![], &[input.clone()])
+                        .map(|mut outputs| outputs.remove(0))
+                },
+                input,
+                (),
+            )
+            .unwrap();
+        assert_eq!(output, Array::scalar(27f64).unwrap());
+        assert_eq!(pullback.residuals(), &[Array::scalar(3f64).unwrap()]);
+        assert_eq!(pullback.apply(Array::scalar(2f64).unwrap()).unwrap(), Array::scalar(54f64).unwrap());
+        assert_eq!(pullback.apply(Array::scalar(4f64).unwrap()).unwrap(), Array::scalar(108f64).unwrap());
+    }
+
+    #[test]
+    fn test_differentiable_operation_jvp_for_transpose_primal_work() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(PreparedCubeOperation, vec![], vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let forward_jvp = program.entry_region_ref().jvp_shared(&[0]).unwrap();
+        let reverse_jvp =
+            program.entry_region_ref().jvp_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose).unwrap();
+        assert_eq!(
+            forward_jvp
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec!["mul", "mul", "add", "add", "mul"],
+        );
+        assert_eq!(
+            reverse_jvp
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec!["mul", "mul", "linear_call"],
+        );
+        let forward = program.linearize().unwrap();
+        let reverse = program
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .unwrap();
+        assert_eq!(forward.residual_count(), 1);
+        assert_eq!(reverse.residual_count(), 1);
+        assert_eq!(
+            forward
+                .primal()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec!["mul", "mul", "add", "add"],
+        );
+        assert_eq!(
+            reverse
+                .primal()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec!["mul", "mul"],
+        );
+        assert_eq!(
+            forward.primal().interpret(vec![Array::scalar(3f64).unwrap()]),
+            Ok(vec![Array::scalar(27f64).unwrap(), Array::scalar(27f64).unwrap()]),
+        );
+        assert_eq!(
+            reverse.primal().interpret(vec![Array::scalar(3f64).unwrap()]),
+            Ok(vec![Array::scalar(27f64).unwrap(), Array::scalar(3f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_differentiable_operation_jvp_for_transpose_nested_condition() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(PreparedCubeOperation, vec![], vec![input], None).unwrap()[0];
+        let branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let branch = builder.import_program(branch);
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let reverse_jvp =
+            program.entry_region_ref().jvp_shared_for_rule(&[1], DifferentiationRule::JvpForTranspose).unwrap();
+        let condition = &reverse_jvp.instructions()[0];
+        assert_eq!(condition.operation().name(), "condition");
+        for &branch in condition.regions() {
+            assert_eq!(
+                reverse_jvp
+                    .region(branch)
+                    .unwrap()
+                    .instructions()
+                    .iter()
+                    .map(|instruction| instruction.operation().name())
+                    .collect::<Vec<_>>(),
+                vec!["mul", "mul", "linear_call"],
+            );
+        }
+        let reverse = program
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[1], DifferentiationRule::JvpForTranspose)
+            .unwrap();
+        let outputs = reverse
+            .primal()
+            .interpret(vec![Array::scalar(true).unwrap(), Array::scalar(3f64).unwrap()])
+            .unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                Array::scalar(27f64).unwrap(),
+                Array::scalar(true).unwrap(),
+                Array::scalar(3f64).unwrap(),
+                Array::scalar(0f64).unwrap(),
+            ],
+        );
+        let backward = reverse.pullback().unwrap();
+        assert_eq!(
+            backward.interpret(vec![
+                Array::scalar(2f64).unwrap(),
+                Array::scalar(true).unwrap(),
+                Array::scalar(3f64).unwrap(),
+                Array::scalar(0f64).unwrap(),
+            ]),
+            Ok(vec![Array::scalar(54f64).unwrap()]),
+        );
+        assert_eq!(
+            reverse.primal().interpret(vec![Array::scalar(false).unwrap(), Array::scalar(3f64).unwrap()]),
+            Ok(vec![
+                Array::scalar(27f64).unwrap(),
+                Array::scalar(false).unwrap(),
+                Array::scalar(0f64).unwrap(),
+                Array::scalar(3f64).unwrap(),
+            ]),
+        );
+        assert_eq!(
+            backward.interpret(vec![
+                Array::scalar(2f64).unwrap(),
+                Array::scalar(false).unwrap(),
+                Array::scalar(0f64).unwrap(),
+                Array::scalar(3f64).unwrap(),
+            ]),
+            Ok(vec![Array::scalar(54f64).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_differentiable_operation_jvp_for_transpose_after_batching() {
+        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(PreparedCubeOperation, vec![], vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let (batched, output_axes) = program
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        let reverse = batched
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .unwrap();
+        assert_eq!(reverse.residual_count(), 1);
+        assert_eq!(
+            reverse.primal().interpret(vec![Array::vector(vec![2f64, 3.0, 4.0]).unwrap()]),
+            Ok(vec![Array::vector(vec![8f64, 27.0, 64.0]).unwrap(), Array::vector(vec![2f64, 3.0, 4.0]).unwrap()]),
+        );
+        assert_eq!(
+            reverse.pullback().unwrap().interpret(vec![
+                Array::vector(vec![1f64, 1.0, 1.0]).unwrap(),
+                Array::vector(vec![2f64, 3.0, 4.0]).unwrap(),
+            ]),
+            Ok(vec![Array::vector(vec![12f64, 27.0, 48.0]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_differentiable_operation_jvp_for_transpose_higher_order() {
+        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let (_, pullback) = context
+            .vjp(
+                |input, ()| {
+                    input
+                        .context()
+                        .bind(PreparedCubeOperation, vec![], &[input.clone()])
+                        .map(|mut outputs| outputs.remove(0))
+                },
+                Array::scalar(3f64).unwrap(),
+                (),
+            )
+            .unwrap();
+
+        // Differentiate the materialized backward program with respect to its saved x, keeping seed 2 fixed.
+        let backward = pullback.transposed_program(&[CotangentDestinationKind::Return]).unwrap();
+        assert_eq!(
+            backward.entry_region_ref().jvp(&[0]).unwrap().interpret(vec![
+                Array::scalar(2f64).unwrap(),
+                Array::scalar(3f64).unwrap(),
+                Array::scalar(1f64).unwrap(),
+            ]),
+            Ok(vec![Array::scalar(54f64).unwrap(), Array::scalar(27f64).unwrap()]),
+        );
+        assert_eq!(
+            backward.entry_region_ref().jvp(&[1]).unwrap().interpret(vec![
+                Array::scalar(2f64).unwrap(),
+                Array::scalar(3f64).unwrap(),
+                Array::scalar(1f64).unwrap(),
+            ]),
+            Ok(vec![Array::scalar(54f64).unwrap(), Array::scalar(36f64).unwrap()]),
+        );
+    }
+
+    #[test]
     fn test_differentiation_tracer_new() {
         let context = DifferentiationContext::fused(EagerContext::<Array, TestArrayOperation>::new());
         let primal = Array::scalar(2.0_f64).unwrap();
@@ -4153,6 +4636,16 @@ mod tests {
             TestArrayOperation,
         >::new());
         assert!(std::ptr::eq(context.primal(), context.tangent()));
+    }
+
+    #[test]
+    fn test_differentiation_context_rule() {
+        let context = DifferentiationContext::fused(EagerContext::<TestValue, TestOperation>::new());
+        assert_eq!(context.rule(), DifferentiationRule::Jvp);
+        let context = context.with_rule(DifferentiationRule::JvpForTranspose);
+        assert_eq!(context.rule(), DifferentiationRule::JvpForTranspose);
+        assert_eq!(context.clone().rule(), DifferentiationRule::JvpForTranspose);
+        assert_eq!(context.project::<ArrayType>().rule(), DifferentiationRule::JvpForTranspose);
     }
 
     #[test]
@@ -6502,6 +6995,27 @@ mod tests {
         let (primal, tangent) = output.into_parts();
         assert_eq!(primal, ProjectedProgramValue::Third(ProjectedMemberValue::<2>(11)));
         assert!(matches!(tangent, MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>)),));
+    }
+
+    #[test]
+    fn test_jvp_projected_operation_explicit_rule() {
+        let context = DifferentiationContext::fused(EagerContext::<TestValue, TestOperation>::new())
+            .with_rule(DifferentiationRule::JvpForTranspose);
+        assert!(matches!(
+            jvp_projected_operation(&context, &RuleProbeOperation, &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "forward with JvpForTranspose",
+        ));
+    }
+
+    #[test]
+    fn test_jvp_for_transpose_projected_operation() {
+        let context = DifferentiationContext::fused(EagerContext::<TestValue, TestOperation>::new());
+        assert!(matches!(
+            jvp_for_transpose_projected_operation(&context, &RuleProbeOperation, &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "reverse with Jvp",
+        ));
     }
 
     #[test]
