@@ -63,14 +63,15 @@ pub use differentiation::{
     CotangentSeed, DenseDifferentiableType, DerivativeTransform, DifferentiableOperation, DifferentiableType,
     Differentiate, DifferentiationBoundaryPosition, DifferentiationBuilder, DifferentiationBuilderContext,
     DifferentiationBuilderLinearityMode, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationParameterRole, DifferentiationPolicy, DifferentiationTracer,
-    ElementwiseDerivativeAlignment, ForwardModeDifferentiate, FusedDifferentiationPolicy, Hessian, HessianBlock,
-    HolomorphicLinearity, Jacobian, JacobianBlock, Linearization, LinearizationContext, LinearizationTracer,
-    MemberDifferentiableOperation, MemberTransposableOperation, PartitionedDifferentiationPolicy, Pullback,
-    Pushforward, RealLinearity, ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation,
+    DifferentiationError, DifferentiationParameterRole, DifferentiationPolicy, DifferentiationRule,
+    DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate, FusedDifferentiationPolicy,
+    Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, Linearization, LinearizationContext,
+    LinearizationTracer, MemberDifferentiableOperation, MemberTransposableOperation, PartitionedDifferentiationPolicy,
+    Pullback, Pushforward, RealLinearity, ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation,
     TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliaryOutput, WithCapture,
     WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp, differentiate_at,
-    jvp_projected_operation, transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
+    jvp_for_transpose_projected_operation, jvp_projected_operation, transpose_mixed_operation,
+    transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
@@ -203,6 +204,7 @@ pub(crate) mod tests {
 
     use crate::arrays::{Array, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, ArrayType};
     use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::forward::tests::CustomCubeOperation;
     use crate::differentiation::{
         CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext,
         DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation,
@@ -210,7 +212,6 @@ pub(crate) mod tests {
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
-    use crate::operations::differentiation::tests::PreparedCubeOperation;
     use crate::operations::{
         AddOperation, BroadcastOperation, CompareOperation, ConditionOperation, ConstantOperation,
         ConvertElementTypeOperation, DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation,
@@ -253,7 +254,7 @@ pub(crate) mod tests {
         Mul(MulOperation<ArrayType>),
         Div(DivOperation<ArrayType>),
         Exp(ExpOperation<ArrayType>),
-        PreparedCube(PreparedCubeOperation),
+        CustomCube(CustomCubeOperation),
         ConvertElementType(ConvertElementTypeOperation<ArrayType>),
         Broadcast(BroadcastOperation),
         Transpose(TransposeOperation),

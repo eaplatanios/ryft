@@ -3390,11 +3390,86 @@ mod tests {
 
     #[test]
     fn test_rematerialize_call_independent_derivative_rules() {
-        use crate::differentiation::forward::tests::CustomCubeOperation;
-        use crate::tests::TestArrayOperation;
+        use ryft_macros::Operation;
 
-        let function = rematerialize::<EagerContext<Array, TestArrayOperation>, _, _, _>(
-            |input: DomainTracer<EagerContext<Array, TestArrayOperation>>| {
+        use crate::differentiation::forward::tests::CustomCubeOperation;
+        use crate::operations::{
+            AddOperation, BroadcastOperation, CompareOperation, ConstantOperation, ConvertElementTypeOperation,
+            DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation, OneLikeOperation,
+            OneOperation, ParallelVaryOperation, ReduceOperation, ReshapeOperation, ReshardOperation, SelectOperation,
+            SubOperation, TransposeOperation, ZeroLikeOperation, ZeroOperation,
+        };
+        use crate::programs::{
+            NoReferenceTransform, NoReferent, OperationProvider, ReferenceAccessDescriptor, ReferenceAccessOperation,
+        };
+
+        /// Array operations and the rematerialization boundary required by this test.
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(type = ArrayType, constant = Array, dispatch(batching, differentiation, transposition))]
+        enum RematerializationTestOperation {
+            Constant(ConstantOperation<Array>),
+            Zero(ZeroOperation<ArrayType>),
+            One(OneOperation<ArrayType>),
+            ZeroLike(ZeroLikeOperation<ArrayType>),
+            OneLike(OneLikeOperation<ArrayType>),
+            Neg(NegOperation<ArrayType>),
+            Add(AddOperation<ArrayType>),
+            Sub(SubOperation<ArrayType>),
+            Mul(MulOperation<ArrayType>),
+            Div(DivOperation<ArrayType>),
+            Exp(ExpOperation<ArrayType>),
+            CustomCube(CustomCubeOperation),
+            Rematerialize(RematerializeOperation<ArrayType>),
+            ConvertElementType(ConvertElementTypeOperation<ArrayType>),
+            Broadcast(BroadcastOperation),
+            Transpose(TransposeOperation),
+            Reshape(ReshapeOperation),
+            Reduce(ReduceOperation),
+            Reshard(ReshardOperation),
+            Compare(CompareOperation<ArrayType>),
+            Select(SelectOperation<ArrayType>),
+            LinearCall(LinearCallOperation<ArrayType>),
+        }
+
+        // Like `ArrayOperation`, this reference-free family declares no access layout, but reverse-mode differentiation
+        // and the `reference_freeze` transpose name its transform type to select the reference cotangent accumulation,
+        // which resolves to the reference-free `reference_add_update` provider.
+        impl ReferenceAccessOperation for RematerializationTestOperation {
+            type Transform = NoReferenceTransform<NoReferent, ArrayType>;
+
+            fn base_input_count(&self) -> usize {
+                0
+            }
+
+            fn reference_access_descriptor(
+                &self,
+                _input_index: usize,
+            ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+                None
+            }
+
+            fn with_reference_access_transforms(
+                &self,
+                _input_index: usize,
+                _transforms: Vec<Self::Transform>,
+            ) -> Result<Self, ProgramError> {
+                Err(ProgramError::MalformedProgram("array-only operations have no reference inputs".to_owned()))
+            }
+        }
+
+        impl OperationProvider<ArrayType, ParallelVaryOperation> for RematerializationTestOperation {
+            type Operation = Self;
+
+            fn provide(_request: ParallelVaryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "test array operation family cannot align manual variation".to_string(),
+                })
+            }
+        }
+
+        let function = rematerialize::<EagerContext<Array, RematerializationTestOperation>, _, _, _>(
+            |input: DomainTracer<EagerContext<Array, RematerializationTestOperation>>| {
                 input
                     .dispatch_domain()
                     .bind(CustomCubeOperation, vec![], &[input.clone()])
@@ -3402,7 +3477,7 @@ mod tests {
             },
         )
         .with_policy(EverythingSaveable);
-        let context = EagerContext::<Array, TestArrayOperation>::new();
+        let context = EagerContext::<Array, RematerializationTestOperation>::new();
         let input = Array::scalar(3f64).unwrap();
         assert_eq!(
             context.jvp(|input, ()| function.call(input), input.clone(), Array::scalar(2f64).unwrap(), ()),
