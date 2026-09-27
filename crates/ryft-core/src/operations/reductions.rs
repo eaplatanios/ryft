@@ -1206,70 +1206,14 @@ impl Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own because a
-/// mean lowers to a sum followed by a division by the reduced element count.
+/// Element-level mean divisor, serving mean reductions, which have no capability analogue of their own
+/// because a mean lowers to a sum followed by a division by the reduced element count.
 trait ElementDivideByCount: NumericArrayElement {
     /// Divides this element by `count` after converting `count` to the element type.
     fn divide_by_count(self, count: usize) -> Result<Self, ProgramError>;
 }
 
-// Implements typed arithmetic for signed primitive integers with deterministic two's-complement wrapping.
-macro_rules! impl_element_divide_by_count_for_signed_integer {
-    ($type:ty) => {
-        impl ElementDivideByCount for $type {
-            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
-                let divisor = count as Self;
-                if divisor == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer array element of data type `{}` by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                if self == Self::MIN && divisor == -1 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide the minimum integer array element of data type `{}` by -1",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(self / divisor)
-            }
-        }
-    };
-}
-
-// Implements typed arithmetic for unsigned primitive integers with deterministic modular wrapping.
-macro_rules! impl_element_divide_by_count_for_unsigned_integer {
-    ($type:ty) => {
-        impl ElementDivideByCount for $type {
-            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
-                let divisor = count as Self;
-                if divisor == 0 {
-                    return Err(TypeError::invalid(format!(
-                        "cannot divide an integer array element of data type `{}` by zero",
-                        Self::data_type(),
-                    ))
-                    .into());
-                }
-                Ok(self / divisor)
-            }
-        }
-    };
-}
-
-impl_element_divide_by_count_for_signed_integer!(i8);
-impl_element_divide_by_count_for_signed_integer!(i16);
-impl_element_divide_by_count_for_signed_integer!(i32);
-impl_element_divide_by_count_for_signed_integer!(i64);
-impl_element_divide_by_count_for_unsigned_integer!(u8);
-impl_element_divide_by_count_for_unsigned_integer!(u16);
-impl_element_divide_by_count_for_unsigned_integer!(u32);
-impl_element_divide_by_count_for_unsigned_integer!(u64);
-
-// Implements modular arithmetic for a signed sub-byte integer's checked low-bit encoding.
+/// Implements modular arithmetic for a signed sub-byte integer's checked low-bit encoding.
 macro_rules! impl_element_divide_by_count_for_signed_sub_byte_integer {
     ($type:ty) => {
         impl ElementDivideByCount for $type {
@@ -1296,7 +1240,42 @@ macro_rules! impl_element_divide_by_count_for_signed_sub_byte_integer {
     };
 }
 
-// Implements modular arithmetic for an unsigned sub-byte integer's checked low-bit encoding.
+impl_element_divide_by_count_for_signed_sub_byte_integer!(i1);
+impl_element_divide_by_count_for_signed_sub_byte_integer!(i2);
+impl_element_divide_by_count_for_signed_sub_byte_integer!(i4);
+
+/// Implements typed arithmetic for signed primitive integers with deterministic two's-complement wrapping.
+macro_rules! impl_element_divide_by_count_for_signed_integer {
+    ($type:ty) => {
+        impl ElementDivideByCount for $type {
+            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
+                let divisor = count as Self;
+                if divisor == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot divide an integer array element of data type `{}` by zero",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                if self == Self::MIN && divisor == -1 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot divide the minimum integer array element of data type `{}` by -1",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                Ok(self / divisor)
+            }
+        }
+    };
+}
+
+impl_element_divide_by_count_for_signed_integer!(i8);
+impl_element_divide_by_count_for_signed_integer!(i16);
+impl_element_divide_by_count_for_signed_integer!(i32);
+impl_element_divide_by_count_for_signed_integer!(i64);
+
+/// Implements modular arithmetic for an unsigned sub-byte integer's checked low-bit encoding.
 macro_rules! impl_element_divide_by_count_for_unsigned_sub_byte_integer {
     ($type:ty) => {
         impl ElementDivideByCount for $type {
@@ -1315,14 +1294,35 @@ macro_rules! impl_element_divide_by_count_for_unsigned_sub_byte_integer {
     };
 }
 
-impl_element_divide_by_count_for_signed_sub_byte_integer!(i1);
-impl_element_divide_by_count_for_signed_sub_byte_integer!(i2);
-impl_element_divide_by_count_for_signed_sub_byte_integer!(i4);
 impl_element_divide_by_count_for_unsigned_sub_byte_integer!(u1);
 impl_element_divide_by_count_for_unsigned_sub_byte_integer!(u2);
 impl_element_divide_by_count_for_unsigned_sub_byte_integer!(u4);
 
-// Implements arithmetic for a low-precision floating-point format through its exact f64 conversion contract.
+/// Implements typed arithmetic for unsigned primitive integers with deterministic modular wrapping.
+macro_rules! impl_element_divide_by_count_for_unsigned_integer {
+    ($type:ty) => {
+        impl ElementDivideByCount for $type {
+            fn divide_by_count(self, count: usize) -> Result<Self, ProgramError> {
+                let divisor = count as Self;
+                if divisor == 0 {
+                    return Err(TypeError::invalid(format!(
+                        "cannot divide an integer array element of data type `{}` by zero",
+                        Self::data_type(),
+                    ))
+                    .into());
+                }
+                Ok(self / divisor)
+            }
+        }
+    };
+}
+
+impl_element_divide_by_count_for_unsigned_integer!(u8);
+impl_element_divide_by_count_for_unsigned_integer!(u16);
+impl_element_divide_by_count_for_unsigned_integer!(u32);
+impl_element_divide_by_count_for_unsigned_integer!(u64);
+
+/// Implements arithmetic for a low-precision floating-point format through its exact f64 conversion contract.
 macro_rules! impl_element_divide_by_count_for_low_precision_float {
     ($type:ty) => {
         impl ElementDivideByCount for $type {
@@ -1347,7 +1347,7 @@ impl_element_divide_by_count_for_low_precision_float!(f8e5m2);
 impl_element_divide_by_count_for_low_precision_float!(f8e5m2fnuz);
 impl_element_divide_by_count_for_low_precision_float!(f8e8m0fnu);
 
-// Implements ordinary arithmetic for a native or half-precision real floating-point type.
+/// Implements ordinary arithmetic for a native or half-precision real floating-point type.
 macro_rules! impl_element_divide_by_count_for_float {
     ($type:ty, $from_count:expr) => {
         impl ElementDivideByCount for $type {
@@ -1364,7 +1364,7 @@ impl_element_divide_by_count_for_float!(f16, |count: usize| f16::from_f64(count 
 impl_element_divide_by_count_for_float!(f32, |count: usize| count as f32);
 impl_element_divide_by_count_for_float!(f64, |count: usize| count as f64);
 
-// Implements complex arithmetic; division by a real count acts componentwise to avoid an unnecessary complex norm.
+/// Implements complex arithmetic. Division by a real count acts componentwise to avoid an unnecessary complex norm.
 macro_rules! impl_element_divide_by_count_for_complex {
     ($component:ty) => {
         impl ElementDivideByCount for Complex<$component> {
@@ -1381,6 +1381,8 @@ macro_rules! impl_element_divide_by_count_for_complex {
 
 impl_element_divide_by_count_for_complex!(f32);
 impl_element_divide_by_count_for_complex!(f64);
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the output [`ArrayType`] produced by reducing `input` along `axes` with `kind`.
 ///
