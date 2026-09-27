@@ -34,7 +34,7 @@ use crate::operations::constants::one::{One, OneOperation};
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::{Select, SelectOperation};
-use crate::operations::cumulative::cumulative_sum::{CumulativeSum, CumulativeSumOperation};
+use crate::operations::cumulative::{Cumulative, CumulativeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
 use crate::operations::manipulation::conversions::{ConvertElementType, ConvertElementTypeOperation};
@@ -934,7 +934,7 @@ impl_differentiable_operation! {
             + From<ConcatenateOperation<ArrayType>>
             + From<CompareOperation<ArrayType>>
             + From<ConvertElementTypeOperation<ArrayType>>
-            + From<CumulativeSumOperation>
+            + From<CumulativeOperation>
             + From<NegOperation<ArrayType>>
             + From<OneOperation<ArrayType>>
             + From<RaggedAllToAllOperation>
@@ -1222,7 +1222,7 @@ where
         + From<BroadcastOperation>
         + From<ConvertElementTypeOperation<ArrayType>>
         + From<CompareOperation<ArrayType>>
-        + From<CumulativeSumOperation>
+        + From<CumulativeOperation>
         + From<NegOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
         + From<ReshapeOperation>
@@ -1908,7 +1908,7 @@ mod tests {
                         kind=add,
                         __SCATTER_DIMENSIONS__
                     ] %17 %16 %13
-                    %19:i64[5] = cumulative_sum [axis=0] %18
+                    %19:i64[5] = cumulative [kind=sum, axis=0] %18
                     %20:i64[4] = slice [start_indices=[0], limit_indices=[4]] %19
                     %21:i64[4] = zero [type=i64[4]]
                     %22:bool[4] = compare [direction=NotEqual] %20 %21

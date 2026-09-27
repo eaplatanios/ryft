@@ -316,14 +316,13 @@ mod tests {
 
     use ryft_core::{
         Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Clamp, Compare, ComparisonDirection, Concatenate,
-        ConvertElementType, ConvertElementTypeOperation, Cos, CumulativeLogSumExp, CumulativeMax, CumulativeMin,
-        CumulativeProduct, CumulativeSum, DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension,
-        DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather, GatherDimensionNumbers, GatherMode,
-        GatherOptions, Ln1p, Log, LogAddExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min, OneLike, Pad,
-        Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter,
-        ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin,
-        Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch,
-        differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
+        ConvertElementType, ConvertElementTypeOperation, Cos, Cumulative, DenseDifferentiableType, Device, DeviceMesh,
+        Differentiate, Dimension, DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather,
+        GatherDimensionNumbers, GatherMode, GatherOptions, Ln1p, Log, LogAddExp, LogicalMesh, Logistic, Max, MeshAxis,
+        MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape,
+        ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind,
+        Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose,
+        TypeError, UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 

@@ -41,9 +41,10 @@ pub use arrays::{
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
 pub use batching::{
     Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedOutputs, BatchedProgram,
-    BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BatchingPolicyProjection,
-    BatchingTracer, BoundaryPreservingBatchedProgram, InterpretableBatchableOperation, MemberBatchableOperation,
-    ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy, batch, batch_projected_operation,
+    BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent,
+    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram,
+    InterpretableBatchableOperation, MemberBatchableOperation, ProgramBatchingOutputAxesPolicy,
+    RecursiveBatchingPolicy, batch, batch_projected_operation,
 };
 pub use captures::{CaptureConstant, CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::{
@@ -84,13 +85,10 @@ pub use operations::{
     BasicIndex, BlockQuantize, Broadcast, BroadcastOperation, CEIL_OPERATION_NAME, CLAMP_OPERATION_NAME,
     COMPARE_OPERATION_NAME, CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME, CONSTANT_OPERATION_NAME,
     CONSTRAIN_SHARDING_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, COS_OPERATION_NAME,
-    CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME, CUMULATIVE_MIN_OPERATION_NAME,
-    CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CUSTOM_JVP_OPERATION_NAME,
-    CUSTOM_VJP_OPERATION_NAME, Ceil, CeilOperation, Clamp, ClampOperation, Compare, CompareOperation,
-    ComparisonDirection, Concatenate, ConcatenateOperation, ConditionOperation, Constant, ConstantOperation,
-    ConstrainSharding, ConstrainShardingOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation,
-    CumulativeLogSumExp, CumulativeLogSumExpOperation, CumulativeMax, CumulativeMaxOperation, CumulativeMin,
-    CumulativeMinOperation, CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation,
+    CUMULATIVE_OPERATION_NAME, CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME, Ceil, CeilOperation, Clamp,
+    ClampOperation, Compare, CompareOperation, ComparisonDirection, Concatenate, ConcatenateOperation,
+    ConditionOperation, Constant, ConstantOperation, ConstrainSharding, ConstrainShardingOperation, ConvertElementType,
+    ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeKind, CumulativeOperation,
     CustomDerivativeBuilder, CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation,
     DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME,
     DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME, DIMENSION_MIN_OPERATION_NAME,
@@ -214,7 +212,7 @@ pub(crate) mod tests {
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
-    use crate::operations::differentiation::custom_jvp::tests::LazyCustomJvpOperation;
+    use crate::operations::differentiation::custom_rules::{CustomRuleOperation, CustomRuleTransposeOperation};
     use crate::operations::{
         AddOperation, BroadcastOperation, CompareOperation, ConditionOperation, ConstantOperation,
         ConvertElementTypeOperation, DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation,
@@ -262,7 +260,6 @@ pub(crate) mod tests {
         CustomWeightedCube(CustomWeightedCubeOperation),
         RuleMarker(RuleMarkerOperation),
         NestedRule(NestedRuleOperation),
-        LazyCustomJvp(LazyCustomJvpOperation),
         ConvertElementType(ConvertElementTypeOperation<ArrayType>),
         Broadcast(BroadcastOperation),
         Transpose(TransposeOperation),
@@ -273,6 +270,8 @@ pub(crate) mod tests {
         Select(SelectOperation<ArrayType>),
         Condition(ConditionOperation<Array>),
         LinearCall(LinearCallOperation<ArrayType>),
+        CustomRule(CustomRuleOperation<Array, TestArrayOperation>),
+        CustomRuleTranspose(CustomRuleTransposeOperation<Array, TestArrayOperation>),
     }
 
     // Like `ArrayOperation`, this reference-free family declares no access layout, but reverse-mode differentiation

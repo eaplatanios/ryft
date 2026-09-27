@@ -23,21 +23,20 @@ use ryft_core::operations::sort::{SORT_OPERATION_NAME, SortDirection, SortOperat
 use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
-    CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME, CUMULATIVE_MIN_OPERATION_NAME,
-    CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CUSTOM_JVP_OPERATION_NAME,
-    CUSTOM_VJP_OPERATION_NAME, CaptureReference, CeilOperation, ClampOperation, ComparisonDirection, ConstantOperation,
-    ConvertElementTypeOperation, CosOperation, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation,
-    DimensionType, DimensionValue, DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass,
-    EffectClasses, ErfOperation, ExpOperation, ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation,
-    Instruction, IotaOperation, LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation, LogAddExpOperation, LogOperation,
-    LogicalMesh, LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation,
-    Operation, PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program,
-    ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode,
-    RaggedDotOperation, ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation, ReverseOperation,
-    RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode,
-    ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation,
-    SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType,
-    TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    CUMULATIVE_OPERATION_NAME, CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME, CaptureReference, CeilOperation,
+    ClampOperation, ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CosOperation, CumulativeKind,
+    DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DivOperation,
+    DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
+    ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, Instruction, IotaOperation,
+    LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalMesh,
+    LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
+    PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError,
+    ProjectedValue, Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation,
+    ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation, ReverseOperation, RoundOperation,
+    RsqrtOperation, SCAN_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation,
+    ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation,
+    SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed,
+    Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -2224,7 +2223,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Ln1pOperation<ArrayType
 }
 
 // StableHLO has no `logaddexp` primitive, so the operation lowers by expanding the guarded construction that
-// `ryft-core` pins, shared with the `cumulative_log_sum_exp` reducer body through `lower_log_add_exp_to_mlir`.
+// `ryft-core` pins, shared with the log-sum-exp `cumulative` reducer body through `lower_log_add_exp_to_mlir`.
 impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogAddExpOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -5822,66 +5821,10 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 )?;
                 Ok(vec![value])
             }
-            ArrayOperation::CumulativeSum(operation) => {
+            ArrayOperation::Cumulative(operation) => {
                 check_count!("output", output_types, 1, ProgramError);
                 let value = lower_cumulative_to_mlir(
-                    CumulativeKind::Sum,
-                    operation.axis(),
-                    operation.reverse(),
-                    input_values[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                Ok(vec![value])
-            }
-            ArrayOperation::CumulativeProduct(operation) => {
-                check_count!("output", output_types, 1, ProgramError);
-                let value = lower_cumulative_to_mlir(
-                    CumulativeKind::Product,
-                    operation.axis(),
-                    operation.reverse(),
-                    input_values[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                Ok(vec![value])
-            }
-            ArrayOperation::CumulativeMax(operation) => {
-                check_count!("output", output_types, 1, ProgramError);
-                let value = lower_cumulative_to_mlir(
-                    CumulativeKind::Max,
-                    operation.axis(),
-                    operation.reverse(),
-                    input_values[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                Ok(vec![value])
-            }
-            ArrayOperation::CumulativeMin(operation) => {
-                check_count!("output", output_types, 1, ProgramError);
-                let value = lower_cumulative_to_mlir(
-                    CumulativeKind::Min,
-                    operation.axis(),
-                    operation.reverse(),
-                    input_values[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                Ok(vec![value])
-            }
-            ArrayOperation::CumulativeLogSumExp(operation) => {
-                check_count!("output", output_types, 1, ProgramError);
-                let value = lower_cumulative_to_mlir(
-                    CumulativeKind::LogSumExp,
+                    operation.kind(),
                     operation.axis(),
                     operation.reverse(),
                     input_values[0],
@@ -11227,7 +11170,7 @@ fn lower_complex_ln_1p_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// `isnan(a - b)` arm routes the cases whose difference is undefined through `a + b`, which pins `(+∞, +∞) ↦ +∞`,
 /// `(-∞, -∞) ↦ -∞`, and NaN propagation. Both operands must already carry the same tensor type, which is what the
 /// callers guarantee: the elementwise operation normalizes its broadcast operands, and the
-/// `cumulative_log_sum_exp` reducer body applies the same expansion to two scalar block arguments.
+/// log-sum-exp `cumulative` reducer body applies the same expansion to two scalar block arguments.
 /// Narrow real formats evaluate the entire composition in `f32` before converting back. Complex values use
 /// `max(a, b) + ln_1p(exp(min(a, b) - max(a, b)))`, with lexicographic extrema and an imaginary part wrapped
 /// to `[-pi, pi)`.
@@ -11641,117 +11584,78 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(result.result(0).expect("stablehlo.add should return one result").as_ref())
 }
 
-/// Combining operator of one prefix scan, selecting the `stablehlo.reduce_window` reducer body and the initial value
-/// that makes the padded window positions of [`lower_cumulative_to_mlir`] inert.
-#[derive(Copy, Clone, Debug)]
-enum CumulativeKind {
-    /// Prefix summation, whose identity is zero.
-    Sum,
-
-    /// Prefix product, whose identity is one.
-    Product,
-
-    /// Running maximum, whose identity is the element data type's lowest value.
-    Max,
-
-    /// Running minimum, whose identity is the element data type's highest value.
-    Min,
-
-    /// Running `log(sum(exp(x)))`, whose identity is negative infinity, the value whose exponential is the inner
-    /// sum's zero identity.
-    LogSumExp,
+/// Builds the scalar `tensor<{element_type}>` value seeding every window of a prefix scan's `reduce_window`, which is the
+/// identity of the combining operator selected by `kind`, so that the padded positions of a window cannot change its
+/// prefix.
+fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
+    kind: CumulativeKind,
+    element_type: DataType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    match kind {
+        CumulativeKind::Sum => {
+            build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)
+        }
+        // A scalar `one` reaches the same real and complex constant synthesis that the `one` primitive lowers through,
+        // which the reduction identities do not cover because no reduction kind multiplies.
+        CumulativeKind::Product => {
+            Ok(lower_unplaced_constant_output(&[ArrayType::scalar(element_type)], 1, block, context, location)?[0])
+        }
+        CumulativeKind::Max => {
+            build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
+        }
+        CumulativeKind::Min => {
+            build_reduction_identity_constant(ReductionKind::Min, element_type, block, context, location)
+        }
+        // Formats with infinity use negative infinity; supported finite-only formats use their lowest value, which
+        // remains an identity after each rounded pairwise combination regardless of prefix length.
+        CumulativeKind::LogSumExp => {
+            build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
+        }
+    }
 }
 
-impl CumulativeKind {
-    /// Returns the canonical `ryft-core` operation name of the prefix scan combining with this operator, used in
-    /// lowering diagnostics.
-    fn operation_name(self) -> &'static str {
-        match self {
-            CumulativeKind::Sum => CUMULATIVE_SUM_OPERATION_NAME,
-            CumulativeKind::Product => CUMULATIVE_PRODUCT_OPERATION_NAME,
-            CumulativeKind::Max => CUMULATIVE_MAX_OPERATION_NAME,
-            CumulativeKind::Min => CUMULATIVE_MIN_OPERATION_NAME,
-            CumulativeKind::LogSumExp => CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME,
-        }
+/// Builds the scalar reducer body region of a prefix scan's `reduce_window` for the combining operator selected by
+/// `kind`. The three combiners that a reduction kind also names delegate to [`build_reduce_body_region`] verbatim,
+/// which keeps the extrema on the same portable total-order expansion that `reduce` emits. The other two build their own
+/// region over the same pair of scalar block arguments.
+fn build_cumulative_body_region<'c, 't>(
+    kind: CumulativeKind,
+    element_type: DataType,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
+    let reduction_kind = match kind {
+        CumulativeKind::Sum => Some(ReductionKind::Sum),
+        CumulativeKind::Max => Some(ReductionKind::Max),
+        CumulativeKind::Min => Some(ReductionKind::Min),
+        CumulativeKind::Product | CumulativeKind::LogSumExp => None,
+    };
+    if let Some(reduction_kind) = reduction_kind {
+        return build_reduce_body_region(reduction_kind, element_type, context, location);
     }
 
-    /// Builds the scalar `tensor<{element_type}>` value seeding every window of the scan's `reduce_window`, which is
-    /// the identity of the combining operator so that the padded positions of a window cannot change its prefix.
-    fn build_initial_value<'b, 'c: 'b, 't: 'c>(
-        self,
-        element_type: DataType,
-        block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-        match self {
-            CumulativeKind::Sum => {
-                build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)
-            }
-            // A scalar `one` reaches the same real and complex constant synthesis that the `one` primitive lowers
-            // through, which the reduction identities do not cover because no reduction kind multiplies.
-            CumulativeKind::Product => {
-                Ok(lower_unplaced_constant_output(&[ArrayType::scalar(element_type)], 1, block, context, location)?[0])
-            }
-            CumulativeKind::Max => {
-                build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
-            }
-            CumulativeKind::Min => {
-                build_reduction_identity_constant(ReductionKind::Min, element_type, block, context, location)
-            }
-            // Formats with infinity use negative infinity; supported finite-only formats use their lowest value,
-            // which remains an identity after each rounded pairwise combination regardless of prefix length.
-            CumulativeKind::LogSumExp => {
-                build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
-            }
+    // The remaining two combiners own their body, which they build over a pair of scalar block arguments.
+    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
+    let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
+    let mut region = context.region();
+    let mut block_ref = region.append_block(block)?;
+    let left = block_ref.argument(0)?.as_ref();
+    let right = block_ref.argument(1)?.as_ref();
+    let body_value = match kind {
+        CumulativeKind::LogSumExp => {
+            lower_log_add_exp_to_mlir(left, right, &ArrayType::scalar(element_type), &mut block_ref, context, location)?
         }
-    }
-
-    /// Builds the scalar reducer body region of the scan's `reduce_window`. The three combiners that a reduction
-    /// kind also names delegate to [`build_reduce_body_region`] verbatim, which keeps the extrema on the same
-    /// portable total-order expansion that `reduce` emits. The other two build their own region over the same pair
-    /// of scalar block arguments.
-    fn build_body_region<'c, 't>(
-        self,
-        element_type: DataType,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
-        // This scalar block scaffold belongs to the two combiners that own their body; the other three return the
-        // region `build_reduce_body_region` builds for them and leave it unused.
-        let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
-        let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
-        let mut region = context.region();
-        let mut block_ref = region.append_block(block)?;
-        let left = block_ref.argument(0)?.as_ref();
-        let right = block_ref.argument(1)?.as_ref();
-        let body_value = match self {
-            CumulativeKind::Sum => {
-                return build_reduce_body_region(ReductionKind::Sum, element_type, context, location);
-            }
-            CumulativeKind::Max => {
-                return build_reduce_body_region(ReductionKind::Max, element_type, context, location);
-            }
-            CumulativeKind::Min => {
-                return build_reduce_body_region(ReductionKind::Min, element_type, context, location);
-            }
-            CumulativeKind::Product => block_ref
-                .append_operation(stable_hlo::multiply(left, right, location)?)?
-                .result(0)
-                .expect("stablehlo.multiply should return one result")
-                .as_ref(),
-            CumulativeKind::LogSumExp => lower_log_add_exp_to_mlir(
-                left,
-                right,
-                &ArrayType::scalar(element_type),
-                &mut block_ref,
-                context,
-                location,
-            )?,
-        };
-        block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
-        Ok(region)
-    }
+        _ => block_ref
+            .append_operation(stable_hlo::multiply(left, right, location)?)?
+            .result(0)
+            .expect("stablehlo.multiply should return one result")
+            .as_ref(),
+    };
+    block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
+    Ok(region)
 }
 
 /// Lowers one prefix-scan dispatch to a `stablehlo.reduce_window` whose window spans the whole scanned axis.
@@ -11782,7 +11686,7 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
         Some(Dimension::Static(extent)) => *extent,
         _ => {
             return Err(LoweringError::UnsupportedOp {
-                op: format!("`{}` over dynamically sized axis {axis}", kind.operation_name()),
+                op: format!("`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` over dynamically sized axis {axis}"),
             });
         }
     };
@@ -11795,13 +11699,13 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
     if matches!(kind, CumulativeKind::LogSumExp) && matches!(element_type, DataType::F8E8M0FNU | DataType::F6E2M3FN) {
         return Err(LoweringError::UnsupportedOp {
             op: format!(
-                "`{}` over `{element_type}`, whose lowest value is not a `log_add_exp` identity",
-                kind.operation_name(),
+                "`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` over `{element_type}`, whose lowest value is not a \
+                 `log_add_exp` identity",
             ),
         });
     }
-    let initial_value = kind.build_initial_value(element_type, block, context, location)?;
-    let body_region = kind.build_body_region(element_type, context, location)?;
+    let initial_value = build_cumulative_initial_value(kind, element_type, block, context, location)?;
+    let body_region = build_cumulative_body_region(kind, element_type, context, location)?;
     let rank = output_array_type.rank();
     let mut window_dimensions = vec![1; rank];
     window_dimensions[axis] = extent;
@@ -12749,8 +12653,7 @@ mod tests {
         AndOperation, Array as CpuArray, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation,
         ArrayOperation, Atan2Operation, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
         BroadcastOperation, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation, ConstantOperation,
-        Context, Cos, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
-        CumulativeProductOperation, CumulativeSumOperation, Device, DeviceMesh, Differentiate, Dimension,
+        Context, Cos, CumulativeKind, CumulativeOperation, Device, DeviceMesh, Differentiate, Dimension,
         DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation, DimensionOperation,
         DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers,
         DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation,
@@ -18142,7 +18045,7 @@ mod tests {
         // identity that also seeds the window.
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::CumulativeSum(CumulativeSumOperation::new(0)),
+                ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::Sum)),
                 DataType::F32,
                 vec![4],
             )
@@ -18169,7 +18072,7 @@ mod tests {
         // output position `i` covers input positions `i..n`.
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::CumulativeSum(CumulativeSumOperation::new(0).with_reverse(true)),
+                ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::Sum).with_reverse(true)),
                 DataType::F32,
                 vec![4],
             )
@@ -18196,7 +18099,7 @@ mod tests {
         // per row rather than mixing rows.
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::CumulativeSum(CumulativeSumOperation::new(1)),
+                ArrayOperation::Cumulative(CumulativeOperation::new(1, CumulativeKind::Sum)),
                 DataType::F32,
                 vec![2, 3],
             )
@@ -18223,7 +18126,7 @@ mod tests {
         // so the lowering forwards the operand instead of emitting any operation.
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::CumulativeSum(CumulativeSumOperation::new(0)),
+                ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::Sum)),
                 DataType::F32,
                 vec![0, 2],
             )
@@ -18244,7 +18147,7 @@ mod tests {
         // reducer body and in the multiplicative identity seeding every window.
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::CumulativeProduct(CumulativeProductOperation::new(0)),
+                ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::Product)),
                 DataType::F32,
                 vec![4],
             )
@@ -18271,7 +18174,7 @@ mod tests {
         // body that `reduce` uses, so signed zeros order correctly and NaNs propagate on every backend.
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::CumulativeMax(CumulativeMaxOperation::new(0)),
+                ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::Max)),
                 DataType::F32,
                 vec![4],
             )
@@ -18303,7 +18206,7 @@ mod tests {
         // flips the padding exactly as the summation's does.
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::CumulativeMin(CumulativeMinOperation::new(0).with_reverse(true)),
+                ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::Min).with_reverse(true)),
                 DataType::F32,
                 vec![4],
             )
@@ -18335,7 +18238,7 @@ mod tests {
         // seeds its windows with negative infinity, whose exponential is the inner sum's zero identity.
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+                ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::LogSumExp)),
                 DataType::F32,
                 vec![4],
             )
@@ -18380,7 +18283,7 @@ mod tests {
         let input = builder.add_input(dynamic_type.clone());
         let output = builder.add_variable(dynamic_type);
         builder.add_instruction_unchecked(Instruction::new(
-            ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+            ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::LogSumExp)),
             vec![input],
             vec![output],
             Vec::new(),
@@ -18391,7 +18294,7 @@ mod tests {
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main"),
             Err(LoweringError::UnsupportedOp {
-                op: "`cumulative_log_sum_exp` over dynamically sized axis 0".to_string(),
+                op: "`cumulative` with kind `log_sum_exp` over dynamically sized axis 0".to_string(),
             }),
         );
     }
@@ -18405,7 +18308,7 @@ mod tests {
             let input = builder.add_input(array_type.clone());
             let output = builder.add_variable(array_type);
             builder.add_instruction_unchecked(Instruction::new(
-                ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+                ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::LogSumExp)),
                 vec![input],
                 vec![output],
                 Vec::new(),
@@ -18421,8 +18324,8 @@ mod tests {
                 to_mlir_module_for_plain_program(&program, "main"),
                 Err(LoweringError::UnsupportedOp {
                     op: format!(
-                        "`cumulative_log_sum_exp` over `{element_type}`, whose lowest value is not a `log_add_exp` \
-                         identity",
+                        "`cumulative` with kind `log_sum_exp` over `{element_type}`, whose lowest value is not a \
+                         `log_add_exp` identity",
                     ),
                 }),
             );
@@ -18439,7 +18342,7 @@ mod tests {
         ] {
             assert!(
                 lowered_unary_module(
-                    ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+                    ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::LogSumExp)),
                     data_type,
                     vec![3000],
                 )

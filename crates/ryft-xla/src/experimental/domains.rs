@@ -5042,13 +5042,9 @@ fn array_data_dependent_padding_discipline(
         ArrayOperation::Scatter(operation) => scatter_data_dependent_padding_discipline(operation.kind()),
         // A prefix scan mixes positions only along its scanned axis, and type inference already requires that axis to
         // be static, so a data-derived extent can only sit on an axis the scan treats elementwise. That reasoning is
-        // the same for every combining operator of the family, so all five members share this arm, and the prefix sum
-        // in `data_derived_padding_fixture` executes it with the data-derived extent on the unscanned axis.
-        ArrayOperation::CumulativeSum(_)
-        | ArrayOperation::CumulativeProduct(_)
-        | ArrayOperation::CumulativeMax(_)
-        | ArrayOperation::CumulativeMin(_)
-        | ArrayOperation::CumulativeLogSumExp(_) => Propagated,
+        // the same for every combining operator, and the prefix sum in `data_derived_padding_fixture` executes this arm
+        // with the data-derived extent on the unscanned axis.
+        ArrayOperation::Cumulative(_) => Propagated,
         ArrayOperation::Dot(_) => XlaZeroPadded,
         ArrayOperation::RaggedDot(_) => {
             Unsupported { reason: "group-size metadata may describe positions in bounded physical padding" }
@@ -6263,21 +6259,20 @@ mod tests {
         BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver, CaptureReference, CompareOperation,
         ComparisonDirection, CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher,
         ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
-        CotangentDestinationKind, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
-        CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, Dimension, DimensionAddOperation,
-        DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation,
-        DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
-        DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, DynamicGather, DynamicReshape,
-        DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions,
-        DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers,
-        GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
-        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
-        ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter,
-        ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding,
-        ShardingDimension, SliceOperation, StagingContext, StaticShape, SubOperation, TracingContext, WhileOperation,
-        ZeroOperation, batch, try_jit_with_options,
+        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomJvpOperation, Dimension,
+        DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMulOperation,
+        DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
+        DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
+        DynamicGather, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
+        DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather,
+        GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization,
+        MulOperation, NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation,
+        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation,
+        ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
+        SelectOperation, Sharding, ShardingDimension, SliceOperation, StagingContext, StaticShape, SubOperation,
+        TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -6711,8 +6706,9 @@ mod tests {
         let log_sum_exp = builder
             .add_instruction(ReduceOperation::new(vec![1], ReductionKind::LogSumExp), Vec::new(), vec![matrix], None)
             .unwrap()[0];
-        let cumulative_sum =
-            builder.add_instruction(CumulativeSumOperation::new(1), Vec::new(), vec![matrix], None).unwrap()[0];
+        let cumulative_sum = builder
+            .add_instruction(CumulativeOperation::new(1, CumulativeKind::Sum), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
         builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![
@@ -10595,14 +10591,17 @@ mod tests {
 
         // The prefix scans own their own arm rather than sharing the collapsed shape-preserving one, because the
         // classification rests on type inference keeping the scanned axis static.
-        for operation in [
-            ArrayOperation::CumulativeSum(CumulativeSumOperation::new(0)),
-            ArrayOperation::CumulativeProduct(CumulativeProductOperation::new(0)),
-            ArrayOperation::CumulativeMax(CumulativeMaxOperation::new(0)),
-            ArrayOperation::CumulativeMin(CumulativeMinOperation::new(0)),
-            ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+        for kind in [
+            CumulativeKind::Sum,
+            CumulativeKind::Product,
+            CumulativeKind::Max,
+            CumulativeKind::Min,
+            CumulativeKind::LogSumExp,
         ] {
-            assert_eq!(array_data_dependent_padding_discipline(&operation), Propagated);
+            assert_eq!(
+                array_data_dependent_padding_discipline(&ArrayOperation::Cumulative(CumulativeOperation::new(0, kind))),
+                Propagated,
+            );
         }
     }
 
