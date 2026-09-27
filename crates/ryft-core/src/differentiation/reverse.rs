@@ -3111,11 +3111,11 @@ pub trait ReverseModeDifferentiate:
     /// with this [`Context`] executing (or staging) the primal-side operations. Refer to the documentation of
     /// [`DifferentiationBuilder::vjp`](crate::DifferentiationBuilder::vjp) for the reverse-mode transform.
     ///
-    /// This function constructs the derivative program using [`DifferentiableOperation::jvp_for_transpose`], whose
-    /// default delegates to [`DifferentiableOperation::jvp`]. Overrides may choose different saved residuals and
-    /// derivative programs without changing public forward linearization. The returned pullback retains the derivative
-    /// program and transposes it on its first application for the [`CotangentDestination`]s chosen then (refer to the
-    /// documentation of [`Pullback`]), so transposition errors surface on that first application rather than here.
+    /// Reverse mode builds its linearization with [`DifferentiableOperation::jvp_for_transpose`] (which defaults to
+    /// [`DifferentiableOperation::jvp`]), so overrides can choose different residuals and derivative programs without
+    /// affecting forward-mode linearization. The returned pullback retains the derivative program and transposes it
+    /// on its first application for the [`CotangentDestination`]s chosen then (refer to the documentation of
+    /// [`Pullback`]), so transposition errors surface on that first application rather than here.
     #[allow(clippy::type_complexity)]
     fn vjp<
         F: FnOnce(

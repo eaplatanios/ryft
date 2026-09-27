@@ -474,6 +474,21 @@ impl<
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
+        _context: &DifferentiationContext<C, P>,
+        _driver: &D,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "cannot apply forward-mode differentiation to a {CUSTOM_VJP_OPERATION_NAME} call; it supports \
+                 only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
+            ),
+        }
+        .into())
+    }
+
+    fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
         context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
@@ -487,9 +502,9 @@ impl<
         //   L_(p,r): ẋ ↦ ẏ.
         //
         // `LinearCallOperation` knows only how to transpose that map: its transpose replays `backward(p, r, ȳ) = x̄`.
-        // An eager forward-mode use attempts to execute `L_(p,r)` and is therefore rejected, while reverse mode
-        // transposes it without execution. Passing `p` and `r` as the carrier's leading residual inputs keeps the path
-        // capture-free and exposes every dependency as an ordinary Single Static Assignment (SSA) edge.
+        // Reverse mode transposes it without execution; executable forward requests reject in `jvp` before this
+        // preparation begins. Passing `p` and `r` as the carrier's leading residual inputs keeps the path capture-free
+        // and exposes every dependency as an ordinary Single Static Assignment (SSA) edge.
         //
         // The attached regions are `["primal", "forward", "backward"]` and the primal interface provides
         // the boundary types.
@@ -564,21 +579,7 @@ impl<
         let carrier =
             LinearCallOperation::transpose_only(leading_input_count, input_tangent_types, output_tangent_types);
 
-        // Any context that must _execute_ the carrier (i.e., an eager forward-mode pass or a forward-mode pass over an
-        // already staged carrier) rejects it as unsupported. Restate that rejection in `custom_vjp` vocabulary instead
-        // of leaking the internals of the carrier.
-        let output_tangents = context
-            .tangent()
-            .bind(carrier, vec![backward_region.to_program()], &carrier_inputs)
-            .map_err(|error| match error {
-                ProgramError::UnsupportedOperation { .. } => ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "cannot apply forward-mode differentiation to a {CUSTOM_VJP_OPERATION_NAME} call; it supports \
-                         only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
-                    ),
-                },
-                error => error,
-            })?;
+        let output_tangents = context.tangent().bind(carrier, vec![backward_region.to_program()], &carrier_inputs)?;
         check_count!("output", output_tangents, output_count, ProgramError);
 
         primal_outputs
@@ -589,11 +590,10 @@ impl<
     }
 }
 
-// The raw carrier is intentionally non-transposable, which does not restrict reverse-mode differentiation. Reverse
-// mode linearizes first, and the JVP rule replaces `f(p, x)` with the opaque linear map `L_(p,r): ẋ ↦ ẏ` (i.e., the
-// analogue of JAX's `custom_lin` primitive), so reverse mode transposes that `LinearCallOperation`, whose rule
-// evaluates `backward(p, r, ȳ) = x̄`. Therefore, only an invalid direct transpose of an un-linearized custom VJP call
-// can reach this rejection path.
+// The raw carrier is intentionally non-transposable, which does not restrict reverse-mode differentiation.
+// Reverse mode linearizes first, and its `jvp_for_transpose` rule replaces `f(p, x)` with the opaque linear map
+// `L_(p,r): ẋ ↦ ẏ`. Reverse mode transposes that `LinearCallOperation`, whose rule evaluates `backward(p, r, ȳ) = x̄`.
+// Therefore, only an invalid direct transpose of an un-linearized custom VJP call can reach this rejection path.
 impl_non_transposable_operation!(<T> CustomVjpOperation<T> where T: DifferentiableType);
 
 /// Function with user-supplied forward and backward (i.e., Vector-Jacobian Product or VJP) rules, built by
@@ -811,12 +811,16 @@ impl<
 ///     lowering support; the closure cannot execute arbitrary external code on tracer values.
 ///   - **Numerical Stability:** Replace an unstable or wasteful automatically derived gradient with a handwritten one.
 ///
-/// Direct forward-mode differentiation of a staged custom VJP call is rejected because no pushforward rule was
-/// supplied. Its generated pullback, however, contains the backward program's operations and can itself be
-/// differentiated when those operations and the residual-producing computation support the requested transforms.
-/// This includes reverse-over-reverse and forward-over-reverse differentiation; it does not supply a forward rule
-/// for a nested custom VJP encountered along either path. Use [`custom_jvp`](fn@crate::custom_jvp) when callers need
-/// direct forward-mode differentiation as well as reverse mode.
+/// Active forward-mode differentiation and reusable forward linearization reject a custom VJP call before executing
+/// its forward preparation, because no pushforward rule was supplied. This rejection also occurs when constructing
+/// staged forward derivatives, rather than waiting for their execution. Calls with no active derivative inputs can
+/// still execute their primal directly.
+///
+/// The generated pullback contains the backward program's operations and can itself be differentiated when
+/// those operations and the residual-producing computation support the requested transforms. This includes
+/// reverse-over-reverse and forward-over-reverse differentiation; it does not supply a forward rule for a nested
+/// custom VJP encountered along either path. Use [`custom_jvp`](fn@crate::custom_jvp) when callers need direct
+/// forward-mode differentiation as well as reverse mode.
 ///
 /// # Calling Convention
 ///
@@ -882,10 +886,10 @@ impl<
 ///   - _batching_ preserves the call around axis-reconciled batched copies of all three programs, so that the custom
 ///     derivative survives batching applied _before_ differentiation, and it sums the cotangents that the batched
 ///     backward program produces for replicated inputs over the batch axis, and
-///   - _differentiation_ replays the forward program for the primal outputs and residuals and stages a transpose-only
-///     linear call for the output tangents whose transpose replays the backward program, so reverse mode uses exactly
-///     the user-supplied gradient. Because that linear call cannot be executed, forward-mode differentiation of a
-///     staged call is rejected, and the staged call itself is never transposed.
+///   - _reverse-mode differentiation_ replays the forward program for the primal outputs and residuals and stages a
+///     transpose-only linear call whose transpose replays the backward program, so reverse mode uses exactly the
+///     user-supplied gradient. Executable forward derivatives reject before replaying the forward program, including
+///     when constructing staged derivatives, and the original custom call is never transposed.
 ///
 /// # Parameters
 ///
@@ -918,17 +922,16 @@ mod tests {
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{CotangentDestination, CotangentSeed, differentiate_at};
+    use crate::differentiation::{CotangentDestination, CotangentSeed, DifferentiationRule, differentiate_at};
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::assertions::AssertOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::differentiation::custom_jvp::tests::nested_custom_derivative_state_program;
-    use crate::operations::differentiation::tests::{
-        ReferenceRuleDifferentiationDriver, custom_derivative_call_program,
-    };
+    use crate::operations::differentiation::tests::custom_derivative_call_program;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::operations::references::{
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceWrite,
+        ReferenceAddUpdate, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceWrite,
     };
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
@@ -1392,7 +1395,10 @@ mod tests {
         assert!(!program.entry_region_ref().contains_references_in_closure());
         let input = ArrayIrValue::Array(Array::scalar(5.0f32).unwrap());
         assert_eq!(program.interpret(vec![input.clone()]), Ok(vec![input.clone()]));
-        let linearization = program.linearize().unwrap();
+        let linearization = program
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .unwrap();
         let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
         let mut cotangents = vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())];
         cotangents.extend(primal_outputs.split_off(1));
@@ -1496,7 +1502,11 @@ mod tests {
         assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
         assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::CustomVjp(_)));
-        let linearization = evaluation.program.linearize().unwrap();
+        let linearization = evaluation
+            .program
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .unwrap();
         let mut outputs = linearization.primal().interpret(vec![Array::scalar(2.0).unwrap()]).unwrap();
         assert_eq!(outputs.remove(0), Array::scalar(2.0f64.sin()).unwrap());
         let mut cotangents = vec![Array::scalar(1.0).unwrap()];
@@ -1595,7 +1605,10 @@ mod tests {
         );
 
         // Unequal output cotangents verify the actual reduction, not just the presence of a reduce instruction.
-        let linearization = batched.linearize().unwrap();
+        let linearization = batched
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose)
+            .unwrap();
         let mut outputs = linearization
             .primal()
             .interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap(), Array::scalar(5.0).unwrap()])
@@ -1740,7 +1753,10 @@ mod tests {
             .unwrap()[0];
         let custom =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let linearization = custom.linearize().unwrap();
+        let linearization = custom
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .unwrap();
         assert_eq!(linearization.residual_count(), 0);
         let custom_pullback = linearization.tangent().transpose().unwrap();
         assert_eq!(custom_pullback.interpret(vec![Array::scalar(3.0).unwrap()]), Ok(vec![Array::scalar(9.0).unwrap()]));
@@ -1755,9 +1771,8 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_differentiation_rejects_forward_mode() {
-        // A custom VJP supplies no tangent program, so the tangent carrier that its JVP rule stages cannot be executed.
-        // Forward mode must therefore fail with a user-facing custom-VJP error rather than leaking the internal
-        // vocabulary of the carrier.
+        // A custom VJP supplies no executable tangent rule. Forward mode rejects before reverse preparation begins,
+        // with the same custom-VJP diagnostic whether evaluating immediately or constructing staged derivatives.
         assert!(matches!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| {
                 let scalar_type = ArrayType::scalar(DataType::F64);
@@ -1775,17 +1790,84 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_vjp_differentiation_nested_local_reference_state() {
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let input = DifferentiationDual::new(
-            ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()),
-            ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()),
+    fn test_custom_vjp_differentiation_rejects_forward_before_preparation() {
+        let function = custom_vjp(
+            |(counter, input): (ArrayIrTracer, ArrayIrTracer)| {
+                counter.add_update(&input)?;
+                Ok(input)
+            },
+            |(counter, input)| {
+                counter.add_update(&input)?;
+                Ok((input, counter))
+            },
+            |counter, cotangent| Ok((counter, cotangent)),
+        )
+        .with_non_differentiated_count(1);
+        let counter = ArrayReference::new(Array::scalar(0.0f32).unwrap());
+        let counter_tangent = ArrayReference::new(Array::scalar(0.0f32).unwrap());
+        let inputs = (ArrayIrValue::Reference(counter.clone()), ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()));
+        let tangents =
+            (ArrayIrValue::Reference(counter_tangent.clone()), ArrayIrValue::Array(Array::scalar(1.0f32).unwrap()));
+        assert!(matches!(
+            differentiate_at(inputs.clone()).jvp(tangents, |inputs| function.call(inputs)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == FORWARD_MODE_REJECTION,
+        ));
+        assert!(matches!(
+            differentiate_at(inputs.clone()).linearize(|inputs| function.call(inputs)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == FORWARD_MODE_REJECTION,
+        ));
+        assert_eq!(counter.read(), Ok(Array::scalar(0.0f32).unwrap()));
+        assert_eq!(counter_tangent.read(), Ok(Array::scalar(0.0f32).unwrap()));
+
+        // Building executable forward derivatives of an already staged call rejects immediately too: neither
+        // request returns an artifact that defers the error until its transpose-only carrier is executed.
+        let (_, program) = ArrayIrContext::trace(
+            |inputs| function.call(inputs),
+            (
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+            ),
         )
         .unwrap();
+        assert!(matches!(
+            program.entry_region_ref().jvp(&[1]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == FORWARD_MODE_REJECTION,
+        ));
+        assert!(matches!(
+            program.entry_region_ref().linearize(&[1]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == FORWARD_MODE_REJECTION,
+        ));
+        assert_eq!(counter.read(), Ok(Array::scalar(0.0f32).unwrap()));
 
-        // A forward rule may allocate and use local reference state inside a dormant nested rule: it is replayed
-        // directly (the driver makes recursive differentiation an assertion failure), so forward mode reaches the
-        // transpose-only carrier and fails with the custom-VJP forward-mode rejection rather than a state rejection.
+        // Reverse preparation still executes the state update exactly once. Reusing the pullback executes only
+        // the identity backward rule and preserves the saved caller-owned reference.
+        let (value, pullback) = differentiate_at(inputs).vjp(|inputs| function.call(inputs)).unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()));
+        assert_eq!(counter.read(), Ok(Array::scalar(3.0f32).unwrap()));
+        assert_eq!(
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())),
+                (CotangentDestination::Ignore, CotangentDestination::Return),
+            ),
+            Ok((None, Some(ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())))),
+        );
+        assert_eq!(
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(ArrayIrValue::Array(Array::scalar(5.0f32).unwrap())),
+                (CotangentDestination::Ignore, CotangentDestination::Return),
+            ),
+            Ok((None, Some(ArrayIrValue::Array(Array::scalar(5.0f32).unwrap())))),
+        );
+        assert_eq!(counter.read(), Ok(Array::scalar(3.0f32).unwrap()));
+    }
+
+    #[test]
+    fn test_custom_vjp_differentiation_nested_local_reference_state() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let identity = {
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
             let input = builder.add_input(scalar_type.clone());
@@ -1797,18 +1879,29 @@ mod tests {
                 )
                 .unwrap()
         };
+
+        // Reverse preparation replays a forward region with local state inside a dormant nested custom rule.
+        // It preserves the nested primal semantics without trying to differentiate the preparation itself.
         let forward = nested_custom_derivative_state_program(&scalar_type, false);
         assert!(forward.entry_region_ref().contains_effect_in_closure(EffectClass::OrderedState));
-        let driver = ReferenceRuleDifferentiationDriver { programs: vec![identity.clone(), forward, identity] };
-        assert!(matches!(
-            CustomVjpOperation::<ArrayIrType>::new().jvp(
-                &DifferentiationContext::fused(ArrayIrContext::new()),
-                &driver,
-                std::slice::from_ref(&input),
-            ),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == FORWARD_MODE_REJECTION,
-        ));
+        let program = custom_derivative_call_program(
+            CustomVjpOperation::new(),
+            vec![identity.clone(), forward, identity],
+            vec![scalar_type],
+        );
+        let linearization = program
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose)
+            .unwrap();
+        let mut outputs =
+            linearization.primal().interpret(vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())]).unwrap();
+        let mut inputs = vec![ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())];
+        inputs.extend(outputs.split_off(1));
+        assert_eq!(outputs, vec![ArrayIrValue::Array(Array::scalar(1.0f32).unwrap())]);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(inputs),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())]),
+        );
     }
 
     #[test]

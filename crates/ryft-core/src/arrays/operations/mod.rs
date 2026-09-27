@@ -21,9 +21,9 @@ use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, Batch
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
-    MemberTransposableOperation, ResidualZeroProvider, TransposableOperation, TranspositionContext,
-    TranspositionDriver, jvp_projected_operation, transpose_projected_operation,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationRule,
+    MemberDifferentiableOperation, MemberTransposableOperation, ResidualZeroProvider, TransposableOperation,
+    TranspositionContext, TranspositionDriver, transpose_projected_operation,
 };
 use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
@@ -945,18 +945,60 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        self.jvp_in_parent_for_rule(context, driver, inputs, DifferentiationRule::Jvp)
+    }
+
+    fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        self.jvp_in_parent_for_rule(context, driver, inputs, DifferentiationRule::JvpForTranspose)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ArrayOperation<A> {
+    /// Applies the explicitly selected member rule and materializes parent-universe structural zeros.
+    fn jvp_in_parent_for_rule<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+        rule: DifferentiationRule,
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
+    where
+        C: Context<
+                Type = ArrayIrType,
+                Constant: ValueProjection<ArrayType, Projected = A>,
+                Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
+                               + From<ArrayIrOperation<A>>
+                               + From<DynamicBroadcastOperation>
+                               + From<DimensionSizeOperation>
+                               + From<DimensionToScalarOperation>
+                               + From<LinearCallOperation<ArrayIrType>>
+                               + From<ZeroOperation<ArrayType>>
+                               + From<ConstantOperation<DimensionValue>>
+                               + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+                               + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+            > + Zero<C::Value>,
+        C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+        ScatterOperation: MemberDifferentiableOperation<C>,
+    {
         let output_duals = match self {
-            Self::Slice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
-            Self::UpdateSlice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
-            Self::DynamicSlice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
-            Self::DynamicUpdateSlice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
-            Self::Gather(operation) => operation.jvp_in_parent(context, driver, inputs)?,
-            Self::Scatter(operation) => operation.jvp_in_parent(context, driver, inputs)?,
-            Self::Reduce(operation) => operation.jvp_in_parent(context, driver, inputs)?,
-            operation => match replicated_elementwise_duals(context, operation, inputs)? {
-                Some(duals) => jvp_projected_operation(context, operation, duals.as_slice())?,
-                None => jvp_projected_operation(context, operation, inputs)?,
-            },
+            Self::Slice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::UpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::DynamicSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::DynamicUpdateSlice(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::Gather(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::Scatter(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            Self::Reduce(operation) => rule.apply_member(operation, context, driver, inputs)?,
+            operation => {
+                let replicated = replicated_elementwise_duals(context, operation, inputs)?;
+                let inputs = replicated.as_deref().unwrap_or(inputs);
+                rule.apply_projected(context, operation, inputs)?
+            }
         };
         output_duals
             .into_iter()

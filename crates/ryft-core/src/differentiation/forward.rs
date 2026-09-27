@@ -3498,7 +3498,8 @@ pub(crate) mod tests {
             _driver: &D,
             _inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            Err(ProgramError::UnsupportedOperation { message: format!("forward with {:?}", context.rule()) }.into())
+            Err(ProgramError::UnsupportedOperation { message: format!("forward with rule `{:?}`", context.rule()) }
+                .into())
         }
 
         fn jvp_for_transpose<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -3507,7 +3508,8 @@ pub(crate) mod tests {
             _driver: &D,
             _inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            Err(ProgramError::UnsupportedOperation { message: format!("reverse with {:?}", context.rule()) }.into())
+            Err(ProgramError::UnsupportedOperation { message: format!("reverse with rule `{:?}`", context.rule()) }
+                .into())
         }
     }
 
@@ -3518,8 +3520,10 @@ pub(crate) mod tests {
             _driver: &D,
             _inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            Err(ProgramError::UnsupportedOperation { message: format!("parent forward with {:?}", context.rule()) }
-                .into())
+            Err(ProgramError::UnsupportedOperation {
+                message: format!("parent forward with rule `{:?}`", context.rule()),
+            }
+            .into())
         }
 
         fn jvp_for_transpose_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -3528,8 +3532,10 @@ pub(crate) mod tests {
             _driver: &D,
             _inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            Err(ProgramError::UnsupportedOperation { message: format!("parent reverse with {:?}", context.rule()) }
-                .into())
+            Err(ProgramError::UnsupportedOperation {
+                message: format!("parent reverse with rule `{:?}`", context.rule()),
+            }
+            .into())
         }
     }
 
@@ -4264,12 +4270,12 @@ pub(crate) mod tests {
         assert!(matches!(
             DifferentiationRule::Jvp.apply(&RuleProbeOperation, &context, &EmptyRegionDriver, &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "forward with JvpForTranspose",
+                if message == "forward with rule `JvpForTranspose`",
         ));
         assert!(matches!(
             context.rule().apply(&RuleProbeOperation, &context, &EmptyRegionDriver, &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "reverse with JvpForTranspose",
+                if message == "reverse with rule `JvpForTranspose`",
         ));
     }
 
@@ -4279,13 +4285,13 @@ pub(crate) mod tests {
         assert!(matches!(
             DifferentiationRule::JvpForTranspose.apply_member(&RuleProbeOperation, &context, &EmptyRegionDriver, &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "parent reverse with Jvp",
+                if message == "parent reverse with rule `Jvp`",
         ));
         let context = context.with_rule(DifferentiationRule::JvpForTranspose);
         assert!(matches!(
             DifferentiationRule::Jvp.apply_member(&RuleProbeOperation, &context, &EmptyRegionDriver, &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "parent forward with JvpForTranspose",
+                if message == "parent forward with rule `JvpForTranspose`",
         ));
     }
 
@@ -4352,20 +4358,37 @@ pub(crate) mod tests {
         let reverse_jvp =
             program.entry_region_ref().jvp_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose).unwrap();
         assert_eq!(
-            forward_jvp
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec!["mul", "mul", "add", "add", "mul"],
+            forward_jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %0
+                    %3:f64[] = mul %2 %0
+                    %4:f64[] = add %2 %2
+                    %5:f64[] = add %4 %2
+                    %6:f64[] = mul %5 %1
+                in (%3, %6)
+            "}
+            .trim_end(),
         );
         assert_eq!(
-            reverse_jvp
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec!["mul", "mul", "linear_call"],
+            reverse_jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %0 %0
+                    %3:f64[] = mul %2 %0
+                    %4:f64[] = linear_call [residual_count=1, transpose_only=true] %0 %1 [
+                        transpose={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = mul %0 %0
+                                %3:f64[] = add %2 %2
+                                %4:f64[] = add %3 %2
+                                %5:f64[] = mul %4 %1
+                            in (%5)
+                        },
+                    ]
+                in (%3, %4)
+            "}
+            .trim_end(),
         );
         let forward = program.linearize().unwrap();
         let reverse = program
@@ -4375,22 +4398,26 @@ pub(crate) mod tests {
         assert_eq!(forward.residual_count(), 1);
         assert_eq!(reverse.residual_count(), 1);
         assert_eq!(
-            forward
-                .primal()
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec!["mul", "mul", "add", "add"],
+            forward.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = mul %1 %0
+                    %3:f64[] = add %1 %1
+                    %4:f64[] = add %3 %1
+                in (%2, %4)
+            "}
+            .trim_end(),
         );
         assert_eq!(
-            reverse
-                .primal()
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec!["mul", "mul"],
+            reverse.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = mul %1 %0
+                in (%2, %0)
+            "}
+            .trim_end(),
         );
         assert_eq!(
             forward.primal().interpret(vec![Array::scalar(3f64).unwrap()]),
@@ -4421,20 +4448,33 @@ pub(crate) mod tests {
             .unwrap();
         let reverse_jvp =
             program.entry_region_ref().jvp_shared_for_rule(&[1], DifferentiationRule::JvpForTranspose).unwrap();
-        let condition = &reverse_jvp.instructions()[0];
-        assert_eq!(condition.operation().name(), "condition");
-        for &branch in condition.regions() {
-            assert_eq!(
-                reverse_jvp
-                    .region(branch)
-                    .unwrap()
-                    .instructions()
-                    .iter()
-                    .map(|instruction| instruction.operation().name())
-                    .collect::<Vec<_>>(),
-                vec!["mul", "mul", "linear_call"],
-            );
-        }
+        assert_eq!(
+            reverse_jvp.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[] .
+                let %3:f64[], %4:f64[] = condition %0 %1 %2 [
+                    true=^1={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %0 %0
+                            %3:f64[] = mul %2 %0
+                            %4:f64[] = linear_call [residual_count=1, transpose_only=true] %0 %1 [
+                                transpose={
+                                    lambda %0:f64[], %1:f64[] .
+                                    let %2:f64[] = mul %0 %0
+                                        %3:f64[] = add %2 %2
+                                        %4:f64[] = add %3 %2
+                                        %5:f64[] = mul %4 %1
+                                    in (%5)
+                                },
+                            ]
+                        in (%3, %4)
+                    },
+                    false=^1,
+                ]
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
         let reverse = program
             .entry_region_ref()
             .linearize_shared_for_rule(&[1], DifferentiationRule::JvpForTranspose)
@@ -7004,7 +7044,7 @@ pub(crate) mod tests {
         assert!(matches!(
             jvp_projected_operation(&context, &RuleProbeOperation, &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "forward with JvpForTranspose",
+                if message == "forward with rule `JvpForTranspose`",
         ));
     }
 
@@ -7014,7 +7054,7 @@ pub(crate) mod tests {
         assert!(matches!(
             jvp_for_transpose_projected_operation(&context, &RuleProbeOperation, &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "reverse with Jvp",
+                if message == "reverse with rule `Jvp`",
         ));
     }
 
