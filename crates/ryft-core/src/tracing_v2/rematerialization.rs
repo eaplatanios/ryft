@@ -3402,10 +3402,10 @@ mod tests {
         use crate::differentiation::forward::tests::CustomCubeOperation;
         use crate::operations::{
             AddOperation, BroadcastOperation, CompareOperation, ConcatenateOperation, ConstantOperation,
-            ConvertElementTypeOperation, DivOperation, ExpOperation, LinearCallOperation, MulOperation, NegOperation,
-            OneLikeOperation, OneOperation, PadOperation, ParallelVaryOperation, ReduceOperation, ReshapeOperation,
-            ReshardOperation, SelectOperation, SliceOperation, SubOperation, TransposeOperation, UpdateSliceOperation,
-            ZeroLikeOperation, ZeroOperation,
+            ConvertElementTypeOperation, CustomDerivativeTransposeOperation, DivOperation, ExpOperation,
+            LinearCallOperation, MulOperation, NegOperation, OneLikeOperation, OneOperation, PadOperation,
+            ParallelVaryOperation, ReduceOperation, ReshapeOperation, ReshardOperation, SelectOperation,
+            SliceOperation, SubOperation, TransposeOperation, UpdateSliceOperation, ZeroLikeOperation, ZeroOperation,
         };
         use crate::programs::{
             NoReferenceTransform, NoReferent, OperationProvider, ReferenceAccessDescriptor, ReferenceAccessOperation,
@@ -3441,6 +3441,7 @@ mod tests {
             Compare(CompareOperation<ArrayType>),
             Select(SelectOperation<ArrayType>),
             LinearCall(LinearCallOperation<ArrayType>),
+            CustomDerivativeTranspose(CustomDerivativeTransposeOperation<Array, RematerializationTestOperation>),
         }
 
         // Like `ArrayOperation`, this reference-free family declares no access layout, but reverse-mode differentiation
@@ -3549,14 +3550,14 @@ mod tests {
                 .instructions()
                 .iter()
                 .any(|instruction| matches!(instruction.operation(), ArrayOperation::CustomDerivative(_))),
-            "the rematerialized primal program should preserve the custom derivative call",
+            "the rematerialized primal program should preserve the custom rule call",
         );
         assert_eq!(forward.output_types().len(), 3);
 
         // Checkpointing preserves reverse-only custom rules without presenting their opaque carrier as an executable
         // forward derivative, whether forward differentiation executes immediately or stages a program.
-        let expected = "cannot apply forward-mode differentiation to a `custom_derivative` call that has only \
-                        reverse-mode rules; it supports only reverse-mode differentiation (e.g., `vjp`, \
+        let expected = "cannot apply forward-mode differentiation to a `custom_derivative` call of `custom_vjp` that has \
+                        only reverse-mode rules; it supports only reverse-mode differentiation (e.g., `vjp`, \
                         `value_and_gradient`, or `jacobian_reverse`)";
         assert!(matches!(
             domain.jvp(|input, ()| function.call(input), Array::scalar(2f64).unwrap(), Array::scalar(1f64).unwrap(), ()),
