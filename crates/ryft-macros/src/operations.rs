@@ -2470,7 +2470,7 @@ fn value_bound_argument(bound: &syn::TypeParamBound) -> Option<syn::Type> {
 
 #[cfg(test)]
 mod tests {
-    use quote::{ToTokens, format_ident, quote};
+    use quote::{ToTokens, quote};
 
     use super::*;
 
