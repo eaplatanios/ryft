@@ -524,30 +524,29 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 /// the executing PJRT client under the same target name (e.g., via `ryft-pjrt`'s `Client::register_ffi_handler`).
 /// The reference array backend cannot execute foreign kernels, so eager interpretation on it reports an error.
 ///
-/// Because the kernel is opaque, Ryft cannot derive its transform rules. Differentiating it reports an error
-/// directing users to wrap the call with [`custom_jvp`](crate::operations::differentiation::custom_jvp::custom_jvp()) or
-/// [`custom_vjp`](crate::operations::differentiation::custom_vjp::custom_vjp()), which supply the missing derivative. Those wrappers do *not*
-/// supply a batching rule: each of them structurally batches its own primal region, so a mapped operand reaches this
-/// same operation and meets this same batching contract. Batching a call whose operands are all replicated binds it
-/// unchanged, because a region-free foreign kernel cannot observe the transform's named axis. A mapped operand is
-/// instead governed by the [`CustomCallBatching`] behavior selected with [`with_batching`](Self::with_batching):
-/// the default [`Rejected`](CustomCallBatching::Rejected) reports an error naming that operand,
+/// Because the kernel is opaque, Ryft cannot derive its transform rules. Differentiating it reports an error directing
+/// users to call the kernel through a [`custom_function`](crate::custom_function) with derivative rules (refer to
+/// [`CustomFunction::from_custom_call`](crate::CustomFunction::from_custom_call)), which supply the missing derivative.
+/// Unless that function also has a batching rule, it structurally batches its own primal region, so a mapped operand
+/// reaches this same operation and meets this same batching contract. Batching a call whose operands are all replicated
+/// binds it unchanged, because a region-free foreign kernel cannot observe the transform's named axis. A mapped operand
+/// is instead governed by the [`CustomCallBatching`] behavior selected with [`with_batching`](Self::with_batching): the
+/// default [`Rejected`](CustomCallBatching::Rejected) reports an error naming that operand,
 /// [`Sequential`](CustomCallBatching::Sequential) applies the kernel once per batch item through a `scan`, and
-/// [`BroadcastAll`](CustomCallBatching::BroadcastAll) hands the kernel batch-prefixed buffers in a single call.
-/// A call that uses explicit packed buffers and ordinary scalar extent operands may additionally declare a
+/// [`BroadcastAll`](CustomCallBatching::BroadcastAll) hands the kernel batch-prefixed buffers in a single call. A call
+/// that uses explicit packed buffers and ordinary scalar extent operands may additionally declare a
 /// [`CustomCallRaggedContract`] with [`with_ragged_contract`](Self::with_ragged_contract). The declaration never adds,
 /// removes, hides, or reorders operands or outputs. It only lets batching verify that the exact extent value attached
-/// to an input [`RaggedAxis`] is already present at the declared operand index, use the
-/// selected [`CustomCallBatching`] strategy unchanged, and attach preserved or fresh ragged metadata to the declared
-/// outputs. Calls without this declaration retain the default ragged-input rejection. The contract deliberately
-/// supports one ragged axis per operand and one ragged batching level; differentiation remains governed by the same
-/// custom JVP/VJP wrappers as dense calls.
-/// Marking the call as side-effecting via [`with_side_effect`](Self::with_side_effect) reports
+/// to an input [`RaggedAxis`] is already present at the declared operand index, use the selected [`CustomCallBatching`]
+/// strategy unchanged, and attach preserved or fresh ragged metadata to the declared outputs. Calls without this
+/// declaration retain the default ragged-input rejection. The contract deliberately supports one ragged axis per
+/// operand and one ragged batching level; differentiation remains governed by the same custom JVP/VJP wrappers as dense
+/// calls. Marking the call as side-effecting via [`with_side_effect`](Self::with_side_effect) reports
 /// [`EffectClass::OrderedIo`], which keeps the call alive through dead-code elimination and preserves its execution
-/// order relative to other ordered I/O effects across every participating device; the lowered custom call is then
-/// also marked `has_side_effect = true`. [`with_effect_class`](Self::with_effect_class) selects a different
-/// contract: [`EffectClass::DeviceOrderedIo`] preserves program order only among the ordered I/O executing on the
-/// same device, which is what permits the call to execute once per device inside `shard_map` bodies, and
+/// order relative to other ordered I/O effects across every participating device; the lowered custom call is then also
+/// marked `has_side_effect = true`. [`with_effect_class`](Self::with_effect_class) selects a different contract:
+/// [`EffectClass::DeviceOrderedIo`] preserves program order only among the ordered I/O executing on the same device,
+/// which is what permits the call to execute once per device inside `shard_map` bodies, and
 /// [`EffectClass::UnorderedIo`] keeps the call observable without any ordering dependency.
 ///
 /// # Backend Contract
@@ -827,14 +826,13 @@ impl CustomCallOperation {
     }
 
     /// Returns the [`ProgramError`] reported when a transform asks this opaque call for a derivative. Foreign kernels
-    /// have no derivable derivative, so users must wrap the call with `custom_jvp` or `custom_vjp` (which is also how
-    /// JAX handles `ffi_call` differentiation).
+    /// have no derivable derivative, so users must call them through a [`custom_function`](crate::custom_function) with
+    /// derivative rules (which is also how JAX handles `ffi_call` differentiation).
     fn no_differentiation_rule_error(&self) -> ProgramError {
         ProgramError::UnsupportedOperation {
             message: format!(
-                // TODO(eaplatanios): Stop hardcoding mentions for things like `custom_jvp` and `custom_vjp`.
-                "custom call `{}` has no differentiation rule; wrap it with `custom_jvp` or `custom_vjp` to provide \
-                 one",
+                "custom call `{}` has no differentiation rule; call it through a `custom_function` with derivative \
+                 rules to provide one",
                 self.target_name,
             ),
         }
@@ -1475,7 +1473,7 @@ impl<C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>> Partial
 // named-axis operation whose value differs per batch item even when every operand of the enclosing instruction is
 // replicated. `.tasks/plan_custom_derivative_batching_axis_parity.md` records the JAX fixture pinning that
 // counterexample (`vmap` with `in_axes=None`, an explicit extent, and a named-axis index still produces
-// `[0, 1, 2]`), which is why the custom-derivative wrappers always batch their regions structurally.
+// `[0, 1, 2]`), which is why the custom-function wrappers always batch their regions structurally.
 //
 // A mapped operand is instead governed by the call's own [`CustomCallBatching`] behavior:
 // [`Rejected`](CustomCallBatching::Rejected) reports a [`BatchingError::UnsupportedOperation`] naming that operand
@@ -1636,8 +1634,8 @@ impl_differentiable_operation! {
     {
         |operation, _context, _driver, _inputs| {
             // Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error
-            // directing users to wrap the call with `custom_jvp` or `custom_vjp`, which is also how JAX handles
-            // `ffi_call` differentiation.
+            // directing users to call it through a `custom_function` with derivative rules, which is also how JAX
+            // handles `ffi_call` differentiation.
             Err(operation.no_differentiation_rule_error().into())
         }
     },
@@ -1964,7 +1962,7 @@ where
 }
 
 // Differentiation in the mixed universe reports the same error as the homogeneous rule: the kernel is opaque, so the
-// derivative must come from a `custom_jvp` or `custom_vjp` wrapper.
+// derivative must come from the rules of a `custom_function`.
 impl<C: Context<Type = ArrayIrType>> MemberDifferentiableOperation<C> for CustomCallOperation {
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -4012,8 +4010,8 @@ mod tests {
             program.jvp(),
             Err(error)
                 if error.to_string()
-                    == "custom call `ryft.test.add_one` has no differentiation rule; wrap it with `custom_jvp` or \
-                        `custom_vjp` to provide one",
+                    == "custom call `ryft.test.add_one` has no differentiation rule; call it through a \
+                        `custom_function` with derivative rules to provide one",
         ));
 
         let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(

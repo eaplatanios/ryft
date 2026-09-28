@@ -3320,8 +3320,8 @@ impl<
 {
     /// Structurally batches this borrowed homogeneous-array [`Region`] so that the resulting program operates over
     /// inputs batched along the specified [`BatchAxis`]s. Staged higher-order [`BatchableOperation`] implementations
-    /// use this function to batch captured programs *without* concretizing any batch-item values, so that batched
-    /// control-flow and custom-derivative structure can be staged back into the enclosing trace. This function replays
+    /// use this function to batch captured programs _without_ concretizing any batch-item values, so that batched
+    /// control-flow and custom-function structure can be staged back into the enclosing trace. This function replays
     /// the region through an [`ArrayBatchingPolicy`] [`BatchingContext`] over a fresh [`TracingContext`], lifts every
     /// instruction through its [`BatchableOperation`] rule, and extracts the resulting staged program together
     /// with the requested [`ProgramBatchingOutputAxesPolicy`].

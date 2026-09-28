@@ -1194,16 +1194,17 @@ where
             input_known: input_known.to_vec(),
             required_known_outputs: required_known_outputs.to_vec(),
         };
-        let artifact = region.transform::<JvpPartitionTransform, _, _>(arguments, |region, arguments| {
-            let (partition, _) = region.partition_with_configuration(
-                &arguments.input_known,
-                true,
-                true,
-                Some(&arguments.required_known_outputs),
-            )?;
-            let (known_program, residual_program, metadata) = partition.into_programs_and_metadata();
-            Ok(TransformArtifact::new(vec![Arc::new(known_program), Arc::new(residual_program)], metadata))
-        })?;
+        let artifact =
+            region.transform::<JvpPartitionTransform, _, DifferentiationError>(arguments, |region, arguments| {
+                let (partition, _) = region.partition_with_configuration(
+                    &arguments.input_known,
+                    true,
+                    true,
+                    Some(&arguments.required_known_outputs),
+                )?;
+                let (known_program, residual_program, metadata) = partition.into_programs_and_metadata();
+                Ok(TransformArtifact::new(vec![Arc::new(known_program), Arc::new(residual_program)], metadata))
+            })?;
         let (programs, metadata) = artifact.into_parts();
         let mut programs = programs.into_iter().map(Arc::unwrap_or_clone);
         let known_program = programs.next().unwrap();
@@ -3474,7 +3475,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for JvpPart
 
 /// Argument key for one retained [`JvpPartitionTransform`] artifact.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct JvpPartitionTransformArguments {
+pub(crate) struct JvpPartitionTransformArguments {
     /// Whether each input of the partitioned program is known.
     input_known: Vec<bool>,
 
