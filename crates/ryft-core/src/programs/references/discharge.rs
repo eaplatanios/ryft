@@ -115,7 +115,7 @@
 //! cannot represent a reference, and callers invoke it when they want the explicit state-passing form of a program;
 //! the transforms themselves do not. Forward mode differentiation, linearization, reverse mode differentiation (with
 //! per-input [`CotangentDestination`](crate::CotangentDestination)s), batching, partial evaluation (with global
-//! ordered effect ordering), rematerialization, the custom derivative operations, and Just-In-Time (JIT) compilation
+//! ordered effect ordering), rematerialization, the custom function operations, and Just-In-Time (JIT) compilation
 //! operate on references directly, reading structural facts from the [`ReferenceAnalysis`] cached on the region and
 //! validating runtime aliasing at their public boundaries with
 //! [`validate_reference_boundary`](super::validate_reference_boundary). The discharged program is the oracle those
@@ -311,8 +311,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// selectable targets without paying for either. Allocations inside nested regions are included because every
     /// allocating [`Instruction`](crate::Instruction) defines a concrete local reference wherever it occurs.
     ///
-    /// One class of enumerated targets is inert: an allocation inside a closure that no operation ever replays, such
-    /// as a dormant derivative rule region of a [`CustomDerivativeOperation`](crate::CustomDerivativeOperation).
+    /// One class of enumerated targets is inert: an allocation inside a closure that no operation ever replays,
+    /// such as a dormant derivative rule region of a [`CustomFunctionOperation`](crate::CustomFunctionOperation).
     /// Discharge rejects such a program outright, whichever way the target is selected, because how a reference
     /// boundary widens there has no defined meaning. The enumeration reports the target anyway rather than
     /// second-guessing the region roles, so that it stays a structural query.

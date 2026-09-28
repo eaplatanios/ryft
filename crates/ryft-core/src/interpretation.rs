@@ -297,7 +297,7 @@ impl<
     /// which additionally wires residual-input feeders, and the transform-aware counterpart of structural relocation
     /// through [`ProgramBuilder::splice_program`](crate::ProgramBuilder::splice_program), which records
     /// [`Instruction`]s directly into a builder without routing through `bind`'s transform interception. Nested program
-    /// interpretation (e.g., control flow branches, custom derivative programs, etc.) routes back through here via the
+    /// interpretation (e.g., control flow branches, custom function programs, etc.) routes back through here via the
     /// driver behind the rule's [`InterpretationDriver`].
     pub fn interpret_in_context<C: Context<Type = T, Constant = V, Operation = O>>(
         &self,
