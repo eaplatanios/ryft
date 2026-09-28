@@ -38,12 +38,11 @@ use crate::operations::Accuracy;
 use crate::operations::arithmetic::{Add, Div, Mul, Sub};
 use crate::operations::comparisons::{Compare, ComparisonDirection};
 use crate::operations::complex::{Complex, Real};
-use crate::operations::constants::fill::Fill;
 use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::logical::And;
-use crate::programs::{MaybeZero, ProgramError, Type, Typed, Value};
+use crate::programs::{MaybeZero, ProgramError, Type, Typed};
 
 /// Canonical operation name for [`ExpOperation`].
 pub const EXP_OPERATION_NAME: &str = "exp";
@@ -293,7 +292,6 @@ impl_differentiable_operation! {
             + Compare<C::Value>
             + Select
             + ElementwiseDerivativeAlignment<C::Type>,
-        <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
     {
         |_operation, context, _driver, inputs| {
             // The partial derivative with respect to each input is the softmax weight `exp(x - log_add_exp(a, b))`, and
@@ -337,21 +335,25 @@ impl_differentiable_operation! {
                 left.log_add_exp(&right)?
             };
 
-            // Inspect the real component for complex values. A literal infinity saturates in finite-only
-            // formats, so first check that halving this constant actually leaves it infinite. This prevents
-            // a representable finite maximum from being mistaken for positive infinity.
+            // Inspect the real component for complex values. Positive infinity is detected without any constant,
+            // because `x · 0` is NaN exactly when `x` is infinite or NaN, and `x > 0` then keeps only positive
+            // infinity. Formats without infinities never produce a NaN there (a saturated finite maximum times zero is
+            // zero), so their representable maximum is never mistaken for positive infinity. Building no constants also
+            // keeps the rule free of shape-typed fills, which cannot replicate a scalar into a dynamic axis.
             let real = |value: &C::Value| {
                 if target.is_complex() { value.real() } else { Ok(value.clone()) }
             };
             let real_output = real(&aligned_primal)?;
-            let real_type = real_output.r#type().into_owned();
-            let infinity = aligned_primal.dispatch_domain().fill(&real_type, f64::INFINITY)?;
-            let half = aligned_primal.dispatch_domain().fill(&real_type, 0.5)?;
-            let has_infinity = infinity.compare(&infinity.mul(&half)?, ComparisonDirection::Equal)?;
             let replace_infinity = |value: C::Value, component: C::Value| -> Result<C::Value, DifferentiationError> {
-                let is_positive_infinity = component.compare(&infinity, ComparisonDirection::Equal)?;
-                let is_positive_infinity = is_positive_infinity.and(&has_infinity)?;
-                Ok(C::Value::select(&is_positive_infinity, &value.zero_like()?, &value)?)
+                let zero = component.zero_like()?;
+                let product = component.mul(&zero)?;
+                let is_non_finite = product.compare(&product, ComparisonDirection::NotEqual)?;
+                let is_positive = component.compare(&zero, ComparisonDirection::GreaterThan)?;
+                let is_positive_infinity = is_non_finite.and(&is_positive)?;
+
+                // A real value is its own component, so the zero it is compared against also replaces it.
+                let replacement = if target.is_complex() { value.zero_like()? } else { zero };
+                Ok(C::Value::select(&is_positive_infinity, &replacement, &value)?)
             };
 
             let output_exponent = replace_infinity(aligned_primal, real_output)?;
@@ -1263,30 +1265,32 @@ mod tests {
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
                     let %4:f64[] = log_add_exp %0 %1
-                        %5:f64[] = constant [value=inf]
-                        %6:f64[] = constant [value=0.5]
-                        %7:f64[] = mul %5 %6
-                        %8:bool[] = compare [direction=Equal] %5 %7
-                        %9:bool[] = compare [direction=Equal] %4 %5
-                        %10:bool[] = and %9 %8
-                        %11:f64[] = zero_like %4
-                        %12:f64[] = select %10 %11 %4
-                        %13:bool[] = compare [direction=Equal] %0 %5
-                        %14:bool[] = and %13 %8
-                        %15:f64[] = zero_like %0
-                        %16:f64[] = select %14 %15 %0
-                        %17:f64[] = sub %16 %12
+                        %5:f64[] = zero_like %4
+                        %6:f64[] = mul %4 %5
+                        %7:bool[] = compare [direction=NotEqual] %6 %6
+                        %8:bool[] = compare [direction=GreaterThan] %4 %5
+                        %9:bool[] = and %7 %8
+                        %10:f64[] = select %9 %5 %4
+                        %11:f64[] = zero_like %0
+                        %12:f64[] = mul %0 %11
+                        %13:bool[] = compare [direction=NotEqual] %12 %12
+                        %14:bool[] = compare [direction=GreaterThan] %0 %11
+                        %15:bool[] = and %13 %14
+                        %16:f64[] = select %15 %11 %0
+                        %17:f64[] = sub %16 %10
                         %18:f64[] = exp %17
                         %19:f64[] = mul %18 %2
-                        %20:bool[] = compare [direction=Equal] %1 %5
-                        %21:bool[] = and %20 %8
-                        %22:f64[] = zero_like %1
-                        %23:f64[] = select %21 %22 %1
-                        %24:f64[] = sub %23 %12
-                        %25:f64[] = exp %24
-                        %26:f64[] = mul %25 %3
-                        %27:f64[] = add %19 %26
-                    in (%4, %27)
+                        %20:f64[] = zero_like %1
+                        %21:f64[] = mul %1 %20
+                        %22:bool[] = compare [direction=NotEqual] %21 %21
+                        %23:bool[] = compare [direction=GreaterThan] %1 %20
+                        %24:bool[] = and %22 %23
+                        %25:f64[] = select %24 %20 %1
+                        %26:f64[] = sub %25 %10
+                        %27:f64[] = exp %26
+                        %28:f64[] = mul %27 %3
+                        %29:f64[] = add %19 %28
+                    in (%4, %29)
                 "},
             }],
         );
