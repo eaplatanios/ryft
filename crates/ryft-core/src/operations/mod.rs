@@ -33,7 +33,6 @@ pub mod special;
 pub mod tagging;
 pub mod trigonometric;
 
-// TODO(eaplatanios): We should be importing specific symbols here wherever possible / relevant.
 pub use arithmetic::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, Abs, AbsOperation, Add, AddOperation, DIV_OPERATION_NAME, Div,
     DivOperation, MUL_OPERATION_NAME, Mul, MulOperation, NEG_OPERATION_NAME, Neg, NegOperation, POW_OPERATION_NAME,
@@ -48,15 +47,31 @@ pub use collectives::{
     ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelReduce, ParallelReduceOperation,
     ParallelReductionKind, ParallelVary, ParallelVaryOperation, forward_collective_to_parent,
 };
-pub use comparisons::*;
-pub use constants::*;
-pub use control_flow::*;
-pub use cumulative::*;
+pub use comparisons::{
+    COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonTypeSemantics,
+};
+pub use constants::{
+    CONSTANT_OPERATION_NAME, Constant, ConstantOperation, DimensionConstant, DynamicFill, DynamicIota, DynamicOne,
+    DynamicZero, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One,
+    OneLike, OneLikeOperation, OneOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
+};
+pub use control_flow::{
+    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation,
+    ScanReferenceDischarge, Select, SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate,
+    WhileTypeSemantics, associative_scan, transpose_primal_condition, transpose_primal_scan,
+};
+pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation};
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::{
-    CUSTOM_DERIVATIVE_OPERATION_NAME, CustomDerivativeBuilder, CustomDerivativeJvpRule, CustomDerivativeOperation,
-    CustomJvp, CustomVjp, LINEAR_CALL_OPERATION_NAME, LinearCallOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient,
-    StopGradientOperation, StopGradients, custom_derivative_at, custom_jvp, custom_vjp,
+    CUSTOM_DERIVATIVE_OPERATION_NAME, CUSTOM_DERIVATIVE_TRANSPOSE_OPERATION_NAME, CustomCallPrimal, CustomDerivative,
+    CustomDerivativeBatching, CustomDerivativeBuilder, CustomDerivativeJvp, CustomDerivativeJvpRule,
+    CustomDerivativeOperation, CustomDerivativeTransposeOperation, CustomDerivativeVjp, CustomJvp,
+    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer,
+    CustomRuleTracer, CustomVjp, JvpFromPrimal, LINEAR_CALL_OPERATION_NAME, LiftedCustomRules, LinearCallOperation,
+    NoBatching, NoJvp, NoVjp, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients,
+    UnavailableCustomRules, WeakCustomRuleRegistration, WithAccumulatingVjp, WithBatching, WithJvp,
+    WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, custom_derivative, custom_derivative_at, custom_jvp, custom_vjp,
 };
 pub use dimensions::{
     ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME,
@@ -82,8 +97,25 @@ pub use extrema::{
     CLAMP_OPERATION_NAME, Clamp, ClampOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, Max, MaxOperation, Min,
     MinOperation,
 };
-pub use logical::*;
-pub use manipulation::*;
+pub use logical::{
+    AND_OPERATION_NAME, And, AndOperation, NOT_OPERATION_NAME, Not, NotOperation, OR_OPERATION_NAME, Or, OrOperation,
+    XOR_OPERATION_NAME, Xor, XorOperation,
+};
+pub use manipulation::{
+    BROADCAST_OPERATION_NAME, BasicIndex, Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME,
+    CONVERT_ELEMENT_TYPE_OPERATION_NAME, Concatenate, ConcatenateOperation, ConvertElementType,
+    ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicBroadcast,
+    DynamicBroadcastOperation, DynamicConcatenate, DynamicGather, DynamicPad, DynamicReshape, DynamicReshapeOperation,
+    DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation, DynamicSliceWithDimensions,
+    DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather,
+    GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector,
+    IndexSlice, Indexed, Indexing, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, RESHAPE_OPERATION_NAME,
+    REVERSE_OPERATION_NAME, Reshape, ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME,
+    SLICE_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
+    ScatterReductionKind, Slice, SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME,
+    TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME,
+    UpdateSlice, UpdateSliceOperation,
+};
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use reductions::{REDUCE_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind};
 pub use references::{
@@ -98,7 +130,10 @@ pub use rounding::{
     CEIL_OPERATION_NAME, Ceil, CeilOperation, FLOOR_OPERATION_NAME, Floor, FloorOperation, ROUND_OPERATION_NAME, Round,
     RoundOperation,
 };
-pub use sharding::*;
+pub use sharding::{
+    CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingOperation, RESHARD_OPERATION_NAME, Reshard,
+    ReshardOperation,
+};
 pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};
 pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use trigonometric::{
