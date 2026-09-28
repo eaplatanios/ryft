@@ -2026,7 +2026,7 @@ where
         let Some(first) = inputs.first() else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "the custom-call capability dispatches through its first input's context, so calling '{}' with \
+                    "the custom-call capability dispatches through its first input's context, so calling `{}` with \
                      no inputs requires staging the operation through a program builder instead",
                     operation.target_name(),
                 ),
