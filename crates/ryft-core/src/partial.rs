@@ -527,7 +527,7 @@ enum PartitionReferenceRoot {
 ///
 /// The key `K` identifies an allocation, using either [`ReferenceRoot`] during source replay or
 /// [`PartitionReferenceRoot`] when comparing the two halves of a partition. Views of the same allocation share a key.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum EffectOrdering<K: Eq + Hash> {
     /// Requires work on any of these reference allocations to stay ordered relative to other work on the same
     /// allocation. For example, sets containing `{a, b}` and `{b, c}` conflict because both include `b`, while `{a}`
@@ -610,10 +610,34 @@ impl EffectsSummary {
     }
 }
 
-/// Result of partitioning a [`Program`] into a known-side program and a residual program based on which original inputs
-/// are known. Unlike [`PartialEvaluation`], this representation carries only programs and positional wiring. It does
-/// not retain values from a parent [`Context`]. It is returned by [`Program::partition`] and is typically passed to
-/// [`PartialEvaluationContext::inline_partitioned_program`] when recursively transforming an attached region.
+/// Boundary wiring and effect-ordering constraints of a [`PartitionedProgram`], retained separately from its two
+/// [`Program`]s so that region transform caches can store and reassemble the complete partition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartitionMetadata {
+    /// Refer to the documentation of [`PartitionedProgram::known_input_indices`] for more information.
+    known_input_indices: Vec<usize>,
+
+    /// Refer to the documentation of [`PartitionedProgram::residual_inputs`] for more information.
+    residual_inputs: Vec<PartialEvaluationInput<usize>>,
+
+    /// Refer to the documentation of [`PartitionedProgram::outputs`] for more information.
+    outputs: Vec<PartialEvaluationOutput<usize>>,
+
+    /// Effect-ordering constraints for the known program and residual program, respectively. By default, all ordered
+    /// effects must retain their relative execution order. When partitioning work into a known invocation followed by
+    /// repeated residual invocations (for example, linearization followed by pushforward calls), reference analysis
+    /// can establish separate ordering constraints for independent allocations. References in both programs are then
+    /// identified relative to the original inputs so that accesses to the same allocation can be compared across the
+    /// partition boundary; allocations created within either program have separate identities.
+    effect_ordering: [EffectOrdering<PartitionReferenceRoot>; 2],
+}
+
+/// Result of partitioning a [`Program`] into a known-side program and a residual program based on which original
+/// inputs are known. Unlike [`PartialEvaluation`], this representation carries only programs and [`PartitionMetadata`]
+/// describing their positional wiring and effect-ordering constraints. It does not retain values from a parent
+/// [`Context`]. It is returned by [`Program::partition`] and is typically passed to
+/// [`PartialEvaluationContext::inline_partitioned_program`] when recursively
+/// transforming an attached region.
 ///
 /// # Boundary Wiring
 ///
@@ -642,22 +666,8 @@ pub struct PartitionedProgram<V: Value, O: Operation<Type = V::Type>> {
     /// Refer to the documentation of [`residual_program`](Self::residual_program) for more information.
     residual_program: Program<V, O, Vec<V>, Vec<V>>,
 
-    /// Refer to the documentation of [`known_input_indices`](Self::known_input_indices) for more information.
-    known_input_indices: Vec<usize>,
-
-    /// Refer to the documentation of [`residual_inputs`](Self::residual_inputs) for more information.
-    residual_inputs: Vec<PartialEvaluationInput<usize>>,
-
-    /// Refer to the documentation of [`outputs`](Self::outputs) for more information.
-    outputs: Vec<PartialEvaluationOutput<usize>>,
-
-    /// Effect-ordering constraints for the known program and residual program, respectively. By default, all ordered
-    /// effects must retain their relative execution order. When partitioning work into a known invocation followed by
-    /// repeated residual invocations (for example, linearization followed by pushforward calls), reference analysis
-    /// can establish separate ordering constraints for independent allocations. References in both programs are then
-    /// identified relative to the original inputs so that accesses to the same allocation can be compared across the
-    /// partition boundary; allocations created within either program have separate identities.
-    effect_ordering: [EffectOrdering<PartitionReferenceRoot>; 2],
+    /// Boundary wiring and effect-ordering constraints shared by the two programs.
+    metadata: PartitionMetadata,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
@@ -674,7 +684,23 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         let effect_ordering = [&known_program, &residual_program].map(|program| {
             if program.effects().classes().is_ordered() { EffectOrdering::Global } else { EffectOrdering::default() }
         });
-        Self { known_program, residual_program, known_input_indices, residual_inputs, outputs, effect_ordering }
+        Self {
+            known_program,
+            residual_program,
+            metadata: PartitionMetadata { known_input_indices, residual_inputs, outputs, effect_ordering },
+        }
+    }
+
+    /// Reassembles a [`PartitionedProgram`] from the programs and metadata that
+    /// [`into_programs_and_metadata`](Self::into_programs_and_metadata) returned, preserving its effect-ordering
+    /// constraints (unlike [`from_parts`](Self::from_parts), which recomputes conservative ones). This is how region
+    /// transform caches retain partitions.
+    pub(crate) fn from_programs_and_metadata(
+        known_program: Program<V, O, Vec<V>, Vec<V>>,
+        residual_program: Program<V, O, Vec<V>, Vec<V>>,
+        metadata: PartitionMetadata,
+    ) -> Self {
+        Self { known_program, residual_program, metadata }
     }
 
     /// Returns the known-side [`Program`] of this [`PartitionedProgram`], which represents the known work reified
@@ -699,7 +725,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// (i.e., [`known_program`](Self::known_program)), in order.
     #[inline]
     pub fn known_input_indices(&self) -> &[usize] {
-        &self.known_input_indices
+        &self.metadata.known_input_indices
     }
 
     /// Returns the source feeding each residual [`Program`] (i.e., [`residual_program`](Self::residual_program))
@@ -710,7 +736,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// operation's outputs.
     #[inline]
     pub fn residual_inputs(&self) -> &[PartialEvaluationInput<usize>] {
-        &self.residual_inputs
+        &self.metadata.residual_inputs
     }
 
     /// Returns the source of each original (i.e., pre-partitioning) [`Program`] output, in original output order.
@@ -720,7 +746,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// program's outputs.
     #[inline]
     pub fn outputs(&self) -> &[PartialEvaluationOutput<usize>] {
-        &self.outputs
+        &self.metadata.outputs
     }
 
     /// Returns the residual input positions that receive known reference values from the known program, in residual
@@ -728,7 +754,8 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// positions describe boundary wiring, not whether the two programs access overlapping reference allocations.
     #[inline]
     pub fn known_reference_inputs(&self) -> impl '_ + Iterator<Item = usize> {
-        self.residual_inputs
+        self.metadata
+            .residual_inputs
             .iter()
             .zip(self.residual_program.inputs())
             .enumerate()
@@ -748,7 +775,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// still check value dependencies, loop-carried values, shapes, and how intermediate values are stored. The query
     /// does not inspect runtime reference identities; it relies on the assumptions used to construct the partition.
     pub(crate) fn has_effect_ordering_conflicts(&self) -> bool {
-        self.effect_ordering[0].conflicts(&self.effect_ordering[1])
+        self.metadata.effect_ordering[0].conflicts(&self.metadata.effect_ordering[1])
     }
 
     /// Consumes this [`PartitionedProgram`] and returns its [`known_program`](Self::known_program),
@@ -765,7 +792,21 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         Vec<PartialEvaluationInput<usize>>,
         Vec<PartialEvaluationOutput<usize>>,
     ) {
-        (self.known_program, self.residual_program, self.known_input_indices, self.residual_inputs, self.outputs)
+        (
+            self.known_program,
+            self.residual_program,
+            self.metadata.known_input_indices,
+            self.metadata.residual_inputs,
+            self.metadata.outputs,
+        )
+    }
+
+    /// Consumes this [`PartitionedProgram`] and returns its [`known_program`](Self::known_program),
+    /// its [`residual_program`](Self::residual_program), and its [`PartitionMetadata`], in that order.
+    pub(crate) fn into_programs_and_metadata(
+        self,
+    ) -> (Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, PartitionMetadata) {
+        (self.known_program, self.residual_program, self.metadata)
     }
 }
 
@@ -1943,6 +1984,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Bind the known-side operation into the known-side context over the original known inputs.
         let known_inputs = program
+            .metadata
             .known_input_indices
             .iter()
             .map(|&index| {
@@ -1961,8 +2003,9 @@ impl<C: Context> PartialEvaluationContext<C> {
         // program without outputs can still carry effectful residual instructions whose effects must be preserved, and
         // an entirely empty residual program only yields a dead pure operation that the walk's final simplification
         // removes.
-        let known_output_count = program.outputs.iter().filter(|output| output.is_known()).count();
+        let known_output_count = program.metadata.outputs.iter().filter(|output| output.is_known()).count();
         let residual_inputs = program
+            .metadata
             .residual_inputs
             .iter()
             .map(|source| match source {
@@ -1985,6 +2028,7 @@ impl<C: Context> PartialEvaluationContext<C> {
 
         // Reassemble the original outputs from the two operations' outputs.
         program
+            .metadata
             .outputs
             .iter()
             .map(|source| match source {
@@ -2693,9 +2737,9 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                     let roots = analysis.roots().filter_map(|root| match root {
                         ReferenceRoot::RegionInput { region, input_index } if region == analysis.region() => {
                             if index == 0 {
-                                Some(PartitionReferenceRoot::Input(partition.known_input_indices[input_index]))
+                                Some(PartitionReferenceRoot::Input(partition.metadata.known_input_indices[input_index]))
                             } else if let PartialEvaluationInput::Unknown(original) =
-                                partition.residual_inputs[input_index]
+                                partition.metadata.residual_inputs[input_index]
                             {
                                 Some(PartitionReferenceRoot::Input(original))
                             } else {
@@ -2715,7 +2759,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                             None
                         }
                     });
-                    partition.effect_ordering[index] = program.effects().effect_ordering(roots);
+                    partition.metadata.effect_ordering[index] = program.effects().effect_ordering(roots);
                 }
             }
 
@@ -3246,6 +3290,14 @@ mod tests {
             .unwrap();
         assert!(!repeated.has_effect_ordering_conflicts());
         assert!(!program.partition(&[false, false]).unwrap().has_effect_ordering_conflicts());
+
+        // Keeping the metadata preserves the evidence that the two programs access independent references.
+        let (known, residual, metadata) = repeated.into_programs_and_metadata();
+        let repeated = PartitionedProgram::from_programs_and_metadata(known, residual, metadata);
+        assert!(!repeated.has_effect_ordering_conflicts());
+        assert_eq!(repeated.known_input_indices(), &[0]);
+        assert_eq!(repeated.residual_inputs(), &[PartialEvaluationInput::Unknown(1)]);
+        assert_eq!(repeated.outputs(), &[PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
 
         // Reconstructing through the unqualified boundary constructor carries no repeated-invocation evidence.
         let (known, residual, input_indices, residual_inputs, outputs) = repeated.into_parts();
@@ -5467,12 +5519,12 @@ mod tests {
             .unwrap();
 
         let partition = program.partition(&[true, false]).unwrap();
-        assert_eq!(partition.known_input_indices, vec![0]);
+        assert_eq!(partition.known_input_indices(), &[0]);
         assert_eq!(
-            partition.residual_inputs,
+            partition.residual_inputs(),
             vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(0),],
         );
-        assert_eq!(partition.outputs, vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(partition.outputs(), vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(
             partition.known_program.to_string(),
             indoc! {"
@@ -5505,20 +5557,20 @@ mod tests {
 
         // All-unknown known-ness produces an empty known program and residualizes everything.
         let partition = program.partition(&[false, false]).unwrap();
-        assert_eq!(partition.known_input_indices, Vec::<usize>::new());
+        assert_eq!(partition.known_input_indices(), Vec::<usize>::new());
         assert!(partition.known_program.instructions().is_empty());
         assert!(partition.known_program.output_ids().is_empty());
         assert_eq!(
-            partition.residual_inputs,
+            partition.residual_inputs(),
             vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Unknown(1),],
         );
-        assert_eq!(partition.outputs, vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
+        assert_eq!(partition.outputs(), vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
 
         // All-known known-ness folds everything into the known program and leaves an empty residual program.
         let partition = program.partition(&[true, true]).unwrap();
-        assert_eq!(partition.known_input_indices, vec![0, 1]);
-        assert_eq!(partition.residual_inputs, Vec::new());
-        assert_eq!(partition.outputs, vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Known(1)]);
+        assert_eq!(partition.known_input_indices(), &[0, 1]);
+        assert_eq!(partition.residual_inputs(), &[]);
+        assert_eq!(partition.outputs(), vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Known(1)]);
         assert!(partition.residual_program.instructions().is_empty());
 
         // The provided known-ness must cover every program input.
