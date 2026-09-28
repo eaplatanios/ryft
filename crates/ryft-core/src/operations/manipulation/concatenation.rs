@@ -525,8 +525,9 @@ impl_differentiable_operation! {
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // The forward map lays its inputs end to end, so its pullback slices the output cotangent at cumulative
-            // input offsets. The concatenated input dimensions must be static so those offsets are known. Symbolic-zero
-            // cotangents remain symbolic for every input.
+            // input offsets. The concatenated input dimensions must be static so those offsets are known, while every
+            // other axis is read whole, including a dynamic one, which the output cotangent shares with every input.
+            // Symbolic-zero cotangents remain symbolic for every input.
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
             if inputs.is_empty() {
@@ -552,28 +553,15 @@ impl_differentiable_operation! {
                             .into());
                         };
                         let mut start_indices = vec![0usize; rank];
-                        let mut limit_indices = input_type
-                            .shape()
-                            .dimensions()
-                            .iter()
-                            .enumerate()
-                            .map(|(other_axis, dimension)| {
-                                dimension.value().ok_or_else(|| {
-                                    TypeError::invalid(format!(
-                                        "`{CONCATENATE_OPERATION_NAME}` transpose requires a static size on axis \
-                                         {other_axis} but input {index} has size {dimension}",
-                                    ))
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
+                        let mut limits = input_type.shape().dimensions().to_vec();
                         let limit = offset.checked_add(input_axis_size).ok_or_else(|| {
                             TypeError::invalid(format!(
                                 "`{CONCATENATE_OPERATION_NAME}` output size overflows `usize` on axis {axis}",
                             ))
                         })?;
                         start_indices[axis] = offset;
-                        limit_indices[axis] = limit;
-                        let slice = SliceOperation::new(start_indices, limit_indices);
+                        limits[axis] = Dimension::Static(limit);
+                        let slice = SliceOperation::new(start_indices, limits);
                         let outputs = context.stage_operation(slice, Vec::new(), std::slice::from_ref(cotangent))?;
                         check_count!("output", outputs, 1, ProgramError);
                         let input_cotangent =
@@ -2139,8 +2127,8 @@ mod tests {
                     ],
                     pullback = indoc! {"
                         lambda %0:f64[5] .
-                        let %1:f64[2] = slice [start_indices=[0], limit_indices=[2]] %0
-                            %2:f64[3] = slice [start_indices=[2], limit_indices=[5]] %0
+                        let %1:f64[2] = slice [start_indices=[0], limits=[2]] %0
+                            %2:f64[3] = slice [start_indices=[2], limits=[5]] %0
                         in (%1, %2)
                     "},
                 },
@@ -2191,12 +2179,11 @@ mod tests {
             }],
         );
 
-        // A dynamic non-concatenated axis cannot be expressed by this homogeneous rule, whose `slice` bounds are
-        // static payload values, so transposition rejects the case instead of consulting hidden input-shape metadata.
-        // The composite rule does not inherit that rejection: it delegates here only for fully static inputs and
-        // otherwise stages a `dynamic_slice` whose extents it reads off the live output cotangent, which is
-        // pinned by `test_array_ir_concatenate_transposition_slices_a_dynamic_non_concatenated_extent` in
-        // this module.
+        // A dynamic non-concatenated axis is shared by the output cotangent and every input, so the pullback reads it
+        // whole through a dynamic slice limit while it slices the concatenated axis at static offsets. The composite
+        // rule delegates here only for fully static inputs and otherwise stages a `dynamic_slice` whose extents it
+        // reads off the live output cotangent, which is pinned by
+        // `test_array_ir_concatenate_transposition_slices_a_dynamic_non_concatenated_extent`.
         let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
         let left_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns.clone())]));
@@ -2211,13 +2198,16 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        assert!(matches!(
-            program.transpose_with_respect_to(&[0, 1], &[]),
-            Err(crate::differentiation::DifferentiationError::Program(ProgramError::Type(
-                TypeError::Invalid { message },
-            ))) if message == format!("`{CONCATENATE_OPERATION_NAME}` transpose requires a static size on axis 1 but \
-                                       input 0 has size columns"),
-        ));
+        assert_eq!(
+            program.transpose_with_respect_to(&[0, 1], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[5, columns] .
+                let %1:f64[2, columns] = slice [start_indices=[0, 0], limits=[2, columns]] %0
+                    %2:f64[3, columns] = slice [start_indices=[2, 0], limits=[5, columns]] %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -3129,8 +3119,8 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3] .
                 let %1:dimension<3> = const 3
-                    %2:f64[2] = slice [start_indices=[0], limit_indices=[2]] %0
-                    %3:f64[1] = slice [start_indices=[2], limit_indices=[3]] %0
+                    %2:f64[2] = slice [start_indices=[0], limits=[2]] %0
+                    %3:f64[1] = slice [start_indices=[2], limits=[3]] %0
                 in (%2, %3)
             "}
             .trim_end(),
@@ -3635,8 +3625,8 @@ mod tests {
                 ],
                 pullback = indoc! {"
                     lambda %0:f64[5] .
-                    let %1:f64[2] = slice [start_indices=[0], limit_indices=[2]] %0
-                        %2:f64[3] = slice [start_indices=[2], limit_indices=[5]] %0
+                    let %1:f64[2] = slice [start_indices=[0], limits=[2]] %0
+                        %2:f64[3] = slice [start_indices=[2], limits=[5]] %0
                         %3:zero[] = zero [type=zero[]]
                     in (%1, %2, %3)
                 "},

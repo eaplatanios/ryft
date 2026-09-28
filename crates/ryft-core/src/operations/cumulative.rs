@@ -1394,24 +1394,24 @@ mod tests {
             jvp.to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[4] .
-                let %2:f64[2] = slice [start_indices=[0], limit_indices=[3], strides=[2]] %0
-                    %3:f64[2] = slice [start_indices=[0], limit_indices=[3], strides=[2]] %1
-                    %4:f64[2] = slice [start_indices=[1], limit_indices=[4], strides=[2]] %0
-                    %5:f64[2] = slice [start_indices=[1], limit_indices=[4], strides=[2]] %1
+                let %2:f64[2] = slice [start_indices=[0], limits=[3], strides=[2]] %0
+                    %3:f64[2] = slice [start_indices=[0], limits=[3], strides=[2]] %1
+                    %4:f64[2] = slice [start_indices=[1], limits=[4], strides=[2]] %0
+                    %5:f64[2] = slice [start_indices=[1], limits=[4], strides=[2]] %1
                     %6:f64[2] = mul %2 %4
                     %7:f64[2] = mul %4 %3
                     %8:f64[2] = mul %2 %5
                     %9:f64[2] = add %7 %8
-                    %10:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %6
-                    %11:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %9
-                    %12:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %6
-                    %13:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %9
+                    %10:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %6
+                    %11:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %9
+                    %12:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %6
+                    %13:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %9
                     %14:f64[1] = mul %10 %12
                     %15:f64[1] = mul %12 %11
                     %16:f64[1] = mul %10 %13
                     %17:f64[1] = add %15 %16
-                    %18:f64[1] = slice [start_indices=[0], limit_indices=[1]] %6
-                    %19:f64[1] = slice [start_indices=[0], limit_indices=[1]] %9
+                    %18:f64[1] = slice [start_indices=[0], limits=[1]] %6
+                    %19:f64[1] = slice [start_indices=[0], limits=[1]] %9
                     %20:f64[] = zero [type=f64[]]
                     %21:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %18 %20
                     %22:f64[] = zero [type=f64[]]
@@ -1421,12 +1421,12 @@ mod tests {
                     %26:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %17 %25
                     %27:f64[2] = add %21 %24
                     %28:f64[2] = add %23 %26
-                    %29:f64[1] = slice [start_indices=[0], limit_indices=[1]] %0
-                    %30:f64[1] = slice [start_indices=[0], limit_indices=[1]] %1
-                    %31:f64[1] = slice [start_indices=[0], limit_indices=[1]] %27
-                    %32:f64[1] = slice [start_indices=[0], limit_indices=[1]] %28
-                    %33:f64[1] = slice [start_indices=[2], limit_indices=[4], strides=[2]] %0
-                    %34:f64[1] = slice [start_indices=[2], limit_indices=[4], strides=[2]] %1
+                    %29:f64[1] = slice [start_indices=[0], limits=[1]] %0
+                    %30:f64[1] = slice [start_indices=[0], limits=[1]] %1
+                    %31:f64[1] = slice [start_indices=[0], limits=[1]] %27
+                    %32:f64[1] = slice [start_indices=[0], limits=[1]] %28
+                    %33:f64[1] = slice [start_indices=[2], limits=[4], strides=[2]] %0
+                    %34:f64[1] = slice [start_indices=[2], limits=[4], strides=[2]] %1
                     %35:f64[1] = mul %31 %33
                     %36:f64[1] = mul %33 %32
                     %37:f64[1] = mul %31 %34
@@ -1468,10 +1468,10 @@ mod tests {
             std::fmt::from_fn(|formatter| jvp.render(formatter, 0, ProgramRenderingMode::WithProvenance)).to_string(),
             indoc! {"
                 lambda %0:f64[2], %1:f64[2] .
-                let %2:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %3:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %4:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %5:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
+                let %2:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %3:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %4:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %5:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
                     %6:f64[1] = max %2 %4 ; provenance=ryft::differentiation::ryft::associative_scan
                     %7:bool[1] = compare [direction=GreaterThan] %2 %4 ; provenance=ryft::differentiation::ryft::associative_scan
                     %8:bool[1] = compare [direction=Equal] %2 %4 ; provenance=ryft::differentiation::ryft::associative_scan
@@ -1492,8 +1492,8 @@ mod tests {
                     %23:f64[1] = select %16 %18 %22 ; provenance=ryft::differentiation::ryft::associative_scan
                     %24:f64[1] = mul %23 %5 ; provenance=ryft::differentiation::ryft::associative_scan
                     %25:f64[1] = add %15 %24 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %26:f64[1] = slice [start_indices=[0], limit_indices=[1]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %27:f64[1] = slice [start_indices=[0], limit_indices=[1]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %26:f64[1] = slice [start_indices=[0], limits=[1]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %27:f64[1] = slice [start_indices=[0], limits=[1]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
                     %28:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::ryft::associative_scan
                     %29:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %26 %28 ; provenance=ryft::differentiation::ryft::associative_scan
                     %30:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::ryft::associative_scan
@@ -1547,6 +1547,40 @@ mod tests {
             laid_out_outputs.iter().map(|output| output.elements::<f64>()).collect::<Vec<_>>(),
             plain_outputs.iter().map(|output| output.elements::<f64>()).collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn test_cumulative_differentiation_dynamic_unscanned_axis() {
+        // Only the scanned axis must be static: the decomposition keeps every other axis whole, so each nonlinear kind
+        // differentiates over a dynamic unscanned axis in forward mode, and its linearized tangent transposes too. On a
+        // concrete input, the dynamic program computes exactly what the statically shaped one does.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
+        let static_type = ArrayType::new_static(DataType::F64, [2, 3]);
+        let program = |r#type: &ArrayType, kind: CumulativeKind| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(r#type.clone());
+            let outputs = builder
+                .add_instruction(ArrayOperation::from(CumulativeOperation::new(1, kind)), Vec::new(), vec![input], None)
+                .unwrap()
+                .to_vec();
+            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let primal = Array::matrix(2, 3, vec![0.5, 2.0, 1.0, -1.0, 3.0, 0.25]).unwrap();
+        let tangent = Array::matrix(2, 3, vec![1.0, -2.0, 0.5, 3.0, 1.0, -1.0]).unwrap();
+        for kind in [CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min, CumulativeKind::LogSumExp] {
+            let dynamic = program(&dynamic_type, kind);
+            let jvp = dynamic.jvp().unwrap();
+            assert_eq!(jvp.output_types(), vec![dynamic_type.clone(), dynamic_type.clone()], "{kind}");
+            assert_eq!(
+                jvp.interpret(vec![primal.clone(), tangent.clone()]),
+                program(&static_type, kind).jvp().unwrap().interpret(vec![primal.clone(), tangent.clone()]),
+                "{kind}",
+            );
+            let linearization = dynamic.linearize().unwrap();
+            assert!(linearization.tangent().transpose_with_respect_to(&[0], &[]).is_ok(), "{kind}");
+        }
     }
 
     #[test]

@@ -1113,8 +1113,8 @@ mod tests {
                 lambda %0:f64[4] .
                 let %1:i32[4] = iota [type=i32[4], dimension=0]
                     %2:f64[4], %3:i32[4] = sort [axis=0, direction=descending] %0 %1
-                    %4:f64[2] = slice [start_indices=[0], limit_indices=[2]] %2
-                    %5:i32[2] = slice [start_indices=[0], limit_indices=[2]] %3
+                    %4:f64[2] = slice [start_indices=[0], limits=[2]] %2
+                    %5:i32[2] = slice [start_indices=[0], limits=[2]] %3
                 in (%4)
             "}
             .trim_end(),
@@ -1140,8 +1140,8 @@ mod tests {
                 let %1:f64[4] = reshape [shape=[4]] %0
                     %2:i32[4] = iota [type=i32[4], dimension=0]
                     %3:f64[4], %4:i32[4] = sort [axis=0, direction=descending] %1 %2
-                    %5:f64[2] = slice [start_indices=[0], limit_indices=[2]] %3
-                    %6:i32[2] = slice [start_indices=[0], limit_indices=[2]] %4
+                    %5:f64[2] = slice [start_indices=[0], limits=[2]] %3
+                    %6:i32[2] = slice [start_indices=[0], limits=[2]] %4
                     %7:f64[1, 2] = reshape [shape=[1, 2]] %5
                     %8:i32[1, 2] = reshape [shape=[1, 2]] %6
                 in (%7)

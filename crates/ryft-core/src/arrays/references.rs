@@ -3228,8 +3228,8 @@ mod tests {
             }),
             indoc! {"
                 lambda %0:f32[3, 3], %1:f32[2] .
-                let %2:f32[2, 2] = slice [start_indices=[1, 0], limit_indices=[3, 2]] %0
-                    %3:f32[1, 2] = slice [start_indices=[1, 0], limit_indices=[2, 2]] %2
+                let %2:f32[2, 2] = slice [start_indices=[1, 0], limits=[3, 2]] %0
+                    %3:f32[1, 2] = slice [start_indices=[1, 0], limits=[2, 2]] %2
                     %4:f32[2] = reshape [shape=[2]] %3
                 in (%4)"},
         );
@@ -3274,7 +3274,7 @@ mod tests {
             }),
             indoc! {"
                 lambda %0:f32[3, 3], %1:f32[2] .
-                let %2:f32[2, 2] = slice [start_indices=[1, 0], limit_indices=[3, 2]] %0
+                let %2:f32[2, 2] = slice [start_indices=[1, 0], limits=[3, 2]] %0
                     %3:f32[1, 2] = reshape [shape=[1, 2]] %1
                     %4:f32[2, 2] = update_slice [start_indices=[1, 0]] %2 %3
                     %5:f32[3, 3] = update_slice [start_indices=[1, 0]] %0 %4
@@ -3313,8 +3313,8 @@ mod tests {
             }),
             indoc! {"
                 lambda %0:f32[3, 3], %1:f32[2] .
-                let %2:f32[2, 2] = slice [start_indices=[1, 0], limit_indices=[3, 2]] %0
-                    %3:f32[1, 2] = slice [start_indices=[1, 0], limit_indices=[2, 2]] %2
+                let %2:f32[2, 2] = slice [start_indices=[1, 0], limits=[3, 2]] %0
+                    %3:f32[1, 2] = slice [start_indices=[1, 0], limits=[2, 2]] %2
                     %4:f32[2] = reshape [shape=[2]] %3
                     %5:f32[1, 2] = reshape [shape=[1, 2]] %1
                     %6:f32[2, 2] = update_slice [start_indices=[1, 0]] %2 %5
@@ -3349,8 +3349,8 @@ mod tests {
             }),
             indoc! {"
                 lambda %0:f32[3, 3], %1:f32[2] .
-                let %2:f32[2, 2] = slice [start_indices=[1, 0], limit_indices=[3, 2]] %0
-                    %3:f32[1, 2] = slice [start_indices=[1, 0], limit_indices=[2, 2]] %2
+                let %2:f32[2, 2] = slice [start_indices=[1, 0], limits=[3, 2]] %0
+                    %3:f32[1, 2] = slice [start_indices=[1, 0], limits=[2, 2]] %2
                     %4:f32[2] = reshape [shape=[2]] %3
                     %5:f32[2] = add %4 %1
                     %6:f32[1, 2] = reshape [shape=[1, 2]] %5
@@ -3394,8 +3394,8 @@ mod tests {
             staged.to_string(),
             indoc! {"
                 lambda %0:f32[4], %1:f32[2] .
-                let %2:f32[3] = slice [start_indices=[1], limit_indices=[4]] %0
-                    %3:f32[2] = slice [start_indices=[0], limit_indices=[2]] %2
+                let %2:f32[3] = slice [start_indices=[1], limits=[4]] %0
+                    %3:f32[2] = slice [start_indices=[0], limits=[2]] %2
                     %4:f32[2] = add %3 %1
                     %5:f32[3] = update_slice [start_indices=[0]] %2 %4
                     %6:f32[4] = update_slice [start_indices=[1]] %0 %5
@@ -3437,7 +3437,7 @@ mod tests {
                 lambda %0:f32[2, 3], %1:i32[], %2:f32[2] .
                 let %3:f32[1, 3] = dynamic_slice [sizes=[1, 3]] %0 %1 %1
                     %4:f32[3] = reshape [shape=[3]] %3
-                    %5:f32[2] = slice [start_indices=[1], limit_indices=[3]] %4
+                    %5:f32[2] = slice [start_indices=[1], limits=[3]] %4
                     %6:f32[1, 3] = dynamic_slice [sizes=[1, 3]] %0 %1 %1
                     %7:f32[3] = reshape [shape=[3]] %6
                     %8:f32[3] = update_slice [start_indices=[1]] %7 %2
@@ -3445,7 +3445,7 @@ mod tests {
                     %10:f32[2, 3] = dynamic_update_slice %0 %9 %1 %1
                     %11:f32[1, 3] = dynamic_slice [sizes=[1, 3]] %0 %1 %1
                     %12:f32[3] = reshape [shape=[3]] %11
-                    %13:f32[2] = slice [start_indices=[1], limit_indices=[3]] %12
+                    %13:f32[2] = slice [start_indices=[1], limits=[3]] %12
                     %14:f32[2] = add %13 %2
                     %15:f32[3] = update_slice [start_indices=[1]] %12 %14
                     %16:f32[1, 3] = reshape [shape=[1, 3]] %15

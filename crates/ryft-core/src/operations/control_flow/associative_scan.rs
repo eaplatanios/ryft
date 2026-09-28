@@ -8,7 +8,7 @@
 
 // TODO(eaplatanios): Review this module.
 
-use crate::arrays::{ArrayType, DataType, StaticShape};
+use crate::arrays::{ArrayType, DataType};
 use crate::axes::Axis;
 use crate::contexts::Context;
 use crate::operations::arithmetic::Add;
@@ -18,7 +18,7 @@ use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::padding::Pad;
 use crate::operations::manipulation::slicing::Slice;
 use crate::parameters::Parameterized;
-use crate::programs::{ProgramError, ProvenanceScope, TypeError, Value};
+use crate::programs::{ProgramError, ProvenanceScope, TypeError, Typed, Value};
 
 /// Returns the inclusive prefix scans of the arrays in `values` along `axis` under the associative operator `combine`,
 /// built out of ordinary manipulation primitives instead of out of one
@@ -52,8 +52,9 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Value};
 /// after a forward scan, which saves two array reversals per array and scan. Boolean arrays are interleaved with a
 /// disjunction rather than an addition, because Booleans have no addition.
 ///
-/// The shape of every array must be static, because the construction slices at staging-time positions. A scanned axis
-/// shorter than two elements leaves the arrays unchanged, and so does a structure that holds no arrays. A negative
+/// The scanned axis of every array must have a static extent, because the construction slices it at staging-time
+/// positions, while every other axis can be dynamic (it is kept whole). A scanned axis shorter than two elements leaves
+/// the arrays unchanged, and so does a structure that holds no arrays. A negative
 /// `axis` counts from the end of the shape of the first array, and the resulting position is scanned in every array.
 ///
 /// # Parameters
@@ -66,7 +67,8 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Value};
 ///
 /// # Errors
 ///
-/// Returns a [`ProgramError`] if `axis` is out of bounds for any array, if the shape of any array is not static, if
+/// Returns a [`ProgramError`] if `axis` is out of bounds for any array, if the scanned extent of any array is not
+/// static, if
 /// the arrays have different extents along `axis`, if `combine` returns a different number of arrays, or if staging
 /// any of the primitives of the construction (including those that `combine` stages) fails.
 pub fn associative_scan<V, Values, A: Into<Axis>, F>(
@@ -90,7 +92,7 @@ where
         .into()
         .normalize(first.r#type().rank())
         .map_err(|error| TypeError::invalid(format!("`associative_scan` {error}")))?;
-    let shapes = arrays
+    let extents = arrays
         .iter()
         .map(|array| {
             let array_type = array.r#type();
@@ -100,18 +102,17 @@ where
                     "`associative_scan` axis {axis} is out of bounds for rank {rank}",
                 )));
             }
-            array_type.static_shape().ok_or_else(|| {
+            array_type.dimension(axis).value().ok_or_else(|| {
                 TypeError::invalid(format!(
-                    "`associative_scan` requires statically shaped operands but got `{array_type}`",
+                    "`associative_scan` requires a static extent along the scanned axis {axis} but got `{array_type}`",
                 ))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let extent = shapes[0][axis];
-    if let Some(shape) = shapes.iter().find(|shape| shape[axis] != extent) {
+    let extent = extents[0];
+    if let Some(other) = extents.iter().find(|other| **other != extent) {
         return Err(TypeError::invalid(format!(
-            "`associative_scan` requires operands with equal extents along axis {axis} but got {extent} and {}",
-            shape[axis],
+            "`associative_scan` requires operands with equal extents along axis {axis} but got {extent} and {other}",
         ))
         .into());
     }
@@ -138,17 +139,17 @@ where
     let domain = first.dispatch_domain();
     let scanned = domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
         domain.invoke_with_provenance_scope(ProvenanceScope::new("associative_scan"), || {
-            associative_scan_recursively(&arrays, &shapes, axis, reverse, &flat_combine)
+            associative_scan_recursively(&arrays, extent, axis, reverse, &flat_combine)
         })
     })?;
     Ok(Values::from_parameters(structure, scanned)?)
 }
 
-/// Recursive half of [`associative_scan`], operating on the flat arrays of the scanned structure, whose shapes are
-/// already known to be static and to agree along `axis`.
+/// Recursive half of [`associative_scan`], operating on the flat arrays of the scanned structure, whose (static) extent
+/// along `axis` is `extent`.
 fn associative_scan_recursively<V, F>(
     values: &[V],
-    shapes: &[StaticShape],
+    extent: usize,
     axis: usize,
     reverse: bool,
     combine: &F,
@@ -158,7 +159,6 @@ where
     V::DispatchDomain: Context<Type = ArrayType> + Zero<V>,
     F: Fn(&[V], &[V]) -> Result<Vec<V>, ProgramError>,
 {
-    let extent = shapes[0][axis];
     if extent < 2 {
         return Ok(values.to_vec());
     }
@@ -171,8 +171,8 @@ where
         true => extent % 2,
         false => 0,
     };
-    let earlier = scan_slice(values, shapes, axis, pair_offset, extent - 1, 2)?;
-    let later = scan_slice(values, shapes, axis, pair_offset + 1, extent, 2)?;
+    let earlier = scan_slice(values, axis, pair_offset, extent - 1, 2)?;
+    let later = scan_slice(values, axis, pair_offset + 1, extent, 2)?;
     let reduced = match reverse {
         true => combine(&later, &earlier)?,
         false => combine(&earlier, &later)?,
@@ -180,15 +180,7 @@ where
 
     // Scanning the pairwise reductions yields every other output element: the odd positions of a forward scan, and the
     // positions congruent to `pair_offset` of a reverse one.
-    let halved_shapes = shapes
-        .iter()
-        .map(|shape| {
-            let mut dimensions = shape.dimensions().to_vec();
-            dimensions[axis] = half;
-            StaticShape::new(dimensions)
-        })
-        .collect::<Vec<_>>();
-    let aligned = associative_scan_recursively(&reduced, &halved_shapes, axis, reverse, combine)?;
+    let aligned = associative_scan_recursively(&reduced, half, axis, reverse, combine)?;
 
     // Each complementary position extends the aligned result before it by the one element that separates them, except
     // for the position at the scan's own start, which is just the operand element there. An even extent has one fewer
@@ -200,16 +192,16 @@ where
     };
     let (complement, aligned_leads) = match reverse {
         true => {
-            let last = scan_slice(values, shapes, axis, extent - 1, extent, 1)?;
+            let last = scan_slice(values, axis, extent - 1, extent, 1)?;
             let complement = match complement_count {
                 0 => last,
                 _ => {
                     let trimmed = match extent % 2 {
-                        0 => scan_slice(&aligned, &halved_shapes, axis, 1, half, 1)?,
+                        0 => scan_slice(&aligned, axis, 1, half, 1)?,
                         _ => aligned.clone(),
                     };
                     let start = (pair_offset + 1) % 2;
-                    let operands = scan_slice(values, shapes, axis, start, start + 2 * complement_count, 2)?;
+                    let operands = scan_slice(values, axis, start, start + 2 * complement_count, 2)?;
                     combine(&trimmed, &operands)?
                         .iter()
                         .zip(&last)
@@ -220,15 +212,15 @@ where
             (complement, extent % 2 == 0)
         }
         false => {
-            let first = scan_slice(values, shapes, axis, 0, 1, 1)?;
+            let first = scan_slice(values, axis, 0, 1, 1)?;
             let complement = match complement_count {
                 0 => first,
                 _ => {
                     let trimmed = match extent % 2 {
-                        0 => scan_slice(&aligned, &halved_shapes, axis, 0, half - 1, 1)?,
+                        0 => scan_slice(&aligned, axis, 0, half - 1, 1)?,
                         _ => aligned.clone(),
                     };
-                    let operands = scan_slice(values, shapes, axis, 2, (2 + 2 * complement_count).min(extent), 2)?;
+                    let operands = scan_slice(values, axis, 2, (2 + 2 * complement_count).min(extent), 2)?;
                     first
                         .iter()
                         .zip(&combine(&trimmed, &operands)?)
@@ -241,39 +233,26 @@ where
     };
 
     match aligned_leads {
-        true => scan_interleave(&aligned, &complement, shapes, axis, half, extent - half),
-        false => scan_interleave(&complement, &aligned, shapes, axis, extent - half, half),
+        true => scan_interleave(&aligned, &complement, axis, half, extent - half),
+        false => scan_interleave(&complement, &aligned, axis, extent - half, half),
     }
 }
 
 /// Returns the elements of each array in `values` at positions `start`, `start + stride`, ... below `limit` along
-/// `axis`, keeping every other axis whole. `shapes` holds the static shape of each array.
-fn scan_slice<V: Slice>(
+/// `axis`, keeping every other axis whole (including a dynamic one) through [`Slice::slice_axis`].
+fn scan_slice<V: Slice + Typed<Type = ArrayType>>(
     values: &[V],
-    shapes: &[StaticShape],
     axis: usize,
     start: usize,
     limit: usize,
     stride: usize,
 ) -> Result<Vec<V>, ProgramError> {
-    values
-        .iter()
-        .zip(shapes)
-        .map(|(value, shape)| {
-            let mut start_indices = vec![0; shape.rank()];
-            let mut limit_indices = shape.dimensions().to_vec();
-            let mut strides = vec![1; shape.rank()];
-            start_indices[axis] = start;
-            limit_indices[axis] = limit;
-            strides[axis] = stride;
-            value.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())
-        })
-        .collect()
+    values.iter().map(|value| value.slice_axis(axis, start, limit, stride)).collect()
 }
 
 /// Returns each array of `left` interleaved along `axis` with the corresponding array of `right`, starting with the
-/// `left` one, where `shapes` holds the static shapes of the (uninterleaved) scanned arrays. Each `left` array must
-/// hold either as many elements along `axis` as its `right` counterpart or exactly one more.
+/// `left` one. Each `left` array must hold either as many elements along `axis` as its `right` counterpart or exactly
+/// one more.
 ///
 /// Both operands are dilated into the output extent with interior padding (writing zeros into the positions that the
 /// other operand occupies) and then combined with an addition, or with a disjunction for Boolean operands, which have
@@ -282,7 +261,6 @@ fn scan_slice<V: Slice>(
 fn scan_interleave<V>(
     left: &[V],
     right: &[V],
-    shapes: &[StaticShape],
     axis: usize,
     left_count: usize,
     right_count: usize,
@@ -299,12 +277,12 @@ where
     }
     left.iter()
         .zip(right)
-        .zip(shapes)
-        .map(|((left, right), shape)| {
+        .map(|(left, right)| {
+            let rank = left.r#type().rank();
             let padding_value = left.dispatch_domain().zero(&left.r#type().scalar_like()?)?;
-            let mut edge_padding_low = vec![0; shape.rank()];
-            let mut edge_padding_high = vec![0; shape.rank()];
-            let mut interior_padding = vec![0; shape.rank()];
+            let mut edge_padding_low = vec![0; rank];
+            let mut edge_padding_high = vec![0; rank];
+            let mut interior_padding = vec![0; rank];
             interior_padding[axis] = 1;
             edge_padding_high[axis] = i64::from(left_count == right_count);
             let dilated_left = left.pad(&padding_value, &edge_padding_low, &edge_padding_high, &interior_padding)?;
@@ -324,7 +302,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation};
+    use crate::arrays::{Array, ArrayOperation, Dimension, DimensionBounds, DimensionVariable, Shape, StaticShape};
     use crate::contexts::StagingContext;
     use crate::operations::comparisons::{Compare, ComparisonDirection};
     use crate::operations::control_flow::select::Select;
@@ -401,6 +379,48 @@ mod tests {
         assert_eq!(
             associative_scan(&matrix, -3, false, &add),
             Err(ProgramError::Type(TypeError::invalid("`associative_scan` axis -3 is out of bounds for rank 2"))),
+        );
+    }
+
+    #[test]
+    fn test_associative_scan_dynamic_unscanned_axes() {
+        // Only the scanned axis needs a static extent: every other axis is sliced whole, so a dynamic one keeps its
+        // dynamic extent through the construction.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = context.input(ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]),
+        ));
+        let output = associative_scan(&input, 1, false, &|left, right| left.add(right)).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[batch, 2] .
+                let %1:f64[batch, 1] = slice [start_indices=[0, 0], limits=[batch, 1], strides=[1, 2]] %0
+                    %2:f64[batch, 1] = slice [start_indices=[0, 1], limits=[batch, 2], strides=[1, 2]] %0
+                    %3:f64[batch, 1] = add %1 %2
+                    %4:f64[batch, 1] = slice [start_indices=[0, 0], limits=[batch, 1]] %0
+                    %5:f64[] = zero [type=f64[]]
+                    %6:f64[batch, 2] = pad [edge_padding_low=[0, 0], edge_padding_high=[0, 1], interior_padding=[0, 1]] %4 %5
+                    %7:f64[batch, 2] = pad [edge_padding_low=[0, 1], edge_padding_high=[0, 0], interior_padding=[0, 1]] %3 %5
+                    %8:f64[batch, 2] = add %6 %7
+                in (%8)"
+            },
+        );
+
+        // The scanned axis itself must still be static, since the construction slices it at staging-time positions.
+        assert_eq!(
+            associative_scan(&input, 0, false, &|left, right| left.add(right)),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`associative_scan` requires a static extent along the scanned axis 0 but got `f64[batch, 2]`",
+            ))),
         );
     }
 
@@ -498,10 +518,10 @@ mod tests {
                 .to_string(),
             indoc! {"
                 lambda %0:f64[2] .
-                let %1:f64[1] = slice [start_indices=[0], limit_indices=[1], strides=[2]] %0 ; provenance=ryft::associative_scan
-                    %2:f64[1] = slice [start_indices=[1], limit_indices=[2], strides=[2]] %0 ; provenance=ryft::associative_scan
+                let %1:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %0 ; provenance=ryft::associative_scan
+                    %2:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %0 ; provenance=ryft::associative_scan
                     %3:f64[1] = add %1 %2 ; provenance=ryft::associative_scan
-                    %4:f64[1] = slice [start_indices=[0], limit_indices=[1]] %0 ; provenance=ryft::associative_scan
+                    %4:f64[1] = slice [start_indices=[0], limits=[1]] %0 ; provenance=ryft::associative_scan
                     %5:f64[] = zero [type=f64[]] ; provenance=ryft::associative_scan
                     %6:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %4 %5 ; provenance=ryft::associative_scan
                     %7:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %3 %5 ; provenance=ryft::associative_scan

@@ -1909,7 +1909,7 @@ mod tests {
                         __SCATTER_DIMENSIONS__
                     ] %17 %16 %13
                     %19:i64[5] = cumulative [kind=sum, axis=0] %18
-                    %20:i64[4] = slice [start_indices=[0], limit_indices=[4]] %19
+                    %20:i64[4] = slice [start_indices=[0], limits=[4]] %19
                     %21:i64[4] = zero [type=i64[4]]
                     %22:bool[4] = compare [direction=NotEqual] %20 %21
                     %23:f32[4] = zero [type=f32[4]]

@@ -349,7 +349,7 @@ pub enum SpecializationCacheEntry<'c, Key: Clone + Eq + Hash, Artifact: Clone> {
 /// that protocol when callers do not need to separate entry resolution from production. Statistics are exposed as
 /// ordinary value snapshots, while private atomics accumulate events without participating in cache correctness.
 #[cfg_attr(doc, aquamarine::aquamarine)]
-pub struct SpecializationCache<Key: Clone + Eq + Hash, Artifact: Clone> {
+pub struct SpecializationCache<Key, Artifact> {
     /// Retained artifacts in Least-Recently-Used (LRU) order.
     entries: Mutex<LruCache<Key, Artifact>>,
 

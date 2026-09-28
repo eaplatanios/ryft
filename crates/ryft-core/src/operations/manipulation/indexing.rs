@@ -2468,7 +2468,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[2, 3] .
-                let %1:f64[2, 1] = slice [start_indices=[0, 1], limit_indices=[2, 2]] %0
+                let %1:f64[2, 1] = slice [start_indices=[0, 1], limits=[2, 2]] %0
                     %2:f64[2] = reshape [shape=[2]] %1
                 in (%2)
             "}

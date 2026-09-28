@@ -3833,7 +3833,7 @@ mod tests {
                     true={
                         lambda %0:f32[3] .
                         let %1:f32[] = const 1.0
-                            %2:f32[1] = slice [start_indices=[1], limit_indices=[2]] %0
+                            %2:f32[1] = slice [start_indices=[1], limits=[2]] %0
                             %3:f32[] = reshape [shape=[]] %2
                             %4:f32[] = add %3 %1
                             %5:f32[1] = reshape [shape=[1]] %4

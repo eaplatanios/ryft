@@ -851,16 +851,34 @@ impl_differentiable_operation! {
                     let mut high = Vec::with_capacity(target_type.rank());
                     let mut empty = false;
                     for axis in 0..target_type.rank() {
+                        // A dynamic axis that the padding leaves untouched maps each input position onto itself, so
+                        // its cotangent is read back whole through the cotangent's own dynamic extent (which is the
+                        // input's) and needs no padding. Any other dynamic axis would need its runtime extent.
+                        if matches!(target_type.dimension(axis), Dimension::Dynamic(_))
+                            && operation.edge_padding_low[axis] == 0
+                            && operation.edge_padding_high[axis] == 0
+                            && operation.interior_padding[axis] == 0
+                        {
+                            starts.push(0);
+                            limits.push(cotangent.r#type().dimension(axis));
+                            strides.push(1);
+                            low.push(0);
+                            high.push(0);
+                            continue;
+                        }
+
                         let input_extent = target_type.dimension(axis).value().ok_or_else(|| {
                             TypeError::invalid(format!(
                                 "`{PAD_OPERATION_NAME}` transpose requires a static input extent on axis {axis}",
                             ))
                         })? as i128;
+
                         let output_extent = cotangent.r#type().dimension(axis).value().ok_or_else(|| {
                             TypeError::invalid(format!(
                                 "`{PAD_OPERATION_NAME}` transpose requires a static output extent on axis {axis}",
                             ))
                         })? as i128;
+
                         let edge = operation.edge_padding_low[axis] as i128;
                         let stride = operation.interior_padding[axis] as i128 + 1;
 
@@ -878,7 +896,7 @@ impl_differentiable_operation! {
 
                         // Surviving coordinates lie inside the static output extent, so they fit `usize`.
                         starts.push(usize::try_from(edge + first * stride).unwrap());
-                        limits.push(usize::try_from(edge + (end - 1) * stride + 1).unwrap());
+                        limits.push(Dimension::Static(usize::try_from(edge + (end - 1) * stride + 1).unwrap()));
 
                         // With one surviving element, the stride is irrelevant and need not fit usize.
                         strides.push(if end - first == 1 { 1 } else { usize::try_from(stride).unwrap() });
@@ -3330,6 +3348,39 @@ mod tests {
     }
 
     #[test]
+    fn test_pad_transposition_dynamic_unpadded_axis() {
+        // A dynamic axis that the padding leaves untouched maps onto itself, so the pullback reads its cotangent back
+        // whole and pads nothing along it, while it crops and dilates the padded static axis as usual.
+        let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input =
+            builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![size.into(), Dimension::Static(2)])));
+        let padding_value = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                PadOperation::new(vec![0, 1], vec![0, 0], vec![0, 1]).unwrap(),
+                Vec::new(),
+                vec![input, padding_value],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[size, 4], %1:f64[] .
+                let %2:f64[size, 2] = slice [start_indices=[0, 1], limits=[size, 4], strides=[1, 2]] %0
+                    %3:f64[] = zero [type=f64[]]
+                    %4:f64[size, 2] = pad [edge_padding_low=[0, 0], edge_padding_high=[0, 0], interior_padding=[0, 0]] %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_pad_transposition_rejects_unrepresentable_geometry() {
         // The homogeneous pullback slices static geometry only. A dynamic axis whose extent the padding leaves
         // unchanged passes type inference but has no static input extent to slice.
@@ -5577,7 +5628,7 @@ mod tests {
                 ],
                 pullback = indoc! {"
                     lambda %0:f64[8], %1:dimension<8> .
-                    let %2:f64[3] = slice [start_indices=[1], limit_indices=[6], strides=[2]] %0
+                    let %2:f64[3] = slice [start_indices=[1], limits=[6], strides=[2]] %0
                         %3:f64[] = zero [type=f64[]]
                         %4:f64[3] = pad [edge_padding_low=[0], edge_padding_high=[0], interior_padding=[0]] %2 %3
                         %5:bool[3] = zero [type=bool[3]]
