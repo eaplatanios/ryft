@@ -355,7 +355,7 @@ impl<V: Typed> Typed for CotangentReferenceAccumulator<V> {
 /// underlying storage, so repeated operands can each contribute to one gradient value. Handles are valid only in their
 /// [`TranspositionContext`]s that created them; reference-state adjoints use the context's separate reference
 /// operations instead.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Parameter)]
 pub struct CotangentAccumulator {
     /// Identity token shared with the [`TranspositionContext`] that owns this handle's storage slot. The context
     /// checks pointer equality with this token before accessing the slot, rejecting handles from other contexts.

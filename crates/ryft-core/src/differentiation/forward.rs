@@ -19,7 +19,7 @@ use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewO
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
-    PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
+    PartialValue, PartiallyEvaluatableOperation, PartitionMetadata, PartitionedProgram,
 };
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
@@ -1188,7 +1188,27 @@ where
         input_known: &[bool],
         required_known_outputs: &[usize],
     ) -> Result<PartitionedProgram<C::Constant, C::Operation>, DifferentiationError> {
-        Ok(region.partition_with_configuration(input_known, true, true, Some(required_known_outputs))?.0)
+        // Rules that replay a retained program (e.g., a custom JVP rule) partition the same region on every request,
+        // so the partition is retained in the region's transform cache.
+        let arguments = JvpPartitionTransformArguments {
+            input_known: input_known.to_vec(),
+            required_known_outputs: required_known_outputs.to_vec(),
+        };
+        let artifact = region.transform::<JvpPartitionTransform, _, _>(arguments, |region, arguments| {
+            let (partition, _) = region.partition_with_configuration(
+                &arguments.input_known,
+                true,
+                true,
+                Some(&arguments.required_known_outputs),
+            )?;
+            let (known_program, residual_program, metadata) = partition.into_programs_and_metadata();
+            Ok(TransformArtifact::new(vec![Arc::new(known_program), Arc::new(residual_program)], metadata))
+        })?;
+        let (programs, metadata) = artifact.into_parts();
+        let mut programs = programs.into_iter().map(Arc::unwrap_or_clone);
+        let known_program = programs.next().unwrap();
+        let residual_program = programs.next().unwrap();
+        Ok(PartitionedProgram::from_programs_and_metadata(known_program, residual_program, metadata))
     }
 
     #[inline]
@@ -1284,9 +1304,10 @@ pub trait DifferentiableOperation<C: Context>: Operation {
     /// Reverse-mode differentiation uses this rule before computing primal outputs and saving residuals. Immediate
     /// forward-mode differentiation and public [`linearize`](ForwardModeDifferentiate::linearize) instead use
     /// [`Self::jvp`], whose tangent computation must support execution as a pushforward. This rule's tangent
-    /// computation need only support transposition (e.g., it may retain a custom backward program in a transpose-only
-    /// [`LinearCallOperation`](crate::LinearCallOperation), which cannot be executed as a pushforward). Callers
-    /// constructing an executable JVP must therefore use [`Self::jvp`] with a forward-selected context and driver.
+    /// computation need only support transposition (e.g., it may retain a custom backward program in a
+    /// [`CustomFunctionTransposeOperation`](crate::CustomFunctionTransposeOperation), which cannot be executed as a
+    /// pushforward). Callers constructing an executable JVP must therefore use [`Self::jvp`] with a forward-selected
+    /// context and driver.
     ///
     /// The default delegates to [`Self::jvp`], deriving reverse mode from the same derivative rule as forward mode.
     /// Override this function when reverse mode needs a custom backward program or different primal computations and
@@ -3440,6 +3461,27 @@ impl JvpAndLinearizationTransformArguments {
     }
 }
 
+/// [`Region`] [`Transform`] marker for retained partitions of Jacobian-Vector Product (JVP) programs into their known
+/// and tangent parts. Refer to [`DifferentiationDriver::partition_jvp_program`] for more information.
+pub(crate) struct JvpPartitionTransform;
+
+impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for JvpPartitionTransform {
+    type Arguments = JvpPartitionTransformArguments;
+    type Artifact = TransformArtifact<V, O, PartitionMetadata>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = 8;
+}
+
+/// Argument key for one retained [`JvpPartitionTransform`] artifact.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct JvpPartitionTransformArguments {
+    /// Whether each input of the partitioned program is known.
+    input_known: Vec<bool>,
+
+    /// Indices of the outputs that the known part must compute.
+    required_known_outputs: Vec<usize>,
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::rc::Rc;
@@ -3463,10 +3505,10 @@ pub(crate) mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::impl_non_transposable_operation;
     use crate::operations::{
-        AddOperation, ConditionOperation, LinearCallOperation, Mul, MulOperation, NegOperation, PrintOperation,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-        ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation, StopGradient, StopGradientOperation,
-        ZeroOperation,
+        AddOperation, ConditionOperation, CustomFunctionTransposeOperation, Mul, MulOperation, NegOperation,
+        PrintOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation, StopGradient,
+        StopGradientOperation, ZeroOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
@@ -3614,7 +3656,7 @@ pub(crate) mod tests {
                 Type = ArrayType,
                 Operation: From<MulOperation<ArrayType>>
                                + From<AddOperation<ArrayType>>
-                               + From<LinearCallOperation<ArrayType>>,
+                               + From<CustomFunctionTransposeOperation<C::Constant, C::Operation>>,
             >,
     > DifferentiableOperation<C> for CustomCubeOperation
     {
@@ -3662,7 +3704,7 @@ pub(crate) mod tests {
                 vec![Placeholder; 2],
                 vec![Placeholder],
             )?;
-            let carrier = LinearCallOperation::transpose_only(
+            let carrier = CustomFunctionTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
                 1,
                 vec![input.r#type().into_owned()],
                 vec![input.r#type().into_owned()],
@@ -3739,7 +3781,7 @@ pub(crate) mod tests {
                 Type = ArrayType,
                 Operation: From<MulOperation<ArrayType>>
                                + From<AddOperation<ArrayType>>
-                               + From<LinearCallOperation<ArrayType>>,
+                               + From<CustomFunctionTransposeOperation<C::Constant, C::Operation>>,
             >,
     > DifferentiableOperation<C> for CustomWeightedCubeOperation
     {
@@ -3811,7 +3853,11 @@ pub(crate) mod tests {
                 vec![Placeholder; 3],
                 vec![Placeholder; 2],
             )?;
-            let carrier = LinearCallOperation::transpose_only(2, vec![value_type.clone(); 2], vec![value_type.clone()]);
+            let carrier = CustomFunctionTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
+                2,
+                vec![value_type.clone(); 2],
+                vec![value_type.clone()],
+            );
             let weight_residual = context.primal_to_tangent(weight.clone())?;
             let input_residual = context.primal_to_tangent(input.clone())?;
             let tangent = context
@@ -3887,8 +3933,13 @@ pub(crate) mod tests {
         }
     }
 
-    impl<C: Context<Type = ArrayType, Operation: From<AddOperation<ArrayType>> + From<LinearCallOperation<ArrayType>>>>
-        DifferentiableOperation<C> for RuleMarkerOperation
+    impl<
+        C: Context<
+                Type = ArrayType,
+                Operation: From<AddOperation<ArrayType>>
+                               + From<CustomFunctionTransposeOperation<C::Constant, C::Operation>>,
+            >,
+    > DifferentiableOperation<C> for RuleMarkerOperation
     {
         fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
             &self,
@@ -3917,7 +3968,11 @@ pub(crate) mod tests {
                 vec![Placeholder],
                 vec![Placeholder],
             )?;
-            let carrier = LinearCallOperation::transpose_only(0, vec![value_type.clone()], vec![value_type]);
+            let carrier = CustomFunctionTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
+                0,
+                vec![value_type.clone()],
+                vec![value_type],
+            );
             let tangent = inputs[0].tangent().as_value().unwrap().clone();
             let tangent = context.tangent().bind(carrier, vec![backward], &[tangent])?.remove(0);
             Ok(vec![DifferentiationDual::new(inputs[0].primal().clone(), tangent)?])
@@ -3980,8 +4035,13 @@ pub(crate) mod tests {
         }
     }
 
-    impl<C: Context<Type = ArrayType, Operation: From<RuleMarkerOperation> + From<LinearCallOperation<ArrayType>>>>
-        DifferentiableOperation<C> for NestedRuleOperation
+    impl<
+        C: Context<
+                Type = ArrayType,
+                Operation: From<RuleMarkerOperation>
+                               + From<CustomFunctionTransposeOperation<C::Constant, C::Operation>>,
+            >,
+    > DifferentiableOperation<C> for NestedRuleOperation
     {
         fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
             &self,
@@ -4007,7 +4067,11 @@ pub(crate) mod tests {
                 vec![Placeholder],
                 vec![Placeholder],
             )?;
-            let carrier = LinearCallOperation::transpose_only(0, vec![value_type.clone()], vec![value_type]);
+            let carrier = CustomFunctionTransposeOperation::<C::Constant, C::Operation>::from_backward_region(
+                0,
+                vec![value_type.clone()],
+                vec![value_type],
+            );
             let tangent = inputs[0].tangent().as_value().unwrap().clone();
             let tangent = context.tangent().bind(carrier, vec![backward], &[tangent])?.remove(0);
             Ok(vec![DifferentiationDual::new(inputs[0].primal().clone(), tangent)?])
@@ -4727,8 +4791,8 @@ pub(crate) mod tests {
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = mul %0 %0
                     %3:f64[] = mul %2 %0
-                    %4:f64[] = linear_call [residual_count=1, transpose_only=true] %0 %1 [
-                        transpose={
+                    %4:f64[] = custom_function_transpose [leading_input_count=1] %0 %1 [
+                        backward={
                             lambda %0:f64[], %1:f64[] .
                             let %2:f64[] = mul %0 %0
                                 %3:f64[] = add %2 %2
@@ -4808,8 +4872,8 @@ pub(crate) mod tests {
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = mul %0 %0
                             %3:f64[] = mul %2 %0
-                            %4:f64[] = linear_call [residual_count=1, transpose_only=true] %0 %1 [
-                                transpose={
+                            %4:f64[] = custom_function_transpose [leading_input_count=1] %0 %1 [
+                                backward={
                                     lambda %0:f64[], %1:f64[] .
                                     let %2:f64[] = mul %0 %0
                                         %3:f64[] = add %2 %2
