@@ -20,7 +20,7 @@ use crate::programs::types::Typed;
 /// transitively through rules without ever inspecting a program or materializing a buffer. A zero is _materialized_
 /// into a real value only at boundaries where one is structurally required (e.g., a nested sub-program operand, a
 /// program output, or an eagerly returned tangent), which is also where its carried [`Type`](crate::Type) is consumed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Parameter)]
 pub enum MaybeZero<V: Typed> {
     /// Structural zero of the carried [`Type`](crate::Type) (i.e., no value exists and nothing has been staged or
     /// computed for it).
