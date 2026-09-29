@@ -1,3 +1,4 @@
+use std::any::{Any, TypeId};
 use std::borrow::Cow;
 
 use crate::macros::check_count;
@@ -347,6 +348,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - A canonical [`OperationProjection<U>`] implementation for every projected member variant, in either role, naming
 ///     that variant's payload family as the enum's projection into `U`. Native and mixed variants do not define a
 ///     homogeneous operation-family projection.
+///   - An [`OperationPayloadProjection`] implementation, which recognizes and constructs payloads without naming the
+///     family that holds them, delegating through projected member variants. Refer to its documentation for which
+///     payloads it exposes and for the construction precedence.
 ///   - [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation),
 ///     [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
 ///     and [`TransposableOperation`](crate::TransposableOperation) dispatchers selected through
@@ -376,6 +380,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     projected operation family. Several operations in the same member universe should first be collected into that
 ///     family rather than declared as separate outer variants. Mixed-boundary variants do not claim that projection,
 ///     so they may repeat a member type freely.
+///   - A payload type that [`OperationPayloadProjection::from_payload`] constructs (i.e., one that is `'static`
+///     independently of the enum's generic parameters) may be held by at most one composite-native variant, so that
+///     construction is unambiguous.
 ///   - Bare generic payload variants such as `Extension(Extension)` do not receive `From` or `TryFrom` conversions.
 ///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
 ///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
@@ -1024,6 +1031,102 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
     type Projected: Operation<Type = T>;
 }
 
+/// Projection of the values of an [`Operation`] family into the concrete payload operations that they hold, and back,
+/// without naming the family. This is the runtime, type-erased counterpart of [`OperationProjection`]. It looks through
+/// the projected member variants of composite families at any depth, and it identifies payloads by [`TypeId`].
+///
+/// Code that must recognize or stage a particular payload without naming the family that holds
+/// it uses this trait. For example, a residual policy that saves the outputs of dot products must
+/// recognize a [`DotOperation`](crate::DotOperation) in [`ArrayOperation`](crate::ArrayOperation), in
+/// [`ArrayIrOperation`](crate::ArrayIrOperation) (where it lives inside the [`Array`](crate::ArrayIrOperation::Array)
+/// variant), and in backend families that embed those families as projected members, and the storage of such a policy
+/// describes how to offload a saved residual as a [`TransferToMemoryOperation`](crate::TransferToMemoryOperation)
+/// payload that the planner stages into whichever family the program uses. Borrowed [`TryFrom`] and owned [`From`]
+/// conversions cannot express that, because they require naming each family and each level of nesting, and because
+/// type-erased code cannot name the family at all.
+///
+/// `#[derive(Operation)]` generates the implementation of every derived family:
+///
+///   - A projected member variant delegates to its member family in both directions. Payloads that a member family
+///     constructs are lifted through the family's `From` conversion from that member family, exactly as staging a
+///     member operation would.
+///   - Every other variant projects into its payload when the payload's type is `'static` independently of the
+///     family's generic parameters (i.e., when it mentions none of the family's type parameters and no lifetime). This
+///     covers every region-free primitive payload (e.g., `DotOperation` or `TagOperation<ArrayType>`), while payloads
+///     such as `ScanOperation<V>` are not exposed.
+///   - [`from_payload`](Self::from_payload) tries the family's own (composite-native) variants first, in declaration
+///     order, and then its projected member variants, in declaration order, so a family's own variant takes precedence
+///     over a member family that holds the same payload type. Mixed member variants are never constructed, because
+///     their instruction boundaries differ from those of their payloads, and the derive rejects two composite-native
+///     variants that hold the same constructible payload type.
+///
+/// There is exactly one implementation per family, so a payload held both directly and through a member family (e.g.,
+/// a composite-native `ZeroOperation<ArrayType>` next to a member family that also holds one) cannot cause conflicting
+/// implementations. Handwritten families must implement this trait with the same semantics.
+pub trait OperationPayloadProjection {
+    /// Returns the payload operation whose [`TypeId`] is `payload`, if this operation holds one directly or
+    /// through a projected member variant, and [`None`] otherwise. Trait objects, which cannot call the generic
+    /// [`projected_payload`](Self::projected_payload) function, use this function directly.
+    fn project_payload(&self, payload: TypeId) -> Option<&dyn Any>;
+
+    /// Returns the payload operation of type `P`, if this operation holds one directly or through a projected member
+    /// variant, and [`None`] otherwise.
+    #[inline]
+    fn projected_payload<P: 'static>(&self) -> Option<&P>
+    where
+        Self: Sized,
+    {
+        self.project_payload(TypeId::of::<P>()).and_then(|payload| payload.downcast_ref::<P>())
+    }
+
+    /// Returns the value of this family that holds `payload`, or `payload` back unchanged when no variant of this
+    /// family can hold it.
+    fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation>
+    where
+        Self: Sized;
+}
+
+/// Type-erased payload operation (e.g., a [`TransferToMemoryOperation`](crate::TransferToMemoryOperation) value) that
+/// [`OperationPayloadProjection::from_payload`] lifts into an [`Operation`] family. It carries the operation's type
+/// name for diagnostics.
+pub struct ErasedOperation {
+    /// Erased payload operation.
+    operation: Box<dyn Any>,
+
+    /// Name of the operation's type, as reported by [`std::any::type_name`].
+    type_name: &'static str,
+}
+
+impl ErasedOperation {
+    /// Creates a new [`ErasedOperation`] that erases `operation`.
+    #[inline]
+    pub fn new<P: 'static + Operation>(operation: P) -> Self {
+        Self { operation: Box::new(operation), type_name: std::any::type_name::<P>() }
+    }
+
+    /// Returns the name of the erased operation's type.
+    #[inline]
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+
+    /// Returns the erased operation when its type is `P`, and returns this [`ErasedOperation`] unchanged otherwise.
+    #[inline]
+    pub fn downcast<P: 'static>(self) -> Result<P, Self> {
+        match self.operation.downcast::<P>() {
+            Ok(operation) => Ok(*operation),
+            Err(operation) => Err(Self { operation, type_name: self.type_name }),
+        }
+    }
+}
+
+impl std::fmt::Debug for ErasedOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("ErasedOperation").field(&self.type_name).finish()
+    }
+}
+
 /// Selects and constructs the concrete [`Operation`] staged by one value-level capability for program type `T`.
 ///
 /// Capabilities such as [`Mul`](crate::Mul) are declared once through the elementwise capability macro and are
@@ -1274,8 +1377,14 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrType, ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue};
-    use crate::operations::{DimensionAddOperation, DimensionPowOperation, StopGradientOperation};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, DataType, DimensionBounds, DimensionType,
+        DimensionValue,
+    };
+    use crate::operations::{
+        ConditionOperation, DimensionAddOperation, DimensionPowOperation, ReferenceNewOperation, SinOperation,
+        StopGradientOperation, TagOperation, ZeroOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{EffectClass, EffectClasses, ReferenceEffect};
@@ -1647,6 +1756,74 @@ mod tests {
                 "`selected_fold` fold declares a singleton output but its type `{scalar}` does not determine a value",
             ))),
         );
+    }
+
+    #[test]
+    fn test_operation_payload_projection() {
+        // Payloads are recognized directly in a family, through the projected array member of a composite family,
+        // and through trait objects.
+        let sin = ArrayOperation::<Array>::from(SinOperation::<ArrayType>::new());
+        let tag = ArrayIrOperation::<Array>::from(ArrayOperation::<Array>::from(TagOperation::new("residual")));
+        let reference = ArrayIrOperation::<Array>::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
+        assert!(sin.projected_payload::<SinOperation<ArrayType>>().is_some());
+        assert!(sin.projected_payload::<TagOperation<ArrayType>>().is_none());
+        assert_eq!(tag.projected_payload::<TagOperation<ArrayType>>().map(TagOperation::key), Some("residual"));
+        assert!(tag.projected_payload::<TagOperation<ArrayIrType>>().is_none());
+        assert!(reference.projected_payload::<ReferenceNewOperation<ArrayType, ArrayIrType>>().is_some());
+        let tag: &dyn OperationPayloadProjection = &tag;
+        let tag = tag.project_payload(TypeId::of::<TagOperation<ArrayType>>());
+        assert_eq!(
+            tag.and_then(|tag| tag.downcast_ref::<TagOperation<ArrayType>>()).map(TagOperation::key),
+            Some("residual")
+        );
+
+        // Payloads that mention a generic parameter of their family are not exposed.
+        let condition = ArrayOperation::<Array>::from(ConditionOperation::<Array>::new());
+        assert!(condition.projected_payload::<ConditionOperation<Array>>().is_none());
+    }
+
+    #[test]
+    fn test_erased_operation() {
+        let payload = ErasedOperation::new(SinOperation::<ArrayType>::new());
+        let type_name = std::any::type_name::<SinOperation<ArrayType>>();
+        assert_eq!(payload.type_name(), type_name);
+        assert_eq!(format!("{payload:?}"), format!("ErasedOperation({type_name:?})"));
+
+        // A failed downcast returns the payload unchanged.
+        let payload = payload.downcast::<TagOperation<ArrayType>>().unwrap_err();
+        assert_eq!(payload.type_name(), type_name);
+        assert_eq!(payload.downcast::<SinOperation<ArrayType>>().unwrap().to_string(), "sin");
+    }
+
+    #[test]
+    fn test_operation_payload_projection_from_payload() {
+        // Native payloads construct their own variants, including in a composite family.
+        let sin = ArrayOperation::<Array>::from_payload(ErasedOperation::new(SinOperation::<ArrayType>::new()));
+        assert!(matches!(sin, Ok(ArrayOperation::Sin(_))));
+        let reference = ArrayIrOperation::<Array>::from_payload(ErasedOperation::new(ReferenceNewOperation::<
+            ArrayType,
+            ArrayIrType,
+        >::new()));
+        assert!(matches!(reference, Ok(ArrayIrOperation::ReferenceNew(_))));
+
+        // Array payloads construct through the projected array member, whose result the composite family's `From`
+        // conversion lifts. The mixed `Zero` variant is never constructed directly, so the zero constructor reaches
+        // the composite family through that same conversion.
+        let tag =
+            ArrayIrOperation::<Array>::from_payload(ErasedOperation::new(TagOperation::<ArrayType>::new("residual")));
+        assert!(matches!(tag, Ok(ArrayIrOperation::Array(ArrayOperation::Tag(_)))));
+        let r#type = ArrayType::scalar(DataType::F64);
+        let zero =
+            ArrayIrOperation::<Array>::from_payload(ErasedOperation::new(ZeroOperation::new(r#type.clone()))).unwrap();
+        assert_eq!(zero.to_string(), ArrayIrOperation::<Array>::from(ZeroOperation::new(r#type)).to_string());
+
+        // Payloads that no variant holds, or that mention a generic parameter of their family, are returned unchanged.
+        let payload = ErasedOperation::new(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
+        let payload = ArrayOperation::<Array>::from_payload(payload).unwrap_err();
+        assert_eq!(payload.type_name(), std::any::type_name::<ReferenceNewOperation<ArrayType, ArrayIrType>>());
+        let payload = ErasedOperation::new(ConditionOperation::<Array>::new());
+        let payload = ArrayOperation::<Array>::from_payload(payload).unwrap_err();
+        assert_eq!(payload.type_name(), std::any::type_name::<ConditionOperation<Array>>());
     }
 
     #[test]
