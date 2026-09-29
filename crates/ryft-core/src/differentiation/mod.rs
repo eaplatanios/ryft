@@ -3035,6 +3035,10 @@ mod tests {
             fn named_axis(&self, name: &str) -> Option<NamedAxis> {
                 self.0.named_axis(name)
             }
+
+            fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+                self.0.named_axes()
+            }
         }
 
         impl Zero<Array> for ExplicitContext {
