@@ -242,6 +242,8 @@ pub use values::{
     validate_reference_boundary,
 };
 
+pub(crate) use analysis::LocalReferenceLifecycles;
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
