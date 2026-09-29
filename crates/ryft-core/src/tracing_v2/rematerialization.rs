@@ -2427,13 +2427,9 @@ where
 
         // The local reference lifecycles of the linearization primal decide which ordered instructions recompute slices
         // may copy (reference operations on local roots, together with their state predecessors) and which force a save
-        // (reads of external roots and every other effect). A reference-free primal has no analysis and no lifecycles.
-        let analysis = match linearization.primal().entry_region_ref().contains_references_in_closure() {
-            true => Some(linearization.primal().reference_analysis(0)?),
-            false => None,
-        };
-        let lifecycles =
-            LocalReferenceLifecycles::new(linearization.primal().entry_region_ref(), analysis.as_deref(), |_| true)?;
+        // (reads of external roots and every other effect). A reference-free primal tracks no lifecycles.
+        let analysis = linearization.primal().reference_analysis(0)?;
+        let lifecycles = analysis.local_lifecycles(linearization.primal().entry_region_ref(), |_| true)?;
 
         // Classify each instruction-produced residual exactly once from the provenance recovered from the primal
         // sub-program (the operation defining the residual atom, looked through nested provenance), memoizing the
@@ -2449,9 +2445,7 @@ where
         for index in 0..residual_count {
             if residual_types[index].is_reference() {
                 let value = ValueId::new(linearization.primal().entry(), residual_atoms[index]);
-                if let Some(ReferenceRoot::Allocation { instruction, .. }) =
-                    analysis.as_ref().and_then(|analysis| analysis.root_of(value))
-                {
+                if let Some(ReferenceRoot::Allocation { instruction, .. }) = analysis.root_of(value) {
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
                             "rematerialization cannot thread the reference allocated at {instruction} inside the \
@@ -4399,7 +4393,8 @@ mod tests {
         let mut destination = ProgramBuilder::<Array, SplitOperation>::new();
         let region_input = destination.add_input(scalar_type.clone());
         let saved_input = destination.add_input(scalar_type);
-        let lifecycles = LocalReferenceLifecycles::new(primal.entry_region_ref(), None, |_| true).unwrap();
+        let lifecycles =
+            primal.reference_analysis(0).unwrap().local_lifecycles(primal.entry_region_ref(), |_| true).unwrap();
         let mut resolver = PrimalSliceResolver::new(&primal, &lifecycles, std::slice::from_ref(&region_input));
         resolver.seed_cut(split_outputs[0], saved_input);
 
@@ -4791,7 +4786,8 @@ mod tests {
             builder.add_instruction(TestOrderedStateOperation::Pure, Vec::new(), vec![state], None).unwrap()[0];
         let primal =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let lifecycles = LocalReferenceLifecycles::new(primal.entry_region_ref(), None, |_| true).unwrap();
+        let lifecycles =
+            primal.reference_analysis(0).unwrap().local_lifecycles(primal.entry_region_ref(), |_| true).unwrap();
         let instruction_by_output = primal.instruction_by_output();
         assert!(!residual_slice_is_recomputable(
             &primal,
@@ -4850,7 +4846,7 @@ mod tests {
             )
             .unwrap();
         let analysis = primal.reference_analysis(0).unwrap();
-        let lifecycles = LocalReferenceLifecycles::new(primal.entry_region_ref(), Some(&analysis), |_| true).unwrap();
+        let lifecycles = analysis.local_lifecycles(primal.entry_region_ref(), |_| true).unwrap();
         let instruction_by_output = primal.instruction_by_output();
         let mut safe = HashSet::new();
         assert!(residual_slice_is_recomputable(
@@ -4899,7 +4895,7 @@ mod tests {
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(vec![read], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let analysis = primal.reference_analysis(0).unwrap();
-        let lifecycles = LocalReferenceLifecycles::new(primal.entry_region_ref(), Some(&analysis), |_| true).unwrap();
+        let lifecycles = analysis.local_lifecycles(primal.entry_region_ref(), |_| true).unwrap();
         let instruction_by_output = primal.instruction_by_output();
         assert!(!residual_slice_is_recomputable(
             &primal,
@@ -5001,7 +4997,7 @@ mod tests {
             )
             .unwrap();
         let analysis = primal.reference_analysis(0).unwrap();
-        let lifecycles = LocalReferenceLifecycles::new(primal.entry_region_ref(), Some(&analysis), |_| true).unwrap();
+        let lifecycles = analysis.local_lifecycles(primal.entry_region_ref(), |_| true).unwrap();
         assert!(!residual_slice_is_recomputable(
             &primal,
             &lifecycles,
@@ -5046,7 +5042,7 @@ mod tests {
             )
             .unwrap();
         let analysis = primal.reference_analysis(0).unwrap();
-        let lifecycles = LocalReferenceLifecycles::new(primal.entry_region_ref(), Some(&analysis), |_| true).unwrap();
+        let lifecycles = analysis.local_lifecycles(primal.entry_region_ref(), |_| true).unwrap();
         assert!(!residual_slice_is_recomputable(
             &primal,
             &lifecycles,
@@ -5074,7 +5070,7 @@ mod tests {
             )
             .unwrap();
         let analysis = primal.reference_analysis(0).unwrap();
-        let lifecycles = LocalReferenceLifecycles::new(primal.entry_region_ref(), Some(&analysis), |_| true).unwrap();
+        let lifecycles = analysis.local_lifecycles(primal.entry_region_ref(), |_| true).unwrap();
         assert!(residual_slice_is_recomputable(
             &primal,
             &lifecycles,

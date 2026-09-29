@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
@@ -22,6 +22,7 @@ use crate::operations::{
 };
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::references::LocalReferenceLifecycles;
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, BindingRegionDriver, EffectClass, EmptyRegionDriver, Instruction, InstructionId, MaybeZero,
@@ -2197,18 +2198,64 @@ impl<
             Complete,
         }
 
-        /// Helper internal enum for the [`materialize_known`] implementation.
+        /// One step of the iterative postorder traversal of the [`materialize_known`] implementation. Steps are kept on
+        /// a stack, so a step that schedules an instruction pushes its [`Replay`](Self::Replay) step before the steps
+        /// that materialize the instruction's inputs, which replays the instruction only after all of its inputs.
         #[derive(Copy, Clone, PartialEq, Eq)]
         enum MaterializationStep {
+            /// Materializes the known source atom with the provided [`AtomId`]. An atom that is already materialized
+            /// needs nothing and a constant is copied directly, while any other atom schedules its producing
+            /// instruction (i.e., a [`Replay`](Self::Replay) step preceded by one [`Visit`](Self::Visit) step per
+            /// input). The first visit of a value produced by a known local reference lifecycle instead schedules the
+            /// complete lifecycle slice, in program order, through [`Self::VisitLifecycleInstruction`] steps, and then
+            /// visits the value again, which finds it materialized.
             Visit(AtomId),
+
+            /// Schedules the replay of the instruction at the provided position of the source region's instruction list
+            /// as part of the known local reference lifecycle slice. Unlike a [`Visit`](Self::Visit) step, which starts
+            /// from an atom that a transpose rule demands and reaches its producer through data dependencies, this step
+            /// starts from the instruction itself, because the slice must also replay instructions that no demanded
+            /// value depends on through data (e.g., a write without outputs whose effect a later read observes). The
+            /// step does nothing when the instruction was already replayed, and it is rejected when the instruction is
+            /// not recomputable.
+            VisitLifecycleInstruction(usize),
+
+            /// Copies the instruction at the provided position of the source region's instruction list into the
+            /// pullback, after all of its inputs were materialized, and records the pullback atoms of its outputs.
             Replay(usize),
         }
 
-        /// Replays the pure producer subgraph of one known atom into the pullback builder using an iterative postorder
+        /// Known (primal) local reference lifecycles that [`materialize_known`] replays into the pullback.
+        struct KnownLifecycleReplay {
+            /// Lifecycles of the known local reference roots of the transposed region.
+            lifecycles: Option<LocalReferenceLifecycles>,
+
+            /// Positions, in the transposed region's instruction list, of the lifecycle instructions that transpose
+            /// rules may need, in program order. They are replayed together, the first time any lifecycle value is
+            /// materialized, so that every replayed access observes its primal state regardless of the order in which
+            /// the reverse walk demands their values.
+            slice: Vec<usize>,
+
+            /// Whether [`slice`](Self::slice) has already been replayed.
+            replayed: bool,
+        }
+
+        impl KnownLifecycleReplay {
+            /// Returns whether the instruction at position `index` of the transposed region's instruction list belongs
+            /// to a known local reference lifecycle.
+            fn contains(&self, index: usize) -> bool {
+                self.lifecycles.as_ref().is_some_and(|lifecycles| !lifecycles.roots(index).is_empty())
+            }
+        }
+
+        /// Replays the producer subgraph of one known atom into the pullback builder using an iterative postorder
         /// traversal. Program inputs are seeded in `known_map` by the caller, constants are copied directly, and all
         /// outputs of a replayed instruction are memoized together so shared producers and sibling results are emitted
         /// only once. `materialization_state` distinguishes scheduled producers from completed ones, both detecting a
-        /// malformed cycle and keeping the traversal independent of the native call stack.
+        /// malformed cycle and keeping the traversal independent of the native call stack. Producers must be pure,
+        /// except for ordered assertions and the instructions of known local reference lifecycles. The first
+        /// materialized lifecycle value replays the complete lifecycle slice of `known_lifecycles` in program order,
+        /// each instruction together with its data dependencies, so that later demands find their values memoized.
         ///
         /// # Parameters
         ///
@@ -2222,7 +2269,9 @@ impl<
         ///   - `known_map`: Per-source-atom mapping to an already materialized pullback atom.
         ///   - `materialization_state`: Per-source-instruction traversal state used for memoization
         ///      and cycle detection.
+        ///   - `known_lifecycles`: Known local reference lifecycles and the slice of them that is replayed.
         ///   - `atom`: ID of the known source atom to materialize in the pullback builder.
+        #[allow(clippy::too_many_arguments)]
         fn materialize_known<V: Value, O: Operation<Type = V::Type>>(
             program: RegionRef<'_, V, O>,
             instruction_by_output: &[Option<usize>],
@@ -2231,6 +2280,7 @@ impl<
             builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
             known_map: &mut [Option<AtomId>],
             materialization_state: &mut [MaterializationState],
+            known_lifecycles: &mut KnownLifecycleReplay,
             atom: AtomId,
         ) -> Result<AtomId, ProgramError> {
             let mut steps = vec![MaterializationStep::Visit(atom)];
@@ -2261,6 +2311,28 @@ impl<
                             .get(instruction_index)
                             .ok_or_else(|| ProgramError::MalformedProgram("known atom producer is missing".into()))?;
 
+                        // A value of a known local reference lifecycle is produced by replaying the complete lifecycle
+                        // slice in program order and then resuming this visit, which finds the value memoized.
+                        if known_lifecycles.contains(instruction_index) {
+                            if known_lifecycles.replayed {
+                                return Err(ProgramError::MalformedProgram(
+                                    "known local reference lifecycle value is outside the replayed lifecycle slice"
+                                        .into(),
+                                ));
+                            }
+                            known_lifecycles.replayed = true;
+                            steps.push(MaterializationStep::Visit(current));
+                            steps.extend(
+                                known_lifecycles
+                                    .slice
+                                    .iter()
+                                    .rev()
+                                    .copied()
+                                    .map(MaterializationStep::VisitLifecycleInstruction),
+                            );
+                            continue;
+                        }
+
                         // Replaying an ordered assertion is safe. It validates the same saved primal value and cannot
                         // introduce a failure that successful primal execution did not already admit. Other effects
                         // could be duplicated or reordered and therefore require prior residualization.
@@ -2290,6 +2362,42 @@ impl<
                                 ));
                             }
                         }
+                        steps.push(MaterializationStep::Replay(instruction_index));
+                        steps.extend(instruction.inputs().iter().rev().copied().map(MaterializationStep::Visit));
+                    }
+                    MaterializationStep::VisitLifecycleInstruction(instruction_index) => {
+                        let instruction = program
+                            .instructions()
+                            .get(instruction_index)
+                            .ok_or_else(|| ProgramError::MalformedProgram("known atom producer is missing".into()))?;
+
+                        match materialization_state.get_mut(instruction_index).ok_or_else(|| {
+                            ProgramError::MalformedProgram("known atom producer state is missing".into())
+                        })? {
+                            state @ MaterializationState::Unseen => *state = MaterializationState::Visiting,
+                            MaterializationState::Visiting => {
+                                return Err(ProgramError::MalformedProgram(
+                                    "known local reference lifecycle graph contains a cycle".into(),
+                                ));
+                            }
+                            MaterializationState::Complete => continue,
+                        }
+
+                        if !known_lifecycles
+                            .lifecycles
+                            .as_ref()
+                            .is_some_and(|lifecycles| lifecycles.is_recomputable(instruction_index))
+                        {
+                            return Err(ProgramError::UnsupportedOperation {
+                                message: format!(
+                                    "partition-aware transpose cannot replay known local reference lifecycle \
+                                     instruction `{}`, whose effects are not confined to local reference state; \
+                                     partial-evaluate its observations into residual inputs first",
+                                    instruction.operation().name(),
+                                ),
+                            });
+                        }
+
                         steps.push(MaterializationStep::Replay(instruction_index));
                         steps.extend(instruction.inputs().iter().rev().copied().map(MaterializationStep::Visit));
                     }
@@ -2340,37 +2448,6 @@ impl<
                 .ok_or_else(|| ProgramError::MalformedProgram("known producer output was not remapped".into()))
         }
 
-        // Propagate operand linearity forward over the primal atoms. A program-input atom is linear when it has a
-        // selected destination kind, a constant atom is always known (non-linear), and an instruction result is linear
-        // when any of its operands is linear. Because instructions are stored in evaluation order, a single forward
-        // pass suffices: every operand atom of an instruction is defined before that instruction. Known-only producers
-        // remain primal computations whose outputs may supply coefficients to transpose rules. A reference allocated
-        // inside the linear program is linear regardless of its initial value: it is mutable state of the linear map
-        // whose contents are linear values (a tangent reference allocated from a materialized zero tangent is the
-        // common case), so its root receives a cotangent accumulator and the stores into it transpose into on-reference
-        // cotangents. Hand-built linear programs that allocate a reference holding known (non-linear) contents are
-        // therefore not supported by the direct entry points (such an allocation is treated as linear state as well).
-        let mut linear = vec![false; self.atoms().len()];
-        self.input_ids().iter().zip(&kind_by_input).try_for_each(|(&input, kind)| {
-            *linear.get_mut(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })? = kind.is_some();
-            Ok::<_, ProgramError>(())
-        })?;
-        for instruction in self.instructions().iter() {
-            let mut output_is_linear = false;
-            for input in instruction.inputs().iter().copied() {
-                if *linear.get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })? {
-                    output_is_linear = true;
-                    break;
-                }
-            }
-            let effects = instruction.operation().effects();
-            for (output_index, output) in instruction.outputs().iter().copied().enumerate() {
-                let allocates = effects.allocation_output_indices().any(|index| index == output_index);
-                *linear.get_mut(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })? =
-                    output_is_linear || allocates;
-            }
-        }
-
         // Stage the pullback into a fresh tracing context's builder, and reserve the main structural vectors up
         // front. These are conservative lower bounds that cover cotangent inputs, one instruction per reversed primal
         // instruction, and possible zero outputs for disconnected primal inputs. The context is scoped to this region
@@ -2405,19 +2482,71 @@ impl<
         let analysis = context.reference_analysis().cloned();
         if let Some(analysis) = &analysis {
             for (output_index, root) in analysis.output_roots().iter().enumerate() {
-                match root {
-                    Some(ReferenceRoot::Allocation { .. }) => {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: format!(
-                                "output {output_index} is a reference allocated inside the transposed program and \
-                                 cannot be pulled back because its later uses are unknown to the program",
-                            ),
-                        }
-                        .into());
+                if let Some(ReferenceRoot::Allocation { .. }) = root {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "output {output_index} is a reference allocated inside the transposed program and \
+                             cannot be pulled back because its later uses are unknown to the program",
+                        ),
                     }
-                    _ => {}
+                    .into());
                 }
             }
+        }
+
+        // Classify every atom and every local reference root as linear (tangent) or known (primal). Known-only
+        // producers remain primal computations whose outputs may supply coefficients to transpose rules. Refer to
+        // `classify_linearity` for the rules.
+        let (linear, linear_roots) = self.classify_linearity(&kind_by_input, analysis.as_deref())?;
+
+        // The lifecycle of a known local reference root is primal computation. A linear instruction that accesses such
+        // a root through its handle would observe the root's state when the pullback runs rather than at its primal
+        // position, so it is rejected. Otherwise, the lifecycle instructions that transpose rules may need are replayed
+        // into the pullback as one slice, in program order, the first time any of their values is materialized. Rules
+        // may need the known operands of every instruction that the reverse walk may visit.
+        let instruction_by_output = self.region().instruction_by_output();
+        let lifecycles = analysis
+            .as_deref()
+            .map(|analysis| analysis.local_lifecycles(*self, |root| !linear_roots.contains(&root)))
+            .transpose()?;
+        let mut known_lifecycles = KnownLifecycleReplay { lifecycles: None, slice: Vec::new(), replayed: false };
+        if let Some(lifecycles) = lifecycles {
+            let may_visit = |index: usize| -> Result<bool, ProgramError> {
+                let instruction = &self.instructions()[index];
+                Ok(instruction.inputs().iter().chain(instruction.outputs()).any(|atom| linear[atom.index()])
+                    || self.instruction_effects(index)?.has_deferred_work()
+                    || instruction
+                        .regions()
+                        .iter()
+                        .any(|id| self.with_id(*id).unwrap().has_observable_effects_in_closure()))
+            };
+
+            let mut seeds = Vec::new();
+            for (index, instruction) in self.instructions().iter().enumerate() {
+                let is_linear =
+                    instruction.inputs().iter().chain(instruction.outputs()).any(|atom| linear[atom.index()]);
+                if is_linear && !lifecycles.roots(index).is_empty() {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "partition-aware transpose cannot transpose linear instruction `{}`, which accesses known \
+                             local reference state that its transpose would observe out of order; pass the observed \
+                             values instead of the reference",
+                            instruction.operation().name(),
+                        ),
+                    }
+                    .into());
+                }
+                if may_visit(index)? {
+                    seeds.extend(instruction.inputs().iter().copied());
+                }
+            }
+
+            known_lifecycles.slice = lifecycles
+                .slice(*self, instruction_by_output.as_slice(), seeds, |atom| linear[atom.index()])
+                .into_iter()
+                .filter(|index| !lifecycles.roots(*index).is_empty())
+                .collect();
+            known_lifecycles.lifecycles = Some(lifecycles);
         }
 
         // Seed the reverse pass with one cotangent input for each non-reference primal output, typed with that output's
@@ -2563,7 +2692,8 @@ impl<
 
         // Every linear reference allocation of this region gets an accumulator that starts unallocated: the first rule
         // that accumulates into the root allocates it, and the allocation's own transpose freezes it into the cotangent
-        // of the initial value (or yields a symbolic zero when nothing ever accumulated).
+        // of the initial value (or yields a symbolic zero when nothing ever accumulated). Known allocations are primal
+        // state that is replayed rather than transposed, so they get no accumulator.
         for (instruction_index, instruction) in self.instructions().iter().enumerate() {
             for output_index in instruction.operation().effects().allocation_output_indices() {
                 let output = *instruction.outputs().get(output_index).ok_or_else(|| {
@@ -2574,20 +2704,25 @@ impl<
                         instruction.outputs().len(),
                     ))
                 })?;
+
+                let root = ReferenceRoot::Allocation {
+                    instruction: InstructionId::new(self.id(), instruction_index),
+                    output_index,
+                };
+
+                if !linear_roots.contains(&root) {
+                    continue;
+                }
+
                 let cotangent_type = self.atoms()[output.index()].r#type().cotangent()?;
-                context.reference_accumulators.insert(
-                    ReferenceRoot::Allocation {
-                        instruction: InstructionId::new(self.id(), instruction_index),
-                        output_index,
-                    },
-                    CotangentReferenceAccumulator::Unallocated { cotangent_type },
-                );
+                context
+                    .reference_accumulators
+                    .insert(root, CotangentReferenceAccumulator::Unallocated { cotangent_type });
             }
         }
 
         // Constants and pure known intermediates are materialized lazily below, only when a live transpose rule
         // needs them. This avoids copying dead constants and replaying dead known-side work into the pullback.
-        let instruction_by_output = self.region().instruction_by_output();
         let region_mappings = RegionReplayMappings::new();
         let mut materialization_state = vec![MaterializationState::Unseen; self.instructions().len()];
 
@@ -2732,6 +2867,7 @@ impl<
                             &builder,
                             known_map.as_mut_slice(),
                             materialization_state.as_mut_slice(),
+                            &mut known_lifecycles,
                             input,
                         )?;
                         Ok(PartialValue::Known(context.tracer(atom, Some(r#type))))
@@ -2839,6 +2975,23 @@ impl<
             }
         }
 
+        // Record the pullback allocations of the replayed known lifecycles, whose observations may have fed only rules
+        // that ignore their known operands.
+        let replayed_allocations = known_lifecycles
+            .slice
+            .iter()
+            .flat_map(|index| {
+                let instruction = &self.instructions()[*index];
+                instruction
+                    .operation()
+                    .effects()
+                    .allocation_output_indices()
+                    .filter_map(|output_index| instruction.outputs().get(output_index).copied())
+                    .collect::<Vec<_>>()
+            })
+            .filter_map(|output| known_map[output.index()])
+            .collect::<HashSet<_>>();
+
         // Release the context and the staged tracers it retains so the cloned `builder` handle can be unwrapped.
         // Accumulator handles retain only the separate context identity token, so they do not keep the builder alive.
         drop(context);
@@ -2852,9 +3005,109 @@ impl<
             Ok(builder) => builder.into_inner(),
             Err(_) => return Err(ProgramError::EscapedProgramBuilder.into()),
         };
-        builder
-            .build(outputs, vec![Placeholder; pullback_input_count], vec![Placeholder; pullback_output_count])
-            .map_err(DifferentiationError::from)
+
+        let pullback = builder.build(
+            outputs,
+            vec![Placeholder; pullback_input_count],
+            vec![Placeholder; pullback_output_count],
+        )?;
+        Ok(pullback.without_unobserved_local_references(&replayed_allocations)?)
+    }
+
+    /// Classifies every atom of this region, and every reference root allocated by its instructions, as linear (i.e.,
+    /// tangent) or known (i.e., primal) for transposition with the destination kinds `kind_by_input`, returning the
+    /// per-atom linearity mask together with the linear local roots.
+    ///
+    /// A program input is linear when it has a selected destination kind, and a constant is always known. An
+    /// instruction result is linear when any of its operands is linear, or when the instruction accesses the state of
+    /// a linear root, directly or inside its attached computation regions. A reference allocated by an instruction of
+    /// this region is linear state (e.g., a tangent reference) when a linear value flows into it, either as its initial
+    /// value or through a value that a later instruction stores into it (including another linear root's contents).
+    /// Otherwise, the reference and its entire lifecycle are known primal computation, which transposition replays
+    /// rather than transposes. A reference value is linear exactly when its root is. Because a store can make a root
+    /// linear after earlier reads of that root were classified, the forward pass repeats until no additional root
+    /// becomes linear. Roots only ever become linear, so the pass runs at most once more than the number of linear
+    /// local roots.
+    fn classify_linearity(
+        &self,
+        kind_by_input: &[Option<CotangentDestinationKind>],
+        analysis: Option<&ReferenceAnalysis>,
+    ) -> Result<(Vec<bool>, BTreeSet<ReferenceRoot>), ProgramError> {
+        let is_local = |root: ReferenceRoot| match root {
+            ReferenceRoot::Allocation { instruction, .. } => instruction.region() == self.id(),
+            ReferenceRoot::RegionInput { .. } | ReferenceRoot::Constant { .. } => false,
+        };
+
+        let local_root_of = |atom: AtomId| {
+            analysis
+                .and_then(|analysis| analysis.root_of(ValueId::new(self.id(), atom)))
+                .filter(|root| is_local(*root))
+        };
+
+        let mut linear_roots = BTreeSet::new();
+        loop {
+            let linear_root_count = linear_roots.len();
+            let mut linear = vec![false; self.atoms().len()];
+            for (input, kind) in self.input_ids().iter().zip(kind_by_input) {
+                *linear.get_mut(input.index()).ok_or(ProgramError::UnboundAtomId { id: *input })? = kind.is_some();
+            }
+
+            for (index, instruction) in self.instructions().iter().enumerate() {
+                let id = InstructionId::new(self.id(), index);
+                let access = analysis.and_then(|analysis| analysis.transitive_access(id));
+
+                // The handle of a local root is linear exactly when its root is, which may have changed since the
+                // handle was produced.
+                let operands = instruction
+                    .inputs()
+                    .iter()
+                    .map(|input| {
+                        let root = local_root_of(*input);
+                        let is_linear = match root {
+                            Some(root) => linear_roots.contains(&root),
+                            None => *linear.get(input.index()).ok_or(ProgramError::UnboundAtomId { id: *input })?,
+                        };
+                        Ok((root, is_linear))
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                let accesses_linear_state =
+                    access.is_some_and(|access| access.roots().any(|root| linear_roots.contains(&root)));
+                let result_is_linear = operands.iter().any(|(_, is_linear)| *is_linear) || accesses_linear_state;
+
+                // A mutated local root becomes linear when a linear value other than its own handle flows into it.
+                if let Some(access) = access {
+                    for root in access.roots().filter(|root| is_local(*root) && access.is_mutated(*root)) {
+                        let receives_linear_value =
+                            operands.iter().any(|(operand_root, is_linear)| *is_linear && *operand_root != Some(root))
+                                || access.roots().any(|other| other != root && linear_roots.contains(&other));
+                        if receives_linear_value {
+                            linear_roots.insert(root);
+                        }
+                    }
+                }
+
+                let effects = instruction.operation().effects();
+                for (output_index, output) in instruction.outputs().iter().enumerate() {
+                    let is_linear = if effects.allocation_output_indices().any(|index| index == output_index) {
+                        let root = ReferenceRoot::Allocation { instruction: id, output_index };
+                        if result_is_linear {
+                            linear_roots.insert(root);
+                        }
+                        linear_roots.contains(&root)
+                    } else {
+                        match local_root_of(*output) {
+                            Some(root) => linear_roots.contains(&root),
+                            None => result_is_linear,
+                        }
+                    };
+                    *linear.get_mut(output.index()).ok_or(ProgramError::UnboundAtomId { id: *output })? = is_linear;
+                }
+            }
+
+            if linear_roots.len() == linear_root_count {
+                return Ok((linear, linear_roots));
+            }
+        }
     }
 }
 
@@ -2997,6 +3250,16 @@ where
     /// The source may consume a selected reference input directly in its entry region. Transposing that consumption
     /// transfers the returned value's cotangent into the input accumulator and leaves the cotangent destination live.
     /// Known references remain borrowed, and attached regions cannot consume references owned by their callers.
+    ///
+    /// A reference allocated inside the source is linear state (e.g., a tangent reference) only when a linear value
+    /// flows into it, either as its initial value or through a later store. Otherwise, its complete lifecycle is known
+    /// primal computation (e.g., the recomputation of a primal local reference inside a linear program). The pullback
+    /// replays the lifecycle instructions that its transpose rules need, once and in program order, so that every
+    /// replayed read observes the state it observed in the source, and it removes replayed lifecycles whose values no
+    /// rule ends up using. A linear instruction that accesses such a known reference is rejected, because its transpose
+    /// would observe the reference's state out of program order. A reference with a known nonzero initial value that
+    /// later receives a linear store is affine rather than linear state, so it is transposed as linear state only when
+    /// its initial value is zero.
     ///
     /// This raw program transformation sees types rather than runtime reference identities. When executing its result,
     /// callers must supply mutually independent cotangent references that do not alias primal references or captured
@@ -4040,6 +4303,16 @@ pub(crate) mod tests {
     /// Wraps a scalar `f32` array into the composite value used by the reference transposition tests.
     fn reference_test_scalar(value: f32) -> ReferenceTestValue {
         ArrayIrValue::Array(Array::scalar(value).unwrap())
+    }
+
+    /// Stages `left · right` into a composite reference test program builder and returns the product.
+    fn reference_test_mul(
+        builder: &mut ProgramBuilder<ReferenceTestValue, ReferenceTestOperation>,
+        left: AtomId,
+        right: AtomId,
+    ) -> AtomId {
+        let operation = ReferenceTestOperation::Array(ArrayOperation::Mul(MulOperation::new()));
+        builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0]
     }
 
     /// Squares a value in the composite reference test family, preserving the active transform context.
@@ -6716,6 +6989,352 @@ pub(crate) mod tests {
                 vec![]
             ),
             vec![Array::scalar(7.0_f32).unwrap(), Array::scalar(0.0_f32).unwrap()],
+        );
+    }
+
+    #[test]
+    fn test_program_transpose_with_respect_to_known_reference_lifecycle() {
+        // `(t, r) ↦ freeze(new(r) += r²) · t` recomputes a primal local reference from the known input `r`. Its
+        // lifecycle is primal computation: the pullback replays it once, in program order, rather than transposing it
+        // as tangent state, and scales the cotangent by the frozen value `r + r²`. Applying the pullback repeatedly
+        // replays the lifecycle afresh each time.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let tangent = builder.add_input(scalar_type.clone());
+        let primal = builder.add_input(scalar_type);
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![primal], None).unwrap()[0];
+        let square = reference_test_mul(&mut builder, primal, primal);
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, square], None)
+            .unwrap();
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let output = reference_test_mul(&mut builder, frozen, tangent);
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:ref<f32[]> = reference_new %1
+                    %3:f32[] = mul %1 %1
+                    () = reference_add_update %2 %3
+                    %4:f32[] = reference_freeze %2
+                    %5:f32[] = mul %4 %0
+                in (%5)
+            "}
+            .trim_end(),
+        );
+
+        assert_eq!(
+            pullback.interpret(vec![reference_test_scalar(2.0), reference_test_scalar(3.0)]),
+            Ok(vec![reference_test_scalar(24.0)]),
+        );
+
+        assert_eq!(
+            pullback.interpret(vec![reference_test_scalar(-1.0), reference_test_scalar(0.5)]),
+            Ok(vec![reference_test_scalar(-0.75)]),
+        );
+    }
+
+    #[test]
+    fn test_program_transpose_with_respect_to_known_reference_reads_observe_primal_states() {
+        // `(t, r) ↦ (read(a) · t, (read(a) after a += r²) · t)` reads one known local reference at two states. The
+        // reverse walk demands the later read first, yet the replayed reads observe the same states as in the source,
+        // because the lifecycle is replayed as one slice in program order: `t̄ = r · c̄₁ + (r + r²) · c̄₂`.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let tangent = builder.add_input(scalar_type.clone());
+        let primal = builder.add_input(scalar_type);
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![primal], None).unwrap()[0];
+        let first =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let square = reference_test_mul(&mut builder, primal, primal);
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, square], None)
+            .unwrap();
+        let second =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let first_output = reference_test_mul(&mut builder, first, tangent);
+        let second_output = reference_test_mul(&mut builder, second, tangent);
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![first_output, second_output],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[], %2:f32[] .
+                let %3:ref<f32[]> = reference_new %2
+                    %4:f32[] = reference_read %3
+                    %5:f32[] = mul %2 %2
+                    () = reference_add_update %3 %5
+                    %6:f32[] = reference_read %3
+                    %7:f32[] = mul %6 %1
+                    %8:f32[] = mul %4 %0
+                    %9:f32[] = add %7 %8
+                in (%9)
+            "}
+            .trim_end(),
+        );
+
+        assert_eq!(
+            pullback.interpret(vec![
+                reference_test_scalar(1.0),
+                reference_test_scalar(10.0),
+                reference_test_scalar(3.0),
+            ]),
+            Ok(vec![reference_test_scalar(123.0)]),
+        );
+    }
+
+    #[test]
+    fn test_program_transpose_with_respect_to_mixed_known_and_tangent_references() {
+        // A known local reference `a = new(r)` and a tangent reference `b = new(t)` interleave: `b` accumulates
+        // `read(a) · t` before and after `a += r²`. `b` receives linear values and is transposed as tangent state
+        // through its accumulator, while `a` is primal computation that the pullback replays in program order.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let tangent = builder.add_input(scalar_type.clone());
+        let primal = builder.add_input(scalar_type);
+        let known = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![primal], None).unwrap()[0];
+        let linear = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![tangent], None).unwrap()[0];
+        let first = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![known], None).unwrap()[0];
+        let first_product = reference_test_mul(&mut builder, first, tangent);
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![linear, first_product], None)
+            .unwrap();
+        let square = reference_test_mul(&mut builder, primal, primal);
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![known, square], None)
+            .unwrap();
+        let second = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![known], None).unwrap()[0];
+        let second_product = reference_test_mul(&mut builder, second, tangent);
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![linear, second_product], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![linear], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[] = zero [type=f32[]]
+                    %3:ref<f32[]> = reference_new %2
+                    () = reference_add_update %3 %0
+                    %4:f32[] = reference_read %3
+                    %5:ref<f32[]> = reference_new %1
+                    %6:f32[] = reference_read %5
+                    %7:f32[] = mul %1 %1
+                    () = reference_add_update %5 %7
+                    %8:f32[] = reference_read %5
+                    %9:f32[] = mul %8 %4
+                    %10:f32[] = reference_read %3
+                    %11:f32[] = mul %6 %10
+                    %12:f32[] = add %9 %11
+                    %13:f32[] = reference_freeze %3
+                    %14:f32[] = add %12 %13
+                in (%14)
+            "}
+            .trim_end(),
+        );
+
+        // `y = t + r · t + (r + r²) · t`, so `t̄ = (1 + 2r + r²) · ȳ`.
+        assert_eq!(
+            pullback.interpret(vec![reference_test_scalar(2.0), reference_test_scalar(3.0)]),
+            Ok(vec![reference_test_scalar(32.0)]),
+        );
+    }
+
+    #[test]
+    fn test_program_transpose_with_respect_to_reference_becomes_linear_after_read() {
+        // `a = new(0)` is read before `a += t` stores a linear value into it. The store makes `a` tangent state even
+        // though its first read was classified before the store was reached, so both reads are linear: the first one
+        // contributes nothing and the second one passes its cotangent through, `t̄ = c̄₂`.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let tangent = builder.add_input(scalar_type);
+        let zero = builder.add_constant(reference_test_scalar(0.0));
+        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        let first =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, tangent], None)
+            .unwrap();
+        let second =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![first, second],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.interpret(vec![reference_test_scalar(5.0), reference_test_scalar(7.0)]),
+            Ok(vec![reference_test_scalar(7.0)]),
+        );
+    }
+
+    #[test]
+    fn test_program_transpose_with_respect_to_rejects_linear_access_to_known_reference() {
+        // A `condition` whose branches multiply the linear input `t` by a read of the known local reference `a`
+        // accesses `a` from a linear instruction. Its transpose would observe `a` when the pullback runs rather
+        // than at its primal position, so transposition rejects it.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let branch = || {
+            let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+            let reference = builder.add_input(reference_type.clone());
+            let tangent = builder.add_input(scalar_type.clone());
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            let output = reference_test_mul(&mut builder, value, tangent);
+            builder
+                .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                    vec![output],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let true_branch = builder.import_region(branch().entry_region_ref());
+        let false_branch = builder.import_region(branch().entry_region_ref());
+        let tangent = builder.add_input(scalar_type.clone());
+        let primal = builder.add_input(scalar_type);
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![primal], None).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference, tangent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[0], &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "partition-aware transpose cannot transpose linear instruction `condition`, which \
+                    accesses known local reference state that its transpose would observe out of order; pass the \
+                    observed values instead of the reference",
+        ));
+    }
+
+    #[test]
+    fn test_program_transpose_with_respect_to_removes_unobserved_known_reference_lifecycle() {
+        // `(t, r) ↦ read(new(r)) · r + t` gives the transpose of `add` a known operand that it ignores. Materializing
+        // that operand replays the known lifecycle, which nothing observes afterwards, so the pullback removes it
+        // together with its dead product and simply returns the cotangent.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let tangent = builder.add_input(scalar_type.clone());
+        let primal = builder.add_input(scalar_type);
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![primal], None).unwrap()[0];
+        let value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let product = reference_test_mul(&mut builder, value, primal);
+        let output = builder
+            .add_instruction(
+                ReferenceTestOperation::Array(ArrayOperation::Add(AddOperation::new())),
+                Vec::new(),
+                vec![product, tangent],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_transpose_with_respect_to_jvp_program_with_local_primal_reference() {
+        // The JVP program of `x ↦ (x + x²)²`, computed through a local reference, recomputes the reference's lifecycle
+        // on its primal side next to the tangent reference that differentiation allocates for it. Transposing it with
+        // respect to `ẋ` replays the primal lifecycle, which yields the gradient `2 (x + x²) (1 + 2x)` (i.e., `3` at
+        // `x = 0.5`). The pullback's inputs are the cotangents of `y` and `ẏ`, followed by `x`.
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let input = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let square = reference_test_mul(&mut builder, input, input);
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, square], None)
+            .unwrap();
+        let sum =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let output = reference_test_mul(&mut builder, sum, sum);
+        let program = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let jvp = program.entry_region_ref().jvp(&[0]).unwrap();
+        let pullback = jvp.transpose_with_respect_to(&[1], &[]).unwrap();
+        assert_eq!(
+            pullback.interpret(vec![
+                reference_test_scalar(0.0),
+                reference_test_scalar(1.0),
+                reference_test_scalar(0.5),
+            ]),
+            Ok(vec![reference_test_scalar(3.0)]),
+        );
+        assert_eq!(
+            pullback.interpret(vec![
+                reference_test_scalar(0.0),
+                reference_test_scalar(2.0),
+                reference_test_scalar(1.0),
+            ]),
+            Ok(vec![reference_test_scalar(24.0)]),
         );
     }
 
