@@ -192,37 +192,36 @@ pub struct CumulativeOperation {
     reverse: bool,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl CumulativeOperation {
     /// Creates a new forward [`CumulativeOperation`] scanning along `axis` with the supplied `kind`. The scanned extent
-    /// is not part of the operation payload: it is recoverable from the staged input type wherever a rule needs it.
+    /// is not part of the operation payload (it is recoverable from the staged input type wherever a rule needs it).
     #[inline]
     pub fn new(axis: usize, kind: CumulativeKind) -> Self {
         Self { axis, kind, reverse: false }
     }
 
-    /// Returns this operation with its scan direction set to `reverse`, accumulating from the end of the scanned axis
-    /// toward its start.
+    /// Returns this [`CumulativeOperation`] with its scan direction set to `reverse`, accumulating from the end of the
+    /// scanned axis toward its start if `reverse` is `true`, and the opposite otherwise.
     #[inline]
     pub fn with_reverse(mut self, reverse: bool) -> Self {
         self.reverse = reverse;
         self
     }
 
-    /// Returns the scanned axis, in the input's own coordinate system.
+    /// Returns the scanned axis of this [`CumulativeOperation`], in the input's own coordinate system.
     #[inline]
     pub fn axis(&self) -> usize {
         self.axis
     }
 
-    /// Returns the combining operator of this [`CumulativeOperation`].
+    /// Returns the [`CumulativeKind`] of this [`CumulativeOperation`].
     #[inline]
     pub fn kind(&self) -> CumulativeKind {
         self.kind
     }
 
-    /// Returns whether the scan accumulates from the end of the scanned axis toward its start.
+    /// Returns whether the scan accumulates from the end of the scanned axis toward its start,
+    /// for this [`CumulativeOperation`].
     #[inline]
     pub fn reverse(&self) -> bool {
         self.reverse
@@ -244,6 +243,7 @@ impl Operation for CumulativeOperation {
         CUMULATIVE_OPERATION_NAME
     }
 
+    #[inline]
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
@@ -253,12 +253,12 @@ impl Operation for CumulativeOperation {
         Ok(vec![input_types[0].cumulative(self.axis, self.kind)?])
     }
 
-    // The scan direction renders only when it is set, keeping the common forward scan compact.
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("kind", self.kind)?;
             operation.field("axis", self.axis)?;
             if self.reverse {
+                // The scan direction renders only when it is set, keeping the common forward scan rendering compact.
                 operation.field("reverse", self.reverse)?;
             }
             Ok(())
@@ -267,6 +267,7 @@ impl Operation for CumulativeOperation {
 }
 
 impl<C: Domain<Type = ArrayType, Value: Cumulative>> InterpretableOperation<C> for CumulativeOperation {
+    #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
@@ -278,11 +279,12 @@ impl<C: Domain<Type = ArrayType, Value: Cumulative>> InterpretableOperation<C> f
     }
 }
 
-// Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`.
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for CumulativeOperation where
-    C::Operation: From<CumulativeOperation>
+impl<C: Context<Type = ArrayType, Operation: From<CumulativeOperation>>> PartiallyEvaluatableOperation<C>
+    for CumulativeOperation
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for CumulativeOperation

@@ -464,35 +464,19 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
             }
         }
 
+        // A region may only attach regions that were sealed before it, whose summaries are therefore already known.
         let effects = region.instructions.iter().try_fold(
             EffectsSummary::PURE,
             |effects, instruction| -> Result<_, ProgramError> {
-                let region_slots = instruction.operation().region_slots();
-                instruction.operation().validate_region_count(instruction.regions().len())?;
-                instruction.regions().iter().copied().enumerate().try_fold(
-                    effects.union(instruction.operation().effects().summary()),
-                    |effects, (region_index, nested_region)| {
-                        let nested_effects = sealed_regions
-                            .get(nested_region.index())
-                            .map(|nested_region| nested_region.effects)
-                            .ok_or_else(|| {
-                                ProgramError::MalformedProgram(format!(
-                                    "instruction references region {nested_region} which has not been sealed yet",
-                                ))
-                            })?;
-
-                        // Only computation regions may execute as part of the owning operation, so their effects
-                        // are observable and must propagate outward. Rule regions are dormant transform definitions.
-                        // Merely attaching one does not execute it and therefore must not make the owning computation
-                        // effectful. Because the union retains the observable-when-unused bit of either side, an outer
-                        // operation can never suppress an observable nested effect.
-                        Ok(if region_slots[region_index].role == RegionRole::Computation {
-                            effects.union(nested_effects)
-                        } else {
-                            effects
-                        })
-                    },
-                )
+                Ok(effects.union(instruction.effects_summary(|nested_region| {
+                    sealed_regions.get(nested_region.index()).map(|nested_region| nested_region.effects).ok_or_else(
+                        || {
+                            ProgramError::MalformedProgram(format!(
+                                "instruction references region {nested_region} which has not been sealed yet",
+                            ))
+                        },
+                    )
+                })?))
             },
         )?;
         let type_identity_signature = region.type_identity_signature()?;
@@ -808,10 +792,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     }
 
     /// Returns the [`EffectsSummary`] of the [`Instruction`] at `instruction_index`, combining its operation's
-    /// intrinsic summary with the recursively derived summaries of attached computation regions. Dormant rule regions
-    /// are excluded according to their declared [`RegionRole`]. Because the union retains the observable-when-unused
-    /// property of either side, the summary of an instruction whose intrinsic declaration is discardable (e.g.,
-    /// allocation-only) still retains it when any nested computation has an observable consequence.
+    /// intrinsic summary with the recursively derived summaries of attached computation regions. Dormant rule
+    /// regions are excluded according to their declared [`RegionRole`], except for the deferred work that a
+    /// [`DeferredRule`](RegionRole::DeferredRule) region with effects places on the instruction. Because the union
+    /// retains the observable-when-unused property of either side, the summary of an instruction whose intrinsic
+    /// declaration is discardable (e.g., allocation-only) still retains it when any nested computation has an
+    /// observable consequence.
     pub fn instruction_effects(self, instruction_index: usize) -> Result<EffectsSummary, ProgramError> {
         let instruction = self.instructions().get(instruction_index).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
@@ -819,24 +805,11 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
                 self.id,
             ))
         })?;
-        instruction.regions().iter().copied().enumerate().try_fold(
-            instruction.operation().effects().summary(),
-            |effects, (region_index, attached)| {
-                let attached_effects = self
-                    .arena
-                    .effects(attached)
-                    .ok_or_else(|| ProgramError::MalformedProgram(format!("region {attached} is out of range")))?;
-
-                // Include effects from regions the operation may execute during ordinary interpretation. Dormant rule
-                // regions are inputs to later transforms rather than executed children of this instruction, so their
-                // effects are intentionally excluded.
-                Ok(if instruction.operation().region_role(region_index) == Some(RegionRole::Computation) {
-                    effects.union(attached_effects)
-                } else {
-                    effects
-                })
-            },
-        )
+        instruction.effects_summary(|attached| {
+            self.arena
+                .effects(attached)
+                .ok_or_else(|| ProgramError::MalformedProgram(format!("region {attached} is out of range")))
+        })
     }
 
     /// Returns the [`RegionInterface`] of the rooted [`Region`].
@@ -1137,6 +1110,15 @@ pub enum RegionRole {
     /// It is consumed by a transform rather than ordinary interpretation and so its [`EffectClasses`] do not belong to
     /// the owning computation.
     Rule,
+
+    /// The [`Region`] represents a dormant transformation rule that a later transform of the owning operation executes
+    /// (e.g., the attached rule of a [`CustomFunctionTransposeOperation`](crate::CustomFunctionTransposeOperation),
+    /// which transposition replays). Like a [`Rule`](Self::Rule) region, it does not execute during ordinary
+    /// interpretation, so its [`EffectClasses`] do not belong to the owning computation. Unlike a [`Rule`](Self::Rule)
+    /// region though, a region with effects or deferred work makes the owning operation carry
+    /// [deferred work](crate::Effects#deferred-work), so that transforms retain the operation (e.g., dead code
+    /// elimination keeps it even when its outputs are unused) until the transform that executes the region replaces it.
+    DeferredRule,
 }
 
 /// Represents a slot for a [`Region`] in an [`Operation`].
@@ -1158,6 +1140,12 @@ impl RegionSlot {
     /// Creates a [`RegionSlot`] for a [`Region`] that represents a dormant transformation rule.
     pub const fn rule(name: &'static str) -> Self {
         Self { name, role: RegionRole::Rule }
+    }
+
+    /// Creates a [`RegionSlot`] for a [`Region`] that represents a dormant transformation rule that a later transform
+    /// of the owning operation executes. Refer to [`RegionRole::DeferredRule`] for more information.
+    pub const fn deferred_rule(name: &'static str) -> Self {
+        Self { name, role: RegionRole::DeferredRule }
     }
 }
 
@@ -2872,6 +2860,14 @@ mod tests {
         assert_eq!(materialized.instructions()[0].regions(), materialized.instructions()[1].regions());
         assert_eq!(materialized.input_types(), vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(materialized.output_types(), vec![ArrayType::scalar(DataType::F64)]);
+    }
+
+    #[test]
+    fn test_region_slot_deferred_rule() {
+        assert_eq!(
+            RegionSlot::deferred_rule("backward"),
+            RegionSlot { name: "backward", role: RegionRole::DeferredRule },
+        );
     }
 
     #[test]

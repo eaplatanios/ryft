@@ -5699,6 +5699,10 @@ mod tests {
         fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
             None
         }
+
+        fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+            Vec::new()
+        }
     }
 
     impl Context for StagedDispatchTestDomain {

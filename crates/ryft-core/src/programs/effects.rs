@@ -632,6 +632,16 @@ impl EffectsSummary {
         has_deferred_work: false,
     };
 
+    /// [`EffectsSummary`] of an application that carries [deferred work](Effects#deferred-work) and nothing else (e.g.,
+    /// the obligation that an effectful [`RegionRole::DeferredRule`](crate::RegionRole::DeferredRule) region places on
+    /// its owning [`Operation`](crate::Operation)).
+    pub const DEFERRED_WORK: EffectsSummary = EffectsSummary {
+        classes: EffectClasses::NONE,
+        has_observable_effects_when_unused: false,
+        has_explicit_ordered_state: false,
+        has_deferred_work: true,
+    };
+
     /// Returns the aggregate [`EffectClasses`] of this [`EffectsSummary`].
     pub const fn classes(self) -> EffectClasses {
         self.classes

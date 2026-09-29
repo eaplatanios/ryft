@@ -1,8 +1,11 @@
 use std::fmt::Display;
 
+use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
+use crate::programs::effects::EffectsSummary;
+use crate::programs::operations::Operation;
 use crate::programs::provenance::Provenance;
-use crate::programs::regions::RegionId;
+use crate::programs::regions::{RegionId, RegionRole};
 
 /// Location of one [`Instruction`] in a multi-region [`Program`](crate::Program), identified by its containing
 /// [`Region`](crate::Region) and its zero-based index within that region's instruction sequence.
@@ -137,14 +140,114 @@ impl<O> Instruction<O> {
     }
 }
 
+impl<O: Operation> Instruction<O> {
+    /// Returns the [`EffectsSummary`] of this [`Instruction`], which combines its operation's intrinsic summary with
+    /// the part of each attached [`Region`](crate::Region)'s summary that the operation carries according to the
+    /// region's [`RegionRole`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `summary_of`: Returns the recursively derived [`EffectsSummary`] of an attached region.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the number of attached regions does not match the operation's region slots,
+    /// or when `summary_of` fails.
+    pub(crate) fn effects_summary<F: Fn(RegionId) -> Result<EffectsSummary, ProgramError>>(
+        &self,
+        summary_of: F,
+    ) -> Result<EffectsSummary, ProgramError> {
+        let operation = self.operation();
+        operation.validate_region_count(self.regions().len())?;
+        self.regions().iter().zip(operation.region_slots()).try_fold(
+            operation.effects().summary(),
+            |effects, (region, slot)| {
+                let region_effects = summary_of(*region)?;
+                Ok(effects.union(match slot.role {
+                    RegionRole::Computation => {
+                        // A computation region may execute as part of the operation, so all of its effects are effects
+                        // of the operation. The union retains the observable-when-unused property of either side, so an
+                        // enclosing operation can never suppress an observable nested effect.
+                        region_effects
+                    }
+                    RegionRole::Rule => {
+                        // A rule region is a dormant transform definition. Attaching one does not execute it,
+                        // so none of its effects belong to the operation.
+                        EffectsSummary::PURE
+                    }
+                    RegionRole::DeferredRule => {
+                        // A deferred rule region does not execute during ordinary interpretation either, but a later
+                        // transform of the operation executes it. When it has effects or deferred work of its own, the
+                        // operation therefore carries deferred work until that transform replaces it.
+                        if region_effects == EffectsSummary::PURE {
+                            EffectsSummary::PURE
+                        } else {
+                            EffectsSummary::DEFERRED_WORK
+                        }
+                    }
+                }))
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+
+    use crate::programs::effects::{EffectClass, EffectClasses, Effects};
+    use crate::programs::regions::RegionSlot;
+    use crate::tests::TestRegionOperation;
 
     use super::*;
 
     #[test]
     fn test_instruction_id_display() {
         assert_eq!(InstructionId::new(RegionId::new(2), 7).to_string(), "^2[7]");
+    }
+
+    #[test]
+    fn test_instruction_effects_summary() {
+        // Regions `0`, `1`, and `2` are attached as a computation, a rule, and a deferred rule. A computation region
+        // contributes its complete summary, a rule region contributes nothing, and a deferred rule region contributes
+        // deferred work exactly when it has effects or deferred work of its own.
+        let instruction = Instruction::new(
+            TestRegionOperation::WithRegions(
+                const {
+                    &[
+                        RegionSlot::computation("computation"),
+                        RegionSlot::rule("rule"),
+                        RegionSlot::deferred_rule("deferred"),
+                    ]
+                },
+            ),
+            Vec::new(),
+            Vec::new(),
+            vec![RegionId::new(0), RegionId::new(1), RegionId::new(2)],
+        );
+        let effectful = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)).summary();
+        let deferred = Effects::empty().clone().with_deferred_work().summary();
+        let summary =
+            |summaries: [EffectsSummary; 3]| instruction.effects_summary(|region| Ok(summaries[region.index()]));
+        assert_eq!(summary([EffectsSummary::PURE; 3]), Ok(EffectsSummary::PURE));
+        assert_eq!(summary([effectful, EffectsSummary::PURE, EffectsSummary::PURE]), Ok(effectful));
+        assert_eq!(summary([EffectsSummary::PURE, effectful, EffectsSummary::PURE]), Ok(EffectsSummary::PURE));
+        assert_eq!(summary([EffectsSummary::PURE, deferred, EffectsSummary::PURE]), Ok(EffectsSummary::PURE));
+        assert_eq!(summary([EffectsSummary::PURE, EffectsSummary::PURE, effectful]), Ok(EffectsSummary::DEFERRED_WORK));
+        assert_eq!(summary([EffectsSummary::PURE, EffectsSummary::PURE, deferred]), Ok(EffectsSummary::DEFERRED_WORK));
+
+        // The number of attached regions must match the operation's region slots.
+        let mismatched = Instruction::new(
+            TestRegionOperation::WithRegions(const { &[RegionSlot::computation("computation")] }),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            mismatched.effects_summary(|_| Ok(EffectsSummary::PURE)),
+            Err(ProgramError::MalformedProgram(
+                "operation `with_regions` declares 1 region slots but 0 regions were attached".to_string(),
+            )),
+        );
     }
 }

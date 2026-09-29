@@ -304,12 +304,20 @@ pub enum NamedAxis {
 ///   axis_index --> value["Current Index Value"]
 /// ```
 ///
-/// Implementations introduce only their local bindings. Every miss delegates outward unless the context is a leaf.
+/// Lookup (i.e., [`NamedAxes::named_axis`]) checks local bindings before delegating outward unless the context is a
+/// leaf. Enumeration (i.e., [`NamedAxes::named_axes`]) includes the enclosing bindings with the same shadowing rules.
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub trait NamedAxes: Context {
     /// Resolves `name` against this context, returning the [`NamedAxis`] it is bound to,
     /// or `None` when no enclosing binder binds it.
     fn named_axis(&self, name: &str) -> Option<NamedAxis>;
+
+    /// Returns the named axes in scope at this context, innermost first, with each name once (i.e., without the
+    /// bindings that nearer binders shadow), so that [`Self::named_axis`] resolves a name to the binding that this
+    /// function returns for it. Functions that trace user code in a fresh trace instead of in the context that they
+    /// are called in (e.g., [`CustomFunction::call`](crate::CustomFunction::call) for its primal and rules) seed that
+    /// trace with these bindings, so that the code resolves the same names as it would in the calling context.
+    fn named_axes(&self) -> Vec<(String, NamedAxis)>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContext<V, O>>> NamedAxes
@@ -320,6 +328,11 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContex
         // An eager context binds no named axes as it is a leaf of the resolution stack. So every lookup returns `None`.
         None
     }
+
+    #[inline]
+    fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+        Vec::new()
+    }
 }
 
 impl<T: Type, C: NamedAxes + DomainProjection<T>> NamedAxes for ProjectedContext<C, T> {
@@ -329,6 +342,11 @@ impl<T: Type, C: NamedAxes + DomainProjection<T>> NamedAxes for ProjectedContext
         // context stack and therefore passes through unchanged.
         self.parent().named_axis(name)
     }
+
+    #[inline]
+    fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+        self.parent().named_axes()
+    }
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, C> NamedAxes for TracingContext<V, O, C> {
@@ -337,7 +355,21 @@ impl<V: Value, O: Operation<Type = V::Type>, C> NamedAxes for TracingContext<V, 
         // A `TracingContext` is a leaf of the resolution stack and it resolves only the named axes it was seeded with
         // (e.g., a `shard_map` body's device mesh axes) and reports every other name unbound. Ordinary traces are
         // seeded with no axes. Named-axis binders such as `BatchingContext` wrap a base trace and resolve against it.
-        self.named_axes().iter().find(|(axis_name, _)| axis_name == name).map(|(_, axis)| axis.clone())
+        self.local_named_axes()
+            .iter()
+            .find(|(axis_name, _)| axis_name == name)
+            .map(|(_, axis)| axis.clone())
+    }
+
+    fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+        // The first of several seeded bindings of one name is the one that `named_axis` resolves.
+        let mut axes = Vec::<(String, NamedAxis)>::new();
+        for (name, axis) in self.local_named_axes() {
+            if !axes.iter().any(|(visible, _)| visible == name) {
+                axes.push((name.clone(), axis.clone()));
+            }
+        }
+        axes
     }
 }
 
@@ -348,11 +380,23 @@ impl<C: NamedAxes> NamedAxes for NestedTracingContext<C> {
         // parent context it is nested into, because named axes are dynamically scoped: a seeded binding shadows an
         // enclosing one, while a collective staged inside an unseeded nested tracing context still resolves an axis
         // bound by an enclosing transform.
-        self.named_axes()
+        self.local_named_axes()
             .iter()
             .find(|(axis_name, _)| axis_name == name)
             .map(|(_, axis)| axis.clone())
             .or_else(|| self.parent().named_axis(name))
+    }
+
+    fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+        // Seeded bindings shadow the parent's bindings of the same names, and the first of several seeded bindings
+        // of one name is the one that `named_axis` resolves.
+        let mut axes = Vec::<(String, NamedAxis)>::new();
+        for (name, axis) in self.local_named_axes().iter().cloned().chain(self.parent().named_axes()) {
+            if !axes.iter().any(|(visible, _)| visible == &name) {
+                axes.push((name, axis));
+            }
+        }
+        axes
     }
 }
 
@@ -366,6 +410,11 @@ where
         // A partial-evaluation context resolves named axes against its known-side inner context, so collectives
         // inside a partially evaluated closure resolve against the enclosing batching levels and mesh regions.
         self.parent().named_axis(name)
+    }
+
+    #[inline]
+    fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+        self.parent().named_axes()
     }
 }
 
@@ -384,6 +433,16 @@ impl<C: NamedAxes<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPoli
             self.parent().named_axis(name)
         }
     }
+
+    fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+        // This level's axis shadows the parent's binding of the same name.
+        let mut axes = self.parent().named_axes();
+        if let Some(name) = self.axis_name() {
+            axes.retain(|(visible, _)| visible != name);
+            axes.insert(0, (name.to_string(), NamedAxis::Batched { size: P::static_batch_axis_extent(self) }));
+        }
+        axes
+    }
 }
 
 impl<C: NamedAxes, P: DifferentiationPolicy<C>> NamedAxes for DifferentiationContext<C, P>
@@ -401,6 +460,11 @@ where
         // context, so collectives inside a differentiated closure resolve against the enclosing batching levels and
         // mesh regions.
         self.primal().named_axis(name)
+    }
+
+    #[inline]
+    fn named_axes(&self) -> Vec<(String, NamedAxis)> {
+        self.primal().named_axes()
     }
 }
 

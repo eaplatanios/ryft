@@ -1007,6 +1007,10 @@ impl ryft_core::NamedAxes for XlaDomain<'_> {
     fn named_axis(&self, _name: &str) -> Option<ryft_core::NamedAxis> {
         None
     }
+
+    fn named_axes(&self) -> Vec<(String, ryft_core::NamedAxis)> {
+        Vec::new()
+    }
 }
 
 impl<'c> Context for XlaDomain<'c> {

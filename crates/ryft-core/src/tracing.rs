@@ -391,7 +391,7 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     /// Returns the named axes this trace was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
     /// implementation. Ordinary traces are seeded with no axes.
     #[inline]
-    pub fn named_axes(&self) -> &[(String, NamedAxis)] {
+    pub(crate) fn local_named_axes(&self) -> &[(String, NamedAxis)] {
         self.named_axes.as_slice()
     }
 
@@ -671,7 +671,7 @@ impl<C: Context> NestedTracingContext<C> {
     /// Returns the named axes this nested trace was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
     /// implementation ahead of the parent context's bindings. Ordinary nested traces are seeded with no axes.
     #[inline]
-    pub fn named_axes(&self) -> &[(String, NamedAxis)] {
+    pub(crate) fn local_named_axes(&self) -> &[(String, NamedAxis)] {
         self.named_axes.as_slice()
     }
 
