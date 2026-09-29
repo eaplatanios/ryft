@@ -82,7 +82,7 @@
 //! in (%3)
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -92,7 +92,7 @@ use thiserror::Error;
 use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
-use crate::programs::effects::ReferenceAccessMode;
+use crate::programs::effects::{EffectClass, ReferenceAccessMode};
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
@@ -1225,6 +1225,367 @@ where
     }
 }
 
+/// Lifecycles of selected local [`ReferenceRoot`]s of one [`Region`], derived from its [`ReferenceAnalysis`].
+///
+/// A local root is a [`ReferenceRoot::Allocation`] performed by an instruction of the region itself. Its _lifecycle_
+/// consists of its allocation and of every instruction that accesses it, directly or inside an attached computation
+/// region (i.e., as reported by [`ReferenceAnalysis::transitive_access`]). A lifecycle's state is private to the
+/// region: nothing outside the lifecycle observes it except through the values that its reads and freezes produce.
+/// Replaying the instructions of a set of lifecycles in program order therefore reproduces exactly the values that
+/// their accesses observed, provided that every replayed access is preceded by the earlier mutations of each root it
+/// touches (i.e., its _state predecessors_) and that the replayed instructions have no other effects.
+///
+/// An instruction is _recomputable_ when copying it into a recomputation cannot duplicate or reorder an observable
+/// effect: it is either pure, or it belongs to tracked lifecycles, touches no other root, and has no effects beyond
+/// ordered reference state. Recomputing an access of an untracked root (e.g., a reference-typed input) could observe
+/// changed state, and an ordered instruction that touches no tracked root (e.g., a print, an opaque stateful operation,
+/// or an operation whose attached regions allocate and consume references entirely inside them) is not a tracked
+/// lifecycle, so neither is ever recomputable. Deferred work is never recomputable either, because recomputing
+/// it would repeat its transformation obligation.
+///
+/// Transposition uses these facts to replay the primal lifecycles that a transposed linear program recomputes, and
+/// [`Program::without_unobserved_local_references`] uses them to remove lifecycles that nothing observes. They are
+/// derived from a [`ReferenceAnalysis`] through [`ReferenceAnalysis::local_lifecycles`].
+pub(crate) struct LocalReferenceLifecycles {
+    /// Selected local roots that each instruction of the region allocates or accesses, in canonical root order,
+    /// indexed by the instruction's position in the region's instruction list.
+    roots: Vec<Vec<ReferenceRoot>>,
+
+    /// Positions, in the region's instruction list, of the instructions that allocate or mutate each selected root,
+    /// in program order.
+    mutations: BTreeMap<ReferenceRoot, Vec<usize>>,
+
+    /// Whether each instruction is recomputable (refer to the documentation of [`LocalReferenceLifecycles`]),
+    /// indexed by the instruction's position in the region's instruction list.
+    recomputable: Vec<bool>,
+}
+
+impl LocalReferenceLifecycles {
+    /// Returns the selected local roots that the instruction at position `index` of the region's instruction list
+    /// allocates or accesses, in canonical root order. The slice is empty for an instruction that belongs to no
+    /// tracked lifecycle.
+    #[inline]
+    pub(crate) fn roots(&self, index: usize) -> &[ReferenceRoot] {
+        &self.roots[index]
+    }
+
+    /// Returns whether the instruction at position `index` of the region's instruction list is recomputable.
+    /// Refer to the documentation of [`LocalReferenceLifecycles`] for information on what that means.
+    #[inline]
+    pub(crate) fn is_recomputable(&self, index: usize) -> bool {
+        self.recomputable[index]
+    }
+
+    /// Returns the positions, in the region's instruction list, of the instructions preceding position `index` that
+    /// allocate or mutate a selected root touched by the instruction at `index`: the state predecessors that a replay
+    /// must execute first so that the instruction observes its primal state.
+    pub(crate) fn state_predecessors(&self, index: usize) -> impl '_ + Iterator<Item = usize> {
+        self.roots[index].iter().flat_map(move |root| {
+            self.mutations[root].iter().copied().take_while(move |predecessor| *predecessor < index)
+        })
+    }
+
+    /// Returns the positions, in the instruction list of `region`, of the instructions that recomputing the atoms in
+    /// `seeds` requires, in program order: the closure of the seeds under data dependencies and, for every instruction
+    /// that belongs to a tracked lifecycle, under its state predecessors. The traversal stops at atoms for which
+    /// `is_boundary` holds, at region inputs, and at constants.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: [`Region`] from which these lifecycles were derived.
+    ///   - `instruction_by_output`: Position, in the instruction list of `region`, of the instruction producing each
+    ///     atom of `region`, or [`None`] for inputs and constants.
+    ///   - `seeds`: Atoms whose producers are needed.
+    ///   - `is_boundary`: Predicate identifying atoms whose producers are not needed (e.g., values that are already
+    ///     available).
+    pub(crate) fn slice<
+        V: Value,
+        O: Operation<Type = V::Type>,
+        S: IntoIterator<Item = AtomId>,
+        F: Fn(AtomId) -> bool,
+    >(
+        &self,
+        region: RegionRef<'_, V, O>,
+        instruction_by_output: &[Option<usize>],
+        seeds: S,
+        is_boundary: F,
+    ) -> BTreeSet<usize> {
+        let mut needed = BTreeSet::new();
+        let mut visited = vec![false; region.atoms().len()];
+        let mut atoms = seeds.into_iter().collect::<Vec<_>>();
+        let mut instructions = Vec::new();
+        loop {
+            while let Some(atom) = atoms.pop() {
+                if is_boundary(atom) || std::mem::replace(&mut visited[atom.index()], true) {
+                    continue;
+                }
+                if let Some(index) = instruction_by_output[atom.index()] {
+                    instructions.push(index);
+                }
+            }
+            let Some(index) = instructions.pop() else {
+                return needed;
+            };
+            if needed.insert(index) {
+                atoms.extend(region.instructions()[index].inputs().iter().copied());
+                instructions.extend(self.state_predecessors(index));
+            }
+        }
+    }
+}
+
+impl ReferenceAnalysis {
+    /// Returns the [`LocalReferenceLifecycles`] of the local roots of `region` that `is_selected` selects, derived
+    /// from this analysis. Roots that are not local allocations of `region` (e.g., reference-typed inputs) are never
+    /// selected. Nothing is retained as the lifecycles depend on the selection, which differs between consumers.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: [`Region`] that this [`ReferenceAnalysis`] analyzed, whose instructions own the lifecycles.
+    ///   - `is_selected`: Predicate selecting the local roots whose lifecycles are tracked. An instruction that
+    ///     allocates or accesses any other root is not recomputable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `region` is not the region that this analysis analyzed,
+    /// and propagates errors of computing instruction effects.
+    pub(crate) fn local_lifecycles<V: Value, O: Operation<Type = V::Type>, F: Fn(ReferenceRoot) -> bool>(
+        &self,
+        region: RegionRef<'_, V, O>,
+        is_selected: F,
+    ) -> Result<LocalReferenceLifecycles, ProgramError> {
+        if region.id() != self.region {
+            return Err(ProgramError::MalformedProgram(format!(
+                "cannot derive local reference lifecycles of region {} from the reference analysis of region {}",
+                region.id(),
+                self.region,
+            )));
+        }
+
+        // Only allocations performed by instructions of `region` itself can have lifecycles that are private to it.
+        // Reference-typed inputs, external constants, and allocations of nested regions are never tracked, whatever
+        // `is_selected` says, and touching them makes an instruction non-recomputable below.
+        let is_tracked = |root: ReferenceRoot| {
+            matches!(root, ReferenceRoot::Allocation { instruction, .. } if instruction.region() == region.id())
+                && is_selected(root)
+        };
+
+        let instruction_count = region.instructions().len();
+        let mut roots = vec![Vec::new(); instruction_count];
+        let mut mutations = BTreeMap::<ReferenceRoot, Vec<usize>>::new();
+        let mut recomputable = vec![false; instruction_count];
+        for (index, instruction) in region.instructions().iter().enumerate() {
+            let id = InstructionId::new(region.id(), index);
+            let mut touched = BTreeSet::new();
+            let mut touches_other_roots = false;
+
+            // An allocation defines the initial state of its root, so it heads the root's mutation list: every later
+            // access of the root must be replayed after it. Allocating an untracked root is state that no tracked
+            // lifecycle accounts for.
+            for output_index in instruction.operation().effects().allocation_output_indices() {
+                let root = ReferenceRoot::Allocation { instruction: id, output_index };
+                if is_tracked(root) {
+                    touched.insert(root);
+                    mutations.entry(root).or_default().push(index);
+                } else {
+                    touches_other_roots = true;
+                }
+            }
+
+            // Transitive accesses cover the accesses that the instruction performs directly and inside its attached
+            // computation regions, expressed in the namespace of `region` (i.e., nested region inputs are substituted
+            // by the caller roots bound to them). A nested region may therefore read or update a tracked root, and
+            // that access counts as an access by this instruction.
+            for (root, modes) in
+                self.transitive_access(id).map(ReferenceTransitiveAccess::access_modes).into_iter().flatten()
+            {
+                if !is_tracked(*root) {
+                    touches_other_roots = true;
+                    continue;
+                }
+
+                // Any access other than a pure read (e.g., a write, an accumulation, or a freeze that consumes the
+                // root) changes the state that later accesses observe, so it is a state predecessor of those accesses.
+                // An instruction that both allocates and mutates the same root is recorded once.
+                touched.insert(*root);
+                let is_mutation = modes.iter().any(|mode| *mode != ReferenceAccessMode::Read);
+                let root_mutations = mutations.entry(*root).or_default();
+                if is_mutation && root_mutations.last() != Some(&index) {
+                    root_mutations.push(index);
+                }
+            }
+
+            // The instruction's effect summary includes the effects of its attached computation regions. An instruction
+            // outside every tracked lifecycle is recomputable only when it is pure. An instruction inside one is
+            // recomputable when its only effects are the ordered state of the tracked roots it touches: an explicitly
+            // declared ordered-state effect describes state that reference analysis cannot attribute to those roots,
+            // and any other effect class (e.g., I/O) would be duplicated by recomputing it. Deferred work is never
+            // recomputable, because recomputing it would repeat its transformation obligation.
+            let effects = region.instruction_effects(index)?;
+            recomputable[index] = !touches_other_roots
+                && !effects.has_deferred_work()
+                && if touched.is_empty() {
+                    effects.classes().is_empty()
+                } else {
+                    !effects.has_explicit_ordered_state()
+                        && effects.classes().into_iter().all(|class| class == EffectClass::OrderedState)
+                };
+            roots[index] = touched.into_iter().collect();
+        }
+
+        Ok(LocalReferenceLifecycles { roots, mutations, recomputable })
+    }
+}
+
+impl<
+    V: Value,
+    O: Clone + Operation<Type = V::Type>,
+    Input: Parameterized<V, ParameterStructure: Clone>,
+    Output: Parameterized<V, ParameterStructure: Clone>,
+> Program<V, O, Input, Output>
+{
+    /// Returns this [`Program`] without the unobserved lifecycles of the local references that its entry region
+    /// allocates at `allocations`, followed by dead code elimination (refer to [`Program::simplified`] for more
+    /// information on that). The lifecycle of such a reference is its allocation together with every instruction that
+    /// accesses it (refer to [`LocalReferenceLifecycles`] for more information on reference lifecycles). Its state is
+    /// private to the program, so when no value that its instructions produce reaches a program output or an
+    /// instruction outside the lifecycle, and when its instructions have no effects beyond that state, removing the
+    /// whole lifecycle cannot change the program's behavior. Dead code elimination alone retains such lifecycles
+    /// because reference accesses are ordered state effects. Lifecycles that share an instruction are removed together
+    /// or not at all, and removing one lifecycle can leave another one unobserved.
+    ///
+    /// Transposition uses this after replaying the primal lifecycles that a transposed program recomputes (via
+    /// [`RegionRef::transpose`]), because a replayed lifecycle may only have fed transpose rules that ignore their
+    /// known operands.
+    ///
+    /// # Parameters
+    ///
+    ///   - `allocations`: Output [`AtomId`]s of reference allocations in the entry region whose lifecycles
+    ///     may be removed. Other lifecycles are always retained.
+    pub(crate) fn without_unobserved_local_references(
+        self,
+        allocations: &HashSet<AtomId>,
+    ) -> Result<Self, ProgramError> {
+        if allocations.is_empty() {
+            return Ok(self);
+        }
+
+        let region = self.entry_region_ref();
+        let analysis = region.reference_analysis(0)?;
+        let instructions = region.instructions();
+        let is_candidate = |root: ReferenceRoot| match root {
+            ReferenceRoot::Allocation { instruction, output_index } => instructions[instruction.index()]
+                .outputs()
+                .get(output_index)
+                .is_some_and(|output| allocations.contains(output)),
+            _ => false,
+        };
+        let lifecycles = analysis.local_lifecycles(region, is_candidate)?;
+
+        // Group the candidate roots into the lifecycles that must be removed together. Roots touched by one instruction
+        // share a group, and a group containing a non-recomputable instruction or an escaping root is always retained.
+        let mut groups = BTreeMap::<ReferenceRoot, usize>::new();
+        let mut group_members = Vec::<Vec<usize>>::new();
+        let mut group_retained = Vec::<bool>::new();
+        for (index, roots) in (0..instructions.len()).map(|index| (index, lifecycles.roots(index))) {
+            let Some(first) = roots.first() else {
+                continue;
+            };
+
+            let group = *groups.entry(*first).or_insert_with(|| {
+                group_members.push(Vec::new());
+                group_retained.push(false);
+                group_members.len() - 1
+            });
+
+            for root in &roots[1..] {
+                match groups.get(root).copied() {
+                    Some(other) if other != group => {
+                        let members = std::mem::take(&mut group_members[other]);
+                        group_members[group].extend(members);
+                        group_retained[group] |= group_retained[other];
+                        groups.values_mut().filter(|value| **value == other).for_each(|value| *value = group);
+                    }
+                    Some(_) => {}
+                    None => {
+                        groups.insert(*root, group);
+                    }
+                }
+            }
+
+            group_members[group].push(index);
+            group_retained[group] |= !lifecycles.is_recomputable(index);
+        }
+
+        for root in analysis.output_roots().iter().flatten() {
+            if let Some(group) = groups.get(root) {
+                group_retained[*group] = true;
+            }
+        }
+
+        // Assume that every other group is unobserved, compute liveness by walking the region backward, and retain any
+        // group that turns out to be observed. Retaining a group only makes more values live, so the iteration reaches
+        // its fixed point after at most one additional pass per group. The liveness of the final pass also identifies
+        // the pure instructions that only fed unobserved groups, which must be dropped together with those groups.
+        let mut live_instructions = vec![false; instructions.len()];
+        loop {
+            let mut live = vec![false; region.atoms().len()];
+            region.output_ids().iter().for_each(|output| live[output.index()] = true);
+            for (index, instruction) in instructions.iter().enumerate().rev() {
+                // All roots that an instruction touches belong to one group, so its first root identifies the group.
+                live_instructions[index] = match lifecycles.roots(index).first() {
+                    Some(root) => group_retained[groups[root]],
+                    None => {
+                        region.instruction_effects(index)?.is_retained_when_unused()
+                            || instruction.outputs().iter().any(|output| live[output.index()])
+                    }
+                };
+                if live_instructions[index] {
+                    instruction.inputs().iter().for_each(|input| live[input.index()] = true);
+                }
+            }
+
+            // Instructions of groups assumed unobserved mark none of their inputs live, so an output of such a group is
+            // live exactly when a program output or an instruction outside the unobserved groups consumes it.
+            let observed = (0..group_members.len())
+                .filter(|group| !group_retained[*group])
+                .filter(|group| {
+                    group_members[*group]
+                        .iter()
+                        .any(|index| instructions[*index].outputs().iter().any(|output| live[output.index()]))
+                })
+                .collect::<Vec<_>>();
+            if observed.is_empty() {
+                break;
+            }
+            observed.into_iter().for_each(|group| group_retained[group] = true);
+        }
+
+        if group_retained.iter().all(|retained| *retained) {
+            return Ok(self);
+        }
+
+        let entry = self.entry();
+        let mut regions = self.regions().iter().cloned().collect::<Vec<_>>();
+        let source = &regions[entry.index()];
+        let instructions = source
+            .instructions()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| live_instructions[*index])
+            .map(|(_, instruction)| instruction.clone())
+            .collect();
+        regions[entry.index()] = Region::new(
+            source.atoms().to_vec(),
+            source.input_ids().to_vec(),
+            source.output_ids().to_vec(),
+            instructions,
+        );
+
+        Program::new(self.input_structure().clone(), self.output_structure().clone(), regions, entry)?.into_simplified()
+    }
+}
+
 /// Per-[`ReferenceRoot`] record of a [`ReferenceAnalysis`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ReferenceRootRecord {
@@ -1618,7 +1979,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 // instantiates them rather than by this instruction's operands, so they are neither entered nor
                 // folded into this instruction's summary. The placeholder keeps region indices aligned for output
                 // provenance, which may only name computation regions.
-                if operation.region_role(region_index) == Some(RegionRole::Rule) {
+                if matches!(operation.region_role(region_index), Some(RegionRole::Rule | RegionRole::DeferredRule)) {
                     attached.push(AttachedRegion { id: attached_id, entering: Vec::new(), outputs: Vec::new() });
                     continue;
                 }
@@ -2029,9 +2390,10 @@ impl<V: Value, O: ReferenceAccessOperation<Type = V::Type>> Transform<Region<V, 
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::fmt::Display;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
@@ -2042,8 +2404,9 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, ReferenceAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceReadOperation, ReferenceWriteOperation, WhileOperation,
+        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, MulOperation,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceWriteOperation, WhileOperation,
     };
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
@@ -2467,6 +2830,59 @@ mod tests {
         let element = body.add_instruction(TestOperation::Identity, Vec::new(), vec![root], None).unwrap()[0];
         body.add_instruction(TestOperation::Read, Vec::new(), vec![element], None).unwrap();
         build(body, vec![carry])
+    }
+
+    /// Returns a program over the array IR universe `(x, r) ↦ (read(a) · x, freeze(a), read(a))` whose local
+    /// reference `a = new(x)` is read, updated with `x`, read again, updated with a read of the external reference
+    /// `r`, and frozen, used by the [`LocalReferenceLifecycles`] tests, which refer to its instructions by their
+    /// positions in this rendering (e.g., the `mul` is instruction `6`):
+    ///
+    /// ```text
+    /// lambda %0:f32[], %1:ref<f32[]> .
+    /// let %2:ref<f32[]> = reference_new %0
+    ///     %3:f32[] = reference_read %2
+    ///     () = reference_add_update %2 %0
+    ///     %4:f32[] = reference_read %2
+    ///     %5:f32[] = reference_read %1
+    ///     () = reference_add_update %2 %5
+    ///     %6:f32[] = mul %4 %0
+    ///     %7:f32[] = reference_freeze %2
+    /// in (%6, %7, %3)
+    /// ```
+    fn local_reference_lifecycles_fixture()
+    -> Program<TestArrayValue, TestArrayIrOperation, Vec<TestArrayValue>, Vec<TestArrayValue>> {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let input = builder.add_input(scalar_type.clone().into());
+        let external = builder.add_input(ReferenceType::new(scalar_type).into());
+        let local = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let first = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![local], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![local, input], None)
+            .unwrap();
+        let second = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![local], None).unwrap()[0];
+        let external_value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![external], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![local, external_value], None)
+            .unwrap();
+        let product = builder
+            .add_instruction(
+                TestArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new())),
+                Vec::new(),
+                vec![second, input],
+                None,
+            )
+            .unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![local], None).unwrap()[0];
+        builder
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(
+                vec![product, frozen, first],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap()
     }
 
     #[test]
@@ -4899,5 +5315,245 @@ mod tests {
 
         // Repeated requests under the same capture count reuse the retained analysis.
         assert!(Arc::ptr_eq(&retained, &region.reference_view_analysis(0).unwrap()));
+    }
+
+    #[test]
+    fn test_local_reference_lifecycles_roots() {
+        // The external reference input is never tracked, and the pure product belongs to no lifecycle.
+        let program = local_reference_lifecycles_fixture();
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis(0).unwrap();
+        let lifecycles = analysis.local_lifecycles(region, |_| true).unwrap();
+        let local = ReferenceRoot::Allocation { instruction: InstructionId::new(region.id(), 0), output_index: 0 };
+        assert_eq!(
+            (0..region.instructions().len()).map(|index| lifecycles.roots(index).to_vec()).collect::<Vec<_>>(),
+            vec![vec![local], vec![local], vec![local], vec![local], Vec::new(), vec![local], Vec::new(), vec![local],],
+        );
+    }
+
+    #[test]
+    fn test_local_reference_lifecycles_is_recomputable() {
+        // Every instruction of the lifecycle has only ordered local state effects and the product is pure,
+        // so all of them are recomputable, while the read of the external reference is not.
+        let program = local_reference_lifecycles_fixture();
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis(0).unwrap();
+        let lifecycles = analysis.local_lifecycles(region, |_| true).unwrap();
+        assert_eq!(
+            (0..region.instructions().len()).map(|index| lifecycles.is_recomputable(index)).collect::<Vec<_>>(),
+            vec![true, true, true, true, false, true, true, true],
+        );
+
+        // An instruction that also touches an untracked root is not recomputable. A `condition` that writes a read of
+        // the external reference `r` into the local reference `a` touches both roots.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type: ArrayIrType = ReferenceType::new(scalar_type.clone()).into();
+        let branch = || {
+            let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+            let local = builder.add_input(reference_type.clone());
+            let external = builder.add_input(reference_type.clone());
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![external], None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![local, value], None)
+                .unwrap();
+            builder
+                .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let true_branch = builder.import_region(branch().entry_region_ref());
+        let false_branch = builder.import_region(branch().entry_region_ref());
+        let input = builder.add_input(scalar_type.into());
+        let external = builder.add_input(reference_type);
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let local = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, local, external],
+                None,
+            )
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![local], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis(0).unwrap();
+        let lifecycles = analysis.local_lifecycles(region, |_| true).unwrap();
+        assert_eq!(
+            (0..region.instructions().len()).map(|index| lifecycles.is_recomputable(index)).collect::<Vec<_>>(),
+            vec![true, false, true],
+        );
+    }
+
+    #[test]
+    fn test_local_reference_lifecycles_state_predecessors() {
+        // Each access is preceded by the allocation and by the earlier mutations of its root, but not by reads.
+        let program = local_reference_lifecycles_fixture();
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis(0).unwrap();
+        let lifecycles = analysis.local_lifecycles(region, |_| true).unwrap();
+        assert_eq!(lifecycles.state_predecessors(0).collect::<Vec<_>>(), Vec::<usize>::new());
+        assert_eq!(lifecycles.state_predecessors(1).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(lifecycles.state_predecessors(3).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(lifecycles.state_predecessors(7).collect::<Vec<_>>(), vec![0, 2, 5]);
+        assert_eq!(lifecycles.state_predecessors(6).collect::<Vec<_>>(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_local_reference_lifecycles_slice() {
+        // The product needs the second read and, through its state predecessors, the allocation and the first update,
+        // but not the later update. The frozen value needs the whole lifecycle, including the external read feeding the
+        // second update, unless that read's value is a boundary.
+        let program = local_reference_lifecycles_fixture();
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis(0).unwrap();
+        let lifecycles = analysis.local_lifecycles(region, |_| true).unwrap();
+        let instruction_by_output = region.region().instruction_by_output();
+        let [product, frozen, _] = region.output_ids() else {
+            panic!("the fixture has three outputs");
+        };
+        assert_eq!(
+            lifecycles.slice(region, &instruction_by_output, [*product], |_| false),
+            BTreeSet::from([0, 2, 3, 6]),
+        );
+        assert_eq!(
+            lifecycles.slice(region, &instruction_by_output, [*frozen], |_| false),
+            BTreeSet::from([0, 2, 4, 5, 7]),
+        );
+        let external_value = region.instructions()[4].outputs()[0];
+        assert_eq!(
+            lifecycles.slice(region, &instruction_by_output, [*frozen], |atom| atom == external_value),
+            BTreeSet::from([0, 2, 5, 7]),
+        );
+    }
+
+    #[test]
+    fn test_reference_analysis_local_lifecycles() {
+        // Selecting no root tracks no lifecycle, so only the pure product is recomputable.
+        let program = local_reference_lifecycles_fixture();
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis(0).unwrap();
+        let lifecycles = analysis.local_lifecycles(region, |_| false).unwrap();
+        assert!((0..region.instructions().len()).all(|index| lifecycles.roots(index).is_empty()));
+        assert_eq!(
+            (0..region.instructions().len()).map(|index| lifecycles.is_recomputable(index)).collect::<Vec<_>>(),
+            vec![false, false, false, false, false, false, true, false],
+        );
+
+        // The analysis of one region cannot derive the lifecycles of another region, such as the entry region of a
+        // program whose entry region attaches two branch regions.
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let branch = {
+            let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+            let input = builder.add_input(scalar_type.clone());
+            builder
+                .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let true_branch = builder.import_region(branch.entry_region_ref());
+        let false_branch = builder.import_region(branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type);
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![true_branch, false_branch], vec![predicate, input], None)
+            .unwrap()[0];
+        let other = builder
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            analysis.local_lifecycles(other.entry_region_ref(), |_| true),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "cannot derive local reference lifecycles of region ^2 from the reference analysis of \
+                    region ^0",
+        ));
+    }
+
+    #[test]
+    fn test_program_without_unobserved_local_references() {
+        // The program allocates five local references: `a` (`%1`) is only read by a dead read, `b` (`%3`) is observed
+        // through the output, `d` (`%8`) is initialized from a read of `c` (`%6`) and never observed, and `e` (`%9`)
+        // is unobserved but not a candidate. Removing `d` leaves `c` unobserved, so both are removed together with `a`,
+        // while `b` and `e` are retained, and dead-code elimination renumbers the remaining atoms.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let input = builder.add_input(scalar_type);
+        let reference_new = |builder: &mut ProgramBuilder<TestArrayValue, TestArrayIrOperation>, value: AtomId| {
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![value], None).unwrap()[0]
+        };
+        let a = reference_new(&mut builder, input);
+        builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![a], None).unwrap();
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![a, input], None)
+            .unwrap();
+        let b = reference_new(&mut builder, input);
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![b], None).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                TestArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new())),
+                Vec::new(),
+                vec![frozen, input],
+                None,
+            )
+            .unwrap()[0];
+        let c = reference_new(&mut builder, input);
+        let c_value = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![c], None).unwrap()[0];
+        let d = reference_new(&mut builder, c_value);
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![d, input], None)
+            .unwrap();
+        let e = reference_new(&mut builder, input);
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![e, input], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:ref<f32[]> = reference_new %0
+                    %2:f32[] = reference_read %1
+                    () = reference_add_update %1 %0
+                    %3:ref<f32[]> = reference_new %0
+                    %4:f32[] = reference_freeze %3
+                    %5:f32[] = mul %4 %0
+                    %6:ref<f32[]> = reference_new %0
+                    %7:f32[] = reference_read %6
+                    %8:ref<f32[]> = reference_new %7
+                    () = reference_add_update %8 %0
+                    %9:ref<f32[]> = reference_new %0
+                    () = reference_add_update %9 %0
+                in (%5)
+            "}
+            .trim_end(),
+        );
+
+        let simplified = program.clone().without_unobserved_local_references(&HashSet::from([a, b, c, d])).unwrap();
+        assert_eq!(
+            simplified.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:ref<f32[]> = reference_new %0
+                    %2:f32[] = reference_freeze %1
+                    %3:ref<f32[]> = reference_new %0
+                    () = reference_add_update %3 %0
+                    %4:f32[] = mul %2 %0
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        let input_value = TestArrayValue::Array(Array::scalar(3.0f32).unwrap());
+        assert_eq!(simplified.interpret(vec![input_value.clone()]), program.interpret(vec![input_value]));
+
+        // Without candidates, the program is returned unchanged.
+        let unchanged = program.clone().without_unobserved_local_references(&HashSet::new()).unwrap();
+        assert_eq!(unchanged.to_string(), program.to_string());
     }
 }
