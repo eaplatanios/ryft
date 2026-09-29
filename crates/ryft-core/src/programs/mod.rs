@@ -104,6 +104,7 @@ pub mod effects;
 pub mod identities;
 pub mod instructions;
 pub mod operations;
+#[allow(clippy::module_inception)]
 pub mod programs;
 pub mod provenance;
 pub mod references;
