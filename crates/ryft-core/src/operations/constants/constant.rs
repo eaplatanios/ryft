@@ -6,7 +6,7 @@ use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
     RecursiveBatchingPolicy,
 };
-use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
 };
@@ -14,8 +14,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
-    TypeIdentityRenaming, Value, ValueProjection,
+    Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming, Value,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -178,13 +178,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Constant<V, V> for EagerContext<V, 
     }
 }
 
-impl<C: Context, T: Type>
+impl<C: Context + DomainProjection<T>, T: Type>
     Constant<<C::Value as ValueProjection<T>>::Projected, <C::Constant as ValueProjection<T>>::Projected>
     for ProjectedContext<C, T>
-where
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Operation: OperationProjection<T>,
 {
     #[inline]
     fn constant(

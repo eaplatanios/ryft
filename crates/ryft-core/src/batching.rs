@@ -89,14 +89,14 @@ use ryft_macros::Parameter;
 
 use crate::arrays::{ArrayType, DimensionType, ShardingDimension};
 use crate::axes::{Axis, AxisError};
-use crate::contexts::{Context, Domain, ProjectedContext, StagingContext, ValueResolution};
+use crate::contexts::{Context, Domain, DomainProjection, ProjectedContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
-    BindingRegionDriver, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, Provenance,
-    ProvenanceScope, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceIdentity,
-    RegionDriver, RegionRef, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    BindingRegionDriver, EmptyRegionDriver, Operation, Program, ProgramError, Provenance, ProvenanceScope,
+    ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceIdentity, RegionDriver, RegionRef,
+    Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -2069,11 +2069,7 @@ pub fn batch_projected_operation<
     T: Type,
     O: Operation<Type = T> + BatchableOperation<ProjectedContext<C, T>, P::Projected>,
     P: BatchingPolicyProjection<C, T>,
-    C: Context<
-            Value: ValueProjection<T, Projected: Value<Type = T>>,
-            Constant: ValueProjection<T, Projected: Value<Type = T>>,
-            Operation: OperationProjection<T>,
-        >,
+    C: Context + DomainProjection<T>,
 >(
     context: &BatchingContext<C, P>,
     operation: &O,

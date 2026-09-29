@@ -2140,10 +2140,9 @@ mod tests {
     /// every operand is materialized on the batch axis and the elementwise `ryft.test.add_one` handler receives one
     /// batch-prefixed buffer in a single call, agreeing with the per-row result.
     ///
-    /// `CustomCallBatching::Sequential` is not available through the *eager* XLA path, whose batching parent is a
-    /// [`ProjectedContext`] that rejects every region-carrying operation. That restriction is a property of projected
-    /// binding rather than of this rule (the scan-based `rng_bit_generator` batching rule meets the same wall), so
-    /// the diagnostic is pinned here alongside the behavior that does execute.
+    /// `CustomCallBatching::Sequential` also executes through the *eager* XLA path, whose batching parent is a
+    /// [`ProjectedContext`]: the projection lifts the `scan` that applies the kernel once per batch item, together with
+    /// its body region, into the composite family.
     #[test]
     fn test_eager_custom_call_batching_executes_registered_ffi_handler() {
         use ryft_core::operations::custom_call::{CustomCall, CustomCallBatching, CustomCallOperation};
@@ -2179,7 +2178,7 @@ mod tests {
         .unwrap();
         assert_eq!(read_f32s(&output), vec![2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
 
-        let sequential: Result<Array<'_>, _> = batch(
+        let sequential: Array<'_> = batch(
             move |row| {
                 let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![row_type])
                     .with_batching(CustomCallBatching::Sequential { unroll: None });
@@ -2189,11 +2188,9 @@ mod tests {
             BatchAxis::new(0),
             BatchAxis::new(0),
             None,
-        );
-        assert!(
-            matches!(&sequential, Err(error) if error.to_string().contains("`scan` cannot carry regions")),
-            "{sequential:?}",
-        );
+        )
+        .unwrap();
+        assert_eq!(read_f32s(&sequential), vec![2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
     }
 
     /// A declared ragged custom-call contract reaches the registered FFI handler with its existing extent operand,
@@ -2275,13 +2272,13 @@ mod tests {
         assert!(error.to_string().contains("extent 5 at batch item 1 lies outside the packed bound 4"), "{error}");
     }
 
-    /// A custom call wrapped with `custom_vjp` differentiates through the user-provided rule while the primal
-    /// executes the registered FFI handler, which is the documented pairing for differentiable foreign kernels
-    /// (the bare operation rejects differentiation).
+    /// A custom call wrapped in a custom function with reverse-mode rules differentiates through the user-provided
+    /// rules while the primal executes the registered FFI handler, which is the documented pairing for differentiable
+    /// foreign kernels (the bare operation rejects differentiation).
     #[test]
-    fn test_eager_custom_call_differentiates_through_custom_vjp() {
+    fn test_eager_custom_call_differentiates_through_custom_function() {
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
-        use ryft_core::{DomainTracer, custom_vjp};
+        use ryft_core::{DomainTracer, custom_function};
 
         use crate::XlaDomain;
 
@@ -2301,11 +2298,11 @@ mod tests {
             let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![output_type.clone()]);
             Ok(CustomCall::custom_call(&operation, std::slice::from_ref(x))?.remove(0))
         };
-        let function = custom_vjp(
-            {
-                let add_one = add_one.clone();
-                move |x: DomainTracer<ArrayXlaDomain<'_>>| add_one(&x)
-            },
+        let function = custom_function({
+            let add_one = add_one.clone();
+            move |x: DomainTracer<ArrayXlaDomain<'_>>| add_one(&x)
+        })
+        .with_vjp(
             move |x: DomainTracer<ArrayXlaDomain<'_>>| Ok((add_one(&x)?, ())),
             // d(x + 1)/dx is the identity, so the backward rule passes the cotangent through.
             |(), cotangent| Ok(cotangent),
@@ -2316,6 +2313,90 @@ mod tests {
             .unwrap();
         assert_eq!(read_f32s(&value), vec![6.0]);
         assert_eq!(read_f32s(&gradient), vec![1.0, 1.0]);
+    }
+
+    /// A function built from a custom call with `CustomFunction::from_custom_call` executes the registered FFI
+    /// handler as its primal, through the projection of the composite XLA domain onto arrays, and differentiates
+    /// through its user-provided rules.
+    #[test]
+    fn test_eager_custom_call_differentiates_through_from_custom_call() {
+        use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
+        use ryft_core::{CustomFunction, DomainTracer};
+
+        use crate::XlaDomain;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        ensure_add_one_handler_registered(&client).unwrap();
+        let mesh = cpu_mesh(&client);
+        let input = f32_vector(&client, &mesh, &[1.5, 2.5]);
+        let output_type = replicated_type(&mesh, DataType::F32, &[2]);
+        let domain = input.execution_domain();
+
+        type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
+
+        // The forward rule calls the kernel again, and d(x + 1)/dx is the identity, so the backward rule passes the
+        // cotangent through.
+        let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![output_type]);
+        let function = CustomFunction::from_custom_call(operation.clone()).with_vjp(
+            move |inputs: Vec<Tracer<'_>>| Ok((CustomCall::custom_call(&operation, &inputs)?, ())),
+            |(), cotangents| Ok(cotangents),
+        );
+        let (value, gradient) = domain
+            .differentiate_at(input)
+            .value_and_gradient(|x| function.call(vec![x]).unwrap().remove(0).reduce(&[0], ReductionKind::Sum).unwrap())
+            .unwrap();
+        assert_eq!(read_f32s(&value), vec![6.0]);
+        assert_eq!(read_f32s(&gradient), vec![1.0, 1.0]);
+    }
+
+    /// A custom function with a custom batching rule, written against the projection of the composite XLA domain onto
+    /// arrays, executes through that projection, which lifts the regions of the calls that it binds. Its unbatched
+    /// derivative differentiates the primal, while batching it (before or after differentiating it) applies the rule
+    /// (here deliberately `2 · sin(x)` instead of `sin(x)`).
+    #[test]
+    fn test_eager_custom_function_with_batching_rule() {
+        use ryft_core::{BatchingLevelExtent, DomainTracer, custom_function};
+
+        use crate::XlaDomain;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        let x = [0.5f32, 1.0, 1.5];
+        let input = f32_vector(&client, &mesh, &x);
+        let tangent = f32_vector(&client, &mesh, &[1.0, 1.0, 1.0]);
+
+        type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
+        let function = custom_function(|x: Tracer<'_>| Ok(x.sin()?)).with_batching(
+            |_: BatchingLevelExtent<Tracer<'_>>, x: Tracer<'_>, axis: BatchAxis| Ok((x.sin()? + x.sin()?, axis)),
+        );
+        let close = |actual: &Array<'_>, expected: &[f32]| {
+            let actual = read_f32s(actual);
+            actual.len() == expected.len() && actual.iter().zip(expected).all(|(a, e)| (a - e).abs() < 1e-5)
+        };
+        let sine = x.iter().map(|x| f32::sin(*x)).collect::<Vec<_>>();
+        let cosine = x.iter().map(|x| f32::cos(*x)).collect::<Vec<_>>();
+        let doubled = |values: &[f32]| values.iter().map(|value| 2.0 * value).collect::<Vec<_>>();
+
+        let (value, derivative) = differentiate_at(input.clone()).jvp(tangent.clone(), |x| function.call(x)).unwrap();
+        assert!(close(&value, &sine) && close(&derivative, &cosine));
+        let batched: Array<'_> =
+            batch(|x| Ok(function.call(x)?), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+        assert!(close(&batched, &doubled(&sine)));
+        let (value, derivative): (Array<'_>, Array<'_>) = batch(
+            |(x, tangent)| Ok(differentiate_at(x).jvp(tangent, |x| function.call(x))?),
+            (input, tangent),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        assert!(close(&value, &doubled(&sine)) && close(&derivative, &doubled(&cosine)));
     }
 
     /// Sorting, top-k, and argmax agree between the XLA-backed eager array backend and the reference array backend,

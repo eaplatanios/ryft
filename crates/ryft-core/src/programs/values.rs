@@ -440,10 +440,16 @@ impl<T: Type, V> Typed for ProjectedValue<T, V> {
     }
 }
 
+// The dispatch domains are bounded by the parts of `DomainProjection<T>` that this implementation needs rather than
+// by the trait itself: 1DomainProjection<T>` also requires that the domain's values project onto a `Value`, and that
+// projected value is this `ProjectedValue`, so proving it would require this very implementation (i.e., the trait
+// solver overflows).
 impl<T: Type, V: ValueProjection<T, Projected = Self>> Value for ProjectedValue<T, V>
 where
+    <V::DispatchDomain as Domain>::Type: From<T>,
     <V::DispatchDomain as Domain>::Constant: ValueProjection<T, Projected: Value<Type = T>>,
     <V::DispatchDomain as Domain>::Operation: OperationProjection<T>,
+    <V::ExecutionDomain as Domain>::Type: From<T>,
     <V::ExecutionDomain as Domain>::Constant: ValueProjection<T, Projected: Value<Type = T>>,
     <V::ExecutionDomain as Domain>::Operation: OperationProjection<T>,
 {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, Domain, ProjectedContext, StagingContext, ValueResolution};
+use crate::contexts::{Context, Domain, DomainProjection, ProjectedContext, StagingContext, ValueResolution};
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::{
@@ -23,8 +23,8 @@ use crate::partial::{
 };
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
-    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, OperationProvider,
-    Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, ReferenceAccessOperation,
+    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, MaybeZero, Operation, OperationProvider, Program,
+    ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, ReferenceAccessOperation,
     ReferenceBoundary, ReferenceIdentity, ReferenceMemberType, ReferenceRoot, ReferenceTransform, Region, RegionDriver,
     RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value,
     ValueProjection,
@@ -914,12 +914,8 @@ where
 #[derive(Copy, Clone, Debug)]
 pub struct ProjectedDifferentiationPolicy<P>(PhantomData<P>);
 
-impl<T: Type, C: Context, P: DifferentiationPolicy<C>> DifferentiationPolicy<ProjectedContext<C, T>>
-    for ProjectedDifferentiationPolicy<P>
-where
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Operation: OperationProjection<T>,
+impl<T: Type, C: Context + DomainProjection<T>, P: DifferentiationPolicy<C>>
+    DifferentiationPolicy<ProjectedContext<C, T>> for ProjectedDifferentiationPolicy<P>
 {
     #[inline]
     fn tangent_context(primal: &ProjectedContext<C, T>) -> Option<ProjectedContext<C, T>> {
@@ -1366,13 +1362,14 @@ pub trait DifferentiableOperation<C: Context>: Operation {
 /// requires `Self::Type = C::Type`. This trait preserves that same-universe invariant while making member
 /// differentiation in the parent universe explicit.
 ///
-/// Implementations bound the parent context by the projection vocabulary they actually use (typically
-/// [`ValueProjection<T>`](ValueProjection) for values and constants, [`OperationProjection<T>`](OperationProjection)
-/// for the member operation family, and the member and mixed operations they stage) rather than this trait imposing
-/// one fixed vocabulary on every implementation. Operation-family dispatchers should use this trait only for projected
-/// members whose derivative requires parent-universe values. Members whose inputs, outputs, and derivative all remain
-/// within `T` should use [`jvp_projected_operation`] and [`jvp_for_transpose_projected_operation`] in their
-/// respective named hooks. A parent dispatcher must forward both hooks to preserve member overrides.
+/// Implementations bound the parent context by the projection vocabulary they
+/// actually use (typically [`ValueProjection<T>`](ValueProjection) for values and constants,
+/// [`OperationProjection<T>`](crate::OperationProjection) for the member operation family, and the member and
+/// mixed operations they stage) rather than this trait imposing one fixed vocabulary on every implementation.
+/// Operation-family dispatchers should use this trait only for projected members whose derivative requires
+/// parent-universe values. Members whose inputs, outputs, and derivative all remain within `T` should use
+/// [`jvp_projected_operation`] and [`jvp_for_transpose_projected_operation`] in their respective named hooks.
+/// A parent dispatcher must forward both hooks to preserve member overrides.
 pub trait MemberDifferentiableOperation<C: Context>: Operation<Type: DifferentiableType> {
     /// Applies this projected member's Jacobian-Vector Product (JVP) rule (i.e., its [`DifferentiableOperation::jvp`])
     /// in the parent context enclosing the member's projection, using that parent's own values.
@@ -1665,9 +1662,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     /// primal and tangent programs through their projected contexts.
     pub fn project<T: Type>(&self) -> DifferentiationContext<ProjectedContext<C, T>, ProjectedDifferentiationPolicy<P>>
     where
-        C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-        C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-        C::Operation: OperationProjection<T>,
+        C: DomainProjection<T>,
     {
         // Reuse the existing contexts instead of invoking the policy's tangent context constructor again.
         DifferentiationContext {
@@ -3276,12 +3271,7 @@ impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 pub fn jvp_projected_operation<
     T: DifferentiableType,
     O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
-    C: Context<
-            Type: DifferentiableType + From<T>,
-            Value: ValueProjection<T, Projected: Value<Type = T>>,
-            Constant: ValueProjection<T, Projected: Value<Type = T>>,
-            Operation: OperationProjection<T>,
-        >,
+    C: Context<Type: DifferentiableType> + DomainProjection<T>,
     P: DifferentiationPolicy<C>,
 >(
     context: &DifferentiationContext<C, P>,
@@ -3306,12 +3296,7 @@ pub fn jvp_projected_operation<
 pub fn jvp_for_transpose_projected_operation<
     T: DifferentiableType,
     O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
-    C: Context<
-            Type: DifferentiableType + From<T>,
-            Value: ValueProjection<T, Projected: Value<Type = T>>,
-            Constant: ValueProjection<T, Projected: Value<Type = T>>,
-            Operation: OperationProjection<T>,
-        >,
+    C: Context<Type: DifferentiableType> + DomainProjection<T>,
     P: DifferentiationPolicy<C>,
 >(
     context: &DifferentiationContext<C, P>,

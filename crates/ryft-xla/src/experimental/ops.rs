@@ -23,30 +23,30 @@ use ryft_core::{
     CaptureConstant, CaptureReference, CeilOperation, ClampOperation, CompareOperation, CompiledCallOperation,
     ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, ConstrainShardingOperation, Context,
     ConvertElementTypeOperation, CosOperation, CotangentDestinationKind, CotangentDestinations, CumulativeOperation,
-    CustomDerivativeOperation, DataType, DifferentiableOperation, DifferentiableType, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension,
-    DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
-    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
-    DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
-    DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
-    DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation,
-    GatherOperation, InputRegionProvenance, IotaOperation, LinearCallOperation, Ln1pOperation, LogAddExpOperation,
-    LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation,
-    OneLikeOperation, OneOperation, Operation, OperationFormatter, OperationProvider, OrOperation,
-    OutputRegionProvenance, PadOperation, ParallelReduceOperation, ParallelVaryOperation, Parameter,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAccessDescriptor,
-    ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
-    ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
-    SelectOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation,
-    SubOperation, TagOperation, TanhOperation, Tracer, TracingContext, TransferToMemoryOperation,
-    TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
-    TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
-    ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
+    CustomFunctionOperation, CustomFunctionTransposeOperation, DataType, DifferentiableOperation,
+    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
+    DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation,
+    DimensionRemOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
+    DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
+    DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
+    ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation, LiftedCustomRules,
+    LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero,
+    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
+    OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation,
+    ParallelVaryOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
+    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation,
+    ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation,
+    ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, SelectOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation, StagingContext,
+    StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer, TracingContext,
+    TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver,
+    Type, TypeError, TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueProjection,
+    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;
 
@@ -506,17 +506,48 @@ where
     /// Backend-owned scan whose attached body region can contain XLA operations.
     Scan(ScanOperation<Constant>),
 
-    /// Backend-owned custom derivative call whose attached regions can contain XLA operations.
-    CustomDerivative(CustomDerivativeOperation<ArrayIrType>),
+    /// Backend-owned custom function call whose primal region can contain XLA operations, with either attached rule
+    /// regions that can contain XLA operations or retained rules registered in this family, which are traced lazily.
+    CustomFunction(CustomFunctionOperation<Constant, XlaOperation<Constant>>),
 
-    /// Differentiation-owned call to an explicitly transposable linear map with ordinary trailing residual
-    /// operands. This variant carries both carrier forms: the forward-and-transpose form lowers by inlining its
-    /// forward region, while the reverse-only transpose-only form (attached transpose region only) cannot be lowered
-    /// and reports the canonical reverse-only diagnostic.
+    /// Reverse-mode carrier of a [`CustomFunction`](Self::CustomFunction) call, which transposition replaces with
+    /// the call's backward rule.
+    CustomFunctionTranspose(CustomFunctionTransposeOperation<Constant, XlaOperation<Constant>>),
+
+    /// Differentiation-owned call to an explicitly transposable linear map with ordinary trailing residual operands,
+    /// which lowers by inlining its forward region.
     LinearCall(LinearCallOperation<ArrayIrType>),
 
     /// Backend-owned rematerialized call whose attached regions can contain XLA operations.
     Rematerialize(RematerializeOperation<ArrayIrType>),
+
+    /// Custom function call whose retained rules are registered in the [`ArrayOperation`] member family, promoted
+    /// from its member payload. Its derivative rules are specialized by the member definition and converted into this
+    /// family (refer to [`LiftedCustomRules`]). Conversions never produce such a call with attached rules, which follow
+    /// their call into the [`CustomFunction`](Self::CustomFunction) variant instead.
+    LiftedCustomFunction(
+        CustomFunctionOperation<
+            Constant,
+            XlaOperation<Constant>,
+            LiftedCustomRules<
+                <Constant as ValueProjection<ArrayType>>::Projected,
+                ArrayOperation<<Constant as ValueProjection<ArrayType>>::Projected>,
+            >,
+        >,
+    ),
+
+    /// Reverse-mode carrier of a [`LiftedCustomFunction`](Self::LiftedCustomFunction) call, whose backward rule is
+    /// specialized by the member definition and converted into this family.
+    LiftedCustomFunctionTranspose(
+        CustomFunctionTransposeOperation<
+            Constant,
+            XlaOperation<Constant>,
+            LiftedCustomRules<
+                <Constant as ValueProjection<ArrayType>>::Projected,
+                ArrayOperation<<Constant as ValueProjection<ArrayType>>::Projected>,
+            >,
+        >,
+    ),
 
     /// Call to a flat jitted XLA sub-program.
     JitCall(JitCallOperation<ArrayIrType>),
@@ -681,9 +712,36 @@ where
                         .with_captures(captures),
                 )
             }
-            ArrayIrOperation::CustomDerivative(operation) => Self::CustomDerivative(operation),
             ArrayIrOperation::LinearCall(operation) => Self::LinearCall(operation),
             ArrayIrOperation::Rematerialize(operation) => Self::Rematerialize(operation),
+            // Custom function calls and carriers with attached rules follow their regions into the native variants.
+            // Converted member calls keep their member definition. Calls registered in the array IR family itself
+            // cannot follow their program, because constants of this family cannot represent array IR values, so their
+            // rules become unavailable while their primal still executes.
+            ArrayIrOperation::CustomFunction(operation) => {
+                match operation.into_attached_family() {
+                    Ok(operation) => Self::CustomFunction(operation),
+                    Err(operation) => Self::LiftedCustomFunction(operation.into_family(|rules| {
+                        LiftedCustomRules::Unavailable(UnavailableCustomRules::from_source(&rules))
+                    })),
+                }
+            }
+            ArrayIrOperation::CustomFunctionTranspose(operation) => {
+                match operation.into_attached_family() {
+                    Ok(operation) => Self::CustomFunctionTranspose(operation),
+                    Err(operation) => Self::LiftedCustomFunctionTranspose(operation.into_family(|rules| {
+                        LiftedCustomRules::Unavailable(UnavailableCustomRules::from_source(&rules))
+                    })),
+                }
+            }
+            ArrayIrOperation::LiftedCustomFunction(operation) => match operation.into_attached_family() {
+                Ok(operation) => Self::CustomFunction(operation),
+                Err(operation) => Self::LiftedCustomFunction(operation.into_family(|rules| rules)),
+            },
+            ArrayIrOperation::LiftedCustomFunctionTranspose(operation) => match operation.into_attached_family() {
+                Ok(operation) => Self::CustomFunctionTranspose(operation),
+                Err(operation) => Self::LiftedCustomFunctionTranspose(operation.into_family(|rules| rules)),
+            },
         }
     }
 }
@@ -907,9 +965,12 @@ where
             | Self::Condition(_)
             | Self::While(_)
             | Self::Scan(_)
-            | Self::CustomDerivative(_)
+            | Self::CustomFunction(_)
             | Self::LinearCall(_)
             | Self::Rematerialize(_)
+            | Self::CustomFunctionTranspose(_)
+            | Self::LiftedCustomFunction(_)
+            | Self::LiftedCustomFunctionTranspose(_)
             | Self::JitCall(_)
             | Self::ShardMap(_) => return None,
         })
@@ -1639,17 +1700,18 @@ mod tests {
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, CaptureReference,
         CapturingContext, Compare, CompareOperation, ComparisonDirection, ConditionOperation, Context,
-        CotangentDestinationKind, CotangentDestinations, CustomDerivativeJvpRule, CustomDerivativeOperation, DataType,
-        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
-        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, EffectClass,
-        EffectClasses, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
-        MulOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
-        ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
-        RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
-        Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
-        TypeIdentityRenaming, Typed, Value, ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
+        CotangentDestinationKind, CotangentDestinations, CustomFunctionJvpRule, CustomFunctionOperation,
+        CustomFunctionTransposeOperation, DataType, DifferentiableType, DifferentiationError, Dimension,
+        DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
+        DomainTracingContext, DynamicBroadcastOperation, EffectClass, EffectClasses, ExternalReferenceBinding,
+        InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation,
+        OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessOperation,
+        ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
+        ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionDriver, RegionInterface,
+        RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension,
+        StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value,
+        ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -2062,28 +2124,66 @@ mod tests {
     }
 
     #[test]
-    fn test_core_custom_derivative_and_rematerialization_promotions_preserve_metadata() {
+    fn test_core_custom_function_and_rematerialization_promotions_preserve_metadata() {
         // These payloads are promoted by move rather than reconstructed, so their complete stored surface must
-        // survive: the rule layout of custom-derivative calls, the non-differentiated operand split of both, and
+        // survive: the rule layout of custom-function calls, the non-differentiated operand split of both, and
         // additionally the rematerialization optimization-barrier hint. The promoted carrier must also keep
         // contributing the payload's own operation name and region slots, because the attached regions are matched
         // against those slots by name.
-        for custom_derivative in [
-            CustomDerivativeOperation::<ArrayIrType>::new()
-                .with_jvp_rule(CustomDerivativeJvpRule::Region)
-                .with_non_differentiated_count(2),
-            CustomDerivativeOperation::<ArrayIrType>::new().with_vjp_rule().with_non_differentiated_count(3),
-            CustomDerivativeOperation::<ArrayIrType>::new()
-                .with_jvp_rule(CustomDerivativeJvpRule::Primal)
-                .with_vjp_rule()
-                .with_non_differentiated_count(1),
+        for (jvp_rule, has_vjp_rule, non_differentiated_count) in [
+            (CustomFunctionJvpRule::Explicit, false, 2),
+            (CustomFunctionJvpRule::Absent, true, 3),
+            (CustomFunctionJvpRule::Primal, true, 1),
         ] {
+            let custom_function = CustomFunctionOperation::from_rule_regions(jvp_rule, has_vjp_rule)
+                .with_non_differentiated_count(non_differentiated_count)
+                .unwrap();
             let promoted: XlaOperation<XlaConstant> =
-                ArrayIrOperation::<XlaArrayConstant>::CustomDerivative(custom_derivative).into();
-            assert!(matches!(&promoted, XlaOperation::CustomDerivative(operation) if operation == &custom_derivative));
-            assert_eq!(promoted.name(), custom_derivative.name());
-            assert_eq!(promoted.region_slots(), custom_derivative.region_slots());
+                ArrayIrOperation::<XlaArrayConstant>::CustomFunction(custom_function.clone()).into();
+            assert!(matches!(
+                &promoted,
+                XlaOperation::CustomFunction(operation)
+                    if operation.rules().is_none()
+                        && operation.jvp_rule() == jvp_rule
+                        && operation.has_vjp_rule() == has_vjp_rule
+                        && operation.non_differentiated_count() == non_differentiated_count,
+            ));
+            assert_eq!(promoted.name(), custom_function.name());
+            assert_eq!(promoted.region_slots(), custom_function.region_slots());
+
+            // A call with attached rules that reaches this family from the array member family follows its regions
+            // into the native variant as well.
+            let promoted: XlaOperation<XlaConstant> = ArrayOperation::<XlaArrayConstant>::CustomFunction(
+                CustomFunctionOperation::from_rule_regions(jvp_rule, has_vjp_rule),
+            )
+            .into();
+            assert!(matches!(
+                &promoted,
+                XlaOperation::CustomFunction(operation)
+                    if operation.rules().is_none()
+                        && operation.jvp_rule() == jvp_rule
+                        && operation.has_vjp_rule() == has_vjp_rule,
+            ));
         }
+
+        // A carrier with an attached backward rule keeps its tangent interface and follows its region into the native
+        // carrier variant.
+        let tangent_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let carrier = CustomFunctionTransposeOperation::from_backward_region(
+            1,
+            vec![tangent_type.clone()],
+            vec![tangent_type.clone()],
+        );
+        let promoted: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::CustomFunctionTranspose(carrier).into();
+        assert!(matches!(
+            &promoted,
+            XlaOperation::CustomFunctionTranspose(operation)
+                if operation.rules().is_none()
+                    && operation.leading_input_count() == 1
+                    && operation.input_tangent_types() == std::slice::from_ref(&tangent_type)
+                    && operation.output_tangent_types() == std::slice::from_ref(&tangent_type),
+        ));
 
         let rematerialize =
             RematerializeOperation::<ArrayIrType>::new().with_non_differentiated_count(1).with_prevent_cse(true);
@@ -2092,6 +2192,72 @@ mod tests {
         assert!(matches!(&promoted, XlaOperation::Rematerialize(operation) if operation == &rematerialize));
         assert_eq!(promoted.name(), rematerialize.name());
         assert_eq!(promoted.region_slots(), rematerialize.region_slots());
+    }
+
+    #[test]
+    fn test_core_custom_function_retained_rule_promotions() {
+        use ryft_core::{ArrayIrValue, CustomRuleDefinition, CustomRuleRegistration, LiftedCustomRules};
+
+        // Converted member calls and carriers keep their member definition, which specializes their rules for this
+        // family on demand.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let member = CustomRuleRegistration::new(CustomRuleDefinition::<
+            XlaArrayConstant,
+            ArrayOperation<XlaArrayConstant>,
+        >::new("member"));
+        let promoted: XlaOperation<XlaConstant> =
+            ArrayOperation::<XlaArrayConstant>::CustomFunction(CustomFunctionOperation::new(member.reference()))
+                .into();
+        assert!(matches!(
+            &promoted,
+            XlaOperation::LiftedCustomFunction(operation)
+                if operation.rules() == Some(&LiftedCustomRules::Member(member.reference())),
+        ));
+        assert_eq!(promoted.to_string(), "custom_function [name=\"member\"]");
+        let promoted: XlaOperation<XlaConstant> =
+            ArrayOperation::<XlaArrayConstant>::CustomFunctionTranspose(CustomFunctionTransposeOperation::new(
+                member.reference(),
+                0,
+                vec![scalar_type.clone()],
+                vec![scalar_type.clone()],
+            ))
+            .into();
+        assert!(matches!(&promoted, XlaOperation::LiftedCustomFunctionTranspose(_)));
+
+        // Calls registered in the array IR family itself cannot follow their program, because constants of this family
+        // cannot represent array IR values. Their primal still executes, but their explicit rules are unavailable.
+        let composite = CustomRuleRegistration::new(
+            CustomRuleDefinition::<ArrayIrValue<XlaArrayConstant>, ArrayIrOperation<XlaArrayConstant>>::new(
+                "composite",
+            )
+            .with_jvp(|primals, tangents| Ok((primals.to_vec(), tangents.to_vec()))),
+        );
+        let promoted: XlaOperation<XlaConstant> = ArrayIrOperation::<XlaArrayConstant>::CustomFunction(
+            CustomFunctionOperation::new(composite.reference()),
+        )
+        .into();
+        assert!(matches!(
+            &promoted,
+            XlaOperation::LiftedCustomFunction(operation)
+                if matches!(operation.rules(), Some(LiftedCustomRules::Unavailable(_))),
+        ));
+        let mut primal = XlaProgramBuilder::new();
+        let input = primal.add_input(scalar_type.clone().into());
+        let primal = primal
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let primal = builder.import_program(primal);
+        let input = builder.add_input(scalar_type.into());
+        let output = builder.add_instruction(promoted, vec![primal], vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap_err().to_string(),
+            "`custom_function` `composite` was converted from a family whose values its current family cannot \
+             represent, so its derivative rules are unavailable",
+        );
     }
 
     #[test]

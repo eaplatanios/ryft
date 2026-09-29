@@ -57,8 +57,9 @@
 //!
 //! [`ProjectedContext`] presents one member kind of a composite domain as an ordinary context while forwarding every
 //! lift, bind, resolution, and eagerness query to the composite parent. It preserves symbolic identity and creates no
-//! second interpreter or program. Projection is intentionally limited to region-free member operations because an
-//! attached region may mix several member kinds and therefore belongs to the composite operation contract.
+//! second interpreter or program. The regions of a bound member operation are member-family programs, so projection
+//! lifts them into the composite family together with the operation, while operations whose regions mix several member
+//! kinds belong to the composite operation contract and never reach the projection.
 //!
 //! # Value Resolution
 //!
@@ -116,6 +117,32 @@ pub trait Domain: Sized {
 
     /// [`Operation`] representation supported by this [`Domain`] for ordinary traced [`Program`]s.
     type Operation: Operation<Type = Self::Type>;
+}
+
+/// Projection of a composite [`Domain`] onto its `T`-typed member kind, which a [`ProjectedContext`] presents as
+/// an ordinary domain. This is the domain-level counterpart of [`ValueProjection`] and [`OperationProjection`]: the
+/// domain's values, constants, and operations each project onto that member kind, and its type family embeds the member
+/// types, which lifting the regions of bound member operations requires. It names these requirements once, so that code
+/// generic over projections bounds `D: DomainProjection<T>` instead of restating them, and it is implemented for every
+/// domain that satisfies them.
+pub trait DomainProjection<T: Type>:
+    Domain<
+        Type: From<T>,
+        Value: ValueProjection<T, Projected: Value<Type = T>>,
+        Constant: ValueProjection<T, Projected: Value<Type = T>>,
+        Operation: OperationProjection<T>,
+    >
+{
+}
+
+impl<T: Type, D> DomainProjection<T> for D where
+    D: Domain<
+            Type: From<T>,
+            Value: ValueProjection<T, Projected: Value<Type = T>>,
+            Constant: ValueProjection<T, Projected: Value<Type = T>>,
+            Operation: OperationProjection<T>,
+        >
+{
 }
 
 /// Active binding semantics layered on a passive [`Domain`]. A [`Context`] decides how stored constants become flowing
@@ -432,9 +459,12 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
 /// substitutions. Every dependency of a bound operation must therefore arrive as an explicit operand, which keeps
 /// the program graph the sole source of data dependencies.
 ///
-/// Note that projected binding is intentionally limited to [`Region`](crate::Region)-free member operations. A region
-/// can carry values of several member kinds at once, so higher-order operations own composite region contracts instead
-/// of projecting them; a bound operation that declares or receives regions is rejected.
+/// A bound member operation may carry [`Region`](crate::Region)s (e.g., a
+/// [`CustomFunctionOperation`](crate::CustomFunctionOperation) and its primal program). Those regions are programs of
+/// the member family, so every value that they carry is of the member kind by construction, and `bind` lifts them into
+/// the composite family with [`Program::into_unprojected`] before binding the lifted operation. Higher-order operations
+/// whose regions mix member kinds are composite operations rather than member operations, so they never reach this
+/// adapter.
 pub struct ProjectedContext<C: Domain, T: Type> {
     /// Composite parent [`Domain`] or [`Context`].
     parent: C,
@@ -463,24 +493,14 @@ impl<C: Domain + Clone, T: Type> Clone for ProjectedContext<C, T> {
     }
 }
 
-impl<C: Domain, T: Type> Domain for ProjectedContext<C, T>
-where
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Operation: OperationProjection<T>,
-{
+impl<C: DomainProjection<T>, T: Type> Domain for ProjectedContext<C, T> {
     type Type = T;
     type Value = <C::Value as ValueProjection<T>>::Projected;
     type Constant = <C::Constant as ValueProjection<T>>::Projected;
     type Operation = <C::Operation as OperationProjection<T>>::Projected;
 }
 
-impl<C: Context, T: Type> Context for ProjectedContext<C, T>
-where
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Operation: OperationProjection<T>,
-{
+impl<C: Context + DomainProjection<T>, T: Type> Context for ProjectedContext<C, T> {
     #[inline]
     fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
         self.parent
@@ -495,16 +515,13 @@ where
         driver: D,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
-        let operation = operation.into();
-        if !operation.region_slots().is_empty() || driver.region_count() != 0 {
-            return Err(ProgramError::MalformedProgram(format!(
-                "projected operation `{}` cannot carry regions",
-                operation.name(),
-            )));
-        }
-
-        let operation: C::Operation = operation.into();
-        let regions = Vec::<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>::new();
+        // The regions of a member operation are member-family programs, so every value that they carry is
+        // of the member kind, and they are lifted into the parent family exactly like the operation itself.
+        let regions = driver
+            .regions()
+            .map(|region| region.to_program().into_unprojected::<C::Constant, C::Operation>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let operation: C::Operation = operation.into().into();
 
         // `Context::bind` borrows its inputs while embedding a projected member consumes it, so clone each member
         // representation to construct temporary composite values for the parent. Keep the common nullary, unary, and
@@ -927,11 +944,12 @@ mod tests {
     use std::sync::Arc;
 
     use half::{bf16, f16};
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::differentiation::DifferentiationTracer;
     use crate::operations::{
@@ -1124,7 +1142,8 @@ mod tests {
             ValueResolution::Constant(ProjectedMemberValue::<0>(13)),
         );
 
-        // Homogeneous projected operations cannot smuggle composite values through attached regions.
+        // Attached member regions are lifted into the parent family, whose binding validates them against the lifted
+        // operation's region slots.
         let mut builder = ProgramBuilder::<ProjectedMemberValue<0>, ProjectedMemberOperation<0>>::new();
         let input = builder.add_input(ProjectedMemberType);
         let region = builder
@@ -1141,8 +1160,71 @@ mod tests {
                 &[ProjectedMemberValue::<0>(17)],
             ),
             Err(ProgramError::MalformedProgram(message))
-                if message == "projected operation `projected_member` cannot carry regions",
+                if message == "operation `projected_member` declares no region slots but 1 regions were attached",
         ));
+    }
+
+    #[test]
+    fn test_projected_context_binds_region_carrying_operations() {
+        // A member operation's regions are member-family programs, which binding lifts into the parent family,
+        // both when the parent executes the operation and when it stages it.
+        let program = |build: fn(&mut ProgramBuilder<Array, ArrayOperation<Array>>, AtomId) -> AtomId| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            let output = build(&mut builder, input);
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let condition = program(|builder, carry| {
+            let eight = builder.add_constant(Array::scalar(8.0).unwrap());
+            let direction = ComparisonDirection::LessThan;
+            builder
+                .add_instruction(CompareOperation::new(direction), Vec::new(), vec![carry, eight], None)
+                .unwrap()[0]
+        });
+        let body = program(|builder, carry| {
+            builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry], None).unwrap()[0]
+        });
+        let regions = vec![condition, body];
+
+        let eager =
+            ProjectedContext::<_, ArrayType>::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        assert_eq!(
+            eager.bind(ArrayOperation::While(WhileOperation::new()), regions.clone(), &[Array::scalar(1.0).unwrap()]),
+            Ok(vec![Array::scalar(8.0).unwrap()]),
+        );
+
+        type ArrayIrTracer = Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>;
+        let (_, staged) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input: ArrayIrTracer| {
+                let context = ProjectedContext::<_, ArrayType>::new(input.context().clone());
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = context.bind(ArrayOperation::While(WhileOperation::new()), regions, &[input])?.remove(0);
+                Ok::<_, ProgramError>(<ArrayIrTracer as ValueProjection<ArrayType>>::from_projected(output))
+            },
+            ArrayIrType::Array(ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        assert_eq!(
+            staged.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = while %0 [
+                    condition={
+                        lambda %0:f64[] .
+                        let %1:f64[] = const 8.0
+                            %2:bool[] = compare [direction=LessThan] %0 %1
+                        in (%2)
+                    },
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = add %0 %0
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

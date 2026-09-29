@@ -25,11 +25,13 @@ use crate::operations::control_flow::scan::{
     SCAN_OPERATION_NAME, ScanInterpretation, read_scan_iteration, stacked_scan_type, validate_scan_runtime_length,
     write_scan_iteration,
 };
+use crate::operations::control_flow::{
+    TemporalResidualOperation, TemporalResidualType, WhileResidualStackOperation, WhileResidualStackType,
+};
 use crate::operations::{
     AddOperation, AndOperation, BroadcastOperation, DIMENSION_DATA_TYPE, DimensionFromScalarOperation,
     DimensionToScalarOperation, DynamicUpdateSliceOperation, Fill, OneOperation, ReduceOperation, ReductionKind,
-    Reshape, SelectOperation, Slice, TemporalResidualOperation, TemporalResidualType, UpdateSlice, WhilePredicate,
-    WhileResidualStackOperation, WhileResidualStackType, Zero, ZeroOperation,
+    Reshape, SelectOperation, Slice, UpdateSlice, WhilePredicate, Zero, ZeroOperation,
 };
 use crate::programs::{Operation, ProgramError, TypeError, Typed, Value, ValueProjection};
 

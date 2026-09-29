@@ -56,7 +56,7 @@ use crate::arrays::{
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, RecursiveBatchingPolicy,
 };
-use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
+use crate::contexts::{Context, Domain, DomainProjection, EagerContext, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationPolicy, ResidualZeroProvider,
 };
@@ -67,10 +67,7 @@ use crate::parameters::Parameter;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
-use crate::programs::{
-    Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError, Value,
-    ValueProjection,
-};
+use crate::programs::{Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Value};
 use crate::tracing::{NestedTracingContext, TracingContext};
 
 /// Represents axis-related errors.
@@ -325,12 +322,7 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContex
     }
 }
 
-impl<C: NamedAxes, T: Type> NamedAxes for ProjectedContext<C, T>
-where
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Operation: OperationProjection<T>,
-{
+impl<T: Type, C: NamedAxes + DomainProjection<T>> NamedAxes for ProjectedContext<C, T> {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // Projection changes only the visible type/value/operation member. Named-axis scope belongs to the parent

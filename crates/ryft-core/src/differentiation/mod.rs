@@ -158,7 +158,7 @@ use std::fmt::{Debug, Display, Formatter};
 
 use thiserror::Error;
 
-use crate::contexts::{Context, ProjectedContext};
+use crate::contexts::{Context, DomainProjection, ProjectedContext};
 use crate::differentiation::hessian::hessian_in_context;
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
@@ -170,9 +170,9 @@ use crate::operations::{
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EmptyRegionDriver, MaybeZero, Operation, OperationProjection, OperationProvider, ProgramError,
-    ReferenceAccessOperation, ReferenceBoundary, ReferenceBoundaryError, ReferenceMemberType, ReferenceTransform,
-    TypeError, Value, ValueProjection,
+    EmptyRegionDriver, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessOperation,
+    ReferenceBoundary, ReferenceBoundaryError, ReferenceMemberType, ReferenceTransform, TypeError, Value,
+    ValueProjection,
 };
 use crate::tracing::TracingContext;
 
@@ -444,12 +444,7 @@ impl DifferentiationRule {
     pub(crate) fn apply_projected<
         T: DifferentiableType,
         O: Operation<Type = T> + DifferentiableOperation<ProjectedContext<C, T>>,
-        C: Context<
-                Type: DifferentiableType + From<T>,
-                Value: ValueProjection<T, Projected: Value<Type = T>>,
-                Constant: ValueProjection<T, Projected: Value<Type = T>>,
-                Operation: OperationProjection<T>,
-            >,
+        C: Context<Type: DifferentiableType> + DomainProjection<T>,
         P: DifferentiationPolicy<C>,
     >(
         self,

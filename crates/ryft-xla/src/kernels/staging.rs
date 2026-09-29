@@ -13,15 +13,15 @@ use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::{
     Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayReferenceTransform, Atom,
     AtomId, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, ConstantOperation,
-    Context, CotangentAccumulator, CustomDerivativeJvpRule, CustomDerivativeOperation, DifferentiableOperation,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    Domain, Effects, InputRegionProvenance, Instruction, InterpretableOperation, InterpretationDriver, MaybeZero,
-    Operation, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
-    PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionInterface,
-    RegionSlot, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
-    TypeError, TypeIdentityRenaming, Typed, Value,
+    Context, CotangentAccumulator, CustomFunctionJvpRule, CustomFunctionOperation, CustomRuleSource,
+    DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationPolicy, Domain, Effects, InputRegionProvenance, Instruction, InterpretableOperation,
+    InterpretationDriver, MaybeZero, Operation, OutputRegionProvenance, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program,
+    ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    Region, RegionInterface, RegionSlot, Tracer, TracingContext, TransposableOperation, TranspositionContext,
+    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, Value,
 };
 
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
@@ -548,7 +548,7 @@ where
 }
 
 /// Stages a native kernel primal with an explicit canonical JVP region. The JVP receives primal inputs followed by
-/// active tangents and returns primal results followed by their tangents, as checked by a [`CustomDerivativeOperation`]
+/// active tangents and returns primal results followed by their tangents, as checked by a [`CustomFunctionOperation`]
 /// with a JVP rule region. The supplied rule owns derivative semantics; the mutable kernel body is never implicitly
 /// differentiated.
 pub fn stage_kernel_with_jvp<C, Extension>(
@@ -562,7 +562,10 @@ where
     Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        CustomDerivativeOperation::<ArrayIrType>::new().with_jvp_rule(CustomDerivativeJvpRule::Region),
+        CustomFunctionOperation::<XlaConstant, XlaOperation>::from_rule_regions(
+            CustomFunctionJvpRule::Explicit,
+            false,
+        ),
         vec![kernel_primal(definition)?, jvp.clone()],
         inputs,
     )
@@ -570,7 +573,7 @@ where
 
 /// Stages a native kernel primal with explicit canonical forward and backward VJP regions. The forward region returns
 /// primal outputs and residuals; the backward region receives residuals and output cotangents and returns input
-/// cotangents. A [`CustomDerivativeOperation`] with reverse-mode rules validates these boundaries and retains its
+/// cotangents. A [`CustomFunctionOperation`] with reverse-mode rules validates these boundaries and retains its
 /// reverse-mode-only contract.
 /// A forward rule may itself stage a kernel when its primal must execute natively during differentiation.
 pub fn stage_kernel_with_vjp<C, Extension>(
@@ -585,10 +588,34 @@ where
     Extension: KernelExtension + Into<XlaKernelExtension>,
 {
     context.bind(
-        CustomDerivativeOperation::<ArrayIrType>::new().with_vjp_rule(),
+        CustomFunctionOperation::<XlaConstant, XlaOperation>::from_rule_regions(
+            CustomFunctionJvpRule::Absent,
+            true,
+        ),
         vec![kernel_primal(definition)?, forward.clone(), backward.clone()],
         inputs,
     )
+}
+
+/// Stages a native kernel primal whose derivative rules are the retained callbacks of a registered custom rule set.
+/// The rules are traced lazily, on the first derivative request of each specialization, and ordinary execution only
+/// ever runs the native kernel. `rules` is either a [`CustomRuleReference`](ryft_core::CustomRuleReference) to a rule
+/// set registered in the XLA operation family, whose rules are written against XLA tracers, or a
+/// [`LiftedCustomRules`](ryft_core::LiftedCustomRules) of a rule set registered in the array member family, whose
+/// rules are written against array tracers and whose specializations are converted into this family.
+pub fn stage_kernel_with_rules<C, Extension, S>(
+    context: &C,
+    definition: &KernelDefinition<Extension>,
+    rules: S,
+    inputs: &[C::Value],
+) -> Result<Vec<C::Value>, ProgramError>
+where
+    C: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>,
+    Extension: KernelExtension + Into<XlaKernelExtension>,
+    S: CustomRuleSource<XlaConstant, XlaOperation>,
+    XlaOperation: From<CustomFunctionOperation<XlaConstant, XlaOperation, S>>,
+{
+    context.bind(CustomFunctionOperation::new(rules), vec![kernel_primal(definition)?], inputs)
 }
 
 /// Uses an explicitly supplied pure equivalent program for differentiation while ordinary execution retains the
@@ -640,7 +667,7 @@ where
     stage_kernel_with_jvp(context, definition, &jvp, inputs)
 }
 
-/// Builds the ordinary functional primal region shared by canonical custom derivative carriers.
+/// Builds the ordinary functional primal region shared by canonical custom function carriers.
 fn kernel_primal<Extension: KernelExtension + Into<XlaKernelExtension>>(
     definition: &KernelDefinition<Extension>,
 ) -> Result<FlatXlaProgram, ProgramError> {
@@ -1148,6 +1175,7 @@ pub(crate) fn select_kernels(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::EffectClass;
     use ryft_core::kernels::{KernelCompilationError, KernelCompiler, KernelSchedule, VerifiedKernel};
@@ -1592,9 +1620,90 @@ pub(crate) mod tests {
             vec![scalar],
         )
         .unwrap();
-        assert_eq!(program.instructions()[0].operation().name(), "custom_derivative");
+        assert_eq!(program.instructions()[0].operation().name(), "custom_function");
         assert_eq!(program.instructions()[0].regions().len(), 2);
         assert_eq!(execute_derivative(&program.jvp().unwrap(), &[3.0, 4.0]), vec![3.0, 8.0]);
+    }
+
+    #[test]
+    fn test_stage_kernel_with_rules() {
+        use ryft_core::{ArrayOperation, CustomRuleDefinition, CustomRuleRegistration, LiftedCustomRules};
+
+        use crate::experimental::ops::XlaArrayConstant;
+
+        // A rule set registered in the XLA family (written against XLA tracers) and one registered in the array member
+        // family (written against array tracers) both double the tangent of the identity kernel.
+        let definition = differentiable_definition();
+        let scalar = definition.operation().input_types()[0].clone();
+        let native = CustomRuleRegistration::new(
+            CustomRuleDefinition::<XlaConstant, XlaOperation>::new("double").with_jvp(|primals, tangents| {
+                let doubled = tangents[0].context().bind(
+                    ryft_core::ArrayOperation::Add(ryft_core::AddOperation::<ryft_core::ArrayType>::new()),
+                    Vec::new(),
+                    &[tangents[0].clone(), tangents[0].clone()],
+                )?;
+                Ok((primals.to_vec(), doubled))
+            }),
+        );
+        let member = CustomRuleRegistration::new(
+            CustomRuleDefinition::<XlaArrayConstant, ArrayOperation<XlaArrayConstant>>::new("double")
+                .with_jvp(|primals, tangents| Ok((primals.to_vec(), vec![tangents[0].clone() + tangents[0].clone()]))),
+        );
+        let (_, native_program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                stage_kernel_with_rules(inputs[0].context(), &definition, native.reference(), &inputs)
+            },
+            vec![scalar.clone()],
+        )
+        .unwrap();
+        let (_, member_program) = TracingContext::<XlaConstant, XlaOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<XlaConstant, XlaOperation>>>| {
+                stage_kernel_with_rules(
+                    inputs[0].context(),
+                    &definition,
+                    LiftedCustomRules::Member(member.reference()),
+                    &inputs,
+                )
+            },
+            vec![scalar],
+        )
+        .unwrap();
+        // Both calls render the same, because rendering does not show where a call's rules come from, so only the
+        // operation variants distinguish the definition registered in this family from the lifted member definition.
+        assert!(matches!(native_program.instructions()[0].operation(), XlaOperation::CustomFunction(_)));
+        assert!(matches!(member_program.instructions()[0].operation(), XlaOperation::LiftedCustomFunction(_)));
+        for program in [native_program, member_program] {
+            assert_eq!(
+                program.to_string(),
+                indoc! {"
+                    lambda %0:f32[] .
+                    let %1:f32[] = custom_function [name=\"double\"] %0 [
+                        primal={
+                            lambda %0:f32[] .
+                            let %1:f32[] = kernel_call [
+                                grid=[],
+                                parameter_0=read-write f32[] [] InBounds,
+                                mapping_0={
+                                    lambda  .
+                                    in ()
+                                },
+                            ] %0 [
+                                body={
+                                    lambda %0:ref<f32[]> .
+                                    let %1:f32[] = reference_read %0
+                                        () = reference_write %0 %1
+                                    in ()
+                                },
+                            ]
+                            in (%1)
+                        },
+                    ]
+                    in (%1)
+                "}
+                .trim_end(),
+            );
+            assert_eq!(execute_derivative(&program.jvp().unwrap(), &[3.0, 4.0]), vec![3.0, 8.0]);
+        }
     }
 
     #[test]
@@ -1636,7 +1745,7 @@ pub(crate) mod tests {
             vec![scalar],
         )
         .unwrap();
-        assert_eq!(program.instructions()[0].operation().name(), "custom_derivative");
+        assert_eq!(program.instructions()[0].operation().name(), "custom_function");
         assert_eq!(program.instructions()[0].regions().len(), 3);
         let context = TracingContext::<XlaConstant, XlaOperation>::new();
         let input = context.input(program.input_types()[0].clone());

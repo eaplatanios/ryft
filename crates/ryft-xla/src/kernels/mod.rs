@@ -7,10 +7,11 @@
 //!
 //! [`stage_kernel`] preserves the complete kernel call through batching, control flow, and rematerialization.
 //! Differentiation requires an explicit [`stage_kernel_with_jvp`], [`stage_kernel_with_vjp`], or pure
-//! [`stage_kernel_with_fallback`] contract. Specialize scalar-prefetched values with
-//! [`KernelDefinition::specialize_prefetch`] before XLA staging; transforms never read captured device buffers back
-//! to the host. Local per-shard compilation retains full sharding metadata and requires every manual axis to be bound
-//! by an enclosing shard map with the same axis descriptor. Automatic partitioning and collectives are rejected.
+//! [`stage_kernel_with_fallback`] contract, or retained custom derivative rules ([`stage_kernel_with_rules`]).
+//! Specialize scalar-prefetched values with [`KernelDefinition::specialize_prefetch`] before XLA staging; transforms
+//! never read captured device buffers back to the host. Local per-shard compilation retains full sharding metadata and
+//! requires every manual axis to be bound by an enclosing shard map with the same axis descriptor. Automatic
+//! partitioning and collectives are rejected.
 //!
 //! [`KernelTuningRequest`] defines a finite, fingerprinted schedule search. Call [`KernelTuner::load`] or
 //! [`KernelTuner::run`] explicitly, sharing a tuner per device and controlling external contention. Samples measure
@@ -77,7 +78,8 @@ pub use tuning::{
 pub(crate) use staging::select_kernels;
 pub use staging::{
     XlaKernelCompilerBinding, XlaKernelDeviceFacts, XlaKernelExecutionFacts, XlaKernelExtension, XlaKernelOperation,
-    XlaKernelTarget, stage_kernel, stage_kernel_with_fallback, stage_kernel_with_jvp, stage_kernel_with_vjp,
+    XlaKernelTarget, stage_kernel, stage_kernel_with_fallback, stage_kernel_with_jvp, stage_kernel_with_rules,
+    stage_kernel_with_vjp,
 };
 
 #[cfg(feature = "rocm")]

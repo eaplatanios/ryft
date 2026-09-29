@@ -62,15 +62,15 @@ use std::fmt::{Debug, Display};
 use ryft_macros::Parameter;
 
 use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
-use crate::contexts::{Context, EagerContext, ProjectedContext};
+use crate::contexts::{Context, DomainProjection, EagerContext, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationPolicy, ResidualZeroProvider,
 };
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Atom, AtomId, Instruction, Operation, OperationProjection, Program, ProgramBuilder, ProgramError, ProjectedValue,
-    RegionArena, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    Atom, AtomId, Instruction, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, RegionArena, Type,
+    TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{NestedTracingContext, TracingContext};
 
@@ -233,9 +233,7 @@ pub trait CapturingContext: Context {
 
 impl<C: CapturingContext, T: Type> CapturingContext for ProjectedContext<C, T>
 where
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Operation: OperationProjection<T>,
+    C: DomainProjection<T>,
     C::Capture: ValueProjection<T, Projected: Value<Type = T>>,
 {
     type Capture = <C::Capture as ValueProjection<T>>::Projected;

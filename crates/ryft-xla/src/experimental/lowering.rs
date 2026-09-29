@@ -23,10 +23,11 @@ use ryft_core::operations::sort::{SORT_OPERATION_NAME, SortDirection, SortOperat
 use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
-    CUMULATIVE_OPERATION_NAME, CUSTOM_DERIVATIVE_OPERATION_NAME, CaptureReference, CeilOperation, ClampOperation,
-    ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CosOperation, CumulativeKind,
-    DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DivOperation,
-    DomainTracingContext, DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
+    CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME,
+    CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CaptureReference, CeilOperation, ClampOperation, ComparisonDirection,
+    ConstantOperation, ConvertElementTypeOperation, CosOperation, CumulativeKind, DYNAMIC_SLICE_OPERATION_NAME,
+    DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DivOperation, DomainTracingContext,
+    DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
     ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, Instruction, IotaOperation,
     LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalMesh,
     LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
@@ -4029,25 +4030,79 @@ fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Cop
         .collect()
 }
 
-/// Lowers a static slice.
-fn lower_slice_to_mlir<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+/// Lowers a slice. Static limits slice the input directly. A dynamic limit keeps its bounded dynamic axis whole, so
+/// the input is first exposed as its static physical allocation (i.e., each dynamic axis is widened to its physical
+/// bound), sliced with that bound as the limit along each such axis, and the logical extents of the output's dynamic
+/// axes are then restored from the same axes of the input. The lanes beyond each logical extent are never masked,
+/// because restoring the logical extents discards them again.
+fn lower_slice_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &SliceOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
     output_types: &[ArrayType],
-    block: &mut B,
-    _context: &'c MlirContext<'t>,
-    location: L,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     check_count!("input", input_values, 1, ProgramError);
+    check_count!("input", input_types, 1, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
+    let static_limits = operation.limits().iter().map(Dimension::value).collect::<Option<Vec<_>>>();
+    if let Some(limits) = static_limits {
+        let result = block.append_operation(stable_hlo::slice(
+            input_values[0],
+            operation.start_indices(),
+            &limits,
+            operation.strides(),
+            location,
+        )?)?;
+        return Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()]);
+    }
+
+    let input_type = &input_types[0];
+    let physical_type = physical_bound_type(input_type)?;
+    let size_type = lower_tensor_type(&ArrayType::scalar(DataType::I32), context, location)?;
+    let mut physical = input_values[0];
+    let mut physical_dimensions = input_type.shape().dimensions().to_vec();
+    for (axis, dimension) in physical_type.shape().dimensions().iter().enumerate() {
+        if physical_dimensions[axis] == *dimension {
+            continue;
+        }
+        let extent = reshape_dimension_i32(dimension.value().unwrap())?;
+        let elements = context
+            .dense_i32_elements_attribute(size_type, &[extent])
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I32 })?;
+        let size = block.append_operation(stable_hlo::constant(elements, location)?)?.result(0).unwrap().as_ref();
+        physical_dimensions[axis] = dimension.clone();
+        let physical_type = input_type.clone().with_shape(Shape::new(physical_dimensions.clone()));
+        physical = block
+            .append_operation(stable_hlo::set_dimension_size(
+                physical,
+                size,
+                lower_tensor_type(&physical_type, context, location)?,
+                axis,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+    }
+    let limits = operation
+        .limits()
+        .iter()
+        .zip(physical_type.shape().dimensions())
+        .map(|(limit, physical_extent)| limit.value().or(physical_extent.value()).unwrap())
+        .collect::<Vec<_>>();
     let result = block.append_operation(stable_hlo::slice(
-        input_values[0],
+        physical,
         operation.start_indices(),
-        operation.limit_indices(),
+        &limits,
         operation.strides(),
         location,
     )?)?;
-    Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
+    let result = result.result(0).expect("stablehlo.slice should return one result").as_ref();
+    let sources = (0..input_type.rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
+    Ok(vec![lower_restore_dynamic_dimensions(result, &output_types[0], &sources, block, context, location)?])
 }
 
 fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
@@ -5714,13 +5769,13 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 lowerer.context,
                 lowerer.location,
             ),
-            ArrayOperation::CustomDerivative(_) | ArrayOperation::Rematerialize(_) => {
-                Err(ProgramError::UnsupportedOperation {
-                    message: "higher-order operation must be stored directly in the enclosing backend operation family"
-                        .to_string(),
-                }
-                .into())
+            ArrayOperation::CustomFunction(_)
+            | ArrayOperation::CustomFunctionTranspose(_)
+            | ArrayOperation::Rematerialize(_) => Err(ProgramError::UnsupportedOperation {
+                message: "higher-order operation must be stored directly in the enclosing backend operation family"
+                    .to_string(),
             }
+            .into()),
             ArrayOperation::LinearCall(operation) => Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
@@ -5964,7 +6019,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 Ok(vec![input_values[0]])
             }
             ArrayOperation::ParallelReduce(operation) => {
-                // This plain dispatch serves nested programs (control-flow bodies, inlined custom-derivative and
+                // This plain dispatch serves nested programs (control-flow bodies, inlined custom-function and
                 // rematerialized primals), which can sit inside a shard_map manual region: the threaded
                 // `CollectiveLoweringState` resolves the collective's mesh axis there and errors outside manual
                 // regions (a batched axis would have been consumed into a `Reduce` at trace time).
@@ -6074,6 +6129,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::Slice(operation) => lower_slice_to_mlir(
                 operation,
                 input_values,
+                &lowerer.input_types,
                 output_types,
                 &mut lowerer.block,
                 lowerer.context,
@@ -8956,7 +9012,7 @@ fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
 ///
 /// Eligible programs (see [`supports_structural_dedup`]) are keyed by their canonical rendering plus their complete
 /// flat input/output signature: type inference is deterministic and attached regions (control-flow bodies,
-/// custom-derivative programs, and nested `jit_call` callees) render contextually inside their instructions, so two
+/// custom-function programs, and nested `jit_call` callees) render contextually inside their instructions, so two
 /// programs that render identically with equal boundary types compute the same function and may share one emitted
 /// function — even when they are distinct staged programs produced by separate transform passes (for example the
 /// per-block primal and pullback programs of `grad(jit(f))` over repeated blocks).
@@ -9071,7 +9127,7 @@ impl JitCallFunctionMap {
 }
 
 /// Counts `jit_call` callee occurrences in `program`, covering nested computations at every depth: attached regions
-/// (control-flow bodies, custom-derivative programs, and callee bodies) all live in the program's one canonical
+/// (control-flow bodies, custom-function programs, and callee bodies) all live in the program's one canonical
 /// region arena, so the walk descends region edges without materializing nested programs. Shard-map body regions are
 /// intentionally skipped: their `jit_call`s lower with shard-local types and always inline.
 ///
@@ -9872,29 +9928,30 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Condition(_) => lowerer.lower_condition(regions, input_values),
         XlaOperation::While(operation) => lowerer.lower_while(operation, regions, input_values),
         XlaOperation::Scan(operation) => lowerer.lower_scan(operation, regions, input_values),
-        XlaOperation::CustomDerivative(operation) => {
+        XlaOperation::CustomFunction(_) | XlaOperation::LiftedCustomFunction(_) => {
             let [primal, ..] = regions else {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("{CUSTOM_DERIVATIVE_OPERATION_NAME} expected a primal region but got no regions"),
+                    op: format!("{CUSTOM_FUNCTION_OPERATION_NAME} expected a primal region but got no regions"),
                 });
             };
             if regions.len() != operation.region_slots().len() {
                 return Err(LoweringError::UnsupportedOp {
                     op: format!(
                         "{} expected {} attached regions but got {}",
-                        CUSTOM_DERIVATIVE_OPERATION_NAME,
+                        CUSTOM_FUNCTION_OPERATION_NAME,
                         operation.region_slots().len(),
                         regions.len(),
                     ),
                 });
             }
-            // Custom derivative regions are traced through fresh-root contexts whose local capture tables are
+            // Custom function regions are traced through fresh-root contexts whose local capture tables are
             // discarded, so they can never legally reference the enclosing function's captures (the trace boundary
             // rejects bodies that register captures). Lowering the primal region with an empty capture namespace turns
             // any capture-referencing constant that still sneaks in into a loud `MissingCapturedConstant` error instead
-            // of silently aliasing whatever value occupies the referenced slot of the enclosing capture prefix. The rule
-            // regions are dormant under lowering. Nested-traced regions (`while`/`scan`/`condition`/`linear_call`)
-            // share the enclosing capture scope and keep inheriting it.
+            // of silently aliasing whatever value occupies the referenced slot of the enclosing capture prefix. Only
+            // the primal region is lowered: attached rule regions are dormant under lowering, and retained rules are
+            // callbacks rather than regions. Nested-traced regions (`while`/`scan`/`condition`/`linear_call`) share
+            // the enclosing capture scope and keep inheriting it.
             lower_nested_program_inline(
                 primal,
                 input_values,
@@ -9907,6 +9964,15 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 &lowerer.collective_state,
                 &mut lowerer.effect_tokens,
             )
+        }
+        XlaOperation::CustomFunctionTranspose(_) | XlaOperation::LiftedCustomFunctionTranspose(_) => {
+            Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "a `{CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME}` has no forward program and cannot be lowered to \
+                     StableHLO; transpose it before lowering",
+                ),
+            }
+            .into())
         }
         XlaOperation::Rematerialize(_) => {
             let [primal, _forward, _backward, _tangent] = regions else {
@@ -9919,7 +9985,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 });
             };
             // Rematerialized regions are traced through fresh-root contexts and lower with an empty capture
-            // namespace; refer to the `CustomDerivative` arm above for the rationale.
+            // namespace; refer to the `CustomFunction` arm above for the rationale.
             lower_nested_program_inline(
                 primal,
                 input_values,
@@ -9933,13 +9999,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 &mut lowerer.effect_tokens,
             )
         }
-        XlaOperation::LinearCall(operation) => {
-            if operation.is_transpose_only() {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!("a transpose-only `{LINEAR_CALL_OPERATION_NAME}` cannot be lowered to StableHLO"),
-                }
-                .into());
-            }
+        XlaOperation::LinearCall(_) => {
             let [forward, _transpose] = regions else {
                 return Err(LoweringError::UnsupportedOp {
                     op: format!("`{LINEAR_CALL_OPERATION_NAME}` expected 2 attached regions but got {}", regions.len()),
@@ -16540,10 +16600,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_derivative_lowering_inlines_only_the_primal_program() {
-        use ryft_core::{CustomDerivativeJvpRule, CustomDerivativeOperation, PrintOperation};
+    fn test_custom_function_lowering_inlines_only_the_primal_program() {
+        use ryft_core::{CustomFunctionJvpRule, CustomFunctionOperation, PrintOperation};
 
-        // A retained `custom_derivative` call lowers only its primal program and threads its effects onto the
+        // A retained `custom_function` call lowers only its primal program and threads its effects onto the
         // enclosing ordered-I/O chain, for every rule layout. Nothing from the user-supplied rule programs (marked
         // here by the multiplies on the tangent and cotangent sides) reaches the emitted module.
         let vector_type = test_vector_type(4);
@@ -16600,10 +16660,13 @@ mod tests {
                 .unwrap()
         };
         for (operation, rules) in [
-            (CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region), vec![&jvp]),
-            (CustomDerivativeOperation::new().with_vjp_rule(), vec![&forward, &backward]),
+            (CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Explicit, false), vec![&jvp]),
             (
-                CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region).with_vjp_rule(),
+                CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Absent, true),
+                vec![&forward, &backward],
+            ),
+            (
+                CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Explicit, true),
                 vec![&jvp, &forward, &backward],
             ),
         ] {
@@ -16612,7 +16675,7 @@ mod tests {
             regions.extend(rules.into_iter().map(|rule| builder.import_region(rule.entry_region_ref())));
             let input = builder.add_input(vector_type.clone().into());
             let output = builder
-                .add_instruction(XlaOperation::CustomDerivative(operation), regions, vec![input], None)
+                .add_instruction(XlaOperation::CustomFunction(operation), regions, vec![input], None)
                 .unwrap()[0];
             let program = builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -16636,6 +16699,75 @@ mod tests {
                 "#},
             );
         }
+    }
+
+    #[test]
+    fn test_custom_rule_lowering_inlines_only_the_primal_program() {
+        use ryft_core::{
+            CustomRuleDefinition, CustomFunctionOperation, CustomRuleRegistration, CustomFunctionTransposeOperation,
+        };
+
+        // A custom rule call lowers only its primal program: its derivative rules are retained callbacks, not regions.
+        let vector_type = test_vector_type(4);
+        let rules = CustomRuleRegistration::new(CustomRuleDefinition::<XlaConstant, XlaOperation>::new("doubled"));
+        let primal = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(vector_type.clone().into());
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let primal_region = builder.import_region(primal.entry_region_ref());
+        let input = builder.add_input(vector_type.clone().into());
+        let output = builder
+            .add_instruction(
+                XlaOperation::CustomFunction(CustomFunctionOperation::new(rules.reference())),
+                vec![primal_region],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![vector_type.clone()];
+        let output_types = vec![vector_type.clone()];
+        assert_eq!(
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+
+        // An unresolved reverse-mode carrier has no forward program to lower.
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(vector_type.clone().into());
+        let carrier = CustomFunctionTransposeOperation::new(
+            rules.reference(),
+            0,
+            vec![vector_type.clone().into()],
+            vec![vector_type.clone().into()],
+        );
+        let output = builder
+            .add_instruction(XlaOperation::CustomFunctionTranspose(carrier), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None)
+                .unwrap_err()
+                .to_string(),
+            "a `custom_function_transpose` has no forward program and cannot be lowered to StableHLO; transpose it \
+             before lowering",
+        );
     }
 
     #[test]
@@ -16811,11 +16943,11 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_only_linear_call_lowering_is_rejected() {
-        use ryft_core::LinearCallOperation;
+    fn test_custom_function_transpose_lowering_is_rejected() {
+        use ryft_core::CustomFunctionTransposeOperation;
 
-        // Phase 0 boundary pin for the first-class-program-regions plan: the un-transposed transpose-only linear
-        // call carrier is reverse-mode-only and must be transposed away before lowering, so lowering it is rejected.
+        // A custom function carrier with an attached backward rule is reverse-mode-only and must be transposed away
+        // before lowering, so lowering it is rejected.
         let vector_type = test_vector_type(4);
         let backward = {
             let mut builder = CompositeXlaProgramBuilder::new();
@@ -16831,7 +16963,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let operation = LinearCallOperation::transpose_only(
+        let operation = CustomFunctionTransposeOperation::<XlaConstant, XlaOperation>::from_backward_region(
             1,
             vec![ArrayIrType::Array(vector_type.clone())],
             vec![ArrayIrType::Array(vector_type.clone())],
@@ -16841,7 +16973,12 @@ mod tests {
         let tangent = builder.add_input(vector_type.clone().into());
         let residual = builder.add_input(vector_type.clone().into());
         let output = builder
-            .add_instruction(XlaOperation::LinearCall(operation), vec![backward_region], vec![tangent, residual], None)
+            .add_instruction(
+                XlaOperation::CustomFunctionTranspose(operation),
+                vec![backward_region],
+                vec![tangent, residual],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -16856,7 +16993,8 @@ mod tests {
         assert!(matches!(
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
             Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == "a transpose-only `linear_call` cannot be lowered to StableHLO",
+                if message == "a `custom_function_transpose` has no forward program and cannot be lowered to \
+                               StableHLO; transpose it before lowering",
         ));
     }
 
@@ -23929,24 +24067,21 @@ mod tests {
         assert_eq!(stablehlo.matches("@ryft.assert").count(), 1, "{stablehlo}");
         assert!(stablehlo.contains("stablehlo.concatenate"), "{stablehlo}");
 
-        // Dynamic non-concatenated dimensions need transform residuals rather than a hidden runtime-size lookup in a
-        // nominally static slice operation.
+        // A dynamic non-concatenated dimension is shared by the output cotangent and every input, so the transpose
+        // slices it whole through a dynamic slice limit instead of looking up a hidden runtime size.
         let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
         let left_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), columns.clone().into()]));
         let right_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), columns.into()]));
         let mut builder = XlaProgramBuilder::new();
-        let left = builder.add_input(left_type);
-        let right = builder.add_input(right_type);
+        let left = builder.add_input(left_type.clone());
+        let right = builder.add_input(right_type.clone());
         let joined = builder
             .add_instruction(ConcatenateOperation::<ArrayType>::new(0, 2).unwrap(), Vec::new(), vec![left, right], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaArrayConstant>, XlaArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
-        assert_eq!(
-            program.transpose().unwrap_err().to_string(),
-            "`concatenate` transpose requires a static size on axis 1 but input 0 has size columns",
-        );
+        assert_eq!(program.transpose().unwrap().output_types(), vec![left_type, right_type]);
     }
 
     #[test]
@@ -24218,6 +24353,75 @@ mod tests {
                 .unwrap();
             let expected = if index == 0 { vec![1_i64, 2, 3, 4] } else { vec![5_i64, 6, 7, 8] };
             assert_eq!(values_from_bytes::<i64>(bytes.as_slice()), expected);
+        }
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_whole_axis_dynamic_slice() {
+        // A dynamic limit keeps its bounded dynamic axis whole: the lowering slices the physical allocation, whose
+        // dynamic axis is widened to its bound, and then restores that axis's logical extent from the input.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(4)]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(
+                SliceOperation::new(vec![0, 1], vec![Dimension::Dynamic(batch), Dimension::Static(4)])
+                    .with_strides(vec![1, 2])
+                    .unwrap(),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?x4xf32, #stablehlo.bounds<4, ?>>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>> {
+                    %c = stablehlo.constant dense<4> : tensor<i32>
+                    %0 = stablehlo.set_dimension_size %arg0, %c, dim = 0 : (tensor<?x4xf32, #stablehlo.bounds<4, ?>>, tensor<i32>) -> tensor<4x4xf32>
+                    %1 = stablehlo.slice %0 [0:4, 1:4:2] : (tensor<4x4xf32>) -> tensor<4x2xf32>
+                    %2 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x4xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %3 = stablehlo.set_dimension_size %1, %2, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    return %3 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_nonlinear_cumulative_jvp_over_dynamic_unscanned_axis() {
+        // The forward mode of a nonlinear cumulative kind differentiates through `associative_scan`, whose slices keep
+        // a dynamic unscanned axis whole, so the whole derivative program lowers for every nonlinear kind.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(4)]));
+        for kind in [CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min, CumulativeKind::LogSumExp] {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let output = builder
+                .add_instruction(
+                    ArrayOperation::Cumulative(CumulativeOperation::new(1, kind)),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let jvp = program.jvp().unwrap();
+            assert!(to_mlir_module_for_plain_program(&jvp, "main").is_ok(), "{kind}");
         }
     }
 

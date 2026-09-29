@@ -5,7 +5,7 @@ use crate::arrays::{
     ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
 };
@@ -213,10 +213,9 @@ where
     }
 }
 
-impl<C: Context, T: Type> One<<C::Value as ValueProjection<T>>::Projected> for ProjectedContext<C, T>
+impl<C: Context + DomainProjection<T>, T: Type> One<<C::Value as ValueProjection<T>>::Projected>
+    for ProjectedContext<C, T>
 where
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
-    C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
     C::Operation: OperationProjection<T, Projected: From<OneOperation<T>>>,
 {
     #[inline]

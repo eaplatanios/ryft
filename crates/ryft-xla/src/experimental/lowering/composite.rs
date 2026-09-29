@@ -1436,9 +1436,12 @@ where
         ArrayIrOperation::Condition(_)
         | ArrayIrOperation::While(_)
         | ArrayIrOperation::Scan(_)
-        | ArrayIrOperation::CustomDerivative(_)
+        | ArrayIrOperation::CustomFunction(_)
         | ArrayIrOperation::LinearCall(_)
-        | ArrayIrOperation::Rematerialize(_) => Err(LoweringError::UnsupportedOp {
+        | ArrayIrOperation::Rematerialize(_)
+        | ArrayIrOperation::CustomFunctionTranspose(_)
+        | ArrayIrOperation::LiftedCustomFunction(_)
+        | ArrayIrOperation::LiftedCustomFunctionTranspose(_) => Err(LoweringError::UnsupportedOp {
             op: format!(
                 "core composite higher-order operation `{}` must be promoted to the XLA operation family before \
                      lowering",

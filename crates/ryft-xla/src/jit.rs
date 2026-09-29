@@ -1848,6 +1848,7 @@ mod tests {
     use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
@@ -2937,6 +2938,85 @@ mod tests {
         };
         assert_eq!(read_f32_array(&client, &input_cotangent), vec![7.0]);
         assert_eq!(read_f32_array(&client, &cotangent_reference.read().unwrap()), vec![7.0]);
+    }
+
+    #[test]
+    fn test_stateful_compiled_function_commits_accumulating_custom_backward_buffers() {
+        use ryft_core::{
+            ArraySliceAxis, CotangentAccumulator, MaybeZero, Slice, TranspositionContext, custom_function,
+        };
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::new_static(DataType::F32, [4]);
+
+        // `x ↦ x[1]`, whose accumulating backward rule adds its seed to only the affected entry of the caller buffer.
+        // The compiled pullback therefore updates the buffer in place, without a full-sized cotangent temporary.
+        type Tracer<'c> = DomainTracer<XlaDomain<'c>>;
+        let element = |x: &Tracer<'_>| -> Result<Tracer<'_>, ProgramError> {
+            Ok(ValueProjection::<ArrayType>::into_projected(x.clone())?.slice(&[1], &[2usize], &[1])?.into_value())
+        };
+        let function = custom_function(move |x: Tracer<'_>| element(&x)).with_accumulating_vjp(
+            move |x: Tracer<'_>| Ok((element(&x)?, ())),
+            |context: &mut TranspositionContext<XlaConstant, XlaOperation>,
+             (): (),
+             seed: MaybeZero<Tracer<'_>>,
+             accumulator: CotangentAccumulator| {
+                let (MaybeZero::Value(seed), Some(buffer)) = (seed, accumulator.reference(context)?) else {
+                    return Err(
+                        ProgramError::InvalidArgument { message: "expected a caller buffer".to_string() }.into()
+                    );
+                };
+                let slice = ArrayReferenceTransform::Slice { axes: vec![ArraySliceAxis::new(1, 1, 1)] };
+                buffer.add_update_through(&seed, &[slice], &[])?;
+                Ok(())
+            },
+        );
+        let array = |r#type: &ArrayType, values: &[f32]| {
+            Array::from_host_buffer(&client, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values)).unwrap()
+        };
+        let input = ArrayIrValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0]));
+        let (_, pullback) = domain.differentiate_at(input).vjp(|x| function.call(x)).unwrap();
+        assert!(pullback.residuals().is_empty());
+        let pullback = pullback.transposed_program(&[CotangentDestinationKind::Reference]).unwrap();
+        let [seed_type, buffer_type] = <[ArrayIrType; 2]>::try_from(pullback.input_types()).unwrap();
+        assert!(matches!(&buffer_type, ArrayIrType::Reference(_)));
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[1][sharding={mesh<['x'=1:auto]>, [{}]}], \
+                %1:ref<f32[4][sharding={mesh<['x'=1:auto]>, [{}]}]> .
+                let () = reference_add_update [transforms=[slice(axes=[1:2])]] %1 %0
+                in ()
+            "}
+            .trim_end(),
+        );
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+            |(buffer, seed)| {
+                let context = buffer.context().clone();
+                pullback.interpret_in_context(&context, vec![seed, buffer])?;
+                Ok(())
+            },
+            (buffer_type, seed_type),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let buffer = ArrayReference::new(array(&array_type, &[1.0, 1.0, 1.0, 1.0]));
+        compiled
+            .call_statefully(
+                &domain,
+                (
+                    ArrayIrValue::Reference(buffer.clone()),
+                    ArrayIrValue::Array(array(&ArrayType::new_static(DataType::F32, [1]), &[5.0])),
+                ),
+            )
+            .unwrap();
+        assert_eq!(read_f32_array(&client, &buffer.read().unwrap()), vec![1.0, 6.0, 1.0, 1.0]);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod constants;
 pub mod control_flow;
 pub mod cumulative;
 pub mod custom_call;
+pub mod custom_functions;
 pub mod debugging;
 pub mod differentiation;
 pub mod dimensions;
@@ -62,16 +63,18 @@ pub use control_flow::{
     WhileTypeSemantics, associative_scan, transpose_primal_condition, transpose_primal_scan,
 };
 pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation};
+pub use custom_functions::{
+    CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CustomCallPrimal, CustomFunction,
+    CustomFunctionBatching, CustomFunctionJvp, CustomFunctionJvpRule, CustomFunctionOperation,
+    CustomFunctionTransposeOperation, CustomFunctionVjp, CustomRuleDefinition, CustomRuleReference,
+    CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer, CustomRuleTracer, DefaultBatching, DefaultJvp,
+    DefaultVjp, JvpFromPrimal, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration,
+    WithAccumulatingVjp, WithBatching, WithJvp, WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, custom_function,
+};
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::{
-    CUSTOM_DERIVATIVE_OPERATION_NAME, CUSTOM_DERIVATIVE_TRANSPOSE_OPERATION_NAME, CustomCallPrimal, CustomDerivative,
-    CustomDerivativeBatching, CustomDerivativeBuilder, CustomDerivativeJvp, CustomDerivativeJvpRule,
-    CustomDerivativeOperation, CustomDerivativeTransposeOperation, CustomDerivativeVjp, CustomJvp,
-    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer,
-    CustomRuleTracer, CustomVjp, JvpFromPrimal, LINEAR_CALL_OPERATION_NAME, LiftedCustomRules, LinearCallOperation,
-    NoBatching, NoJvp, NoVjp, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients,
-    UnavailableCustomRules, WeakCustomRuleRegistration, WithAccumulatingVjp, WithBatching, WithJvp,
-    WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, custom_derivative, custom_derivative_at, custom_jvp, custom_vjp,
+    LINEAR_CALL_OPERATION_NAME, LinearCallOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation,
+    StopGradients,
 };
 pub use dimensions::{
     ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME,

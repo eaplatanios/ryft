@@ -5134,7 +5134,8 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::StopGradient(_)
         | ArrayOperation::Tag(_)
         | ArrayOperation::Rematerialize(_)
-        | ArrayOperation::CustomDerivative(_)
+        | ArrayOperation::CustomFunction(_)
+        | ArrayOperation::CustomFunctionTranspose(_)
         | ArrayOperation::LinearCall(_) => Propagated,
     }
 }
@@ -5187,9 +5188,12 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         | XlaOperation::Condition(_)
         | XlaOperation::While(_)
         | XlaOperation::Scan(_)
-        | XlaOperation::CustomDerivative(_)
+        | XlaOperation::CustomFunction(_)
         | XlaOperation::LinearCall(_)
         | XlaOperation::Rematerialize(_)
+        | XlaOperation::CustomFunctionTranspose(_)
+        | XlaOperation::LiftedCustomFunction(_)
+        | XlaOperation::LiftedCustomFunctionTranspose(_)
         | XlaOperation::JitCall(_) => Propagated,
     }
 }
@@ -6260,8 +6264,8 @@ mod tests {
         BatchAxis, BatchableOperation, BatchingContext, CalleeRegionDriver, CaptureReference, CompareOperation,
         ComparisonDirection, CompilationStagingRequest, CompilationTracer, CompiledFunctionDispatcher,
         ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
-        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomDerivativeJvpRule,
-        CustomDerivativeOperation, Dimension, DimensionAddOperation, DimensionDivOperation,
+        CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomFunctionJvpRule,
+        CustomFunctionOperation, Dimension, DimensionAddOperation, DimensionDivOperation,
         DimensionFromScalarOperation, DimensionMulOperation, DimensionRemOperation, DimensionSize,
         DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
         DotOperation, DynamicBroadcastOperation, DynamicGather, DynamicReshape, DynamicReshapeOperation,
@@ -9959,6 +9963,58 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_associative_scan_over_dynamic_unscanned_axis() {
+        use ryft_core::{Cumulative, Max, associative_scan};
+
+        // `associative_scan` keeps every unscanned axis whole, so a bounded dynamic row axis survives its slices, pads,
+        // and interleaving, and one compiled program computes the prefix maxima of every row at each logical row
+        // count, exactly like the reference backend's cumulative maximum.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(5)]))
+                .with_sharding(sharding.clone())
+                .unwrap();
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            |input| associative_scan(&input, 1, false, &|left, right| left.max(right)).unwrap(),
+            dynamic_type,
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
+            domain.compile(domain.lower(staged).unwrap()).unwrap();
+        for rows in [2usize, 4] {
+            let values = (0..rows * 5).map(|value| ((value * 7) % 11) as f32).collect::<Vec<_>>();
+            let input = Array::from_host_buffer(
+                &client,
+                ArrayType::new_static(DataType::F32, [rows, 5]).with_sharding(sharding.clone()).unwrap(),
+                mesh.clone(),
+                values_to_bytes(values.as_slice()).as_slice(),
+            )
+            .unwrap();
+            let output = ryft_core::compilation::call_function(
+                &domain,
+                compiled.executable_function(),
+                ArrayIrValue::Array(input),
+            )
+            .unwrap();
+            let ArrayIrValue::Array(output) = output else {
+                panic!("array-only compiled function returned a first-class dimension");
+            };
+            output.block_until_ready().unwrap();
+            assert_eq!(output.shape().as_slice(), &[rows, 5]);
+            let expected =
+                CpuArray::matrix(rows, 5, values).unwrap().cumulative_max(1).unwrap().elements::<f32>().unwrap();
+            assert_eq!(read_f32s(&client, &output), expected);
+        }
+    }
+
+    #[test]
     fn test_bounded_dynamic_input_padding_is_dense_row_major() {
         let source = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
 
@@ -12372,14 +12428,15 @@ mod tests {
         };
         assert_eq!(
             XlaDomain::token().bind(
-                XlaOperation::CustomDerivative(
-                    CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region)
-                ),
+                XlaOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                    CustomFunctionJvpRule::Explicit,
+                    false,
+                )),
                 vec![primal.clone(), rule],
                 &[],
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "`custom_derivative` carries reference state that XLA eager execution cannot lower; \
+                message: "`custom_function` carries reference state that XLA eager execution cannot lower; \
                           discharge references before lowering"
                     .to_string(),
             }),
@@ -12405,14 +12462,15 @@ mod tests {
         };
         assert_eq!(
             XlaDomain::token().bind(
-                XlaOperation::CustomDerivative(
-                    CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region)
-                ),
+                XlaOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                    CustomFunctionJvpRule::Explicit,
+                    false,
+                )),
                 vec![primal, pure_reference_rule],
                 &[],
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "`custom_derivative` carries reference state that XLA eager execution cannot lower; \
+                message: "`custom_function` carries reference state that XLA eager execution cannot lower; \
                           discharge references before lowering"
                     .to_string(),
             }),

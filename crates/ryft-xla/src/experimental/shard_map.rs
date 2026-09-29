@@ -4824,8 +4824,8 @@ mod tests {
             .enumerate()
             .map(|(index, input)| boundary.local_input_type(index, input).unwrap())
             .collect::<Vec<_>>();
-        // Trace the region-carrying custom derivative in its homogeneous universe, then lift the complete program.
-        // A projected context intentionally cannot bind regions; whole-program promotion preserves those regions.
+        // Trace the custom function in its homogeneous universe, then lift the complete program. Whole-program
+        // promotion preserves the call's primal region and converts its retained rules into the lifted family.
         let (_, body) = DomainTracingContext::<AttentionDomain>::trace_with_named_axes(
             |inputs: Vec<DomainTracer<AttentionDomain>>| {
                 let function = differentiable_dot_product_attention::<AttentionDomain>(

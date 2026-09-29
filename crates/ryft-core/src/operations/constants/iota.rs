@@ -5,7 +5,7 @@ use crate::arrays::{
     ArrayOperation, ArrayType, Dimension, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
 };
@@ -248,10 +248,9 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
     }
 }
 
-impl<C: Context> Iota<<C::Value as ValueProjection<ArrayType>>::Projected> for ProjectedContext<C, ArrayType>
+impl<C: Context + DomainProjection<ArrayType>> Iota<<C::Value as ValueProjection<ArrayType>>::Projected>
+    for ProjectedContext<C, ArrayType>
 where
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: OperationProjection<ArrayType, Projected: From<IotaOperation<ArrayType>>>,
 {
     #[inline]

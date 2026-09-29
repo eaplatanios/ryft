@@ -23,7 +23,10 @@ use crate::kernels::validation::{
 };
 use crate::operations::attention::AttentionConfiguration;
 use crate::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
-use crate::operations::{DimensionFromScalar, DimensionFromScalarOperation, LINEAR_CALL_OPERATION_NAME, PadOperation};
+use crate::operations::{
+    CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, DimensionFromScalar,
+    DimensionFromScalarOperation, PadOperation,
+};
 use crate::parameters::Placeholder;
 use crate::programs::{
     Atom, FlatProgram, InputRegionProvenance, Operation, OperationFormatter, ProgramBuilder, ProgramError,
@@ -999,6 +1002,15 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
         );
     }
 
+    /// Returns the error that rejects the kernel semantic descriptor encoding of the custom function operation named
+    /// `name` with retained rules, whose identity is local to the process.
+    fn retained_custom_function_encoding_error(name: &str) -> TypeError {
+        TypeError::invalid(format!(
+            "`{name}` operations with retained rules have no kernel semantic descriptor encoding, because the identity \
+             of their rules is local to the process",
+        ))
+    }
+
     /// Encodes the closed canonical portable payload family, with explicit eligibility for lossy/opaque forms.
     fn portable_semantic_fields(key: &mut String, operation: &ArrayIrOperation<Array>) -> Result<(), TypeError> {
         // Unlike the public Operation render contract, this closed structural representation includes typed variant
@@ -1017,9 +1029,17 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 ArrayOperation::DotProductAttentionBackward(operation) => {
                     Self::attention_semantic_fields(key, operation.configuration())
                 }
-                ArrayOperation::LinearCall(operation) if operation.is_transpose_only() => {
+                ArrayOperation::CustomFunction(operation) if operation.rules().is_some() => {
+                    return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_OPERATION_NAME));
+                }
+                ArrayOperation::CustomFunctionTranspose(operation) if operation.rules().is_some() => {
+                    return Err(Self::retained_custom_function_encoding_error(
+                        CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
+                    ));
+                }
+                ArrayOperation::CustomFunctionTranspose(_) => {
                     return Err(TypeError::invalid(format!(
-                        "transpose-only `{LINEAR_CALL_OPERATION_NAME}` operations have no kernel semantic descriptor \
+                        "`{CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME}` operations have no kernel semantic descriptor \
                          encoding",
                     )));
                 }
@@ -1104,13 +1124,26 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Rematerialize(_)
                 | ArrayOperation::Assert(_)
                 | ArrayOperation::Print(_)
-                | ArrayOperation::CustomDerivative(_)
+                | ArrayOperation::CustomFunction(_)
                 | ArrayOperation::LinearCall(_) => {}
             },
             ArrayIrOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
-            ArrayIrOperation::LinearCall(operation) if operation.is_transpose_only() => {
+            ArrayIrOperation::CustomFunction(operation) if operation.rules().is_some() => {
+                return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_OPERATION_NAME));
+            }
+            ArrayIrOperation::LiftedCustomFunction(_) => {
+                return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_OPERATION_NAME));
+            }
+            ArrayIrOperation::CustomFunctionTranspose(operation) if operation.rules().is_some() => {
+                return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME));
+            }
+            ArrayIrOperation::LiftedCustomFunctionTranspose(_) => {
+                return Err(Self::retained_custom_function_encoding_error(CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME));
+            }
+            ArrayIrOperation::CustomFunctionTranspose(_) => {
                 return Err(TypeError::invalid(format!(
-                    "transpose-only `{LINEAR_CALL_OPERATION_NAME}` operations have no kernel semantic descriptor encoding",
+                    "`{CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME}` operations have no kernel semantic descriptor \
+                     encoding",
                 )));
             }
             ArrayIrOperation::Zero(_)
@@ -1141,7 +1174,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
             | ArrayIrOperation::Condition(_)
             | ArrayIrOperation::While(_)
             | ArrayIrOperation::Scan(_)
-            | ArrayIrOperation::CustomDerivative(_)
+            | ArrayIrOperation::CustomFunction(_)
             | ArrayIrOperation::LinearCall(_)
             | ArrayIrOperation::Assert(_)
             | ArrayIrOperation::Rematerialize(_) => {}
@@ -1163,8 +1196,9 @@ mod tests {
     use crate::kernels::grids::{GridDimension, GridExecution};
     use crate::kernels::mappings::BoundaryPolicy;
     use crate::operations::{
-        ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceWrite, ReferenceWriteOperation, ZeroOperation,
+        CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation, CustomRuleDefinition,
+        CustomRuleRegistration, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EffectClasses, ProgramBuilder, ReferenceAccessDescriptor};
@@ -2259,6 +2293,90 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn test_kernel_definition_semantic_key_custom_functions() {
+        // Builds a kernel whose body applies `operation` to one scalar constant, with `region_count` attached regions
+        // that are each the scalar identity.
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let definition = |operation: ArrayIrOperation<Array>, region_count: usize| {
+            let mut identity = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let input = identity.add_input(scalar_type.clone());
+            let identity = identity
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![input],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let mut body = ProgramBuilder::<ArrayIrValue<Array>, KernelOperation>::new();
+            let regions = (0..region_count).map(|_| body.import_program(identity.clone())).collect::<Vec<_>>();
+            let input = body.add_constant(ArrayIrValue::Array(Array::scalar(1f32).unwrap()));
+            body.add_instruction(KernelOperation::Portable(operation), regions, vec![input], None).unwrap();
+            KernelDefinition::new(
+                KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap(),
+                body.build(vec![], vec![], vec![]).unwrap(),
+            )
+            .unwrap()
+        };
+
+        // A call with attached rules is encoded structurally, because its rules are regions of the body.
+        let attached = CustomFunctionOperation::from_rule_regions(CustomFunctionJvpRule::Absent, false);
+        assert!(definition(ArrayIrOperation::CustomFunction(attached), 1).semantic_key().is_ok());
+
+        // Calls and carriers with retained rules have no encoding, whether their rules are registered in this family or
+        // lifted from the array member family, because the identity of their rules is local to the process.
+        let retained = |name: &str| {
+            Err(TypeError::invalid(format!(
+                "`{name}` operations with retained rules have no kernel semantic descriptor encoding, because the \
+                 identity of their rules is local to the process",
+            )))
+        };
+        let rules = CustomRuleRegistration::new(
+            CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("retained"),
+        );
+        assert_eq!(
+            definition(ArrayIrOperation::CustomFunction(CustomFunctionOperation::new(rules.reference())), 1)
+                .semantic_key(),
+            retained("custom_function"),
+        );
+        let member_rules =
+            CustomRuleRegistration::new(CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("member"));
+        assert_eq!(
+            definition(
+                ArrayIrOperation::from(ArrayOperation::CustomFunction(CustomFunctionOperation::new(
+                    member_rules.reference(),
+                ))),
+                1,
+            )
+            .semantic_key(),
+            retained("custom_function"),
+        );
+        let carrier = CustomFunctionTransposeOperation::new(
+            rules.reference(),
+            0,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+        );
+        assert_eq!(
+            definition(ArrayIrOperation::CustomFunctionTranspose(carrier), 0).semantic_key(),
+            retained("custom_function_transpose"),
+        );
+
+        // A carrier with an attached backward rule is an unresolved reverse-mode obligation, so it has no encoding
+        // either.
+        let carrier = CustomFunctionTransposeOperation::from_backward_region(
+            0,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+        );
+        assert_eq!(
+            definition(ArrayIrOperation::CustomFunctionTranspose(carrier), 1).semantic_key(),
+            Err(TypeError::invalid(
+                "`custom_function_transpose` operations have no kernel semantic descriptor encoding",
+            )),
+        );
     }
 
     #[test]
