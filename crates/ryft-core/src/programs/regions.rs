@@ -1397,7 +1397,8 @@ impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for Calle
 /// Custom transforms can create one driver per instruction and pass it to their region-aware operation rules. Share
 /// one [`RegionReplayMappings`] across those drivers so instructions referencing the same source region reuse its
 /// destination import. Create fresh mappings for each source-arena replay, including recursive replays. The driver
-/// exposes and imports attached regions; it does not transform their bodies. Context staging owns specialization.
+/// exposes and imports attached regions; it does not transform their bodies. Contexts that consume attached regions
+/// structurally (i.e., staging and differentiation contexts) own their specialization.
 ///
 /// For example, the following imports attached regions incrementally into one builder while preserving sharing across
 /// instructions. A transform can supply its established [`TypeIdentityRenaming`] when replay has replaced identities

@@ -55,7 +55,7 @@ use crate::programs::{
 };
 
 /// Error returned when classifying residuals with a [`ResidualPolicy`], staging their [`ResidualStorage`],
-/// or planning a [`PartitionedProgram`] with [`PartitionedProgram::with_residual_policy`].
+/// or placing the residuals of a [`PartitionedProgram`] with [`PartitionedProgram::with_residual_policy`].
 ///
 /// This error and [`ProgramError`] convert into each other without losing information. Converting a
 /// [`ResidualPolicyError::Program`] into a [`ProgramError`] unwraps it and every other variant is wrapped in
@@ -263,7 +263,7 @@ impl<S> ResidualDecision<S> {
 }
 
 /// Rejection of a residual by the classifier of a [`ResidualPolicy`] (e.g., because the policy forbids saving values
-/// that carry a particular name), which planning reports as [`ResidualPolicyError::Rejected`].
+/// that carry a particular name), which placing residuals reports as [`ResidualPolicyError::Rejected`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ResidualRejection {
     /// Refer to the documentation of [`message`](Self::message) for more information.
@@ -871,13 +871,14 @@ impl<T: Type> Hash for ResidualPolicyReference<T> {
 }
 
 impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadProjection> PartitionedProgram<V, O> {
-    /// Returns this partition with the known values that its residual program consumes placed according to `policy`.
-    /// This plans an existing partition at its top level only. [`Program::partition_with_residual_policy`] instead
-    /// partitions a program with `policy` in its [`PartialEvaluationContext`](crate::PartialEvaluationContext),
-    /// which also plans the partitions that split rules construct for the bodies of region-carrying operations.
+    /// Returns this partition with the known values that its residual program consumes placed
+    /// according to `policy`. This places the residuals of an existing partition at its top level only.
+    /// [`Program::partition_with_residual_policy`] instead partitions a program with `policy` in its
+    /// [`PartialEvaluationContext`](crate::PartialEvaluationContext), which also places the residuals
+    /// of the partitions that split rules construct for the bodies of region-carrying operations.
     ///
     /// Planning starts from the edges that the residual program reads and decides everything before it emits the
-    /// planned programs. It classifies each demanded known value once:
+    /// resulting programs. It classifies each demanded known value once:
     ///
     ///   - Known inputs are forwarded as edges and constants are re-created in the residual program, without consulting
     ///     the policy. Known inputs are therefore the only inputs that are ever saved, and only when residual work
@@ -901,7 +902,7 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     /// kept. Effectful known work stays in the known program regardless of demand, except for local reference
     /// lifecycles that nothing in the known program observes anymore, which are removed from it.
     ///
-    /// The planned partition keeps the known inputs, the outputs, and the effect-ordering constraints of this
+    /// The resulting partition keeps the known inputs, the outputs, and the effect-ordering constraints of this
     /// partition. The residual program keeps its unknown inputs and the edges that it still reads at their relative
     /// positions, followed by the new edges in known-program order, and edges that nothing reads are dropped. The
     /// effect-ordering constraints remain valid because the known program gains no effects and the residual program
@@ -919,9 +920,9 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
         self.with_residual_policy_and_region_replay(policy, true)
     }
 
-    /// Plans the residuals of this partition like [`with_residual_policy`](Self::with_residual_policy). When
+    /// Places the residuals of this partition like [`with_residual_policy`](Self::with_residual_policy). When
     /// `replay_region_operations` is `false`, outputs of region-carrying operations are saved rather than replayed,
-    /// because the split rules of those operations already planned their bodies with the same policy.
+    /// because the split rules of those operations already placed the residuals of their bodies with the same policy.
     fn with_residual_policy_and_region_replay(
         self,
         policy: &ResidualPolicyReference<V::Type>,
@@ -960,27 +961,24 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Planning of the partitions of programs over values of type `V` and operations of family `O` according to one
-/// residual policy. It is type-erased so that a
-/// [`PartialEvaluationContext`](crate::partial::contexts::PartialEvaluationContext) can carry a policy into the
-/// partitions that the split rules of region-carrying operations construct, without requiring every operation family
-/// to support planning. [`ResidualPolicyReference`]s implement it for every family that does.
-pub(crate) trait PartitionPlanning<V: Value, O: Operation<Type = V::Type>> {
-    /// Returns `partition` with its residuals planned according to the policy (refer to
-    /// [`PartitionedProgram::with_residual_policy`]). Outputs of region-carrying operations in the known program are
-    /// saved rather than replayed, because the split rules of those operations already planned their bodies with the
-    /// same policy when the partition was constructed.
-    fn plan_partition(&self, partition: PartitionedProgram<V, O>) -> Result<PartitionedProgram<V, O>, ProgramError>;
+/// Placement of the residuals of the partitions of programs over values of type `V`
+/// and operations of family `O` according to one residual policy. It is type-erased so that a
+/// [`PartialEvaluationContext`](crate::PartialEvaluationContext) can carry a policy into the partitions that the
+/// split rules of region-carrying operations construct, without requiring every operation family to support residual
+/// placement. [`ResidualPolicyReference`]s implement it for every family that does.
+pub(crate) trait ResidualPlacement<V: Value, O: Operation<Type = V::Type>> {
+    /// Returns `partition` with its residuals placed according to the policy (refer to the documentation of
+    /// [`PartitionedProgram::with_residual_policy`] for more information on that). Outputs of region-carrying
+    /// operations in the known program are saved rather than replayed, because the split rules of those operations
+    /// already placed the residuals of their bodies with the same policy when the partition was constructed.
+    fn place_residuals(&self, partition: PartitionedProgram<V, O>) -> Result<PartitionedProgram<V, O>, ProgramError>;
 }
 
-impl<V: Value, O: Operation<Type = V::Type> + OperationPayloadProjection> PartitionPlanning<V, O>
+impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadProjection> ResidualPlacement<V, O>
     for ResidualPolicyReference<V::Type>
-where
-    V::Type: 'static,
 {
-    fn plan_partition(&self, partition: PartitionedProgram<V, O>) -> Result<PartitionedProgram<V, O>, ProgramError> {
+    #[inline]
+    fn place_residuals(&self, partition: PartitionedProgram<V, O>) -> Result<PartitionedProgram<V, O>, ProgramError> {
         Ok(partition.with_residual_policy_and_region_replay(self, false)?)
     }
 }
@@ -998,7 +996,7 @@ enum ResidualPlan<T: Type> {
 }
 
 /// State of [`PartitionedProgram::with_residual_policy`] for one partition, which plans the known atoms that residual
-/// work demands (refer to [`discover`](Self::discover)) before emitting the planned programs.
+/// work demands (via [`discover`](Self::discover)) before emitting the planned programs.
 struct ResidualPlanner<'p, V: Value, O: Operation<Type = V::Type>> {
     /// Known program of the partition.
     known_program: &'p Program<V, O, Vec<V>, Vec<V>>,
@@ -1009,8 +1007,8 @@ struct ResidualPlanner<'p, V: Value, O: Operation<Type = V::Type>> {
     /// Policy that classifies the demanded atoms.
     policy: &'p ResidualPolicyReference<V::Type>,
 
-    /// Whether region-carrying producers may be replayed as a whole (refer to
-    /// [`PartitionedProgram::with_residual_policy_and_region_replay`]).
+    /// Whether region-carrying producers may be replayed as a whole. Refer to
+    /// [`PartitionedProgram::with_residual_policy_and_region_replay`] for more information.
     replay_region_operations: bool,
 
     /// Lifecycles of the local references of the known program that do not escape it.
@@ -1033,16 +1031,16 @@ struct ResidualPlanner<'p, V: Value, O: Operation<Type = V::Type>> {
     plans: Vec<Option<ResidualPlan<V::Type>>>,
 
     /// Positions of the instructions of the known program that the residual program replays.
-    replay: BTreeSet<usize>,
+    replay_instructions: BTreeSet<usize>,
 }
 
-impl<'p, V: 'p + Value, O: 'p + Operation<Type = V::Type>> ResidualPlanner<'p, V, O>
-where
-    V::Type: 'static,
-    O: OperationPayloadProjection,
+// TODO(eaplatanios): Review from here onwards.
+
+impl<'p, V: 'p + Value<Type: 'static>, O: 'p + Operation<Type = V::Type> + OperationPayloadProjection>
+    ResidualPlanner<'p, V, O>
 {
-    /// Creates a new [`ResidualPlanner`] for the partition whose known program is `known_program` and whose edges are
-    /// `edges`.
+    /// Creates a new [`ResidualPlanner`] for the partition whose known program is `known_program`
+    /// and whose edges are `edges`.
     fn new(
         known_program: &'p Program<V, O, Vec<V>, Vec<V>>,
         edges: &'p [AtomId],
@@ -1069,7 +1067,7 @@ where
             provenance: ResidualProvenance { program: known_program, summaries: HashMap::new() },
             replayable: vec![None; known_program.instructions().len()],
             plans: (0..atom_count).map(|_| None).collect(),
-            replay: BTreeSet::new(),
+            replay_instructions: BTreeSet::new(),
         })
     }
 
@@ -1095,7 +1093,7 @@ where
             let Some(index) = instructions.pop() else {
                 return Ok(());
             };
-            if self.replay.insert(index) {
+            if self.replay_instructions.insert(index) {
                 atoms.extend(self.known_program.instructions()[index].inputs().iter().rev().copied());
                 instructions.extend(self.lifecycles.state_predecessors(index));
             }
@@ -1135,7 +1133,7 @@ where
         }
 
         // Replaying a region-carrying producer re-executes it as a whole, which would undo the per-iteration and
-        // per-branch decisions of a split rule that already planned its body with the same policy.
+        // per-branch decisions of a split rule that already placed the residuals of its body with the same policy.
         if !self.replay_region_operations && !known_program.instructions()[index].regions().is_empty() {
             return Ok(ResidualPlan::Edge(None));
         }
@@ -1260,7 +1258,7 @@ where
         // The residual program replays these lifecycles, so the known program keeps them only if it still observes
         // them itself.
         let replayed_allocations = self
-            .replay
+            .replay_instructions
             .iter()
             .flat_map(|index| {
                 let instruction = &known_program.instructions()[*index];
@@ -1324,7 +1322,7 @@ where
 
         let mut known_atoms = vec![None; known_program.atoms().len()];
         let mut remapping = HashMap::new();
-        for index in &self.replay {
+        for index in &self.replay_instructions {
             let instruction = &known_program.instructions()[*index];
             let inputs = instruction
                 .inputs()
