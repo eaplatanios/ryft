@@ -9,15 +9,16 @@ use crate::parameters::{Parameter, Placeholder};
 use crate::partial::evaluations::PartialEvaluation;
 use crate::partial::operations::{PartiallyEvaluatableOperation, RecursivePartialEvaluationDriver};
 use crate::partial::partitions::{EffectOrdering, PartitionedProgram};
+use crate::partial::residuals::{ResidualPlacement, ResidualPolicyReference};
 use crate::partial::values::{
     PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartialValueMaterialization,
 };
 use crate::programs::operations::OperationFoldReplacement;
 use crate::programs::{
-    AtomId, BindingRegionDriver, EffectClasses, FlatProgram, InstructionId, Operation, Program, ProgramBuilder,
-    ProgramError, ProjectedValue, Provenance, ProvenanceScope, ProvenanceState, ReferenceAnalysis, ReferenceIdentity,
-    RegionRef, RegionReplayMappings, RegionRole, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed,
-    Value, ValueProjection,
+    AtomId, BindingRegionDriver, EffectClasses, FlatProgram, InstructionId, Operation, OperationPayloadProjection,
+    Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, ProvenanceState,
+    ReferenceAnalysis, ReferenceIdentity, RegionRef, RegionReplayMappings, RegionRole, ReplayRegionDriver, Type,
+    TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::TracingContext;
 
@@ -168,17 +169,25 @@ pub struct PartialEvaluationContext<C: Context> {
     /// Specialization retains these operations so they observe state when the specialized program is called.
     reference_placement: ReferencePlacement,
 
+    // TODO(eaplatanios): Should this become private with an accessor function?
     /// Specifies whether effectful operations with known inputs may run in the parent context. Deferred sibling
     /// contexts disable this so that every residual call performs its own effects, including allocations with known
     /// initial values. Pure known work can still fold; reference placement and previously deferred ordered effects
     /// can further restrict folding.
     pub(super) allow_effect_folding: bool,
 
+    // TODO(eaplatanios): Should this become private with an accessor function?
     /// Specifies whether ordered effects must remain residual to preserve execution order. Clones share this flag so
     /// that nested operations cannot move effects ahead of already deferred work. During replay with per-reference
     /// ordering, each instruction receives a separate flag initialized from its conflicts with earlier deferred work;
     /// the reference sets themselves remain local to that replay.
     pub(super) defer_ordered_effects: Rc<Cell<bool>>,
+
+    /// Residual placement with which the partitions that split rules construct through
+    /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program) place their
+    /// residuals, if a residual policy was set. Refer to [`with_residual_policy`](Self::with_residual_policy) for how
+    /// to do that.
+    residual_placement: Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>>,
 
     /// First binding error retained for finalization, even if the failed operation has no outputs or its poisoned
     /// outputs are discarded. Once set, later binds propagate poison without executing operations. Clones share the
@@ -209,6 +218,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             reference_placement: ReferencePlacement::Execute,
             allow_effect_folding: true,
             defer_ordered_effects: Rc::new(Cell::new(false)),
+            residual_placement: None,
             error: Rc::new(RefCell::new(None)),
         }
     }
@@ -238,6 +248,47 @@ impl<C: Context> PartialEvaluationContext<C> {
         self
     }
 
+    /// Returns a copy of this context whose nested partitions place their residuals according to `policy`.
+    /// The split rules of region-carrying operations (e.g., `scan` and `condition`) partition their bodies through
+    /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program), which then
+    /// places the residuals of each such partition according to `policy` (which can be set using
+    /// [`PartitionedProgram::with_residual_policy`]) and carries `policy` into the partitions nested within it. This
+    /// has implications for various region-carrying operation types. For example, it means that decisions apply per
+    /// iteration of a `scan` operation and per branch of a `condition` operation. A region-carrying operation whose
+    /// body was split this way is never replayed as a whole when the residuals of an enclosing partition are placed,
+    /// because its split rule already placed the residuals of its body. For example, a `while` loop saves nothing as
+    /// its residual loop re-runs every iteration, so its split rule partitions its regions without the policy.
+    ///
+    /// This function changes only the returned context's configuration, without creating a new residual program
+    /// or changing previously emitted work. Existing clones retain their own residual policy.
+    #[inline]
+    pub fn with_residual_policy(self, policy: &ResidualPolicyReference<C::Type>) -> Self
+    where
+        C::Type: 'static,
+        C::Operation: OperationPayloadProjection,
+    {
+        self.with_residual_placement(Some(Rc::new(policy.clone())))
+    }
+
+    /// Returns a copy of this context without a residual policy, for split rules whose residual programs do not consume
+    /// saved values (e.g., a `while` loop, whose residual loop re-runs every iteration). Refer to
+    /// [`with_residual_policy`](Self::with_residual_policy) for the inverse operation.
+    #[inline]
+    pub fn without_residual_policy(self) -> Self {
+        self.with_residual_placement(None)
+    }
+
+    /// Returns a copy of this context with the provided residual placement, which nested contexts inherit
+    /// from their parents.
+    #[inline]
+    pub(super) fn with_residual_placement(
+        mut self,
+        residual_placement: Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>>,
+    ) -> Self {
+        self.residual_placement = residual_placement;
+        self
+    }
+
     /// Creates a fresh sibling [`PartialEvaluationContext`] that folds pure known work into this context's parent
     /// and retains every effectful operation in its residual program, even when all operands are known. Each residual
     /// invocation therefore executes its own effects, including fresh reference allocations. The shared parent identity
@@ -249,6 +300,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         Self::from_shared_parent(self.parent.clone())
             .with_reference_placement(self.reference_placement)
             .with_allow_effect_folding(false)
+            .with_residual_placement(self.residual_placement.clone())
     }
 
     /// Returns the known-side parent [`Context`] of this [`PartialEvaluationContext`] which is used
@@ -265,6 +317,13 @@ impl<C: Context> PartialEvaluationContext<C> {
     #[inline]
     pub fn reference_placement(&self) -> ReferencePlacement {
         self.reference_placement
+    }
+
+    /// Returns the residual placement of this [`PartialEvaluationContext`], if a residual policy was set (refer to
+    /// [`with_residual_policy`](Self::with_residual_policy)).
+    #[inline]
+    pub(super) fn residual_placement(&self) -> Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>> {
+        self.residual_placement.clone()
     }
 
     /// Imports a known value from another [`PartialEvaluationContext`] sharing this context's parent. The first import
@@ -981,6 +1040,7 @@ impl<C: Context> Clone for PartialEvaluationContext<C> {
             reference_placement: self.reference_placement,
             allow_effect_folding: self.allow_effect_folding,
             defer_ordered_effects: self.defer_ordered_effects.clone(),
+            residual_placement: self.residual_placement.clone(),
             error: self.error.clone(),
         }
     }
@@ -1367,6 +1427,9 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::partial::evaluations::PartialEvaluation;
+    use crate::partial::residuals::{
+        NoStorage, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualRejection,
+    };
     use crate::partial::tests::{
         TestCapture, TestOperation, TestValue, reference_ordering_program, replay_reference_ordering_program,
     };
@@ -1385,6 +1448,28 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    /// Returns a residual policy over [`ArrayIrType`] that recomputes every residual.
+    fn save_nothing() -> ResidualPolicyReference<ArrayIrType> {
+        struct SaveNothing;
+
+        impl ResidualPolicy<ArrayIrType> for SaveNothing {
+            type Storage = NoStorage;
+
+            fn name(&self) -> &str {
+                "save_nothing"
+            }
+
+            fn classify(
+                &self,
+                _candidate: &ResidualCandidate<'_, ArrayIrType>,
+            ) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
+                Ok(ResidualDecision::Recompute)
+            }
+        }
+
+        ResidualPolicyReference::new(SaveNothing)
+    }
 
     #[test]
     fn test_partial_evaluation_context_new() {
@@ -1448,6 +1533,57 @@ mod tests {
         assert!(
             matches!(&outputs[1], TestValue::Reference(reference) if reference.read() == Ok(Array::scalar(2.0_f32).unwrap())),
         );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_with_residual_policy() {
+        // Contexts carry no residual policy by default. Configured contexts carry theirs into clones and deferred
+        // siblings, while existing clones keep their own configuration.
+        let policy = save_nothing();
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let configured = context.clone().with_residual_policy(&policy);
+        assert!(context.residual_placement().is_none());
+        assert!(configured.residual_placement().is_some());
+        assert!(configured.clone().residual_placement().is_some());
+        assert!(configured.deferred_sibling().residual_placement().is_some());
+
+        // The carried residual placement follows the policy: `f(x, t) = -x * t` with `x` known recomputes
+        // the negation in the residual program instead of saving it.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let x = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let t = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let negated = builder
+            .add_instruction(ArrayOperation::from(NegOperation::new()), Vec::new(), vec![x], None)
+            .unwrap()[0];
+        let product = builder
+            .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![negated, t], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let planned = configured
+            .residual_placement()
+            .unwrap()
+            .place_residuals(program.partition(&[true, false]).unwrap())
+            .unwrap();
+        assert_eq!(
+            planned.residual_program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[] = neg %1
+                    %3:f32[] = mul %2 %0
+                in (%3)"},
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_without_residual_policy() {
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+            .with_residual_policy(&save_nothing());
+        let without_policy = context.clone().without_residual_policy();
+        assert!(without_policy.residual_placement().is_none());
+        assert!(without_policy.deferred_sibling().residual_placement().is_none());
+        assert!(context.residual_placement().is_some());
     }
 
     #[test]
