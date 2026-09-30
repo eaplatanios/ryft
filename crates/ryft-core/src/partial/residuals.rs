@@ -694,41 +694,87 @@ impl ResidualPolicyInstantiations {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Next process-unique identifier of a residual policy definition.
 static NEXT_RESIDUAL_POLICY_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Type-erased reference to a [`ResidualPolicy`] instantiated in type universe `T`, which is how programs and
 /// transforms carry policies.
 ///
-/// Each reference identifies a policy _definition_ by a process-unique identifier that [`new`](Self::new) assigns.
-/// Clones and [lifts](Self::lift) of a reference keep that identifier, and references compare and hash by it, so that
-/// operations that carry a policy compare equal exactly when they carry the same definition, in any universe. Two
-/// separately registered references are distinct even when their policies are equal, and so are the references that
-/// the opt-ins [`with_native_instantiation`](Self::with_native_instantiation) and
-/// [`with_projection_fallback`](Self::with_projection_fallback) return, because those change what the policy decides.
+/// # Identity
+///
+/// Operations that carry a policy must support equality and hashing, because programs compare and deduplicate their
+/// instructions, transform caches key on them, and tests compare program structure. Policies, however, are arbitrary
+/// values, often closures or structs holding closures, and neither closures nor trait objects can be compared or
+/// hashed. Each reference therefore identifies a policy _definition_ by a process-unique identifier that
+/// [`new`](Self::new) assigns, and references compare and hash by that identifier. Operations that carry
+/// a policy then compare equal exactly when they carry the same definition.
+///
+/// Identity is tracked by an identifier rather than by pointer identity because it must survive lifting.
+/// For example, promoting an operation that carries a policy from an [`ArrayType`](crate::ArrayType) family into an
+/// [`ArrayIrType`](crate::ArrayIrType) family [lifts](Self::lift) its policy into a different type-erased object (i.e.,
+/// a native instantiation or a projecting wrapper), yet the promoted operation must still compare equal to its origin
+/// and to any other promotion of it. Clones and lifts of a reference therefore keep its identifier.
+///
+/// Identifiers are conservative. Two separately registered references are distinct even when their policies
+/// look equal, because the equality of two closures cannot be decided. The references that the opt-ins
+/// [`Self::with_native_instantiation`] and [`Self::with_projection_fallback`] return are new definitions as well,
+/// because those opt-ins change what the policy decides, and treating the result as the same definition would let
+/// caches return results computed under the old behavior. Identifiers only need to be unique within one process, since
+/// policies are never serialized, and they come from a global atomic counter because policies can be registered on any
+/// thread.
 pub struct ResidualPolicyReference<T: Type> {
-    /// Policy instantiated in universe `T`.
-    policy: Arc<dyn ErasedResidualPolicy<T>>,
-
     /// Identifier of the policy definition.
     id: u64,
+
+    /// Policy instantiated in universe `T`.
+    policy: Arc<dyn ErasedResidualPolicy<T>>,
 
     /// Instantiations of the policy definition in other type universes.
     instantiations: Arc<ResidualPolicyInstantiations>,
 }
 
 impl<T: 'static + Type> ResidualPolicyReference<T> {
-    /// Registers `policy` as a new policy definition, together with the [native
-    /// instantiations](ResidualPolicy::native_instantiations) that it declares.
+    /// Registers `policy` as a new policy definition, together with the
+    /// [native instantiations](ResidualPolicy::native_instantiations) that it declares.
     pub fn new<P: ResidualPolicy<T>>(policy: P) -> Self {
         let natives = policy.native_instantiations();
         Self {
-            policy: Arc::new(NativeResidualPolicy(policy)),
             id: NEXT_RESIDUAL_POLICY_ID.fetch_add(1, Ordering::Relaxed),
+            policy: Arc::new(NativeResidualPolicy(policy)),
             instantiations: Arc::new(ResidualPolicyInstantiations { natives, fallbacks: Vec::new() }),
         }
+    }
+
+    /// Returns a new policy definition that classifies candidates of type universe `U` with `policy` after lifting
+    /// into `U`, instead of projecting their types into `T`. This is how custom policies classify candidates that exist
+    /// only in `U` (e.g., dimensions or references). `policy` must make the same decisions as this policy for the
+    /// candidates whose types project into `T`, which this function cannot check.
+    pub fn with_native_instantiation<U: 'static + Type, P: ResidualPolicy<U>>(self, policy: P) -> Self {
+        let mut instantiations = (*self.instantiations).clone();
+        instantiations.natives = instantiations.natives.with(policy);
+        self.redefined(instantiations)
+    }
+
+    /// Returns a new policy definition whose lift into type universe `U` classifies the candidates whose types do not
+    /// all project into `T` with `fallback`. Candidates whose types project still reach this policy unchanged. The
+    /// fallback receives the complete candidate together with which of its types project.
+    pub fn with_projection_fallback<
+        U: 'static + Type,
+        F: 'static
+            + Send
+            + Sync
+            + for<'c, 'o> Fn(
+                &ProjectionFallbackCandidate<'c, 'o, U>,
+            ) -> Result<ResidualDecision<ErasedResidualStorage<U>>, ResidualRejection>,
+    >(
+        self,
+        fallback: F,
+    ) -> Self {
+        let mut instantiations = (*self.instantiations).clone();
+        let fallback: ProjectionFallback<U> = Arc::new(fallback);
+        instantiations.fallbacks.retain(|(universe, _)| *universe != TypeId::of::<U>());
+        instantiations.fallbacks.push((TypeId::of::<U>(), Arc::new(fallback)));
+        self.redefined(instantiations)
     }
 
     /// Returns the identifier of the policy definition of this reference.
@@ -757,70 +803,48 @@ impl<T: 'static + Type> ResidualPolicyReference<T> {
         self.policy.classify(candidate)
     }
 
-    /// Returns a new policy definition that classifies candidates of type universe `U` with `policy` after lifting
-    /// into `U`, instead of projecting their types into `T`. This is how custom policies classify candidates that exist
-    /// only in `U` (e.g., dimensions or references). `policy` must make the same decisions as this policy for the
-    /// candidates whose types project into `T`, which this function cannot check.
-    pub fn with_native_instantiation<U: 'static + Type, P: ResidualPolicy<U>>(self, policy: P) -> Self {
-        let mut instantiations = (*self.instantiations).clone();
-        instantiations.natives = instantiations.natives.with(policy);
-        self.redefined(instantiations)
-    }
-
-    /// Returns a new policy definition whose lift into type universe `U` classifies the candidates whose types do not
-    /// all project into `T` with `fallback`. Candidates whose types project still reach this policy unchanged. The
-    /// fallback receives the complete candidate together with which of its types project.
-    pub fn with_projection_fallback<U: 'static + Type, F>(self, fallback: F) -> Self
-    where
-        F: 'static
-            + Send
-            + Sync
-            + for<'c, 'o> Fn(
-                &ProjectionFallbackCandidate<'c, 'o, U>,
-            ) -> Result<ResidualDecision<ErasedResidualStorage<U>>, ResidualRejection>,
-    {
-        let mut instantiations = (*self.instantiations).clone();
-        let fallback: ProjectionFallback<U> = Arc::new(fallback);
-        instantiations.fallbacks.retain(|(universe, _)| *universe != TypeId::of::<U>());
-        instantiations.fallbacks.push((TypeId::of::<U>(), Arc::new(fallback)));
-        self.redefined(instantiations)
-    }
-
-    /// Returns this policy lifted into a type universe `U` whose types project into `T` (e.g., from `ArrayType` into
-    /// `ArrayIrType`), keeping the identifier of its definition. The lifted policy is the [native
-    /// instantiation](ResidualPolicy::native_instantiations) of the policy in `U`, if there is one. Otherwise, it
-    /// projects the types of each candidate into `T` and classifies the projected candidate with this policy, using
-    /// the [projection fallback](Self::with_projection_fallback) for `U` for the candidates that do not project.
+    /// Returns this policy lifted into a type universe `U` whose types project into `T` (e.g., from
+    /// [`ArrayType`](crate::ArrayType) into [`ArrayIrType`](crate::ArrayIrType)), keeping the identifier of its
+    /// definition. The lifted policy is the [native instantiation](ResidualPolicy::native_instantiations) of the
+    /// policy in `U`, if there is one. Otherwise, it projects the types of each candidate into `T` and classifies
+    /// the projected candidate with this policy, using the [projection fallback](Self::with_projection_fallback)
+    /// for `U` for the candidates that do not project.
+    #[inline]
     pub fn lift<U: 'static + Type>(&self) -> ResidualPolicyReference<U>
     where
         for<'t> &'t T: TryFrom<&'t U>,
     {
-        let policy = self.instantiations.natives.get::<U>().unwrap_or_else(|| {
-            Arc::new(LiftedResidualPolicy::<T, U> {
-                source: self.policy.clone(),
-                fallback: self.instantiations.fallback::<U>(),
-            })
-        });
-        ResidualPolicyReference { policy, id: self.id, instantiations: self.instantiations.clone() }
+        ResidualPolicyReference {
+            id: self.id,
+            policy: self.instantiations.natives.get::<U>().unwrap_or_else(|| {
+                Arc::new(LiftedResidualPolicy::<T, U> {
+                    source: self.policy.clone(),
+                    fallback: self.instantiations.fallback::<U>(),
+                })
+            }),
+            instantiations: self.instantiations.clone(),
+        }
     }
 
     /// Returns this reference as a new policy definition with the provided instantiations.
     fn redefined(self, instantiations: ResidualPolicyInstantiations) -> Self {
         Self {
-            policy: self.policy,
             id: NEXT_RESIDUAL_POLICY_ID.fetch_add(1, Ordering::Relaxed),
+            policy: self.policy,
             instantiations: Arc::new(instantiations),
         }
     }
 }
 
 impl<T: Type> Clone for ResidualPolicyReference<T> {
+    #[inline]
     fn clone(&self) -> Self {
-        Self { policy: self.policy.clone(), id: self.id, instantiations: self.instantiations.clone() }
+        Self { id: self.id, policy: self.policy.clone(), instantiations: self.instantiations.clone() }
     }
 }
 
 impl<T: Type> Debug for ResidualPolicyReference<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ResidualPolicyReference")
@@ -831,6 +855,7 @@ impl<T: Type> Debug for ResidualPolicyReference<T> {
 }
 
 impl<T: Type> PartialEq for ResidualPolicyReference<T> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
@@ -839,10 +864,13 @@ impl<T: Type> PartialEq for ResidualPolicyReference<T> {
 impl<T: Type> Eq for ResidualPolicyReference<T> {}
 
 impl<T: Type> Hash for ResidualPolicyReference<T> {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// Returns this partition with the known values that its residual program consumes placed according to `policy`
