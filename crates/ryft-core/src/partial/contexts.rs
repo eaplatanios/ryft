@@ -806,9 +806,8 @@ impl<C: Context> PartialEvaluationContext<C> {
         build_residual_operation: BuildResidualProgramOperation,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Bind the known-side operation into the known-side context over the original known inputs.
-        let known_inputs = program
-            .metadata
-            .known_input_indices
+        let (known_program, residual_program, known_input_indices, residual_inputs, outputs) = program.into_parts();
+        let known_inputs = known_input_indices
             .iter()
             .map(|&index| {
                 inputs
@@ -817,7 +816,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                     .ok_or(ProgramError::InvalidInputCount { expected: index + 1, actual: inputs.len() })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (known_program_operation, known_regions) = build_known_operation(program.known_program);
+        let (known_program_operation, known_regions) = build_known_operation(known_program);
         let known_outputs =
             self.fold_or_residualize(known_program_operation, known_regions, known_inputs.as_slice())?;
 
@@ -826,10 +825,8 @@ impl<C: Context> PartialEvaluationContext<C> {
         // program without outputs can still carry effectful residual instructions whose effects must be preserved, and
         // an entirely empty residual program only yields a dead pure operation that the walk's final simplification
         // removes.
-        let known_output_count = program.metadata.outputs.iter().filter(|output| output.is_known()).count();
-        let residual_inputs = program
-            .metadata
-            .residual_inputs
+        let known_output_count = outputs.iter().filter(|output| output.is_known()).count();
+        let residual_inputs = residual_inputs
             .iter()
             .map(|source| match source {
                 PartialEvaluationInput::Unknown(index) => inputs
@@ -845,14 +842,12 @@ impl<C: Context> PartialEvaluationContext<C> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (residual_program_operation, residual_regions) = build_residual_operation(program.residual_program);
+        let (residual_program_operation, residual_regions) = build_residual_operation(residual_program);
         let residual_outputs =
             self.residualize(residual_program_operation, residual_regions, residual_inputs.as_slice())?;
 
         // Reassemble the original outputs from the two operations' outputs.
-        program
-            .metadata
-            .outputs
+        outputs
             .iter()
             .map(|source| match source {
                 PartialEvaluationOutput::Known(index) => known_outputs.get(*index).cloned().ok_or_else(|| {

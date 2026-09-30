@@ -21,7 +21,7 @@ use crate::partial::evaluations::PartialEvaluation;
 /// Reference identity shared across a [`PartitionedProgram`] boundary. Allocations belong to their emitted invocation
 /// even when the two independently constructed programs reuse region and instruction identifiers.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum PartitionReferenceRoot {
+enum PartitionReferenceRoot {
     /// Original input shared by the partition's boundary wiring.
     Input(usize),
 
@@ -134,13 +134,13 @@ impl EffectsSummary {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartitionMetadata {
     /// Refer to the documentation of [`PartitionedProgram::known_input_indices`] for more information.
-    pub(super) known_input_indices: Vec<usize>,
+    known_input_indices: Vec<usize>,
 
     /// Refer to the documentation of [`PartitionedProgram::residual_inputs`] for more information.
-    pub(super) residual_inputs: Vec<PartialEvaluationInput<usize>>,
+    residual_inputs: Vec<PartialEvaluationInput<usize>>,
 
     /// Refer to the documentation of [`PartitionedProgram::outputs`] for more information.
-    pub(super) outputs: Vec<PartialEvaluationOutput<usize>>,
+    outputs: Vec<PartialEvaluationOutput<usize>>,
 
     /// Effect-ordering constraints for the known program and residual program, respectively. By default, all ordered
     /// effects must retain their relative execution order. When partitioning work into a known invocation followed by
@@ -148,7 +148,17 @@ pub struct PartitionMetadata {
     /// can establish separate ordering constraints for independent allocations. References in both programs are then
     /// identified relative to the original inputs so that accesses to the same allocation can be compared across the
     /// partition boundary; allocations created within either program have separate identities.
-    pub(super) effect_ordering: [EffectOrdering<PartitionReferenceRoot>; 2],
+    effect_ordering: [EffectOrdering<PartitionReferenceRoot>; 2],
+}
+
+impl PartitionMetadata {
+    /// Returns this [`PartitionMetadata`] with its residual inputs replaced by `residual_inputs`, keeping its known
+    /// inputs, outputs, and effect-ordering constraints. [`PartitionedProgram::plan_residuals`] uses this after it
+    /// rewrites which residual edges the residual program consumes.
+    pub(super) fn with_residual_inputs(mut self, residual_inputs: Vec<PartialEvaluationInput<usize>>) -> Self {
+        self.residual_inputs = residual_inputs;
+        self
+    }
 }
 
 /// Result of partitioning a [`Program`] into a known-side program and a residual program based on which original
@@ -180,13 +190,13 @@ pub struct PartitionMetadata {
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct PartitionedProgram<V: Value, O: Operation<Type = V::Type>> {
     /// Refer to the documentation of [`known_program`](Self::known_program) for more information.
-    pub(super) known_program: Program<V, O, Vec<V>, Vec<V>>,
+    known_program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Refer to the documentation of [`residual_program`](Self::residual_program) for more information.
-    pub(super) residual_program: Program<V, O, Vec<V>, Vec<V>>,
+    residual_program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Boundary wiring and effect-ordering constraints shared by the two programs.
-    pub(super) metadata: PartitionMetadata,
+    metadata: PartitionMetadata,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {

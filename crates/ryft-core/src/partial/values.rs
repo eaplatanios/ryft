@@ -264,3 +264,162 @@ impl<V> PartialEvaluationOutput<V> {
         matches!(self, Self::Unknown(_))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{Array, ArrayType, DataType};
+
+    use super::*;
+
+    #[test]
+    fn test_partial_value_is_known() {
+        assert!(PartialValue::Known(Array::scalar(2.0f64).unwrap()).is_known());
+        assert!(!PartialValue::<Array>::Unknown(ArrayType::scalar(DataType::F64)).is_known());
+    }
+
+    #[test]
+    fn test_partial_value_is_unknown() {
+        assert!(!PartialValue::Known(Array::scalar(2.0f64).unwrap()).is_unknown());
+        assert!(PartialValue::<Array>::Unknown(ArrayType::scalar(DataType::F64)).is_unknown());
+    }
+
+    #[test]
+    fn test_partial_value_as_known() {
+        let value = Array::scalar(2.0f64).unwrap();
+        assert_eq!(PartialValue::Known(value.clone()).as_known(), Some(&value));
+        assert_eq!(PartialValue::<Array>::Unknown(ArrayType::scalar(DataType::F64)).as_known(), None);
+    }
+
+    #[test]
+    fn test_partial_value_type() {
+        // Known values report the type of their value and unknown values report the type they carry.
+        let r#type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let value = Array::new(r#type.clone(), vec![0u8; 24]).unwrap();
+        assert_eq!(PartialValue::Known(value).r#type().as_ref(), &r#type);
+        assert_eq!(PartialValue::<Array>::Unknown(r#type.clone()).r#type().as_ref(), &r#type);
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_known() {
+        let value = PartialEvaluationValue::known(Array::scalar(2.0f64).unwrap());
+        assert_eq!(value.as_known(), Some(&Array::scalar(2.0f64).unwrap()));
+        assert_eq!(value.materialization(), PartialValueMaterialization::Undecided);
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_known_input() {
+        let value = PartialEvaluationValue::known_input(Array::scalar(2.0f64).unwrap());
+        assert_eq!(value.as_known(), Some(&Array::scalar(2.0f64).unwrap()));
+        assert_eq!(value.materialization(), PartialValueMaterialization::Input { residual_atom: None });
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_known_constant() {
+        let value = PartialEvaluationValue::known_constant(Array::scalar(2.0f64).unwrap());
+        assert_eq!(value.as_known(), Some(&Array::scalar(2.0f64).unwrap()));
+        assert_eq!(value.materialization(), PartialValueMaterialization::Constant { residual_atom: None });
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_variable() {
+        let value = PartialEvaluationValue::<Array>::variable(ArrayType::scalar(DataType::F64), AtomId::new(3));
+        assert_eq!(value.as_known(), None);
+        assert_eq!(value.materialization(), PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) });
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_value() {
+        let value = PartialEvaluationValue::known(Array::scalar(2.0f64).unwrap());
+        assert_eq!(value.value().as_known(), Some(&Array::scalar(2.0f64).unwrap()));
+        let value = PartialEvaluationValue::<Array>::variable(ArrayType::scalar(DataType::F64), AtomId::new(3));
+        assert!(value.value().is_unknown());
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_materialization() {
+        // Clones share one materialization slot, so the residual atom recorded by the first materialization is visible
+        // to every other clone of the same logical value.
+        let value = PartialEvaluationValue::known_input(Array::scalar(2.0f64).unwrap());
+        let clone = value.clone();
+        let materialization = PartialValueMaterialization::Input { residual_atom: Some(AtomId::new(3)) };
+        value.materialization.set(materialization);
+        assert_eq!(value.materialization(), materialization);
+        assert_eq!(clone.materialization(), materialization);
+
+        // Separately constructed values have separate slots, even when they hold equal values.
+        let other = PartialEvaluationValue::known_input(Array::scalar(2.0f64).unwrap());
+        assert_eq!(other.materialization(), PartialValueMaterialization::Input { residual_atom: None });
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_is_known() {
+        assert!(PartialEvaluationValue::known(Array::scalar(2.0f64).unwrap()).is_known());
+        assert!(
+            !PartialEvaluationValue::<Array>::variable(ArrayType::scalar(DataType::F64), AtomId::new(3)).is_known()
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_is_unknown() {
+        assert!(!PartialEvaluationValue::known(Array::scalar(2.0f64).unwrap()).is_unknown());
+        assert!(
+            PartialEvaluationValue::<Array>::variable(ArrayType::scalar(DataType::F64), AtomId::new(3)).is_unknown()
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_as_known() {
+        let value = Array::scalar(2.0f64).unwrap();
+        assert_eq!(PartialEvaluationValue::known_constant(value.clone()).as_known(), Some(&value));
+        let variable = PartialEvaluationValue::<Array>::variable(ArrayType::scalar(DataType::F64), AtomId::new(3));
+        assert_eq!(variable.as_known(), None);
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_debug() {
+        // The rendering shows the current contents of the shared materialization slot rather than the slot itself.
+        let value = PartialEvaluationValue::<Array>::variable(ArrayType::scalar(DataType::F64), AtomId::new(3));
+        assert_eq!(
+            format!("{value:?}"),
+            format!(
+                "PartialEvaluationValue {{ value: {:?}, materialization: Variable {{ residual_atom: {:?} }} }}",
+                PartialValue::<Array>::Unknown(ArrayType::scalar(DataType::F64)),
+                AtomId::new(3),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_value_type() {
+        let r#type = ArrayType::scalar(DataType::F64);
+        assert_eq!(PartialEvaluationValue::known(Array::scalar(2.0f64).unwrap()).r#type().as_ref(), &r#type);
+        let variable = PartialEvaluationValue::<Array>::variable(r#type.clone(), AtomId::new(3));
+        assert_eq!(variable.r#type().as_ref(), &r#type);
+    }
+
+    #[test]
+    fn test_partial_evaluation_input_is_known() {
+        assert!(PartialEvaluationInput::Known(0).is_known());
+        assert!(!PartialEvaluationInput::<usize>::Unknown(1).is_known());
+    }
+
+    #[test]
+    fn test_partial_evaluation_input_is_unknown() {
+        assert!(!PartialEvaluationInput::Known(0).is_unknown());
+        assert!(PartialEvaluationInput::<usize>::Unknown(1).is_unknown());
+    }
+
+    #[test]
+    fn test_partial_evaluation_output_is_known() {
+        assert!(PartialEvaluationOutput::Known(0).is_known());
+        assert!(!PartialEvaluationOutput::<usize>::Unknown(1).is_known());
+    }
+
+    #[test]
+    fn test_partial_evaluation_output_is_unknown() {
+        assert!(!PartialEvaluationOutput::Known(0).is_unknown());
+        assert!(PartialEvaluationOutput::<usize>::Unknown(1).is_unknown());
+    }
+}
