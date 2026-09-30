@@ -255,7 +255,7 @@ where
         // Analyze a staged copy using only input knownness to discover allocations that must be fresh on each
         // residual invocation. Discard the staged programs as the replay below must use the caller's actual values.
         let knowledge = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
-        let (_, deferred_instructions) = region.partition_with_configuration(&knowledge, true, true, None)?;
+        let (_, deferred_instructions) = region.partition_with_configuration(&knowledge, true, true, None, None)?;
 
         // Replay into the active context, explicitly deferring the discovered allocations. Source reference roots
         // let replay distinguish independent accesses while keeping accesses to the same state in order.
@@ -289,7 +289,7 @@ where
         // Repeated residual calls use their own allocation placement and reference-ordering analysis. Keep the
         // fresh context's effect folding enabled so that this analysis determines which effects must be deferred.
         let known = knowledge.iter().map(PartialValue::is_known).collect::<Vec<_>>();
-        let (_, deferred_instructions) = region.partition_with_configuration(&known, true, true, None)?;
+        let (_, deferred_instructions) = region.partition_with_configuration(&known, true, true, None, None)?;
 
         // Retain actual known values and create residual inputs for unknowns. Their indices refer to the original
         // region inputs so the returned evaluation can reconstruct its residual arguments in the correct order.
@@ -333,12 +333,12 @@ where
             // Let repeated-call allocation and reference-ordering analysis decide which effects can remain known,
             // rather than inheriting a restriction intended for the caller's current residual program.
             region
-                .partition_with_residual_placement(input_known, true, true, None, residual_placement)
+                .partition_with_configuration(input_known, true, true, None, residual_placement)
                 .map(|(partition, _)| partition)
         } else {
             // Ordinary specialization preserves the caller's effect-folding policy and uses a single partition pass.
             region
-                .partition_with_residual_placement(
+                .partition_with_configuration(
                     input_known,
                     context.allow_effect_folding,
                     false,

@@ -115,9 +115,9 @@ pub use evaluations::PartialEvaluation;
 pub use operations::{PartialEvaluationDriver, PartiallyEvaluatableOperation};
 pub use partitions::{PartitionMetadata, PartitionedProgram};
 pub use residuals::{
-    EitherStorage, ErasedResidualStorage, NativeResidualPolicies, NoStorage, ProjectionFallbackCandidate,
-    ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyError, ResidualPolicyReference,
-    ResidualProducer, ResidualRejection, ResidualStorage,
+    ErasedResidualStorage, NativeResidualPolicies, NoStorage, ProjectionFallbackCandidate, ResidualCandidate,
+    ResidualDecision, ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualProducer,
+    ResidualRejection, ResidualStorage,
 };
 pub use values::{
     PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartialValueMaterialization,
