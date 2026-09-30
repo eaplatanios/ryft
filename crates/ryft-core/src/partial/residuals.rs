@@ -8,7 +8,7 @@
 //! in the pullback. A [`ResidualPolicy`] decides, for each known value that residual work needs, whether to
 //! [save](ResidualDecision::Save) it as an edge, to save it through a [`ResidualStorage`] (e.g., by offloading
 //! it to host memory), or to [recompute](ResidualDecision::Recompute) it in the residual program.
-//! [`PartitionedProgram::plan_residuals`] then rewrites the partition accordingly.
+//! [`PartitionedProgram::with_residual_policy`] then rewrites the partition accordingly.
 //!
 //! This is the mechanism behind [JAX's checkpoint policies](https://docs.jax.dev/en/latest/301/remat.html), which
 //! `partial_eval_jaxpr_custom` applies when it partially evaluates a program. As there, a policy sees every value
@@ -28,13 +28,13 @@
 //!
 //! # Planning
 //!
-//! [`PartitionedProgram::plan_residuals`] decides everything before emitting anything. Starting from the known values
-//! that the residual program reads, it classifies each demanded value once, and it marks the producers of recomputed
-//! values for replay in the residual program, which demands their own inputs in turn. Known inputs are forwarded as
-//! edges and constants are re-created in the residual program without consulting the policy. Work that cannot be
-//! replayed safely (e.g., reads of references that the known program shares with its caller, or other observable
-//! effects) is saved regardless of the policy. Local reference state is replayed together with its complete lifecycle
-//! prefix, and lifecycles that the known program no longer observes are removed from it.
+//! [`PartitionedProgram::with_residual_policy`] decides everything before emitting anything. Starting from the known
+//! values that the residual program reads, it classifies each demanded value once, and it marks the producers of
+//! recomputed values for replay in the residual program, which demands their own inputs in turn. Known inputs are
+//! forwarded as edges and constants are re-created in the residual program without consulting the policy. Work that
+//! cannot be replayed safely (e.g., reads of references that the known program shares with its caller, or other
+//! observable effects) is saved regardless of the policy. Local reference state is replayed together with its
+//! complete lifecycle prefix, and lifecycles that the known program no longer observes are removed from it.
 
 use std::any::{Any, TypeId};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -55,7 +55,7 @@ use crate::programs::{
 };
 
 /// Error returned when classifying residuals with a [`ResidualPolicy`], staging their [`ResidualStorage`],
-/// or planning a [`PartitionedProgram`] with [`PartitionedProgram::plan_residuals`].
+/// or planning a [`PartitionedProgram`] with [`PartitionedProgram::with_residual_policy`].
 ///
 /// This error and [`ProgramError`] convert into each other without losing information. Converting a
 /// [`ResidualPolicyError::Program`] into a [`ProgramError`] unwraps it and every other variant is wrapped in
@@ -286,7 +286,7 @@ impl ResidualRejection {
 
 /// Reversible transformation that is applied to a saved residual, such as offloading it to host memory,
 /// described without naming an operation family. Each transformation is a chain of payload operations (e.g.,
-/// [`TransferToMemoryOperation`](crate::TransferToMemoryOperation)s) that [`PartitionedProgram::plan_residuals`]
+/// [`TransferToMemoryOperation`](crate::TransferToMemoryOperation)s) that [`PartitionedProgram::with_residual_policy`]
 /// stages into the family of the partitioned programs through [`OperationPayloadProjection::from_payload`]. The store
 /// chain applies to the residual in the known program, and the restore chain reproduces it in the residual program
 /// before its first use. Every staged operation must be a pure unary operation with a single result, which leaves
@@ -870,10 +870,11 @@ impl<T: Type> Hash for ResidualPolicyReference<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadProjection> PartitionedProgram<V, O> {
     /// Returns this partition with the known values that its residual program consumes placed according to `policy`.
+    /// This plans an existing partition at its top level only. [`Program::partition_with_residual_policy`] instead
+    /// partitions a program with `policy` in its [`PartialEvaluationContext`](crate::PartialEvaluationContext),
+    /// which also plans the partitions that split rules construct for the bodies of region-carrying operations.
     ///
     /// Planning starts from the edges that the residual program reads and decides everything before it emits the
     /// planned programs. It classifies each demanded known value once:
@@ -914,15 +915,14 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     /// staged, and [`ResidualPolicyError::Program`] when rebuilding the programs fails (e.g., when residual work would
     /// require a local reference handle as a new edge).
     #[inline]
-    pub fn plan_residuals(self, policy: &ResidualPolicyReference<V::Type>) -> Result<Self, ResidualPolicyError> {
-        self.plan_residuals_with_region_replay(policy, true)
+    pub fn with_residual_policy(self, policy: &ResidualPolicyReference<V::Type>) -> Result<Self, ResidualPolicyError> {
+        self.with_residual_policy_and_region_replay(policy, true)
     }
 
-    /// Plans the residuals of this partition like [`plan_residuals`](Self::plan_residuals). When
+    /// Plans the residuals of this partition like [`with_residual_policy`](Self::with_residual_policy). When
     /// `replay_region_operations` is `false`, outputs of region-carrying operations are saved rather than replayed,
-    /// because the split rules of those operations already planned their bodies with the same policy (refer to
-    /// [`PartitionPlanning`]).
-    fn plan_residuals_with_region_replay(
+    /// because the split rules of those operations already planned their bodies with the same policy.
+    fn with_residual_policy_and_region_replay(
         self,
         policy: &ResidualPolicyReference<V::Type>,
         replay_region_operations: bool,
@@ -960,6 +960,8 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Planning of the partitions of programs over values of type `V` and operations of family `O` according to one
 /// residual policy. It is type-erased so that a
 /// [`PartialEvaluationContext`](crate::partial::contexts::PartialEvaluationContext) can carry a policy into the
@@ -967,9 +969,9 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
 /// to support planning. [`ResidualPolicyReference`]s implement it for every family that does.
 pub(crate) trait PartitionPlanning<V: Value, O: Operation<Type = V::Type>> {
     /// Returns `partition` with its residuals planned according to the policy (refer to
-    /// [`PartitionedProgram::plan_residuals`]). Outputs of region-carrying operations in the known program are saved
-    /// rather than replayed, because the split rules of those operations already planned their bodies with the same
-    /// policy when the partition was constructed.
+    /// [`PartitionedProgram::with_residual_policy`]). Outputs of region-carrying operations in the known program are
+    /// saved rather than replayed, because the split rules of those operations already planned their bodies with the
+    /// same policy when the partition was constructed.
     fn plan_partition(&self, partition: PartitionedProgram<V, O>) -> Result<PartitionedProgram<V, O>, ProgramError>;
 }
 
@@ -979,11 +981,11 @@ where
     V::Type: 'static,
 {
     fn plan_partition(&self, partition: PartitionedProgram<V, O>) -> Result<PartitionedProgram<V, O>, ProgramError> {
-        Ok(partition.plan_residuals_with_region_replay(self, false)?)
+        Ok(partition.with_residual_policy_and_region_replay(self, false)?)
     }
 }
 
-/// Plan of [`PartitionedProgram::plan_residuals`] for one known atom that residual work demands.
+/// Plan of [`PartitionedProgram::with_residual_policy`] for one known atom that residual work demands.
 enum ResidualPlan<T: Type> {
     /// The atom is an edge of the planned partition, stored through the provided storage, if any.
     Edge(Option<ErasedResidualStorage<T>>),
@@ -995,8 +997,8 @@ enum ResidualPlan<T: Type> {
     Constant,
 }
 
-/// State of [`PartitionedProgram::plan_residuals`] for one partition, which plans the known atoms that residual work
-/// demands (refer to [`discover`](Self::discover)) before emitting the planned programs.
+/// State of [`PartitionedProgram::with_residual_policy`] for one partition, which plans the known atoms that residual
+/// work demands (refer to [`discover`](Self::discover)) before emitting the planned programs.
 struct ResidualPlanner<'p, V: Value, O: Operation<Type = V::Type>> {
     /// Known program of the partition.
     known_program: &'p Program<V, O, Vec<V>, Vec<V>>,
@@ -1008,7 +1010,7 @@ struct ResidualPlanner<'p, V: Value, O: Operation<Type = V::Type>> {
     policy: &'p ResidualPolicyReference<V::Type>,
 
     /// Whether region-carrying producers may be replayed as a whole (refer to
-    /// [`PartitionedProgram::plan_residuals_with_region_replay`]).
+    /// [`PartitionedProgram::with_residual_policy_and_region_replay`]).
     replay_region_operations: bool,
 
     /// Lifecycles of the local references of the known program that do not escape it.
@@ -2120,13 +2122,13 @@ mod tests {
     }
 
     #[test]
-    fn test_partitioned_program_plan_residuals() {
+    fn test_partitioned_program_with_residual_policy() {
         let program = sin_dot_program();
         let partition = program.partition(&[true, false]).unwrap();
         let expected = program.interpret(sin_dot_inputs()).unwrap();
 
         // Saving everything reproduces the partition, which saves the cosine.
-        let planned = program.partition(&[true, false]).unwrap().plan_residuals(&save_everything()).unwrap();
+        let planned = program.partition(&[true, false]).unwrap().with_residual_policy(&save_everything()).unwrap();
         assert_eq!(render(&planned), render(&partition));
         assert_eq!(
             render(&planned),
@@ -2145,7 +2147,7 @@ mod tests {
         );
 
         // Saving only dot products saves the dot product and recomputes its cosine in the residual program.
-        let planned = partition.plan_residuals(&save_dots(None)).unwrap();
+        let planned = partition.with_residual_policy(&save_dots(None)).unwrap();
         assert_eq!(
             render(&planned),
             indoc! {"
@@ -2164,7 +2166,7 @@ mod tests {
         assert_eq!(run(&planned, &sin_dot_inputs()), expected);
 
         // Saving nothing recomputes the dot product too, which saves the known input that it needs.
-        let planned = program.partition(&[true, false]).unwrap().plan_residuals(&save_nothing()).unwrap();
+        let planned = program.partition(&[true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
         assert_eq!(
             render(&planned),
             indoc! {"
@@ -2188,7 +2190,7 @@ mod tests {
         // Rejections of the policy fail planning.
         let rejecting = policy("rejecting", |_| Err::<ResidualDecision<NoStorage>, _>(ResidualRejection::new("never")));
         assert_eq!(
-            program.partition(&[true, false]).unwrap().plan_residuals(&rejecting).map(|_| ()).unwrap_err(),
+            program.partition(&[true, false]).unwrap().with_residual_policy(&rejecting).map(|_| ()).unwrap_err(),
             ResidualPolicyError::Rejected {
                 policy: "rejecting".to_owned(),
                 rejection: ResidualRejection::new("never")
@@ -2197,7 +2199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partitioned_program_plan_residuals_saves_no_unneeded_inputs() {
+    fn test_partitioned_program_with_residual_policy_saves_no_unneeded_inputs() {
         // `f(x, t) = (exp(x), exp(x) * t)`: saving everything saves only `exp(x)`, never its input.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let x = builder.add_input(scalar_type());
@@ -2205,7 +2207,7 @@ mod tests {
         let exponential = add(&mut builder, ExpOperation::<ArrayType>::new().into(), vec![x]);
         let tangent = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![exponential, t]);
         let program = build(builder, vec![exponential, tangent]);
-        let planned = program.partition(&[true, false]).unwrap().plan_residuals(&save_everything()).unwrap();
+        let planned = program.partition(&[true, false]).unwrap().with_residual_policy(&save_everything()).unwrap();
         assert_eq!(
             render(&planned),
             indoc! {"
@@ -2248,7 +2250,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partitioned_program_plan_residuals_decides_per_producer_output() {
+    fn test_partitioned_program_with_residual_policy_decides_per_producer_output() {
         let inputs = vec![
             ArrayIrValue::Array(Array::scalar(true).unwrap()),
             ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
@@ -2256,7 +2258,7 @@ mod tests {
         ];
         let plan = |first_consumed_first: bool, policy: ResidualPolicyReference<ArrayIrType>| {
             let program = condition_program(first_consumed_first);
-            let planned = program.partition(&[true, true, false]).unwrap().plan_residuals(&policy).unwrap();
+            let planned = program.partition(&[true, true, false]).unwrap().with_residual_policy(&policy).unwrap();
             assert_eq!(run(&planned, &inputs), program.interpret(inputs.clone()).unwrap());
             render(&planned)
         };
@@ -2465,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partitioned_program_plan_residuals_saves_external_reads() {
+    fn test_partitioned_program_with_residual_policy_saves_external_reads() {
         // `f(r, t)` reads the external reference `r`, overwrites it with the cosine of the value that it read, and
         // reads it again, returning the sines of both reads multiplied by `t`. Reads of `r` cannot be replayed, so they
         // are saved in topological order even though the policy saves nothing, and the zero-output write stays in the
@@ -2482,7 +2484,7 @@ mod tests {
         let tangent_a = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![sine_a, t]);
         let tangent_b = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![sine_b, t]);
         let program = build(builder, vec![tangent_a, tangent_b]);
-        let planned = program.partition(&[true, false]).unwrap().plan_residuals(&save_nothing()).unwrap();
+        let planned = program.partition(&[true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
         assert_eq!(
             render(&planned),
             indoc! {"
@@ -2503,7 +2505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partitioned_program_plan_residuals_replays_local_reference_lifecycles() {
+    fn test_partitioned_program_with_residual_policy_replays_local_reference_lifecycles() {
         // `f(x, t)` allocates a reference holding `x`, reads it, overwrites it with `sin(x)`, reads it again, and
         // freezes it, returning each observed value multiplied by `t`. Saving nothing replays the complete lifecycle in
         // the residual program, in program order, and removes it from the known program, which no longer observes it.
@@ -2539,7 +2541,7 @@ mod tests {
                 in (%4, %5, %6)
                 [Unknown(1), Known(0), Known(1), Known(2)]"},
         );
-        let planned = partition.plan_residuals(&save_nothing()).unwrap();
+        let planned = partition.with_residual_policy(&save_nothing()).unwrap();
         assert_eq!(
             render(&planned),
             indoc! {"
@@ -2566,13 +2568,13 @@ mod tests {
     }
 
     #[test]
-    fn test_partitioned_program_plan_residuals_stages_storage() {
+    fn test_partitioned_program_with_residual_policy_stages_storage() {
         // The known program stores the dot product and the residual program restores it before the cosine uses it.
         let program = sin_dot_program();
         let planned = program
             .partition(&[true, false])
             .unwrap()
-            .plan_residuals(&save_dots(Some(NegationStorage)))
+            .with_residual_policy(&save_dots(Some(NegationStorage)))
             .unwrap();
         assert_eq!(
             render(&planned),
@@ -2606,7 +2608,7 @@ mod tests {
             program
                 .partition(&[true, false])
                 .unwrap()
-                .plan_residuals(&store_dots(ForgetfulStorage))
+                .with_residual_policy(&store_dots(ForgetfulStorage))
                 .map(|_| ())
                 .unwrap_err(),
             ResidualPolicyError::InvalidStorage {
@@ -2619,7 +2621,7 @@ mod tests {
             program
                 .partition(&[true, false])
                 .unwrap()
-                .plan_residuals(&store_dots(UnsupportedStorage))
+                .with_residual_policy(&store_dots(UnsupportedStorage))
                 .map(|_| ())
                 .unwrap_err(),
             ResidualPolicyError::UnsupportedStorage {
@@ -2634,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partitioned_program_plan_residuals_resolves_provenance_through_shared_regions() {
+    fn test_partitioned_program_with_residual_policy_resolves_provenance_through_shared_regions() {
         // Three levels of conditions share their branch regions and forward their operands: the innermost region
         // returns its input, and each enclosing region returns the output of a condition over the next region. Two
         // top-level conditions invoke the shared regions with differently tagged operands, so the provenance of each
@@ -2673,8 +2675,11 @@ mod tests {
         let program = build(builder, vec![tangent_first, tangent_second]);
 
         // Saving only `u` saves the first condition's output and replays the second condition in the residual program.
-        let planned =
-            program.partition(&[true, true, false]).unwrap().plan_residuals(&save_names(&["u"], &[])).unwrap();
+        let planned = program
+            .partition(&[true, true, false])
+            .unwrap()
+            .with_residual_policy(&save_names(&["u"], &[]))
+            .unwrap();
         assert_eq!(
             render(&planned),
             indoc! {"
@@ -2775,7 +2780,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partitioned_program_plan_residuals_reproduces_partitions_that_save_everything() {
+    fn test_partitioned_program_with_residual_policy_reproduces_partitions_that_save_everything() {
         let mut programs = vec![(sin_dot_program(), vec![true, false])];
         programs.extend(
             [true, false]
@@ -2784,7 +2789,7 @@ mod tests {
         for (program, input_known) in programs {
             let partition = program.partition(&input_known).unwrap();
             let rendering = render(&partition);
-            let planned = partition.plan_residuals(&save_everything()).unwrap();
+            let planned = partition.with_residual_policy(&save_everything()).unwrap();
             assert_eq!(render(&planned), rendering);
         }
     }
