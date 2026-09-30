@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::rc::Rc;
 
@@ -12,8 +12,8 @@ use crate::partial::operations::PartiallyEvaluatableOperation;
 use crate::partial::residuals::{ResidualPlacement, ResidualPolicyReference};
 use crate::partial::values::{PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue};
 use crate::programs::{
-    EffectClass, EffectsSummary, InstructionId, Operation, OperationPayloadProjection, Program, ProgramError,
-    ReferenceAccessMode, ReferenceRoot, RegionRef, Type, Typed, Value, ValueId,
+    EffectClass, EffectsSummary, InstructionId, Operation, OperationFormatter, OperationPayloadProjection, Program,
+    ProgramError, ProgramRenderingMode, ReferenceAccessMode, ReferenceRoot, RegionRef, Type, Typed, Value, ValueId,
 };
 use crate::tracing::TracingContext;
 
@@ -189,6 +189,37 @@ impl PartitionMetadata {
 /// Its outputs place fully known original outputs before residual edge values. The residual program consumes the
 /// original unknown inputs together with those edges, while [`outputs`](Self::outputs) records which side supplies
 /// each original output.
+///
+/// # Rendering
+///
+/// The [`Display`] implementation renders the boundary wiring of a partition like the metadata of an operation,
+/// followed by its two programs, each indented beneath its label like the attached regions of an instruction. For
+/// example, partitioning `f(x, t) = (sin(dot(x, x)), cos(dot(x, x)) * t)` with `x` known renders as follows:
+///
+/// ```text
+/// partition [
+///     known_inputs=[0],
+///     residual_inputs=[Unknown(1), Known(0)],
+///     outputs=[Known(0), Unknown(0)],
+/// ]
+/// known={
+///     lambda %0:f64[3] .
+///     let %1:f64[] = dot [...] %0 %0
+///         %2:f64[] = sin %1
+///         %3:f64[] = cos %1
+///     in (%2, %3)
+/// }
+/// residual={
+///     lambda %0:f64[], %1:f64[] .
+///     let %2:f64[] = mul %1 %0
+///     in (%2)
+/// }
+/// ```
+///
+/// Here, `residual_inputs` lists the original input `1` followed by the edge `0` (i.e., known output `%3`), and
+/// `outputs` takes the first original output from the known program and the second one from the residual program.
+/// The wiring renders on one line when it is short enough. The effect-ordering constraints are not rendered, because
+/// reference analysis derives them from the two programs.
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct PartitionedProgram<V: Value, O: Operation<Type = V::Type>> {
     /// Refer to the documentation of [`known_program`](Self::known_program) for more information.
@@ -338,6 +369,23 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         self,
     ) -> (Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, PartitionMetadata) {
         (self.known_program, self.residual_program, self.metadata)
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> Display for PartitionedProgram<V, O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        OperationFormatter::new(formatter, 0, "partition")?.bracketed(|partition| {
+            partition.list("known_inputs", self.known_input_indices())?;
+            partition.list("residual_inputs", self.residual_inputs().iter().map(|input| format!("{input:?}")))?;
+            partition.list("outputs", self.outputs().iter().map(|output| format!("{output:?}")))
+        })?;
+
+        // The programs render at the top level rather than as program-valued fields, which would nest them deeper.
+        write!(formatter, "\nknown={{\n")?;
+        self.known_program.render(formatter, 4, ProgramRenderingMode::Semantic)?;
+        write!(formatter, "\n}}\nresidual={{\n")?;
+        self.residual_program.render(formatter, 4, ProgramRenderingMode::Semantic)?;
+        write!(formatter, "\n}}")
     }
 }
 
@@ -762,11 +810,6 @@ mod tests {
         ResidualPolicyReference::new(SaveDots)
     }
 
-    /// Renders the known program, the residual program, and the residual inputs of `partition`.
-    fn render<V: Value, O: Operation<Type = V::Type>>(partition: &PartitionedProgram<V, O>) -> String {
-        format!("{}\n{}\n{:?}", partition.known_program(), partition.residual_program(), partition.residual_inputs())
-    }
-
     #[test]
     fn test_effect_ordering_is_empty() {
         assert!(EffectOrdering::<usize>::default().is_empty());
@@ -946,23 +989,31 @@ mod tests {
         let policy = save_dots();
         let partition = program.entry_region_ref().partition_with_residual_policy(&[true, false], &policy).unwrap();
         assert_eq!(
-            render(&partition),
-            render(&program.partition(&[true, false]).unwrap().with_residual_policy(&policy).unwrap())
+            partition.to_string(),
+            program.partition(&[true, false]).unwrap().with_residual_policy(&policy).unwrap().to_string()
         );
         assert_eq!(
-            render(&partition),
+            partition.to_string(),
             indoc! {"
-                lambda %0:f64[3] .
-                let %1:f64[] = dot [
-                    dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                ] %0 %0
-                    %2:f64[] = sin %1
-                in (%2, %1)
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = cos %1
-                    %3:f64[] = mul %2 %0
-                in (%3)
-                [Unknown(1), Known(0)]"},
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[3] .
+                    let %1:f64[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %0 %0
+                        %2:f64[] = sin %1
+                    in (%2, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = cos %1
+                        %3:f64[] = mul %2 %0
+                    in (%3)
+                }"},
         );
     }
 
@@ -1469,57 +1520,66 @@ mod tests {
 
         let partition = program.partition(&[false, true]).unwrap();
         assert_eq!(
-            render(&partition),
+            partition.to_string(),
             indoc! {"
-                lambda %0:f64[2, 3] .
-                let %1:f64[2] = scan [carry_count=0, length=2, reverse=false] %0 [
-                    body={
-                        lambda %0:i64[], %1:f64[3] .
-                        let %2:f64[] = dot [
-                            dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                        ] %1 %1
-                            %3:f64[] = cos %2
-                        in (%3)
-                    },
-                ]
-                in (%1)
-                lambda %0:f64[], %1:f64[2] .
-                let %2:f64[] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
-                    body={
-                        lambda %0:i64[], %1:f64[], %2:f64[] .
-                        let %3:f64[] = mul %1 %2
-                        in (%3)
-                    },
-                ]
-                in (%2)
-                [Unknown(0), Known(0)]"},
+                partition [known_inputs=[1], residual_inputs=[Unknown(0), Known(0)], outputs=[Unknown(0)]]
+                known={
+                    lambda %0:f64[2, 3] .
+                    let %1:f64[2] = scan [carry_count=0, length=2, reverse=false] %0 [
+                        body={
+                            lambda %0:i64[], %1:f64[3] .
+                            let %2:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %1 %1
+                                %3:f64[] = cos %2
+                            in (%3)
+                        },
+                    ]
+                    in (%1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[2] .
+                    let %2:f64[] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[] .
+                            let %3:f64[] = mul %1 %2
+                            in (%3)
+                        },
+                    ]
+                    in (%2)
+                }"},
         );
+
         let planned = program.partition_with_residual_policy(&[false, true], &save_dots()).unwrap();
         assert_eq!(
-            render(&planned),
+            planned.to_string(),
             indoc! {"
-                lambda %0:f64[2, 3] .
-                let %1:f64[2] = scan [carry_count=0, length=2, reverse=false] %0 [
-                    body={
-                        lambda %0:i64[], %1:f64[3] .
-                        let %2:f64[] = dot [
-                            dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                        ] %1 %1
-                        in (%2)
-                    },
-                ]
-                in (%1)
-                lambda %0:f64[], %1:f64[2] .
-                let %2:f64[] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
-                    body={
-                        lambda %0:i64[], %1:f64[], %2:f64[] .
-                        let %3:f64[] = cos %2
-                            %4:f64[] = mul %1 %3
-                        in (%4)
-                    },
-                ]
-                in (%2)
-                [Unknown(0), Known(0)]"},
+                partition [known_inputs=[1], residual_inputs=[Unknown(0), Known(0)], outputs=[Unknown(0)]]
+                known={
+                    lambda %0:f64[2, 3] .
+                    let %1:f64[2] = scan [carry_count=0, length=2, reverse=false] %0 [
+                        body={
+                            lambda %0:i64[], %1:f64[3] .
+                            let %2:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %1 %1
+                            in (%2)
+                        },
+                    ]
+                    in (%1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[2] .
+                    let %2:f64[] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[] .
+                            let %3:f64[] = cos %2
+                                %4:f64[] = mul %1 %3
+                            in (%4)
+                        },
+                    ]
+                    in (%2)
+                }"},
         );
 
         // Running the known program and then the residual program reproduces the original output.

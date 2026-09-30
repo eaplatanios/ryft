@@ -1798,11 +1798,6 @@ mod tests {
         builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
     }
 
-    /// Renders the known program, the residual program, and the residual inputs of `partition`.
-    fn render(partition: &TestPartition) -> String {
-        format!("{}\n{}\n{:?}", partition.known_program(), partition.residual_program(), partition.residual_inputs())
-    }
-
     /// Runs the known program of `partition` and then its residual program on `inputs`, returning the original
     /// outputs.
     fn run(partition: &TestPartition, inputs: &[TestValue]) -> Vec<TestValue> {
@@ -2225,61 +2220,85 @@ mod tests {
 
         // Saving everything reproduces the partition, which saves the cosine.
         let placed = program.partition(&[true, false]).unwrap().with_residual_policy(&save_everything()).unwrap();
-        assert_eq!(render(&placed), render(&partition));
+        assert_eq!(placed.to_string(), partition.to_string());
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:f64[3] .
-                let %1:f64[] = dot [
-                    dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                ] %0 %0
-                    %2:f64[] = sin %1
-                    %3:f64[] = cos %1
-                in (%2, %3)
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = mul %1 %0
-                in (%2)
-                [Unknown(1), Known(0)]"},
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[3] .
+                    let %1:f64[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %0 %0
+                        %2:f64[] = sin %1
+                        %3:f64[] = cos %1
+                    in (%2, %3)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = mul %1 %0
+                    in (%2)
+                }"},
         );
 
         // Saving only dot products saves the dot product and recomputes its cosine in the residual program.
         let placed = partition.with_residual_policy(&save_dots(None)).unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:f64[3] .
-                let %1:f64[] = dot [
-                    dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                ] %0 %0
-                    %2:f64[] = sin %1
-                in (%2, %1)
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = cos %1
-                    %3:f64[] = mul %2 %0
-                in (%3)
-                [Unknown(1), Known(0)]"},
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[3] .
+                    let %1:f64[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %0 %0
+                        %2:f64[] = sin %1
+                    in (%2, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = cos %1
+                        %3:f64[] = mul %2 %0
+                    in (%3)
+                }"},
         );
         assert_eq!(run(&placed, &sin_dot_inputs()), expected);
 
         // Saving nothing recomputes the dot product too, which saves the known input that it needs.
         let placed = program.partition(&[true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:f64[3] .
-                let %1:f64[] = dot [
-                    dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                ] %0 %0
-                    %2:f64[] = sin %1
-                in (%2, %0)
-                lambda %0:f64[], %1:f64[3] .
-                let %2:f64[] = dot [
-                    dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                ] %1 %1
-                    %3:f64[] = cos %2
-                    %4:f64[] = mul %3 %0
-                in (%4)
-                [Unknown(1), Known(0)]"},
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[3] .
+                    let %1:f64[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %0 %0
+                        %2:f64[] = sin %1
+                    in (%2, %0)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[3] .
+                    let %2:f64[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %1 %1
+                        %3:f64[] = cos %2
+                        %4:f64[] = mul %3 %0
+                    in (%4)
+                }"},
         );
         assert_eq!(run(&placed, &sin_dot_inputs()), expected);
 
@@ -2305,15 +2324,23 @@ mod tests {
         let program = build(builder, vec![exponential, tangent]);
         let placed = program.partition(&[true, false]).unwrap().with_residual_policy(&save_everything()).unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = exp %0
-                in (%1, %1)
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = mul %1 %0
-                in (%2)
-                [Unknown(1), Known(0)]"},
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[] .
+                    let %1:f64[] = exp %0
+                    in (%1, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = mul %1 %0
+                    in (%2)
+                }"},
         );
     }
 
@@ -2337,43 +2364,51 @@ mod tests {
             .with_residual_policy(&save_names(&["first"], &[]))
             .unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:bool[], %1:f64[] .
-                let %2:f64[] = condition %0 %1 [
-                    true={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                        in (%2)
-                    },
-                    false={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                        in (%2)
-                    },
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0), Known(1), Known(2)],
+                    outputs=[Unknown(0), Unknown(1)],
                 ]
-                in (%2, %0, %1)
-                lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
-                let %4:f64[] = mul %1 %0
-                    %5:f64[] = condition %2 %3 [
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    let %2:f64[] = condition %0 %1 [
                         true={
                             lambda %0:f64[] .
-                            let %1:f64[] = cos %0
-                                %2:f64[] = tag [key=second] %1
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
                             in (%2)
                         },
                         false={
                             lambda %0:f64[] .
-                            let %1:f64[] = cos %0
-                                %2:f64[] = tag [key=second] %1
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
                             in (%2)
                         },
                     ]
-                    %6:f64[] = mul %5 %0
-                in (%4, %6)
-                [Unknown(2), Known(0), Known(1), Known(2)]"},
+                    in (%2, %0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
+                    let %4:f64[] = mul %1 %0
+                        %5:f64[] = condition %2 %3 [
+                            true={
+                                lambda %0:f64[] .
+                                let %1:f64[] = cos %0
+                                    %2:f64[] = tag [key=second] %1
+                                in (%2)
+                            },
+                            false={
+                                lambda %0:f64[] .
+                                let %1:f64[] = cos %0
+                                    %2:f64[] = tag [key=second] %1
+                                in (%2)
+                            },
+                        ]
+                        %6:f64[] = mul %5 %0
+                    in (%4, %6)
+                }"},
         );
         assert_eq!(run(&placed, &inputs), expected);
 
@@ -2385,76 +2420,34 @@ mod tests {
             .with_residual_policy(&save_names(&["first"], &[]))
             .unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:bool[], %1:f64[] .
-                let %2:f64[] = condition %0 %1 [
-                    true={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                        in (%2)
-                    },
-                    false={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                        in (%2)
-                    },
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0), Known(1), Known(2)],
+                    outputs=[Unknown(0), Unknown(1)],
                 ]
-                in (%2, %0, %1)
-                lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
-                let %4:f64[] = condition %2 %3 [
-                    true={
-                        lambda %0:f64[] .
-                        let %1:f64[] = cos %0
-                            %2:f64[] = tag [key=second] %1
-                        in (%2)
-                    },
-                    false={
-                        lambda %0:f64[] .
-                        let %1:f64[] = cos %0
-                            %2:f64[] = tag [key=second] %1
-                        in (%2)
-                    },
-                ]
-                    %5:f64[] = mul %4 %0
-                    %6:f64[] = mul %1 %0
-                in (%5, %6)
-                [Unknown(2), Known(0), Known(1), Known(2)]"},
-        );
-        assert_eq!(run(&placed, &inputs), reversed.interpret(inputs.clone()).unwrap());
-
-        // Storing the first output instead of saving it stages its storage around its edge.
-        let placed = program
-            .partition(&[true, true, false])
-            .unwrap()
-            .with_residual_policy(&save_names(&[], &["first"]))
-            .unwrap();
-        assert_eq!(
-            render(&placed),
-            indoc! {"
-                lambda %0:bool[], %1:f64[] .
-                let %2:f64[] = condition %0 %1 [
-                    true={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                        in (%2)
-                    },
-                    false={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                        in (%2)
-                    },
-                ]
-                    %3:f64[] = neg %2
-                in (%3, %0, %1)
-                lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
-                let %4:f64[] = neg %1
-                    %5:f64[] = mul %4 %0
-                    %6:f64[] = condition %2 %3 [
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    let %2:f64[] = condition %0 %1 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                            in (%2)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                            in (%2)
+                        },
+                    ]
+                    in (%2, %0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
+                    let %4:f64[] = condition %2 %3 [
                         true={
                             lambda %0:f64[] .
                             let %1:f64[] = cos %0
@@ -2468,9 +2461,67 @@ mod tests {
                             in (%2)
                         },
                     ]
-                    %7:f64[] = mul %6 %0
-                in (%5, %7)
-                [Unknown(2), Known(0), Known(1), Known(2)]"},
+                        %5:f64[] = mul %4 %0
+                        %6:f64[] = mul %1 %0
+                    in (%5, %6)
+                }"},
+        );
+        assert_eq!(run(&placed, &inputs), reversed.interpret(inputs.clone()).unwrap());
+
+        // Storing the first output instead of saving it stages its storage around its edge.
+        let placed = program
+            .partition(&[true, true, false])
+            .unwrap()
+            .with_residual_policy(&save_names(&[], &["first"]))
+            .unwrap();
+        assert_eq!(
+            placed.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0), Known(1), Known(2)],
+                    outputs=[Unknown(0), Unknown(1)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    let %2:f64[] = condition %0 %1 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                            in (%2)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                            in (%2)
+                        },
+                    ]
+                        %3:f64[] = neg %2
+                    in (%3, %0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
+                    let %4:f64[] = neg %1
+                        %5:f64[] = mul %4 %0
+                        %6:f64[] = condition %2 %3 [
+                            true={
+                                lambda %0:f64[] .
+                                let %1:f64[] = cos %0
+                                    %2:f64[] = tag [key=second] %1
+                                in (%2)
+                            },
+                            false={
+                                lambda %0:f64[] .
+                                let %1:f64[] = cos %0
+                                    %2:f64[] = tag [key=second] %1
+                                in (%2)
+                            },
+                        ]
+                        %7:f64[] = mul %6 %0
+                    in (%5, %7)
+                }"},
         );
         assert_eq!(run(&placed, &inputs), expected);
 
@@ -2481,68 +2532,84 @@ mod tests {
             .with_residual_policy(&save_names(&["first"], &["second"]))
             .unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:bool[], %1:f64[] .
-                let %2:f64[], %3:f64[] = condition %0 %1 [
-                    true={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
-                    },
-                    false={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
-                    },
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    outputs=[Unknown(0), Unknown(1)],
                 ]
-                    %4:f64[] = neg %3
-                in (%2, %4)
-                lambda %0:f64[], %1:f64[], %2:f64[] .
-                let %3:f64[] = mul %1 %0
-                    %4:f64[] = neg %2
-                    %5:f64[] = mul %4 %0
-                in (%3, %5)
-                [Unknown(2), Known(0), Known(1)]"},
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    let %2:f64[], %3:f64[] = condition %0 %1 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                                %3:f64[] = cos %0
+                                %4:f64[] = tag [key=second] %3
+                            in (%2, %4)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                                %3:f64[] = cos %0
+                                %4:f64[] = tag [key=second] %3
+                            in (%2, %4)
+                        },
+                    ]
+                        %4:f64[] = neg %3
+                    in (%2, %4)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                    let %3:f64[] = mul %1 %0
+                        %4:f64[] = neg %2
+                        %5:f64[] = mul %4 %0
+                    in (%3, %5)
+                }"},
         );
         assert_eq!(run(&placed, &inputs), expected);
 
         // Saving nothing replays the complete condition over the known inputs, which are saved instead.
         let placed = program.partition(&[true, true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:bool[], %1:f64[] .
-                in (%0, %1)
-                lambda %0:f64[], %1:bool[], %2:f64[] .
-                let %3:f64[], %4:f64[] = condition %1 %2 [
-                    true={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
-                    },
-                    false={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
-                    },
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    outputs=[Unknown(0), Unknown(1)],
                 ]
-                    %5:f64[] = mul %3 %0
-                    %6:f64[] = mul %4 %0
-                in (%5, %6)
-                [Unknown(2), Known(0), Known(1)]"},
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    in (%0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:bool[], %2:f64[] .
+                    let %3:f64[], %4:f64[] = condition %1 %2 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                                %3:f64[] = cos %0
+                                %4:f64[] = tag [key=second] %3
+                            in (%2, %4)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                                %3:f64[] = cos %0
+                                %4:f64[] = tag [key=second] %3
+                            in (%2, %4)
+                        },
+                    ]
+                        %5:f64[] = mul %3 %0
+                        %6:f64[] = mul %4 %0
+                    in (%5, %6)
+                }"},
         );
         assert_eq!(run(&placed, &inputs), expected);
     }
@@ -2567,21 +2634,29 @@ mod tests {
         let program = build(builder, vec![tangent_a, tangent_b]);
         let placed = program.partition(&[true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:ref<f64[]> .
-                let %1:f64[] = reference_read %0
-                    %2:f64[] = cos %1
-                    () = reference_write %0 %2
-                    %3:f64[] = reference_read %0
-                in (%1, %3)
-                lambda %0:f64[], %1:f64[], %2:f64[] .
-                let %3:f64[] = sin %1
-                    %4:f64[] = mul %3 %0
-                    %5:f64[] = sin %2
-                    %6:f64[] = mul %5 %0
-                in (%4, %6)
-                [Unknown(1), Known(0), Known(1)]"},
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0), Known(1)],
+                    outputs=[Unknown(0), Unknown(1)],
+                ]
+                known={
+                    lambda %0:ref<f64[]> .
+                    let %1:f64[] = reference_read %0
+                        %2:f64[] = cos %1
+                        () = reference_write %0 %2
+                        %3:f64[] = reference_read %0
+                    in (%1, %3)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                    let %3:f64[] = sin %1
+                        %4:f64[] = mul %3 %0
+                        %5:f64[] = sin %2
+                        %6:f64[] = mul %5 %0
+                    in (%4, %6)
+                }"},
         );
     }
 
@@ -2605,41 +2680,57 @@ mod tests {
         let program = build(builder, vec![tangent_a, tangent_b, tangent_f]);
         let partition = program.partition(&[true, false]).unwrap();
         assert_eq!(
-            render(&partition),
+            partition.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                let %1:ref<f64[]> = reference_new %0
-                    %2:f64[] = reference_read %1
-                    %3:f64[] = sin %0
-                    () = reference_write %1 %3
-                    %4:f64[] = reference_read %1
-                    %5:f64[] = reference_freeze %1
-                in (%2, %4, %5)
-                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
-                let %4:f64[] = mul %1 %0
-                    %5:f64[] = mul %2 %0
-                    %6:f64[] = mul %3 %0
-                in (%4, %5, %6)
-                [Unknown(1), Known(0), Known(1), Known(2)]"},
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0), Known(1), Known(2)],
+                    outputs=[Unknown(0), Unknown(1), Unknown(2)],
+                ]
+                known={
+                    lambda %0:f64[] .
+                    let %1:ref<f64[]> = reference_new %0
+                        %2:f64[] = reference_read %1
+                        %3:f64[] = sin %0
+                        () = reference_write %1 %3
+                        %4:f64[] = reference_read %1
+                        %5:f64[] = reference_freeze %1
+                    in (%2, %4, %5)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                    let %4:f64[] = mul %1 %0
+                        %5:f64[] = mul %2 %0
+                        %6:f64[] = mul %3 %0
+                    in (%4, %5, %6)
+                }"},
         );
         let placed = partition.with_residual_policy(&save_nothing()).unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:f64[] .
-                in (%0)
-                lambda %0:f64[], %1:f64[] .
-                let %2:ref<f64[]> = reference_new %1
-                    %3:f64[] = reference_read %2
-                    %4:f64[] = sin %1
-                    () = reference_write %2 %4
-                    %5:f64[] = reference_read %2
-                    %6:f64[] = reference_freeze %2
-                    %7:f64[] = mul %3 %0
-                    %8:f64[] = mul %5 %0
-                    %9:f64[] = mul %6 %0
-                in (%7, %8, %9)
-                [Unknown(1), Known(0)]"},
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0)],
+                    outputs=[Unknown(0), Unknown(1), Unknown(2)],
+                ]
+                known={
+                    lambda %0:f64[] .
+                    in (%0)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:ref<f64[]> = reference_new %1
+                        %3:f64[] = reference_read %2
+                        %4:f64[] = sin %1
+                        () = reference_write %2 %4
+                        %5:f64[] = reference_read %2
+                        %6:f64[] = reference_freeze %2
+                        %7:f64[] = mul %3 %0
+                        %8:f64[] = mul %5 %0
+                        %9:f64[] = mul %6 %0
+                    in (%7, %8, %9)
+                }"},
         );
         let inputs = vec![
             ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
@@ -2658,21 +2749,29 @@ mod tests {
             .with_residual_policy(&save_dots(Some(NegationStorage)))
             .unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:f64[3] .
-                let %1:f64[] = dot [
-                    dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                ] %0 %0
-                    %2:f64[] = sin %1
-                    %3:f64[] = neg %1
-                in (%2, %3)
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = neg %1
-                    %3:f64[] = cos %2
-                    %4:f64[] = mul %3 %0
-                in (%4)
-                [Unknown(1), Known(0)]"},
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[3] .
+                    let %1:f64[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %0 %0
+                        %2:f64[] = sin %1
+                        %3:f64[] = neg %1
+                    in (%2, %3)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = neg %1
+                        %3:f64[] = cos %2
+                        %4:f64[] = mul %3 %0
+                    in (%4)
+                }"},
         );
         assert_eq!(run(&placed, &sin_dot_inputs()), program.interpret(sin_dot_inputs()).unwrap());
 
@@ -2807,95 +2906,103 @@ mod tests {
             .with_residual_policy(&save_names(&["u"], &[]))
             .unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:bool[], %1:f64[] .
-                let %2:f64[] = sin %1
-                    %3:f64[] = tag [key=u] %2
-                    %4:f64[] = condition %0 %0 %3 [
-                        true={
-                            lambda %0:bool[], %1:f64[] .
-                            let %2:f64[] = condition %0 %0 %1 [
-                                true=^1={
-                                    lambda %0:bool[], %1:f64[] .
-                                    let %2:f64[] = condition %0 %1 [
-                                        true=^0={
-                                            lambda %0:f64[] .
-                                            in (%0)
-                                        },
-                                        false=^0,
-                                    ]
-                                    in (%2)
-                                },
-                                false=^1,
-                            ]
-                            in (%2)
-                        },
-                        false={
-                            lambda %0:bool[], %1:f64[] .
-                            let %2:f64[] = condition %0 %0 %1 [
-                                true=^4={
-                                    lambda %0:bool[], %1:f64[] .
-                                    let %2:f64[] = condition %0 %1 [
-                                        true=^3={
-                                            lambda %0:f64[] .
-                                            in (%0)
-                                        },
-                                        false=^3,
-                                    ]
-                                    in (%2)
-                                },
-                                false=^4,
-                            ]
-                            in (%2)
-                        },
-                    ]
-                in (%4, %0, %1)
-                lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
-                let %4:f64[] = mul %1 %0
-                    %5:f64[] = cos %3
-                    %6:f64[] = tag [key=v] %5
-                    %7:f64[] = condition %2 %2 %6 [
-                        true={
-                            lambda %0:bool[], %1:f64[] .
-                            let %2:f64[] = condition %0 %0 %1 [
-                                true=^1={
-                                    lambda %0:bool[], %1:f64[] .
-                                    let %2:f64[] = condition %0 %1 [
-                                        true=^0={
-                                            lambda %0:f64[] .
-                                            in (%0)
-                                        },
-                                        false=^0,
-                                    ]
-                                    in (%2)
-                                },
-                                false=^1,
-                            ]
-                            in (%2)
-                        },
-                        false={
-                            lambda %0:bool[], %1:f64[] .
-                            let %2:f64[] = condition %0 %0 %1 [
-                                true=^4={
-                                    lambda %0:bool[], %1:f64[] .
-                                    let %2:f64[] = condition %0 %1 [
-                                        true=^3={
-                                            lambda %0:f64[] .
-                                            in (%0)
-                                        },
-                                        false=^3,
-                                    ]
-                                    in (%2)
-                                },
-                                false=^4,
-                            ]
-                            in (%2)
-                        },
-                    ]
-                    %8:f64[] = mul %7 %0
-                in (%4, %8)
-                [Unknown(2), Known(0), Known(1), Known(2)]"},
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0), Known(1), Known(2)],
+                    outputs=[Unknown(0), Unknown(1)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    let %2:f64[] = sin %1
+                        %3:f64[] = tag [key=u] %2
+                        %4:f64[] = condition %0 %0 %3 [
+                            true={
+                                lambda %0:bool[], %1:f64[] .
+                                let %2:f64[] = condition %0 %0 %1 [
+                                    true=^1={
+                                        lambda %0:bool[], %1:f64[] .
+                                        let %2:f64[] = condition %0 %1 [
+                                            true=^0={
+                                                lambda %0:f64[] .
+                                                in (%0)
+                                            },
+                                            false=^0,
+                                        ]
+                                        in (%2)
+                                    },
+                                    false=^1,
+                                ]
+                                in (%2)
+                            },
+                            false={
+                                lambda %0:bool[], %1:f64[] .
+                                let %2:f64[] = condition %0 %0 %1 [
+                                    true=^4={
+                                        lambda %0:bool[], %1:f64[] .
+                                        let %2:f64[] = condition %0 %1 [
+                                            true=^3={
+                                                lambda %0:f64[] .
+                                                in (%0)
+                                            },
+                                            false=^3,
+                                        ]
+                                        in (%2)
+                                    },
+                                    false=^4,
+                                ]
+                                in (%2)
+                            },
+                        ]
+                    in (%4, %0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
+                    let %4:f64[] = mul %1 %0
+                        %5:f64[] = cos %3
+                        %6:f64[] = tag [key=v] %5
+                        %7:f64[] = condition %2 %2 %6 [
+                            true={
+                                lambda %0:bool[], %1:f64[] .
+                                let %2:f64[] = condition %0 %0 %1 [
+                                    true=^1={
+                                        lambda %0:bool[], %1:f64[] .
+                                        let %2:f64[] = condition %0 %1 [
+                                            true=^0={
+                                                lambda %0:f64[] .
+                                                in (%0)
+                                            },
+                                            false=^0,
+                                        ]
+                                        in (%2)
+                                    },
+                                    false=^1,
+                                ]
+                                in (%2)
+                            },
+                            false={
+                                lambda %0:bool[], %1:f64[] .
+                                let %2:f64[] = condition %0 %0 %1 [
+                                    true=^4={
+                                        lambda %0:bool[], %1:f64[] .
+                                        let %2:f64[] = condition %0 %1 [
+                                            true=^3={
+                                                lambda %0:f64[] .
+                                                in (%0)
+                                            },
+                                            false=^3,
+                                        ]
+                                        in (%2)
+                                    },
+                                    false=^4,
+                                ]
+                                in (%2)
+                            },
+                        ]
+                        %8:f64[] = mul %7 %0
+                    in (%4, %8)
+                }"},
         );
         let inputs = vec![
             ArrayIrValue::Array(Array::scalar(false).unwrap()),
@@ -2911,16 +3018,16 @@ mod tests {
         // consumes the outputs of a region-carrying operation in either order.
         let program = sin_dot_program();
         let partition = program.partition(&[true, false]).unwrap();
-        let rendering = render(&partition);
-        assert_eq!(render(&partition.with_residual_policy(&save_everything()).unwrap()), rendering);
+        let rendering = partition.to_string();
+        assert_eq!(partition.with_residual_policy(&save_everything()).unwrap().to_string(), rendering);
         let program = condition_program(true);
         let partition = program.partition(&[true, true, false]).unwrap();
-        let rendering = render(&partition);
-        assert_eq!(render(&partition.with_residual_policy(&save_everything()).unwrap()), rendering);
+        let rendering = partition.to_string();
+        assert_eq!(partition.with_residual_policy(&save_everything()).unwrap().to_string(), rendering);
         let program = condition_program(false);
         let partition = program.partition(&[true, true, false]).unwrap();
-        let rendering = render(&partition);
-        assert_eq!(render(&partition.with_residual_policy(&save_everything()).unwrap()), rendering);
+        let rendering = partition.to_string();
+        assert_eq!(partition.with_residual_policy(&save_everything()).unwrap().to_string(), rendering);
     }
 
     #[test]
@@ -2930,33 +3037,41 @@ mod tests {
         let program = condition_program(true);
         let placed = save_nothing().place_residuals(program.partition(&[true, true, false]).unwrap()).unwrap();
         assert_eq!(
-            render(&placed),
+            placed.to_string(),
             indoc! {"
-                lambda %0:bool[], %1:f64[] .
-                let %2:f64[], %3:f64[] = condition %0 %1 [
-                    true={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
-                    },
-                    false={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
-                    },
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    outputs=[Unknown(0), Unknown(1)],
                 ]
-                in (%2, %3)
-                lambda %0:f64[], %1:f64[], %2:f64[] .
-                let %3:f64[] = mul %1 %0
-                    %4:f64[] = mul %2 %0
-                in (%3, %4)
-                [Unknown(2), Known(0), Known(1)]"},
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    let %2:f64[], %3:f64[] = condition %0 %1 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                                %3:f64[] = cos %0
+                                %4:f64[] = tag [key=second] %3
+                            in (%2, %4)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                                %3:f64[] = cos %0
+                                %4:f64[] = tag [key=second] %3
+                            in (%2, %4)
+                        },
+                    ]
+                    in (%2, %3)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                    let %3:f64[] = mul %1 %0
+                        %4:f64[] = mul %2 %0
+                    in (%3, %4)
+                }"},
         );
         let inputs = vec![
             ArrayIrValue::Array(Array::scalar(true).unwrap()),
