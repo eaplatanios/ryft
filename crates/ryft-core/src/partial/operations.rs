@@ -282,8 +282,9 @@ where
 
         // Give the nested evaluation its own residual program while folding through the same known-side parent.
         // Stage placement keeps live reference operations residual when that parent is eager.
-        let nested =
-            PartialEvaluationContext::new(context.parent().clone()).with_reference_placement(ReferencePlacement::Stage);
+        let nested = PartialEvaluationContext::new(context.parent().clone())
+            .with_reference_placement(ReferencePlacement::Stage)
+            .with_residual_placement(context.residual_placement());
 
         // Repeated residual calls use their own allocation placement and reference-ordering analysis. Keep the
         // fresh context's effect folding enabled so that this analysis determines which effects must be deferred.
@@ -324,15 +325,26 @@ where
     ) -> Result<PartitionedProgram<C::Constant, C::Operation>, ProgramError> {
         // Both paths stage fresh known and residual programs without executing effects or changing the caller's
         // accumulated ordering state. Only the programs are needed here; allocation IDs are for replaying source
-        // regions, whereas these returned programs already incorporate the allocation decisions.
+        // regions, whereas these returned programs already incorporate the allocation decisions. Also, a residual
+        // policy set on the caller's context places the residuals of the partition and of the partitions nested
+        // within it.
+        let residual_placement = context.residual_placement();
         if self.repeated_residual {
             // Let repeated-call allocation and reference-ordering analysis decide which effects can remain known,
             // rather than inheriting a restriction intended for the caller's current residual program.
-            region.partition_with_configuration(input_known, true, true, None).map(|(partition, _)| partition)
+            region
+                .partition_with_residual_placement(input_known, true, true, None, residual_placement)
+                .map(|(partition, _)| partition)
         } else {
             // Ordinary specialization preserves the caller's effect-folding policy and uses a single partition pass.
             region
-                .partition_with_configuration(input_known, context.allow_effect_folding, false, None)
+                .partition_with_residual_placement(
+                    input_known,
+                    context.allow_effect_folding,
+                    false,
+                    None,
+                    residual_placement,
+                )
                 .map(|(partition, _)| partition)
         }
     }
