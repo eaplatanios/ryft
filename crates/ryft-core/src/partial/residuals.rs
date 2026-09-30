@@ -1389,7 +1389,159 @@ enum ResidualPlan<T: Type> {
     Constant,
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Resolution of the operation outputs that may have produced the values of a [`Program`], which looks through the
+/// outputs of operations that forward the outputs of their attached regions (for more information on this, refer to
+/// [`Operation::output_region_provenance`]) and through the inputs of those regions back to the operands that supply
+/// them (for more information on this refer to [`Operation::input_region_provenance`]).
+///
+/// Region outputs are summarized symbolically, in terms of the inputs of their regions, and each summary is computed
+/// once and instantiated at every call site. A region that several operations invoke (e.g., with differently tagged
+/// operands) therefore resolves to the producers of each call site's own operands.
+struct ResidualProvenance<'p, V: Value, O: Operation<Type = V::Type>> {
+    /// Program whose values are resolved.
+    program: &'p Program<V, O, Vec<V>, Vec<V>>,
+
+    /// Symbolic provenance of each region output that was summarized so far, keyed by region and output index.
+    summaries: HashMap<(RegionId, usize), Vec<ProvenanceLeaf>>,
+}
+
+impl<'p, V: Value, O: Operation<Type = V::Type> + OperationPayloadProjection> ResidualProvenance<'p, V, O> {
+    /// Returns the candidate for `value` with residual type `residual_type`, or [`None`] when every provenance path
+    /// of `value` ends at an input or constant of the program.
+    fn candidate(
+        &mut self,
+        value: ValueId,
+        residual_type: V::Type,
+    ) -> Result<Option<ResidualCandidate<'p, V::Type>>, ProgramError> {
+        let program = self.program;
+        let producers = self
+            .resolve(value)?
+            .into_iter()
+            .filter_map(|leaf| match leaf {
+                ProvenanceLeaf::Producer(value) => Some(value),
+                ProvenanceLeaf::Input(_) => None,
+            })
+            .map(|value| {
+                // The `unwrap`s are safe because producer leaves are always outputs of instructions.
+                let instruction = program.instruction(program.producer(value)?.unwrap())?;
+                let output_index = instruction.outputs().iter().position(|output| *output == value.atom()).unwrap();
+                let region = program.region(value.region())?;
+                let atom_type = |atom: &AtomId| region.atoms()[atom.index()].r#type().into_owned();
+                Ok(ResidualProducer::new(
+                    instruction.operation(),
+                    output_index,
+                    instruction.inputs().iter().map(atom_type).collect(),
+                    instruction.outputs().iter().map(atom_type).collect(),
+                ))
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        Ok((!producers.is_empty()).then(|| ResidualCandidate::new(producers, residual_type)))
+    }
+
+    /// Returns the symbolic provenance of `value`, in semantic order and without duplicates. The provenance of each
+    /// region output that it looks through is summarized once, in terms of the inputs of that region, and reused at
+    /// every call site of the region.
+    fn resolve(&mut self, value: ValueId) -> Result<Vec<ProvenanceLeaf>, ProgramError> {
+        let program = self.program;
+
+        // A value without a producer is an input or a constant of its region. An input stays symbolic as an input
+        // leaf, which the call site of the region instantiates through its own operands, and a constant has no
+        // provenance at all.
+        let Some(instruction_id) = program.producer(value)? else {
+            let region = program.region(value.region())?;
+            let input = region.input_ids().iter().position(|input| *input == value.atom());
+            return Ok(input.map(ProvenanceLeaf::Input).into_iter().collect());
+        };
+        let instruction = program.instruction(instruction_id)?;
+
+        // The `unwrap` is safe because `value` is an output of the instruction that produces it.
+        let output_index = instruction.outputs().iter().position(|output| *output == value.atom()).unwrap();
+
+        // An operation that produces the output itself is its producer. Otherwise, the output forwards outputs of the
+        // attached regions (e.g., the corresponding outputs of both branches of a `condition`), whose provenance is
+        // resolved through those regions.
+        let origins = instruction.operation().output_region_provenance(output_index);
+        if origins.is_empty() {
+            return Ok(vec![ProvenanceLeaf::Producer(value)]);
+        }
+
+        let mut leaves = Vec::new();
+        for origin in origins {
+            let region = *instruction.regions().get(origin.region_index).ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "operation `{}` declares provenance from its region {} but its instruction has {} regions",
+                    instruction.operation().name(),
+                    origin.region_index,
+                    instruction.regions().len(),
+                ))
+            })?;
+
+            // Summarize the provenance of the forwarded region output in terms of the inputs of its region. The
+            // summary does not depend on this call site, so it is computed once per region output and reused by
+            // every instruction that attaches the region.
+            let summary = match self.summaries.get(&(region, origin.output_index)) {
+                Some(summary) => summary.clone(),
+                None => {
+                    let output = *program.region(region)?.output_ids().get(origin.output_index).ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!("region {region} has no output {}", origin.output_index))
+                    })?;
+                    let summary = self.resolve(ValueId::new(region, output))?;
+                    self.summaries.insert((region, origin.output_index), summary.clone());
+                    summary
+                }
+            };
+
+            // Instantiate the summary at this call site. Producer leaves carry over unchanged, while each input leaf is
+            // replaced by the provenance of the operand that this instruction supplies to that region input, resolved
+            // in the region that contains the instruction. Region inputs that the operation creates itself, or whose
+            // provenance it does not declare, have no producer that a policy could classify and contribute nothing.
+            for leaf in summary {
+                let leaves_of_leaf = match leaf {
+                    ProvenanceLeaf::Producer(_) => vec![leaf],
+                    ProvenanceLeaf::Input(input_index) => {
+                        match instruction.operation().input_region_provenance(origin.region_index, input_index) {
+                            InputRegionProvenance::Input { index } => {
+                                let operand = *instruction.inputs().get(index).ok_or_else(|| {
+                                    ProgramError::MalformedProgram(format!(
+                                        "operation `{}` declares its operand {} as the source of an input of its \
+                                         region {} but its instruction has {} operands",
+                                        instruction.operation().name(),
+                                        index,
+                                        origin.region_index,
+                                        instruction.inputs().len(),
+                                    ))
+                                })?;
+                                self.resolve(ValueId::new(value.region(), operand))?
+                            }
+                            InputRegionProvenance::None | InputRegionProvenance::Local => Vec::new(),
+                        }
+                    }
+                };
+
+                // Alternative origins may share leaves (e.g., two branches that forward the same operand),
+                // so each leaf is kept once, at its first position in semantic order.
+                for leaf in leaves_of_leaf {
+                    if !leaves.contains(&leaf) {
+                        leaves.push(leaf);
+                    }
+                }
+            }
+        }
+
+        Ok(leaves)
+    }
+}
+
+/// Leaf of the symbolic provenance of a value, as resolved by [`ResidualProvenance`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum ProvenanceLeaf {
+    /// Output of an instruction that produces it itself, rather than forwarding an output of an attached region.
+    Producer(ValueId),
+
+    /// Input at the provided position of the region that contains the value, which each call site of that region
+    /// resolves through its own operands.
+    Input(usize),
+}
 
 /// Returns the atom of `builder` that copies atom `atom` of `program`, using `atoms` to map the atoms of `program` that
 /// were already copied and copying constants on first use.
@@ -1442,138 +1594,6 @@ fn stage_storage<V: Value<Type: 'static>, O: Operation<Type = V::Type> + Operati
             }),
         }
     })
-}
-
-/// Resolution of the operation outputs that may have produced the values of a [`Program`], which looks through the
-/// outputs of operations that forward the outputs of their attached regions (refer to
-/// [`Operation::output_region_provenance`]) and through the inputs of those regions back to the operands that supply
-/// them (refer to [`Operation::input_region_provenance`]).
-///
-/// Region outputs are summarized symbolically, in terms of the inputs of their regions, and each summary is computed
-/// once and instantiated at every call site. A region that several operations invoke (e.g., with differently tagged
-/// operands) therefore resolves to the producers of each call site's own operands.
-struct ResidualProvenance<'p, V: Value, O: Operation<Type = V::Type>> {
-    /// Program whose values are resolved.
-    program: &'p Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Symbolic provenance of each region output that was summarized so far, keyed by region and output index.
-    summaries: HashMap<(RegionId, usize), Vec<ProvenanceLeaf>>,
-}
-
-impl<'p, V: Value, O: Operation<Type = V::Type> + OperationPayloadProjection> ResidualProvenance<'p, V, O> {
-    /// Returns the candidate for `value` with residual type `residual_type`, or [`None`] when every provenance path
-    /// of `value` ends at an input or constant of the program.
-    fn candidate(
-        &mut self,
-        value: ValueId,
-        residual_type: V::Type,
-    ) -> Result<Option<ResidualCandidate<'p, V::Type>>, ProgramError> {
-        let program = self.program;
-        let producers = self
-            .resolve(value)?
-            .into_iter()
-            .filter_map(|leaf| match leaf {
-                ProvenanceLeaf::Producer(value) => Some(value),
-                ProvenanceLeaf::Input(_) => None,
-            })
-            .map(|value| {
-                // The `unwrap`s are safe because producer leaves are always outputs of instructions.
-                let instruction = program.instruction(program.producer(value)?.unwrap())?;
-                let output_index = instruction.outputs().iter().position(|output| *output == value.atom()).unwrap();
-                let region = program.region(value.region())?;
-                let atom_type = |atom: &AtomId| region.atoms()[atom.index()].r#type().into_owned();
-                Ok(ResidualProducer::new(
-                    instruction.operation(),
-                    output_index,
-                    instruction.inputs().iter().map(atom_type).collect(),
-                    instruction.outputs().iter().map(atom_type).collect(),
-                ))
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        Ok((!producers.is_empty()).then(|| ResidualCandidate::new(producers, residual_type)))
-    }
-
-    /// Returns the symbolic provenance of `value`, in semantic order and without duplicates.
-    fn resolve(&mut self, value: ValueId) -> Result<Vec<ProvenanceLeaf>, ProgramError> {
-        let program = self.program;
-        let Some(instruction_id) = program.producer(value)? else {
-            let region = program.region(value.region())?;
-            let input = region.input_ids().iter().position(|input| *input == value.atom());
-            return Ok(input.map(ProvenanceLeaf::Input).into_iter().collect());
-        };
-        let instruction = program.instruction(instruction_id)?;
-        // The `unwrap` is safe because `value` is an output of the instruction that produces it.
-        let output_index = instruction.outputs().iter().position(|output| *output == value.atom()).unwrap();
-        let origins = instruction.operation().output_region_provenance(output_index);
-        if origins.is_empty() {
-            return Ok(vec![ProvenanceLeaf::Producer(value)]);
-        }
-
-        let mut leaves = Vec::new();
-        for origin in origins {
-            let region = *instruction.regions().get(origin.region_index).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "operation `{}` declares provenance from its region {} but its instruction has {} regions",
-                    instruction.operation().name(),
-                    origin.region_index,
-                    instruction.regions().len(),
-                ))
-            })?;
-            for leaf in self.summary(region, origin.output_index)? {
-                let leaves_of_leaf = match leaf {
-                    ProvenanceLeaf::Producer(_) => vec![leaf],
-                    ProvenanceLeaf::Input(input_index) => {
-                        match instruction.operation().input_region_provenance(origin.region_index, input_index) {
-                            InputRegionProvenance::Input { index } => {
-                                let operand = *instruction.inputs().get(index).ok_or_else(|| {
-                                    ProgramError::MalformedProgram(format!(
-                                        "operation `{}` declares its operand {index} as the source of an input of its \
-                                         region {} but its instruction has {} operands",
-                                        instruction.operation().name(),
-                                        origin.region_index,
-                                        instruction.inputs().len(),
-                                    ))
-                                })?;
-                                self.resolve(ValueId::new(value.region(), operand))?
-                            }
-                            InputRegionProvenance::None | InputRegionProvenance::Local => Vec::new(),
-                        }
-                    }
-                };
-                for leaf in leaves_of_leaf {
-                    if !leaves.contains(&leaf) {
-                        leaves.push(leaf);
-                    }
-                }
-            }
-        }
-        Ok(leaves)
-    }
-
-    /// Returns the symbolic provenance of output `output_index` of `region`, which is computed once per region output.
-    fn summary(&mut self, region: RegionId, output_index: usize) -> Result<Vec<ProvenanceLeaf>, ProgramError> {
-        if let Some(summary) = self.summaries.get(&(region, output_index)) {
-            return Ok(summary.clone());
-        }
-        let output =
-            *self.program.region(region)?.output_ids().get(output_index).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("region {region} has no output {output_index}"))
-            })?;
-        let summary = self.resolve(ValueId::new(region, output))?;
-        self.summaries.insert((region, output_index), summary.clone());
-        Ok(summary)
-    }
-}
-
-/// Leaf of the symbolic provenance of a value, as resolved by [`ResidualProvenance`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum ProvenanceLeaf {
-    /// Output of an instruction that produces it itself, rather than forwarding an output of an attached region.
-    Producer(ValueId),
-
-    /// Input at the provided position of the region that contains the value, which each call site of that region
-    /// resolves through its own operands.
-    Input(usize),
 }
 
 #[cfg(test)]
@@ -1840,6 +1860,34 @@ mod tests {
             ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap()),
             ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
         ]
+    }
+
+    /// Builds `f(p, x, t)`, whose condition on `p` produces `tag[first](sin(x))` and `tag[second](cos(x))` in both
+    /// branches, and whose outputs multiply those two values by `t`. When `first_consumed_first` is `false`, the
+    /// residual program consumes the second value first, which reverses the order of the edges of the partition.
+    fn condition_program(first_consumed_first: bool) -> TestProgram {
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let a = branch.add_input(scalar_type());
+        let sine = add(&mut branch, SinOperation::<ArrayType>::new().into(), vec![a]);
+        let first = add(&mut branch, TagOperation::<ArrayType>::new("first").into(), vec![sine]);
+        let cosine = add(&mut branch, CosOperation::<ArrayType>::new().into(), vec![a]);
+        let second = add(&mut branch, TagOperation::<ArrayType>::new("second").into(), vec![cosine]);
+        let branch = build(branch, vec![first, second]);
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let p = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let x = builder.add_input(scalar_type());
+        let t = builder.add_input(scalar_type());
+        let true_branch = builder.import_program(branch.clone());
+        let false_branch = builder.import_program(branch);
+        let outputs = builder
+            .add_instruction(ConditionOperation::new(), vec![true_branch, false_branch], vec![p, x], None)
+            .unwrap()
+            .to_vec();
+        let consumed = if first_consumed_first { [outputs[0], outputs[1]] } else { [outputs[1], outputs[0]] };
+        let first = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![consumed[0], t]);
+        let second = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![consumed[1], t]);
+        build(builder, vec![first, second])
     }
 
     #[test]
@@ -2142,34 +2190,6 @@ mod tests {
                 in (%2)
                 [Unknown(1), Known(0)]"},
         );
-    }
-
-    /// Builds `f(p, x, t)`, whose condition on `p` produces `tag[first](sin(x))` and `tag[second](cos(x))` in both
-    /// branches, and whose outputs multiply those two values by `t`. When `first_consumed_first` is `false`, the
-    /// residual program consumes the second value first, which reverses the order of the edges of the partition.
-    fn condition_program(first_consumed_first: bool) -> TestProgram {
-        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
-        let a = branch.add_input(scalar_type());
-        let sine = add(&mut branch, SinOperation::<ArrayType>::new().into(), vec![a]);
-        let first = add(&mut branch, TagOperation::<ArrayType>::new("first").into(), vec![sine]);
-        let cosine = add(&mut branch, CosOperation::<ArrayType>::new().into(), vec![a]);
-        let second = add(&mut branch, TagOperation::<ArrayType>::new("second").into(), vec![cosine]);
-        let branch = build(branch, vec![first, second]);
-
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let p = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let x = builder.add_input(scalar_type());
-        let t = builder.add_input(scalar_type());
-        let true_branch = builder.import_program(branch.clone());
-        let false_branch = builder.import_program(branch);
-        let outputs = builder
-            .add_instruction(ConditionOperation::new(), vec![true_branch, false_branch], vec![p, x], None)
-            .unwrap()
-            .to_vec();
-        let consumed = if first_consumed_first { [outputs[0], outputs[1]] } else { [outputs[1], outputs[0]] };
-        let first = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![consumed[0], t]);
-        let second = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![consumed[1], t]);
-        build(builder, vec![first, second])
     }
 
     #[test]
