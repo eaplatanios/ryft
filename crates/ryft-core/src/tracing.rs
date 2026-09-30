@@ -80,7 +80,7 @@ use crate::macros::{check_builders, check_count};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
     AtomId, BindingRegionDriver, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
-    ProvenanceScope, ProvenanceState, ReferenceIdentity, Type, TypeError, Typed, Value, ValueProjection,
+    ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, Typed, Value, ValueProjection,
 };
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -1053,6 +1053,100 @@ impl<
     }
 }
 
+impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
+    /// Returns the attached `regions` of an application of `operation` to operands of types `input_types` specialized
+    /// to the region input types that `operation` infers for those operands, or [`None`] when no region requires
+    /// specialization (per [`region_requires_specialization`](Self::region_requires_specialization)). Regions are
+    /// visited in application order, and the region input types are re-inferred after each specialization, because the
+    /// signature of one region can depend on another (e.g., a linear call's transpose receives the cotangent of its
+    /// specialized forward output).
+    ///
+    /// Contexts that consume attached regions structurally rather than by interpreting them use this. For example,
+    /// a region traced with a threaded batch extent `b` and replayed at `DimensionValue::constant(2)` has its extent
+    /// instantiated as an exact dynamic dimension, while eager array operands carry the static extent 2. Primitive
+    /// operations infer their outputs from their operands and so never observe this, but a differentiation rule that
+    /// linearizes such a region would construct tangents whose types disagree with those of the primal outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of inferring the region input types and of specializing the regions.
+    pub(crate) fn specialize_attached_regions<'r, R: Iterator<Item = RegionRef<'r, V, O>>>(
+        operation: &O,
+        input_types: &[V::Type],
+        regions: R,
+    ) -> Result<Option<Vec<Self>>, ProgramError>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        let regions = regions.collect::<Vec<_>>();
+        let mut interfaces = regions.iter().map(|region| region.interface()).collect::<Vec<_>>();
+        let mut region_input_types = operation.infer_region_input_types(input_types, &interfaces)?;
+        let mut programs: Option<Vec<Self>> = None;
+        for index in 0..regions.len() {
+            // A malformed list of region input types is reported when the operation is bound with these regions.
+            let Some(Some(requested)) = region_input_types.get(index) else {
+                continue;
+            };
+            if !Self::region_requires_specialization(interfaces[index].input_types(), requested)? {
+                continue;
+            }
+            let programs = programs.get_or_insert_with(|| regions.iter().map(|region| region.to_program()).collect());
+            let specialized = programs[index].clone().specialize_to_region_input_types(requested)?;
+            interfaces[index] = specialized.interface();
+            programs[index] = specialized;
+            if index + 1 < regions.len() {
+                region_input_types = operation.infer_region_input_types(input_types, &interfaces)?;
+            }
+        }
+        Ok(programs)
+    }
+
+    /// Returns whether an attached region whose declared input types are `declared` must be specialized before an
+    /// operation application that infers the region input types `requested` for it can use it. Input types that differ
+    /// from the declared ones only in their type identities require no specialization, because instantiating the
+    /// identities of the region at them makes its signature agree with them. Input types that strictly refine the
+    /// declared ones (e.g., a static extent where the region declares a dynamic one) do, and so do input types that
+    /// only narrow bounds: instantiating the formal dimension `d` of a region that computes `d + 2` at an input that
+    /// is exactly 3 makes its signature agree, but leaves `d + 2` with the bounds that it was traced with instead of
+    /// inferring that it is exactly 5.
+    pub(crate) fn region_requires_specialization(
+        declared: &[V::Type],
+        requested: &[V::Type],
+    ) -> Result<bool, TypeError> {
+        let renaming = V::Type::derive_identity_renaming(declared, requested)?;
+        let renamed =
+            declared.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
+        let narrows_bounds = declared
+            .iter()
+            .zip(requested)
+            .any(|(declared, actual)| declared.is_refined_by(actual) && !actual.is_refined_by(declared));
+        Ok(renamed != requested || narrows_bounds)
+    }
+
+    /// Returns this attached region specialized to the region input types `input_types` that an operation
+    /// application infers for it for when this is needed). The type identities of the region are first instantiated at
+    /// `input_types`, and its body is then replayed at them so that type inference propagates their refinements through
+    /// it. The body is replayed even when the instantiated signature already equals `input_types`, which is the case
+    /// for inputs that only narrow bounds, whereas [`specialize`](Self::specialize) would return such a region
+    /// unchanged.
+    pub(crate) fn specialize_to_region_input_types(self, input_types: &[V::Type]) -> Result<Self, ProgramError> {
+        let instantiated = self.with_instantiated_type_identities(input_types)?.into_owned();
+        if instantiated.input_types() != input_types {
+            return instantiated.specialize(input_types);
+        }
+        TracingContext::<V, O>::trace(
+            |inputs: Vec<Tracer<TracingContext<V, O>>>| {
+                // Only regions whose inputs narrow bounds reach this replay, so their input signatures are non-empty.
+                let context = inputs[0].context().clone();
+                instantiated.interpret_in_context(&context, inputs)
+            },
+            input_types.to_vec(),
+        )
+        .map(|(_, program)| program)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -1063,16 +1157,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceTransform, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
+        DimensionVariable, Shape,
     };
     use crate::axes::NamedAxes;
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        AddOperation, NegOperation, OneLike, OneOperation, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew,
-        ReferenceRead, ReferenceSwap, ReferenceWrite, ZeroLike, ZeroOperation,
+        AddOperation, DimensionAddOperation, LinearCallOperation, NegOperation, OneLike, OneOperation,
+        ReferenceAddUpdate, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceWrite, ZeroLike,
+        ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
@@ -1082,6 +1178,10 @@ mod tests {
     use crate::tests::{TestArrayContext, TestArrayOperation};
 
     use super::*;
+
+    type FlatArrayProgram = Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>;
+    type FlatDimensionProgram =
+        Program<DimensionValue, DimensionOperation<DimensionValue>, Vec<DimensionValue>, Vec<DimensionValue>>;
 
     #[test]
     fn test_trace() {
@@ -1951,5 +2051,140 @@ mod tests {
             error.to_string(),
             format!("specialized input type {unrelated_type} does not refine declared input type {dynamic_type}"),
         );
+    }
+
+    #[test]
+    fn test_program_specialize_attached_regions() {
+        // A linear call whose forward region `x -> -x` and transpose region `ct -> -ct` are both traced over `f64[n]`.
+        let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let negation = || {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(dynamic_type.clone());
+            let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type.clone());
+        let forward = builder.import_program(negation());
+        let transpose = builder.import_program(negation());
+        let output = builder
+            .add_instruction(LinearCallOperation::<ArrayType>::new(0), vec![forward, transpose], vec![input], None)
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let instruction = &program.instructions()[0];
+        let regions = || instruction.regions().iter().map(|region| program.region_ref(*region).unwrap());
+
+        // Operands of the declared types require no specialization.
+        assert!(
+            FlatArrayProgram::specialize_attached_regions(instruction.operation(), &[dynamic_type.clone()], regions())
+                .unwrap()
+                .is_none()
+        );
+
+        // Static operands specialize the forward region, and the inputs of the transpose region, which receives the
+        // cotangents of the specialized forward outputs, are re-inferred and specialized in turn.
+        let specialized =
+            FlatArrayProgram::specialize_attached_regions(instruction.operation(), &[static_type], regions())
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            specialized.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[3] = neg %0
+                in (%1)
+                lambda %0:f64[3] .
+                let %1:f64[3] = neg %0
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_program_region_requires_specialization() {
+        let extent = DimensionType::new("extent", DimensionBounds::non_negative(Some(16)).unwrap());
+        let other_extent = DimensionType::new("other_extent", DimensionBounds::non_negative(Some(16)).unwrap());
+        let exact_extent = DimensionValue::constant(3).unwrap().r#type().into_owned();
+
+        // Equal input types, and input types that differ only in their type identities, require no specialization.
+        assert_eq!(
+            FlatDimensionProgram::region_requires_specialization(
+                std::slice::from_ref(&extent),
+                std::slice::from_ref(&extent),
+            ),
+            Ok(false),
+        );
+        assert_eq!(
+            FlatDimensionProgram::region_requires_specialization(
+                std::slice::from_ref(&extent),
+                std::slice::from_ref(&other_extent),
+            ),
+            Ok(false),
+        );
+
+        // Input types that only narrow bounds require specialization, and so do input types that strictly refine the
+        // declared ones.
+        assert_eq!(
+            FlatDimensionProgram::region_requires_specialization(
+                std::slice::from_ref(&extent),
+                std::slice::from_ref(&exact_extent),
+            ),
+            Ok(true),
+        );
+        let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        assert_eq!(
+            FlatArrayProgram::region_requires_specialization(
+                std::slice::from_ref(&dynamic_type),
+                std::slice::from_ref(&static_type),
+            ),
+            Ok(true),
+        );
+
+        // Input types that the declared ones cannot be renamed to are rejected.
+        assert_eq!(
+            FlatArrayProgram::region_requires_specialization(std::slice::from_ref(&dynamic_type), &[]),
+            Err(TypeError::invalid("declared type count 1 does not match actual type count 0")),
+        );
+    }
+
+    #[test]
+    fn test_program_specialize_to_region_input_types() {
+        // Input types that strictly refine the declared ones replay the region through `specialize`.
+        let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type);
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let negation =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let specialized = negation.specialize_to_region_input_types(std::slice::from_ref(&static_type)).unwrap();
+        assert_eq!(specialized.input_types(), vec![static_type.clone()]);
+        assert_eq!(specialized.output_types(), vec![static_type]);
+
+        // Input types that only narrow bounds are replayed too, although instantiating the type identities of the
+        // region already makes its signature agree with them, in which case `specialize` would return the region
+        // unchanged. The replay infers that `d + 2` is exactly 5 for `d` that is exactly 3.
+        let extent = DimensionType::new("extent", DimensionBounds::non_negative(Some(16)).unwrap());
+        let two = DimensionValue::constant(2).unwrap();
+        let addition = DimensionAddOperation::new(&extent, two.r#type().as_ref()).unwrap();
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let input = builder.add_input(extent);
+        let two = builder.add_constant(two);
+        let output = builder.add_instruction(addition, Vec::new(), vec![input, two], None).unwrap()[0];
+        let region = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let exact_extent = DimensionValue::constant(3).unwrap().r#type().into_owned();
+        let instantiated =
+            region.with_instantiated_type_identities(std::slice::from_ref(&exact_extent)).unwrap().into_owned();
+        let unchanged = instantiated.specialize(std::slice::from_ref(&exact_extent)).unwrap();
+        assert_eq!(unchanged.output_types()[0].bounds(), DimensionBounds::new(2, Some(18)).unwrap());
+        let specialized = region.specialize_to_region_input_types(std::slice::from_ref(&exact_extent)).unwrap();
+        assert_eq!(specialized.output_types()[0].bounds(), DimensionBounds::new(5, Some(6)).unwrap());
     }
 }

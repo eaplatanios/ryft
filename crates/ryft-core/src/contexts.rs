@@ -90,8 +90,8 @@ use crate::macros::check_builders;
 use crate::operations::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{
-    AtomId, BindingRegionDriver, Operation, OperationProjection, Program, ProgramBuilder, ProgramError, Provenance,
-    ProvenanceScope, ReferenceIdentity, Type, Typed, Value, ValueProjection,
+    AtomId, BindingRegionDriver, FlatProgram, Operation, OperationProjection, Program, ProgramBuilder, ProgramError,
+    Provenance, ProvenanceScope, ReferenceIdentity, Type, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
@@ -757,33 +757,21 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             // transpose must accept. Importing both the provisional and replacement transpose directly into the final
             // builder would leave an unreachable region. Import only the finalized reachable closures below, preserving
             // shared regions. Pure identity renaming uses the driver's ordinary import cache without a separate arena.
-            let mut requires_specialization = false;
-            let mut narrowed_regions = Vec::new();
-            for (interface, requested) in region_interfaces.iter().zip(&region_input_types) {
-                let mut narrows_bounds = false;
-                if let Some(requested) = requested {
-                    let declared = interface.input_types();
-                    let renaming = Self::Type::derive_identity_renaming(declared, requested)
-                        .map_err(|error| self.error(error.into()))?;
-                    let renamed = declared
-                        .iter()
-                        .map(|r#type| r#type.rename_identities(&renaming))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|error| self.error(error.into()))?;
-
-                    // Renamed inputs can equal the request even though the body still needs specialization. Consider
-                    // a region `d -> d + 2`, where `d` originally has broad bounds and is now exactly 3. Renaming its
-                    // formal dimension to the exact input updates the signature but does not infer that `d + 2` is 5.
-                    // Remember the narrowing before renaming hides it, so the body is replayed below.
-                    narrows_bounds = declared
-                        .iter()
-                        .zip(requested)
-                        .any(|(declared, actual)| declared.is_refined_by(actual) && !actual.is_refined_by(declared));
-                    requires_specialization |= renamed != *requested || narrows_bounds;
-                }
-                narrowed_regions.push(narrows_bounds);
-            }
-            let preparation_builder = requires_specialization.then(|| Rc::new(RefCell::new(ProgramBuilder::new())));
+            // Determine which regions require specialization before importing them, because importing instantiates
+            // their type identities, which hides input types that only narrow bounds from the comparison below.
+            let requires_specialization = region_interfaces
+                .iter()
+                .zip(&region_input_types)
+                .map(|(interface, requested)| match requested {
+                    Some(requested) => {
+                        FlatProgram::<Self>::region_requires_specialization(interface.input_types(), requested)
+                    }
+                    None => Ok(false),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| self.error(error.into()))?;
+            let preparation_builder =
+                requires_specialization.contains(&true).then(|| Rc::new(RefCell::new(ProgramBuilder::new())));
             let region_builder = preparation_builder.as_ref().unwrap_or(self.builder());
             let mut region_ids =
                 driver.import_into(region_builder, &region_input_types).map_err(|error| self.error(error))?;
@@ -820,7 +808,7 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                 let mut specialized_regions = Vec::new();
                 for index in 0..region_ids.len() {
                     let Some(requested) = &requests[index] else { continue };
-                    if interfaces[index].input_types() == requested && !narrowed_regions[index] {
+                    if interfaces[index].input_types() == requested && !requires_specialization[index] {
                         continue;
                     }
                     if let Some((_, _, specialized_id)) = specialized_regions
@@ -832,26 +820,8 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                     } else {
                         let source_id = region_ids[index];
                         let region = region_builder.borrow().region_ref(source_id).unwrap().to_program();
-                        let instantiated = region
-                            .with_instantiated_type_identities(requested)
-                            .map_err(|error| self.error(error))?
-                            .into_owned();
-                        let specialized = if narrowed_regions[index] {
-                            // Force body replay. Identity instantiation may already have made the formal inputs equal
-                            // the request, in which case `specialize` would return early and retain broad body bounds.
-                            TracingContext::<Self::Constant, Self::Operation>::trace(
-                                |inputs: Vec<Tracer<TracingContext<Self::Constant, Self::Operation>>>| {
-                                    // A narrowed input bound guarantees a non-empty input signature.
-                                    let context = inputs[0].context().clone();
-                                    instantiated.interpret_in_context(&context, inputs)
-                                },
-                                requested.clone(),
-                            )
-                            .map_err(|error| self.error(error))?
-                            .1
-                        } else {
-                            instantiated.specialize(requested).map_err(|error| self.error(error))?
-                        };
+                        let specialized =
+                            region.specialize_to_region_input_types(requested).map_err(|error| self.error(error))?;
                         interfaces[index] = specialized.interface();
                         region_ids[index] = region_builder.borrow_mut().import_program(specialized);
                         specialized_regions.push((source_id, requested.clone(), region_ids[index]));
