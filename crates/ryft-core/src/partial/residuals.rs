@@ -905,8 +905,11 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     /// partition. The residual program keeps its unknown inputs and the edges that it still reads at their relative
     /// positions, followed by the new edges in known-program order, and edges that nothing reads are dropped. The
     /// effect-ordering constraints remain valid because the known program gains no effects and the residual program
-    /// gains only complete local reference lifecycles that nothing outside it can observe. A policy that saves every
-    /// value therefore reproduces this partition, apart from dropping edges that the residual program does not read.
+    /// gains only complete local reference lifecycles that nothing outside it can observe. Both programs are finally
+    /// pruned with [`Program::into_pruned`], so that their region-carrying instructions (e.g., a known `scan` whose
+    /// stacked residuals are now recomputed) stop producing values that nothing uses. A policy that saves every value
+    /// therefore reproduces this partition, apart from dropping edges that the residual program does not read and the
+    /// unused boundaries of region-carrying instructions.
     ///
     /// # Errors
     ///
@@ -1164,12 +1167,17 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                     .collect::<Vec<_>>()
             })
             .collect::<HashSet<_>>();
+
+        // Region-carrying instructions of the known program may produce values that were edges before and that nothing
+        // demands anymore (e.g., per-iteration stacks of a `scan` whose residuals are now recomputed), so the unused
+        // boundaries of those instructions are pruned to stop computing them.
         let input_count = known_program.input_ids().len();
         let output_count = known_outputs.len();
         let new_known_program = builder
             .build::<Vec<V>, Vec<V>>(known_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])?
             .without_unobserved_local_references(&replayed_allocations)?
-            .into_simplified()?;
+            .into_simplified()?
+            .into_pruned()?;
 
         // Emit the resulting residual program, starting with its inputs: the unknown inputs and the original edges that
         // remain edges at their original relative positions, followed by the new edges. Each edge becomes one input,
@@ -1348,7 +1356,8 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
         let output_count = residual_outputs.len();
         let new_residual_program = builder
             .build::<Vec<V>, Vec<V>>(residual_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])?
-            .into_simplified()?;
+            .into_simplified()?
+            .into_pruned()?;
 
         let metadata = metadata.with_residual_inputs(new_residual_inputs);
         Ok(Self::from_programs_and_metadata(new_known_program, new_residual_program, metadata))
@@ -2319,8 +2328,9 @@ mod tests {
         ];
         let expected = program.interpret(inputs.clone()).unwrap();
 
-        // Saving the first output of the condition and recomputing the second replays the complete condition in the
-        // residual program, where the saved first output still resolves to its edge.
+        // Saving the first output of the condition and recomputing the second replays the condition in the residual
+        // program, where the saved first output still resolves to its edge. Pruning then leaves each program with a
+        // condition that computes only the output that it uses.
         let placed = program
             .partition(&[true, true, false])
             .unwrap()
@@ -2330,47 +2340,39 @@ mod tests {
             render(&placed),
             indoc! {"
                 lambda %0:bool[], %1:f64[] .
-                let %2:f64[], %3:f64[] = condition %0 %1 [
+                let %2:f64[] = condition %0 %1 [
                     true={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
                             %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
+                        in (%2)
                     },
                     false={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
                             %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
+                        in (%2)
                     },
                 ]
                 in (%2, %0, %1)
                 lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
                 let %4:f64[] = mul %1 %0
-                    %5:f64[], %6:f64[] = condition %2 %3 [
+                    %5:f64[] = condition %2 %3 [
                         true={
                             lambda %0:f64[] .
-                            let %1:f64[] = sin %0
-                                %2:f64[] = tag [key=first] %1
-                                %3:f64[] = cos %0
-                                %4:f64[] = tag [key=second] %3
-                            in (%2, %4)
+                            let %1:f64[] = cos %0
+                                %2:f64[] = tag [key=second] %1
+                            in (%2)
                         },
                         false={
                             lambda %0:f64[] .
-                            let %1:f64[] = sin %0
-                                %2:f64[] = tag [key=first] %1
-                                %3:f64[] = cos %0
-                                %4:f64[] = tag [key=second] %3
-                            in (%2, %4)
+                            let %1:f64[] = cos %0
+                                %2:f64[] = tag [key=second] %1
+                            in (%2)
                         },
                     ]
-                    %7:f64[] = mul %6 %0
-                in (%4, %7)
+                    %6:f64[] = mul %5 %0
+                in (%4, %6)
                 [Unknown(2), Known(0), Known(1), Known(2)]"},
         );
         assert_eq!(run(&placed, &inputs), expected);
@@ -2386,47 +2388,39 @@ mod tests {
             render(&placed),
             indoc! {"
                 lambda %0:bool[], %1:f64[] .
-                let %2:f64[], %3:f64[] = condition %0 %1 [
+                let %2:f64[] = condition %0 %1 [
                     true={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
                             %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
+                        in (%2)
                     },
                     false={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
                             %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
+                        in (%2)
                     },
                 ]
                 in (%2, %0, %1)
                 lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
-                let %4:f64[], %5:f64[] = condition %2 %3 [
+                let %4:f64[] = condition %2 %3 [
                     true={
                         lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
+                        let %1:f64[] = cos %0
+                            %2:f64[] = tag [key=second] %1
+                        in (%2)
                     },
                     false={
                         lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
+                        let %1:f64[] = cos %0
+                            %2:f64[] = tag [key=second] %1
+                        in (%2)
                     },
                 ]
-                    %6:f64[] = mul %5 %0
-                    %7:f64[] = mul %1 %0
-                in (%6, %7)
+                    %5:f64[] = mul %4 %0
+                    %6:f64[] = mul %1 %0
+                in (%5, %6)
                 [Unknown(2), Known(0), Known(1), Known(2)]"},
         );
         assert_eq!(run(&placed, &inputs), reversed.interpret(inputs.clone()).unwrap());
@@ -2441,49 +2435,41 @@ mod tests {
             render(&placed),
             indoc! {"
                 lambda %0:bool[], %1:f64[] .
-                let %2:f64[], %3:f64[] = condition %0 %1 [
+                let %2:f64[] = condition %0 %1 [
                     true={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
                             %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
+                        in (%2)
                     },
                     false={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
                             %2:f64[] = tag [key=first] %1
-                            %3:f64[] = cos %0
-                            %4:f64[] = tag [key=second] %3
-                        in (%2, %4)
+                        in (%2)
                     },
                 ]
-                    %4:f64[] = neg %2
-                in (%4, %0, %1)
+                    %3:f64[] = neg %2
+                in (%3, %0, %1)
                 lambda %0:f64[], %1:f64[], %2:bool[], %3:f64[] .
                 let %4:f64[] = neg %1
                     %5:f64[] = mul %4 %0
-                    %6:f64[], %7:f64[] = condition %2 %3 [
+                    %6:f64[] = condition %2 %3 [
                         true={
                             lambda %0:f64[] .
-                            let %1:f64[] = sin %0
-                                %2:f64[] = tag [key=first] %1
-                                %3:f64[] = cos %0
-                                %4:f64[] = tag [key=second] %3
-                            in (%2, %4)
+                            let %1:f64[] = cos %0
+                                %2:f64[] = tag [key=second] %1
+                            in (%2)
                         },
                         false={
                             lambda %0:f64[] .
-                            let %1:f64[] = sin %0
-                                %2:f64[] = tag [key=first] %1
-                                %3:f64[] = cos %0
-                                %4:f64[] = tag [key=second] %3
-                            in (%2, %4)
+                            let %1:f64[] = cos %0
+                                %2:f64[] = tag [key=second] %1
+                            in (%2)
                         },
                     ]
-                    %8:f64[] = mul %7 %0
-                in (%5, %8)
+                    %7:f64[] = mul %6 %0
+                in (%5, %7)
                 [Unknown(2), Known(0), Known(1), Known(2)]"},
         );
         assert_eq!(run(&placed, &inputs), expected);
@@ -2832,10 +2818,10 @@ mod tests {
                             let %2:f64[] = condition %0 %0 %1 [
                                 true=^1={
                                     lambda %0:bool[], %1:f64[] .
-                                    let %2:f64[] = condition %0 %0 %1 [
+                                    let %2:f64[] = condition %0 %1 [
                                         true=^0={
-                                            lambda %0:bool[], %1:f64[] .
-                                            in (%1)
+                                            lambda %0:f64[] .
+                                            in (%0)
                                         },
                                         false=^0,
                                     ]
@@ -2850,10 +2836,10 @@ mod tests {
                             let %2:f64[] = condition %0 %0 %1 [
                                 true=^4={
                                     lambda %0:bool[], %1:f64[] .
-                                    let %2:f64[] = condition %0 %0 %1 [
+                                    let %2:f64[] = condition %0 %1 [
                                         true=^3={
-                                            lambda %0:bool[], %1:f64[] .
-                                            in (%1)
+                                            lambda %0:f64[] .
+                                            in (%0)
                                         },
                                         false=^3,
                                     ]
@@ -2875,10 +2861,10 @@ mod tests {
                             let %2:f64[] = condition %0 %0 %1 [
                                 true=^1={
                                     lambda %0:bool[], %1:f64[] .
-                                    let %2:f64[] = condition %0 %0 %1 [
+                                    let %2:f64[] = condition %0 %1 [
                                         true=^0={
-                                            lambda %0:bool[], %1:f64[] .
-                                            in (%1)
+                                            lambda %0:f64[] .
+                                            in (%0)
                                         },
                                         false=^0,
                                     ]
@@ -2893,10 +2879,10 @@ mod tests {
                             let %2:f64[] = condition %0 %0 %1 [
                                 true=^4={
                                     lambda %0:bool[], %1:f64[] .
-                                    let %2:f64[] = condition %0 %0 %1 [
+                                    let %2:f64[] = condition %0 %1 [
                                         true=^3={
-                                            lambda %0:bool[], %1:f64[] .
-                                            in (%1)
+                                            lambda %0:f64[] .
+                                            in (%0)
                                         },
                                         false=^3,
                                     ]
