@@ -872,9 +872,8 @@ impl<T: Type> Hash for ResidualPolicyReference<T> {
 
 // TODO(eaplatanios): Review from here onwards.
 
-impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
-    /// Returns this partition with the known values that its residual program consumes placed according to `policy`
-    /// (refer to the [module documentation](crate::partial::residuals) for more information on residual policies).
+impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadProjection> PartitionedProgram<V, O> {
+    /// Returns this partition with the known values that its residual program consumes placed according to `policy`.
     ///
     /// Planning starts from the edges that the residual program reads and decides everything before it emits the
     /// planned programs. It classifies each demanded known value once:
@@ -899,7 +898,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// so that the replayed access observes the same state. Reference handles never become new edges: residual work
     /// uses local state only through replayed lifecycles, apart from handle edges of the original partition, which are
     /// kept. Effectful known work stays in the known program regardless of demand, except for local reference
-    /// lifecycles that nothing in the known program observes any more, which are removed from it.
+    /// lifecycles that nothing in the known program observes anymore, which are removed from it.
     ///
     /// The planned partition keeps the known inputs, the outputs, and the effect-ordering constraints of this
     /// partition. The residual program keeps its unknown inputs and the edges that it still reads at their relative
@@ -914,11 +913,8 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// [`ResidualPolicyError::UnsupportedStorage`] or [`ResidualPolicyError::InvalidStorage`] when a storage cannot be
     /// staged, and [`ResidualPolicyError::Program`] when rebuilding the programs fails (e.g., when residual work would
     /// require a local reference handle as a new edge).
-    pub fn plan_residuals(self, policy: &ResidualPolicyReference<V::Type>) -> Result<Self, ResidualPolicyError>
-    where
-        V::Type: 'static,
-        O: OperationPayloadProjection,
-    {
+    #[inline]
+    pub fn plan_residuals(self, policy: &ResidualPolicyReference<V::Type>) -> Result<Self, ResidualPolicyError> {
         self.plan_residuals_with_region_replay(policy, true)
     }
 
@@ -930,11 +926,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         self,
         policy: &ResidualPolicyReference<V::Type>,
         replay_region_operations: bool,
-    ) -> Result<Self, ResidualPolicyError>
-    where
-        V::Type: 'static,
-        O: OperationPayloadProjection,
-    {
+    ) -> Result<Self, ResidualPolicyError> {
         let known_output_count = self.outputs().iter().filter(|output| output.is_known()).count();
         let residual_inputs = self.residual_inputs().to_vec();
         let (known_program, residual_program, metadata) = self.into_programs_and_metadata();
