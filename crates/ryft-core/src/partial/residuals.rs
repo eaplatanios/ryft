@@ -48,7 +48,6 @@ use thiserror::Error;
 use crate::parameters::Placeholder;
 use crate::partial::partitions::PartitionedProgram;
 use crate::partial::values::PartialEvaluationInput;
-use crate::programs::references::LocalReferenceLifecycles;
 use crate::programs::{
     Atom, AtomId, ErasedOperation, InputRegionProvenance, Operation, OperationPayloadProjection, Program,
     ProgramBuilder, ProgramError, RegionId, Type, Typed, Value, ValueId,
@@ -950,16 +949,413 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
             })
             .collect::<Vec<_>>();
 
-        let mut planner = ResidualPlanner::new(&known_program, &edges, policy, replay_region_operations)?;
-        planner.discover(seeds)?;
-        let planned_edges = planner.planned_edges(&residual_inputs);
-        let (known_program, edge_types) = planner.emit_known_program(known_output_count, &planned_edges)?;
-        let (residual_program, planned_residual_inputs) =
-            planner.emit_residual_program(&residual_program, &residual_inputs, &planned_edges, &edge_types)?;
-        let metadata = metadata.with_residual_inputs(planned_residual_inputs);
-        Ok(Self::from_programs_and_metadata(known_program, residual_program, metadata))
+        // Local references that escape through an output of the known program (including handle edges) are shared with
+        // work outside it, so their lifecycles are not tracked and none of their accesses is ever replayed.
+        let region = known_program.entry_region_ref();
+        let analysis = region.reference_analysis(0).map_err(ProgramError::from)?;
+        let escaping = analysis.output_roots().iter().flatten().copied().collect::<HashSet<_>>();
+        let lifecycles = analysis.local_lifecycles(region, |root| !escaping.contains(&root))?;
+        let atom_count = known_program.atoms().len();
+        let instruction_by_output = known_program.instruction_by_output();
+        let mut is_input = vec![false; atom_count];
+        known_program.input_ids().iter().for_each(|input| is_input[input.index()] = true);
+
+        // An instruction of the known program can be replayed in the residual program only if it and its transitive
+        // state predecessors (i.e., the earlier accesses to the local reference state that it observes) are all
+        // recomputable. The answer is memoized per instruction, because many demanded atoms share predecessors.
+        let mut replayable = vec![None; known_program.instructions().len()];
+        let mut is_replayable = |index: usize| {
+            if let Some(replayable) = replayable[index] {
+                return replayable;
+            }
+            let mut pending = vec![index];
+            let mut visited = HashSet::new();
+            let mut is_replayable = true;
+            while let Some(index) = pending.pop() {
+                if !visited.insert(index) {
+                    continue;
+                }
+                if !lifecycles.is_recomputable(index) {
+                    is_replayable = false;
+                    break;
+                }
+                pending.extend(lifecycles.state_predecessors(index));
+            }
+            replayable[index] = Some(is_replayable);
+            is_replayable
+        };
+
+        // Plans one demanded known atom, applying the rules listed in the documentation of `with_residual_policy` in
+        // order: constants and known inputs never consult the policy, reference handles are either original edges or
+        // replayed, values whose producers cannot be replayed are saved, and the policy classifies everything else.
+        // The provenance of the known program provides the candidates that the policy classifies, and memoizes the
+        // provenance of region outputs across calls.
+        let mut provenance = ResidualProvenance { program: &known_program, summaries: HashMap::new() };
+        let mut plan = |atom: AtomId| -> Result<ResidualPlan<V::Type>, ResidualPolicyError> {
+            let atom_type = match &known_program.atoms()[atom.index()] {
+                Atom::Constant(_) => return Ok(ResidualPlan::Constant),
+                Atom::Variable(r#type) => r#type.clone(),
+            };
+
+            if is_input[atom.index()] {
+                return Ok(ResidualPlan::Edge(None));
+            }
+
+            // The `unwrap` is safe because every variable that is not an input is produced by an instruction.
+            let index = instruction_by_output[atom.index()].unwrap();
+            if atom_type.is_reference() {
+                // Residual work uses local reference state only through replayed lifecycles, and never through new
+                // handle edges. The handle edges of the original partition stay edges.
+                return if edges.contains(&atom) {
+                    Ok(ResidualPlan::Edge(None))
+                } else if is_replayable(index) {
+                    Ok(ResidualPlan::Recompute)
+                } else {
+                    Err(ProgramError::MalformedProgram(format!(
+                        "residual work requires the reference produced by operation `{}` as a new edge",
+                        known_program.instructions()[index].operation().name(),
+                    ))
+                    .into())
+                };
+            }
+
+            if !is_replayable(index) {
+                return Ok(ResidualPlan::Edge(None));
+            }
+
+            // Replaying a region-carrying producer re-executes it as a whole, which would undo the per-iteration and
+            // per-branch decisions of a split rule that already placed the residuals of its body with the same policy.
+            if !replay_region_operations && !known_program.instructions()[index].regions().is_empty() {
+                return Ok(ResidualPlan::Edge(None));
+            }
+
+            // Values that only forward region inputs or constants have no producer that a policy could classify.
+            let value = ValueId::new(known_program.entry(), atom);
+            let Some(candidate) = provenance.candidate(value, atom_type)? else {
+                return Ok(ResidualPlan::Edge(None));
+            };
+
+            Ok(match policy.classify(&candidate)? {
+                ResidualDecision::Save => ResidualPlan::Edge(None),
+                ResidualDecision::SaveWith(storage) => ResidualPlan::Edge(Some(storage)),
+                ResidualDecision::Recompute => ResidualPlan::Recompute,
+            })
+        };
+
+        // Discover the plans of all demanded known atoms before emitting anything, so that emission sees the final
+        // decisions. Atoms are planned depth-first in seed order, and each one only once. Recomputing an atom marks its
+        // producer for replay, and replaying a producer demands its inputs and replays its state predecessors in turn.
+        // The loop therefore alternates between draining the pending atoms and marking the next pending instruction for
+        // replay, until neither remains.
+        let mut plans = (0..atom_count).map(|_| None).collect::<Vec<Option<ResidualPlan<V::Type>>>>();
+        let mut replay_instructions = BTreeSet::new();
+        let mut pending_atoms = seeds;
+        pending_atoms.reverse();
+        let mut pending_instructions = Vec::new();
+        loop {
+            while let Some(atom) = pending_atoms.pop() {
+                if plans[atom.index()].is_some() {
+                    continue;
+                }
+                let atom_plan = plan(atom)?;
+                if matches!(atom_plan, ResidualPlan::Recompute) {
+                    // The `unwrap` is safe because only atoms produced by instructions are ever recomputed.
+                    pending_instructions.push(instruction_by_output[atom.index()].unwrap());
+                }
+                plans[atom.index()] = Some(atom_plan);
+            }
+
+            let Some(index) = pending_instructions.pop() else {
+                break;
+            };
+
+            if replay_instructions.insert(index) {
+                pending_atoms.extend(known_program.instructions()[index].inputs().iter().rev().copied());
+                pending_instructions.extend(lifecycles.state_predecessors(index));
+            }
+        }
+
+        // The edges of the resulting partition are the saved atoms, in the order of the residual program inputs that
+        // consume them: the original edges that remain edges, at their relative positions among the inputs of the
+        // original residual program, followed by the new edges in known-program order.
+        let is_edge = |atom: &AtomId| matches!(plans[atom.index()], Some(ResidualPlan::Edge(_)));
+        let mut new_edges = Vec::new();
+        let original_edges = residual_inputs.iter().filter_map(|input| match input {
+            PartialEvaluationInput::Known(edge) => Some(edges[*edge]),
+            PartialEvaluationInput::Unknown(_) => None,
+        });
+        for atom in original_edges.chain((0..atom_count).map(AtomId::new)) {
+            if is_edge(&atom) && !new_edges.contains(&atom) {
+                new_edges.push(atom);
+            }
+        }
+
+        // Emit the resulting known program, which copies the known program with its known outputs followed by the new
+        // edges as outputs. The store operations of stored edges are staged right after their producers, so that the
+        // edge outputs carry the stored representations.
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let mut atoms = vec![None; atom_count];
+        for input in known_program.input_ids() {
+            atoms[input.index()] = Some(builder.add_input(known_program.atoms()[input.index()].r#type().into_owned()));
+        }
+
+        let mut stored_atoms = HashMap::new();
+        let mut remapping = HashMap::new();
+        for instruction in known_program.instructions() {
+            let inputs = instruction
+                .inputs()
+                .iter()
+                .map(|input| copy_atom(&known_program, *input, &mut atoms, &mut builder))
+                .collect::<Result<Vec<_>, _>>()?;
+            let regions = instruction
+                .regions()
+                .iter()
+                .map(|region| {
+                    Ok(builder.import_region_with_remapping(known_program.region_ref(*region)?, &mut remapping))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            let outputs = builder
+                .add_instruction(
+                    instruction.operation().clone(),
+                    regions,
+                    inputs,
+                    Some(instruction.provenance().clone()),
+                )?
+                .to_vec();
+            for (source, output) in instruction.outputs().iter().zip(outputs) {
+                atoms[source.index()] = Some(output);
+                if let Some(ResidualPlan::Edge(Some(storage))) = &plans[source.index()] {
+                    let residual_type = known_program.atoms()[source.index()].r#type().into_owned();
+                    let payloads = storage.store_payloads(&residual_type)?;
+                    stored_atoms.insert(*source, stage_storage(&mut builder, output, payloads, &**storage)?);
+                }
+            }
+        }
+
+        let mut known_outputs = known_program.output_ids()[..known_output_count]
+            .iter()
+            .map(|output| copy_atom(&known_program, *output, &mut atoms, &mut builder))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for edge in &new_edges {
+            known_outputs.push(match stored_atoms.get(edge) {
+                Some(stored_atom) => *stored_atom,
+                None => copy_atom(&known_program, *edge, &mut atoms, &mut builder)?,
+            });
+        }
+
+        let edge_types = known_outputs[known_output_count..]
+            .iter()
+            .map(|output| builder.atoms()[output.index()].r#type().into_owned())
+            .collect::<Vec<_>>();
+
+        // The residual program replays the lifecycles of the local references that replayed instructions allocate,
+        // so the known program keeps those lifecycles only if it still observes them itself.
+        let replayed_allocations = replay_instructions
+            .iter()
+            .flat_map(|index| {
+                let instruction = &known_program.instructions()[*index];
+                instruction
+                    .operation()
+                    .effects()
+                    .allocation_output_indices()
+                    .filter_map(|output_index| instruction.outputs().get(output_index))
+                    .filter_map(|output| atoms[output.index()])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        let input_count = known_program.input_ids().len();
+        let output_count = known_outputs.len();
+        let new_known_program = builder
+            .build::<Vec<V>, Vec<V>>(known_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])?
+            .without_unobserved_local_references(&replayed_allocations)?
+            .into_simplified()?;
+
+        // Emit the resulting residual program, starting with its inputs: the unknown inputs and the original edges that
+        // remain edges at their original relative positions, followed by the new edges. Each edge becomes one input,
+        // even when the original residual program received it more than once.
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let mut new_residual_inputs = Vec::new();
+        let mut residual_atoms = vec![None; residual_program.atoms().len()];
+        let mut edge_inputs = HashMap::new();
+        let mut add_edge_input = |edge: AtomId, builder: &mut ProgramBuilder<V, O>, inputs: &mut Vec<_>| {
+            if let Some(position) = new_edges.iter().position(|new_edge| *new_edge == edge)
+                && !edge_inputs.contains_key(&edge)
+            {
+                edge_inputs.insert(edge, builder.add_input(edge_types[position].clone()));
+                inputs.push(PartialEvaluationInput::Known(position));
+            }
+        };
+
+        for (input, atom) in residual_inputs.iter().zip(residual_program.input_ids()) {
+            match input {
+                PartialEvaluationInput::Unknown(index) => {
+                    let r#type = residual_program.atoms()[atom.index()].r#type().into_owned();
+                    residual_atoms[atom.index()] = Some(builder.add_input(r#type));
+                    new_residual_inputs.push(PartialEvaluationInput::Unknown(*index));
+                }
+                PartialEvaluationInput::Known(edge) => {
+                    add_edge_input(edges[*edge], &mut builder, &mut new_residual_inputs)
+                }
+            }
+        }
+
+        for edge in &new_edges {
+            add_edge_input(*edge, &mut builder, &mut new_residual_inputs);
+        }
+
+        // Resolves the atom of the residual program that provides the demanded known atom `atom`, memoized in
+        // `known_atoms`: its edge input (through the restore operations of its storage, which are staged on
+        // first use and must reproduce the residual type), its replayed value, or a re-created constant.
+        let resolve_known_atom = |atom: AtomId,
+                                  known_atoms: &mut [Option<AtomId>],
+                                  builder: &mut ProgramBuilder<V, O>|
+         -> Result<AtomId, ResidualPolicyError> {
+            if let Some(resolved) = known_atoms[atom.index()] {
+                return Ok(resolved);
+            }
+            let resolved = match &plans[atom.index()] {
+                Some(ResidualPlan::Edge(storage)) => {
+                    let input = edge_inputs[&atom];
+                    match storage {
+                        None => input,
+                        Some(storage) => {
+                            let stored_type = builder.atoms()[input.index()].r#type().into_owned();
+                            let residual_type = known_program.atoms()[atom.index()].r#type().into_owned();
+                            let payloads = storage.restore_payloads(&stored_type, &residual_type)?;
+                            let restored = stage_storage(builder, input, payloads, &**storage)?;
+                            let restored_type = builder.atoms()[restored.index()].r#type().into_owned();
+                            let reproduces = |left: &V::Type, right: &V::Type| {
+                                V::Type::derive_identity_renaming(
+                                    std::slice::from_ref(left),
+                                    std::slice::from_ref(right),
+                                )
+                                .is_ok()
+                            };
+                            if !reproduces(&residual_type, &restored_type)
+                                || !reproduces(&restored_type, &residual_type)
+                            {
+                                return Err(ResidualPolicyError::InvalidStorage {
+                                    storage: storage.name(),
+                                    message: format!(
+                                        "its restore operations produce `{restored_type}` instead of the residual type \
+                                         `{residual_type}`",
+                                    ),
+                                });
+                            }
+                            restored
+                        }
+                    }
+                }
+                Some(ResidualPlan::Constant) | None => match &known_program.atoms()[atom.index()] {
+                    Atom::Constant(value) => builder.add_constant(value.clone()),
+                    Atom::Variable(_) => {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "known atom {atom} is neither saved nor recomputed by the residual plan",
+                        ))
+                        .into());
+                    }
+                },
+                Some(ResidualPlan::Recompute) => {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "known atom {atom} is used before the residual program recomputes it",
+                    ))
+                    .into());
+                }
+            };
+            known_atoms[atom.index()] = Some(resolved);
+            Ok(resolved)
+        };
+
+        // Replay the instructions of the known program that are marked for replay, in program order, so that every
+        // replayed state access observes the same local reference state as in the known program.
+        let mut known_atoms = vec![None; atom_count];
+        let mut remapping = HashMap::new();
+        for index in &replay_instructions {
+            let instruction = &known_program.instructions()[*index];
+            let inputs = instruction
+                .inputs()
+                .iter()
+                .map(|input| resolve_known_atom(*input, &mut known_atoms, &mut builder))
+                .collect::<Result<Vec<_>, _>>()?;
+            let regions = instruction
+                .regions()
+                .iter()
+                .map(|region| {
+                    Ok(builder.import_region_with_remapping(known_program.region_ref(*region)?, &mut remapping))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            let outputs = builder
+                .add_instruction(
+                    instruction.operation().clone(),
+                    regions,
+                    inputs,
+                    Some(instruction.provenance().clone()),
+                )?
+                .to_vec();
+            for (source, output) in instruction.outputs().iter().zip(outputs) {
+                // Saved outputs keep resolving to their edges even though their producer is replayed.
+                if !matches!(plans[source.index()], Some(ResidualPlan::Edge(_))) {
+                    known_atoms[source.index()] = Some(output);
+                }
+            }
+        }
+
+        // Edge inputs of the original residual program resolve to the known atoms that they received. Edges that the
+        // original residual program does not read were never demanded, so they have no plan and are dropped.
+        for (input, atom) in residual_inputs.iter().zip(residual_program.input_ids()) {
+            if let PartialEvaluationInput::Known(edge) = input
+                && plans[edges[*edge].index()].is_some()
+            {
+                residual_atoms[atom.index()] = Some(resolve_known_atom(edges[*edge], &mut known_atoms, &mut builder)?);
+            }
+        }
+
+        // Copy the original residual program on top of the replayed instructions.
+        let mut remapping = HashMap::new();
+        for instruction in residual_program.instructions() {
+            let inputs = instruction
+                .inputs()
+                .iter()
+                .map(|input| copy_atom(&residual_program, *input, &mut residual_atoms, &mut builder))
+                .collect::<Result<Vec<_>, _>>()?;
+            let regions = instruction
+                .regions()
+                .iter()
+                .map(|region| {
+                    Ok(builder.import_region_with_remapping(residual_program.region_ref(*region)?, &mut remapping))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            let outputs = builder
+                .add_instruction(
+                    instruction.operation().clone(),
+                    regions,
+                    inputs,
+                    Some(instruction.provenance().clone()),
+                )?
+                .to_vec();
+            for (source, output) in instruction.outputs().iter().zip(outputs) {
+                residual_atoms[source.index()] = Some(output);
+            }
+        }
+
+        let residual_outputs = residual_program
+            .output_ids()
+            .iter()
+            .map(|output| copy_atom(&residual_program, *output, &mut residual_atoms, &mut builder))
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_count = new_residual_inputs.len();
+        let output_count = residual_outputs.len();
+        let new_residual_program = builder
+            .build::<Vec<V>, Vec<V>>(residual_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])?
+            .into_simplified()?;
+
+        let metadata = metadata.with_residual_inputs(new_residual_inputs);
+        Ok(Self::from_programs_and_metadata(new_known_program, new_residual_program, metadata))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Placement of the residuals of the partitions of programs over values of type `V`
 /// and operations of family `O` according to one residual policy. It is type-erased so that a
@@ -985,7 +1381,7 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
 
 /// Plan of [`PartitionedProgram::with_residual_policy`] for one known atom that residual work demands.
 enum ResidualPlan<T: Type> {
-    /// The atom is an edge of the planned partition, stored through the provided storage, if any.
+    /// The atom is an edge of the resulting partition, stored through the provided storage, if any.
     Edge(Option<ErasedResidualStorage<T>>),
 
     /// The atom is recomputed in the residual program by replaying its producer.
@@ -995,474 +1391,7 @@ enum ResidualPlan<T: Type> {
     Constant,
 }
 
-/// State of [`PartitionedProgram::with_residual_policy`] for one partition, which plans the known atoms that residual
-/// work demands (via [`discover`](Self::discover)) before emitting the planned programs.
-struct ResidualPlanner<'p, V: Value, O: Operation<Type = V::Type>> {
-    /// Known program of the partition.
-    known_program: &'p Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Edges of the original partition, as atoms of the known program, in edge order.
-    edges: &'p [AtomId],
-
-    /// Policy that classifies the demanded atoms.
-    policy: &'p ResidualPolicyReference<V::Type>,
-
-    /// Whether region-carrying producers may be replayed as a whole. Refer to
-    /// [`PartitionedProgram::with_residual_policy_and_region_replay`] for more information.
-    replay_region_operations: bool,
-
-    /// Lifecycles of the local references of the known program that do not escape it.
-    lifecycles: LocalReferenceLifecycles,
-
-    /// Position of the instruction producing each atom of the known program, or [`None`] for inputs and constants.
-    instruction_by_output: Vec<Option<usize>>,
-
-    /// Whether each atom of the known program is one of its inputs.
-    is_input: Vec<bool>,
-
-    /// Provenance of the values of the known program, which provides the candidates that the policy classifies.
-    provenance: ResidualProvenance<'p, V, O>,
-
-    /// Whether each instruction of the known program is replayable (i.e., recomputable together with its transitive
-    /// state predecessors), for the instructions queried so far.
-    replayable: Vec<Option<bool>>,
-
-    /// Plan of each atom of the known program that residual work demands.
-    plans: Vec<Option<ResidualPlan<V::Type>>>,
-
-    /// Positions of the instructions of the known program that the residual program replays.
-    replay_instructions: BTreeSet<usize>,
-}
-
 // TODO(eaplatanios): Review from here onwards.
-
-impl<'p, V: 'p + Value<Type: 'static>, O: 'p + Operation<Type = V::Type> + OperationPayloadProjection>
-    ResidualPlanner<'p, V, O>
-{
-    /// Creates a new [`ResidualPlanner`] for the partition whose known program is `known_program`
-    /// and whose edges are `edges`.
-    fn new(
-        known_program: &'p Program<V, O, Vec<V>, Vec<V>>,
-        edges: &'p [AtomId],
-        policy: &'p ResidualPolicyReference<V::Type>,
-        replay_region_operations: bool,
-    ) -> Result<Self, ProgramError> {
-        // Local references that escape through an output of the known program (including handle edges) are shared with
-        // work outside it, so their lifecycles are not tracked and none of their accesses is ever replayed.
-        let region = known_program.entry_region_ref();
-        let analysis = region.reference_analysis(0)?;
-        let escaping = analysis.output_roots().iter().flatten().copied().collect::<HashSet<_>>();
-        let lifecycles = analysis.local_lifecycles(region, |root| !escaping.contains(&root))?;
-        let atom_count = known_program.atoms().len();
-        let mut is_input = vec![false; atom_count];
-        known_program.input_ids().iter().for_each(|input| is_input[input.index()] = true);
-        Ok(Self {
-            known_program,
-            edges,
-            policy,
-            replay_region_operations,
-            lifecycles,
-            instruction_by_output: known_program.instruction_by_output(),
-            is_input,
-            provenance: ResidualProvenance { program: known_program, summaries: HashMap::new() },
-            replayable: vec![None; known_program.instructions().len()],
-            plans: (0..atom_count).map(|_| None).collect(),
-            replay_instructions: BTreeSet::new(),
-        })
-    }
-
-    /// Plans the known atoms that residual work demands, starting from `seeds`. Each demanded atom is planned once and
-    /// each recomputed atom marks its producer for replay, which demands the inputs of the producer and replays its
-    /// state predecessors in turn.
-    fn discover(&mut self, seeds: Vec<AtomId>) -> Result<(), ResidualPolicyError> {
-        let mut atoms = seeds;
-        atoms.reverse();
-        let mut instructions = Vec::new();
-        loop {
-            while let Some(atom) = atoms.pop() {
-                if self.plans[atom.index()].is_some() {
-                    continue;
-                }
-                let plan = self.plan(atom)?;
-                if matches!(plan, ResidualPlan::Recompute) {
-                    // The `unwrap` is safe because only atoms produced by instructions are ever recomputed.
-                    instructions.push(self.instruction_by_output[atom.index()].unwrap());
-                }
-                self.plans[atom.index()] = Some(plan);
-            }
-            let Some(index) = instructions.pop() else {
-                return Ok(());
-            };
-            if self.replay_instructions.insert(index) {
-                atoms.extend(self.known_program.instructions()[index].inputs().iter().rev().copied());
-                instructions.extend(self.lifecycles.state_predecessors(index));
-            }
-        }
-    }
-
-    /// Returns the plan of the demanded known atom `atom`.
-    fn plan(&mut self, atom: AtomId) -> Result<ResidualPlan<V::Type>, ResidualPolicyError> {
-        let known_program = self.known_program;
-        let atom_type = match &known_program.atoms()[atom.index()] {
-            Atom::Constant(_) => return Ok(ResidualPlan::Constant),
-            Atom::Variable(r#type) => r#type.clone(),
-        };
-        if self.is_input[atom.index()] {
-            return Ok(ResidualPlan::Edge(None));
-        }
-
-        // The `unwrap` is safe because every variable that is not an input is produced by an instruction.
-        let index = self.instruction_by_output[atom.index()].unwrap();
-        if atom_type.is_reference() {
-            // Residual work uses local reference state only through replayed lifecycles, and never through new handle
-            // edges. The handle edges of the original partition stay edges.
-            return if self.edges.contains(&atom) {
-                Ok(ResidualPlan::Edge(None))
-            } else if self.is_replayable(index) {
-                Ok(ResidualPlan::Recompute)
-            } else {
-                Err(ProgramError::MalformedProgram(format!(
-                    "residual work requires the reference produced by operation `{}` as a new edge",
-                    known_program.instructions()[index].operation().name(),
-                ))
-                .into())
-            };
-        }
-        if !self.is_replayable(index) {
-            return Ok(ResidualPlan::Edge(None));
-        }
-
-        // Replaying a region-carrying producer re-executes it as a whole, which would undo the per-iteration and
-        // per-branch decisions of a split rule that already placed the residuals of its body with the same policy.
-        if !self.replay_region_operations && !known_program.instructions()[index].regions().is_empty() {
-            return Ok(ResidualPlan::Edge(None));
-        }
-
-        // Values that only forward region inputs or constants have no producer that a policy could classify.
-        let value = ValueId::new(known_program.entry(), atom);
-        let Some(candidate) = self.provenance.candidate(value, atom_type)? else {
-            return Ok(ResidualPlan::Edge(None));
-        };
-        Ok(match self.policy.classify(&candidate)? {
-            ResidualDecision::Save => ResidualPlan::Edge(None),
-            ResidualDecision::SaveWith(storage) => ResidualPlan::Edge(Some(storage)),
-            ResidualDecision::Recompute => ResidualPlan::Recompute,
-        })
-    }
-
-    /// Returns whether the instruction at position `index` of the known program can be replayed in the residual
-    /// program, which requires it and its transitive state predecessors to be recomputable.
-    fn is_replayable(&mut self, index: usize) -> bool {
-        if let Some(replayable) = self.replayable[index] {
-            return replayable;
-        }
-        let mut pending = vec![index];
-        let mut visited = HashSet::new();
-        let mut replayable = true;
-        while let Some(index) = pending.pop() {
-            if !visited.insert(index) {
-                continue;
-            }
-            if !self.lifecycles.is_recomputable(index) {
-                replayable = false;
-                break;
-            }
-            pending.extend(self.lifecycles.state_predecessors(index));
-        }
-        self.replayable[index] = Some(replayable);
-        replayable
-    }
-
-    /// Returns the edges of the planned partition, in the order of the residual program inputs that consume them: the
-    /// edges of the original partition that remain edges, at their relative positions among the inputs of the original
-    /// residual program, followed by the new edges in known-program order.
-    fn planned_edges(&self, residual_inputs: &[PartialEvaluationInput<usize>]) -> Vec<AtomId> {
-        let is_edge = |atom: &AtomId| matches!(self.plans[atom.index()], Some(ResidualPlan::Edge(_)));
-        let mut planned_edges = Vec::new();
-        let old_edges = residual_inputs.iter().filter_map(|input| match input {
-            PartialEvaluationInput::Known(edge) => Some(self.edges[*edge]),
-            PartialEvaluationInput::Unknown(_) => None,
-        });
-        let new_edges = (0..self.plans.len()).map(AtomId::new);
-        for atom in old_edges.chain(new_edges) {
-            if is_edge(&atom) && !planned_edges.contains(&atom) {
-                planned_edges.push(atom);
-            }
-        }
-        planned_edges
-    }
-
-    /// Emits the planned known program, which copies the known program with its known outputs followed by
-    /// `planned_edges` as outputs, stages the store operations of stored edges right after their producers, and
-    /// removes the local reference lifecycles that the residual program replays and that the known program no longer
-    /// observes. Returns the planned known program together with the types of its edge outputs.
-    fn emit_known_program(
-        &self,
-        known_output_count: usize,
-        planned_edges: &[AtomId],
-    ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<V::Type>), ResidualPolicyError> {
-        let known_program = self.known_program;
-        let mut builder = ProgramBuilder::<V, O>::new();
-        let mut atoms = vec![None; known_program.atoms().len()];
-        for input in known_program.input_ids() {
-            atoms[input.index()] = Some(builder.add_input(known_program.atoms()[input.index()].r#type().into_owned()));
-        }
-        let mut stored_atoms = HashMap::new();
-        let mut remapping = HashMap::new();
-        for instruction in known_program.instructions() {
-            let inputs = instruction
-                .inputs()
-                .iter()
-                .map(|input| copy_atom(known_program, *input, &mut atoms, &mut builder))
-                .collect::<Result<Vec<_>, _>>()?;
-            let regions = instruction
-                .regions()
-                .iter()
-                .map(|region| {
-                    Ok(builder.import_region_with_remapping(known_program.region_ref(*region)?, &mut remapping))
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-            let outputs = builder
-                .add_instruction(
-                    instruction.operation().clone(),
-                    regions,
-                    inputs,
-                    Some(instruction.provenance().clone()),
-                )?
-                .to_vec();
-            for (source, output) in instruction.outputs().iter().zip(outputs) {
-                atoms[source.index()] = Some(output);
-                if let Some(ResidualPlan::Edge(Some(storage))) = &self.plans[source.index()] {
-                    let residual_type = known_program.atoms()[source.index()].r#type().into_owned();
-                    let payloads = storage.store_payloads(&residual_type)?;
-                    stored_atoms.insert(*source, stage_storage(&mut builder, output, payloads, &**storage)?);
-                }
-            }
-        }
-
-        let mut outputs = known_program.output_ids()[..known_output_count]
-            .iter()
-            .map(|output| copy_atom(known_program, *output, &mut atoms, &mut builder))
-            .collect::<Result<Vec<_>, _>>()?;
-        for edge in planned_edges {
-            outputs.push(match stored_atoms.get(edge) {
-                Some(stored_atom) => *stored_atom,
-                None => copy_atom(known_program, *edge, &mut atoms, &mut builder)?,
-            });
-        }
-        let edge_types = outputs[known_output_count..]
-            .iter()
-            .map(|output| builder.atoms()[output.index()].r#type().into_owned())
-            .collect::<Vec<_>>();
-
-        // The residual program replays these lifecycles, so the known program keeps them only if it still observes
-        // them itself.
-        let replayed_allocations = self
-            .replay_instructions
-            .iter()
-            .flat_map(|index| {
-                let instruction = &known_program.instructions()[*index];
-                instruction
-                    .operation()
-                    .effects()
-                    .allocation_output_indices()
-                    .filter_map(|output_index| instruction.outputs().get(output_index))
-                    .filter_map(|output| atoms[output.index()])
-                    .collect::<Vec<_>>()
-            })
-            .collect::<HashSet<_>>();
-        let input_count = known_program.input_ids().len();
-        let output_count = outputs.len();
-        let known_program = builder
-            .build::<Vec<V>, Vec<V>>(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])?
-            .without_unobserved_local_references(&replayed_allocations)?
-            .into_simplified()?;
-        Ok((known_program, edge_types))
-    }
-
-    /// Emits the planned residual program, which replays the instructions of the known program marked for replay, in
-    /// program order, followed by a copy of `residual_program` whose edge inputs resolve to the planned edges or to the
-    /// replayed values. Restore operations of stored edges are staged right before their first consumers. Returns the
-    /// planned residual program together with the sources of its inputs.
-    fn emit_residual_program(
-        &self,
-        residual_program: &Program<V, O, Vec<V>, Vec<V>>,
-        residual_inputs: &[PartialEvaluationInput<usize>],
-        planned_edges: &[AtomId],
-        edge_types: &[V::Type],
-    ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<PartialEvaluationInput<usize>>), ResidualPolicyError> {
-        let known_program = self.known_program;
-        let mut builder = ProgramBuilder::<V, O>::new();
-        let mut planned_inputs = Vec::new();
-        let mut residual_atoms = vec![None; residual_program.atoms().len()];
-        let mut edge_inputs = HashMap::new();
-        let mut add_edge_input = |edge: AtomId, builder: &mut ProgramBuilder<V, O>, planned_inputs: &mut Vec<_>| {
-            if let Some(position) = planned_edges.iter().position(|planned_edge| *planned_edge == edge)
-                && !edge_inputs.contains_key(&edge)
-            {
-                edge_inputs.insert(edge, builder.add_input(edge_types[position].clone()));
-                planned_inputs.push(PartialEvaluationInput::Known(position));
-            }
-        };
-        for (input, atom) in residual_inputs.iter().zip(residual_program.input_ids()) {
-            match input {
-                PartialEvaluationInput::Unknown(index) => {
-                    let r#type = residual_program.atoms()[atom.index()].r#type().into_owned();
-                    residual_atoms[atom.index()] = Some(builder.add_input(r#type));
-                    planned_inputs.push(PartialEvaluationInput::Unknown(*index));
-                }
-                PartialEvaluationInput::Known(edge) => {
-                    add_edge_input(self.edges[*edge], &mut builder, &mut planned_inputs)
-                }
-            }
-        }
-        for edge in planned_edges {
-            add_edge_input(*edge, &mut builder, &mut planned_inputs);
-        }
-
-        let mut known_atoms = vec![None; known_program.atoms().len()];
-        let mut remapping = HashMap::new();
-        for index in &self.replay_instructions {
-            let instruction = &known_program.instructions()[*index];
-            let inputs = instruction
-                .inputs()
-                .iter()
-                .map(|input| self.resolve_known_atom(*input, &edge_inputs, &mut known_atoms, &mut builder))
-                .collect::<Result<Vec<_>, _>>()?;
-            let regions = instruction
-                .regions()
-                .iter()
-                .map(|region| {
-                    Ok(builder.import_region_with_remapping(known_program.region_ref(*region)?, &mut remapping))
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-            let outputs = builder
-                .add_instruction(
-                    instruction.operation().clone(),
-                    regions,
-                    inputs,
-                    Some(instruction.provenance().clone()),
-                )?
-                .to_vec();
-            for (source, output) in instruction.outputs().iter().zip(outputs) {
-                // Saved outputs keep resolving to their edges even though their producer is replayed.
-                if !matches!(self.plans[source.index()], Some(ResidualPlan::Edge(_))) {
-                    known_atoms[source.index()] = Some(output);
-                }
-            }
-        }
-
-        // Edge inputs of the original residual program resolve to the planned known atoms that they received. Edges
-        // that the original residual program does not read were never demanded, so they have no plan and are dropped.
-        for (input, atom) in residual_inputs.iter().zip(residual_program.input_ids()) {
-            if let PartialEvaluationInput::Known(edge) = input
-                && self.plans[self.edges[*edge].index()].is_some()
-            {
-                residual_atoms[atom.index()] =
-                    Some(self.resolve_known_atom(self.edges[*edge], &edge_inputs, &mut known_atoms, &mut builder)?);
-            }
-        }
-        let mut remapping = HashMap::new();
-        for instruction in residual_program.instructions() {
-            let inputs = instruction
-                .inputs()
-                .iter()
-                .map(|input| copy_atom(residual_program, *input, &mut residual_atoms, &mut builder))
-                .collect::<Result<Vec<_>, _>>()?;
-            let regions = instruction
-                .regions()
-                .iter()
-                .map(|region| {
-                    Ok(builder.import_region_with_remapping(residual_program.region_ref(*region)?, &mut remapping))
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-            let outputs = builder
-                .add_instruction(
-                    instruction.operation().clone(),
-                    regions,
-                    inputs,
-                    Some(instruction.provenance().clone()),
-                )?
-                .to_vec();
-            for (source, output) in instruction.outputs().iter().zip(outputs) {
-                residual_atoms[source.index()] = Some(output);
-            }
-        }
-        let outputs = residual_program
-            .output_ids()
-            .iter()
-            .map(|output| copy_atom(residual_program, *output, &mut residual_atoms, &mut builder))
-            .collect::<Result<Vec<_>, _>>()?;
-        let input_count = planned_inputs.len();
-        let output_count = outputs.len();
-        let residual_program = builder
-            .build::<Vec<V>, Vec<V>>(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])?
-            .into_simplified()?;
-        Ok((residual_program, planned_inputs))
-    }
-
-    /// Returns the atom of the planned residual program that provides the demanded known atom `atom`: its edge input
-    /// (through the restore operations of its storage, which are staged on first use), its replayed value, or a
-    /// re-created constant.
-    fn resolve_known_atom(
-        &self,
-        atom: AtomId,
-        edge_inputs: &HashMap<AtomId, AtomId>,
-        known_atoms: &mut [Option<AtomId>],
-        builder: &mut ProgramBuilder<V, O>,
-    ) -> Result<AtomId, ResidualPolicyError> {
-        if let Some(resolved) = known_atoms[atom.index()] {
-            return Ok(resolved);
-        }
-        let known_program = self.known_program;
-        let resolved = match &self.plans[atom.index()] {
-            Some(ResidualPlan::Edge(storage)) => {
-                let input = edge_inputs[&atom];
-                match storage {
-                    None => input,
-                    Some(storage) => {
-                        let stored_type = builder.atoms()[input.index()].r#type().into_owned();
-                        let residual_type = known_program.atoms()[atom.index()].r#type().into_owned();
-                        let payloads = storage.restore_payloads(&stored_type, &residual_type)?;
-                        let restored = stage_storage(builder, input, payloads, &**storage)?;
-                        let restored_type = builder.atoms()[restored.index()].r#type().into_owned();
-                        let reproduces = |left: &V::Type, right: &V::Type| {
-                            V::Type::derive_identity_renaming(std::slice::from_ref(left), std::slice::from_ref(right))
-                                .is_ok()
-                        };
-                        if !reproduces(&residual_type, &restored_type) || !reproduces(&restored_type, &residual_type) {
-                            return Err(ResidualPolicyError::InvalidStorage {
-                                storage: storage.name(),
-                                message: format!(
-                                    "its restore operations produce `{restored_type}` instead of the residual type \
-                                     `{residual_type}`",
-                                ),
-                            });
-                        }
-                        restored
-                    }
-                }
-            }
-            Some(ResidualPlan::Constant) | None => match &known_program.atoms()[atom.index()] {
-                Atom::Constant(value) => builder.add_constant(value.clone()),
-                Atom::Variable(_) => {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "known atom {atom} is neither saved nor recomputed by the residual plan",
-                    ))
-                    .into());
-                }
-            },
-            Some(ResidualPlan::Recompute) => {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "known atom {atom} is used before the residual program recomputes it",
-                ))
-                .into());
-            }
-        };
-        known_atoms[atom.index()] = Some(resolved);
-        Ok(resolved)
-    }
-}
 
 /// Returns the atom of `builder` that copies atom `atom` of `program`, using `atoms` to map the atoms of `program` that
 /// were already copied and copying constants on first use.
@@ -1909,7 +1838,8 @@ mod tests {
         build(builder, vec![sine, tangent])
     }
 
-    /// Returns the inputs of [`sin_dot_program`] used to check that planned partitions compute the same outputs.
+    /// Returns the inputs of [`sin_dot_program`] used to check that partitions with placed residuals compute the same
+    /// outputs.
     fn sin_dot_inputs() -> Vec<TestValue> {
         vec![
             ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap()),
