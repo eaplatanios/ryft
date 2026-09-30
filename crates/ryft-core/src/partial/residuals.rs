@@ -1355,8 +1355,6 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Placement of the residuals of the partitions of programs over values of type `V`
 /// and operations of family `O` according to one residual policy. It is type-erased so that a
 /// [`PartialEvaluationContext`](crate::PartialEvaluationContext) can carry a policy into the partitions that the
@@ -1414,18 +1412,15 @@ fn copy_atom<V: Value, O: Operation<Type = V::Type>>(
     }
 }
 
-/// Stages the chain of storage operations that `payloads` describe on atom `atom` of `builder` and returns the atom of
-/// its final result. Each payload is constructed in the operation family of `builder` and must be a pure unary
+/// Stages the chain of storage operations that `payloads` describe on atom `atom` of `builder` and returns the atom
+/// of its final result. Each payload is constructed in the operation family of `builder` and must be a pure unary
 /// operation with a single result.
-fn stage_storage<V: Value, O: Operation<Type = V::Type> + OperationPayloadProjection>(
+fn stage_storage<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadProjection>(
     builder: &mut ProgramBuilder<V, O>,
     atom: AtomId,
     payloads: Vec<ErasedOperation>,
     storage: &dyn ResidualStorage<V::Type>,
-) -> Result<AtomId, ResidualPolicyError>
-where
-    V::Type: 'static,
-{
+) -> Result<AtomId, ResidualPolicyError> {
     payloads.into_iter().try_fold(atom, |atom, payload| {
         let operation = O::from_payload(payload).map_err(|payload| ResidualPolicyError::UnsupportedStorage {
             storage: storage.name(),
@@ -1443,21 +1438,10 @@ where
             [output] => Ok(*output),
             outputs => Err(ResidualPolicyError::InvalidStorage {
                 storage: storage.name(),
-                message: format!("its operation `{name}` has {} results instead of one", outputs.len()),
+                message: format!("its operation `{}` has {} results instead of one", name, outputs.len()),
             }),
         }
     })
-}
-
-/// Leaf of the symbolic provenance of a value, as resolved by [`ResidualProvenance`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum ProvenanceLeaf {
-    /// Output of an instruction that produces it itself, rather than forwarding an output of an attached region.
-    Producer(ValueId),
-
-    /// Input at the provided position of the region that contains the value, which each call site of that region
-    /// resolves through its own operands.
-    Input(usize),
 }
 
 /// Resolution of the operation outputs that may have produced the values of a [`Program`], which looks through the
@@ -1579,6 +1563,17 @@ impl<'p, V: Value, O: Operation<Type = V::Type> + OperationPayloadProjection> Re
         self.summaries.insert((region, output_index), summary.clone());
         Ok(summary)
     }
+}
+
+/// Leaf of the symbolic provenance of a value, as resolved by [`ResidualProvenance`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum ProvenanceLeaf {
+    /// Output of an instruction that produces it itself, rather than forwarding an output of an attached region.
+    Producer(ValueId),
+
+    /// Input at the provided position of the region that contains the value, which each call site of that region
+    /// resolves through its own operands.
+    Input(usize),
 }
 
 #[cfg(test)]
