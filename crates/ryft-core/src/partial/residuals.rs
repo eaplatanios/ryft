@@ -1598,6 +1598,8 @@ fn stage_storage<V: Value<Type: 'static>, O: Operation<Type = V::Type> + Operati
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -1642,51 +1644,6 @@ mod tests {
         }
     }
 
-    /// [`ResidualStorage`] that stores residuals by transferring them to host memory and whose restoration returns
-    /// them unchanged, which violates the storage contract because it does not reproduce the residual type.
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    struct ForgetfulStorage;
-
-    impl<T: Type> ResidualStorage<T> for ForgetfulStorage {
-        fn name(&self) -> String {
-            "forgetful".to_owned()
-        }
-
-        fn store_payloads(&self, _residual_type: &T) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
-            Ok(vec![ErasedOperation::new(TransferToMemoryOperation::new(Memory::Host { pinned: true }))])
-        }
-
-        fn restore_payloads(
-            &self,
-            _stored_type: &T,
-            _residual_type: &T,
-        ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
-            Ok(Vec::new())
-        }
-    }
-
-    /// [`ResidualStorage`] whose payload the operation family of the tests cannot hold.
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    struct UnsupportedStorage;
-
-    impl<T: Type> ResidualStorage<T> for UnsupportedStorage {
-        fn name(&self) -> String {
-            "unsupported".to_owned()
-        }
-
-        fn store_payloads(&self, _residual_type: &T) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
-            Ok(vec![ErasedOperation::new(TagOperation::<ArrayIrType>::new("unsupported"))])
-        }
-
-        fn restore_payloads(
-            &self,
-            _stored_type: &T,
-            _residual_type: &T,
-        ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
-            Ok(Vec::new())
-        }
-    }
-
     /// [`ResidualPolicy`] that returns whatever `classify` returns for each candidate, in any type universe.
     struct TestPolicy<F> {
         /// Name of the policy.
@@ -1728,6 +1685,14 @@ mod tests {
     /// Returns a policy that recomputes every residual.
     fn save_nothing() -> ResidualPolicyReference<ArrayIrType> {
         policy("save_nothing", |_| Ok(ResidualDecision::<NoStorage>::Recompute))
+    }
+
+    /// Returns a policy over [`ArrayType`] that recomputes every residual.
+    fn save_nothing_in_arrays() -> ResidualPolicyReference<ArrayType> {
+        ResidualPolicyReference::new(TestPolicy {
+            name: "save_nothing",
+            classify: |_: &ResidualCandidate<'_, ArrayType>| Ok(ResidualDecision::<NoStorage>::Recompute),
+        })
     }
 
     /// Returns a policy that saves every residual.
@@ -1778,9 +1743,34 @@ mod tests {
         ArrayType::scalar(DataType::F64).into()
     }
 
+    /// Returns the [`ArrayIrType`] of dimensions named `n`, which does not project into [`ArrayType`].
+    fn dimension_type() -> ArrayIrType {
+        ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::non_negative(None).unwrap()))
+    }
+
     /// Returns a dot product of two vectors.
     fn dot() -> ArrayOperation<Array> {
         DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![])).into()
+    }
+
+    /// Returns an operation that produces the size of the leading dimension of an `f64` vector of size 3 as a
+    /// dimension of type [`dimension_type`].
+    fn dimension_size() -> TestOperation {
+        TestOperation::DimensionSize(
+            DimensionSizeOperation::new(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap(),
+        )
+    }
+
+    /// Returns a candidate of type `residual_type` that output 0 of `operation` produces from inputs of `input_types`.
+    fn candidate(
+        operation: &TestOperation,
+        input_types: Vec<ArrayIrType>,
+        residual_type: ArrayIrType,
+    ) -> ResidualCandidate<'_, ArrayIrType> {
+        ResidualCandidate::new(
+            vec![ResidualProducer::new(operation, 0, input_types, vec![residual_type.clone()])],
+            residual_type,
+        )
     }
 
     /// Adds the array operation `operation` to `builder` and returns its first output.
@@ -1893,15 +1883,44 @@ mod tests {
     #[test]
     fn test_residual_policy_error() {
         let rejection = ResidualRejection::new("never save `x`");
-        let error = ResidualPolicyError::Rejected { policy: "names".to_owned(), rejection };
-        assert_eq!(error.to_string(), "residual policy `names` rejected a residual: never save `x`");
-        assert_eq!(ResidualPolicyError::from(ProgramError::from(error.clone())), error);
+        let rejected = ResidualPolicyError::Rejected { policy: "names".to_owned(), rejection };
+        assert_eq!(rejected.to_string(), "residual policy `names` rejected a residual: never save `x`");
+        assert_eq!(
+            ResidualPolicyError::UnsupportedProjection {
+                policy: "names".to_owned(),
+                position: "the residual".to_owned(),
+                residual_type: "n".to_owned(),
+            }
+            .to_string(),
+            "residual policy `names` cannot classify the residual of type `n`, which does not project into the type \
+             universe of the policy; register a native instantiation or a projection fallback for this universe",
+        );
+        assert_eq!(
+            ResidualPolicyError::UnsupportedStorage {
+                storage: "negation".to_owned(),
+                residual_type: "f64[]".to_owned(),
+                message: "no payload".to_owned(),
+            }
+            .to_string(),
+            "residual storage `negation` cannot stage a residual of type `f64[]`: no payload",
+        );
+        assert_eq!(
+            ResidualPolicyError::InvalidStorage {
+                storage: "negation".to_owned(),
+                message: "its operation `neg` is not pure".to_owned(),
+            }
+            .to_string(),
+            "residual storage `negation` is invalid: its operation `neg` is not pure",
+        );
 
-        // Program errors round trip through their dedicated variant.
+        // Residual-policy errors round trip through program errors, while program errors round trip through their
+        // dedicated variant, which renders like the program error that it wraps.
+        assert_eq!(ResidualPolicyError::from(ProgramError::from(rejected.clone())), rejected);
         let program_error = ProgramError::MalformedProgram("broken".to_owned());
+        assert_eq!(ResidualPolicyError::Program(program_error.clone()).to_string(), program_error.to_string());
         assert_eq!(
             ResidualPolicyError::from(program_error.clone()),
-            ResidualPolicyError::Program(program_error.clone())
+            ResidualPolicyError::Program(program_error.clone()),
         );
         assert_eq!(ProgramError::from(ResidualPolicyError::Program(program_error.clone())), program_error);
     }
@@ -1914,10 +1933,20 @@ mod tests {
         assert_eq!(producer.output_index(), 0);
         assert_eq!(producer.input_types(), &[vector_type(), vector_type()]);
         assert_eq!(producer.output_types(), &[scalar_type()]);
+    }
 
-        // Payloads are recognized through the projected array member of the operation family.
+    #[test]
+    fn test_residual_producer_payload() {
+        // Payloads are recognized both through the projected array member of the operation family and among the
+        // native operations of the family, while payloads of other operations are not.
+        let dot = TestOperation::from(dot());
+        let producer = ResidualProducer::new(&dot, 0, vec![vector_type(), vector_type()], vec![scalar_type()]);
         assert!(producer.payload::<DotOperation>().is_some());
         assert!(producer.payload::<SinOperation<ArrayType>>().is_none());
+        let dimension_size = dimension_size();
+        let producer = ResidualProducer::new(&dimension_size, 0, vec![vector_type()], vec![dimension_type()]);
+        assert!(producer.payload::<DimensionSizeOperation>().is_some());
+        assert!(producer.payload::<DotOperation>().is_none());
     }
 
     #[test]
@@ -1952,39 +1981,162 @@ mod tests {
     }
 
     #[test]
+    fn test_native_residual_policies_with() {
+        // A policy over `ArrayType` that declares an `ArrayIrType` instantiation, which it registers twice so that the
+        // second registration replaces the first.
+        struct SavingPolicy;
+
+        impl ResidualPolicy<ArrayType> for SavingPolicy {
+            type Storage = NoStorage;
+
+            fn name(&self) -> &str {
+                "saving"
+            }
+
+            fn classify(
+                &self,
+                _candidate: &ResidualCandidate<'_, ArrayType>,
+            ) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
+                Ok(ResidualDecision::Save)
+            }
+
+            fn native_instantiations(&self) -> NativeResidualPolicies {
+                NativeResidualPolicies::default()
+                    .with(TestPolicy {
+                        name: "replaced",
+                        classify: |_: &ResidualCandidate<'_, ArrayIrType>| Ok(ResidualDecision::<NoStorage>::Recompute),
+                    })
+                    .with(TestPolicy {
+                        name: "saving",
+                        classify: |_: &ResidualCandidate<'_, ArrayIrType>| Ok(ResidualDecision::<NoStorage>::Save),
+                    })
+            }
+        }
+
+        // Lifting the policy into `ArrayIrType` uses the registered instantiation, which also classifies the candidates
+        // that do not project into `ArrayType` (e.g., dimensions).
+        let lifted = ResidualPolicyReference::new(SavingPolicy).lift::<ArrayIrType>();
+        assert_eq!(lifted.name(), "saving");
+        let dimension_size = dimension_size();
+        assert!(matches!(
+            lifted.classify(&candidate(&dimension_size, vec![vector_type()], dimension_type())),
+            Ok(ResidualDecision::Save),
+        ));
+    }
+
+    #[test]
+    fn test_projection_fallback_candidate() {
+        // A candidate whose second producer does not project into `ArrayType` reaches the projection fallback, which
+        // observes the complete candidate together with which of its types project.
+        let dot = TestOperation::from(dot());
+        let dimension_size = dimension_size();
+        let candidate = ResidualCandidate::new(
+            vec![
+                ResidualProducer::new(&dot, 0, vec![vector_type(), vector_type()], vec![scalar_type()]),
+                ResidualProducer::new(&dimension_size, 0, vec![vector_type()], vec![dimension_type()]),
+            ],
+            scalar_type(),
+        );
+        let lifted = save_nothing_in_arrays()
+            .with_projection_fallback::<ArrayIrType, _>(
+                |candidate: &ProjectionFallbackCandidate<'_, '_, ArrayIrType>| {
+                    let producers = candidate.candidate().producers();
+                    assert_eq!(
+                        producers.iter().map(ResidualProducer::name).collect::<Vec<_>>(),
+                        ["dot", "dimension_size"],
+                    );
+                    assert_eq!(candidate.producer_projectable(), &[true, false]);
+                    assert!(candidate.residual_projectable());
+                    Ok(ResidualDecision::Save)
+                },
+            )
+            .lift::<ArrayIrType>();
+        assert!(matches!(lifted.classify(&candidate), Ok(ResidualDecision::Save)));
+    }
+
+    #[test]
     fn test_residual_policy_reference() {
         let dots = save_dots(None);
         assert_eq!(dots.name(), "save_dots");
         assert_eq!(
             format!("{dots:?}"),
-            format!("ResidualPolicyReference {{ name: \"save_dots\", id: {} }}", dots.id())
+            format!("ResidualPolicyReference {{ name: \"save_dots\", id: {} }}", dots.id()),
         );
 
-        // References compare and hash by definition: clones are equal, while separately registered equal policies and
-        // the opt-ins, which change what a policy decides, are distinct definitions.
-        let hash = |reference: &ResidualPolicyReference<ArrayIrType>| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            reference.hash(&mut hasher);
-            hasher.finish()
-        };
-        assert_eq!(dots.clone(), dots);
-        assert_eq!(hash(&dots.clone()), hash(&dots));
-        assert_ne!(save_dots(None), dots);
-        let native = dots.clone().with_native_instantiation::<ArrayType, _>(TestPolicy {
-            name: "save_dots",
-            classify: |_: &ResidualCandidate<'_, ArrayType>| Ok(ResidualDecision::<NoStorage>::Save),
+        // References compare and hash by definition: clones are the same definition, while separately registered
+        // policies are distinct definitions even when they behave identically.
+        let clone = dots.clone();
+        let other = save_dots(None);
+        assert_eq!(clone.id(), dots.id());
+        assert_eq!(clone, dots);
+        assert_ne!(other.id(), dots.id());
+        assert_ne!(other, dots);
+        let definitions = HashSet::from([dots, other]);
+        assert_eq!(definitions.len(), 2);
+        assert!(definitions.contains(&clone));
+        assert!(!definitions.contains(&save_dots(None)));
+    }
+
+    #[test]
+    fn test_residual_policy_reference_with_native_instantiation() {
+        // Lifting a policy over `ArrayType` into `ArrayIrType` cannot classify dimensions by projection. Registering a
+        // native `ArrayIrType` instantiation creates a new definition, whose lift uses that instantiation for every
+        // candidate.
+        let source = save_nothing_in_arrays();
+        let dot = TestOperation::from(dot());
+        let dimension_size = dimension_size();
+        let dot_candidate = candidate(&dot, vec![vector_type(), vector_type()], scalar_type());
+        let dimension_candidate = candidate(&dimension_size, vec![vector_type()], dimension_type());
+        assert!(matches!(
+            source.lift::<ArrayIrType>().classify(&dimension_candidate),
+            Err(ResidualPolicyError::UnsupportedProjection { .. }),
+        ));
+        let native = source.clone().with_native_instantiation::<ArrayIrType, _>(TestPolicy {
+            name: "native_recompute",
+            classify: |candidate: &ResidualCandidate<'_, ArrayIrType>| {
+                Ok(match candidate.residual_type() {
+                    ArrayIrType::Dimension(_) => ResidualDecision::<NoStorage>::Save,
+                    _ => ResidualDecision::Recompute,
+                })
+            },
         });
-        assert_ne!(native.id(), dots.id());
-        let fallback = dots.clone().with_projection_fallback::<ArrayType, _>(|_| Ok(ResidualDecision::Save));
-        assert_ne!(fallback.id(), dots.id());
-        assert_ne!(fallback.id(), native.id());
+        assert_ne!(native.id(), source.id());
+        let lifted = native.lift::<ArrayIrType>();
+        assert_eq!(lifted.id(), native.id());
+        assert_eq!(lifted.name(), "native_recompute");
+        assert!(matches!(lifted.classify(&dimension_candidate), Ok(ResidualDecision::Save)));
+        assert!(matches!(lifted.classify(&dot_candidate), Ok(ResidualDecision::Recompute)));
+    }
+
+    #[test]
+    fn test_residual_policy_reference_with_projection_fallback() {
+        // Registering a projection fallback creates a new definition, whose lift classifies the candidates that do not
+        // project with the fallback while projectable candidates still reach the source policy. A later registration
+        // for the same universe replaces an earlier one.
+        let source = save_nothing_in_arrays();
+        let fallback = source
+            .clone()
+            .with_projection_fallback::<ArrayIrType, _>(|_| Ok(ResidualDecision::Recompute))
+            .with_projection_fallback::<ArrayIrType, _>(|_| Ok(ResidualDecision::Save));
+        assert_ne!(fallback.id(), source.id());
+        let lifted = fallback.lift::<ArrayIrType>();
+        assert_eq!(lifted.id(), fallback.id());
+        let dot = TestOperation::from(dot());
+        let dimension_size = dimension_size();
+        assert!(matches!(
+            lifted.classify(&candidate(&dimension_size, vec![vector_type()], dimension_type())),
+            Ok(ResidualDecision::Save),
+        ));
+        assert!(matches!(
+            lifted.classify(&candidate(&dot, vec![vector_type(), vector_type()], scalar_type())),
+            Ok(ResidualDecision::Recompute),
+        ));
     }
 
     #[test]
     fn test_residual_policy_reference_classify() {
         let operation = TestOperation::from(dot());
-        let producer = ResidualProducer::new(&operation, 0, vec![vector_type(), vector_type()], vec![scalar_type()]);
-        let candidate = ResidualCandidate::new(vec![producer], scalar_type());
+        let candidate = candidate(&operation, vec![vector_type(), vector_type()], scalar_type());
         assert!(matches!(save_dots(None).classify(&candidate), Ok(ResidualDecision::Save)));
         assert!(matches!(save_nothing().classify(&candidate), Ok(ResidualDecision::Recompute)));
         let Ok(ResidualDecision::SaveWith(storage)) = save_dots(Some(NegationStorage)).classify(&candidate) else {
@@ -1998,7 +2150,7 @@ mod tests {
             rejecting.classify(&candidate).map(|_| ()),
             Err(ResidualPolicyError::Rejected {
                 policy: "rejecting".to_owned(),
-                rejection: ResidualRejection::new("never")
+                rejection: ResidualRejection::new("never"),
             }),
         );
     }
@@ -2017,79 +2169,43 @@ mod tests {
         });
         let dot = TestOperation::from(dot());
         let sine = TestOperation::from(ArrayOperation::<Array>::from(SinOperation::<ArrayType>::new()));
-        let array_candidate = |operation| {
-            ResidualCandidate::new(
-                vec![ResidualProducer::new(operation, 0, vec![scalar_type()], vec![scalar_type()])],
-                scalar_type(),
-            )
-        };
-        let dimension_type =
-            ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::non_negative(None).unwrap()));
-        let dimension_size = TestOperation::DimensionSize(
-            DimensionSizeOperation::new(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap(),
-        );
-        let dimension_candidate = ResidualCandidate::new(
-            vec![ResidualProducer::new(&dimension_size, 0, vec![vector_type()], vec![dimension_type.clone()])],
-            dimension_type.clone(),
-        );
+        let dimension_size = dimension_size();
 
-        // Lifting by projection keeps the identity and the decisions of the source policy for projectable candidates,
-        // including its storage, whose residual types are projected.
+        // Lifting by projection keeps the identifier and the name of the source policy, and its decisions for
+        // projectable candidates, including its storage, whose residual types are projected too.
         let lifted = source.lift::<ArrayIrType>();
         assert_eq!(lifted.id(), source.id());
         assert_eq!(lifted.name(), "store_dots");
-        let Ok(ResidualDecision::SaveWith(storage)) = lifted.classify(&array_candidate(&dot)) else {
+        let Ok(ResidualDecision::SaveWith(storage)) =
+            lifted.classify(&candidate(&dot, vec![vector_type(), vector_type()], scalar_type()))
+        else {
             panic!("expected a stored residual");
         };
         assert_eq!(storage.name(), "negation");
         assert_eq!(storage.store_payloads(&scalar_type()).unwrap().len(), 1);
         assert_eq!(
-            storage.store_payloads(&dimension_type).map(|_| ()),
+            storage.store_payloads(&dimension_type()).map(|_| ()),
             Err(ResidualPolicyError::UnsupportedStorage {
                 storage: "negation".to_owned(),
-                residual_type: dimension_type.to_string(),
+                residual_type: dimension_type().to_string(),
                 message: "the type does not project into the type universe of the storage".to_owned(),
             }),
         );
-        assert!(matches!(lifted.classify(&array_candidate(&sine)), Ok(ResidualDecision::Recompute)));
+        assert!(matches!(
+            lifted.classify(&candidate(&sine, vec![scalar_type()], scalar_type())),
+            Ok(ResidualDecision::Recompute),
+        ));
 
-        // Candidates that do not project are unsupported unless the policy opts into classifying them.
+        // Candidates that do not project are unsupported, because the policy registers neither a native instantiation
+        // nor a projection fallback for `ArrayIrType`.
         assert_eq!(
-            lifted.classify(&dimension_candidate).map(|_| ()),
+            lifted.classify(&candidate(&dimension_size, vec![vector_type()], dimension_type())).map(|_| ()),
             Err(ResidualPolicyError::UnsupportedProjection {
                 policy: "store_dots".to_owned(),
                 position: "the output 0 of producer `dimension_size`".to_owned(),
-                residual_type: dimension_type.to_string(),
+                residual_type: dimension_type().to_string(),
             }),
         );
-        let fallback = source
-            .clone()
-            .with_projection_fallback::<ArrayIrType, _>(
-                |candidate: &ProjectionFallbackCandidate<'_, '_, ArrayIrType>| {
-                    assert_eq!(candidate.producer_projectable(), &[false]);
-                    assert!(!candidate.residual_projectable());
-                    assert_eq!(candidate.candidate().producers()[0].name(), "dimension_size");
-                    Ok(ResidualDecision::Save)
-                },
-            )
-            .lift::<ArrayIrType>();
-        assert!(matches!(fallback.classify(&dimension_candidate), Ok(ResidualDecision::Save)));
-        assert!(matches!(fallback.classify(&array_candidate(&dot)), Ok(ResidualDecision::SaveWith(_))));
-
-        // A native instantiation classifies every candidate of its universe.
-        let native = source.with_native_instantiation::<ArrayIrType, _>(TestPolicy {
-            name: "store_dots",
-            classify: |candidate: &ResidualCandidate<'_, ArrayIrType>| {
-                Ok(match candidate.residual_type() {
-                    ArrayIrType::Dimension(_) => ResidualDecision::<NoStorage>::Save,
-                    _ => ResidualDecision::Recompute,
-                })
-            },
-        });
-        let lifted = native.lift::<ArrayIrType>();
-        assert_eq!(lifted.id(), native.id());
-        assert!(matches!(lifted.classify(&dimension_candidate), Ok(ResidualDecision::Save)));
-        assert!(matches!(lifted.classify(&array_candidate(&dot)), Ok(ResidualDecision::Recompute)));
     }
 
     #[test]
@@ -2099,10 +2215,10 @@ mod tests {
         let expected = program.interpret(sin_dot_inputs()).unwrap();
 
         // Saving everything reproduces the partition, which saves the cosine.
-        let planned = program.partition(&[true, false]).unwrap().with_residual_policy(&save_everything()).unwrap();
-        assert_eq!(render(&planned), render(&partition));
+        let placed = program.partition(&[true, false]).unwrap().with_residual_policy(&save_everything()).unwrap();
+        assert_eq!(render(&placed), render(&partition));
         assert_eq!(
-            render(&planned),
+            render(&placed),
             indoc! {"
                 lambda %0:f64[3] .
                 let %1:f64[] = dot [
@@ -2118,9 +2234,9 @@ mod tests {
         );
 
         // Saving only dot products saves the dot product and recomputes its cosine in the residual program.
-        let planned = partition.with_residual_policy(&save_dots(None)).unwrap();
+        let placed = partition.with_residual_policy(&save_dots(None)).unwrap();
         assert_eq!(
-            render(&planned),
+            render(&placed),
             indoc! {"
                 lambda %0:f64[3] .
                 let %1:f64[] = dot [
@@ -2134,12 +2250,12 @@ mod tests {
                 in (%3)
                 [Unknown(1), Known(0)]"},
         );
-        assert_eq!(run(&planned, &sin_dot_inputs()), expected);
+        assert_eq!(run(&placed, &sin_dot_inputs()), expected);
 
         // Saving nothing recomputes the dot product too, which saves the known input that it needs.
-        let planned = program.partition(&[true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
+        let placed = program.partition(&[true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
         assert_eq!(
-            render(&planned),
+            render(&placed),
             indoc! {"
                 lambda %0:f64[3] .
                 let %1:f64[] = dot [
@@ -2156,16 +2272,16 @@ mod tests {
                 in (%4)
                 [Unknown(1), Known(0)]"},
         );
-        assert_eq!(run(&planned, &sin_dot_inputs()), expected);
+        assert_eq!(run(&placed, &sin_dot_inputs()), expected);
 
-        // Rejections of the policy fail planning.
+        // A rejection by the policy fails the placement of residuals.
         let rejecting = policy("rejecting", |_| Err::<ResidualDecision<NoStorage>, _>(ResidualRejection::new("never")));
         assert_eq!(
-            program.partition(&[true, false]).unwrap().with_residual_policy(&rejecting).map(|_| ()).unwrap_err(),
-            ResidualPolicyError::Rejected {
+            program.partition(&[true, false]).unwrap().with_residual_policy(&rejecting).map(|_| ()),
+            Err(ResidualPolicyError::Rejected {
                 policy: "rejecting".to_owned(),
-                rejection: ResidualRejection::new("never")
-            },
+                rejection: ResidualRejection::new("never"),
+            }),
         );
     }
 
@@ -2178,9 +2294,9 @@ mod tests {
         let exponential = add(&mut builder, ExpOperation::<ArrayType>::new().into(), vec![x]);
         let tangent = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![exponential, t]);
         let program = build(builder, vec![exponential, tangent]);
-        let planned = program.partition(&[true, false]).unwrap().with_residual_policy(&save_everything()).unwrap();
+        let placed = program.partition(&[true, false]).unwrap().with_residual_policy(&save_everything()).unwrap();
         assert_eq!(
-            render(&planned),
+            render(&placed),
             indoc! {"
                 lambda %0:f64[] .
                 let %1:f64[] = exp %0
@@ -2194,30 +2310,24 @@ mod tests {
 
     #[test]
     fn test_partitioned_program_with_residual_policy_decides_per_producer_output() {
+        let program = condition_program(true);
+        let reversed = condition_program(false);
         let inputs = vec![
             ArrayIrValue::Array(Array::scalar(true).unwrap()),
             ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
             ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
         ];
-        let plan = |first_consumed_first: bool, policy: ResidualPolicyReference<ArrayIrType>| {
-            let program = condition_program(first_consumed_first);
-            let planned = program.partition(&[true, true, false]).unwrap().with_residual_policy(&policy).unwrap();
-            assert_eq!(run(&planned, &inputs), program.interpret(inputs.clone()).unwrap());
-            render(&planned)
-        };
+        let expected = program.interpret(inputs.clone()).unwrap();
 
-        // Saving one output of the condition and recomputing the other replays the complete condition, whose saved
-        // output still resolves to its edge in either demand order. Storing one output instead stages its storage, and
-        // saving or storing both outputs replays nothing.
-        let renderings = [
-            plan(true, save_names(&["first"], &[])),
-            plan(false, save_names(&["first"], &[])),
-            plan(true, save_names(&[], &["first"])),
-            plan(true, save_names(&["first"], &["second"])),
-            plan(true, save_nothing()),
-        ];
+        // Saving the first output of the condition and recomputing the second replays the complete condition in the
+        // residual program, where the saved first output still resolves to its edge.
+        let placed = program
+            .partition(&[true, true, false])
+            .unwrap()
+            .with_residual_policy(&save_names(&["first"], &[]))
+            .unwrap();
         assert_eq!(
-            renderings.join("\n\n"),
+            render(&placed),
             indoc! {"
                 lambda %0:bool[], %1:f64[] .
                 let %2:f64[], %3:f64[] = condition %0 %1 [
@@ -2261,8 +2371,20 @@ mod tests {
                     ]
                     %7:f64[] = mul %6 %0
                 in (%4, %7)
-                [Unknown(2), Known(0), Known(1), Known(2)]
+                [Unknown(2), Known(0), Known(1), Known(2)]"},
+        );
+        assert_eq!(run(&placed, &inputs), expected);
 
+        // The saved output resolves to its edge in the other demand order too, where the residual program consumes the
+        // second output of the condition first.
+        let placed = reversed
+            .partition(&[true, true, false])
+            .unwrap()
+            .with_residual_policy(&save_names(&["first"], &[]))
+            .unwrap();
+        assert_eq!(
+            render(&placed),
+            indoc! {"
                 lambda %0:bool[], %1:f64[] .
                 let %2:f64[], %3:f64[] = condition %0 %1 [
                     true={
@@ -2305,8 +2427,19 @@ mod tests {
                     %6:f64[] = mul %5 %0
                     %7:f64[] = mul %1 %0
                 in (%6, %7)
-                [Unknown(2), Known(0), Known(1), Known(2)]
+                [Unknown(2), Known(0), Known(1), Known(2)]"},
+        );
+        assert_eq!(run(&placed, &inputs), reversed.interpret(inputs.clone()).unwrap());
 
+        // Storing the first output instead of saving it stages its storage around its edge.
+        let placed = program
+            .partition(&[true, true, false])
+            .unwrap()
+            .with_residual_policy(&save_names(&[], &["first"]))
+            .unwrap();
+        assert_eq!(
+            render(&placed),
+            indoc! {"
                 lambda %0:bool[], %1:f64[] .
                 let %2:f64[], %3:f64[] = condition %0 %1 [
                     true={
@@ -2351,8 +2484,19 @@ mod tests {
                     ]
                     %8:f64[] = mul %7 %0
                 in (%5, %8)
-                [Unknown(2), Known(0), Known(1), Known(2)]
+                [Unknown(2), Known(0), Known(1), Known(2)]"},
+        );
+        assert_eq!(run(&placed, &inputs), expected);
 
+        // Saving one output and storing the other replays nothing.
+        let placed = program
+            .partition(&[true, true, false])
+            .unwrap()
+            .with_residual_policy(&save_names(&["first"], &["second"]))
+            .unwrap();
+        assert_eq!(
+            render(&placed),
+            indoc! {"
                 lambda %0:bool[], %1:f64[] .
                 let %2:f64[], %3:f64[] = condition %0 %1 [
                     true={
@@ -2379,8 +2523,15 @@ mod tests {
                     %4:f64[] = neg %2
                     %5:f64[] = mul %4 %0
                 in (%3, %5)
-                [Unknown(2), Known(0), Known(1)]
+                [Unknown(2), Known(0), Known(1)]"},
+        );
+        assert_eq!(run(&placed, &inputs), expected);
 
+        // Saving nothing replays the complete condition over the known inputs, which are saved instead.
+        let placed = program.partition(&[true, true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
+        assert_eq!(
+            render(&placed),
+            indoc! {"
                 lambda %0:bool[], %1:f64[] .
                 in (%0, %1)
                 lambda %0:f64[], %1:bool[], %2:f64[] .
@@ -2407,6 +2558,7 @@ mod tests {
                 in (%5, %6)
                 [Unknown(2), Known(0), Known(1)]"},
         );
+        assert_eq!(run(&placed, &inputs), expected);
     }
 
     #[test]
@@ -2427,9 +2579,9 @@ mod tests {
         let tangent_a = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![sine_a, t]);
         let tangent_b = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![sine_b, t]);
         let program = build(builder, vec![tangent_a, tangent_b]);
-        let planned = program.partition(&[true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
+        let placed = program.partition(&[true, false]).unwrap().with_residual_policy(&save_nothing()).unwrap();
         assert_eq!(
-            render(&planned),
+            render(&placed),
             indoc! {"
                 lambda %0:ref<f64[]> .
                 let %1:f64[] = reference_read %0
@@ -2484,9 +2636,9 @@ mod tests {
                 in (%4, %5, %6)
                 [Unknown(1), Known(0), Known(1), Known(2)]"},
         );
-        let planned = partition.with_residual_policy(&save_nothing()).unwrap();
+        let placed = partition.with_residual_policy(&save_nothing()).unwrap();
         assert_eq!(
-            render(&planned),
+            render(&placed),
             indoc! {"
                 lambda %0:f64[] .
                 in (%0)
@@ -2507,20 +2659,20 @@ mod tests {
             ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
             ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
         ];
-        assert_eq!(run(&planned, &inputs), program.interpret(inputs.clone()).unwrap());
+        assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
     }
 
     #[test]
     fn test_partitioned_program_with_residual_policy_stages_storage() {
         // The known program stores the dot product and the residual program restores it before the cosine uses it.
         let program = sin_dot_program();
-        let planned = program
+        let placed = program
             .partition(&[true, false])
             .unwrap()
             .with_residual_policy(&save_dots(Some(NegationStorage)))
             .unwrap();
         assert_eq!(
-            render(&planned),
+            render(&placed),
             indoc! {"
                 lambda %0:f64[3] .
                 let %1:f64[] = dot [
@@ -2536,9 +2688,56 @@ mod tests {
                 in (%4)
                 [Unknown(1), Known(0)]"},
         );
-        assert_eq!(run(&planned, &sin_dot_inputs()), program.interpret(sin_dot_inputs()).unwrap());
+        assert_eq!(run(&placed, &sin_dot_inputs()), program.interpret(sin_dot_inputs()).unwrap());
 
         // Storage that does not reproduce the residual type or whose payloads the operation family cannot hold fails.
+
+        /// [`ResidualStorage`] that stores residuals by transferring them to host memory and whose restoration returns
+        /// them unchanged, which violates the storage contract because it does not reproduce the residual type.
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        struct ForgetfulStorage;
+
+        impl<T: Type> ResidualStorage<T> for ForgetfulStorage {
+            fn name(&self) -> String {
+                "forgetful".to_owned()
+            }
+
+            fn store_payloads(&self, _residual_type: &T) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
+                Ok(vec![ErasedOperation::new(TransferToMemoryOperation::new(Memory::Host { pinned: true }))])
+            }
+
+            fn restore_payloads(
+                &self,
+                _stored_type: &T,
+                _residual_type: &T,
+            ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
+                Ok(Vec::new())
+            }
+        }
+
+        /// [`ResidualStorage`] whose payload the operation family of the tests cannot hold.
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        struct UnsupportedStorage;
+
+        impl<T: Type> ResidualStorage<T> for UnsupportedStorage {
+            fn name(&self) -> String {
+                "unsupported".to_owned()
+            }
+
+            fn store_payloads(&self, _residual_type: &T) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
+                Ok(vec![ErasedOperation::new(TagOperation::<ArrayIrType>::new("unsupported"))])
+            }
+
+            fn restore_payloads(
+                &self,
+                _stored_type: &T,
+                _residual_type: &T,
+            ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
+                Ok(Vec::new())
+            }
+        }
+
+        /// Returns a policy that saves the residuals produced by dot products through `storage`.
         fn store_dots<S: Copy + ResidualStorage<ArrayIrType>>(storage: S) -> ResidualPolicyReference<ArrayIrType> {
             policy("store_dots", move |candidate| {
                 Ok(match candidate.producers().iter().any(|producer| producer.payload::<DotOperation>().is_some()) {
@@ -2552,29 +2751,27 @@ mod tests {
                 .partition(&[true, false])
                 .unwrap()
                 .with_residual_policy(&store_dots(ForgetfulStorage))
-                .map(|_| ())
-                .unwrap_err(),
-            ResidualPolicyError::InvalidStorage {
+                .map(|_| ()),
+            Err(ResidualPolicyError::InvalidStorage {
                 storage: "forgetful".to_owned(),
                 message: "its restore operations produce `f64[]@Host[Pinned]` instead of the residual type `f64[]`"
-                    .to_owned()
-            },
+                    .to_owned(),
+            }),
         );
         assert_eq!(
             program
                 .partition(&[true, false])
                 .unwrap()
                 .with_residual_policy(&store_dots(UnsupportedStorage))
-                .map(|_| ())
-                .unwrap_err(),
-            ResidualPolicyError::UnsupportedStorage {
+                .map(|_| ()),
+            Err(ResidualPolicyError::UnsupportedStorage {
                 storage: "unsupported".to_owned(),
                 residual_type: "f64[]".to_owned(),
                 message: format!(
                     "the operation family of the program cannot hold its payload `{}`",
                     std::any::type_name::<TagOperation<ArrayIrType>>(),
                 ),
-            },
+            }),
         );
     }
 
@@ -2618,13 +2815,13 @@ mod tests {
         let program = build(builder, vec![tangent_first, tangent_second]);
 
         // Saving only `u` saves the first condition's output and replays the second condition in the residual program.
-        let planned = program
+        let placed = program
             .partition(&[true, true, false])
             .unwrap()
             .with_residual_policy(&save_names(&["u"], &[]))
             .unwrap();
         assert_eq!(
-            render(&planned),
+            render(&placed),
             indoc! {"
                 lambda %0:bool[], %1:f64[] .
                 let %2:f64[] = sin %1
@@ -2719,21 +2916,67 @@ mod tests {
             ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
             ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
         ];
-        assert_eq!(run(&planned, &inputs), program.interpret(inputs.clone()).unwrap());
+        assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
     }
 
     #[test]
     fn test_partitioned_program_with_residual_policy_reproduces_partitions_that_save_everything() {
-        let mut programs = vec![(sin_dot_program(), vec![true, false])];
-        programs.extend(
-            [true, false]
-                .map(|first_consumed_first| (condition_program(first_consumed_first), vec![true, true, false])),
+        // A policy that saves everything reproduces the ordinary partition, including when the residual program
+        // consumes the outputs of a region-carrying operation in either order.
+        let program = sin_dot_program();
+        let partition = program.partition(&[true, false]).unwrap();
+        let rendering = render(&partition);
+        assert_eq!(render(&partition.with_residual_policy(&save_everything()).unwrap()), rendering);
+        let program = condition_program(true);
+        let partition = program.partition(&[true, true, false]).unwrap();
+        let rendering = render(&partition);
+        assert_eq!(render(&partition.with_residual_policy(&save_everything()).unwrap()), rendering);
+        let program = condition_program(false);
+        let partition = program.partition(&[true, true, false]).unwrap();
+        let rendering = render(&partition);
+        assert_eq!(render(&partition.with_residual_policy(&save_everything()).unwrap()), rendering);
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals() {
+        // Placing residuals for a split rule saves the outputs of the condition instead of replaying it, because the
+        // split rule of the condition already placed the residuals of its branches with the same policy.
+        let program = condition_program(true);
+        let placed = save_nothing().place_residuals(program.partition(&[true, true, false]).unwrap()).unwrap();
+        assert_eq!(
+            render(&placed),
+            indoc! {"
+                lambda %0:bool[], %1:f64[] .
+                let %2:f64[], %3:f64[] = condition %0 %1 [
+                    true={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = tag [key=first] %1
+                            %3:f64[] = cos %0
+                            %4:f64[] = tag [key=second] %3
+                        in (%2, %4)
+                    },
+                    false={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = tag [key=first] %1
+                            %3:f64[] = cos %0
+                            %4:f64[] = tag [key=second] %3
+                        in (%2, %4)
+                    },
+                ]
+                in (%2, %3)
+                lambda %0:f64[], %1:f64[], %2:f64[] .
+                let %3:f64[] = mul %1 %0
+                    %4:f64[] = mul %2 %0
+                in (%3, %4)
+                [Unknown(2), Known(0), Known(1)]"},
         );
-        for (program, input_known) in programs {
-            let partition = program.partition(&input_known).unwrap();
-            let rendering = render(&partition);
-            let planned = partition.with_residual_policy(&save_everything()).unwrap();
-            assert_eq!(render(&planned), rendering);
-        }
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(true).unwrap()),
+            ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
+            ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
+        ];
+        assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
     }
 }
