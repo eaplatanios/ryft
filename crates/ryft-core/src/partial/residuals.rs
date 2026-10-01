@@ -912,11 +912,16 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     ///   - Known inputs are forwarded as edges and constants are re-created in the residual program, without consulting
     ///     the policy. Known inputs are therefore the only inputs that are ever saved, and only when residual work
     ///     needs them.
+    ///   - Outputs of region-carrying operations that forward the value of one of their inputs (i.e., every region
+    ///     that may produce the output returns one of its own inputs, and the operation supplies all of those region
+    ///     inputs from that input, with the same type) are replaced by that input, which is classified in turn, so that
+    ///     a value is never saved once more as an output that merely forwards it (e.g., the input of a call that its
+    ///     linearized callee also returns as a residual).
     ///   - Values whose producers cannot be replayed safely are saved regardless of the policy. This covers producers
     ///     that access references shared with the caller of the known program (e.g., reference inputs, or local
     ///     references that escape through an output), producers with other observable effects, and deferred work.
-    ///     Outputs of operations that forward region inputs are saved too, because replaying them would re-execute the
-    ///     complete operation for a value that it merely forwards.
+    ///     Other outputs of operations that forward region inputs are saved too, because replaying them would
+    ///     re-execute the complete operation for a value that it merely forwards.
     ///   - Every other value is classified by `policy`. Saved values become edges, possibly through the storage that
     ///     the policy returns, whose store operations apply to the value in the known program and whose restore
     ///     operations reproduce it in the residual program before its first use. Recomputed values mark their
@@ -938,8 +943,9 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     /// gains only complete local reference lifecycles that nothing outside it can observe. Both programs are finally
     /// pruned with [`Program::into_pruned`], so that their region-carrying instructions (e.g., a known `scan` whose
     /// stacked residuals are now recomputed) stop producing values that nothing uses. A policy that saves every value
-    /// therefore reproduces this partition, apart from dropping edges that the residual program does not read and the
-    /// unused boundaries of region-carrying instructions.
+    /// therefore reproduces this partition, apart from dropping edges that the residual program does not read, reading
+    /// the inputs of region-carrying instructions instead of the outputs that forward them, and the unused boundaries
+    /// of those instructions.
     ///
     /// # Errors
     ///
@@ -953,8 +959,9 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     }
 
     /// Places the residuals of this partition like [`with_residual_policy`](Self::with_residual_policy). When
-    /// `replay_region_operations` is `false`, outputs of region-carrying operations are saved rather than replayed,
-    /// because the split rules of those operations already placed the residuals of their bodies with the same policy.
+    /// `replay_region_operations` is `false`, outputs of region-carrying operations are saved rather than replayed
+    /// unless the policy would recompute every value that their regions compute, because the split rules of those
+    /// operations may already have placed the residuals of their bodies with the same policy.
     fn with_residual_policy_and_region_replay(
         self,
         policy: &ResidualPolicyReference<V::Type>,
@@ -1018,6 +1025,72 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
             is_replayable
         };
 
+        // A region-carrying producer can only be replayed as a whole, which recomputes every value that its regions
+        // compute. That agrees with the policy only when the policy recomputes each of those values (e.g., under a
+        // policy that saves nothing), which is decided per instruction from the producers alone, and memoized because
+        // many demanded atoms can share a producer.
+        let mut recomputes_regions = vec![None; known_program.instructions().len()];
+        let mut recomputes_regions = |index: usize| {
+            if let Some(recomputes) = recomputes_regions[index] {
+                return recomputes;
+            }
+            let recomputes = known_program.instructions()[index].regions().iter().all(|region| {
+                let Ok(region) = known_program.region_ref(*region) else { return false };
+                region.instructions_in_closure().all(|(id, instruction)| {
+                    // The values of nested region-carrying operations are computed by the instructions of their own
+                    // regions, which the closure contains.
+                    if !instruction.regions().is_empty() {
+                        return true;
+                    }
+                    let Ok(region) = known_program.region_ref(id.region()) else { return false };
+                    let atom_type = |atom: &AtomId| region.atoms()[atom.index()].r#type().into_owned();
+                    let input_types = instruction.inputs().iter().map(atom_type).collect::<Vec<_>>();
+                    let output_types = instruction.outputs().iter().map(atom_type).collect::<Vec<_>>();
+                    output_types.iter().enumerate().all(|(output_index, output_type)| {
+                        let producer = ResidualProducer::new(
+                            instruction.operation(),
+                            output_index,
+                            input_types.clone(),
+                            output_types.clone(),
+                        );
+                        let candidate = ResidualCandidate::new(vec![producer], output_type.clone());
+                        matches!(policy.classify(&candidate), Ok(ResidualDecision::Recompute))
+                    })
+                })
+            });
+            recomputes_regions[index] = Some(recomputes);
+            recomputes
+        };
+
+        // Returns the input of the instruction at `index` whose value its output `atom` forwards, if any. That is the
+        // case when every region that may produce the output returns one of its own inputs as it, and the operation
+        // supplies all of those region inputs from one of its inputs of the same type (e.g., a call whose callee
+        // returns its input, or a condition whose branches all return the same input). This is a statement about
+        // values, so it does not look through operations inside the regions, unlike the provenance of the policy
+        // candidates.
+        let forwarded_input = |index: usize, atom: AtomId| -> Option<AtomId> {
+            let instruction = &known_program.instructions()[index];
+            let operation = instruction.operation();
+            let output_index = instruction.outputs().iter().position(|output| *output == atom)?;
+            let mut input_index = None;
+            for provenance in operation.output_region_provenance(output_index) {
+                let region = known_program.region_ref(*instruction.regions().get(provenance.region_index)?).ok()?;
+                let region_output = *region.output_ids().get(provenance.output_index)?;
+                let region_input = region.input_ids().iter().position(|input| *input == region_output)?;
+                let InputRegionProvenance::Input { index } =
+                    operation.input_region_provenance(provenance.region_index, region_input)
+                else {
+                    return None;
+                };
+                if input_index.replace(index).is_some_and(|previous| previous != index) {
+                    return None;
+                }
+            }
+            let input = *instruction.inputs().get(input_index?)?;
+            (known_program.atoms()[input.index()].r#type() == known_program.atoms()[atom.index()].r#type())
+                .then_some(input)
+        };
+
         // Plans one demanded known atom, applying the rules listed in the documentation of `with_residual_policy` in
         // order: constants and known inputs never consult the policy, reference handles are either original edges or
         // replayed, values whose producers cannot be replayed are saved, and the policy classifies everything else.
@@ -1052,13 +1125,27 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                 };
             }
 
+            // A value that its producer forwards from one of its inputs is that input, which residual work reads
+            // instead, so that the value is not saved once more as the output that forwards it.
+            if let Some(input) = forwarded_input(index, atom) {
+                return Ok(ResidualPlan::Forward(input));
+            }
+
             if !is_replayable(index) {
                 return Ok(ResidualPlan::Edge(None));
             }
 
-            // Replaying a region-carrying producer re-executes it as a whole, which would undo the per-iteration and
-            // per-branch decisions of a split rule that already placed the residuals of its body with the same policy.
-            if !replay_region_operations && !known_program.instructions()[index].regions().is_empty() {
+            // Replaying a region-carrying producer re-executes it as a whole. Unless region operations are replayed
+            // unconditionally, its outputs are saved when the policy would save any value that its regions compute,
+            // so that a known operation that the split rule of a region-carrying operation constructed after placing
+            // the residuals of its body with the same policy (e.g., a known scan that stacks per-iteration dot
+            // products) keeps the per-iteration and per-branch decisions of that rule. Operations whose regions the
+            // policy would recompute entirely (e.g., an operation whose inputs are all known, and which was therefore
+            // not split) are replayed instead, consistently with the policy.
+            if !replay_region_operations
+                && !known_program.instructions()[index].regions().is_empty()
+                && !recomputes_regions(index)
+            {
                 return Ok(ResidualPlan::Edge(None));
             }
 
@@ -1091,9 +1178,11 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                     continue;
                 }
                 let atom_plan = plan(atom)?;
-                if matches!(atom_plan, ResidualPlan::Recompute) {
+                match atom_plan {
                     // The `unwrap` is safe because only atoms produced by instructions are ever recomputed.
-                    pending_instructions.push(instruction_by_output[atom.index()].unwrap());
+                    ResidualPlan::Recompute => pending_instructions.push(instruction_by_output[atom.index()].unwrap()),
+                    ResidualPlan::Edge(_) | ResidualPlan::Constant => {}
+                    ResidualPlan::Forward(input) => pending_atoms.push(input),
                 }
                 plans[atom.index()] = Some(atom_plan);
             }
@@ -1252,6 +1341,15 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
             if let Some(resolved) = known_atoms[atom.index()] {
                 return Ok(resolved);
             }
+            let demanded = atom;
+            let mut atom = atom;
+            while let Some(ResidualPlan::Forward(input)) = &plans[atom.index()] {
+                atom = *input;
+            }
+            if let Some(resolved) = known_atoms[atom.index()] {
+                known_atoms[demanded.index()] = Some(resolved);
+                return Ok(resolved);
+            }
             let resolved = match &plans[atom.index()] {
                 Some(ResidualPlan::Edge(storage)) => {
                     let input = edge_inputs[&atom];
@@ -1300,8 +1398,13 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                     ))
                     .into());
                 }
+                Some(ResidualPlan::Forward(_)) => {
+                    // Forwarding chains end at an atom with another plan.
+                    unreachable!()
+                }
             };
             known_atoms[atom.index()] = Some(resolved);
+            known_atoms[demanded.index()] = Some(resolved);
             Ok(resolved)
         };
 
@@ -1392,6 +1495,136 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
         let metadata = metadata.with_residual_inputs(new_residual_inputs);
         Ok(Self::from_programs_and_metadata(new_known_program, new_residual_program, metadata))
     }
+
+    // TODO(eaplatanios): Review this function.
+    /// Returns this partition with the residual edges that the known program also consumes itself rounded right after
+    /// their producers by the operations that `rounding` returns for their types, so that the known work that consumes
+    /// such a residual and the residual work that receives it observe the same value. Backends may compute inexact
+    /// values at a higher precision than their types (e.g., XLA computes `bf16` values in `f32` under its default
+    /// `--xla_allow_excess_precision` setting), and only the edge is materialized at its declared type, so without the
+    /// rounding the known consumers of a residual and its residual consumers could observe different values (refer to
+    /// [JAX PR #22244](https://github.com/jax-ml/jax/pull/22244), whose `remat_partial_eval` applies the same
+    /// rounding). An edge that a chain of store operations of a [`ResidualStorage`] produces (i.e., of operations for
+    /// which `is_storage` returns `true`) is rounded at the value that the chain stores, before it is stored, if the
+    /// known program also consumes that value elsewhere. Edges that only the residual program consumes, constant edges,
+    /// and edges whose types `rounding` returns no operation for are left unchanged. Each rounding operation is
+    /// constructed in the operation family of this partition through [`OperationPayloadProjection::from_payload`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when the operation family cannot hold a rounding operation or when rebuilding the
+    /// known program fails.
+    pub(crate) fn with_rounded_residuals(
+        self,
+        rounding: impl Fn(&V::Type) -> Option<ErasedOperation>,
+        is_storage: impl Fn(&O) -> bool,
+    ) -> Result<Self, ProgramError> {
+        let known_output_count = self.outputs().iter().filter(|output| output.is_known()).count();
+        let (known_program, residual_program, metadata) = self.into_programs_and_metadata();
+        let mut use_counts = vec![0usize; known_program.atoms().len()];
+        known_program
+            .instructions()
+            .iter()
+            .flat_map(|instruction| instruction.inputs())
+            .for_each(|input| use_counts[input.index()] += 1);
+        let instruction_by_output = known_program.instruction_by_output();
+        let mut rounded = HashMap::new();
+        for edge in &known_program.output_ids()[known_output_count..] {
+            // Walk back through the store operations that produce the edge, if any, to the value that the known program
+            // consumes outside of that chain (which consumes each intermediate value of the chain exactly once).
+            let mut atom = *edge;
+            let mut chain_uses = 0;
+            let value = loop {
+                if !matches!(known_program.atoms()[atom.index()], Atom::Variable(_)) {
+                    break None;
+                }
+                if use_counts[atom.index()] > chain_uses {
+                    break Some(atom);
+                }
+                match instruction_by_output[atom.index()].map(|index| &known_program.instructions()[index]) {
+                    Some(instruction)
+                        if is_storage(instruction.operation())
+                            && instruction.inputs().len() == 1
+                            && instruction.outputs().len() == 1 =>
+                    {
+                        atom = instruction.inputs()[0];
+                        chain_uses = 1;
+                    }
+                    _ => break None,
+                }
+            };
+            if let Some(value) = value
+                && !rounded.contains_key(&value)
+                && let Some(payload) = rounding(&known_program.atoms()[value.index()].r#type())
+            {
+                rounded.insert(value, payload);
+            }
+        }
+        if rounded.is_empty() {
+            return Ok(Self::from_programs_and_metadata(known_program, residual_program, metadata));
+        }
+
+        // Copy the known program, staging each rounding right after the producer of its edge (or at the beginning for
+        // edges that are known inputs) and redirecting every later use of the edge, including the edge output itself,
+        // to the rounded value.
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let mut atoms = vec![None; known_program.atoms().len()];
+        let mut round = |builder: &mut ProgramBuilder<V, O>, atom: AtomId, copy: AtomId| match rounded.remove(&atom) {
+            Some(payload) => {
+                let operation = O::from_payload(payload).map_err(|payload| ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "the operation family of the program cannot hold the residual rounding operation `{}`",
+                        payload.type_name(),
+                    ),
+                })?;
+                Ok(builder.add_instruction(operation, Vec::new(), vec![copy], None)?[0])
+            }
+            None => Ok::<_, ProgramError>(copy),
+        };
+        for input in known_program.input_ids() {
+            let copy = builder.add_input(known_program.atoms()[input.index()].r#type().into_owned());
+            atoms[input.index()] = Some(round(&mut builder, *input, copy)?);
+        }
+        let mut remapping = HashMap::new();
+        for instruction in known_program.instructions() {
+            let inputs = instruction
+                .inputs()
+                .iter()
+                .map(|input| copy_atom(&known_program, *input, &mut atoms, &mut builder))
+                .collect::<Result<Vec<_>, _>>()?;
+            let regions = instruction
+                .regions()
+                .iter()
+                .map(|region| {
+                    Ok(builder.import_region_with_remapping(known_program.region_ref(*region)?, &mut remapping))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            let outputs = builder
+                .add_instruction(
+                    instruction.operation().clone(),
+                    regions,
+                    inputs,
+                    Some(instruction.provenance().clone()),
+                )?
+                .to_vec();
+            for (source, output) in instruction.outputs().iter().zip(outputs) {
+                atoms[source.index()] = Some(round(&mut builder, *source, output)?);
+            }
+        }
+        let outputs = known_program
+            .output_ids()
+            .iter()
+            .map(|output| copy_atom(&known_program, *output, &mut atoms, &mut builder))
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_count = known_program.input_ids().len();
+        let output_count = outputs.len();
+        let known_program = builder.build::<Vec<V>, Vec<V>>(
+            outputs,
+            vec![Placeholder; input_count],
+            vec![Placeholder; output_count],
+        )?;
+        Ok(Self::from_programs_and_metadata(known_program, residual_program, metadata))
+    }
 }
 
 /// Placement of the residuals of the partitions of programs over values of type `V`
@@ -1402,8 +1635,9 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
 pub(crate) trait ResidualPlacement<V: Value, O: Operation<Type = V::Type>> {
     /// Returns `partition` with its residuals placed according to the policy (refer to the documentation of
     /// [`PartitionedProgram::with_residual_policy`] for more information on that). Outputs of region-carrying
-    /// operations in the known program are saved rather than replayed, because the split rules of those operations
-    /// already placed the residuals of their bodies with the same policy when the partition was constructed.
+    /// operations in the known program are saved rather than replayed unless the policy would recompute every value
+    /// that their regions compute, because the split rules of those operations may already have placed the residuals
+    /// of their bodies with the same policy when the partition was constructed.
     fn place_residuals(&self, partition: PartitionedProgram<V, O>) -> Result<PartitionedProgram<V, O>, ProgramError>;
 }
 
@@ -1426,16 +1660,20 @@ enum ResidualPlan<T: Type> {
 
     /// The atom is a constant, which the residual program re-creates.
     Constant,
+
+    /// The atom has the value of the provided known atom, which its producer forwards from one of its inputs,
+    /// and residual work reads that atom instead.
+    Forward(AtomId),
 }
 
 /// Resolution of the operation outputs that may have produced the values of a [`Program`], which looks through the
 /// outputs of operations that forward the outputs of their attached regions (for more information on this, refer to
-/// [`Operation::output_region_provenance`]) and through the inputs of those regions back to the operands that supply
-/// them (for more information on this refer to [`Operation::input_region_provenance`]).
+/// [`Operation::output_region_provenance`]) and through the inputs of those regions back to the instruction inputs
+/// that supply them (for more information on this refer to [`Operation::input_region_provenance`]).
 ///
 /// Region outputs are summarized symbolically, in terms of the inputs of their regions, and each summary is computed
 /// once and instantiated at every call site. A region that several operations invoke (e.g., with differently tagged
-/// operands) therefore resolves to the producers of each call site's own operands.
+/// inputs) therefore resolves to the producers of each call site's own inputs.
 struct ResidualProvenance<'p, V: Value, O: Operation<Type = V::Type>> {
     /// Program whose values are resolved.
     program: &'p Program<V, O, Vec<V>, Vec<V>>,
@@ -1484,7 +1722,7 @@ impl<'p, V: Value, O: Operation<Type = V::Type> + OperationPayloadProjection> Re
         let program = self.program;
 
         // A value without a producer is an input or a constant of its region. An input stays symbolic as an input
-        // leaf, which the call site of the region instantiates through its own operands, and a constant has no
+        // leaf, which the call site of the region instantiates through its own inputs, and a constant has no
         // provenance at all.
         let Some(instruction_id) = program.producer(value)? else {
             let region = program.region(value.region())?;
@@ -1531,7 +1769,7 @@ impl<'p, V: Value, O: Operation<Type = V::Type> + OperationPayloadProjection> Re
             };
 
             // Instantiate the summary at this call site. Producer leaves carry over unchanged, while each input leaf is
-            // replaced by the provenance of the operand that this instruction supplies to that region input, resolved
+            // replaced by the provenance of the input that this instruction supplies to that region input, resolved
             // in the region that contains the instruction. Region inputs that the operation creates itself, or whose
             // provenance it does not declare, have no producer that a policy could classify and contribute nothing.
             for leaf in summary {
@@ -1540,24 +1778,24 @@ impl<'p, V: Value, O: Operation<Type = V::Type> + OperationPayloadProjection> Re
                     ProvenanceLeaf::Input(input_index) => {
                         match instruction.operation().input_region_provenance(origin.region_index, input_index) {
                             InputRegionProvenance::Input { index } => {
-                                let operand = *instruction.inputs().get(index).ok_or_else(|| {
+                                let input = *instruction.inputs().get(index).ok_or_else(|| {
                                     ProgramError::MalformedProgram(format!(
-                                        "operation `{}` declares its operand {} as the source of an input of its \
-                                         region {} but its instruction has {} operands",
+                                        "operation `{}` declares its input {} as the source of an input of its \
+                                         region {} but its instruction has {} inputs",
                                         instruction.operation().name(),
                                         index,
                                         origin.region_index,
                                         instruction.inputs().len(),
                                     ))
                                 })?;
-                                self.resolve(ValueId::new(value.region(), operand))?
+                                self.resolve(ValueId::new(value.region(), input))?
                             }
                             InputRegionProvenance::None | InputRegionProvenance::Local => Vec::new(),
                         }
                     }
                 };
 
-                // Alternative origins may share leaves (e.g., two branches that forward the same operand),
+                // Alternative origins may share leaves (e.g., two branches that forward the same input),
                 // so each leaf is kept once, at its first position in semantic order.
                 for leaf in leaves_of_leaf {
                     if !leaves.contains(&leaf) {
@@ -1578,7 +1816,7 @@ enum ProvenanceLeaf {
     Producer(ValueId),
 
     /// Input at the provided position of the region that contains the value, which each call site of that region
-    /// resolves through its own operands.
+    /// resolves through its own inputs.
     Input(usize),
 }
 
@@ -1646,10 +1884,12 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
         DimensionType, Memory,
     };
+    use crate::differentiation::MemoryTransferStorage;
     use crate::operations::{
-        ConditionOperation, CosOperation, DimensionSizeOperation, DotDimensionNumbers, DotOperation, ExpOperation,
-        MulOperation, NegOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceWriteOperation, SinOperation, TagOperation, TransferToMemoryOperation,
+        AddOperation, ConditionOperation, CosOperation, DimensionSizeOperation, DotDimensionNumbers, DotOperation,
+        ExpOperation, MulOperation, NegOperation, ReducePrecisionOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, SinOperation, TagOperation,
+        TransferToMemoryOperation,
     };
     use crate::partial::values::PartialEvaluationOutput;
     use crate::programs::ReferenceType;
@@ -2892,10 +3132,10 @@ mod tests {
 
     #[test]
     fn test_partitioned_program_with_residual_policy_resolves_provenance_through_shared_regions() {
-        // Three levels of conditions share their branch regions and forward their operands: the innermost region
+        // Three levels of conditions share their branch regions and forward their inputs: the innermost region
         // returns its input, and each enclosing region returns the output of a condition over the next region. Two
-        // top-level conditions invoke the shared regions with differently tagged operands, so the provenance of each
-        // resolves to the producer of its own operand.
+        // top-level conditions invoke the shared regions with differently tagged inputs, so the provenance of each
+        // resolves to the producer of its own input.
         let condition =
             |builder: &mut ProgramBuilder<TestValue, TestOperation>, branch: RegionId, inputs: Vec<AtomId>| {
                 builder.add_instruction(ConditionOperation::new(), vec![branch, branch], inputs, None).unwrap()[0]
@@ -3061,11 +3301,175 @@ mod tests {
     }
 
     #[test]
+    fn test_partitioned_program_with_residual_policy_saves_forwarded_inputs_once() {
+        // The branches of a condition map `x` to `(sin(x), x)`, so the second output of the condition forwards `x`,
+        // which the residual program also reads directly. Residual work reads `x` for the forwarded output too, so `x`
+        // is saved once rather than once more as the output that forwards it.
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let a = branch.add_input(scalar_type());
+        let sine = add(&mut branch, SinOperation::<ArrayType>::new().into(), vec![a]);
+        let branch = build(branch, vec![sine, a]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let p = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let x = builder.add_input(scalar_type());
+        let t = builder.add_input(scalar_type());
+        let true_branch = builder.import_program(branch.clone());
+        let false_branch = builder.import_program(branch);
+        let outputs = builder
+            .add_instruction(ConditionOperation::new(), vec![true_branch, false_branch], vec![p, x], None)
+            .unwrap()
+            .to_vec();
+        let first = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![outputs[0], t]);
+        let second = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![outputs[1], t]);
+        let third = add(&mut builder, MulOperation::<ArrayType>::new().into(), vec![x, t]);
+        let program = build(builder, vec![first, second, third]);
+        let partition = program.partition(&[true, true, false]).unwrap().with_residual_policy(&save_everything());
+        let partition = partition.unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    outputs=[Unknown(0), Unknown(1), Unknown(2)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    let %2:f64[] = condition %0 %1 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                            in (%1)
+                        },
+                    ]
+                    in (%2, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:f64[] .
+                    let %3:f64[] = mul %1 %0
+                        %4:f64[] = mul %2 %0
+                        %5:f64[] = mul %2 %0
+                    in (%3, %4, %5)
+                }"},
+        );
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(true).unwrap()),
+            ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
+            ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
+        ];
+        assert_eq!(run(&partition, &inputs), program.interpret(inputs.clone()).unwrap());
+    }
+
+    #[test]
+    fn test_partitioned_program_with_rounded_residuals() {
+        // With `x` known and `y` unknown, `(x, y) ↦ (sin(x)² · y + sin(x) · y + x · y)` saves `x`, `sin(x)`, and
+        // `sin(x)²` for the residual program. The known program also consumes `x` and `sin(x)`, which are therefore
+        // rounded right where they become available, while `sin(x)²` only feeds the residual program and stays as is.
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::BF16));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let x = builder.add_input(scalar_type.clone());
+        let y = builder.add_input(scalar_type);
+        let sine = add(&mut builder, SinOperation::new().into(), vec![x]);
+        let square = add(&mut builder, MulOperation::new().into(), vec![sine, sine]);
+        let first = add(&mut builder, MulOperation::new().into(), vec![square, y]);
+        let second = add(&mut builder, MulOperation::new().into(), vec![sine, y]);
+        let third = add(&mut builder, MulOperation::new().into(), vec![x, y]);
+        let sum = add(&mut builder, AddOperation::new().into(), vec![first, second]);
+        let sum = add(&mut builder, AddOperation::new().into(), vec![sum, third]);
+        let program = build(builder, vec![sum]);
+        let rounding = |r#type: &ArrayIrType| {
+            Some(ErasedOperation::new(ReducePrecisionOperation::<ArrayType>::new(8, 7))).filter(
+                |_| matches!(r#type, ArrayIrType::Array(array_type) if array_type.data_type() == DataType::BF16),
+            )
+        };
+        let partition = program.partition(&[true, false]).unwrap();
+        assert_eq!(
+            partition.with_rounded_residuals(rounding, |_| false).unwrap().to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0), Known(1), Known(2)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bf16[] .
+                    let %1:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %0
+                        %2:bf16[] = sin %1
+                        %3:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %2
+                        %4:bf16[] = mul %3 %3
+                    in (%4, %3, %1)
+                }
+                residual={
+                    lambda %0:bf16[], %1:bf16[], %2:bf16[], %3:bf16[] .
+                    let %4:bf16[] = mul %1 %0
+                        %5:bf16[] = mul %2 %0
+                        %6:bf16[] = add %4 %5
+                        %7:bf16[] = mul %3 %0
+                        %8:bf16[] = add %6 %7
+                    in (%8)
+                }"},
+        );
+
+        // An edge that store operations produce is rounded before it is stored, if the known program also consumes the
+        // value that they store.
+        let host = Memory::Host { pinned: true };
+        let offload = policy("offload_everything", move |_: &ResidualCandidate<'_, ArrayIrType>| {
+            Ok(ResidualDecision::SaveWith(MemoryTransferStorage::new(host)))
+        });
+        let partition = program.partition(&[true, false]).unwrap().with_residual_policy(&offload).unwrap();
+        let is_storage =
+            |operation: &TestOperation| operation.projected_payload::<TransferToMemoryOperation>().is_some();
+        assert_eq!(
+            partition.with_rounded_residuals(rounding, is_storage).unwrap().to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[Unknown(1), Known(0), Known(1), Known(2)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bf16[] .
+                    let %1:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %0
+                        %2:bf16[] = sin %1
+                        %3:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %2
+                        %4:bf16[] = mul %3 %3
+                        %5:bf16[]@Host[Pinned] = transfer_to_memory [destination=Host[Pinned]] %4
+                        %6:bf16[]@Host[Pinned] = transfer_to_memory [destination=Host[Pinned]] %3
+                    in (%5, %6, %1)
+                }
+                residual={
+                    lambda %0:bf16[], %1:bf16[]@Host[Pinned], %2:bf16[]@Host[Pinned], %3:bf16[] .
+                    let %4:bf16[] = transfer_to_memory [destination=Device] %1
+                        %5:bf16[] = mul %4 %0
+                        %6:bf16[] = transfer_to_memory [destination=Device] %2
+                        %7:bf16[] = mul %6 %0
+                        %8:bf16[] = add %5 %7
+                        %9:bf16[] = mul %3 %0
+                        %10:bf16[] = add %8 %9
+                    in (%10)
+                }"},
+        );
+
+        // A partition whose edges need no rounding is returned unchanged.
+        let partition = program.partition(&[true, false]).unwrap();
+        let expected = partition.to_string();
+        assert_eq!(partition.with_rounded_residuals(|_| None, |_| false).unwrap().to_string(), expected);
+    }
+
+    #[test]
     fn test_residual_policy_reference_place_residuals() {
-        // Placing residuals for a split rule saves the outputs of the condition instead of replaying it, because the
-        // split rule of the condition already placed the residuals of its branches with the same policy.
+        // Placing residuals for a split rule saves the outputs of the condition instead of replaying it as a whole when
+        // the policy would save a value that its branches compute (here, the value tagged `second`), because a split
+        // rule may already have placed the residuals of its branches with the same policy.
         let program = condition_program(true);
-        let placed = save_nothing().place_residuals(program.partition(&[true, true, false]).unwrap()).unwrap();
+        let placed = save_names(&["second"], &[])
+            .place_residuals(program.partition(&[true, true, false]).unwrap())
+            .unwrap();
         assert_eq!(
             placed.to_string(),
             indoc! {"
@@ -3108,6 +3512,47 @@ mod tests {
             ArrayIrValue::Array(Array::scalar(0.5f64).unwrap()),
             ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
         ];
+        assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
+
+        // A policy that recomputes every value that the branches compute replays the condition as a whole instead.
+        let placed = save_nothing().place_residuals(program.partition(&[true, true, false]).unwrap()).unwrap();
+        assert_eq!(
+            placed.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    outputs=[Unknown(0), Unknown(1)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    in (%0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:bool[], %2:f64[] .
+                    let %3:f64[], %4:f64[] = condition %1 %2 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                                %3:f64[] = cos %0
+                                %4:f64[] = tag [key=second] %3
+                            in (%2, %4)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                                %2:f64[] = tag [key=first] %1
+                                %3:f64[] = cos %0
+                                %4:f64[] = tag [key=second] %3
+                            in (%2, %4)
+                        },
+                    ]
+                        %5:f64[] = mul %3 %0
+                        %6:f64[] = mul %4 %0
+                    in (%5, %6)
+                }"},
+        );
         assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
     }
 }
