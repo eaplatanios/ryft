@@ -1541,7 +1541,11 @@ mod tests {
         let linearization = program.linearize().unwrap();
         let rendered_primal = linearization.primal().to_string();
         let rendered_tangent = linearization.tangent().to_string();
-        assert!(rendered_primal.contains("scan [carry_count=1"), "{rendered_primal}");
+
+        // The residual scan threads the invariant extent as a carry. The known side of its split only forwards the
+        // stacked mask that the residual scan consumes, so the primal program needs no known scan.
+        assert!(rendered_tangent.contains("scan [carry_count=2"), "{rendered_tangent}");
+        assert!(!rendered_primal.contains("scan"), "{rendered_primal}");
         assert!(!rendered_primal.contains("dimension_to_scalar"), "{rendered_primal}");
         assert!(!rendered_tangent.contains("dimension_from_scalar"), "{rendered_tangent}");
         let mut primal_outputs = linearization

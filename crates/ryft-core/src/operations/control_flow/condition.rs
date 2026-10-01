@@ -42,11 +42,11 @@ use crate::partial::{
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
 use crate::programs::{
-    CalleeRegionDriver, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationProjection,
-    OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRoot, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
-    discharge_positional_region_operation,
+    CalleeRegionDriver, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning,
+    OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceRoot, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
+    Typed, Value, ValueProjection, discharge_positional_region_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -182,6 +182,28 @@ where
             OutputRegionProvenance { region_index: 0, output_index },
             OutputRegionProvenance { region_index: 1, output_index },
         ]
+    }
+
+    fn prune_boundary(
+        &self,
+        input_count: usize,
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        // Both branches keep one shared boundary, whose inputs the operands after the predicate supply positionally, so
+        // an operand is kept when either branch uses it (as in JAX's `_cond_dce_rule`). The predicate is always kept.
+        let mut used_inputs = vec![false; input_count.saturating_sub(1)];
+        for region_index in 0..2 {
+            let branch_inputs = regions.used_region_inputs(region_index, used_outputs)?;
+            for (used, branch_used) in used_inputs.iter_mut().zip(branch_inputs) {
+                *used |= branch_used;
+            }
+        }
+        Ok(Some(OperationBoundaryPruning {
+            operation: self.clone(),
+            kept_inputs: std::iter::once(true).chain(used_inputs).collect(),
+            kept_outputs: used_outputs.to_vec(),
+        }))
     }
 }
 
@@ -2145,6 +2167,66 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_condition_boundary_pruning() {
+        // The true branch maps `(a, b, c)` to `(sin(a), sin(c))` and the false branch maps it to `(sin(b), sin(c))`.
+        // Using only the first output keeps the operands that either branch needs for it, `a` and `b`, together with
+        // the predicate, and drops `c` and the second output from both branches.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let branch = |first: usize| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let inputs = (0..3).map(|_| builder.add_input(scalar.clone())).collect::<Vec<_>>();
+            let outputs = [inputs[first], inputs[2]]
+                .map(|input| builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0]);
+            builder
+                .build::<Vec<Array>, Vec<Array>>(outputs.to_vec(), vec![Placeholder; 3], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let p = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let inputs = (0..3).map(|_| builder.add_input(scalar.clone())).collect::<Vec<_>>();
+        let true_branch = builder.import_program(branch(0));
+        let false_branch = builder.import_program(branch(1));
+        let outputs = builder
+            .add_instruction(
+                ConditionOperation::<Array>::new(),
+                vec![true_branch, false_branch],
+                vec![p, inputs[0], inputs[1], inputs[2]],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[0]], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+        let pruned = program.clone().into_pruned().unwrap();
+        assert_eq!(
+            pruned.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[], %3:f64[] .
+                let %4:f64[] = condition %0 %1 %2 [
+                    true={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = sin %0
+                        in (%2)
+                    },
+                    false={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = sin %1
+                        in (%2)
+                    },
+                ]
+                in (%4)"},
+        );
+        let inputs = vec![
+            Array::scalar(false).unwrap(),
+            Array::scalar(0.5f64).unwrap(),
+            Array::scalar(1.5f64).unwrap(),
+            Array::scalar(2.5f64).unwrap(),
+        ];
+        assert_eq!(pruned.interpret(inputs.clone()).unwrap(), program.interpret(inputs).unwrap());
     }
 
     #[test]

@@ -6,7 +6,7 @@ which still need to be added, (2) the high-level implementation plan that would 
 missing primitives land, and (3) a target `ryft` model implementation written against that API
 surface.
 
-> **Revision status.** This plan was originally written against the earlier `tracing_v2`-centric
+> **Revision status.** This plan was originally written against the earlier tracing-centric
 > architecture. The codebase has since been rebuilt around the typed `programs` IR,
 > context-based eager dispatch, the builder-style differentiation API (`differentiate_at`),
 > backend-neutral `compilation`/JIT with structural and disk caching, first-class dynamic
@@ -1774,7 +1774,7 @@ A consolidated list of every external source cited in this document, grouped by 
   the `DataType` enum entries for `F4E2M1FN`, `F8E4M3FN`, `F8E5M2`, `F8E8M0FNU`, and friends.
 - [`crates/ryft-core/src/differentiation/`](crates/ryft-core/src/differentiation/) — the
   `differentiate_at` builder (jvp/linearize/vjp/value_and_gradient/jacobians/hessian).
-- [`crates/ryft-core/src/tracing_v2/rematerialization.rs`](crates/ryft-core/src/tracing_v2/rematerialization.rs) —
+- [`crates/ryft-core/src/differentiation/rematerialization/`](crates/ryft-core/src/differentiation/rematerialization/) —
   `rematerialize` and the JAX-parity checkpointing policy family.
 - [`crates/ryft-core/src/compilation/`](crates/ryft-core/src/compilation/) — backend-neutral
   `jit`/`stage_function` with structural and disk caching.

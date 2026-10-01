@@ -1,6 +1,7 @@
 //! Operations that attach string keys to values so that program transforms can recognize them later. Tags are identity
-//! functions on their data: interpretation, batching, partial evaluation, and backend lowering all pass the input
-//! through unchanged, and the key lives only in the staged instruction. This module provides the following:
+//! functions on their data: interpretation, partial evaluation, and backend lowering all pass the input through
+//! unchanged, and the key lives only in the staged instruction. Batching re-binds the tag over the batched value, so
+//! batched programs keep their keys. This module provides the following:
 //!
 //!   - The [`Tag`] value capability, whose [`tag`](Tag::tag) returns its input unchanged while marking the producing
 //!     instruction with a key.
@@ -41,16 +42,19 @@
 //! # }
 //! ```
 
+use std::any::TypeId;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{Array, ArrayType};
+use crate::arrays::{Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType};
+use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
-use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Value};
+use crate::programs::{
+    Operation, OperationFormatter, OperationPayloadProjection, ProgramError, RegionInterface, Type, TypeError, Value,
+};
 
 /// Canonical operation name for [`TagOperation`].
 pub const TAG_OPERATION_NAME: &str = "tag";
@@ -59,10 +63,10 @@ pub const TAG_OPERATION_NAME: &str = "tag";
 /// This is useful for features like key-based rematerialization in automatic differentiation transforms. Refer to the
 /// documentation of [`Tag`] for more information.
 ///
-/// Interpretation, batching, and backend lowering all treat this operation as an identity function. Differentiation
-/// passes the tangent through unchanged while re-tagging the primal value so that the tag is visible to instructions
-/// that define linearization residuals, which is exactly what consumers such as key-based rematerialization strategies
-/// need.
+/// Interpretation and backend lowering treat this operation as an identity function. Batching re-binds it over the
+/// batched value, so that a batched program still carries the key. Differentiation passes the tangent through unchanged
+/// while re-tagging the primal value so that the tag is visible to instructions that define linearization residuals,
+/// which is exactly what consumers such as key-based rematerialization strategies need.
 #[derive(Clone, Debug)]
 pub struct TagOperation<T: Type> {
     /// Refer to the documentation of [`key`](Self::key) for more information.
@@ -83,6 +87,21 @@ impl<T: Type> TagOperation<T> {
     #[inline]
     pub fn key(&self) -> &str {
         self.key.as_str()
+    }
+}
+
+impl<T: 'static + Type> TagOperation<T> {
+    /// Returns the key of the [`TagOperation`] that `operation` holds, or [`None`] when it holds none. `operation` may
+    /// belong to any family over the type universe `T`, and the tag is recognized either as a `TagOperation<T>` or, in
+    /// composite families such as [`ArrayIrOperation`](crate::ArrayIrOperation) that hold array operations through
+    /// their projected array member, as a `TagOperation<ArrayType>`. This is how key-based consumers such as
+    /// rematerialization policies recognize tags without naming the family that holds them.
+    pub fn key_of<O: OperationPayloadProjection + ?Sized>(operation: &O) -> Option<&str> {
+        let tag = operation.project_payload(TypeId::of::<Self>()).and_then(|tag| tag.downcast_ref::<Self>());
+        tag.map(Self::key).or_else(|| {
+            let tag = operation.project_payload(TypeId::of::<TagOperation<ArrayType>>());
+            tag.and_then(|tag| tag.downcast_ref::<TagOperation<ArrayType>>()).map(TagOperation::key)
+        })
     }
 }
 
@@ -118,13 +137,6 @@ impl<T: Type> Operation for TagOperation<T> {
     }
 }
 
-impl ElementwiseOperation for TagOperation<ArrayType> {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
-}
-
 impl<C: Domain> InterpretableOperation<C> for TagOperation<C::Type> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -139,6 +151,27 @@ impl<C: Domain> InterpretableOperation<C> for TagOperation<C::Type> {
 }
 
 impl<C: Context<Operation: From<TagOperation<C::Type>>>> PartiallyEvaluatableOperation<C> for TagOperation<C::Type> {}
+
+impl<C: Context<Type = ArrayType, Operation: From<TagOperation<ArrayType>>>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for TagOperation<ArrayType>
+{
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // Batching re-binds the tag through the parent context over the packed value and keeps the input's batch
+        // metadata. Treating the tag as an interpreted identity would drop it from staged batched programs, where
+        // key-based consumers such as rematerialization policies look for it.
+        check_count!("input", inputs, 1, ProgramError);
+        let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].value()))?;
+        check_count!("output", outputs, 1, ProgramError);
+        let output = ArrayBatch::new(outputs.remove(0), inputs[0].batch_axis())?
+            .with_ragged_axes(inputs[0].ragged_axes().to_vec())?;
+        Ok(vec![output].into())
+    }
+}
 
 impl_differentiable_elementwise_operation! {
     @linear<T>
@@ -181,13 +214,16 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, DataType};
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayOperation, DataType, ShardingDimension};
+    use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::programs::{EffectClasses, EmptyRegionDriver};
+    use crate::operations::SinOperation;
+    use crate::parameters::Placeholder;
+    use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramBuilder};
     use crate::tracing::{DomainTracer, Trace};
 
     use super::*;
@@ -199,8 +235,15 @@ mod tests {
         // Operation identity, accessors, and rendering.
         assert_eq!(operation.name(), TAG_OPERATION_NAME);
         assert_eq!(operation.key(), "residual");
-        assert_eq!(operation.input_count(), 1);
         assert_eq!(operation.to_string(), "tag [key=residual]");
+
+        // Keys are recognized in any family over the operation's universe, including through the projected array member
+        // of a composite family.
+        let tag = ArrayOperation::<Array>::from(operation.clone());
+        assert_eq!(TagOperation::<ArrayType>::key_of(&tag), Some("residual"));
+        assert_eq!(TagOperation::<ArrayIrType>::key_of(&ArrayIrOperation::<Array>::from(tag)), Some("residual"));
+        let sin = ArrayOperation::<Array>::from(SinOperation::<ArrayType>::new());
+        assert_eq!(TagOperation::<ArrayType>::key_of(&sin), None);
     }
 
     #[test]
@@ -264,12 +307,34 @@ mod tests {
                 outputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -2.0]).unwrap())],
             }],
         );
+
+        // Batching a staged program re-binds the tag over the batched value instead of interpreting it away,
+        // so the batched program keeps the key that key-based consumers look for.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(TagOperation::<ArrayType>::new("residual"), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let (batched, output_axes) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[2] .
+                let %1:f64[2] = tag [key=residual] %0
+                in (%1)"},
+        );
     }
 
     #[test]
     fn test_tag_differentiation() {
-        // The JVP re-tags the primal and passes the tangent through untagged, so the key marks the instruction that
-        // defines the linearization residual rather than the tangent program.
+        // The JVP re-tags the primal and passes the tangent through untagged, so the key marks the instruction
+        // that defines the linearization residual rather than the tangent program.
         check_operation_differentiation!(
             @approx(step = 1e-6, epsilon = 1e-6),
             operation = TagOperation::new("residual"),

@@ -1461,8 +1461,12 @@ where
     // Fixed point over state known-ness: a state element can only be demoted as more are demoted, so the loop
     // converges in at most `state_count` rounds.
     let mut state_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
+
+    // The residual loop re-runs every iteration and consumes no saved values, so the partitions below ignore any
+    // residual policy of the context: a `while` loop saves nothing.
+    let partition_context = context.clone().without_residual_policy();
     let partition = loop {
-        let partition = driver.partition_program(context, body, state_known.as_slice())?;
+        let partition = driver.partition_program(&partition_context, body, state_known.as_slice())?;
         let refined = (0..state_count)
             .map(|index| {
                 state_known[index] && matches!(partition.outputs().get(index), Some(PartialEvaluationOutput::Known(_)))
@@ -1482,7 +1486,7 @@ where
 
     // The predicate must fold from the known state alone; otherwise the known loop cannot reproduce the original
     // trip count and the split does not apply.
-    let condition_partition = driver.partition_program(context, condition, state_known.as_slice())?;
+    let condition_partition = driver.partition_program(&partition_context, condition, state_known.as_slice())?;
     let (condition_known_program, _, condition_known_input_indices, _, condition_outputs) =
         condition_partition.into_parts();
     check_count!("output", condition_outputs, 1, ProgramError);

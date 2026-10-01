@@ -47,13 +47,14 @@ use crate::partial::{
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
 use crate::programs::{
-    Atom, AtomId, CalleeRegionDriver, InputRegionProvenance, MaybeZero, Operation, OperationFormatter,
-    OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError,
-    ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeRegionInput,
-    ReferenceDischargeRegionOutput, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, Region,
-    RegionArena, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
-    Typed, Value, ValueProjection, rewrite_reference_access_transforms, validated_reference_access_descriptors,
+    Atom, AtomId, CalleeRegionDriver, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning,
+    OperationFormatter, OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder,
+    ProgramError, ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
+    ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceType, Region, RegionArena, RegionInterface, RegionLiveness, RegionRef,
+    RegionSlot, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    rewrite_reference_access_transforms, validated_reference_access_descriptors,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -309,6 +310,62 @@ where
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
+    }
+
+    fn prune_boundary(
+        &self,
+        input_count: usize,
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        let carry_count = self.carry_count;
+        if used_outputs.len() < carry_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` has {} outputs but carries {carry_count} values",
+                used_outputs.len(),
+            )));
+        }
+
+        // The body maps `[index, carry..., x...]` to `[carry..., y...]`, and each carry is kept or dropped as an input
+        // and output pair. Keeping a carry output can make carry inputs live, which keeps the corresponding carry
+        // outputs in turn, so the kept carries are the least fixed point that contains the used carry outputs (as in
+        // JAX's `_scan_dce_rule`). Stacked inputs and outputs are pruned independently, while the index input and the
+        // runtime length operand that trails the stacked operands of a scan with a dynamic length are always kept.
+        let (used_carries, used_stacked_outputs) = used_outputs.split_at(carry_count);
+        let mut kept_carries = used_carries.to_vec();
+        let used_body_inputs = loop {
+            let body_outputs = kept_carries.iter().chain(used_stacked_outputs).copied().collect::<Vec<_>>();
+            let used_body_inputs = regions.used_region_inputs(0, &body_outputs)?;
+            let mut changed = false;
+            for (kept, used) in kept_carries.iter_mut().zip(used_body_inputs.iter().skip(1)) {
+                changed |= *used && !*kept;
+                *kept |= *used;
+            }
+            if !changed {
+                break used_body_inputs;
+            }
+        };
+        let stacked_count = used_body_inputs.len().checked_sub(1 + carry_count).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` body has fewer inputs than its index and {carry_count} carries",
+            ))
+        })?;
+        let trailing_count = input_count.checked_sub(carry_count + stacked_count).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "`{SCAN_OPERATION_NAME}` has {input_count} inputs but its body takes {carry_count} carries and \
+                 {stacked_count} stacked inputs",
+            ))
+        })?;
+        Ok(Some(OperationBoundaryPruning {
+            operation: Self { carry_count: kept_carries.iter().filter(|kept| **kept).count(), ..self.clone() },
+            kept_inputs: kept_carries
+                .iter()
+                .chain(&used_body_inputs[1 + carry_count..])
+                .copied()
+                .chain(std::iter::repeat_n(true, trailing_count))
+                .collect(),
+            kept_outputs: kept_carries.iter().chain(used_stacked_outputs).copied().collect(),
+        }))
     }
 
     #[inline]
@@ -2644,6 +2701,7 @@ where
     let mut index_edges = Vec::new();
     let mut edge_carry_sources = Vec::new();
     let mut feeder_edge_positions = Vec::with_capacity(residual_inputs.len());
+    let mut edge_stacked_inputs = Vec::with_capacity(residual_inputs.len());
     for input in residual_inputs.iter() {
         match input {
             PartialEvaluationInput::Known(edge) => {
@@ -2669,10 +2727,31 @@ where
                 // Each split scan supplies its own selected slice index. A direct index feeder can therefore
                 // refer to the residual body's index input instead of allocating and storing an index stack.
                 let is_index = known_program.output_ids()[output] == known_program.input_ids()[0];
+
+                // A direct feeder of a known stacked slice can be supplied by the original stacked operand, which
+                // holds exactly the slices that the known scan would otherwise stack again, as long as the slices
+                // are stored as themselves.
+                let stacked_input = known_program
+                    .input_ids()
+                    .iter()
+                    .position(|input| *input == known_program.output_ids()[output])
+                    .map(|position| known_input_indices[position])
+                    .filter(|&index| index > carry_count);
+                let stacked_input = match stacked_input {
+                    Some(index)
+                        if O::residual_to_storage(output_type)?.is_none()
+                            && O::residual_from_storage(output_type)?.is_none()
+                            && output_type.temporal_storage_type()? == *output_type =>
+                    {
+                        Some(index - 1)
+                    }
+                    _ => None,
+                };
                 index_edges.push(is_index);
                 edge_types.push(output_type.clone());
                 edge_carry_sources.push(carry_source);
-                if carry_source.is_some() || is_index {
+                edge_stacked_inputs.push(stacked_input);
+                if carry_source.is_some() || is_index || stacked_input.is_some() {
                     feeder_edge_positions.push(None);
                 } else {
                     feeder_edge_positions.push(Some((*edge, known_program_output_indices.len())));
@@ -2724,8 +2803,10 @@ where
         )
         .collect::<Result<Vec<_>, TypeError>>()?;
 
-    // An empty known side means the split folds nothing; residualize unchanged through the default rule.
-    if known_program_output_indices.is_empty() && known_program.effects().classes().is_empty() {
+    // An empty known side means the split folds nothing; residualize unchanged through the default rule. A known side
+    // that only forwards stacked operands still splits, but it needs no known scan.
+    let needs_known_scan = !known_program_output_indices.is_empty() || !known_program.effects().classes().is_empty();
+    if !needs_known_scan && edge_stacked_inputs.iter().all(Option::is_none) {
         return Ok(None);
     }
 
@@ -2798,6 +2879,7 @@ where
     .flatten();
     let known_outputs = match forwarded_outputs {
         Some(outputs) => outputs,
+        None if !needs_known_scan => Vec::new(),
         None => bind_known(O::from(known_scan), vec![known_body], known_scan_inputs.as_slice())?,
     };
 
@@ -2942,19 +3024,27 @@ where
                 unknown_scan_inputs.push(input.clone());
             }
         }
-        let mut edge_known_output_positions = feeder_edge_positions
-            .iter()
-            .flatten()
-            .chain(instantiated_edge_positions.iter().flatten())
-            .collect::<Vec<_>>();
-        edge_known_output_positions.sort_by_key(|(edge, _)| *edge);
-        for (_, known_output_position) in edge_known_output_positions {
-            unknown_scan_inputs.push(known_outputs.get(*known_output_position).cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram(
-                    format!("{SCAN_OPERATION_NAME} known-ness split known {SCAN_OPERATION_NAME} produced no output for a residual edge"),
-                )
-            })?);
+        // Edges fed by the known scan take its stacked outputs, while edges that forward known stacked slices take the
+        // original stacked operands instead.
+        let mut stacked_edges = Vec::new();
+        for (edge, known_output_position) in
+            feeder_edge_positions.iter().flatten().chain(instantiated_edge_positions.iter().flatten())
+        {
+            let input = known_outputs.get(*known_output_position).cloned().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "{SCAN_OPERATION_NAME} known-ness split known {SCAN_OPERATION_NAME} produced no output for a \
+                     residual edge",
+                ))
+            })?;
+            stacked_edges.push((*edge, input));
         }
+        for (edge, stacked_input) in edge_stacked_inputs.iter().enumerate() {
+            if let Some(input) = stacked_input {
+                stacked_edges.push((edge, body_inputs[*input].clone()));
+            }
+        }
+        stacked_edges.sort_by_key(|(edge, _)| *edge);
+        unknown_scan_inputs.extend(stacked_edges.into_iter().map(|(_, input)| input));
         unknown_scan_inputs.extend_from_slice(runtime_length_inputs);
         residual_outputs = bind_residual(O::from(unknown_scan), vec![unknown_body], unknown_scan_inputs.as_slice())?;
     }
@@ -4643,6 +4733,70 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_scan_boundary_pruning() {
+        // The body maps `[i, a, b, c, u, w]` to `[a + b, b * b, c * c, a * u, sin(w)]`. Using only the final `a` and
+        // the first stacked output keeps the carry `b` too, because the next `a` depends on it, while the carry `c`,
+        // the stacked input `w`, and the second stacked output are dropped.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let stacked = ArrayType::new_static(DataType::F64, [3]);
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let _index = body.add_input(ArrayType::scalar(DataType::I64));
+        let [a, b, c, u, w] = [(); 5].map(|_| body.add_input(scalar.clone()));
+        let next_a = body.add_instruction(AddOperation::new(), Vec::new(), vec![a, b], None).unwrap()[0];
+        let next_b = body.add_instruction(MulOperation::new(), Vec::new(), vec![b, b], None).unwrap()[0];
+        let next_c = body.add_instruction(MulOperation::new(), Vec::new(), vec![c, c], None).unwrap()[0];
+        let first = body.add_instruction(MulOperation::new(), Vec::new(), vec![a, u], None).unwrap()[0];
+        let second = body.add_instruction(SinOperation::new(), Vec::new(), vec![w], None).unwrap()[0];
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![next_a, next_b, next_c, first, second],
+                vec![Placeholder; 6],
+                vec![Placeholder; 5],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let carries = [(); 3].map(|_| builder.add_input(scalar.clone()));
+        let stacked_inputs = [(); 2].map(|_| builder.add_input(stacked.clone()));
+        let body = builder.import_program(body);
+        let outputs = builder
+            .add_instruction(
+                TestScanOperation::new(3, 3),
+                vec![body],
+                carries.iter().chain(&stacked_inputs).copied().collect(),
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[0], outputs[3]], vec![Placeholder; 5], vec![Placeholder; 2])
+            .unwrap();
+        let pruned = program.clone().into_pruned().unwrap();
+        assert_eq!(
+            pruned.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[3], %4:f64[3] .
+                let %5:f64[], %6:f64[], %7:f64[3] = scan [carry_count=2, length=3, reverse=false] %0 %1 %3 [
+                    body={
+                        lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[] = add %1 %2
+                            %5:f64[] = mul %2 %2
+                            %6:f64[] = mul %1 %3
+                        in (%4, %5, %6)
+                    },
+                ]
+                in (%5, %7)"},
+        );
+        let inputs = vec![
+            Array::scalar(1.0f64).unwrap(),
+            Array::scalar(0.5f64).unwrap(),
+            Array::scalar(2.0f64).unwrap(),
+            Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap(),
+            Array::vector(vec![4.0f64, 5.0, 6.0]).unwrap(),
+        ];
+        assert_eq!(pruned.interpret(inputs.clone()).unwrap(), program.interpret(inputs).unwrap());
     }
 
     #[test]
@@ -7705,6 +7859,70 @@ mod tests {
             .unwrap();
         assert_eq!(residual_outputs[0].to_f64s(), expected[0].to_f64s());
         assert_eq!(residual_outputs[0].to_f64s(), vec![24.0]);
+    }
+
+    #[test]
+    fn test_scan_partial_evaluation_forwards_known_stacked_operands() {
+        // Body `[a, k, x] -> [a * x, k + x]` over an unknown carry `a`, a known carry `k`, and known stacked `xs`. The
+        // unknown side consumes the known slices `x` directly, so the residual scan takes the original `xs` operand
+        // instead of a copy that the known scan stacks again, while the known scan still carries `k`.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let _index = builder.add_input(ArrayType::scalar(DataType::I64));
+            let a = builder.add_input(scalar.clone());
+            let k = builder.add_input(scalar.clone());
+            let x = builder.add_input(scalar.clone());
+            let next_a = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, x], None).unwrap()[0];
+            let next_k = builder.add_instruction(AddOperation::new(), Vec::new(), vec![k, x], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![next_a, next_k], vec![Placeholder; 4], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let a = builder.add_input(scalar.clone());
+        let k = builder.add_input(scalar);
+        let xs = builder.add_input(ArrayType::new_static(DataType::F64, [3]));
+        let outputs = builder
+            .add_instruction(TestScanOperation::new(2, 3), vec![body], vec![a, k, xs], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let partition = program.partition(&[false, true, true]).unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[1, 2],
+                    residual_inputs=[Unknown(0), Known(0)],
+                    outputs=[Unknown(0), Known(0)],
+                ]
+                known={
+                    lambda %0:f64[], %1:f64[3] .
+                    let %2:f64[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[] .
+                            let %3:f64[] = add %1 %2
+                            in (%3)
+                        },
+                    ]
+                    in (%2, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[3] .
+                    let %2:f64[] = scan [carry_count=1, length=3, reverse=false] %0 %1 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[] .
+                            let %3:f64[] = mul %1 %2
+                            in (%3)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
     }
 
     #[test]

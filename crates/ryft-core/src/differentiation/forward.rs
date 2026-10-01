@@ -17,17 +17,18 @@ use crate::differentiation::{DifferentiationBoundaryPosition, DifferentiationErr
 use crate::macros::check_count;
 use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use crate::partial::residuals::ResidualPlacement;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
-    PartialValue, PartiallyEvaluatableOperation, PartitionMetadata, PartitionedProgram,
+    PartialValue, PartiallyEvaluatableOperation, PartitionMetadata, PartitionedProgram, ResidualPolicyReference,
 };
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
-    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, MaybeZero, Operation, OperationProvider, Program,
-    ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, ReferenceAccessOperation,
-    ReferenceBoundary, ReferenceIdentity, ReferenceMemberType, ReferenceRoot, ReferenceTransform, Region, RegionDriver,
-    RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value,
-    ValueProjection,
+    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, FlatProgram, MaybeZero, Operation,
+    OperationPayloadProjection, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
+    ProvenanceScope, ReferenceAccessOperation, ReferenceBoundary, ReferenceIdentity, ReferenceMemberType,
+    ReferenceRoot, ReferenceTransform, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type,
+    TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
@@ -1059,6 +1060,46 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
         required_known_outputs: &[usize],
     ) -> Result<PartitionedProgram<C::Constant, C::Operation>, DifferentiationError>;
 
+    /// Partitions an existing fused Jacobian-Vector Product (JVP) [`Region`] like
+    /// [`partition_jvp_program`](Self::partition_jvp_program) while placing the known values that its residual tangent
+    /// program consumes according to `policy`, deciding which primal values the tangent program receives as residuals
+    /// and which it recomputes (refer to [`PartitionedProgram::with_residual_policy`] for more information). The policy
+    /// also places the residuals of the partitions that the split rules of region-carrying operations in the region
+    /// construct (refer to [`PartialEvaluationContext::with_residual_policy`]), so its decisions apply per iteration
+    /// and per branch. Rules that let users control the residuals of their linearization use this. The resulting
+    /// partition is not retained in the region's transform cache, so the policy never affects other requests.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Fused Jacobian-Vector Product (JVP) region to partition.
+    ///   - `input_known`: One entry per region input, in input order. `true` means its value is available to the primal
+    ///     computation. `false` means it is supplied to the tangent computation.
+    ///   - `required_known_outputs`: Region output indices that must be produced by the primal computation.
+    ///     An empty slice imposes no output requirement.
+    ///   - `policy`: Policy that places the residuals of the partition.
+    fn partition_jvp_program_with_residual_policy(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_known: &[bool],
+        required_known_outputs: &[usize],
+        policy: &ResidualPolicyReference<C::Type>,
+    ) -> Result<PartitionedProgram<C::Constant, C::Operation>, DifferentiationError>
+    where
+        C::Type: 'static,
+        C::Operation:
+            OperationPayloadProjection + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    {
+        let residual_placement: Rc<dyn ResidualPlacement<C::Constant, C::Operation>> = Rc::new(policy.clone());
+        let (partition, _) = region.partition_with_configuration(
+            input_known,
+            true,
+            true,
+            Some(required_known_outputs),
+            Some(residual_placement),
+        )?;
+        Ok(partition)
+    }
+
     /// Binds an operation to dual values using the differentiation context's binding semantics, including its
     /// structural zero checks. Rules can recursively differentiate newly constructed operations or replay operations
     /// from a region without wrapping each operand in a [`DifferentiationTracer`]. For example, an eager `while`
@@ -1197,6 +1238,7 @@ where
                     true,
                     true,
                     Some(&arguments.required_known_outputs),
+                    None,
                 )?;
                 let (known_program, residual_program, metadata) = partition.into_programs_and_metadata();
                 Ok(TransformArtifact::new(vec![Arc::new(known_program), Arc::new(residual_program)], metadata))
@@ -1792,10 +1834,21 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
                 })
                 .collect::<Result<Vec<_>, DifferentiationError>>()?
         } else {
-            // Borrow the complete region driver directly, preserving operation-defined ordering without collecting
-            // it into temporary storage.
-            let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver, rule: self.rule };
-            self.rule.apply(operation, self, &differentiation_driver, inputs)?
+            // Rules differentiate attached regions structurally, so regions whose types the primal operands strictly
+            // refine are first specialized to those operands (e.g., a region replayed with a concrete batch extent
+            // whose body still declares the dynamic extent). Otherwise, borrow the complete region driver directly,
+            // preserving operation-defined ordering without collecting it into temporary storage.
+            let primal_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
+            match FlatProgram::<C>::specialize_attached_regions(operation, &primal_types, driver.regions())? {
+                Some(regions) => {
+                    let differentiation_driver = RecursiveDifferentiationDriver { driver: &regions, rule: self.rule };
+                    self.rule.apply(operation, self, &differentiation_driver, inputs)?
+                }
+                None => {
+                    let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver, rule: self.rule };
+                    self.rule.apply(operation, self, &differentiation_driver, inputs)?
+                }
+            }
         };
 
         Ok(outputs)
@@ -3478,8 +3531,8 @@ pub(crate) mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
-        ShardingDimension,
+        ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, Shape, ShardingDimension,
     };
     use crate::batching::{
         BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
@@ -3491,10 +3544,10 @@ pub(crate) mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::impl_non_transposable_operation;
     use crate::operations::{
-        AddOperation, ConditionOperation, CustomFunctionTransposeOperation, Mul, MulOperation, NegOperation,
-        PrintOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation, StopGradient,
-        StopGradientOperation, ZeroOperation,
+        AddOperation, ConditionOperation, CosOperation, CustomFunctionTransposeOperation, LinearCallOperation, Mul,
+        MulOperation, NegOperation, PrintOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceWriteOperation, ScanOperation, SinOperation, StopGradient, StopGradientOperation, ZeroOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
@@ -5531,6 +5584,131 @@ pub(crate) mod tests {
         assert_eq!(outputs[0].tangent().as_value(), Some(&Array::scalar(1.0).unwrap()));
         assert_eq!(primal_calls.get(), 1);
         assert_eq!(tangent_calls.get(), 1);
+    }
+
+    #[test]
+    fn test_differentiation_context_bind_specializes_refined_regions() {
+        // Batching with a threaded extent `b` and then replaying at the concrete extent 2 instantiates `b` as an exact
+        // dynamic dimension in attached regions, while the eager array operands carry the static extent 2. The rules
+        // of `scan`, `condition`, and `linear_call` differentiate their regions structurally, so those regions must be
+        // specialized to the static operands first, or the tangents that the rules construct disagree with the primal
+        // outputs. Each program maps `x: f64[3]` to an output whose derivative is applied to a ones seed.
+        type Value = ArrayIrValue<Array>;
+        let vector = ArrayType::new_static(DataType::F64, [3]);
+        let unary = |operation: ArrayOperation<Array>, input_types: Vec<ArrayType>| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+            let output =
+                builder.add_instruction(operation, Vec::new(), vec![inputs[inputs.len() - 1]], None).unwrap()[0];
+            let input_count = inputs.len();
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; input_count], vec![Placeholder])
+                .unwrap()
+        };
+        let rows = [0.1f64, 0.2, 0.3, 0.5, -0.5, 1.0];
+        let gradient = |program: Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
+                        replicated: Vec<Array>| {
+            let mut axes = vec![BatchAxis::replicated(); replicated.len()];
+            axes.push(BatchAxis::new(0));
+            let (batched, _) = program
+                .into_unprojected::<Value, ArrayIrOperation<Array>>()
+                .unwrap()
+                .batched_with_threaded_extent(
+                    DimensionType::new("b", DimensionBounds::positive(None).unwrap()),
+                    ShardingDimension::Replicated,
+                    &axes,
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts();
+            let xs = Array::matrix(2, 3, rows.to_vec()).unwrap();
+            let context = EagerContext::<Value, ArrayIrOperation<Array>>::new();
+            let (_, pullback) = differentiate_at(Value::Array(xs))
+                .in_context(&context)
+                .vjp(|xs| {
+                    let domain = xs.dispatch_domain();
+                    let mut inputs = vec![domain.lift(Value::Dimension(DimensionValue::constant(2).unwrap()))?];
+                    for value in &replicated {
+                        inputs.push(domain.lift(Value::Array(value.clone()))?);
+                    }
+                    inputs.push(xs);
+                    Ok(batched.interpret_in_context(&domain, inputs)?.remove(1))
+                })
+                .unwrap();
+            let Value::Array(gradient) =
+                pullback.apply(Value::Array(Array::matrix(2, 3, vec![1.0; 6]).unwrap())).unwrap()
+            else {
+                panic!("expected an array gradient");
+            };
+            gradient.to_f64s()
+        };
+
+        // `scan` over two iterations of `c -> sin(c)` computes `sin(sin(x))`.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let index_type = ArrayType::scalar(DataType::I64);
+        let body = builder.import_program(unary(SinOperation::new().into(), vec![index_type, vector.clone()]));
+        let x = builder.add_input(vector.clone());
+        let output =
+            builder.add_instruction(ScanOperation::<Array>::new(1, 2usize), vec![body], vec![x], None).unwrap()[0];
+        let scan = builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let expected = rows.iter().map(|x| x.sin().cos() * x.cos()).collect::<Vec<_>>();
+        assert_abs_diff_eq!(gradient(scan, Vec::new()).as_slice(), expected.as_slice(), epsilon = 1e-12);
+
+        // `condition` with a replicated predicate selects `sin(x)` over `cos(x)`.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let true_branch = builder.import_program(unary(SinOperation::new().into(), vec![vector.clone()]));
+        let false_branch = builder.import_program(unary(CosOperation::new().into(), vec![vector.clone()]));
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let x = builder.add_input(vector.clone());
+        let output = builder
+            .add_instruction(
+                ConditionOperation::<Array>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, x],
+                None,
+            )
+            .unwrap()[0];
+        let condition = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let expected = rows.iter().map(|x| x.cos()).collect::<Vec<_>>();
+        assert_abs_diff_eq!(
+            gradient(condition, vec![Array::scalar(true).unwrap()]).as_slice(),
+            expected.as_slice(),
+            epsilon = 1e-12,
+        );
+
+        // `linear_call` scales `x` by the residual `[1, 2, 3]` in both its forward and transpose regions.
+        let scaled = || {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let residual = builder.add_input(vector.clone());
+            let linear = builder.add_input(vector.clone());
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, linear], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let forward = builder.import_program(scaled());
+        let transpose = builder.import_program(scaled());
+        let x = builder.add_input(vector.clone());
+        let residual = builder.add_constant(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap());
+        let output = builder
+            .add_instruction(
+                LinearCallOperation::<ArrayType>::new(1),
+                vec![forward, transpose],
+                vec![residual, x],
+                None,
+            )
+            .unwrap()[0];
+        let linear_call =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_abs_diff_eq!(
+            gradient(linear_call, Vec::new()).as_slice(),
+            [1.0, 2.0, 3.0, 1.0, 2.0, 3.0].as_slice(),
+            epsilon = 1e-12,
+        );
     }
 
     #[test]
