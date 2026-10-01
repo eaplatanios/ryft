@@ -571,8 +571,6 @@ pub trait Cumulative: Sized {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Cumulative for Array {
     fn cumulative<A: Into<Axis>>(&self, axis: A, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError> {
         let axis = axis.into();
@@ -580,6 +578,7 @@ impl Cumulative for Array {
         let axis = axis.normalize(rank).map_err(|_| {
             TypeError::invalid(format!("`{CUMULATIVE_OPERATION_NAME}` axis {axis} is out of bounds for rank {rank}"))
         })?;
+
         // The type rule validates the scan and supplies the complete output metadata. The kernels below then decode the
         // input's logical elements, run the sequential prefix scan over them with the kind's element-level combining
         // operator, and re-encode the result into the input's own type. Accumulation happens in the input's element
@@ -602,18 +601,6 @@ impl Cumulative for Array {
                             CumulativeKind::Sum => NumericArrayElement::add(left, right),
                             _ => multiply_product_elements(left, right),
                         }
-                    })?;
-                    Self::from_elements(output_type, scanned.as_slice())
-                })
-            }
-            CumulativeKind::Max | CumulativeKind::Min => {
-                dispatch_on_array_element_type!(@numeric data_type, |Element| {
-                    let elements = self.elements::<Element>()?;
-                    let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
-                        Ok(match kind {
-                            CumulativeKind::Max => ArrayElement::max(&left, &right),
-                            _ => ArrayElement::min(&left, &right),
-                        })
                     })?;
                     Self::from_elements(output_type, scanned.as_slice())
                 })
@@ -656,6 +643,18 @@ impl Cumulative for Array {
                     Self::from_elements(output_type, scanned.as_slice())
                 })
             }
+            CumulativeKind::Max | CumulativeKind::Min => {
+                dispatch_on_array_element_type!(@numeric data_type, |Element| {
+                    let elements = self.elements::<Element>()?;
+                    let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
+                        Ok(match kind {
+                            CumulativeKind::Max => ArrayElement::max(&left, &right),
+                            _ => ArrayElement::min(&left, &right),
+                        })
+                    })?;
+                    Self::from_elements(output_type, scanned.as_slice())
+                })
+            }
         }
     }
 }
@@ -681,6 +680,8 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ArrayType {
     /// Returns the output [`ArrayType`] produced by scanning `self` along `axis` with `kind`. The result *is* `self`: a
