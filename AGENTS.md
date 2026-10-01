@@ -61,7 +61,9 @@ When asked to implement a change or add a new feature, you must always follow th
    explicit paths. Verify the staging worktree is clean first; restore a whole path only when the reviewed plan assigns
    its complete delta to that increment, and use patch mode for paths shared with later work. Never target the worktree
    root, a directory broader than the increment, a glob, or an unresolved variable. This exception never applies in
-   the owner checkout and does not permit `git checkout <path>`, `git reset`, `git clean`, or `git stash`.
+   the owner checkout and does not permit `git checkout <path>`, `git reset`, `git clean`, or `git stash`. Never stage
+   or unstage paths either (e.g., `git add`, `git rm`, or `git rm --cached`); the user curates the index and commits
+   pieces as they go, so delete files with a plain `rm` and leave staging to them.
 5. **Elegance:** For non-trivial changes pause and ask yourself "Is there a more elegant way to do this?". If a change
    feels hacky, implement an elegent solution knowing everything that you know by this point. For non-trivial changes,
    always challenge your work before presenting it.
@@ -206,7 +208,9 @@ update this file so that they do not need to remind you again in the future.
   and invoke them unqualified. Reserve `$crate::...` paths for hygienic references inside macro definitions.
 - Use full words for variable names and avoid abbreviations or shortened versions of words. Canonical mathematical
   function names that Rust's own standard library uses (e.g., `abs` as in `f64::abs`) count as full names and are
-  preferred over spelled-out variants such as `absolute_value`.
+  preferred over spelled-out variants such as `absolute_value`. This also applies to names borrowed from external
+  APIs: spell out abbreviations such as JAX's `prevent_cse` (e.g., as `optimization_barrier`, named for the mechanism,
+  or `prevent_common_subexpression_elimination`), and mention the external name only in documentation.
 - When a function-like call or macro invocation argument list spans multiple lines, include a trailing comma after the
   final argument.
 - For canonical conversion helpers in `ryft`, prefer `from_*` naming even when the conversion is fallible and returns
@@ -258,6 +262,9 @@ update this file so that they do not need to remind you again in the future.
   - `'c`: context/client lifetime in `ryft-mlir` and `ryft-pjrt`,
   - `'t`: thread pool lifetime in `ryft-mlir`, and
   - `'s`: store lifetime in `ryft-pjrt`.
+- Name the lifetime of a borrow of an operation, object, or other owner `'o` (e.g., `ResidualProducer<'o, T>`, which
+  borrows its producing operation), including in the types and higher-ranked bounds that carry it along. Do not use a
+  generic `'a`.
 - Non-owning wrapper types in `ryft-mlir` are typically `Copy + Clone` and often end with `Ref`.
 - Owning wrapper types in `ryft-mlir` are not `Copy` and implement `Drop` to release C resources.
 - Owning wrapper types in `ryft-pjrt` are not `Copy` and implement `Drop` to release C resources.
@@ -363,6 +370,9 @@ update this file so that they do not need to remind you again in the future.
   readability-driven sentence breaks.
 - In documentation strings, use "function" for callable APIs, including methods, rather than distinguishing methods
   from free functions in prose.
+- In `ryft-core` program, partial-evaluation, and residual-planning code, call the values that an instruction consumes
+  its "inputs", following `Instruction::inputs` and `InputRegionProvenance::Input`, rather than "operands" (in names,
+  comments, and diagnostics). Write "region input" (or "instruction input") wherever both kinds appear nearby.
 
 ## Testing Guidelines
 

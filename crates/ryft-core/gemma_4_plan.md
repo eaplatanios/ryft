@@ -169,7 +169,7 @@ Landed in `operations/random.rs`, in exactly the stateless-key shape the plan as
 | `lax.while_loop` | autoregressive decode, training loop | ✅ | `WhileOperation` with `WhilePredicate` and `with_iteration_bound` |
 | `lax.scan` | layer stacking, remat-friendly loops | ✅ | `ScanOperation` with `carry_count`, `length`, `with_reverse`, `with_unroll`, `with_captures` |
 | `lax.fori_loop` | optimizer step over parameter tree | ⚠️ | express via `scan`/`while`; a trivial helper if wanted |
-| `jax.checkpoint` (remat) | activation checkpointing per block | ✅ | `rematerialize(body)` + `RematerializeOperation` with the full JAX policy family: `EverythingSaveable`, `NothingSaveable`, `DotsSaveable`, `DotsWithNoBatchDimsSaveable`, `SaveOnlyTheseNames`, `SaveAnyNamesButThese`, `SaveAnythingExceptTheseNames`, `SaveFromBothPolicies`, and `OffloadDotsWithNoBatchDims` with `ResidualStorage`/`MemoryTransferStorage` **offload support** — beyond what the plan asked for |
+| `jax.checkpoint` (remat) | activation checkpointing per block | ✅ | `rematerialize(body)` + `RematerializeOperation` with the full JAX policy family: `EverythingSaveable`, `NothingSaveable`, `DotsSaveable`, `DotsWithNoBatchDimensionsSaveable`, `SaveOnlyTheseNames`, `SaveAnyNamesButThese`, `SaveAnythingExceptTheseNames`, `SaveFromBothPolicies`, and `OffloadDotsWithNoBatchDimensions` with `ResidualStorage`/`MemoryTransferStorage` **offload support** — beyond what the plan asked for |
 | `jax.custom_jvp` / `custom_vjp` | custom derivative rules (fused attention uses this) | ✅ | `custom_function(primal).with_jvp(jvp)` / `.with_vjp(forward, backward)` in `operations::custom_functions`, lowered as first-class program operations |
 
 ### 1.8 Parallelism & sharding
@@ -387,7 +387,7 @@ With the primitives done, the remaining work re-scopes to five focused phases:
   parameter tree, blocks on the fused `dot_product_attention`, loss, `train_step` via
   `differentiate_at(..).with_captures(..).value_and_gradient(..)` + R1's optimizer, JIT-compiled
   through `ryft-xla`'s `jitted`. Wrap each block in `rematerialize(..)` with a
-  `DotsWithNoBatchDimsSaveable`-style policy for long-context memory.
+  `DotsWithNoBatchDimensionsSaveable`-style policy for long-context memory.
 - **R4 — Validation.** Forward-logit parity against the DeepMind JAX reference on a published
   E2B checkpoint; one-optimizer-step parameter-delta parity; short-run loss-curve parity; then
   the §4.7 NVFP4 checks (the `scaled_dot` portable fallback and `__op$block_scaled_dot` CUDA
@@ -814,8 +814,8 @@ recipe:
 
 ```rust
 let block_output = rematerialize(|(x, positions)| block(config, layer_index, params, &x, &positions))
-    .with_policy(DotsWithNoBatchDimsSaveable)
-    .apply((x, positions.clone()))?;
+    .with_policy(DotsWithNoBatchDimensionsSaveable)
+    .call((x, positions.clone()))?;
 ```
 
 ### 3.5 Forward, loss, and one training step
