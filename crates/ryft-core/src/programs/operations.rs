@@ -1525,6 +1525,21 @@ mod tests {
             vec![OutputRegionProvenance { region_index: 0, output_index }]
         }
 
+        fn prune_boundary(
+            &self,
+            input_count: usize,
+            used_outputs: &[bool],
+            regions: &mut dyn RegionLiveness,
+        ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+            let mut kept_inputs = regions.used_region_inputs(0, used_outputs)?;
+            kept_inputs.resize(input_count, true);
+            Ok(Some(OperationBoundaryPruning {
+                operation: self.clone(),
+                kept_inputs,
+                kept_outputs: used_outputs.to_vec(),
+            }))
+        }
+
         fn is_zero(&self, output_index: usize) -> bool {
             output_index == 2
         }
@@ -1667,6 +1682,19 @@ mod tests {
 
     #[test]
     fn test_operation() {
+        /// [`RegionLiveness`] whose attached regions use only their first input.
+        struct FirstInputLiveness;
+
+        impl RegionLiveness for FirstInputLiveness {
+            fn used_region_inputs(
+                &mut self,
+                _region_index: usize,
+                _used_outputs: &[bool],
+            ) -> Result<Vec<bool>, ProgramError> {
+                Ok(vec![true, false])
+            }
+        }
+
         let operation = StopGradientOperation::<DataType>::new();
 
         // Check required inference and the default operation contract. The fixture operation is variadic,
@@ -1694,6 +1722,7 @@ mod tests {
         );
         assert_eq!(operation.infer_region_input_types(&[DataType::F64], &region_interfaces), Ok(vec![None, None]),);
         assert_eq!(operation.output_region_provenance(0), Vec::new());
+        assert!(matches!(operation.prune_boundary(1, &[false], &mut FirstInputLiveness), Ok(None)));
         assert_eq!(operation.region_capture_input_count(0), None);
         assert_eq!(operation.reference_output_identity_input(0), None);
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
@@ -1733,6 +1762,14 @@ mod tests {
         assert_eq!(
             operation.output_region_provenance(3),
             vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],
+        );
+        assert_eq!(
+            operation.prune_boundary(3, &[true, false], &mut FirstInputLiveness),
+            Ok(Some(OperationBoundaryPruning {
+                operation: Box::new(ForwardingOperation::<DataType> { renamed: false, marker: PhantomData }),
+                kept_inputs: vec![true, false, true],
+                kept_outputs: vec![true, false],
+            })),
         );
         assert!(!operation.is_zero(1));
         assert!(operation.is_zero(2));
@@ -1840,6 +1877,25 @@ mod tests {
             Err(TypeError::invalid(format!(
                 "`selected_fold` fold declares a singleton output but its type `{scalar}` does not determine a value",
             ))),
+        );
+    }
+
+    #[test]
+    fn test_operation_boundary_pruning_map_operation() {
+        // Mapping the operation (e.g., into the variant of the operation family that holds it) keeps the boundary.
+        let operation = ForwardingOperation::<DataType> { renamed: false, marker: PhantomData };
+        let pruning = OperationBoundaryPruning {
+            operation: operation.clone(),
+            kept_inputs: vec![true, false],
+            kept_outputs: vec![false, true],
+        };
+        assert_eq!(
+            pruning.map_operation(Box::new),
+            OperationBoundaryPruning {
+                operation: Box::new(operation),
+                kept_inputs: vec![true, false],
+                kept_outputs: vec![false, true],
+            },
         );
     }
 
