@@ -354,9 +354,9 @@ pub trait ElementType: Type {
     /// Returns the element [`DataType`].
     fn element_type(&self) -> DataType;
 
-    /// Returns a copy of this type with `data_type` as its element type, preserving structural and placement metadata
-    /// while clearing byte-stride layouts that a changed element storage width invalidates. This does not validate the
-    /// numerical conversion itself; [`ConvertElementType::convert_element_type`] converts actual values.
+    /// Returns a type derived from this one with `data_type` as its element type, preserving structural and placement
+    /// metadata while clearing byte-stride layouts that a changed element storage width invalidates. This does not
+    /// validate the numerical conversion itself; [`ConvertElementType::convert_element_type`] converts actual values.
     ///
     /// # Parameters
     ///

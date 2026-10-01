@@ -109,7 +109,7 @@ impl ArrayType {
         Self::new(data_type, StaticShape::new(dimensions.into()).into())
     }
 
-    /// Returns a copy of this [`ArrayType`] with its [`DataType`] replaced by the provided one, keeping its [`Shape`],
+    /// Returns this [`ArrayType`] with its [`DataType`] replaced by the provided one, keeping its [`Shape`],
     /// [`Layout`], [`Sharding`], and [`Memory`] unchanged.
     #[inline]
     pub fn with_data_type<D: Into<DataType>>(mut self, data_type: D) -> Self {
@@ -117,7 +117,7 @@ impl ArrayType {
         self
     }
 
-    /// Returns a copy of this [`ArrayType`] with its [`Shape`] replaced by the provided one, keeping its [`DataType`],
+    /// Returns this [`ArrayType`] with its [`Shape`] replaced by the provided one, keeping its [`DataType`],
     /// [`Layout`], [`Sharding`], and [`Memory`] unchanged.
     #[inline]
     pub fn with_shape<S: Into<Shape>>(mut self, shape: S) -> Self {
@@ -133,9 +133,9 @@ impl ArrayType {
         self
     }
 
-    /// Returns a copy of this [`ArrayType`] with the provided [`Sharding`] replacing its current sharding metadata
-    /// (or without any [`Sharding`] information when [`None`] is provided), after validating that any provided
-    /// [`Sharding`] has the same rank as [`Self::shape`].
+    /// Returns this [`ArrayType`] with the provided [`Sharding`] replacing its current sharding metadata (or without
+    /// any [`Sharding`] information when [`None`] is provided), after validating that any provided [`Sharding`] has the
+    /// same rank as [`Self::shape`].
     #[inline]
     pub fn with_sharding<S: Into<Option<Sharding>>>(mut self, sharding: S) -> Result<Self, ShardingError> {
         let sharding = sharding.into();
@@ -150,7 +150,7 @@ impl ArrayType {
         Ok(self)
     }
 
-    /// Returns a copy of this [`ArrayType`] with the array residing in the provided [`Memory`]. This kind of placement
+    /// Returns this [`ArrayType`] with the array residing in the provided [`Memory`]. This kind of placement
     /// information is metadata about where the array lives, and it does not affect the array's [`DataType`], [`Shape`],
     /// [`Layout`], or [`Sharding`] (for sharded arrays, every shard resides in its own device's memory of this kind).
     #[inline]
@@ -291,10 +291,10 @@ impl ArrayType {
         self.sharding.as_ref().map(|sharding| sharding.reduced_axes()).unwrap_or(&EMPTY_BATCH_AXES)
     }
 
-    /// Returns a copy of this [`ArrayType`] whose [`Sharding`] (if any) has its unreduced and reduced axis sets cleared
-    /// while its per-dimension placement and varying-manual axes are preserved. Array types with no [`Sharding`] are
-    /// returned unchanged. Bilinear type-inference rules (e.g., elementwise multiplication rules) use this so the
-    /// shared elementwise broadcast does not reject operands that only disagree on their reduction state, which those
+    /// Returns an [`ArrayType`] whose [`Sharding`] (if any) has its unreduced and reduced axis sets cleared while its
+    /// per-dimension placement and varying-manual axes are preserved. Array types with no [`Sharding`] are returned
+    /// unchanged. Bilinear type-inference rules (e.g., elementwise multiplication rules) use this so the shared
+    /// elementwise broadcast does not reject operands that only disagree on their reduction state, which those
     /// rules combine separately.
     #[inline]
     pub fn without_reduction_axes(&self) -> Self {
@@ -316,10 +316,10 @@ impl ArrayType {
         self.memory
     }
 
-    /// Returns a copy of this [`ArrayType`] with a dimension inserted at the provided index. Rank-changing operations
-    /// clear explicit [`Layout`] information because [`Layout`]s do not carry enough information to infer a correct
-    /// stride or tiling for a newly inserted logical axis. [`Sharding`] information is preserved by inserting a
-    /// replicated sharding dimension at the same index and shifting the existing dimension annotations.
+    /// Returns an [`ArrayType`] with a dimension inserted at the provided index. Rank-changing operations clear
+    /// explicit [`Layout`] information because [`Layout`]s do not carry enough information to infer a correct stride
+    /// or tiling for a newly inserted logical axis. [`Sharding`] information is preserved by inserting a replicated
+    /// sharding dimension at the same index and shifting the existing dimension annotations.
     pub fn with_inserted_dimension(&self, index: usize, dimension: Dimension) -> Result<Self, TypeError> {
         if index > self.rank() {
             return Err(TypeError::invalid(format!(
@@ -349,13 +349,13 @@ impl ArrayType {
         })
     }
 
-    /// Returns a copy of this [`ArrayType`] with its `index`-th dimension removed, paired with the [`Dimension`] of the
-    /// removed dimension. Rank-changing operations clear explicit [`Layout`] information because [`Layout`]s do not
-    /// carry enough information to infer a correct stride or tiling after removing a logical axis. [`Sharding`]
-    /// information is preserved when the removed dimension is replicated or unconstrained. When the removed dimension
-    /// is sharded over manual mesh axes, those axes become varying manual axes because the value can still differ
-    /// across shards even though the ranked array dimension is gone. Removing a dimension sharded over non-manual
-    /// axes is rejected because there is no equivalent rank-independent metadata field for those axes.
+    /// Returns an [`ArrayType`] with its `index`-th dimension removed, paired with the [`Dimension`] of the removed
+    /// dimension. Rank-changing operations clear explicit [`Layout`] information because [`Layout`]s do not carry
+    /// enough information to infer a correct stride or tiling after removing a logical axis. [`Sharding`] information
+    /// is preserved when the removed dimension is replicated or unconstrained. When the removed dimension is sharded
+    /// over manual mesh axes, those axes become varying manual axes because the value can still differ across shards
+    /// even though the ranked array dimension is gone. Removing a dimension sharded over non-manual axes is rejected
+    /// because there is no equivalent rank-independent metadata field for those axes.
     pub fn without_dimension(&self, index: usize) -> Result<(Self, Dimension), TypeError> {
         if index >= self.rank() {
             return Err(TypeError::invalid(format!(
@@ -389,8 +389,8 @@ impl ArrayType {
         ))
     }
 
-    /// Returns a copy of this [`ArrayType`] with a replicated [`Sharding`] over the provided [`DeviceMesh`]. The
-    /// [`Layout`] information and [`Memory`] placement are preserved.
+    /// Returns an [`ArrayType`] with a replicated [`Sharding`] over the provided [`DeviceMesh`]. The [`Layout`]
+    /// information and [`Memory`] placement are preserved.
     pub fn replicated(&self, mesh: &DeviceMesh) -> Result<Self, ShardingError> {
         self.clone().with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), self.shape.rank()))
     }

@@ -146,7 +146,7 @@ impl ParallelReduceOperation {
         Ok(Self { axis_name, kind, axis_size: Some(axis_size), axis_index_groups: Some(axis_index_groups), mesh: None })
     }
 
-    /// Returns a copy of this [`ParallelReduceOperation`] that reduces over a manual axis of `mesh`. The input must
+    /// Returns this [`ParallelReduceOperation`] configured to reduce over a manual axis of `mesh`. The input must
     /// vary over [`axis_name`](Self::axis_name) on that mesh and the output is invariant over it. Validation occurs
     /// during type inference. [`ParallelReduce::parallel_reduce`] supplies the mesh automatically from the enclosing
     /// manual region.

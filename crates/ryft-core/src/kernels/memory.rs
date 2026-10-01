@@ -143,7 +143,7 @@ impl MaskedLoadOperation {
         &self.transforms
     }
 
-    /// Returns a copy with the provided transforms applied before the access.
+    /// Returns this accessor with the provided transforms applied before the access.
     pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.transforms = transforms;
         self
@@ -273,7 +273,7 @@ impl MaskedStoreOperation {
         &self.transforms
     }
 
-    /// Returns a copy with the provided transforms applied before the access.
+    /// Returns this accessor with the provided transforms applied before the access.
     pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.transforms = transforms;
         self
@@ -402,7 +402,7 @@ impl MaskedSwapOperation {
         &self.transforms
     }
 
-    /// Returns a copy with the provided transforms applied before the access.
+    /// Returns this accessor with the provided transforms applied before the access.
     pub fn with_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.transforms = transforms;
         self
@@ -555,13 +555,13 @@ impl AsyncCopyOperation {
         &self.destination_transforms
     }
 
-    /// Returns a copy with the provided transforms applied to the source reference.
+    /// Returns this accessor with the provided transforms applied to the source reference.
     pub fn with_source_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.source_transforms = transforms;
         self
     }
 
-    /// Returns a copy with the provided transforms applied to the destination reference.
+    /// Returns this accessor with the provided transforms applied to the destination reference.
     pub fn with_destination_transforms(mut self, transforms: Vec<ArrayReferenceTransform>) -> Self {
         self.destination_transforms = transforms;
         self

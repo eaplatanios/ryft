@@ -658,7 +658,7 @@ impl CustomCallOperation {
         self.ragged_contract.as_ref()
     }
 
-    /// Returns a copy of this [`CustomCallOperation`] with the provided typed configuration attribute appended.
+    /// Returns this [`CustomCallOperation`] with the provided typed configuration attribute appended.
     #[inline]
     pub fn with_attribute<N: Into<String>, V: Into<CustomCallAttribute>>(mut self, name: N, value: V) -> Self {
         self.attributes.push((name.into(), value.into()));
@@ -706,17 +706,17 @@ impl CustomCallOperation {
         self
     }
 
-    /// Returns a copy of this [`CustomCallOperation`] requesting the provided [`CustomCallBatching`] behavior when
-    /// the batching transform maps one of its operands. Refer to the documentation of [`CustomCallBatching`] for the
-    /// available behaviors and for why the default rejects mapped operands.
+    /// Returns this [`CustomCallOperation`] requesting the provided [`CustomCallBatching`] behavior when the batching
+    /// transform maps one of its operands. Refer to the documentation of [`CustomCallBatching`] for the available
+    /// behaviors and for why the default rejects mapped operands.
     #[inline]
     pub fn with_batching(mut self, batching: CustomCallBatching) -> Self {
         self.batching = batching;
         self
     }
 
-    /// Returns a copy of this operation carrying the provided declared ragged calling convention. Structural
-    /// validation occurs during type inference, when the operand types are available.
+    /// Returns this operation carrying the provided declared ragged calling convention. Structural validation occurs
+    /// during type inference, when the operand types are available.
     #[inline]
     pub fn with_ragged_contract(mut self, contract: CustomCallRaggedContract) -> Self {
         self.ragged_contract = Some(contract);

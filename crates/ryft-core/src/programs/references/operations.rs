@@ -63,8 +63,8 @@ pub trait ReferenceAccessOperation: Operation {
     fn reference_access_descriptor(&self, input_index: usize)
     -> Option<ReferenceAccessDescriptor<'_, Self::Transform>>;
 
-    /// Returns a copy of this [`ReferenceAccessOperation`] with the path of the access at `input_index` replaced.
-    /// Rejects a non-access position or a path unsupported by that access. The instruction's bindings must be replaced
+    /// Returns a [`ReferenceAccessOperation`] with the path of the access at `input_index` replaced. Rejects
+    /// a non-access position or a path unsupported by that access. The instruction's bindings must be replaced
     /// separately in the canonical layout.
     fn with_reference_access_transforms(
         &self,
@@ -101,10 +101,10 @@ pub fn validated_reference_access_descriptors<O: ReferenceAccessOperation>(
     reference_access_layout(operation, input_count).map_err(|(_, message)| ProgramError::MalformedProgram(message))
 }
 
-/// Returns a copy of `instruction` whose reference access at `input_index` applies `transforms`, with `bindings` as
-/// their dynamic inputs, in place of its current transforms and bindings. Everything else (i.e., the other inputs,
-/// including the binding groups of other accesses which shift as needed, outputs, attached regions, and provenance)
-/// is preserved.
+/// Returns an instruction derived from `instruction` whose reference access at `input_index` applies `transforms`,
+/// with `bindings` as their dynamic inputs, in place of its current transforms and bindings. Everything else (i.e., the
+/// other inputs, including the binding groups of other accesses which shift as needed, outputs, attached regions, and
+/// provenance) is preserved.
 ///
 /// Use this when a program transformation changes what an existing access selects, rather than rebuilding the
 /// operation by hand (e.g., prepending an index for a newly mapped batch axis, or dropping a leading index that

@@ -518,7 +518,7 @@ where
     /// which lowers by inlining its forward region.
     LinearCall(LinearCallOperation<ArrayIrType>),
 
-    /// Backend-owned rematerialized call whose attached regions can contain XLA operations.
+    /// Backend-owned rematerialized call whose body can contain XLA operations.
     Rematerialize(RematerializeOperation<ArrayIrType>),
 
     /// Custom function call whose retained rules are registered in the [`ArrayOperation`] member family, promoted
@@ -2320,6 +2320,123 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_residual_candidates_classify_through_callee_provenance() {
+        use std::sync::{Arc, Mutex};
+
+        use ryft_core::PolicyFn;
+
+        // `jit_call` reports positional output-region provenance, so a residual produced by a computed callee output
+        // is classified through the callee to that output's own producer instead of to the opaque `jit_call`. The
+        // program squares its known input `x` inside the callee and multiplies the result of the call by its unknown
+        // input `y` outside of it, so the residual program needs the result of the call.
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            let squared =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![squared], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let callee = builder.import_program(callee);
+        let x = builder.add_input(scalar_type.clone());
+        let y = builder.add_input(scalar_type);
+        let called = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![x], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![called, y], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let recorded = names.clone();
+        let policy = PolicyFn::new::<ArrayIrType>(move |candidate| {
+            let names = candidate.producers().iter().map(|producer| producer.name().to_string());
+            recorded.lock().unwrap().extend(names);
+            Ok::<_, ResidualRejection>(ResidualDecision::<NoStorage>::Save)
+        });
+        program
+            .partition(&[true, false])
+            .unwrap()
+            .with_residual_policy(&ResidualPolicyReference::new(policy))
+            .unwrap();
+        assert_eq!(names.lock().unwrap().clone(), vec!["mul".to_string()]);
+    }
+
+    #[test]
+    fn test_rematerialize_recomputes_known_jit_calls_in_its_body() {
+        use ryft_core::{NothingSaveable, rematerialize};
+
+        // A rematerialized body squares its input inside a jitted call and squares the result of the call outside of
+        // it. Linearizing it with the default policy, which saves nothing, saves only the input: the call, whose inputs
+        // are all known, is recomputed by the differentiated call rather than saved.
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            let squared =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![squared], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let function = rematerialize(move |x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+            let context = x.context().clone();
+            let called = context.bind(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee.clone()], &[x])?;
+            let mut outputs = context.bind(MulOperation::new(), Vec::new(), &[called[0].clone(), called[0].clone()])?;
+            Ok(outputs.remove(0))
+        })
+        .with_policy(NothingSaveable);
+        let (_, program) =
+            DomainTracingContext::<XlaDomain<'static>>::trace(|x: XlaTracer<'static>| function.call(x), scalar_type)
+                .unwrap();
+        let linearization = program.into_flat_program().linearize().unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                        in (%1)
+                    },
+                ]
+                    %2:f64[] = mul %1 %1
+                in (%2, %0)
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = rematerialize [differentiated=true] %0 %1 [
+                    body={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[], %3:f64[] = jit_call %1 [
+                            callee={
+                                lambda %0:f64[] .
+                                let %1:f64[] = mul %0 %0
+                                in (%1, %0)
+                            },
+                        ]
+                            %4:f64[] = jit_call %0 %3 [
+                                callee={
+                                    lambda %0:f64[], %1:f64[] .
+                                    let %2:f64[] = mul %1 %0
+                                        %3:f64[] = mul %1 %0
+                                        %4:f64[] = add %2 %3
+                                    in (%4)
+                                },
+                            ]
+                            %5:f64[] = mul %2 %4
+                            %6:f64[] = mul %2 %4
+                            %7:f64[] = add %5 %6
+                        in (%7)
+                    },
+                ]
+                in (%2)"},
+        );
+    }
+
+    #[test]
     fn test_rematerialize_rejects_captures_registered_in_its_body() {
         use ryft_core::rematerialize;
 
@@ -2328,15 +2445,13 @@ mod tests {
         // silent-aliasing rationale.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
         let captured_value = XlaConstant::Captured(CaptureReference::new(0, scalar_type.clone()));
-        let function = rematerialize(
-            move |x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
-                let context = x.context().clone();
-                let reference = context.capture(captured_value.clone())?;
-                let captured = StagingContext::constant(&context, reference);
-                let mut outputs = context.bind(AddOperation::new(), Vec::new(), &[x, captured])?;
-                Ok(outputs.remove(0))
-            },
-        );
+        let function = rematerialize(move |x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+            let context = x.context().clone();
+            let reference = context.capture(captured_value.clone())?;
+            let captured = StagingContext::constant(&context, reference);
+            let mut outputs = context.bind(AddOperation::new(), Vec::new(), &[x, captured])?;
+            Ok(outputs.remove(0))
+        });
         let root = DomainTracingContext::<XlaDomain<'static>>::new();
         let input = root.input(scalar_type);
         let result = function.call(input);

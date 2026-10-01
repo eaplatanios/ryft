@@ -6046,8 +6046,8 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 Ok(vec![input_values[0]])
             }
             ArrayOperation::ParallelReduce(operation) => {
-                // This plain dispatch serves nested programs (control-flow bodies, inlined custom-function and
-                // rematerialized primals), which can sit inside a shard_map manual region: the threaded
+                // This plain dispatch serves nested programs (control-flow bodies, inlined custom-function primals,
+                // and rematerialized bodies), which can sit inside a shard_map manual region: the threaded
                 // `CollectiveLoweringState` resolves the collective's mesh axis there and errors outside manual
                 // regions (a batched axis would have been consumed into a `Reduce` at trace time).
                 check_count!("input", input_values, 1, ProgramError);
@@ -17074,6 +17074,251 @@ mod tests {
         "#};
         assert_eq!(lower(operation.clone()), unbarriered);
         assert_eq!(lower(operation.with_differentiated(true).with_optimization_barrier(false)), unbarriered);
+    }
+
+    #[test]
+    fn test_rematerialized_gradient_lowers_with_an_input_barrier_on_its_recomputation() {
+        use ryft_core::{differentiate_at, rematerialize};
+
+        // `jit(grad(rematerialize(x ↦ sin(x²))))` saves only `x`, so the backward computation recomputes `cos(x²)`
+        // inside the differentiated call. Its optimization barrier, which is placed on the inputs of that call unless
+        // it is disabled, keeps XLA from reusing the forward computation instead.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let lower = |optimization_barrier: bool| {
+            let function = rematerialize(|x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+                let context = x.context();
+                let square =
+                    context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[x.clone(), x.clone()])?;
+                Ok(context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &square)?.remove(0))
+            })
+            .with_optimization_barrier(optimization_barrier);
+            let (_, program) = DomainTracingContext::<XlaDomain<'static>>::trace(
+                |x: XlaTracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+                ArrayIrType::from(scalar_type.clone()),
+            )
+            .unwrap();
+            to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap()
+        };
+        assert_eq!(
+            lower(true),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<f64>
+                    %1 = stablehlo.sine %0 : tensor<f64>
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
+                    %2:2 = stablehlo.optimization_barrier %cst, %arg0 : tensor<f64>, tensor<f64>
+                    %3 = stablehlo.multiply %2#1, %2#1 : tensor<f64>
+                    %4 = stablehlo.cosine %3 : tensor<f64>
+                    %5 = stablehlo.multiply %4, %2#0 : tensor<f64>
+                    %6 = stablehlo.multiply %2#1, %5 : tensor<f64>
+                    %7 = stablehlo.multiply %2#1, %5 : tensor<f64>
+                    %8 = stablehlo.add %6, %7 : tensor<f64>
+                    return %8 : tensor<f64>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            lower(false),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<f64>
+                    %1 = stablehlo.sine %0 : tensor<f64>
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
+                    %2 = stablehlo.multiply %arg0, %arg0 : tensor<f64>
+                    %3 = stablehlo.cosine %2 : tensor<f64>
+                    %4 = stablehlo.multiply %3, %cst : tensor<f64>
+                    %5 = stablehlo.multiply %arg0, %4 : tensor<f64>
+                    %6 = stablehlo.multiply %arg0, %4 : tensor<f64>
+                    %7 = stablehlo.add %5, %6 : tensor<f64>
+                    return %7 : tensor<f64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_rematerialized_higher_order_derivatives_lower_with_their_input_barriers() {
+        use ryft_core::{differentiate_at, rematerialize};
+
+        // Differentiating the staged gradient of `rematerialize(x ↦ sin(x²))` again, in forward mode (i.e., a
+        // forward-over-reverse Hessian-vector product) or in reverse mode (i.e., the gradient of the gradient), keeps
+        // differentiated calls, whose recomputations therefore stay behind optimization barriers.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let function = rematerialize(|x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+            let context = x.context();
+            let square = context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[x.clone(), x.clone()])?;
+            Ok(context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &square)?.remove(0))
+        });
+        let (_, gradient) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |x: XlaTracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+            ArrayIrType::from(scalar_type.clone()),
+        )
+        .unwrap();
+        let gradient = gradient.into_flat_program();
+        let lower = |program: &XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>| {
+            let array_types = |types: Vec<ArrayIrType>| {
+                types.iter().map(|r#type| <&ArrayType>::try_from(r#type).unwrap().clone()).collect::<Vec<_>>()
+            };
+            let input_types = array_types(program.input_types());
+            let output_types = array_types(program.output_types());
+            to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap()
+        };
+        assert_eq!(
+            lower(&gradient.jvp().unwrap()),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>) -> (tensor<f64>, tensor<f64>) {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<f64>
+                    %1 = stablehlo.multiply %arg0, %arg1 : tensor<f64>
+                    %2 = stablehlo.multiply %arg0, %arg1 : tensor<f64>
+                    %3 = stablehlo.add %1, %2 : tensor<f64>
+                    %4 = stablehlo.sine %0 : tensor<f64>
+                    %5 = stablehlo.cosine %0 : tensor<f64>
+                    %6 = stablehlo.multiply %5, %3 : tensor<f64>
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
+                    %7:3 = stablehlo.optimization_barrier %cst, %arg0, %arg1 : tensor<f64>, tensor<f64>, tensor<f64>
+                    %8 = stablehlo.multiply %7#1, %7#1 : tensor<f64>
+                    %9 = stablehlo.multiply %7#1, %7#2 : tensor<f64>
+                    %10 = stablehlo.multiply %7#1, %7#2 : tensor<f64>
+                    %11 = stablehlo.add %9, %10 : tensor<f64>
+                    %12 = stablehlo.cosine %8 : tensor<f64>
+                    %13 = stablehlo.sine %8 : tensor<f64>
+                    %14 = stablehlo.multiply %13, %11 : tensor<f64>
+                    %15 = stablehlo.negate %14 : tensor<f64>
+                    %16 = stablehlo.multiply %12, %7#0 : tensor<f64>
+                    %17 = stablehlo.multiply %7#0, %15 : tensor<f64>
+                    %18 = stablehlo.multiply %7#1, %16 : tensor<f64>
+                    %19 = stablehlo.multiply %16, %7#2 : tensor<f64>
+                    %20 = stablehlo.multiply %7#1, %17 : tensor<f64>
+                    %21 = stablehlo.add %19, %20 : tensor<f64>
+                    %22 = stablehlo.multiply %7#1, %16 : tensor<f64>
+                    %23 = stablehlo.multiply %16, %7#2 : tensor<f64>
+                    %24 = stablehlo.multiply %7#1, %17 : tensor<f64>
+                    %25 = stablehlo.add %23, %24 : tensor<f64>
+                    %26 = stablehlo.add %18, %22 : tensor<f64>
+                    %27 = stablehlo.add %21, %25 : tensor<f64>
+                    return %26, %27 : tensor<f64>, tensor<f64>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            lower(&gradient.linearize().unwrap().pullback().unwrap()),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>, %arg2: tensor<f64>, %arg3: tensor<f64>) -> tensor<f64> {
+                    %0:3 = stablehlo.optimization_barrier %arg0, %arg1, %arg3 : tensor<f64>, tensor<f64>, tensor<f64>
+                    %1 = stablehlo.multiply %0#1, %0#0 : tensor<f64>
+                    %2 = stablehlo.multiply %0#1, %0#1 : tensor<f64>
+                    %3 = stablehlo.cosine %2 : tensor<f64>
+                    %4 = stablehlo.multiply %3, %0#2 : tensor<f64>
+                    %5 = stablehlo.multiply %4, %0#0 : tensor<f64>
+                    %6 = stablehlo.multiply %0#1, %0#0 : tensor<f64>
+                    %7 = stablehlo.add %1, %6 : tensor<f64>
+                    %8 = stablehlo.multiply %0#2, %7 : tensor<f64>
+                    %9 = stablehlo.negate %8 : tensor<f64>
+                    %10 = stablehlo.sine %2 : tensor<f64>
+                    %11 = stablehlo.multiply %10, %9 : tensor<f64>
+                    %12 = stablehlo.multiply %0#1, %11 : tensor<f64>
+                    %13 = stablehlo.add %5, %12 : tensor<f64>
+                    %14 = stablehlo.multiply %0#1, %11 : tensor<f64>
+                    %15 = stablehlo.add %13, %14 : tensor<f64>
+                    %16 = stablehlo.multiply %4, %0#0 : tensor<f64>
+                    %17 = stablehlo.add %15, %16 : tensor<f64>
+                    return %17 : tensor<f64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_rematerialized_gradient_lowers_with_rounded_bf16_residuals() {
+        use ryft_core::{EverythingSaveable, differentiate_at, rematerialize};
+
+        // Saving everything for `x ↦ sin(x)²` over `bf16` saves `sin(x)`, which the forward computation also squares.
+        // It is rounded to `bf16` right after it is computed, so that XLA cannot use a more precise value for the
+        // forward computation than the one that the backward computation receives.
+        let scalar_type = ArrayType::scalar(DataType::BF16);
+        let function = rematerialize(|x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+            let context = x.context().clone();
+            let sine = context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &[x])?.remove(0);
+            Ok(context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[sine.clone(), sine])?.remove(0))
+        })
+        .with_policy(EverythingSaveable);
+        let (_, gradient) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |x: XlaTracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+            ArrayIrType::from(scalar_type.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            to_mlir_module_for_program(&gradient, &[], &scalar_type, &scalar_type, "main", None, None).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<bf16>) -> tensor<bf16> {
+                    %0 = stablehlo.sine %arg0 : tensor<bf16>
+                    %1 = stablehlo.reduce_precision %0, format = e8m7 : tensor<bf16>
+                    %2 = stablehlo.multiply %1, %1 : tensor<bf16>
+                    %3 = stablehlo.cosine %arg0 : tensor<bf16>
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
+                    %4:3 = stablehlo.optimization_barrier %cst, %3, %1 : tensor<bf16>, tensor<bf16>, tensor<bf16>
+                    %5 = stablehlo.multiply %4#2, %4#0 : tensor<bf16>
+                    %6 = stablehlo.multiply %4#2, %4#0 : tensor<bf16>
+                    %7 = stablehlo.add %5, %6 : tensor<bf16>
+                    %8 = stablehlo.multiply %4#1, %7 : tensor<bf16>
+                    return %8 : tensor<bf16>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_rematerialized_gradient_lowers_with_offloaded_residuals() {
+        use ryft_core::{SaveAndOffloadOnlyTheseNames, TagOperation, differentiate_at, rematerialize};
+
+        // Offloading the value tagged `sine` of `x ↦ cos(tag(sin(x), "sine"))` to pinned host memory moves it to the
+        // host once it is computed and back to the device right before the backward computation uses it.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let function = rematerialize(|x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+            let context = x.context().clone();
+            let sine = context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &[x])?;
+            let sine = context.bind(ArrayOperation::Tag(TagOperation::new("sine")), Vec::new(), &sine)?;
+            Ok(context.bind(ArrayOperation::Cos(CosOperation::new()), Vec::new(), &sine)?.remove(0))
+        })
+        .with_policy(
+            SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["sine"], Memory::Host { pinned: true }).unwrap(),
+        );
+        let (_, gradient) = DomainTracingContext::<XlaDomain<'static>>::trace(
+            |x: XlaTracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
+            ArrayIrType::from(scalar_type.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            to_mlir_module_for_program(&gradient, &[], &scalar_type, &scalar_type, "main", None, None).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
+                    %0 = stablehlo.sine %arg0 : tensor<f32>
+                    %1 = stablehlo.cosine %0 : tensor<f32>
+                    %2 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "pinned_host"}} : (tensor<f32>) -> tensor<f32>
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                    %3:3 = stablehlo.optimization_barrier %cst, %arg0, %2 : tensor<f32>, tensor<f32>, tensor<f32>
+                    %4 = stablehlo.negate %3#0 : tensor<f32>
+                    %5 = stablehlo.custom_call @annotate_device_placement(%3#2) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "device"}} : (tensor<f32>) -> tensor<f32>
+                    %6 = stablehlo.sine %5 : tensor<f32>
+                    %7 = stablehlo.multiply %6, %4 : tensor<f32>
+                    %8 = stablehlo.cosine %3#1 : tensor<f32>
+                    %9 = stablehlo.multiply %8, %7 : tensor<f32>
+                    return %9 : tensor<f32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]

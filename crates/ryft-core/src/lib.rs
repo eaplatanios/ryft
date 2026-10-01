@@ -73,15 +73,15 @@ pub use differentiation::{
     LinearizationTracer, MemberDifferentiableOperation, MemberTransposableOperation, MemoryTransferStorage,
     NOTHING_SAVEABLE_POLICY_NAME, NothingSaveable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
     OffloadDotsWithNoBatchDimensions, POLICY_FN_POLICY_NAME, PartitionedDifferentiationPolicy, PolicyFn, Pullback,
-    Pushforward, RealLinearity, Rematerialize, ResidualZeroProvider, ReverseModeDifferentiate,
+    Pushforward, RealLinearity, Rematerialize, ResidualSource, ResidualZeroProvider, ReverseModeDifferentiate,
     SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME, SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME,
     SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME, SAVE_FROM_BOTH_POLICIES_POLICY_NAME,
     SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
-    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, TransposableOperation,
+    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual, TransposableOperation,
     TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliaryOutput, WithCapture,
     WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp, differentiate_at,
-    jvp_for_transpose_projected_operation, jvp_projected_operation, rematerialize, transpose_mixed_operation,
-    transpose_projected_operation, unary_elementwise_jvp,
+    jvp_for_transpose_projected_operation, jvp_projected_operation, rematerialize, saved_residuals,
+    transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
@@ -901,7 +901,7 @@ pub(crate) mod tests {
     }
 
     /// Region-free test [`Operation`] family isolating ordered-state effect handling (i.e., simplification liveness
-    /// and ordering, rematerialization boundaries) from reference-operation semantics.
+    /// and ordering) from reference-operation semantics.
     #[derive(Clone, Debug, PartialEq)]
     pub enum TestOrderedStateOperation {
         /// Pure unary work that transforms may remove when its result is dead.

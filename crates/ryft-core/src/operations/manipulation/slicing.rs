@@ -91,8 +91,8 @@ impl SliceOperation {
         Self { start_indices, limits, strides }
     }
 
-    /// Returns a copy of this [`SliceOperation`] with its strides set to `strides`. There must be one stride per
-    /// start index, and every stride must be at least `1`; otherwise, this function returns a [`TypeError`].
+    /// Returns this [`SliceOperation`] with its strides set to `strides`. There must be one stride per start index,
+    /// and every stride must be at least `1`; otherwise, this function returns a [`TypeError`].
     pub fn with_strides(mut self, strides: Vec<usize>) -> Result<Self, ProgramError> {
         if strides.len() != self.start_indices.len() {
             return Err(TypeError::invalid(format!(
@@ -1371,9 +1371,9 @@ impl DynamicSliceOperation<ArrayType> {
         }
     }
 
-    /// Returns a copy of this [`DynamicSliceOperation`] with its negative-index policy set to `allow_negative_indices`.
-    /// Refer to the documentation of [`allows_negative_indices`](Self::allows_negative_indices) for the meaning of both
-    /// settings.
+    /// Returns this [`DynamicSliceOperation`] with its negative-index policy set to `allow_negative_indices`.
+    /// Refer to the documentation of [`allows_negative_indices`](Self::allows_negative_indices) for the meaning
+    /// of both settings.
     #[inline]
     pub fn with_allow_negative_indices(mut self, allow_negative_indices: bool) -> Self {
         self.allow_negative_indices = allow_negative_indices;
@@ -1404,7 +1404,7 @@ impl DynamicSliceOperation<ArrayIrType> {
         }
     }
 
-    /// Returns a copy of this [`DynamicSliceOperation`] with its strides set to `strides`. The number of strides must
+    /// Returns this [`DynamicSliceOperation`] with its strides set to `strides`. The number of strides must
     /// match the rank supplied to [`from_rank`](Self::from_rank), and every stride must be strictly positive.
     /// Otherwise, this function returns a [`TypeError`].
     pub fn with_strides(mut self, strides: Vec<usize>) -> Result<Self, TypeError> {
@@ -1426,8 +1426,8 @@ impl DynamicSliceOperation<ArrayIrType> {
         Ok(self)
     }
 
-    /// Returns a copy of this [`DynamicSliceOperation`] with its bounds policy set to `bounds`. Changing the policy
-    /// discards any previous proof that execution can omit its window assertion.
+    /// Returns this [`DynamicSliceOperation`] with its bounds policy set to `bounds`. Changing the policy discards
+    /// any previous proof that execution can omit its window assertion.
     #[inline]
     pub fn with_bounds(mut self, bounds: DynamicSliceBounds) -> Self {
         self.bounds = bounds;
@@ -1435,13 +1435,13 @@ impl DynamicSliceOperation<ArrayIrType> {
         self
     }
 
-    /// Returns a copy of this [`DynamicSliceOperation`] with its assertion requirement derived from `input_types`.
-    /// Each size's upper bound and each checked start's upper bound must fit the input's minimum logical extent.
-    /// Type inference revalidates a discharged assertion, so replay cannot reuse a proof with wider input bounds.
-    /// For example, an input extent of `10`, start in `[0, 3)`, size in `[0, 5)`, and unit stride prove that the
-    /// exclusive limit is at most `6`. An input extent that may be smaller than `6` still requires a runtime check.
-    /// Under [`DynamicSliceBounds::Clamp`], only the maximum window span has to fit and starts are normalized at
-    /// execution time.
+    /// Returns this [`DynamicSliceOperation`] with its assertion requirement derived from `input_types`. Each size's
+    /// upper bound and each checked start's upper bound must fit the input's minimum logical extent. Type inference
+    /// revalidates a discharged assertion, so replay cannot reuse a proof with wider input bounds. For example, an
+    /// input extent of `10`, start in `[0, 3)`, size in `[0, 5)`, and unit stride prove that the exclusive limit
+    /// is at most `6`. An input extent that may be smaller than `6` still requires a runtime check. Under
+    /// [`DynamicSliceBounds::Clamp`], only the maximum window span has to fit and starts are normalized
+    /// at execution time.
     #[inline]
     pub fn with_input_types(mut self, input_types: &[ArrayIrType]) -> Result<Self, TypeError> {
         self.requires_runtime_assertion = true;
@@ -3214,9 +3214,9 @@ impl DynamicUpdateSliceOperation {
         Self { allow_negative_indices: true }
     }
 
-    /// Returns a copy of this [`DynamicUpdateSliceOperation`] with its negative-index policy set to
-    /// `allow_negative_indices`. Refer to the documentation of
-    /// [`allows_negative_indices`](Self::allows_negative_indices) for the meaning of both settings.
+    /// Returns this [`DynamicUpdateSliceOperation`] with its negative-index policy set to `allow_negative_indices`.
+    /// Refer to the documentation of [`allows_negative_indices`](Self::allows_negative_indices) for the meaning of
+    /// both settings.
     #[inline]
     pub fn with_allow_negative_indices(mut self, allow_negative_indices: bool) -> Self {
         self.allow_negative_indices = allow_negative_indices;

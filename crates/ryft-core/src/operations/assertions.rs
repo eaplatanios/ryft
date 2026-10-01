@@ -281,16 +281,16 @@ impl<T: Type + Into<ArrayIrType>> AssertOperation<T> {
         Self { message: message.into(), labels: Vec::new(), failure_limit: None, marker: PhantomData }
     }
 
-    /// Returns a copy of this [`AssertOperation`] with its diagnostic labels set to the provided `labels`.
+    /// Returns this [`AssertOperation`] with its diagnostic labels set to the provided `labels`.
     #[inline]
     pub fn with_labels(mut self, labels: Vec<String>) -> Self {
         self.labels = labels;
         self
     }
 
-    /// Returns a copy of this [`AssertOperation`] with bounded element reporting enabled with the provided `limit`.
-    /// Conditions may then be Boolean arrays; observations must be scalars or have the condition's shape. At most
-    /// `limit` failed elements are reported in logical row-major order, along with the number omitted.
+    /// Returns this [`AssertOperation`] with bounded element reporting enabled with the provided `limit`. Conditions
+    /// may then be Boolean arrays and observations must be scalars or have the condition's shape. At most `limit`
+    /// failed elements are reported in logical row-major order, along with the number omitted.
     #[inline]
     pub fn with_failure_limit(mut self, limit: NonZeroUsize) -> Self {
         self.failure_limit = Some(limit);

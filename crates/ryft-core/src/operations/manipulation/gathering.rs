@@ -200,16 +200,15 @@ impl<V: Value<Type = ArrayType>> GatherOptions<V> {
         }
     }
 
-    /// Returns a copy of this [`GatherOptions`] with its out-of-bounds index handling [`GatherMode`] replaced by
-    /// `mode`.
+    /// Returns this [`GatherOptions`] with its out-of-bounds index handling [`GatherMode`] replaced by `mode`.
     #[inline]
     pub fn with_mode(mut self, mode: GatherMode<V>) -> Self {
         self.mode = mode;
         self
     }
 
-    /// Returns a copy of this [`GatherOptions`] with its sorted-indices promise set to `indices_are_sorted`. When
-    /// `true`, the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
+    /// Returns this [`GatherOptions`] with its sorted-indices promise set to `indices_are_sorted`. When `true`,
+    /// the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
@@ -217,18 +216,18 @@ impl<V: Value<Type = ArrayType>> GatherOptions<V> {
         self
     }
 
-    /// Returns a copy of this [`GatherOptions`] with its unique-indices promise set to `unique_indices`. When `true`,
-    /// the caller promises that gathered windows do not overlap. `false` makes no such promise. Implementations and
-    /// transformations may rely on this property. This function does not test the windows for overlap.
+    /// Returns this [`GatherOptions`] with its unique-indices promise set to `unique_indices`. When `true`,
+    /// the caller promises that gathered windows do not overlap. `false` makes no such promise. Implementations
+    /// and transformations may rely on this property. This function does not test the windows for overlap.
     #[inline]
     pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
         self.unique_indices = unique_indices;
         self
     }
 
-    /// Returns a copy of this [`GatherOptions`] with its requested output [`Sharding`] replaced by `output_sharding`.
-    /// Passing [`None`] restores inferred placement. A request specifies result placement when the window geometry does
-    /// not determine one unambiguously: complete window axes inherit input placement and query axes inherit index
+    /// Returns this [`GatherOptions`] with its requested output [`Sharding`] replaced by `output_sharding`. Passing
+    /// [`None`] restores inferred placement. A request specifies result placement when the window geometry does not
+    /// determine one unambiguously: complete window axes inherit input placement and query axes inherit index
     /// placement. Partial windows on explicitly sharded input axes require a request, as do incompatible placements
     /// on paired batching axes. A request selects per-axis placement while preserving the common mesh, reduction state,
     /// and manual-axis variation. It must have the output rank and cannot reference automatic mesh axes. Validation
@@ -378,24 +377,22 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
         Self { dimensions, slice_sizes, options: GatherOptions::new() }
     }
 
-    /// Returns a copy of this [`GatherOperation`] with its optional behavior and output placement
-    /// replaced by `options`.
+    /// Returns this [`GatherOperation`] with its optional behavior and output placement replaced by `options`.
     #[inline]
     pub fn with_options(mut self, options: GatherOptions<V>) -> Self {
         self.options = options;
         self
     }
 
-    /// Returns a copy of this [`GatherOperation`] with its out-of-bounds index handling [`GatherMode`]
-    /// replaced by `mode`.
+    /// Returns this [`GatherOperation`] with its out-of-bounds index handling [`GatherMode`] replaced by `mode`.
     #[inline]
     pub fn with_mode(mut self, mode: GatherMode<V>) -> Self {
         self.options = self.options.with_mode(mode);
         self
     }
 
-    /// Returns a copy of this [`GatherOperation`] with its sorted-indices promise set to `indices_are_sorted`. When
-    /// `true`, the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
+    /// Returns this [`GatherOperation`] with its sorted-indices promise set to `indices_are_sorted`. When `true`,
+    /// the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
@@ -403,8 +400,8 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
         self
     }
 
-    /// Returns a copy of this [`GatherOperation`] with its unique-indices promise set to `unique_indices`. When
-    /// `true`, the caller promises that gathered windows do not overlap. `false` makes no such promise. Implementations
+    /// Returns this [`GatherOperation`] with its unique-indices promise set to `unique_indices`. When `true`,
+    /// the caller promises that gathered windows do not overlap. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not test the windows for overlap.
     #[inline]
     pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
@@ -412,9 +409,9 @@ impl<V: Value<Type = ArrayType>> GatherOperation<V> {
         self
     }
 
-    /// Returns a copy of this [`GatherOperation`] with its requested output [`Sharding`] replaced by `output_sharding`.
-    /// Passing `None` restores inferred placement. A request specifies result placement when the window geometry does
-    /// not determine one unambiguously: complete window axes inherit input placement and query axes inherit index
+    /// Returns this [`GatherOperation`] with its requested output [`Sharding`] replaced by `output_sharding`. Passing
+    /// `None` restores inferred placement. A request specifies result placement when the window geometry does not
+    /// determine one unambiguously: complete window axes inherit input placement and query axes inherit index
     /// placement. Partial windows on explicitly sharded input axes require a request, as do incompatible placements
     /// on paired batching axes. A request selects per-axis placement while preserving the common mesh, reduction state,
     /// and manual-axis variation. It must have the output rank and cannot reference automatic mesh axes. Validation

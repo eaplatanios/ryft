@@ -452,8 +452,8 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         })
     }
 
-    /// Returns a copy of this _replicated_ [`ArrayBatch`] broadcast to gain a batch axis of size `axis_size` at `axis`.
-    /// This is the analogue of JAX's `batching.broadcast` and is the canonical building block for mixed
+    /// Returns an [`ArrayBatch`] by broadcasting this replicated value to gain a batch axis of size `axis_size` at
+    /// `axis`. This is the analogue of JAX's `batching.broadcast` and is the canonical building block for mixed
     /// batched/replicated primitive rules (e.g., the batching rule of the `dot` operation) and for lifting replicated
     /// residuals during linearization. It returns an error if called on an already-batched value, since such callers
     /// are expected to dispatch the replicated case explicitly (the blanket elementwise [`BatchableOperation`]
@@ -504,12 +504,12 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         ArrayBatch::new(broadcasted, axis)?.with_ragged_axes(ragged_axes)
     }
 
-    /// Returns a copy of this [`ArrayBatch`] with its mapped batch axis moved to `axis`, staging a transpose on the
-    /// packed value via [`Transpose::move_axis`] to realign it. This is the *move* half of JAX's `matchaxis` (i.e., a
-    /// `moveaxis` on the batch dimension). The full move-or-broadcast behavior lives on
-    /// [`match_axis`](Self::match_axis). It brings inputs that map their batch axis at different positions onto a
-    /// common axis before an elementwise operation is applied. A replicated value (i.e., one with no mapped axis),
-    /// or one already mapped at `axis`, is returned unchanged.
+    /// Returns an [`ArrayBatch`] with its mapped batch axis moved to `axis`, staging a transpose on the packed value
+    /// via [`Transpose::move_axis`] to realign it. This is the *move* half of JAX's `matchaxis` (i.e., a `moveaxis` on
+    /// the batch dimension). The full move-or-broadcast behavior lives on [`match_axis`](Self::match_axis). It brings
+    /// inputs that map their batch axis at different positions onto a common axis before an elementwise operation is
+    /// applied. A replicated value (i.e., one with no mapped axis), or one already mapped at `axis`, is returned
+    /// unchanged.
     ///
     /// # Parameters
     ///
@@ -546,11 +546,10 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         Self::new(permuted_value, axis)?.with_ragged_axes(ragged_axes)
     }
 
-    /// Returns a copy of this [`ArrayBatch`] with a batch axis of size `axis_size` materialized at `axis`. An
-    /// already-batched value has its mapped axis realigned to `axis` via [`Self::move_axis`], while a replicated
-    /// value is broadcast to gain a batch axis there via [`Self::broadcast`]. This is the analogue of JAX's
-    /// `batching.matchaxis`, used by rules whose inputs must agree on one packed batch axis (e.g., `pad`,
-    /// `concatenate`, etc.).
+    /// Returns an [`ArrayBatch`] with a batch axis of size `axis_size` materialized at `axis`. An already-batched value
+    /// has its mapped axis realigned to `axis` via [`Self::move_axis`], while a replicated value is broadcast to gain a
+    /// batch axis there via [`Self::broadcast`]. This is the analogue of JAX's `batching.matchaxis`, used by rules
+    /// whose inputs must agree on one packed batch axis (e.g., `pad`, `concatenate`, etc.).
     ///
     /// # Parameters
     ///
@@ -575,8 +574,8 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         }
     }
 
-    /// Returns a copy of this [`ArrayBatch`] aligned to the provided output `batch_axis`. A mapped value is moved to
-    /// a different requested position, while a replicated value is broadcast across `axis_size` when the declaration
+    /// Returns an [`ArrayBatch`] aligned to the provided output `batch_axis`. A mapped value is moved to a
+    /// different requested position, while a replicated value is broadcast across `axis_size` when the declaration
     /// requests a mapped result. This matches JAX's mapped-output instantiation. A mapped value cannot be collapsed
     /// into a replicated declaration without an explicit reduction and that direction returns
     /// [`BatchingError::MismatchedOutputAxes`]. Signed declarations are normalized against the resulting packed
@@ -3735,9 +3734,9 @@ struct ArrayBatchingTransformArguments {
 }
 
 impl Sharding {
-    /// Returns a copy of this per-item output [`Sharding`] with `axis_sharding` inserted as its leading physical
-    /// dimension. The mesh and reduction state are preserved, and mesh axes named by the inserted dimension are
-    /// removed from the varying-manual set: those axes are now represented by the explicit batch placement.
+    /// Returns a per-item output [`Sharding`] with `axis_sharding` inserted as its leading physical dimension. The
+    /// mesh and reduction state are preserved, and mesh axes named by the inserted dimension are removed from the
+    /// varying-manual set: those axes are now represented by the explicit batch placement.
     ///
     /// For example, a per-item output replicated along its array dimensions but varying over manual mesh axis `x`
     /// becomes an output with a leading dimension sharded over `x`, without `x` remaining in its varying-manual set.

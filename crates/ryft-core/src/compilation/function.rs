@@ -897,9 +897,9 @@ where
 impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>>
     ExecutableFunction<D, Input, Output>
 {
-    /// Returns a copy of this function that invokes `program` instead of its current compiled program, while keeping
-    /// its runtime captures, flat input types, and output parameter structure. Backends use it to swap in an
-    /// equivalent executable, such as one deserialized from a persistent cache or recompiled with profile guidance.
+    /// Returns a function that invokes `program` instead of this function's current compiled program, while keeping
+    /// this function's runtime captures, flat input types, and output parameter structure. Backends use it to swap in
+    /// an equivalent executable, such as one deserialized from a persistent cache or recompiled with profile guidance.
     ///
     /// This function does not check compatibility, so the caller must establish it first: `program` must accept the
     /// same `[captures..., public inputs...]` arguments as the current program, and `output_types` must be its

@@ -51,7 +51,7 @@ impl<T: Type, U: Type, Transform: ReferenceTransform<Type = U, Referent = T>> Re
         Self { transforms: Vec::new(), marker: PhantomData }
     }
 
-    /// Returns a copy of this [`ReferenceSwapOperation`] with the provided transforms applied to the reference input.
+    /// Returns this [`ReferenceSwapOperation`] with the provided transforms applied to the reference input.
     #[inline]
     pub fn with_transforms(mut self, transforms: Vec<Transform>) -> Self {
         self.transforms = transforms;

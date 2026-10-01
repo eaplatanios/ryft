@@ -555,8 +555,8 @@ impl AxisIndexOperation {
         Self { axis_name, mesh: None }
     }
 
-    /// Returns a copy of this [`AxisIndexOperation`] with the provided logical mesh. Its output varies over
-    /// [`Self::axis_name`] on that mesh, which must name a manual axis. Validation occurs during type inference.
+    /// Returns this [`AxisIndexOperation`] with the provided logical mesh. Its output varies over [`Self::axis_name`]
+    /// on that mesh, which must name a manual axis. Validation occurs during type inference.
     #[inline]
     pub fn with_mesh(mut self, mesh: LogicalMesh) -> Self {
         self.mesh = Some(mesh);

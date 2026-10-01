@@ -642,9 +642,9 @@ impl DynamicReshapeOperation {
         Self { requires_runtime_assertion: true, output_sharding: None }
     }
 
-    /// Returns a copy of this [`DynamicReshapeOperation`] with its runtime element-count assertion requirement
-    /// recomputed from the provided `input_types`. The complete mixed signature is validated before determining
-    /// whether the input and output shapes are guaranteed to contain the same number of elements.
+    /// Returns this [`DynamicReshapeOperation`] with its runtime element-count assertion requirement recomputed from
+    /// the provided `input_types`. The complete mixed signature is validated before determining whether the input and
+    /// output shapes are guaranteed to contain the same number of elements.
     ///
     /// If that equality can be proved, the returned operation is effect-free. Otherwise, it retains
     /// [`EffectClass::OrderedAssertion`] so execution checks the element counts. For example, reshaping `[n, 4]` to
@@ -670,8 +670,8 @@ impl DynamicReshapeOperation {
         Ok(self)
     }
 
-    /// Returns a copy of this [`DynamicReshapeOperation`] with the requested output `sharding`. Passing [`None`]
-    /// restores inferred placement. The request is validated during type inference.
+    /// Returns this [`DynamicReshapeOperation`] with the requested output `sharding`. Passing [`None`] restores
+    /// inferred placement. The request is validated during type inference.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, sharding: S) -> Self {
         self.output_sharding = sharding.into();

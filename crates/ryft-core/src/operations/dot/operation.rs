@@ -75,7 +75,7 @@ impl DotOperation {
         self
     }
 
-    /// Returns a copy of this [`DotOperation`] with the provided accumulation data type. The operand element types
+    /// Returns this [`DotOperation`] with the provided accumulation data type. The operand element types
     /// must still match each other and must promote to the accumulation type, which becomes the output element
     /// type: the backend upcasts the operands and accumulates the contraction at the wider type (XLA's
     /// `preferred_element_type` contract, which is what its low-precision matrix units implement natively — e.g.,

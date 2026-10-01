@@ -76,7 +76,7 @@
 //! nested calls—use the ordinary [`jitted`] or [`compile`] surface: they are discharged to array SSA before StableHLO
 //! lowering and do not change the public ABI. Local-reference batching and automatic differentiation likewise
 //! discharge first. Rematerialization recomputes local reference lifecycles inside its body, saves reads of external
-//! references, and rejects bodies that mutate them. External reference AD, mapped/shared reference batching,
+//! references, and never recomputes their mutations. External reference AD, mapped/shared reference batching,
 //! custom-derivative rule references, and preserved references outside the experimental kernel boundary are rejected
 //! explicitly.
 
@@ -2938,6 +2938,65 @@ mod tests {
         };
         assert_eq!(read_f32_array(&client, &input_cotangent), vec![7.0]);
         assert_eq!(read_f32_array(&client, &cotangent_reference.read().unwrap()), vec![7.0]);
+    }
+
+    #[test]
+    fn test_rematerialized_function_differentiates_on_the_xla_domain() {
+        use ryft_core::{DotsSaveable, ResidualPolicy, SaveAndOffloadOnlyTheseNames, Tag, rematerialize};
+
+        // `x ↦ sin(tag(x · x, "dot"))` executes its value and gradient on the XLA domain under a policy that saves the
+        // dot product and under one that offloads it to pinned host memory, and both match `sin(x · x)` and
+        // `2 cos(x · x) x`, which the residual placement must not change.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let values = [0.1f32, 0.2, 0.3];
+        let dot = values.iter().map(|value| value * value).sum::<f32>();
+        type Tracer<'c> = DomainTracer<XlaDomain<'c>>;
+        fn sine_of_dot(x: Tracer<'_>) -> Result<Tracer<'_>, ProgramError> {
+            let x = ValueProjection::<ArrayType>::into_projected(x)?;
+            let dot = x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.tag("dot")?;
+            Ok(dot.sin()?.into_value())
+        }
+        fn value_and_gradient<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
+            domain: &XlaDomain<'c>,
+            input: Array<'c>,
+            policy: P,
+        ) -> (ArrayIrValue<Array<'c>>, ArrayIrValue<Array<'c>>) {
+            let function = rematerialize(sine_of_dot).with_policy(policy);
+            domain
+                .differentiate_at(ArrayIrValue::Array(input))
+                .value_and_gradient(|x| function.call(x))
+                .unwrap()
+        }
+        let input = || {
+            Array::from_host_buffer(
+                &client,
+                array_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&values).as_slice(),
+            )
+            .unwrap()
+        };
+        let offload = SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["dot"], Memory::Host { pinned: true });
+        for (value, gradient) in
+            [value_and_gradient(&domain, input(), DotsSaveable), value_and_gradient(&domain, input(), offload.unwrap())]
+        {
+            // XLA's elementary functions may differ from the host ones in the last bit.
+            let assert_close = |actual: ArrayIrValue<Array<'_>>, expected: Vec<f32>| {
+                let actual = read_f32_array(&client, &ValueProjection::<ArrayType>::into_projected(actual).unwrap());
+                assert!(actual.iter().zip(&expected).all(|(actual, expected)| (actual - expected).abs() < 1e-6));
+                assert_eq!(actual.len(), expected.len());
+            };
+            assert_close(value, vec![dot.sin()]);
+            assert_close(gradient, values.iter().map(|value| 2.0 * dot.cos() * value).collect());
+        }
     }
 
     #[test]

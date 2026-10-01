@@ -84,3 +84,8 @@ required-features = ["differential-testing"]
 name = "compilation_benchmark"
 path = "src/bin/compilation_benchmark.rs"
 required-features = ["performance-benchmarking"]
+
+[[bin]]
+name = "rematerialization_benchmark"
+path = "src/bin/rematerialization_benchmark.rs"
+required-features = ["performance-benchmarking"]

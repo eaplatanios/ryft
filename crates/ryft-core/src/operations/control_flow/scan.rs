@@ -269,7 +269,18 @@ where
             instantiated_identities
                 .extend(r#type.identities().map(|(position, identity)| (position, identity.clone())));
         }
-        if declared_identities == instantiated_identities {
+        // The body is requested at the instantiated input types when their type identities differ from the declared
+        // ones and when they strictly refine the declared ones (e.g., with a sharding that the actual inputs carry but
+        // the body leaves unspecified), so that staging and differentiation specialize it and the programs derived
+        // from it (e.g., its forward-mode derivative and its transposition) carry those refinements. Type equality
+        // ignores type identities, so both are checked.
+        let refines_declared_types = region_interfaces[0]
+            .input_types()
+            .iter()
+            .zip(&body_input_types)
+            .all(|(declared, requested)| declared.is_refined_by(requested))
+            && region_interfaces[0].input_types() != body_input_types;
+        if declared_identities == instantiated_identities && !refines_declared_types {
             return Ok(vec![None]);
         }
         Ok(vec![Some(body_input_types)])
@@ -1328,13 +1339,22 @@ pub(crate) fn validate_scan_unroll(unroll: usize, length: &Dimension) -> Result<
     Ok(())
 }
 
-/// Returns the stacked variant of a scan body slice type, prepending `length` to its shape. The
-/// stacked type preserves the slice's memory placement but carries no optional layout or sharding metadata, so it is
-/// a declared type whose optional components are unspecified. Scan input validation compares it against actual input
-/// types with [`Type::is_refined_by`](crate::programs::types::Type::is_refined_by).
+/// Returns the stacked variant of a scan body slice type, prepending `length` to its shape. The stacked type preserves
+/// the slice's memory placement and sharding, with the stacked dimension replicated (i.e., it is the inverse of
+/// slicing a stacked input with [`ArrayType::without_dimension`]), but carries no layout. This is the type of the
+/// stacks that scans produce (e.g., their stacked outputs and the residual stacks of their derivatives).
 pub(crate) fn stacked_scan_type<L: Into<Dimension>>(slice_type: &ArrayType, length: L) -> ArrayType {
+    // Inserting a replicated dimension into a valid sharding cannot fail.
+    slice_type.with_inserted_dimension(0, length.into()).unwrap()
+}
+
+/// Returns the declared type of a stacked scan input whose slices have type `slice_type`, which is the
+/// [`stacked_scan_type`] of `slice_type` without its optional sharding metadata. Scan input validation compares it
+/// against actual input types with [`Type::is_refined_by`](crate::programs::types::Type::is_refined_by), so stacked
+/// inputs are validated by their data types, shapes, and memory placements alone.
+fn declared_stacked_scan_input_type(slice_type: &ArrayType, length: &Dimension) -> ArrayType {
     let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
-    dimensions.push(length.into());
+    dimensions.push(length.clone());
     dimensions.extend(slice_type.shape().dimensions().iter().cloned());
     ArrayType::new(slice_type.data_type(), Shape::new(dimensions)).with_memory(slice_type.memory())
 }
@@ -1343,12 +1363,13 @@ pub(crate) fn stacked_scan_type<L: Into<Dimension>>(slice_type: &ArrayType, leng
 /// `[carry..., stacked_ys...]` output types. This backs type inference for [`ScanOperation`].
 ///
 /// The expected input types are declared types derived from the body signature (with stacked types built by
-/// [`stacked_scan_type`], which carries no optional layout or sharding metadata), while the provided `input_types` may
-/// be actual runtime value types carrying more precise optional metadata, such as the normalized
+/// [`declared_stacked_scan_input_type`], which carries no optional layout or sharding metadata), while the provided
+/// `input_types` may be actual runtime value types carrying more precise optional metadata, such as the normalized
 /// [`Sharding`](crate::arrays::Sharding)s that every concrete backend array type carries. Validation therefore uses the
 /// directional declared-vs-actual [`Type::is_refined_by`] relation instead of strict type equality. The returned output
-/// types are declared types built the same way and thus leave optional metadata unspecified for downstream consumers
-/// (e.g., sharding propagation) to resolve.
+/// types are the carry output types of the body followed by the [`stacked_scan_type`]s of its stacked output types, so
+/// they carry the shardings that the body declares (e.g., after staging specialized the body to sharded inputs) and
+/// leave unspecified the ones that it does not.
 pub(crate) fn scan_output_types(
     body_input_types: &[ArrayType],
     body_output_types: &[ArrayType],
@@ -1358,8 +1379,11 @@ pub(crate) fn scan_output_types(
 ) -> Result<Vec<ArrayType>, TypeError> {
     let body_input_types = &body_input_types[1..];
     let mut expected_input_types = body_input_types[..carry_count].to_vec();
-    expected_input_types
-        .extend(body_input_types[carry_count..].iter().map(|slice_type| stacked_scan_type(slice_type, length)));
+    expected_input_types.extend(
+        body_input_types[carry_count..]
+            .iter()
+            .map(|slice_type| declared_stacked_scan_input_type(slice_type, length)),
+    );
     check_count!("input", input_types, expected_input_types.len(), TypeError);
     for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
         if !expected.is_refined_by(actual) {
@@ -1606,7 +1630,12 @@ fn composite_scan_boundary_types(
     for (index, r#type) in body_types[carry_count..].iter().enumerate() {
         let index = carry_count + index;
         boundary_types.push(match (r#type, side) {
-            (ArrayIrType::Array(r#type), _) => ArrayIrType::Array(stacked_scan_type(r#type, length)),
+            (ArrayIrType::Array(r#type), ScanBoundarySide::Input) => {
+                ArrayIrType::Array(declared_stacked_scan_input_type(r#type, length))
+            }
+            (ArrayIrType::Array(r#type), ScanBoundarySide::Output) => {
+                ArrayIrType::Array(stacked_scan_type(r#type, length))
+            }
             (ArrayIrType::Reference(reference), ScanBoundarySide::Input) => {
                 check_static_scan_type("input", index, reference.referent())?;
                 if reference.referent().rank() == 0 || !length.is_refined_by(&reference.referent().dimension(0)) {
@@ -8554,13 +8583,16 @@ mod tests {
             assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(1), BatchAxis::replicated()]);
             assert_eq!(output_types[0].shape().dimensions(), &[Dimension::Static(2)]);
             assert_eq!(output_types[0].sharding().unwrap().dimensions(), carry_sharding.dimensions());
-            // The staged batched scan's stacked outputs carry the scan's *declared* output types, whose optional
-            // sharding metadata is left unspecified for sharding propagation to resolve (the `scan_output_types`
-            // contract); only the batch axes and shapes are pinned structurally.
+            // The staged batched scan's stacked outputs stack the per-iteration output types of its body, so they keep
+            // the sharding of the batched slices with a replicated stacked dimension, as eager batching does (refer to
+            // `test_scan_batching_preserves_stacked_output_batch_placement`).
             assert_eq!(output_types[1].shape().dimensions(), &[Dimension::Static(0), Dimension::Static(2)]);
-            assert_eq!(output_types[1].sharding(), None);
+            assert_eq!(
+                output_types[1].sharding().unwrap().dimensions(),
+                &[ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+            );
             assert_eq!(output_types[2].shape().dimensions(), &[Dimension::Static(0)]);
-            assert_eq!(output_types[2].sharding(), None);
+            assert_eq!(output_types[2].sharding().unwrap().dimensions(), &[ShardingDimension::replicated()]);
         }
     }
 
@@ -8776,6 +8808,30 @@ mod tests {
         let cotangents = pullback.interpret(pullback_inputs).unwrap();
         assert_eq!(cotangents[0].to_f64s(), vec![48.0]);
         assert_eq!(cotangents[1].to_f64s(), vec![24.0, 16.0, 12.0]);
+    }
+
+    #[test]
+    fn test_scan_vjp_preserves_the_sharding_of_stacked_input_cotangents() {
+        // The body is declared over unsharded types, while the carry and the stacked input carry replicated sharding
+        // annotations. The cotangents of both inputs must have the types that the cotangents of those annotated inputs
+        // have, rather than the declared types of the body.
+        use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let carry_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let stack_type = f64_type(&[3]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let initial = Array::from_elements::<f64>(carry_type.clone(), &[1.0]).unwrap();
+        let values = Array::from_elements::<f64>(stack_type.clone(), &[2.0, 3.0, 4.0]).unwrap();
+        let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .vjp(|(initial, values), ()| stage_product_scan(initial, values), (initial, values), ())
+            .unwrap();
+        assert_eq!(output.to_f64s(), vec![24.0]);
+        let seed = Array::from_elements::<f64>(carry_type.cotangent().unwrap(), &[1.0]).unwrap();
+        let (initial_cotangent, values_cotangent) = pullback.apply(seed).unwrap();
+        assert_eq!(initial_cotangent.r#type().as_ref(), &carry_type.cotangent().unwrap());
+        assert_eq!(initial_cotangent.to_f64s(), vec![24.0]);
+        assert_eq!(values_cotangent.r#type().as_ref(), &stack_type.cotangent().unwrap());
+        assert_eq!(values_cotangent.to_f64s(), vec![12.0, 8.0, 6.0]);
     }
 
     /// The `scan` differentiation rules reach their body through the per-[`Region`](crate::Region) transform cache,

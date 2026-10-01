@@ -504,7 +504,7 @@ impl Sharding {
         Self { unreduced_axes: self.reduced_axes.clone(), reduced_axes: self.unreduced_axes.clone(), ..self.clone() }
     }
 
-    /// Returns a copy of this [`Sharding`] with all of its [`MeshAxisType::Auto`] mesh axes removed.
+    /// Returns a [`Sharding`] with all of its [`MeshAxisType::Auto`] mesh axes removed.
     pub fn without_auto_axes(&self) -> Self {
         let dimensions = self
             .dimensions
@@ -543,13 +543,13 @@ impl Sharding {
         Self { dimensions, unreduced_axes, reduced_axes, ..self.clone() }
     }
 
-    /// Returns a copy of this [`Sharding`] with every [`MeshAxisType::Manual`] mesh axis removed from its reduction
-    /// state (i.e., from [`Self::unreduced_axes`] and [`Self::reduced_axes`]), keeping its dimension placements and
-    /// varying manual axes unchanged. A [`Reshard`](crate::Reshard) target may only name [`MeshAxisType::Explicit`]
-    /// mesh axes, and resharding carries the manual reduction state of its input over to its output rather than taking
-    /// it from the target. Code that reshards a value onto the full type of another value therefore requests this
-    /// projection of that type's sharding: the manual reduction state it drops is already carried by the value being
-    /// resharded, while any remaining state is a genuine redistribution request.
+    /// Returns a [`Sharding`] with every [`MeshAxisType::Manual`] mesh axis removed from its reduction state (i.e.,
+    /// from [`Self::unreduced_axes`] and [`Self::reduced_axes`]), keeping its dimension placements and varying manual
+    /// axes unchanged. A [`Reshard`](crate::Reshard) target may only name [`MeshAxisType::Explicit`] mesh axes, and
+    /// resharding carries the manual reduction state of its input over to its output rather than taking it from the
+    /// target. Code that reshards a value onto the full type of another value therefore requests this projection of
+    /// that type's sharding: the manual reduction state it drops is already carried by the value being resharded,
+    /// while any remaining state is a genuine redistribution request.
     pub fn without_manual_reduction_axes(&self) -> Self {
         let is_not_manual = |name: &&String| self.mesh.axis_type(name) != Some(MeshAxisType::Manual);
         let unreduced_axes = self.unreduced_axes.iter().filter(is_not_manual).cloned().collect();
@@ -557,10 +557,10 @@ impl Sharding {
         Self { unreduced_axes, reduced_axes, ..self.clone() }
     }
 
-    /// Returns a copy of this [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`,
-    /// shifting all subsequent dimensions one position to the right. Batching rules use this to extend an explicit
-    /// output sharding with an entry for a newly introduced batch dimension. The resulting sharding is revalidated,
-    /// and so inserting a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails.
+    /// Returns a [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`, shifting all
+    /// subsequent dimensions one position to the right. Batching rules use this to extend an explicit output sharding
+    /// with an entry for a newly introduced batch dimension. The resulting sharding is revalidated, and so inserting
+    /// a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails.
     ///
     /// This is a placement-only insertion. A batch axis introduced inside a batched computation must be inserted with
     /// [`Self::batched`] instead, which additionally records the variation the placement introduces along manual axes.
@@ -576,8 +576,8 @@ impl Sharding {
             .with_varying_manual_axes(self.varying_manual_axes.clone())
     }
 
-    /// Returns a copy of this [`Sharding`] projected through an array broadcast. Each input dimension `i` is moved to
-    /// output dimension `output_dimensions[i]`, while every output dimension not named by the mapping is replicated.
+    /// Returns a [`Sharding`] projected through an array broadcast. Each input dimension `i` is moved to output
+    /// dimension `output_dimensions[i]`, while every output dimension not named by the mapping is replicated.
     /// The mesh and the unreduced, reduced, and varying-manual axis sets are preserved.
     ///
     /// # Parameters
@@ -617,14 +617,13 @@ impl Sharding {
             .with_varying_manual_axes(self.varying_manual_axes.clone())
     }
 
-    /// Returns a copy of this [`Sharding`] with its `index`-th dimension removed, shifting
-    /// subsequent dimensions one position to the left. This is the sharding-level analogue of
-    /// [`ArrayType::without_dimension`](crate::arrays::ArrayType::without_dimension). The reduction axis sets are
-    /// unchanged, but the removed entry's placement is reconciled with the manual-axis model. A dimension sharded over
-    /// [`MeshAxisType::Manual`] axes moves those axes into the varying set (i.e., the value now varies across them
-    /// rather than being placed along a ranked dimension), while a dimension sharded over a non-manual (e.g., a
-    /// [`MeshAxisType::Explicit`]) axis cannot be dropped structurally (that would silently discard an explicit
-    /// placement that only a reduction or collective can remove), and yields a
+    /// Returns a [`Sharding`] with its `index`-th dimension removed, shifting subsequent dimensions one position to the
+    /// left. This is the sharding analogue of [`ArrayType::without_dimension`](crate::ArrayType::without_dimension).
+    /// The reduction axis sets are unchanged, but the removed entry's placement is reconciled with the manual-axis
+    /// model. A dimension sharded over [`MeshAxisType::Manual`] axes moves those axes into the varying set (i.e., the
+    /// value now varies across them rather than being placed along a ranked dimension), while a dimension sharded over
+    /// a non-manual (e.g., a [`MeshAxisType::Explicit`]) axis cannot be dropped structurally (that would silently
+    /// discard an explicit placement that only a reduction or collective can remove), and yields a
     /// [`ShardingError::NonManualShardedDimensionRemoval`]. [`ShardingDimension::Replicated`] and
     /// [`ShardingDimension::Unconstrained`] entries are dropped without any further effect.
     pub fn without_dimension(&self, index: usize) -> Result<Self, ShardingError> {

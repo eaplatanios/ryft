@@ -111,7 +111,7 @@ impl<T: Type> PrintOperation<T> {
         Self { label: label.into(), effect_class: EffectClass::OrderedIo, marker: PhantomData }
     }
 
-    /// Returns a copy of this [`PrintOperation`] with its effect class set to the provided `effect_class`. Use
+    /// Returns this [`PrintOperation`] with its effect class set to the provided `effect_class`. Use
     /// [`EffectClass::OrderedIo`], [`EffectClass::DeviceOrderedIo`], or [`EffectClass::UnorderedIo`] to select
     /// the I/O ordering contract described in the type documentation.
     #[inline]

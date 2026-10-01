@@ -187,7 +187,7 @@ impl ScatterDimensionNumbers {
         }
     }
 
-    /// Returns a copy of this [`ScatterDimensionNumbers`] with its input and query batching axes replaced by
+    /// Returns this [`ScatterDimensionNumbers`] with its input and query batching axes replaced by
     /// `input_batching_dimensions` and `scatter_indices_batching_dimensions`, respectively. Each update modifies
     /// its corresponding input batch. Paired axes must have equal extents, and input batching axes cannot also be
     /// inserted or indexed by a start vector. These constraints are checked when inferring the scatter result type.
@@ -273,16 +273,15 @@ impl ScatterOptions {
         }
     }
 
-    /// Returns a copy of this [`ScatterOptions`] with its out-of-bounds index handling [`ScatterMode`] replaced by
-    /// `mode`.
+    /// Returns this [`ScatterOptions`] with its out-of-bounds index handling [`ScatterMode`] replaced by `mode`.
     #[inline]
     pub fn with_mode(mut self, mode: ScatterMode) -> Self {
         self.mode = mode;
         self
     }
 
-    /// Returns a copy of this [`ScatterOptions`] with its sorted-indices promise set to `indices_are_sorted`. When
-    /// `true`, the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
+    /// Returns this [`ScatterOptions`] with its sorted-indices promise set to `indices_are_sorted`. When `true`,
+    /// the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
@@ -290,22 +289,22 @@ impl ScatterOptions {
         self
     }
 
-    /// Returns a copy of this [`ScatterOptions`] with its unique-indices promise set to `unique_indices`. When `true`,
-    /// the caller promises that update windows do not overlap. `false` makes no such promise. Implementations and
-    /// transformations may rely on this property. This function does not test the windows for overlap. Differentiating
-    /// multiplicative updates requires this promise when the updates carry nonzero tangents.
+    /// Returns this [`ScatterOptions`] with its unique-indices promise set to `unique_indices`. When `true`, the caller
+    /// promises that update windows do not overlap. `false` makes no such promise. Implementations and transformations
+    /// may rely on this property. This function does not test the windows for overlap. Differentiating multiplicative
+    /// updates requires this promise when the updates carry nonzero tangents.
     #[inline]
     pub fn with_unique_indices(mut self, unique_indices: bool) -> Self {
         self.unique_indices = unique_indices;
         self
     }
 
-    /// Returns a copy of this [`ScatterOptions`] with its requested output [`Sharding`] replaced by `output_sharding`.
-    /// Passing [`None`] restores inferred placement. Without an explicit request, indexed axes with partial update
-    /// windows must be replicated over explicit mesh axes; complete windows preserve their input placement. An explicit
-    /// request selects the result placement while preserving its mesh, reduction state, and manual-axis variation. The
-    /// request must have the input rank and cannot reference automatic mesh axes. Validation takes place when inferring
-    /// the result type.
+    /// Returns this [`ScatterOptions`] with its requested output [`Sharding`] replaced by `output_sharding`. Passing
+    /// [`None`] restores inferred placement. Without an explicit request, indexed axes with partial update windows
+    /// must be replicated over explicit mesh axes; complete windows preserve their input placement. An explicit request
+    /// selects the result placement while preserving its mesh, reduction state, and manual-axis variation. The request
+    /// must have the input rank and cannot reference automatic mesh axes. Validation takes place when inferring the
+    /// result type.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.output_sharding = output_sharding.into();
@@ -380,24 +379,22 @@ impl ScatterOperation {
         Self { dimensions, kind, options: ScatterOptions::new() }
     }
 
-    /// Returns a copy of this [`ScatterOperation`] with its optional behavior and output placement
-    /// replaced by `options`.
+    /// Returns this [`ScatterOperation`] with its optional behavior and output placement replaced by `options`.
     #[inline]
     pub fn with_options(mut self, options: ScatterOptions) -> Self {
         self.options = options;
         self
     }
 
-    /// Returns a copy of this [`ScatterOperation`] with its out-of-bounds index handling [`ScatterMode`]
-    /// replaced by `mode`.
+    /// Returns this [`ScatterOperation`] with its out-of-bounds index handling [`ScatterMode`] replaced by `mode`.
     #[inline]
     pub fn with_mode(mut self, mode: ScatterMode) -> Self {
         self.options = self.options.with_mode(mode);
         self
     }
 
-    /// Returns a copy of this [`ScatterOperation`] with its sorted-indices promise set to `indices_are_sorted`. When
-    /// `true`, the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
+    /// Returns this [`ScatterOperation`] with its sorted-indices promise set to `indices_are_sorted`. When `true`,
+    /// the caller promises that start-index vectors are sorted. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not sort or validate the indices.
     #[inline]
     pub fn with_indices_are_sorted(mut self, indices_are_sorted: bool) -> Self {
@@ -405,8 +402,8 @@ impl ScatterOperation {
         self
     }
 
-    /// Returns a copy of this [`ScatterOperation`] with its unique-indices promise set to `unique_indices`. When
-    /// `true`, the caller promises that update windows do not overlap. `false` makes no such promise. Implementations
+    /// Returns this [`ScatterOperation`] with its unique-indices promise set to `unique_indices`. When `true`,
+    /// the caller promises that update windows do not overlap. `false` makes no such promise. Implementations
     /// and transformations may rely on this property. This function does not test the windows for overlap.
     /// Differentiating multiplicative updates requires this promise when the updates carry nonzero tangents.
     #[inline]
@@ -415,12 +412,12 @@ impl ScatterOperation {
         self
     }
 
-    /// Returns a copy of this [`ScatterOperation`] with its requested output [`Sharding`] replaced by
-    /// `output_sharding`. Passing `None` restores inferred placement. Without an explicit request, indexed axes
-    /// with partial update windows must be replicated over explicit mesh axes; complete windows preserve their input
-    /// placement. An explicit request selects the result placement while preserving its mesh, reduction state, and
-    /// manual-axis variation. The request must have the input rank and cannot reference automatic mesh axes.
-    /// Validation takes place when inferring the result type.
+    /// Returns this [`ScatterOperation`] with its requested output [`Sharding`] replaced by `output_sharding`. Passing
+    /// `None` restores inferred placement. Without an explicit request, indexed axes with partial update windows must
+    /// be replicated over explicit mesh axes; complete windows preserve their input placement. An explicit request
+    /// selects the result placement while preserving its mesh, reduction state, and manual-axis variation. The request
+    /// must have the input rank and cannot reference automatic mesh axes. Validation takes place when inferring the
+    /// result type.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.options = self.options.with_output_sharding(output_sharding);
