@@ -90,7 +90,7 @@ impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayTyp
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
-        // Batching preserves every operand's batch metadata while recursively rebinding the gradient barrier through
+        // Batching preserves every input's batch metadata while recursively rebinding the gradient barrier through
         // the parent context. Rebinding is essential when a packed value is itself a differentiation or batching
         // tracer, because treating it as an interpreted identity would silently expose its tangent to an enclosing
         // transform.

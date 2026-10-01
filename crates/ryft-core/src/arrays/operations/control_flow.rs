@@ -243,8 +243,8 @@ where
             Dimension::Dynamic(_) => {
                 let (runtime_length, stacked_inputs) =
                     inputs.split_last().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-                // The runtime-length safety rule is defined once, in the types space. Applying it to the actual
-                // operand types keeps eager interpretation and staged type inference exactly in step.
+                // The runtime-length safety rule is defined once, in the types space. Applying it to the actual input
+                // types keeps eager interpretation and staged type inference exactly in step.
                 let input_types = inputs.iter().map(|input| input.r#type()).collect::<Vec<_>>();
                 validate_scan_runtime_length(length, input_types.as_slice(), carry_count, stacked_inputs.len())?;
                 let runtime_length = <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(runtime_length)?;
@@ -323,8 +323,8 @@ where
 }
 
 // Batched while-predicate semantics for [`Array`]: `any_true` reduces the whole Boolean payload with `or`, and
-// `mask_select` broadcasts the predicate against the operands along its leading (prefix) axes, so predicate item `i`
-// masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
+// `mask_select` broadcasts the predicate against its other inputs along its leading (prefix) axes, so predicate item
+// `i` masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
 impl crate::operations::control_flow::WhilePredicate for Array {
     fn any_true(&self) -> Result<bool, ProgramError> {
         if !self.r#type().data_type().is_boolean() {
@@ -347,8 +347,8 @@ impl crate::operations::control_flow::WhilePredicate for Array {
         {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "mask_select requires a Boolean predicate whose element count divides congruent operands, but \
-                     got predicate {} with operands {} and {}",
+                    "mask_select requires a Boolean predicate whose element count divides congruent inputs, but \
+                     got predicate {} with inputs {} and {}",
                     self.r#type(),
                     on_true.r#type(),
                     on_false.r#type(),
@@ -422,13 +422,13 @@ mod tests {
     ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let extent = builder.add_input(ArrayIrType::Dimension(dimension_type));
-        let operand = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let input = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let factor = builder.add_constant(array(Array::scalar(factor).unwrap()));
         let output = builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(MulOperation::new())),
                 Vec::new(),
-                vec![operand, factor],
+                vec![input, factor],
                 None,
             )
             .unwrap()[0];
@@ -461,7 +461,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
-        let operand = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let input = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let regions = vec![
             builder.import_region(scale_branch(extent_type.clone(), 2.0).entry_region_ref()),
             builder.import_region(scale_branch(extent_type.clone(), 3.0).entry_region_ref()),
@@ -470,7 +470,7 @@ mod tests {
             .add_instruction(
                 TestOperation::Condition(ConditionOperation::new()),
                 regions,
-                vec![predicate, extent, operand],
+                vec![predicate, extent, input],
                 None,
             )
             .unwrap()
@@ -537,7 +537,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
-        let operand = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let input = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let true_branch = scale_branch(extent_type.clone(), 2.0);
         let false_branch = scale_branch(extent_type.clone(), 3.0);
         let regions = vec![
@@ -548,7 +548,7 @@ mod tests {
             .add_instruction(
                 TestOperation::Condition(ConditionOperation::new()),
                 regions,
-                vec![predicate, extent, operand],
+                vec![predicate, extent, input],
                 None,
             )
             .unwrap()
@@ -725,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_condition_jvp_shapes_a_disconnected_dynamic_operand_tangent_from_its_primal() {
+    fn test_composite_condition_jvp_shapes_a_disconnected_dynamic_input_tangent_from_its_primal() {
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let array_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
@@ -751,8 +751,9 @@ mod tests {
         let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
         let left = builder.add_input(ArrayIrType::Array(array_type.clone()));
         let right = builder.add_input(ArrayIrType::Array(array_type.clone()));
-        // Severing the second operand's tangent leaves the fused conditional with one live and one structurally zero
-        // dynamic tangent operand, which is exactly the case a type-only nullary zero cannot construct.
+        // Severing the tangent of the conditional's last instruction input leaves the fused conditional with one live
+        // and one structurally zero dynamic tangent input, which is exactly the case a type-only nullary zero cannot
+        // construct.
         let severed = builder
             .add_instruction(
                 TestOperation::Array(ArrayOperation::from(StopGradientOperation::<ArrayType>::new())),
@@ -778,7 +779,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[1]], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
 
-        // The severed operand's tangent reads its own primal's runtime extent before constructing the dynamic zero.
+        // The severed input's tangent reads its own primal's runtime extent before constructing the dynamic zero.
         let jvp = program.jvp().unwrap();
         assert_eq!(
             jvp.to_string(),
@@ -832,18 +833,18 @@ mod tests {
         let branch = || {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
-            let operand = builder.add_input(ArrayIrType::Array(array_type.clone()));
+            let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
             let doubled = builder
                 .add_instruction(
                     TestOperation::Array(ArrayOperation::from(AddOperation::new())),
                     Vec::new(),
-                    vec![operand, operand],
+                    vec![input, input],
                     None,
                 )
                 .unwrap()[0];
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(
-                    vec![extent, doubled, operand],
+                    vec![extent, doubled, input],
                     vec![Placeholder; 2],
                     vec![Placeholder; 3],
                 )
@@ -852,7 +853,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
-        let operand = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
         let regions = vec![
             builder.import_region(branch().entry_region_ref()),
             builder.import_region(branch().entry_region_ref()),
@@ -861,7 +862,7 @@ mod tests {
             .add_instruction(
                 TestOperation::Condition(ConditionOperation::new()),
                 regions,
-                vec![predicate, extent, operand],
+                vec![predicate, extent, input],
                 None,
             )
             .unwrap()
@@ -913,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_scan_interprets_stacked_reference_operands_as_per_iteration_transforms() {
+    fn test_composite_scan_interprets_stacked_reference_inputs_as_per_iteration_transforms() {
         /// Builds a program over `[carry, stack]` that applies `operation` to a body which accumulates the carry into
         /// the per-iteration slice reference and then folds the updated slice into the carry, and that returns the
         /// final carry.
@@ -1673,7 +1674,7 @@ mod tests {
         assert_eq!(predicate.any_true(), Ok(true));
         assert_eq!(Array::vector(vec![false, false]).unwrap().any_true(), Ok(false));
         assert!(Array::vector(vec![1.0]).unwrap().any_true().is_err());
-        // Predicate item `i` masks the contiguous per-item block of operand elements it governs.
+        // Predicate item `i` masks the contiguous per-item block of `on_true` and `on_false` elements it governs.
         let on_true =
             Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[1.0, 2.0, 3.0, 4.0]).unwrap();
         let on_false =

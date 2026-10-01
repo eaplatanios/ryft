@@ -248,7 +248,7 @@ impl<T: WhileTypeSemantics> Operation for WhileOperation<T> {
     }
 }
 
-// A `while`'s boundaries are all one state signature: its operands, its outputs, its condition's inputs, and its
+// A `while`'s boundaries are all one state signature: its own inputs and outputs, its condition's inputs, and its
 // body's inputs and outputs carry the same carries at the same positions. Threading discharged state therefore appends
 // the same carries to every one of them, and the loop deliberately applies no read-only pruning: an allocation the loop
 // merely reads still occupies a carry position, because dropping it would leave the body's boundary disagreeing with
@@ -373,9 +373,9 @@ where
             }
         }
 
-        // Rotation discharges the original condition once into the parent before any operand is read: its effects and
-        // state updates land in this context exactly once, and the loop then enters with the updated state and the
-        // resulting predicate as a trailing carry.
+        // Rotation discharges the original condition once into the parent before any instruction input is read: its
+        // effects and state updates land in this context exactly once, and the loop then enters with the updated state
+        // and the resulting predicate as a trailing carry.
         let initial_predicate = match rotate {
             true => {
                 let initial = driver.inline_region(context, 0, inputs.to_vec())?;
@@ -384,19 +384,19 @@ where
             }
             false => None,
         };
-        let mut operands = Vec::with_capacity(inputs.len() + entering.len() + 1);
+        let mut discharged_inputs = Vec::with_capacity(inputs.len() + entering.len() + 1);
         for input in inputs {
-            operands.push(context.boundary_value(input)?);
+            discharged_inputs.push(context.boundary_value(input)?);
         }
         for allocation in &entering {
-            operands.push(
+            discharged_inputs.push(
                 context
                     .boundary_value(&ReferenceDischargeValue::Reference(context.allocation_reference(*allocation)?))?,
             );
         }
         let (operation, regions) = match initial_predicate {
             Some(predicate) => {
-                operands.push(predicate);
+                discharged_inputs.push(predicate);
                 let state_allocations =
                     carries.iter().copied().chain(entering.iter().copied().map(Some)).collect::<Vec<_>>();
                 let (rotated_condition, rotated_body) = rotated_discharge_regions(
@@ -409,7 +409,7 @@ where
             }
             None => (*self, vec![condition_result.into_program(), body_result.into_program()]),
         };
-        let mut outputs = context.parent().bind(operation, regions, operands.as_slice())?;
+        let mut outputs = context.parent().bind(operation, regions, discharged_inputs.as_slice())?;
         if rotate {
             check_count!("output", outputs, inputs.len() + entering.len() + 1, ProgramError);
             outputs.pop();
@@ -1819,10 +1819,10 @@ where
 /// Capture-free forward-mode (JVP) rule for the bounded [`WhileOperation`], staging an augmented primal `while`
 /// and one masked length-`bound` tangent `scan` as ordinary primal-enum operations over the shared builder.
 ///
-/// In the bounded regime the rule keeps every per-iteration residual and the validity mask as plain primal operand
-/// edges: they leave the augmented primal while as ordinary stacked outputs and re-enter the tangent scan as ordinary
-/// stacked scanned inputs, so no symbolic capture is ever introduced. The enclosing partial-evaluation split then
-/// discovers the residual operand edges structurally, exactly as it does for the scan and condition rules.
+/// In the bounded regime the rule keeps every per-iteration residual and the validity mask as plain primal input edges:
+/// they leave the augmented primal while as ordinary stacked outputs and re-enter the tangent scan as ordinary stacked
+/// scanned inputs, so no symbolic capture is ever introduced. The enclosing partial-evaluation split then discovers the
+/// residual input edges structurally, exactly as it does for the scan and condition rules.
 ///
 /// **The unbounded case stages the fused doubled-state loop instead.** This staged rule is only reached when the
 /// context is not [eager](Context::is_eager) (eager contexts run the loop directly through [`jvp_while_eagerly`],
@@ -1840,7 +1840,7 @@ where
 ///   1. Builds the augmented primal `while` over the state `[original_state..., counter (i64 scalar), residual_stacks
 ///      (one zero-initialized [B, ...] stack per residual), mask_stack (a false-initialized Boolean [B] stack)]`
 ///      with `build_bounded_while_programs` from the residual-extended primal body, keeping `iteration_bound = B` so
-///      the per-item writes can never clamp, and stages it over the operand primals followed by the staged counter and
+///      the per-item writes can never clamp, and stages it over the input primals followed by the staged counter and
 ///      stack zeros. Its outputs split into the original state outputs (the primal outputs), the dropped counter, the
 ///      stacked residual outputs, and the mask stack.
 ///   2. Stages a length-`B` tangent [`ScanOperation`] over the live tangent carries, residual storage stacks, and one
@@ -1888,13 +1888,13 @@ where
     // predicate-prefix contract (the scalar iteration counter and the `[bound, ...]` residual stacks are not
     // predicate-prefixed), so the loop is first rewritten into its scalar-predicate masked normal form over
     // `[state..., active_mask]` (see `masked_while_programs`) and differentiated recursively — the masked loop's
-    // forward mode is this same rule. The initial mask is the condition replayed on the operand primals, carried
-    // with a zero tangent since a Boolean mask has no derivative.
+    // forward mode is this same rule. The initial mask is the condition replayed on the input primals, carried with a
+    // zero tangent since a Boolean mask has no derivative.
     if C::Type::is_batched_predicate(&condition.output_types()[0]) {
         let (masked_condition, masked_body) = masked_while_programs::<_, _, A>(condition, body)?;
         let masked_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
-        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut initial_mask = condition.interpret_in_context(context.primal(), primal_operands)?;
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let mut initial_mask = condition.interpret_in_context(context.primal(), primal_inputs)?;
         check_count!("output", initial_mask, 1, ProgramError);
         let mut extended_inputs = inputs.to_vec();
         extended_inputs.push(DifferentiationDual::new_with_zero_tangent(initial_mask.remove(0))?);
@@ -1954,9 +1954,9 @@ where
     let state_types = driver.region(1)?.input_types();
     let state_count = state_types.len();
 
-    // Linearize the body once under the operand duals' activity (state elements keep positional identity, so the
-    // body's mask is the operand mask). The nonlinear half returns the next state followed by ordinary residuals, and
-    // the linear half consumes the live state tangents followed by those residuals.
+    // Linearize the body once under the instruction input duals' activity (state elements keep positional identity, so
+    // the body's region input mask is the instruction input mask). The nonlinear half returns the next state followed
+    // by ordinary residuals, and the linear half consumes the live state tangents followed by those residuals.
     check_count!("input", inputs, state_count, ProgramError);
     let element_has_tangent = inputs.iter().map(DifferentiationDual::is_tangent_active).collect::<Vec<_>>();
     let input_indices = element_has_tangent
@@ -2021,19 +2021,19 @@ where
         stacked_residual_types.as_slice(),
         bound,
     )?;
-    let mut primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+    let mut primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
     for zero_state_type in
         std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type))
     {
         let mut zeros =
             context.primal().bind(C::Operation::residual_stack_zero(zero_state_type.clone()), Vec::new(), &[])?;
         check_count!("output", zeros, 1, ProgramError);
-        primal_operands.push(zeros.remove(0));
+        primal_inputs.push(zeros.remove(0));
     }
     let mut while_outputs = context.primal().bind(
         C::Operation::from(WhileOperation::new().with_iteration_bound(bound)?),
         vec![extended_condition, augmented_body],
-        primal_operands.as_slice(),
+        primal_inputs.as_slice(),
     )?;
     check_count!("output", while_outputs, state_count + 2 + stack_types.len(), ProgramError);
     let mask_stack = while_outputs.pop().unwrap();
@@ -2145,13 +2145,13 @@ where
             |inputs| {
                 let trace_context = inputs[0].context().clone();
                 let (iteration_inputs, mask) = inputs[1..].split_at(inputs.len() - 2);
-                let mut operands = Vec::with_capacity(inputs.len());
-                operands.push(mask[0].clone());
-                operands.extend_from_slice(iteration_inputs);
+                let mut conditional_inputs = Vec::with_capacity(inputs.len());
+                conditional_inputs.push(mask[0].clone());
+                conditional_inputs.extend_from_slice(iteration_inputs);
                 trace_context.bind(
                     C::Operation::from(ConditionOperation::new()),
                     vec![active_body, passive_body],
-                    operands.as_slice(),
+                    conditional_inputs.as_slice(),
                 )
             },
             scan_body_input_types,
@@ -2191,7 +2191,7 @@ where
     // The tangent scan consumes invariant dimension residuals, live tangent carries, stored residual stacks, and one
     // scalar validity stack.
     let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
-    let mut tangent_operands = invariant_residual_sources
+    let mut tangent_scan_inputs = invariant_residual_sources
         .iter()
         .flatten()
         .map(|&state_index| tangent_inputs[state_index].primal().clone())
@@ -2200,25 +2200,25 @@ where
     // the tangent type derivation preserves geometry exactly.
     for (input, &active) in tangent_inputs.iter().zip(&element_has_tangent) {
         if active {
-            tangent_operands.push(C::Operation::materialize_zero_from_residual_sources(
+            tangent_scan_inputs.push(C::Operation::materialize_zero_from_residual_sources(
                 context.tangent(),
                 input.tangent().clone(),
                 std::iter::once(input.primal()),
             )?);
         }
     }
-    tangent_operands.extend(
+    tangent_scan_inputs.extend(
         residual_stacks
             .into_iter()
             .map(|value| context.primal_to_tangent(value))
             .collect::<Result<Vec<_>, _>>()?,
     );
-    tangent_operands.push(context.primal_to_tangent(mask_stack)?);
+    tangent_scan_inputs.push(context.primal_to_tangent(mask_stack)?);
     let tangent_scan = ScanOperation::<C::Constant>::new(invariant_residual_count + tangent_state_count, bound);
     let tangent_outputs =
         context
             .tangent()
-            .bind(C::Operation::from(tangent_scan), vec![scan_body], tangent_operands.as_slice())?;
+            .bind(C::Operation::from(tangent_scan), vec![scan_body], tangent_scan_inputs.as_slice())?;
     check_count!("output", tangent_outputs, invariant_residual_count + tangent_state_count, ProgramError);
 
     let mut tangent_outputs = tangent_outputs.into_iter().skip(invariant_residual_count);
@@ -2288,9 +2288,9 @@ where
 
     // Build the fused body over the compact state `[primal_state..., live(tangent_state)...]` through the
     // instruction-scoped driver (region 1 is the loop body). The fused body carries a tangent boundary input exactly
-    // for the active state elements, so the liveness mask is the operand duals' activity: a numeric element is active
-    // (a symbolic zero is materialized below), while a plumbing reference element and a zero-space element are
-    // inactive and receive no tangent input. State elements keep positional identity across iterations, so the
+    // for the active state elements, so the liveness mask is the instruction input duals' activity: a numeric element
+    // is active (a symbolic zero is materialized below), while a plumbing reference element and a zero-space element
+    // are inactive and receive no tangent input. State elements keep positional identity across iterations, so the
     // activity fixed point is trivial: a numeric element's activity is fixed by its type, and a reference element's
     // tangent can only come from its input, so it cannot become active through iteration.
     let body = driver.region(1)?;
@@ -2322,18 +2322,18 @@ where
         vec![Placeholder; condition_output_count],
     )?;
 
-    // Stage the fused loop over the operand primals followed by the materialized tangents of the live differential
-    // state elements — the fused body takes each of those tangents as a real program input, so their structural
-    // zeros are materialized against their own primal, which supplies the runtime geometry a reference-bearing
-    // tangent type omits — and zip the output halves back into `DifferentiationDual`s in the original state order,
-    // restoring structural zeros for the omitted zero-space state elements.
+    // Stage the fused loop over the instruction input primals followed by the materialized tangents of the live
+    // differential state elements — the fused body takes each of those tangents as a real program input, so their
+    // structural zeros are materialized against their own primal, which supplies the runtime geometry a
+    // reference-bearing tangent type omits — and zip the output halves back into `DifferentiationDual`s in the original
+    // state order, restoring structural zeros for the omitted zero-space state elements.
     let fused_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
-    let mut operands = Vec::with_capacity(fused_state_count);
-    operands.extend(inputs.iter().map(|input| input.primal().clone()));
+    let mut fused_inputs = Vec::with_capacity(fused_state_count);
+    fused_inputs.extend(inputs.iter().map(|input| input.primal().clone()));
     for (input, &has_tangent) in inputs.iter().zip(&element_has_tangent) {
         if has_tangent {
             let primal = context.primal_to_tangent(input.primal().clone())?;
-            operands.push(C::Operation::materialize_zero_from_residual_sources(
+            fused_inputs.push(C::Operation::materialize_zero_from_residual_sources(
                 context.tangent(),
                 input.tangent().clone(),
                 std::iter::once(&primal),
@@ -2344,10 +2344,11 @@ where
     let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
         context
             .primal()
-            .bind(C::Operation::from(fused_while), CalleeRegionDriver::new(&fused_regions), &operands)?
+            .bind(C::Operation::from(fused_while), CalleeRegionDriver::new(&fused_regions), &fused_inputs)?
     } else {
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-        let arguments = operands.iter().map(|value| builder.add_input(value.r#type().into_owned())).collect::<Vec<_>>();
+        let arguments =
+            fused_inputs.iter().map(|value| builder.add_input(value.r#type().into_owned())).collect::<Vec<_>>();
         let regions = fused_regions.iter().map(|program| builder.import_region(program.entry_region_ref())).collect();
         let outputs = builder.add_instruction(C::Operation::from(fused_while), regions, arguments, None)?.to_vec();
         let program = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
@@ -2358,7 +2359,7 @@ where
         let input_known = (0..fused_state_count).map(|index| index < state_count).collect::<Vec<_>>();
         let required_outputs = (0..state_count).collect::<Vec<_>>();
         let partition = driver.partition_jvp_program(program.entry_region_ref(), &input_known, &required_outputs)?;
-        partition.interpret_in_context(context, &operands, state_count)?
+        partition.interpret_in_context(context, &fused_inputs, state_count)?
     };
     check_count!("output", outputs, fused_state_count, ProgramError);
     let (primal_outputs, tangent_outputs) = outputs.split_at(state_count);
@@ -3235,14 +3236,14 @@ mod tests {
     }
 
     #[test]
-    fn test_while_traced_carry_joins_operand_alias_family() {
+    fn test_while_traced_carry_joins_input_alias_family() {
         type TestContext = TracingContext<TestIrValue, TestIrOperation>;
         type TestTracer = Tracer<TestContext>;
 
         // A `while` declares no reference effects of its own; it states that its carry output denotes the same
-        // reference as its carry input through `reference_output_identity_input` instead. Tracing honors that hook,
-        // so the loop's result belongs to its operand's alias family, and an access through it after the allocation
-        // is frozen is reported at the access that performs it.
+        // reference as its carry input through `reference_output_identity_input` instead. Tracing honors that hook, so
+        // the loop's result belongs to its input's alias family, and an access through it after the allocation is
+        // frozen is reported at the access that performs it.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar_type.clone()));
         let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -3664,8 +3665,8 @@ mod tests {
     #[test]
     fn test_while_reference_discharge_threads_a_preserved_carry_through_a_loop() {
         // A loop's boundaries stay symmetric with a preserved carry in them: the carry occupies its declared position
-        // in the operand list, in both region boundaries, and in the output list, carrying a reference rather than
-        // state, and the loop publishes no successor for it.
+        // in the instruction input list, in both region boundaries, and in the output list, carrying a reference rather
+        // than state, and the loop publishes no successor for it.
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let counter = condition_builder.add_input(reference_type.clone().into());
@@ -3989,7 +3990,7 @@ mod tests {
             )
             .unwrap();
 
-        // Each declared carry position still exists in the rebuilt loop even though both source operands name one
+        // Each declared carry position still exists in the rebuilt loop even though both source inputs name one
         // allocation. The allocation has one canonical state, so either carry observes the same update and only one
         // hidden final state is published.
         let discharged = source.discharge_references(0).unwrap();

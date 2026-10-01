@@ -107,12 +107,12 @@ impl Operation for SelectOperation<ArrayType> {
 }
 
 // [`SelectOperation`] is a broadcasting elementwise operation. `select(condition, on_true, on_false)` selects per
-// element between the two branches under the Boolean `condition`, broadcasting the three operands' shapes together like
+// element between the two branches under the Boolean `condition`, broadcasting the three inputs' shapes together like
 // [JAX's `jnp.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html). Its type inference therefore
 // overrides the plain elementwise default. The condition must be `DataType::Boolean` and the two branches' `DataType`s
 // are promoted together (i.e., the condition is a mask, not a value that promotes into the result, so that
 // `select(condition, f32, f64)` yields an `f64` result like JAX's `jnp.where`), while the output `Shape` is the
-// broadcast of all three operand shapes and the output `DataType` is the promotion of the two branch data types.
+// broadcast of all three input shapes and the output `DataType` is the promotion of the two branch data types.
 // Implementing `ElementwiseOperation` also gives `select` the standard elementwise batching rule through its blanket
 // `BatchableOperation` implementation.
 impl ElementwiseOperation for SelectOperation<ArrayType> {
@@ -231,7 +231,7 @@ impl_select_differentiation! {
             // Forward-mode differentiation rule for `SelectOperation`. The primal output is `select(condition, on_true,
             // on_false)` over the input primals, and the tangent selects the branch tangents under the *same* primal
             // condition (i.e., a `select` is piecewise linear in its branches), with the condition carried as an
-            // ordinary primal operand edge. When both branch tangents are structural zeros, the output tangent is a
+            // ordinary primal input edge. When both branch tangents are structural zeros, the output tangent is a
             // structural zero of the output type.
             check_count!("input", inputs, 3, ProgramError);
             let condition = &inputs[0];
@@ -271,15 +271,15 @@ impl_select_differentiation! {
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
-            // Partition-aware transposition rule for `SelectOperation`. The Boolean condition (i.e., operand 0) has no
-            // tangent space, and so in a valid pushforward it is the known operand and the two branches (i.e., operands
-            // 1 and 2) are the linear ones. The forward map `(on_true, on_false) ↦ select(condition, on_true,
-            // on_false)` routes the output cotangent into the branch the known condition selected: the `on_true`
-            // cotangent is `select(condition, cotangent, 0)` and the `on_false` cotangent is `select(condition, 0,
-            // cotangent)`, each staged as a primal `select` over the condition read from the pullback through the known
-            // operand's value. The condition receives a structural zero, and a zero output cotangent stays a structural
-            // zero. The rule is generic over the primary type `V::Type` because it only reaches the branch type (i.e.,
-            // `input_types[1]`), the known condition operand value, and the primal `select`; it carries no rank- or
+            // Partition-aware transposition rule for `SelectOperation`. The Boolean condition (i.e., input 0) has no
+            // tangent space, and so in a valid pushforward it is the known input and the two branches (i.e., inputs 1
+            // and 2) are the linear ones. The forward map `(on_true, on_false) ↦ select(condition, on_true, on_false)`
+            // routes the output cotangent into the branch the known condition selected: the `on_true` cotangent is
+            // `select(condition, cotangent, 0)` and the `on_false` cotangent is `select(condition, 0, cotangent)`, each
+            // staged as a primal `select` over the condition read from the pullback through the known input's value.
+            // The condition receives a structural zero, and a zero output cotangent stays a structural zero. The rule
+            // is generic over the primary type `V::Type` because it only reaches the branch type (i.e.,
+            // `input_types[1]`), the known condition input value, and the primal `select`; it carries no rank- or
             // shape-specific logic, so it applies uniformly to every operation family that contains `SelectOperation`.
             check_count!("input", inputs, 3, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
@@ -287,11 +287,11 @@ impl_select_differentiation! {
             match &outputs[0] {
                 MaybeZero::Zero(_) => Ok(()),
                 MaybeZero::Value(cotangent) => {
-                    // The condition is the known operand. The dispatch guarantees a `Known` operand
-                    // carries its pullback value, so read the tracer directly.
+                    // The condition is the known input. The dispatch guarantees a `Known` input carries its pullback
+                    // value, so read the tracer directly.
                     let condition = inputs[0]
                         .as_known()
-                        .expect("dispatch guarantees a known operand carries its pullback value")
+                        .expect("dispatch guarantees a known input carries its pullback value")
                         .clone();
                     let cotangent_type = cotangent.r#type().into_owned();
                     let zero = if cotangent_type.identities().next().is_some() {
@@ -342,7 +342,7 @@ impl_select_differentiation! {
 /// three-argument form.
 ///
 /// For arrays, `Self::select(condition, on_true, on_false)` returns a value whose `i`-th element equals `on_true`'s
-/// `i`-th element when the corresponding element of `condition` is true, and `on_false`'s otherwise. The three operand
+/// `i`-th element when the corresponding element of `condition` is true, and `on_false`'s otherwise. The three input
 /// shapes broadcast together and the two branch data types promote together, so `condition`, `on_true`, and `on_false`
 /// need not share a shape and the branches need not share a data type. The condition is represented by the same value
 /// type as the branches: concrete arrays use Boolean-typed condition arrays, and staged [`Tracer`]s use Boolean-typed

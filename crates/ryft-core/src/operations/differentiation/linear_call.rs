@@ -34,8 +34,8 @@ pub const LINEAR_CALL_OPERATION_NAME: &str = "linear_call";
 ///   - `forward`: `(r, u) ↦ v = Lᵣ(u)`, and
 ///   - `transpose`: `(r, v̄) ↦ ū = Lᵣᵀ(v̄)`.
 ///
-/// Operation operands are ordered as `[residuals..., linear_inputs...]`, matching both region interfaces, and
-/// [`residual_count`](Self::residual_count) separates the two operand roles. That symmetry makes transposition a
+/// Instruction inputs are ordered as `[residuals..., linear_inputs...]`, matching both region input interfaces, and
+/// [`residual_count`](Self::residual_count) separates the two input roles. That symmetry makes transposition a
 /// *swap*: the transpose of `Lᵣ` staged with regions `(forward, transpose)` is the same operation staged with the
 /// regions `(transpose, forward)` over `[residuals..., output_cotangents...]`, so transposing twice restores the
 /// original call and a pullback program retains the linear-call boundary (and its explicit residual edges) instead
@@ -43,7 +43,7 @@ pub const LINEAR_CALL_OPERATION_NAME: &str = "linear_call";
 /// `jax.custom_derivatives.linear_call`](https://github.com/jax-ml/jax/blob/main/jax/_src/custom_derivatives.py),
 /// which has no rendered documentation page and is therefore linked at its source. The swap re-derives each side's
 /// expected interface with the cotangent type mapping, which requires `cotangent(cotangent(u)) = u` for the linear
-/// types. Tangent types (the only types linearization rules stage as linear operands) satisfy this even where primal
+/// types. Tangent types (the only types linearization rules stage as linear inputs) satisfy this even where primal
 /// storage types do not (e.g., `f8e8m0fnu`, whose tangent and cotangent representations are both `f32`). A transpose
 /// result must describe the same cotangent space as its corresponding linear input. Besides identical types, this
 /// admits representations that refine one another under [`TypeRefinements`], such as a static extent of 2 and a
@@ -51,20 +51,20 @@ pub const LINEAR_CALL_OPERATION_NAME: &str = "linear_call";
 ///
 /// Every residual is an ordinary typed Single Static Assignment (SSA) edge rather than differentiation-only payload
 /// metadata. Partial evaluation can lift those values into the enclosing [`Linearization`](crate::Linearization)
-/// residual environment, and partition-aware transposition receives the same values as known operands in
+/// residual environment, and partition-aware transposition receives the same values as known inputs in
 /// deterministic order.
 ///
 /// An explicit operation boundary is necessary because a tangent program must retain more than the computation of
 /// `Lᵣ(u)`. After linearization, that program may be cloned, imported, simplified, differentiated again, or transposed
 /// independently of the primal program. Merely inlining the forward computation would lose its association with both
 /// the residual values and the program that implements `Lᵣᵀ`. Attaching both regions to this operation makes that
-/// association survive through the ordinary [`Program`](crate::Program) region, operand, identity-renaming, and import
+/// association survive through the ordinary [`Program`](crate::Program) region, input, identity-renaming, and import
 /// machinery, without an ambient value lookup or side table.
 ///
 /// The dynamic reshape operation illustrates the need for this representation. Its tangent map reshapes an input
 /// tangent using the output extents, whereas its transpose reshapes an output cotangent using the original input
 /// extents. Those input extents cannot always be recovered from the output shape (e.g., `[n, 4] → [2, 2·n]`). The
-/// reshape rule therefore carries both sets of extents as explicit residual operands and attaches forward and inverse
+/// reshape rule therefore carries both sets of extents as explicit residual inputs and attaches forward and inverse
 /// reshape regions to one [`LinearCallOperation`]. Other shape-dependent linear rules can use the same mechanism; the
 /// operation itself has no array- or dimension-specific semantics.
 ///
@@ -76,7 +76,7 @@ pub const LINEAR_CALL_OPERATION_NAME: &str = "linear_call";
 /// means that every consumer of a linear call can rely on its forward region.
 #[derive(Clone, PartialEq)]
 pub struct LinearCallOperation<T: DifferentiableType> {
-    /// Number of leading residual operands.
+    /// Number of leading residual inputs.
     residual_count: usize,
 
     /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`](crate::Type) universe in which it is valid.
@@ -85,13 +85,13 @@ pub struct LinearCallOperation<T: DifferentiableType> {
 
 impl<T: DifferentiableType> LinearCallOperation<T> {
     /// Creates a new [`LinearCallOperation`] with two attached regions, `forward` and `transpose`, whose leading
-    /// `residual_count` operands are residuals.
+    /// `residual_count` inputs are residuals.
     #[inline]
     pub fn new(residual_count: usize) -> Self {
         Self { residual_count, marker: PhantomData }
     }
 
-    /// Returns the number of leading residual operands.
+    /// Returns the number of leading residual inputs.
     #[inline]
     pub fn residual_count(&self) -> usize {
         self.residual_count
@@ -116,12 +116,12 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     /// constructs the operation's two region programs. It exists because every producer of a linear call must uphold
     /// the same boundary convention, which is easy to get subtly wrong at any one of many call sites:
     ///
-    ///   - the operands are ordered as `[residuals..., linear_inputs...]`,
+    ///   - the instruction inputs are ordered as `[residuals..., linear_inputs...]`,
     ///   - the `forward` region receives the same values in the same order,
     ///   - the `transpose` region receives the same residuals followed by one cotangent-typed input
     ///     per traced forward output, and
     ///   - the operation carries its regions in `[forward, transpose]` order, with
-    ///     [`residual_count`](Self::residual_count) separating the two operand roles.
+    ///     [`residual_count`](Self::residual_count) separating the two input roles.
     ///
     /// Callers therefore provide only the operation-specific mathematics of the two maps, as closures over tracers that
     /// are already split into their residual and linear/cotangent groups.
@@ -199,8 +199,8 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ///
     ///   - `context`: Active [`BatchingContext`] for the transform level being applied.
     ///   - `driver`: [`BatchingDriver`] exposing this call's attached regions.
-    ///   - `inputs`: Batched operands, ordered as `[residuals..., linear_inputs...]`.
-    ///   - `input_axes`: Batch axis of each operand in `inputs`.
+    ///   - `inputs`: Batched instruction inputs, ordered as `[residuals..., linear_inputs...]`.
+    ///   - `input_axes`: Batch axis of each input in `inputs`.
     pub(crate) fn batch_regions<
         C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
         P: CotangentBatchingPolicy<C>,
@@ -226,8 +226,8 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
 
         // A completely replicated call at an unnamed batching level needs no structural region rewrite, and keeping the
         // original call avoids manufacturing a batch axis that neither region observes. What makes that shortcut sound
-        // is the level being unnamed rather than the operands being replicated: an attached region's value can vary per
-        // batch item with no mapped operand at all, but only by addressing the level _by name_ (e.g., an `axis_index`
+        // is the level being unnamed rather than the inputs being replicated: an attached region's value can vary per
+        // batch item with no mapped input at all, but only by addressing the level _by name_ (e.g., an `axis_index`
         // or a collective over this level's axis, both of which a transposed program naturally contains because
         // `all_gather` transposes to `parallel_sum_scatter` and vice versa). Every named-axis operation resolves the
         // level it belongs to by comparing its own axis name against `BatchingContext::axis_name`, so an unnamed level
@@ -274,16 +274,16 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         check_count!("output", transpose.output_ids(), linear_axes.len(), ProgramError);
 
         // Rebinding the call must reconcile type views that agree only for dense batches. For example, a ragged mapped
-        // operand is packed at its declared bound, so its physical type strictly refines the logical boundary retained
+        // input is packed at its declared bound, so its physical type strictly refines the logical boundary retained
         // by the structurally batched regions, while `linear_call` inference requires its regions' boundaries to match
-        // the operand types exactly. Both regions are therefore specialized to the packed operand types (which is a
+        // the input types exactly. Both regions are therefore specialized to the packed input types (which is a
         // no-op whenever the boundaries already agree, which is true for every dense batch), and the transpose's
         // cotangent inputs derive from the specialized forward's physical outputs for the same reason. The bound call's
         // results are plain values that cannot carry batch metadata, so each output carrier is restored through the
         // driver from the source region's per-item logical output type and the input carriers; wrapping them as bare
         // `P::batch` carriers would present bound padding as live data.
         let mut packed_inputs = P::boundary_operands(context.axis_extent());
-        let boundary_operand_count = packed_inputs.len();
+        let boundary_input_count = packed_inputs.len();
         packed_inputs.extend(input_values);
         let forward_input_types = packed_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
 
@@ -295,7 +295,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         let forward_output_types = driver.region(0)?.to_program().specialize(&logical_input_types)?.output_types();
         let forward = forward.specialize(forward_input_types.as_slice())?;
         let physical_output_types = forward.output_types();
-        let mut transpose_input_types = packed_inputs[..boundary_operand_count + self.residual_count]
+        let mut transpose_input_types = packed_inputs[..boundary_input_count + self.residual_count]
             .iter()
             .map(|input| input.r#type().into_owned())
             .collect::<Vec<_>>();
@@ -308,7 +308,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         );
         let transpose = transpose.specialize(transpose_input_types.as_slice())?;
         let outputs = context.parent().bind(
-            LinearCallOperation::new(self.residual_count + boundary_operand_count),
+            LinearCallOperation::new(self.residual_count + boundary_input_count),
             vec![forward, transpose],
             packed_inputs.as_slice(),
         )?;
@@ -640,7 +640,7 @@ impl<
             })
             .collect::<Vec<_>>();
 
-        // A dead output's structural-zero cotangent still becomes a real operand of the transposed call. Its type
+        // A dead output's structural-zero cotangent still becomes a real input of the transposed call. Its type
         // alone cannot construct it when it references runtime identities, but the boundary collectively names every
         // such quantity: at least one peer cotangent is live here (the all-zero case returned above) and the retained
         // residuals are live too, so the zero is assembled from them one identity at a time before falling back to the
@@ -669,7 +669,7 @@ impl<
         let input_cotangents = context.bind(swapped, vec![transpose_program, forward_program], &transpose_inputs)?;
         check_count!("output", input_cotangents, linear_inputs.len(), ProgramError);
 
-        // Residual operands are known and contribute nothing. Preserve symbolic zeros reported by the stored backward
+        // Residual inputs are known and contribute nothing. Preserve symbolic zeros reported by the stored backward
         // program when their types suffice to reconstruct them. A dynamic zero must retain the already materialized
         // value as its extent inputs live in this call's residual graph and may otherwise disappear before the outer
         // pullback constructs its disconnected-input zeros.
@@ -738,8 +738,8 @@ pub(crate) mod tests {
     }
 
     /// Builds the scalar program `u ↦ u · axis_index("items")`, a linear map whose factor is read from the named
-    /// `items` axis rather than from an operand. It serves as both regions of a linear call whose value varies per
-    /// batch item even though every operand is replicated.
+    /// `items` axis rather than from an input. It serves as both regions of a linear call whose value varies per
+    /// batch item even though every input is replicated.
     fn axis_scaled_multiply_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let linear = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -961,7 +961,7 @@ pub(crate) mod tests {
     #[test]
     fn test_linear_call_operation_batching_rewrites_replicated_regions_naming_the_batch_axis() {
         // Both regions of `u ↦ u · axis_index("items")` address the enclosing named batching level, so the call's
-        // value varies per batch item even though its single operand is replicated.
+        // value varies per batch item even though its single input is replicated.
         let regions = vec![axis_scaled_multiply_program(), axis_scaled_multiply_program()];
         let driver = RecursiveBatchingDriver::new(&regions);
         let context =
@@ -999,7 +999,7 @@ pub(crate) mod tests {
 
         // An unnamed level is the shape every differentiation-generated linear call is batched under, and no operation
         // can address it, so a completely replicated call keeps its fast path: the staged instruction retains its
-        // residual count, its operand order, and both regions byte for byte.
+        // residual count, its input order, and both regions byte for byte.
         let (batched, output_axes) = program
             .batched(
                 2,
@@ -1061,7 +1061,7 @@ pub(crate) mod tests {
     fn test_linear_call_operation_batching_specializes_ragged_region_boundaries() -> Result<(), ProgramError> {
         // A mapped `dimension_from_scalar` gives each batch item its own extent, so the value entering the linear
         // call is packed at the declared bound while the structurally batched regions retain the logical dynamic
-        // boundary. Batching must specialize both attached regions to the packed operand types and restore a ragged
+        // boundary. Batching must specialize both attached regions to the packed input types and restore a ragged
         // carrier for the call's output.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -1092,7 +1092,7 @@ pub(crate) mod tests {
             Placeholder,
         )?;
 
-        // Both attached regions were specialized to the packed operand types. Every array-member boundary type is
+        // Both attached regions were specialized to the packed input types. Every array-member boundary type is
         // the physical bound-shaped storage, with no logical dynamic dimension remaining.
         let instruction = program
             .instructions()
@@ -1330,7 +1330,7 @@ pub(crate) mod tests {
         };
         let driver = TwoRegionDriver { forward: forward.entry_region_ref(), transpose: transpose.entry_region_ref() };
 
-        // A structural-zero output cotangent returns structural zeros for both the residual and the linear operand
+        // A structural-zero output cotangent returns structural zeros for both the residual and the linear input
         // without replaying either region or staging a materialized array zero.
         let zero_context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let residual = zero_context.input(r#type.clone());

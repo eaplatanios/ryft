@@ -1054,17 +1054,17 @@ impl<
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
-    /// Returns the attached `regions` of an application of `operation` to operands of types `input_types` specialized
-    /// to the region input types that `operation` infers for those operands, or [`None`] when no region requires
-    /// specialization (per [`region_requires_specialization`](Self::region_requires_specialization)). Regions are
-    /// visited in application order, and the region input types are re-inferred after each specialization, because the
-    /// signature of one region can depend on another (e.g., a linear call's transpose receives the cotangent of its
-    /// specialized forward output).
+    /// Returns the attached `regions` of an application of `operation` to instruction inputs of types `input_types`
+    /// specialized to the region input types that `operation` infers for those instruction inputs, or [`None`] when no
+    /// region requires specialization (per [`region_requires_specialization`](Self::region_requires_specialization)).
+    /// Regions are visited in application order, and the region input types are re-inferred after each specialization,
+    /// because the signature of one region can depend on another (e.g., a linear call's transpose receives the
+    /// cotangent of its specialized forward output).
     ///
-    /// Contexts that consume attached regions structurally rather than by interpreting them use this. For example,
-    /// a region traced with a threaded batch extent `b` and replayed at `DimensionValue::constant(2)` has its extent
-    /// instantiated as an exact dynamic dimension, while eager array operands carry the static extent 2. Primitive
-    /// operations infer their outputs from their operands and so never observe this, but a differentiation rule that
+    /// Contexts that consume attached regions structurally rather than by interpreting them use this. For example, a
+    /// region traced with a threaded batch extent `b` and replayed at `DimensionValue::constant(2)` has its extent
+    /// instantiated as an exact dynamic dimension, while eager array inputs carry the static extent 2. Primitive
+    /// operations infer their outputs from their inputs and so never observe this, but a differentiation rule that
     /// linearizes such a region would construct tangents whose types disagree with those of the primal outputs.
     ///
     /// # Errors
@@ -2077,15 +2077,15 @@ mod tests {
         let instruction = &program.instructions()[0];
         let regions = || instruction.regions().iter().map(|region| program.region_ref(*region).unwrap());
 
-        // Operands of the declared types require no specialization.
+        // Instruction inputs of the declared types require no specialization.
         assert!(
             FlatArrayProgram::specialize_attached_regions(instruction.operation(), &[dynamic_type.clone()], regions())
                 .unwrap()
                 .is_none()
         );
 
-        // Static operands specialize the forward region, and the inputs of the transpose region, which receives the
-        // cotangents of the specialized forward outputs, are re-inferred and specialized in turn.
+        // Static instruction inputs specialize the forward region, and the inputs of the transpose region, which
+        // receives the cotangents of the specialized forward outputs, are re-inferred and specialized in turn.
         let specialized =
             FlatArrayProgram::specialize_attached_regions(instruction.operation(), &[static_type], regions())
                 .unwrap()
