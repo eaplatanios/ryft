@@ -161,10 +161,11 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        // The body is always requested at the operand types, whose type identities may differ from the declared ones
+        // even when the types compare equal, and staging decides whether that requires instantiating or specializing
+        // the body.
         check_count!("region", region_interfaces, 1, TypeError);
-        if region_interfaces[0].input_types() == input_types {
-            return Ok(vec![None]);
-        }
+        T::derive_identity_renaming(region_interfaces[0].input_types(), input_types)?;
         Ok(vec![Some(input_types.to_vec())])
     }
 
@@ -342,18 +343,18 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
-        Dimension, DimensionBounds, DimensionValue, DimensionVariable, Shape, ShardingDimension,
+        DimensionBounds, DimensionType, DimensionValue, ShardingDimension,
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::rematerialization::{DotsSaveable, NothingSaveable};
     use crate::operations::arithmetic::MulOperation;
-    use crate::operations::manipulation::concatenation::ConcatenateOperation;
+    use crate::operations::dimensions::DimensionAddOperation;
     use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceReadOperation};
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{EffectClasses, Program, ProgramBuilder, ReferenceType};
-    use crate::tracing::TracingContext;
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
@@ -439,26 +440,52 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[ArrayType::scalar(DataType::F32)], std::slice::from_ref(&body)),
-            Err(TypeError::invalid("PLACEHOLDER")),
+            Err(TypeError::invalid(
+                "`rematerialize` body input type signature mismatch: expected [f32[]] but got [f64[]]",
+            )),
         );
 
-        // Operands that match the body need no instantiation, while operands whose type identities differ request the
-        // body at their types, which staging instantiates. The output of the body below is a computed dimension, which
-        // the instantiation renames to the operand's dimension.
-        assert_eq!(operation.infer_region_input_types(std::slice::from_ref(&scalar), std::slice::from_ref(&body)), Ok(vec![None]));
+        // The body is requested at the operand types, which staging instantiates when their type identities differ
+        // from the declared ones. The output of the body below is a computed dimension, which the instantiation renames
+        // to the operand's dimension.
+        assert_eq!(
+            operation.infer_region_input_types(std::slice::from_ref(&scalar), std::slice::from_ref(&body)),
+            Ok(vec![Some(vec![scalar.clone()])]),
+        );
         let bounds = DimensionBounds::new(1, Some(5)).unwrap();
-        let vector_type =
-            |name: &str| ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(name, bounds))]));
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let x = builder.add_input(vector_type("n"));
-        let doubled =
-            builder.add_instruction(ConcatenateOperation::<ArrayType>::new(0, 1).unwrap(), Vec::new(), vec![x, x], None).unwrap()[0];
-        let body = builder.build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap();
-        assert_eq!(body.output_types()[0].to_string(), "PLACEHOLDER");
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input = context.input(vector_type("m"));
-        let outputs = context.bind(operation, vec![body], std::slice::from_ref(&input)).unwrap();
-        assert_eq!(outputs[0].r#type().to_string(), "PLACEHOLDER");
+        let extent = DimensionType::new("n", bounds);
+        let two = DimensionValue::constant(2).unwrap();
+        let addition = DimensionAddOperation::new(&extent, two.r#type().as_ref()).unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let input = builder.add_input(extent.into());
+        let two = builder.add_constant(TestIrValue::Dimension(two));
+        let sum = builder.add_instruction(addition, Vec::new(), vec![input, two], None).unwrap()[0];
+        let body = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![sum], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(body.output_types()[0].to_string(), "dimension<n + 2 ∈ [3, 7)>");
+        let (_, program) = TracingContext::<TestIrValue, TestIrOperation>::trace(
+            |input: Tracer<TracingContext<TestIrValue, TestIrOperation>>| {
+                let context = input.context().clone();
+                Ok(context.bind(operation.lift::<ArrayIrType>(), vec![body], std::slice::from_ref(&input))?.remove(0))
+            },
+            ArrayIrType::from(DimensionType::new("m", bounds)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<m ∈ [1, 5)> .
+                let %1:dimension<n + 2 ∈ [3, 7)> = rematerialize %0 [
+                    body={
+                        lambda %0:dimension<m ∈ [1, 5)> .
+                        let %1:dimension<2> = const 2
+                            %2:dimension<n + 2 ∈ [3, 7)> = dimension_add %0 %1
+                        in (%2)
+                    },
+                ]
+                in (%1)"},
+        );
     }
 
     #[test]
@@ -481,7 +508,15 @@ mod tests {
         assert_eq!(
             program.into_pruned().unwrap().to_string(),
             indoc! {"
-                PLACEHOLDER"},
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = rematerialize %0 [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                ]
+                in (%2)"},
         );
     }
 
@@ -513,7 +548,15 @@ mod tests {
         assert_eq!(
             discharged.program().to_string(),
             indoc! {"
-                PLACEHOLDER"},
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[], %3:f32[] = rematerialize %0 %1 [
+                    body={
+                        lambda %0:f32[], %1:f32[] .
+                        let %2:f32[] = add %0 %1
+                        in (%2, %2)
+                    },
+                ]
+                in (%2, %3)"},
         );
         assert_eq!(discharged.external_reference_bindings().len(), 1);
         assert!(discharged.external_reference_bindings()[0].is_mutated());
@@ -544,7 +587,16 @@ mod tests {
         assert_eq!(
             batched.to_string(),
             indoc! {"
-                PLACEHOLDER"},
+                lambda %0:f64[2] .
+                let %1:f64[2] = rematerialize %0 [
+                    body={
+                        lambda %0:f64[2] .
+                        let %1:f64[2] = sin %0
+                            %2:f64[2] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%1)"},
         );
         assert_eq!(
             batched.interpret(vec![Array::vector(vec![0.5f64, 1.5]).unwrap()]),
@@ -587,7 +639,22 @@ mod tests {
         assert_eq!(
             batched.to_string(),
             indoc! {"
-                PLACEHOLDER"},
+                [
+                    BatchAxis(
+                        Some(
+                            Axis(
+                                0,
+                            ),
+                        ),
+                    ),
+                    BatchAxis(
+                        Some(
+                            Axis(
+                                0,
+                            ),
+                        ),
+                    ),
+                ]"},
         );
         let counter = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
         let outputs = batched
@@ -609,6 +676,6 @@ mod tests {
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(rematerialize_operation(), vec![body], vec![x], None).unwrap()[0];
         let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        assert_eq!(program.jvp().unwrap_err().to_string(), "PLACEHOLDER");
+        assert_eq!(program.jvp().unwrap_err().to_string(), "operation `rematerialize` is not differentiable yet");
     }
 }

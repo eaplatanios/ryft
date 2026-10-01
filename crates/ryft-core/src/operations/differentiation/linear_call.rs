@@ -1,5 +1,5 @@
-use std::borrow::Cow;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
@@ -18,37 +18,12 @@ use crate::operations::constants::zero::Zero;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramError, RegionInterface, RegionSlot,
-    TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value,
+    TypeError, TypeRefinements, Typed, Value,
 };
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
 /// Canonical operation name for [`LinearCallOperation`].
 pub const LINEAR_CALL_OPERATION_NAME: &str = "linear_call";
-
-/// Interface form implemented by a [`LinearCallOperation`].
-#[derive(Clone, Debug, PartialEq)]
-enum LinearCallInterface<T: DifferentiableType> {
-    /// Executable linear map. Both the map and its transpose have attached regions (i.e., `forward` followed by
-    /// `transpose`), and the complete operation interface is derived from the `forward` [`Region`](crate::Region)'s
-    /// boundary, so no [`Type`](crate::Type)s are stored.
-    ForwardAndTranspose,
-
-    /// Reverse-only linear map that supplies a transpose program but no executable forward program, so exactly one
-    /// region is attached, named `transpose`. The forward map `u ↦ Lᵣ(u)` therefore exists mathematically but has no
-    /// region boundary to derive the operation interface from, and its input and output types are stored here
-    /// explicitly. Interpreting this form is deliberately an error (i.e., the canonical reverse-only diagnostic). The
-    /// call exists in a linearized program only so that reverse mode can transpose it by replaying the attached
-    /// [`Region`](crate::Region). For example, [`CustomDerivativeOperation`](crate::CustomDerivativeOperation) stages
-    /// this form because `custom_vjp` supplies a user-written backward program without a tangent program. Refer to the
-    /// documentation of [`LinearCallOperation`] for how this form relates to [`Self::ForwardAndTranspose`].
-    TransposeOnly {
-        /// Input [`Type`](crate::Type)s of the unavailable forward map (one per linear operand).
-        input_types: Vec<T>,
-
-        /// Output [`Type`](crate::Type)s of the unavailable forward map.
-        output_types: Vec<T>,
-    },
-}
 
 /// [`Operation`] that represents a call to a residual-parameterized linear map together with its transpose. For
 /// fixed residual values `r`, this operation represents a linear map `Lᵣ : U → V` and its transpose `Lᵣᵀ : V* → U*`.
@@ -93,73 +68,33 @@ enum LinearCallInterface<T: DifferentiableType> {
 /// reshape regions to one [`LinearCallOperation`]. Other shape-dependent linear rules can use the same mechanism; the
 /// operation itself has no array- or dimension-specific semantics.
 ///
-/// The _forward-and-transpose_ form of this operation derives its complete interface from attached `forward` and
-/// `transpose` [`Region`](crate::Region)s and can be interpreted, lowered, transposed, and differentiated again. The
-/// _transpose-only_ form is the deliberate exception for linear maps that supply only a reverse rule: it stores the
-/// unavailable forward input/output types and attaches only the transpose region, so attempting to execute or
-/// differentiate it in forward mode is an error (e.g., [`CustomDerivativeOperation`](crate::CustomDerivativeOperation)
-/// stages this form for a call whose reverse-mode rules supply a backward program without a tangent program).
-#[derive(Clone, Debug, PartialEq)]
+/// This operation derives its complete interface from its attached `forward` and `transpose` [`Region`](crate::Region)s
+/// and can be interpreted, lowered, batched, transposed, and differentiated again. A linear map that supplies only
+/// a reverse rule (e.g., the backward rule of a custom derivative) has no executable forward program, so it is
+/// represented by a [`CustomFunctionTransposeOperation`](crate::CustomFunctionTransposeOperation) instead, whose
+/// transposition applies that rule inline rather than swapping regions. Keeping such maps out of this operation
+/// means that every consumer of a linear call can rely on its forward region.
+#[derive(Clone, PartialEq)]
 pub struct LinearCallOperation<T: DifferentiableType> {
     /// Number of leading residual operands.
     residual_count: usize,
 
-    /// Specifies whether this call has an executable forward program or is a reverse-only transpose-only map.
-    interface: LinearCallInterface<T>,
+    /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`](crate::Type) universe in which it is valid.
+    marker: PhantomData<fn() -> T>,
 }
 
 impl<T: DifferentiableType> LinearCallOperation<T> {
-    /// Creates a _forward-and-transpose_ [`LinearCallOperation`] with two attached regions,
-    /// `forward` and `transpose`.
+    /// Creates a new [`LinearCallOperation`] with two attached regions, `forward` and `transpose`, whose leading
+    /// `residual_count` operands are residuals.
     #[inline]
     pub fn new(residual_count: usize) -> Self {
-        Self { residual_count, interface: LinearCallInterface::ForwardAndTranspose }
-    }
-
-    /// Creates a reverse-only _transpose-only_ [`LinearCallOperation`] for a linear map that supplies a transpose
-    /// program but no executable forward program, stating the unavailable forward map's interface explicitly.
-    #[inline]
-    pub fn transpose_only(residual_count: usize, input_types: Vec<T>, output_types: Vec<T>) -> Self {
-        Self { residual_count, interface: LinearCallInterface::TransposeOnly { input_types, output_types } }
+        Self { residual_count, marker: PhantomData }
     }
 
     /// Returns the number of leading residual operands.
     #[inline]
     pub fn residual_count(&self) -> usize {
         self.residual_count
-    }
-
-    /// Returns `true` if this call has the _transpose-only_ form, which attaches no executable forward
-    /// [`Region`](crate::Region).
-    #[inline]
-    pub fn is_transpose_only(&self) -> bool {
-        matches!(self.interface, LinearCallInterface::TransposeOnly { .. })
-    }
-
-    /// Maps this operation from type universe `T` into type universe `U` while preserving its interface form and
-    /// [`residual_count`](Self::residual_count). A _forward-and-transpose_ call stores no interface types and therefore
-    /// changes only its type parameter. A _transpose-only_ call applies `map` to every stored input and output type of
-    /// its unavailable forward map.
-    ///
-    /// This operation is consuming so lifting a linear call into a composite type universe can move and map its stored
-    /// types without cloning them or exposing their private representation.
-    ///
-    /// # Parameters
-    ///
-    ///   - `map`: Function that converts each stored type from `T` into `U`.
-    #[inline]
-    pub fn map_types<U: DifferentiableType, F: FnMut(T) -> U>(self, mut map: F) -> LinearCallOperation<U> {
-        LinearCallOperation {
-            residual_count: self.residual_count,
-            interface: match self.interface {
-                LinearCallInterface::ForwardAndTranspose => LinearCallInterface::ForwardAndTranspose,
-                LinearCallInterface::TransposeOnly { input_types, output_types } => {
-                    let input_types = input_types.into_iter().map(&mut map).collect();
-                    let output_types = output_types.into_iter().map(map).collect();
-                    LinearCallInterface::TransposeOnly { input_types, output_types }
-                }
-            },
-        }
     }
 
     /// Splits the provided `input_types` into its leading residual types and trailing linear types.
@@ -175,12 +110,11 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         Ok(input_types.split_at(self.residual_count))
     }
 
-    /// Stages a [`LinearCallInterface::ForwardAndTranspose`] residual-parameterized [`LinearCallOperation`].
-    /// It traces its two attached [`Region`](crate::Region)s and binds the resulting _forward-and-transpose_
-    /// [`LinearCallOperation`] in `context`. This is a canonical constructor rather than a separate binding path as the
-    /// final step is still an ordinary [`Context::bind`], and everything before it only constructs the operation's two
-    /// region programs. It exists because every producer of an [`LinearCallInterface::ForwardAndTranspose`] linear call
-    /// must uphold the same boundary convention, which is easy to get subtly wrong at any one of many call sites:
+    /// Stages a residual-parameterized [`LinearCallOperation`]. It traces its two attached [`Region`](crate::Region)s
+    /// and binds the resulting [`LinearCallOperation`] in `context`. This is a canonical constructor rather than a
+    /// separate binding path as the final step is still an ordinary [`Context::bind`], and everything before it only
+    /// constructs the operation's two region programs. It exists because every producer of a linear call must uphold
+    /// the same boundary convention, which is easy to get subtly wrong at any one of many call sites:
     ///
     ///   - the operands are ordered as `[residuals..., linear_inputs...]`,
     ///   - the `forward` region receives the same values in the same order,
@@ -191,11 +125,6 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ///
     /// Callers therefore provide only the operation-specific mathematics of the two maps, as closures over tracers that
     /// are already split into their residual and linear/cotangent groups.
-    ///
-    /// The _transpose-only_ form (i.e., [`LinearCallInterface::TransposeOnly`]) deliberately has no staging counterpart
-    /// (e.g., an `Option`al `transpose_fn` or a `stage_transpose_only` sibling) as it shares _none_ of this function's
-    /// mechanics, because there is no forward map to trace and therefore no traced outputs to derive the transpose
-    /// boundary from (its interface types are stated explicitly instead).
     ///
     /// # Parameters
     ///
@@ -253,16 +182,13 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     }
 
     /// Batches an invocation to this [`LinearCallOperation`] by structurally batching its two attached
-    /// [`Region`](crate::Region)s. Both interface forms preserve a completely replicated call unchanged
-    /// when the batching level is _unnamed_, which is precisely when no attached region can observe it.
+    /// [`Region`](crate::Region)s. A completely replicated call is preserved unchanged when the batching level
+    /// is _unnamed_, which is precisely when no attached region can observe it.
     ///
-    /// Every other [`LinearCallInterface::ForwardAndTranspose`] call batches its forward region to discover the batched
-    /// output axes, batches its transpose region under those axes, and aligns the transpose outputs with the original
-    /// linear-input axes (i.e., a cotangent for a replicated linear input is summed across the batch by `collapse_fn`,
-    /// while cotangents for mapped linear inputs retain their packed axes).
-    ///
-    /// Every other [`LinearCallInterface::TransposeOnly`] call is rejected because its unavailable forward program
-    /// cannot determine the batched output axes.
+    /// Every other call batches its forward region to discover the batched output axes, batches its transpose region
+    /// under those axes, and aligns the transpose outputs with the original linear-input axes (i.e., a cotangent for a
+    /// replicated linear input is summed across the batch by `collapse_fn`, while cotangents for mapped linear inputs
+    /// retain their packed axes).
     ///
     /// The batching policy owns the boundary shape of its structurally batched programs.
     /// [`BatchingPolicy::adapt_batched_program`] adapts each batched region to the plain two-region linear-call
@@ -315,19 +241,6 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
                 input_values.as_slice(),
             )?;
             return Ok(outputs.into_iter().map(P::replicated).collect());
-        }
-
-        match &self.interface {
-            LinearCallInterface::ForwardAndTranspose => {}
-            LinearCallInterface::TransposeOnly { .. } => {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "a transpose-only `{LINEAR_CALL_OPERATION_NAME}` cannot be batched structurally because its \
-                         unavailable forward program does not determine output batch axes; it is preserved unchanged \
-                         only when every input is replicated at an unnamed batching level",
-                    ),
-                });
-            }
         }
 
         let (residual_axes, linear_axes) = input_axes.split_at(self.residual_count);
@@ -409,6 +322,13 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     }
 }
 
+impl<T: DifferentiableType> Debug for LinearCallOperation<T> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("LinearCallOperation").field("residual_count", &self.residual_count).finish()
+    }
+}
+
 impl<T: DifferentiableType> Display for LinearCallOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -426,11 +346,7 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
 
     #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
-        if self.is_transpose_only() {
-            const { &[RegionSlot::rule("transpose")] }
-        } else {
-            const { &[RegionSlot::computation("forward"), RegionSlot::rule("transpose")] }
-        }
+        const { &[RegionSlot::computation("forward"), RegionSlot::rule("transpose")] }
     }
 
     fn infer_region_input_types(
@@ -439,29 +355,14 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
         check_count!("region", region_interfaces, self.region_slots().len(), TypeError);
-        let output_types = match &self.interface {
-            LinearCallInterface::ForwardAndTranspose => {
-                let forward = &region_interfaces[0];
-                let renaming = T::derive_identity_renaming(forward.input_types(), input_types)?;
-                Cow::Owned(
-                    forward
-                        .output_types()
-                        .iter()
-                        .map(|r#type| r#type.rename_identities(&renaming))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
-            }
-            LinearCallInterface::TransposeOnly { output_types, .. } => Cow::Borrowed(output_types.as_slice()),
-        };
+        let forward = &region_interfaces[0];
+        let renaming = T::derive_identity_renaming(forward.input_types(), input_types)?;
         let (residual_types, _) = self.split_inputs(input_types)?;
         let mut transpose_input_types = residual_types.to_vec();
-        transpose_input_types
-            .extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?);
-        if self.is_transpose_only() {
-            Ok(vec![Some(transpose_input_types)])
-        } else {
-            Ok(vec![Some(input_types.to_vec()), Some(transpose_input_types)])
+        for r#type in forward.output_types() {
+            transpose_input_types.push(r#type.rename_identities(&renaming)?.cotangent()?);
         }
+        Ok(vec![Some(input_types.to_vec()), Some(transpose_input_types)])
     }
 
     fn infer_output_types(
@@ -470,30 +371,20 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         check_count!("region", region_interfaces, self.region_slots().len(), TypeError);
-        let (residual_types, linear_types, output_types, descriptor) = match &self.interface {
-            LinearCallInterface::ForwardAndTranspose => {
-                let forward = &region_interfaces[0];
-                check_types!(@same, format!("`{LINEAR_CALL_OPERATION_NAME}` forward input"), [
-                    input_types,
-                    forward.input_types(),
-                ]);
-                let (residual_types, linear_types) = self.split_inputs(input_types)?;
-                (residual_types, linear_types, forward.output_types(), format!("`{LINEAR_CALL_OPERATION_NAME}`"))
-            }
-            LinearCallInterface::TransposeOnly { input_types: linear_types, output_types } => {
-                let (residual_types, actual_linear_types) = self.split_inputs(input_types)?;
-                let descriptor = format!("transpose-only `{LINEAR_CALL_OPERATION_NAME}`");
-                check_types!(@same, format!("{descriptor} input"), [linear_types, actual_linear_types]);
-                (residual_types, linear_types.as_slice(), output_types.as_slice(), descriptor)
-            }
-        };
-        let transpose = region_interfaces.last().unwrap();
+        let forward = &region_interfaces[0];
+        check_types!(@same, format!("`{LINEAR_CALL_OPERATION_NAME}` forward input"), [
+            input_types,
+            forward.input_types(),
+        ]);
+        let (residual_types, linear_types) = self.split_inputs(input_types)?;
+        let output_types = forward.output_types();
+        let transpose = &region_interfaces[1];
         let mut transpose_input_types = residual_types.to_vec();
         transpose_input_types
             .extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?);
         let transpose_output_types =
             linear_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?;
-        check_types!(@same, format!("{descriptor} transpose input"), [
+        check_types!(@same, format!("`{LINEAR_CALL_OPERATION_NAME}` transpose input"), [
             &transpose_input_types,
             transpose.input_types(),
         ]);
@@ -507,7 +398,7 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
             && (T::Refinements::establish(transpose_output_types.iter(), transpose.output_types().iter()).is_err()
                 || T::Refinements::establish(transpose.output_types().iter(), transpose_output_types.iter()).is_err())
         {
-            check_types!(@same, format!("{descriptor} transpose output"), [
+            check_types!(@same, format!("`{LINEAR_CALL_OPERATION_NAME}` transpose output"), [
                 &transpose_output_types,
                 transpose.output_types(),
             ]);
@@ -518,46 +409,14 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
 
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-        // The forward-and-transpose form's outputs are exactly its forward region's outputs.
-        // The transpose-only form has no forward region and therefore no region provenance.
-        if self.is_transpose_only() {
-            Vec::new()
-        } else {
-            vec![OutputRegionProvenance { region_index: 0, output_index }]
-        }
-    }
-
-    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
-        Ok(Self {
-            residual_count: self.residual_count,
-            interface: match &self.interface {
-                LinearCallInterface::ForwardAndTranspose => LinearCallInterface::ForwardAndTranspose,
-                LinearCallInterface::TransposeOnly { input_types, output_types } => {
-                    LinearCallInterface::TransposeOnly {
-                        input_types: input_types
-                            .iter()
-                            .map(|r#type| r#type.rename_identities(renaming))
-                            .collect::<Result<Vec<_>, _>>()?,
-                        output_types: output_types
-                            .iter()
-                            .map(|r#type| r#type.rename_identities(renaming))
-                            .collect::<Result<Vec<_>, _>>()?,
-                    }
-                }
-            },
-        })
+        // The call's outputs are exactly its forward region's outputs.
+        vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        // The transpose-only form is rendered as a flag so that it remains visible where the operation renders without
-        // its attached regions (e.g., in its `Display` rendering). Its stored forward input and output types are not
-        // rendered because they coincide with the types of the call's linear inputs and outputs.
         OperationFormatter::new(formatter, indentation, LINEAR_CALL_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("residual_count", self.residual_count)?;
-            if self.is_transpose_only() {
-                operation.field("transpose_only", true)?;
-            }
             Ok(())
         })
     }
@@ -573,14 +432,6 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCa
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        if self.is_transpose_only() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "a transpose-only `{LINEAR_CALL_OPERATION_NAME}` has no forward program to execute; it supports \
-                     only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
-                ),
-            });
-        }
         driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
@@ -596,6 +447,7 @@ impl<
     P: CotangentBatchingPolicy<C>,
 > BatchableOperation<C, P> for LinearCallOperation<T>
 {
+    #[inline]
     fn batch<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
@@ -620,16 +472,6 @@ impl<
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if self.is_transpose_only() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "a transpose-only `{LINEAR_CALL_OPERATION_NAME}` has no forward-mode (i.e., JVP) rule; \
-                     it supports only reverse-mode differentiation",
-                ),
-            }
-            .into());
-        }
-
         inputs.len().checked_sub(self.residual_count).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "`{}` residual count {} exceeds input count {}",
@@ -750,11 +592,7 @@ impl<
             ))
             .into());
         }
-        let output_count = match &self.interface {
-            LinearCallInterface::ForwardAndTranspose => driver.region(0)?.output_types().len(),
-            LinearCallInterface::TransposeOnly { output_types, .. } => output_types.len(),
-        };
-        check_count!("output", outputs, output_count, ProgramError);
+        check_count!("output", outputs, driver.region(0)?.output_types().len(), ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let (residual_inputs, linear_inputs) = inputs.split_at(self.residual_count);
         let residuals = residual_inputs
@@ -769,7 +607,7 @@ impl<
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let transpose = driver.region(if self.is_transpose_only() { 0 } else { 1 })?;
+        let transpose = driver.region(1)?;
 
         // Unrequested gradients can omit a pure backward program, but its observable effects must still execute and
         // its deferred work must still be staged even when all seeds are structural zeros or none of the linear inputs
@@ -783,9 +621,7 @@ impl<
 
         // Classify each transpose-region output as structurally zero by inspecting its producing instruction in the
         // source region, so zero cotangents stay symbolic instead of accumulating. Outputs with no producing
-        // instruction (forwarded region inputs and constants) conservatively classify as nonzero. The transpose
-        // region follows the forward-and-transpose form's leading forward region (index 1) and is the transpose-only
-        // form's only region (index 0).
+        // instruction (forwarded region inputs and constants) conservatively classify as nonzero.
         let output_is_zero = transpose
             .output_ids()
             .iter()
@@ -822,20 +658,15 @@ impl<
             .collect::<Result<Vec<_>, _>>()?;
         let mut transpose_inputs = residuals;
         transpose_inputs.extend(materialized_cotangents);
-        let input_cotangents = if self.is_transpose_only() {
-            // The transpose-only form's region is a user-supplied backward program with no linearity contract of its
-            // own, so it cannot be re-transposed and is replayed inline into the pullback.
-            transpose.interpret_in_context(&**context, transpose_inputs)?
-        } else {
-            // The forward-and-transpose form transposes by *swapping* its regions: the pullback stages the same
-            // operation with the transpose region leading, over the same residuals followed by the output
-            // cotangents. Transposing twice therefore restores the original call, and the pullback retains the
-            // linear-call boundary together with its explicit residual edges.
-            let swapped = LinearCallOperation::new(self.residual_count);
-            let transpose_program = transpose.to_program();
-            let forward_program = driver.region(0)?.to_program();
-            context.bind(swapped, vec![transpose_program, forward_program], &transpose_inputs)?
-        };
+
+        // A linear call transposes by _swapping_ its regions: the pullback stages the same operation with the
+        // transpose region leading, over the same residuals followed by the output cotangents. Transposing twice
+        // therefore restores the original call, and the pullback retains the linear-call boundary together with
+        // its explicit residual edges.
+        let swapped = LinearCallOperation::new(self.residual_count);
+        let transpose_program = transpose.to_program();
+        let forward_program = driver.region(0)?.to_program();
+        let input_cotangents = context.bind(swapped, vec![transpose_program, forward_program], &transpose_inputs)?;
         check_count!("output", input_cotangents, linear_inputs.len(), ProgramError);
 
         // Residual operands are known and contribute nothing. Preserve symbolic zeros reported by the stored backward
@@ -858,7 +689,7 @@ impl<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
@@ -867,8 +698,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
+        ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
@@ -879,17 +710,15 @@ mod tests {
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::constants::zero::ZeroOperation;
-    use crate::operations::constants::zero_like::ZeroLikeOperation;
-    use crate::operations::dimensions::dimension_from_scalar::{DimensionFromScalar, DimensionFromScalarOperation};
+    use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
     use crate::operations::manipulation::broadcasting::DynamicBroadcast;
     use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation};
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialEvaluationOutput, PartialValue};
+    use crate::partial::PartialValue;
     use crate::programs::{
-        EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionSlot,
-        ValueProjection,
+        MaybeZero, Program, ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionSlot, ValueProjection,
     };
     use crate::tests::{ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue};
     use crate::tracing::TracingContext;
@@ -897,7 +726,7 @@ mod tests {
     use super::*;
 
     /// Builds the scalar program `(r, u) ↦ r · u` used as a residual-parameterized linear-map region.
-    fn scalar_multiply_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+    pub(crate) fn scalar_multiply_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let r#type = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let residual = builder.add_input(r#type.clone());
@@ -924,193 +753,15 @@ mod tests {
         builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    /// Test-only transposition driver exposing one attached region, used to invoke the _transpose-only_ form's
-    /// transposition rule directly on the transpose region it replays.
-    struct TestTranspositionDriver<'r> {
-        /// Transpose region exposed by this driver.
-        region: RegionRef<'r, Array, ArrayOperation<Array>>,
-    }
-
-    impl RegionDriver<Array, ArrayOperation<Array>> for TestTranspositionDriver<'_> {
-        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Array, ArrayOperation<Array>>>
-        where
-            Array: 'r,
-            ArrayOperation<Array>: 'r,
-        {
-            std::iter::once(self.region)
-        }
-    }
-
-    impl TranspositionDriver<Array, ArrayOperation<Array>> for TestTranspositionDriver<'_> {
-        fn transpose_program(
-            &self,
-            _region: RegionRef<'_, Array, ArrayOperation<Array>>,
-            _input_indices: &[usize],
-            _destination_kinds: &[CotangentDestinationKind],
-        ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError> {
-            Err(ProgramError::UnsupportedOperation {
-                message: "test driver does not transpose nested regions".to_string(),
-            }
-            .into())
-        }
-    }
-
     #[test]
     fn test_linear_call_operation() {
-        let r#type = ArrayType::scalar(DataType::F64);
-
-        // The forward-and-transpose form derives its interface from two attached regions.
+        // A linear call derives its interface from its two attached regions.
         let operation = LinearCallOperation::<ArrayType>::new(1);
         assert_eq!(operation.name(), LINEAR_CALL_OPERATION_NAME);
         assert_eq!(operation.residual_count(), 1);
-        assert!(!operation.is_transpose_only());
         assert_eq!(operation.to_string(), "linear_call [residual_count=1]");
         assert_eq!(operation.region_slots(), &[RegionSlot::computation("forward"), RegionSlot::rule("transpose")]);
-        assert_eq!(
-            format!("{operation:?}"),
-            "LinearCallOperation { residual_count: 1, interface: ForwardAndTranspose }",
-        );
-
-        // The transpose-only form stores the unavailable forward interface, shares the operation name, and renders
-        // with a `transpose_only` flag.
-        let operation = LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type]);
-        assert_eq!(operation.name(), LINEAR_CALL_OPERATION_NAME);
-        assert_eq!(operation.residual_count(), 1);
-        assert!(operation.is_transpose_only());
-        assert_eq!(operation.to_string(), "linear_call [residual_count=1, transpose_only=true]");
-        assert_eq!(operation.region_slots(), &[RegionSlot::rule("transpose")]);
-
-        // Mapping changes only the type universe: the executable form retains its marker-only interface, while the
-        // transpose-only form maps every stored input and output type without changing the residual boundary.
-        assert_eq!(
-            LinearCallOperation::<ArrayType>::new(2).map_types(ArrayIrType::Array),
-            LinearCallOperation::<ArrayIrType>::new(2),
-        );
-        let scalar_type = ArrayType::scalar(DataType::F64);
-        assert_eq!(
-            LinearCallOperation::transpose_only(1, vec![scalar_type.clone()], vec![scalar_type.clone()])
-                .map_types(ArrayIrType::Array),
-            LinearCallOperation::transpose_only(
-                1,
-                vec![ArrayIrType::Array(scalar_type.clone())],
-                vec![ArrayIrType::Array(scalar_type)],
-            ),
-        );
-
-        // The transpose-only form derives its transpose region's expected interface from the stored forward interface
-        // through the cotangent type mapping, so it infers the stored output types whenever the attached region agrees.
-        // The linear types are differential types rather than primal storage types, which the mapping must respect.
-        let residual_type = ArrayType::scalar(DataType::F64);
-        let tangent_type = ArrayType::scalar(DataType::F32);
-        let transpose_interface = RegionInterface::new(
-            vec![residual_type.clone(), tangent_type.clone()],
-            vec![tangent_type.clone()],
-            EffectClasses::NONE,
-        );
-        assert_eq!(
-            LinearCallOperation::transpose_only(1, vec![tangent_type.clone()], vec![tangent_type.clone()])
-                .infer_output_types(&[residual_type, tangent_type.clone()], std::slice::from_ref(&transpose_interface)),
-            Ok(vec![tangent_type]),
-        );
-    }
-
-    #[test]
-    fn test_linear_call_operation_type_inference_exact_transpose_outputs() {
-        let scalar = ArrayType::scalar(DataType::F32);
-        let vector = ArrayType::new_static(DataType::F32, [2]);
-        let exact = DimensionVariable::new("exact", DimensionBounds::new(2, Some(3)).unwrap());
-        let broad = DimensionVariable::new("broad", DimensionBounds::new(0, Some(4)).unwrap());
-        let other = DimensionVariable::new("other", DimensionBounds::new(0, Some(4)).unwrap());
-        let operation = LinearCallOperation::transpose_only(0, vec![vector.clone()], vec![scalar.clone()]);
-
-        // An exact named extent and its static representation describe precisely the same cotangent space.
-        assert_eq!(
-            operation.infer_output_types(
-                std::slice::from_ref(&vector),
-                &[RegionInterface::new(
-                    vec![scalar.clone()],
-                    vec![ArrayType::new(DataType::F32, Shape::new(vec![exact.into()]))],
-                    EffectClasses::NONE,
-                )],
-            ),
-            Ok(vec![scalar.clone()]),
-        );
-
-        // A possible extent is not proof of equality, and neither shape nor element type may change.
-        assert_eq!(
-            operation.infer_output_types(
-                std::slice::from_ref(&vector),
-                &[RegionInterface::new(
-                    vec![scalar.clone()],
-                    vec![ArrayType::new(DataType::F32, Shape::new(vec![broad.clone().into()]))],
-                    EffectClasses::NONE,
-                )],
-            ),
-            Err(TypeError::invalid(
-                "transpose-only `linear_call` transpose output type signature mismatch: \
-                 expected [f32[2]] but got [f32[broad]]",
-            )),
-        );
-        assert_eq!(
-            operation.infer_output_types(
-                std::slice::from_ref(&vector),
-                &[RegionInterface::new(
-                    vec![scalar.clone()],
-                    vec![ArrayType::new_static(DataType::F32, [3])],
-                    EffectClasses::NONE,
-                )],
-            ),
-            Err(TypeError::invalid(
-                "transpose-only `linear_call` transpose output type signature mismatch: \
-                 expected [f32[2]] but got [f32[3]]",
-            )),
-        );
-        assert_eq!(
-            operation.infer_output_types(
-                std::slice::from_ref(&vector),
-                &[RegionInterface::new(
-                    vec![scalar.clone()],
-                    vec![ArrayType::new_static(DataType::F64, [2])],
-                    EffectClasses::NONE,
-                )],
-            ),
-            Err(TypeError::invalid(
-                "transpose-only `linear_call` transpose output type signature mismatch: \
-                 expected [f32[2]] but got [f64[2]]",
-            )),
-        );
-
-        // Equal bounds do not equate unrelated identities or erase a repeated-axis relationship.
-        let square = ArrayType::new(DataType::F32, Shape::new(vec![broad.clone().into(), broad.clone().into()]));
-        let operation = LinearCallOperation::transpose_only(0, vec![square.clone()], vec![scalar.clone()]);
-        assert_eq!(
-            operation.infer_output_types(
-                std::slice::from_ref(&square),
-                &[RegionInterface::new(
-                    vec![scalar.clone()],
-                    vec![ArrayType::new(DataType::F32, Shape::new(vec![other.clone().into(), other.clone().into()]))],
-                    EffectClasses::NONE,
-                )],
-            ),
-            Err(TypeError::invalid(
-                "transpose-only `linear_call` transpose output type signature mismatch: \
-                 expected [f32[broad, broad]] but got [f32[other, other]]",
-            )),
-        );
-        assert_eq!(
-            operation.infer_output_types(
-                std::slice::from_ref(&square),
-                &[RegionInterface::new(
-                    vec![scalar],
-                    vec![ArrayType::new(DataType::F32, Shape::new(vec![broad.into(), other.into()]))],
-                    EffectClasses::NONE,
-                )],
-            ),
-            Err(TypeError::invalid(
-                "transpose-only `linear_call` transpose output type signature mismatch: \
-                 expected [f32[broad, broad]] but got [f32[broad, other]]",
-            )),
-        );
+        assert_eq!(format!("{operation:?}"), "LinearCallOperation { residual_count: 1 }");
     }
 
     #[test]
@@ -1163,55 +814,6 @@ mod tests {
         let residual = ProjectedProgramValue::Third(ProjectedMemberValue(7));
         assert_eq!(program.interpret(vec![residual, linear.clone()]), Ok(vec![linear]));
         assert_eq!(program.instructions()[0].regions().len(), 2);
-    }
-
-    #[test]
-    fn test_linear_call_operation_transpose_only_validates_residual_count() {
-        let r#type = ArrayType::scalar(DataType::F64);
-
-        // A residual count larger than the operand count is a malformed call rather than a silently truncated split,
-        // and inference rejects it before any region interface is consulted.
-        let transpose_interface = RegionInterface::new(vec![r#type.clone()], vec![r#type.clone()], EffectClasses::NONE);
-        assert!(matches!(
-            LinearCallOperation::transpose_only(2, Vec::new(), Vec::new())
-                .infer_output_types(&[], std::slice::from_ref(&transpose_interface)),
-            Err(TypeError::Invalid { message }) if message == "`linear_call` residual count 2 exceeds input count 0",
-        ));
-
-        // Transposition enforces the same split independently, because a pullback may be built from an imported call
-        // whose operands were pruned after inference ran.
-        let transpose = scalar_multiply_program();
-        let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        assert!(matches!(
-            LinearCallOperation::transpose_only(3, vec![r#type.clone()], vec![r#type.clone()]).transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &driver,
-                &[],
-                &[],
-                &[],
-            ),
-            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
-                if message == "`linear_call` residual count 3 exceeds input count 0",
-        ));
-
-        // Every residual must be known during transposition, because the replayed transpose region consumes the
-        // residual values themselves rather than cotangents for them.
-        let output_cotangent = context.input(r#type.clone());
-        let inputs = [PartialValue::Unknown(r#type.clone()), PartialValue::Unknown(r#type.clone())];
-        let mut context = TranspositionContext::new(context);
-        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
-        assert!(matches!(
-            LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type.clone()]).transpose(
-                &mut context,
-                &driver,
-                &inputs,
-                &[MaybeZero::Value(output_cotangent)],
-                &accumulators,
-            ),
-            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
-                if message == "`linear_call` residual input 0 is not known during transposition",
-        ));
     }
 
     #[test]
@@ -1271,83 +873,6 @@ mod tests {
         assert_eq!(targets.len(), 2);
         let partial = program.partially_discharge_references(0, &targets[..1]).unwrap();
         assert!(partial.program().entry_region_ref().contains_references_in_closure());
-    }
-
-    #[test]
-    fn test_linear_call_operation_transpose_only_form_rejects_forward_execution() {
-        let r#type = ArrayType::scalar(DataType::F64);
-        let transpose = scalar_multiply_program();
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let transpose = builder.import_region(transpose.entry_region_ref());
-        let residual = builder.add_input(r#type.clone());
-        let linear = builder.add_input(r#type.clone());
-        let output = builder
-            .add_instruction(
-                LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type]),
-                vec![transpose],
-                vec![residual, linear],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        assert!(matches!(
-            program.interpret(vec![Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()]),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "a transpose-only `linear_call` has no forward program to execute; it supports \
-                               only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
-                               `jacobian_reverse`)",
-        ));
-        assert!(matches!(
-            program.batched(
-                2,
-                ShardingDimension::Replicated,
-                &[BatchAxis::replicated(), BatchAxis::new(0)],
-                ProgramBatchingOutputAxesPolicy::Natural,
-            ),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "a transpose-only `linear_call` cannot be batched structurally because its \
-                               unavailable forward program does not determine output batch axes; it is preserved \
-                               unchanged only when every input is replicated at an unnamed batching level",
-        ));
-    }
-
-    #[test]
-    fn test_linear_call_operation_transpose_only_remains_opaque_to_partial_evaluation() {
-        // A transpose-only carrier (the form `custom_vjp` stages into its tangent program) must survive partial
-        // evaluation as one unknown-producing instruction. Splitting or folding it would separate the backward region
-        // from the residuals that parameterize it, so the default opaque rule is the correct behavior here.
-        let r#type = ArrayType::scalar(DataType::F64);
-        let transpose = scalar_multiply_program();
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let transpose = builder.import_region(transpose.entry_region_ref());
-        let residual = builder.add_input(r#type.clone());
-        let linear = builder.add_input(r#type.clone());
-        let output = builder
-            .add_instruction(
-                ArrayOperation::LinearCall(LinearCallOperation::transpose_only(
-                    1,
-                    vec![r#type.clone()],
-                    vec![r#type.clone()],
-                )),
-                vec![transpose],
-                vec![residual, linear],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        let evaluation = program
-            .partially_evaluate(&[PartialValue::Unknown(r#type.clone()), PartialValue::Unknown(r#type)])
-            .unwrap();
-
-        assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::LinearCall(_)));
     }
 
     #[test]
@@ -1431,43 +956,6 @@ mod tests {
             ]),
             Ok(vec![Array::matrix(2, 2, vec![8.0, 10.0, 18.0, 21.0]).unwrap()]),
         );
-    }
-
-    #[test]
-    fn test_linear_call_operation_batching_preserves_a_replicated_transpose_only_call() {
-        let r#type = ArrayType::scalar(DataType::F64);
-        let transpose = scalar_multiply_program();
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let transpose = builder.import_region(transpose.entry_region_ref());
-        let residual = builder.add_input(r#type.clone());
-        let linear = builder.add_input(r#type.clone());
-        let output = builder
-            .add_instruction(
-                LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type]),
-                vec![transpose],
-                vec![residual, linear],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        // A completely replicated call needs no structural region rewrite, so batching is the one transform the
-        // transpose-only form supports: the call rebinds itself over its untouched backward region.
-        let (batched, output_axes) = program
-            .batched(
-                2,
-                ShardingDimension::Replicated,
-                &[BatchAxis::replicated(), BatchAxis::replicated()],
-                ProgramBatchingOutputAxesPolicy::Natural,
-            )
-            .unwrap()
-            .into_parts();
-        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
-        let instruction = &batched.instructions()[0];
-        assert_eq!(instruction.operation().to_string(), "linear_call [residual_count=1, transpose_only=true]");
-        assert_eq!(instruction.regions().len(), 1);
     }
 
     #[test]
@@ -1796,53 +1284,6 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_call_operation_transposition_preserves_unrequested_backward_effects() {
-        // The backward rule asserts a dimension bound even though its contribution is unused. Its forward call has
-        // no computation region, so ordinary forward-effect summaries cannot keep this assertion alive.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut backward = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let seed = backward.add_input(scalar_type.clone());
-        let invalid_extent = backward.add_constant(Array::scalar(-1_i32).unwrap().into());
-        backward
-            .add_instruction(
-                DimensionFromScalarOperation::new(DimensionVariable::new(
-                    "extent",
-                    DimensionBounds::new(0, None).unwrap(),
-                )),
-                Vec::new(),
-                vec![invalid_extent],
-                None,
-            )
-            .unwrap();
-        let backward = backward
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![seed],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(scalar_type.clone());
-        let backward = builder.import_program(backward);
-        builder
-            .add_instruction(
-                LinearCallOperation::transpose_only(0, vec![scalar_type.clone()], vec![scalar_type]),
-                vec![backward],
-                vec![input],
-                None,
-            )
-            .unwrap();
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), vec![Placeholder], Vec::new())
-            .unwrap();
-        let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
-        assert!(transposed.input_ids().is_empty());
-        assert!(transposed.output_ids().is_empty());
-        assert!(matches!(transposed.interpret(Vec::new()), Err(ProgramError::Concretization { message })
-            if message == "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range"));
-    }
-
-    #[test]
     fn test_linear_call_operation_transposition_swaps_the_attached_regions() {
         /// Exposes an executable linear call's two regions directly to its transposition rule.
         struct TwoRegionDriver<'r> {
@@ -1962,130 +1403,6 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_linear_call_operation_transposition_zeros_known_operand_cotangents() {
-        // The transpose region of a transpose-only call returns one cotangent per linear operand, in operand order
-        // after the leading residuals. Residual operands are fixed primal parameters rather than linear inputs, and
-        // a *known* linear operand is not being differentiated, so both receive structural zeros while the replayed
-        // region's cotangents are assigned only to the unknown linear operands.
-        let r#type = ArrayType::scalar(DataType::F64);
-        let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let residual = transpose_builder.add_input(r#type.clone());
-        let output_cotangent = transpose_builder.add_input(r#type.clone());
-        let first_input_cotangent = transpose_builder
-            .add_instruction(MulOperation::new(), Vec::new(), vec![residual, output_cotangent], None)
-            .unwrap()[0];
-        let transpose = transpose_builder
-            .build::<Vec<Array>, Vec<Array>>(
-                vec![first_input_cotangent, output_cotangent],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let residual = context.input(r#type.clone());
-        let known_linear = context.input(r#type.clone());
-        let output_cotangent = context.input(r#type.clone());
-
-        let linear_types = vec![r#type.clone(), r#type.clone()];
-        let cotangents = {
-            let mut rule_context = TranspositionContext::new(context.clone());
-            let rule_inputs = &[
-                PartialValue::Known(residual),
-                PartialValue::Unknown(r#type.clone()),
-                PartialValue::Known(known_linear),
-            ];
-            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
-            LinearCallOperation::transpose_only(1, linear_types, vec![r#type.clone()])
-                .transpose(
-                    &mut rule_context,
-                    &driver,
-                    rule_inputs,
-                    &[MaybeZero::Value(output_cotangent)],
-                    &accumulators,
-                )
-                .unwrap();
-            rule_context.take_cotangents(&accumulators).unwrap()
-        };
-
-        assert_eq!(cotangents.len(), 3);
-        assert!(cotangents[0].is_zero());
-        assert!(matches!(cotangents[1], MaybeZero::Value(_)));
-        assert!(cotangents[2].is_zero());
-    }
-
-    #[test]
-    fn test_linear_call_operation_transposition_preserves_structural_zero_outputs() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let primal_type = ArrayType::scalar(DataType::F64)
-            .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
-            .unwrap();
-        let tangent_type = primal_type.tangent().unwrap();
-        let cotangent_type = primal_type.cotangent().unwrap();
-        assert_ne!(tangent_type, cotangent_type);
-
-        // A canonical `zero` transpose-region output is already typed in the linear input's cotangent space.
-        // Recovering its structural zero must retain that type instead of dualizing its sharding a second time.
-        let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        transpose_builder.add_input(cotangent_type.clone());
-        let zero = transpose_builder
-            .add_instruction(ZeroOperation::new(cotangent_type.clone()), Vec::new(), Vec::new(), None)
-            .unwrap()[0];
-        let transpose = transpose_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let output_cotangent = context.input(cotangent_type.clone());
-        let cotangents = {
-            let mut rule_context = TranspositionContext::new(context.clone());
-            let rule_inputs = &[PartialValue::Unknown(tangent_type.clone())];
-            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
-            LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type.clone()])
-                .transpose(
-                    &mut rule_context,
-                    &driver,
-                    rule_inputs,
-                    &[MaybeZero::Value(output_cotangent)],
-                    &accumulators,
-                )
-                .unwrap();
-            rule_context.take_cotangents(&accumulators).unwrap()
-        };
-        assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
-
-        // `zero_like` is equally structural even though it consumes an exemplar input. Opaque region replay must
-        // recognize it instead of turning the result into a live zero-valued tracer.
-        let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let output_cotangent = transpose_builder.add_input(cotangent_type.clone());
-        let zero_like = transpose_builder
-            .add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![output_cotangent], None)
-            .unwrap()[0];
-        let transpose = transpose_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![zero_like], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let output_cotangent = context.input(cotangent_type.clone());
-        let cotangents = {
-            let mut rule_context = TranspositionContext::new(context.clone());
-            let rule_inputs = &[PartialValue::Unknown(primal_type.tangent().unwrap())];
-            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
-            LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type])
-                .transpose(
-                    &mut rule_context,
-                    &driver,
-                    rule_inputs,
-                    &[MaybeZero::Value(output_cotangent)],
-                    &accumulators,
-                )
-                .unwrap();
-            rule_context.take_cotangents(&accumulators).unwrap()
-        };
-        assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
     }
 
     #[test]
