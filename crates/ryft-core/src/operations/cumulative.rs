@@ -59,6 +59,7 @@ use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayType, DataType, Dimension, FloatingPointArrayElement,
     NumericArrayElement, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity, ShardingDimension, StaticShape,
 };
+use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -470,8 +471,6 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Value-level cumulative capability that accumulates the elements of an array along one axis based on a chosen
 /// [`CumulativeKind`]. [`Cumulative`] fills the same role for [`CumulativeOperation`] that [`Reduce`](crate::Reduce)
 /// fills for [`ReduceOperation`](crate::ReduceOperation). Concrete [`Array`]s scan immediately, while context-carrying
@@ -487,7 +486,8 @@ pub trait Cumulative: Sized {
     ///
     /// # Parameters
     ///
-    ///   - `axis`: Axis of `self` to scan. Its dimension must be static and unsharded.
+    ///   - `axis`: Axis of `self` to scan, with negative indices counted from the end. Its dimension must be static
+    ///     and unsharded.
     ///   - `kind`: [`CumulativeKind`] that determines how the elements along `axis` are combined.
     ///   - `reverse`: Whether to accumulate from the end of `axis` toward its start (i.e., to compute inclusive
     ///     suffixes rather than inclusive prefixes).
@@ -496,61 +496,61 @@ pub trait Cumulative: Sized {
     ///
     /// Returns a [`ProgramError`] if `kind` does not support the data type of `self`, if `axis` is out of bounds, if
     /// the scanned dimension is dynamic or sharded, or if the context of `self` fails to bind the scan.
-    fn cumulative(&self, axis: usize, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError>;
+    fn cumulative<A: Into<Axis>>(&self, axis: A, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError>;
 
     /// Returns the inclusive prefix sum of `self` along `axis` using [`CumulativeKind::Sum`]. Refer to
     /// [`Self::cumulative`] for the semantics of `axis` and for the errors that this function may return.
     #[inline]
-    fn cumulative_sum(&self, axis: usize) -> Result<Self, ProgramError> {
+    fn cumulative_sum<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         self.cumulative(axis, CumulativeKind::Sum, false)
     }
 
     /// Returns the inclusive suffix sum of `self` along `axis` using [`CumulativeKind::Sum`]. Refer to
     /// [`Self::cumulative`] for the semantics of `axis` and for the errors that this function may return.
     #[inline]
-    fn reverse_cumulative_sum(&self, axis: usize) -> Result<Self, ProgramError> {
+    fn reverse_cumulative_sum<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         self.cumulative(axis, CumulativeKind::Sum, true)
     }
 
     /// Returns the inclusive prefix product of `self` along `axis` using [`CumulativeKind::Product`]. Refer to
     /// [`Self::cumulative`] for the semantics of `axis` and for the errors that this function may return.
     #[inline]
-    fn cumulative_product(&self, axis: usize) -> Result<Self, ProgramError> {
+    fn cumulative_product<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         self.cumulative(axis, CumulativeKind::Product, false)
     }
 
     /// Returns the inclusive suffix product of `self` along `axis` using [`CumulativeKind::Product`]. Refer to
     /// [`Self::cumulative`] for the semantics of `axis` and for the errors that this function may return.
     #[inline]
-    fn reverse_cumulative_product(&self, axis: usize) -> Result<Self, ProgramError> {
+    fn reverse_cumulative_product<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         self.cumulative(axis, CumulativeKind::Product, true)
     }
 
     /// Returns the running maximum of `self` along `axis` using [`CumulativeKind::Max`]. Refer to [`Self::cumulative`]
     /// for the semantics of `axis` and for the errors that this function may return.
     #[inline]
-    fn cumulative_max(&self, axis: usize) -> Result<Self, ProgramError> {
+    fn cumulative_max<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         self.cumulative(axis, CumulativeKind::Max, false)
     }
 
     /// Returns the reverse running maximum of `self` along `axis` using [`CumulativeKind::Max`]. Refer to
     /// [`Self::cumulative`] for the semantics of `axis` and for the errors that this function may return.
     #[inline]
-    fn reverse_cumulative_max(&self, axis: usize) -> Result<Self, ProgramError> {
+    fn reverse_cumulative_max<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         self.cumulative(axis, CumulativeKind::Max, true)
     }
 
     /// Returns the running minimum of `self` along `axis` using [`CumulativeKind::Min`]. Refer to [`Self::cumulative`]
     /// for the semantics of `axis` and for the errors that this function may return.
     #[inline]
-    fn cumulative_min(&self, axis: usize) -> Result<Self, ProgramError> {
+    fn cumulative_min<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         self.cumulative(axis, CumulativeKind::Min, false)
     }
 
     /// Returns the reverse running minimum of `self` along `axis` using [`CumulativeKind::Min`]. Refer to
     /// [`Self::cumulative`] for the semantics of `axis` and for the errors that this function may return.
     #[inline]
-    fn reverse_cumulative_min(&self, axis: usize) -> Result<Self, ProgramError> {
+    fn reverse_cumulative_min<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         self.cumulative(axis, CumulativeKind::Min, true)
     }
 
@@ -558,21 +558,28 @@ pub trait Cumulative: Sized {
     /// whose documentation describes its data-type limits. Refer to [`Self::cumulative`] for the semantics of `axis`
     /// and for the errors that this function may return.
     #[inline]
-    fn cumulative_log_sum_exp(&self, axis: usize) -> Result<Self, ProgramError> {
+    fn cumulative_log_sum_exp<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         self.cumulative(axis, CumulativeKind::LogSumExp, false)
     }
 
     /// Returns the reverse running numerically stable `log(sum(exp(self)))` along `axis` using
-    /// [`CumulativeKind::LogSumExp`], whose documentation describes its data-type limits. Refer to [`Self::cumulative`]
-    /// for the semantics of `axis` and for the errors that this function may return.
+    /// [`CumulativeKind::LogSumExp`], whose documentation describes its data-type limits. Refer to
+    /// [`Self::cumulative`] for the semantics of `axis` and for the errors that this function may return.
     #[inline]
-    fn reverse_cumulative_log_sum_exp(&self, axis: usize) -> Result<Self, ProgramError> {
+    fn reverse_cumulative_log_sum_exp<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
         self.cumulative(axis, CumulativeKind::LogSumExp, true)
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl Cumulative for Array {
-    fn cumulative(&self, axis: usize, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError> {
+    fn cumulative<A: Into<Axis>>(&self, axis: A, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError> {
+        let axis = axis.into();
+        let rank = self.r#type().rank();
+        let axis = axis.normalize(rank).map_err(|_| {
+            TypeError::invalid(format!("`{CUMULATIVE_OPERATION_NAME}` axis {axis} is out of bounds for rank {rank}"))
+        })?;
         // The type rule validates the scan and supplies the complete output metadata. The kernels below then decode the
         // input's logical elements, run the sequential prefix scan over them with the kind's element-level combining
         // operator, and re-encode the result into the input's own type. Accumulation happens in the input's element
@@ -659,7 +666,12 @@ impl Cumulative for Array {
 impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<CumulativeOperation>>>>
     Cumulative for V
 {
-    fn cumulative(&self, axis: usize, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError> {
+    fn cumulative<A: Into<Axis>>(&self, axis: A, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError> {
+        let axis = axis.into();
+        let rank = self.r#type().rank();
+        let axis = axis.normalize(rank).map_err(|_| {
+            TypeError::invalid(format!("`{CUMULATIVE_OPERATION_NAME}` axis {axis} is out of bounds for rank {rank}"))
+        })?;
         let mut outputs = self.dispatch_domain().bind(
             CumulativeOperation::new(axis, kind).with_reverse(reverse),
             Vec::new(),
@@ -1678,54 +1690,63 @@ mod tests {
     fn test_cumulative_cumulative_sum() {
         let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(input.cumulative_sum(0), Ok(Array::vector(vec![1.0, 3.0, 6.0]).unwrap()));
+        assert_eq!(input.cumulative_sum(-1), input.cumulative_sum(Axis::from(0usize)));
     }
 
     #[test]
     fn test_cumulative_reverse_cumulative_sum() {
         let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(input.reverse_cumulative_sum(0), Ok(Array::vector(vec![6.0, 5.0, 3.0]).unwrap()));
+        assert_eq!(input.reverse_cumulative_sum(-1), input.reverse_cumulative_sum(Axis::from(0usize)));
     }
 
     #[test]
     fn test_cumulative_cumulative_product() {
         let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(input.cumulative_product(0), Ok(Array::vector(vec![1.0, 2.0, 6.0]).unwrap()));
+        assert_eq!(input.cumulative_product(-1), input.cumulative_product(Axis::from(0usize)));
     }
 
     #[test]
     fn test_cumulative_reverse_cumulative_product() {
         let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(input.reverse_cumulative_product(0), Ok(Array::vector(vec![6.0, 6.0, 3.0]).unwrap()));
+        assert_eq!(input.reverse_cumulative_product(-1), input.reverse_cumulative_product(Axis::from(0usize)));
     }
 
     #[test]
     fn test_cumulative_cumulative_max() {
         let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
         assert_eq!(input.cumulative_max(0), Ok(Array::vector(vec![3.0, 3.0, 4.0]).unwrap()));
+        assert_eq!(input.cumulative_max(-1), input.cumulative_max(Axis::from(0usize)));
     }
 
     #[test]
     fn test_cumulative_reverse_cumulative_max() {
         let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
         assert_eq!(input.reverse_cumulative_max(0), Ok(Array::vector(vec![4.0, 4.0, 4.0]).unwrap()));
+        assert_eq!(input.reverse_cumulative_max(-1), input.reverse_cumulative_max(Axis::from(0usize)));
     }
 
     #[test]
     fn test_cumulative_cumulative_min() {
         let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
         assert_eq!(input.cumulative_min(0), Ok(Array::vector(vec![3.0, 1.0, 1.0]).unwrap()));
+        assert_eq!(input.cumulative_min(-1), input.cumulative_min(Axis::from(0usize)));
     }
 
     #[test]
     fn test_cumulative_reverse_cumulative_min() {
         let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
         assert_eq!(input.reverse_cumulative_min(0), Ok(Array::vector(vec![1.0, 1.0, 4.0]).unwrap()));
+        assert_eq!(input.reverse_cumulative_min(-1), input.reverse_cumulative_min(Axis::from(0usize)));
     }
 
     #[test]
     fn test_cumulative_cumulative_log_sum_exp() {
         let input = Array::vector(vec![0.0, 0.0]).unwrap();
         assert_eq!(input.cumulative_log_sum_exp(0), Ok(Array::vector(vec![0.0, std::f64::consts::LN_2]).unwrap()));
+        assert_eq!(input.cumulative_log_sum_exp(-1), input.cumulative_log_sum_exp(Axis::from(0usize)));
     }
 
     #[test]
@@ -1735,6 +1756,47 @@ mod tests {
             input.reverse_cumulative_log_sum_exp(0),
             Ok(Array::vector(vec![std::f64::consts::LN_2, 0.0]).unwrap()),
         );
+        assert_eq!(input.reverse_cumulative_log_sum_exp(-1), input.reverse_cumulative_log_sum_exp(Axis::from(0usize)),);
+    }
+
+    #[test]
+    fn test_cumulative_axis_arguments() {
+        let input = Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        for (axis, position) in [(-1, 1usize), (-2, 0usize)] {
+            for kind in [
+                CumulativeKind::Sum,
+                CumulativeKind::Product,
+                CumulativeKind::Max,
+                CumulativeKind::Min,
+                CumulativeKind::LogSumExp,
+            ] {
+                for reverse in [false, true] {
+                    let expected = input.cumulative(position, kind, reverse).unwrap();
+                    assert_eq!(input.cumulative(axis, kind, reverse), Ok(expected.clone()));
+                    let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                        |value: Tracer<TracingContext<Array, ArrayOperation<Array>>>| {
+                            value.cumulative(Axis::from(axis), kind, reverse)
+                        },
+                        input.r#type().into_owned(),
+                    )
+                    .unwrap();
+                    assert_eq!(program.interpret(input.clone()), Ok(expected));
+                }
+            }
+        }
+
+        for (input, axis) in [(input.clone(), -3), (input, 2), (Array::scalar(1.0f64).unwrap(), -1)] {
+            let error = ProgramError::Type(TypeError::invalid(format!(
+                "`cumulative` axis {axis} is out of bounds for rank {}",
+                input.r#type().rank(),
+            )));
+            assert_eq!(input.cumulative_sum(axis), Err(error.clone()));
+            let result = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |value: Tracer<TracingContext<Array, ArrayOperation<Array>>>| value.cumulative_sum(axis),
+                input.r#type().into_owned(),
+            );
+            assert!(matches!(result, Err(actual) if actual == error));
+        }
     }
 
     #[test]
