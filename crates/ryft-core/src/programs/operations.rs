@@ -6,9 +6,11 @@ use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
 use crate::programs::effects::{Effects, ReferenceAccessMode};
 use crate::programs::identities::TypeIdentityRenaming;
+use crate::programs::instructions::Instruction;
 use crate::programs::programs::{Program, ProgramRenderingMode};
 use crate::programs::regions::{
-    InputRegionProvenance, OutputRegionProvenance, RegionInterface, RegionLiveness, RegionRole, RegionSlot,
+    InputRegionProvenance, OutputRegionProvenance, RegionArena, RegionInterface, RegionLiveness, RegionRef, RegionRole,
+    RegionSlot,
 };
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
@@ -28,7 +30,7 @@ pub struct OperationFormatter<'f, 'a> {
     /// [`Formatter`](std::fmt::Formatter) receiving the rendered text.
     formatter: &'f mut std::fmt::Formatter<'a>,
 
-    /// Indentation of the rendered [`Instruction`](crate::Instruction) line that owns the [`Operation`]
+    /// Indentation of the rendered [`Instruction`] line that owns the [`Operation`]
     /// that is being rendered.
     indentation: usize,
 
@@ -132,10 +134,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
     }
 }
 
-/// [`Operation`] that can appear in [`Program`]s. [`Operation`] invocations are represented as
-/// [`Instruction`](crate::Instruction)s in [`Program`]s. This trait represents the high-level operation interface
-/// that only requires operations to be able to provide their name and to infer their output [`Type`]s given their
-/// input [`Type`]s.
+/// [`Operation`] that can appear in [`Program`]s. [`Operation`] invocations are represented as [`Instruction`]s in
+/// [`Program`]s. This trait represents the high-level operation interface that only requires operations to be able
+/// to provide their name and to infer their output [`Type`]s given their input [`Type`]s.
 ///
 /// # Deriving Operation Enums
 ///
@@ -466,7 +467,7 @@ pub trait Operation: Clone {
     /// Returns declarations for this [`Operation`]'s attached-[`Region`](crate::Region) slots, in operation-defined
     /// order. Each [`RegionSlot`] supplies the stable name used by diagnostics and rendering together with the
     /// [`RegionRole`] that determines whether the region may execute during ordinary interpretation. The declared
-    /// region count must match the number of regions attached to every [`Instruction`](crate::Instruction).
+    /// region count must match the number of regions attached to every [`Instruction`].
     /// [`ProgramBuilder`](crate::ProgramBuilder)s validate this both when the instruction is added and when the final
     /// [`Program`] is built. The default declares no region slots, which is correct for region-free operations.
     #[inline]
@@ -526,9 +527,9 @@ pub trait Operation: Clone {
         Ok(vec![None; region_interfaces.len()])
     }
 
-    /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s and
-    /// attached-region [`RegionInterface`]s without executing it, validating the complete hypothetical
-    /// [`Instruction`](crate::Instruction) that the arguments describe.
+    /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s and attached-region
+    /// [`RegionInterface`]s without executing it, validating the complete hypothetical [`Instruction`] that the
+    /// arguments describe.
     ///
     /// [`ProgramBuilder`](crate::ProgramBuilder)s never ask their callers to provide region interfaces. They receive
     /// input/operand atoms plus attached [`RegionId`](crate::RegionId)s referencing sealed [`Region`](crate::Region)s,
@@ -673,11 +674,10 @@ pub trait Operation: Clone {
         InputRegionProvenance::None
     }
 
-    /// Returns the attached [`Region`](crate::Region) outputs that may directly supply output `output_index` of the
-    /// parent [`Instruction`](crate::Instruction). Each item identifies one attached region and one output within it.
-    /// Multiple items represent alternative sources, such as the corresponding outputs of a condition's two branches,
-    /// and semantic order is preserved. An empty vector means that the operation itself produces the instruction
-    /// output.
+    /// Returns the attached [`Region`](crate::Region) outputs that may directly supply output `output_index` of
+    /// the parent [`Instruction`]. Each item identifies one attached region and one output within it. Multiple items
+    /// represent alternative sources, such as the corresponding outputs of a condition's two branches, and semantic
+    /// order is preserved. An empty vector means that the operation itself produces the instruction output.
     ///
     /// This is the output side counterpart of [`Self::input_region_provenance`]. Analyses can recursively follow the
     /// returned region outputs to their producers; a path may end at a region input or constant and therefore have no
@@ -689,9 +689,9 @@ pub trait Operation: Clone {
         Vec::new()
     }
 
-    /// Prunes the boundary of an [`Instruction`](crate::Instruction) that applies this operation, given which of its
-    /// outputs are used, returning the pruned boundary or [`None`] to keep the instruction whole. A pruning drops the
-    /// instruction inputs and outputs, and the attached-region inputs and outputs, that nothing needs, like the
+    /// Prunes the boundary of an [`Instruction`] that applies this operation, given which of its outputs are used,
+    /// returning the pruned boundary or [`None`] to keep the instruction whole. A pruning drops the instruction
+    /// inputs and outputs, and the attached-region inputs and outputs, that nothing needs, like the
     /// [dead code elimination rules](https://github.com/jax-ml/jax/blob/main/jax/_src/interpreters/partial_eval.py)
     /// of JAX's higher-order primitives (e.g., `pe.dce_rules[scan_p]`). [`Program::into_pruned`] applies the pruning,
     /// and [`OperationBoundaryPruning`] describes its contract.
@@ -889,9 +889,9 @@ pub trait Operation: Clone {
         Ok(self.clone())
     }
 
-    /// Renders this [`Operation`] as part of an [`Instruction`](crate::Instruction). The default implementation
-    /// simply renders [`Operation::name`], which is complete only for operations whose payload carries no semantics.
-    /// Attached [`Region`](crate::Region)s are not rendered here. The contextual [`Program`] renderer renders each
+    /// Renders this [`Operation`] as part of an [`Instruction`]. The default implementation simply renders
+    /// [`Operation::name`], which is complete only for operations whose payload carries no semantics. Attached
+    /// [`Region`](crate::Region)s are not rendered here. The contextual [`Program`] renderer renders each
     /// instruction's attached regions after its operation.
     ///
     /// # Contract
@@ -1235,8 +1235,8 @@ impl<O: Default + Operation> OperationProvider<O::Type> for O {
 /// [`infer_projected_operation_region_input_types`] and [`infer_projected_operation_output_types`]. A mixed member
 /// needs this trait only when it deliberately retains a native payload type `T` but its enclosing instruction has a
 /// different or mixed `U`-typed signature. Dynamic array constructors and shape-changing collectives are examples.
-/// Their payloads remain canonical array operations, while their [`Instruction`](crate::Instruction)s additionally
-/// consume first-class dimension inputs/operands.
+/// Their payloads remain canonical array operations, while their [`Instruction`]s additionally consume first-class
+/// dimension inputs/operands.
 ///
 /// Implementations own only the boundary-dependent parts of [`Operation`]. Name, [`Region`](crate::Region) slots,
 /// provenance, structural zero classification, effects, and rendering remain properties of the native payload and are
@@ -1299,10 +1299,9 @@ pub enum OperationFoldReplacement<V> {
     Constant(V),
 }
 
-/// Pruned boundary of one region-carrying [`Instruction`](crate::Instruction), as returned by
-/// [`Operation::prune_boundary`]. [`Program::into_pruned`] applies it by dropping the instruction inputs and outputs
-/// that are not kept and by attaching pruned copies of the regions, so that regions attached elsewhere are never
-/// modified.
+/// Pruned boundary of one region-carrying [`Instruction`], as returned by [`Operation::prune_boundary`].
+/// [`Program::into_pruned`] applies it by dropping the instruction inputs and outputs that are not kept
+/// and by attaching pruned copies of the regions, so that regions attached elsewhere are never modified.
 ///
 /// The kept boundary of each attached region follows from the region provenance that the operation declares (i.e.,
 /// [`Operation::input_region_provenance`] and [`Operation::output_region_provenance`]). A region input is kept unless
@@ -1320,14 +1319,14 @@ pub struct OperationBoundaryPruning<O> {
     /// Operation that applies to the kept inputs and produces the kept outputs (e.g., a `scan` with fewer carries).
     pub operation: O,
 
-    /// Whether each input of the [`Instruction`](crate::Instruction) is kept.
+    /// Whether each input of the [`Instruction`] is kept.
     pub kept_inputs: Vec<bool>,
 
-    /// Whether each output of the [`Instruction`](crate::Instruction) is kept.
+    /// Whether each output of the [`Instruction`] is kept.
     pub kept_outputs: Vec<bool>,
 }
 
-impl<O> OperationBoundaryPruning<O> {
+impl<O: Operation> OperationBoundaryPruning<O> {
     /// Returns this [`OperationBoundaryPruning`] with its operation mapped by `function` (e.g., wrapped into the
     /// variant of the operation family that holds it).
     #[inline]
@@ -1337,6 +1336,83 @@ impl<O> OperationBoundaryPruning<O> {
             kept_inputs: self.kept_inputs,
             kept_outputs: self.kept_outputs,
         }
+    }
+
+    /// Validates that this pruning describes the boundary of `instruction`, whose outputs that `used_outputs`
+    /// marks are used,and that it keeps every used output.
+    pub(crate) fn validate(&self, instruction: &Instruction<O>, used_outputs: &[bool]) -> Result<(), ProgramError> {
+        let name = instruction.operation().name();
+        if self.kept_inputs.len() != instruction.inputs().len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "the boundary pruning of operation `{}` describes {} inputs but its instruction has {}",
+                name,
+                self.kept_inputs.len(),
+                instruction.inputs().len(),
+            )));
+        }
+
+        if self.kept_outputs.len() != instruction.outputs().len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "the boundary pruning of operation `{}` describes {} outputs but its instruction has {}",
+                name,
+                self.kept_outputs.len(),
+                instruction.outputs().len(),
+            )));
+        }
+
+        if let Some(output) = (0..used_outputs.len()).find(|&output| used_outputs[output] && !self.kept_outputs[output])
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "the boundary pruning of operation `{name}` drops its used output {output}",
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Returns whether each input and each output of each region attached to `instruction` is kept, in attachment
+    /// order, as derived from the kept boundary of the instruction that this pruning describes through the region
+    /// provenance of its operation. A region input is kept unless the operand that supplies it is dropped, and a
+    /// region output is kept unless every instruction output that it supplies is dropped.
+    pub(crate) fn kept_region_boundaries<V: Value<Type = O::Type>>(
+        &self,
+        instruction: &Instruction<O>,
+        arena: &RegionArena<V, O>,
+    ) -> Result<(Vec<Vec<bool>>, Vec<Vec<bool>>), ProgramError> {
+        let operation = instruction.operation();
+        let mut kept_inputs = Vec::with_capacity(instruction.regions().len());
+        let mut supplied_outputs = Vec::with_capacity(instruction.regions().len());
+        for (region_index, region) in instruction.regions().iter().enumerate() {
+            let region = RegionRef::new(arena, *region)?;
+            kept_inputs.push(
+                (0..region.input_ids().len())
+                    .map(|input_index| match operation.input_region_provenance(region_index, input_index) {
+                        InputRegionProvenance::Input { index } => self.kept_inputs.get(index).copied().unwrap_or(true),
+                        InputRegionProvenance::Local | InputRegionProvenance::None => true,
+                    })
+                    .collect(),
+            );
+            supplied_outputs.push(vec![None; region.output_ids().len()]);
+        }
+
+        // Each region output records whether some kept instruction output takes its value from it, and outputs that
+        // supply no instruction output at all stay `None` and are kept.
+        for (output_index, kept) in self.kept_outputs.iter().enumerate() {
+            for origin in operation.output_region_provenance(output_index) {
+                if let Some(supplied) = supplied_outputs
+                    .get_mut(origin.region_index)
+                    .and_then(|outputs| outputs.get_mut(origin.output_index))
+                {
+                    *supplied = Some(supplied.unwrap_or(false) || *kept);
+                }
+            }
+        }
+
+        let kept_outputs = supplied_outputs
+            .into_iter()
+            .map(|outputs| outputs.into_iter().map(|supplied| supplied.unwrap_or(true)).collect())
+            .collect();
+        Ok((kept_inputs, kept_outputs))
     }
 }
 
