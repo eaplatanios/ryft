@@ -839,6 +839,8 @@ impl Array {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use half::bf16;
     use indoc::indoc;
     use num_complex::Complex as ComplexNumber;
@@ -852,7 +854,7 @@ mod tests {
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableOperation, TransposableOperation, TranspositionContext, differentiate_at,
+        DifferentiableOperation, DifferentiationContext, TransposableOperation, TranspositionContext, differentiate_at,
     };
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -861,7 +863,7 @@ mod tests {
     use crate::operations::reductions::Reduce;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, ValueProjection};
+    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramRenderingMode, ValueProjection};
 
     use super::*;
 
@@ -875,14 +877,29 @@ mod tests {
         }
     }
 
+    // Single-instruction program that applies `operation` to one input of type `input_type`, which the tests below
+    // transform to inspect the programs that the differentiation rule stages.
+    fn cumulative_program(
+        operation: CumulativeOperation,
+        input_type: ArrayType,
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type);
+        let outputs = builder
+            .add_instruction(ArrayOperation::from(operation), Vec::new(), vec![input], None)
+            .unwrap()
+            .to_vec();
+        builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
     #[test]
     fn test_cumulative_kind_name() {
         for (kind, name) in [
             (CumulativeKind::Sum, "sum"),
             (CumulativeKind::Product, "product"),
+            (CumulativeKind::LogSumExp, "log_sum_exp"),
             (CumulativeKind::Max, "max"),
             (CumulativeKind::Min, "min"),
-            (CumulativeKind::LogSumExp, "log_sum_exp"),
         ] {
             assert_eq!(kind.name(), name);
             assert_eq!(kind.to_string(), name);
@@ -905,10 +922,17 @@ mod tests {
             "cumulative [kind=log_sum_exp, axis=0, reverse=true]",
         );
 
-        // Equality distinguishes kinds and directions.
+        // Equality and hashing distinguish axes, kinds, and directions.
+        let reverse = operation.clone().with_reverse(true);
         assert_eq!(operation.clone().with_reverse(false), operation);
-        assert_ne!(operation.clone().with_reverse(true), operation);
+        assert_ne!(reverse, operation);
+        assert_ne!(CumulativeOperation::new(0, CumulativeKind::Sum), operation);
         assert_ne!(CumulativeOperation::new(1, CumulativeKind::Max), operation);
+        let operations = HashSet::from([operation.clone(), reverse.clone()]);
+        assert_eq!(operations.len(), 2);
+        assert!(operations.contains(&CumulativeOperation::new(1, CumulativeKind::Sum)));
+        assert!(operations.contains(&reverse));
+        assert!(!operations.contains(&CumulativeOperation::new(1, CumulativeKind::Max)));
     }
 
     #[test]
@@ -1008,32 +1032,30 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_batching_unscanned_ragged_axis() {
+    fn test_cumulative_batching_ragged_unscanned_axis() {
         // Per item, a ragged `[length]` row is scanned along its dense trailing axis, so the ragged axis is not the
         // scanned one: nothing needs masking, the axis rides through onto the result unchanged, and, because the scan
         // consumes no axis, the rule claims no consumption evidence.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let extents = Array::vector(vec![1i32, 3]).unwrap();
-        let input = ArrayBatch::new(
-            Array::from_elements::<f32>(
-                ArrayType::new_static(DataType::F32, [2, 3, 2]),
-                &(1..=12).map(|value| value as f32).collect::<Vec<_>>(),
+        let ragged_axes = vec![RaggedAxis::new(1, Array::vector(vec![1i32, 3]).unwrap(), variable, vec![0])];
+        let batch = |values: &[f32]| {
+            ArrayBatch::new(
+                Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 3, 2]), values).unwrap(),
+                BatchAxis::new(0),
             )
-            .unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap()
-        .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
-        .unwrap();
+            .unwrap()
+            .with_ragged_axes(ragged_axes.clone())
+            .unwrap()
+        };
         let (outputs, evidence) = CumulativeOperation::new(1, CumulativeKind::Sum)
-            .batch(&BatchingContext::new(EagerContext::<Array>::new(), 2), &EmptyRegionDriver, &[input])
+            .batch(
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
+                &[batch(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])],
+            )
             .unwrap()
             .into_parts();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].ragged_axes(), &[RaggedAxis::new(1, extents, variable, vec![0])]);
-        let expected = vec![1.0, 3.0, 3.0, 7.0, 5.0, 11.0, 7.0, 15.0, 9.0, 19.0, 11.0, 23.0];
-        assert_eq!(outputs[0].value().to_f64s(), expected);
+        assert_eq!(outputs, vec![batch(&[1.0, 3.0, 3.0, 7.0, 5.0, 11.0, 7.0, 15.0, 9.0, 19.0, 11.0, 23.0])]);
         assert!(evidence.is_empty());
     }
 
@@ -1051,9 +1073,9 @@ mod tests {
         for (kind, identity) in [
             (CumulativeKind::Sum, "Zero"),
             (CumulativeKind::Product, "One"),
+            (CumulativeKind::LogSumExp, "LowestReal"),
             (CumulativeKind::Max, "Lowest"),
             (CumulativeKind::Min, "Highest"),
-            (CumulativeKind::LogSumExp, "LowestReal"),
         ] {
             assert_eq!(
                 CumulativeOperation::new(0, kind).batch(
@@ -1108,9 +1130,10 @@ mod tests {
             ProjectedContext::new(trace.clone()),
             batch_extent,
         );
+        let ragged_axes = vec![RaggedAxis::new(1, extents.into_projected().unwrap(), length, vec![0])];
         let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0))
             .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected().unwrap(), length.clone(), vec![0])])
+            .with_ragged_axes(ragged_axes.clone())
             .unwrap();
 
         // The per-item scan of axis 0 is the packed axis 1 that carries the ragged extents.
@@ -1120,13 +1143,10 @@ mod tests {
             .into_parts();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].ragged_axes().len(), 1);
-        assert_eq!(outputs[0].ragged_axes()[0].axis(), 1);
-        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &length);
+        assert_eq!(outputs[0].ragged_axes(), ragged_axes.as_slice());
         assert!(evidence.is_empty());
 
         let output_id = outputs.into_iter().next().unwrap().into_value().into_value().atom_id().unwrap();
-        drop(context);
         let program = trace
             .builder()
             .borrow()
@@ -1158,129 +1178,155 @@ mod tests {
 
     #[test]
     fn test_cumulative_differentiation() {
-        // Sums are linear, so their tangent is the same scan of the input tangent. The other kinds differentiate
-        // through the associative-scan decomposition, and their expected tangents are, respectively, the product rule
-        // applied to each prefix (a zero input zeroes every later prefix but still passes its own tangent, scaled by
-        // the product of the other elements), the tangent of the element that currently attains the extremum (at
-        // tie-free inputs), and the softmax-weighted average of the input tangents over each prefix, which is the
+        // Sums are linear, so their tangent is the same scan of the input tangent.
+        check_operation_differentiation!(
+            @approx(step = 1e-4, epsilon = 1e-6),
+            operation = CumulativeOperation::new(0, CumulativeKind::Sum),
+            cases = [{
+                primals = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 1.0, 1.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![1.0, 3.0, 6.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+            }],
+        );
+        check_operation_differentiation!(
+            @approx(step = 1e-4, epsilon = 1e-6),
+            operation = CumulativeOperation::new(0, CumulativeKind::Sum).with_reverse(true),
+            cases = [{
+                primals = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 1.0, 1.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![6.0, 5.0, 3.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![3.0, 2.0, 1.0]).unwrap()],
+            }],
+        );
+
+        // The other kinds differentiate through the associative-scan decomposition. A product's tangent applies the
+        // product rule to each prefix, so a zero input zeroes every later prefix but still passes its own tangent,
+        // scaled by the product of the other elements.
+        check_operation_differentiation!(
+            @approx(step = 1e-4, epsilon = 1e-6),
+            operation = CumulativeOperation::new(0, CumulativeKind::Product),
+            cases = [
+                {
+                    primals = [Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
+                    tangents = [Array::vector(vec![1.0, 1.0, 1.0, 1.0]).unwrap()],
+                    primal_outputs = [Array::vector(vec![1.0, 2.0, 6.0, 24.0]).unwrap()],
+                    tangent_outputs = [Array::vector(vec![1.0, 3.0, 11.0, 50.0]).unwrap()],
+                },
+                {
+                    primals = [Array::vector(vec![2.0, 0.0, 3.0]).unwrap()],
+                    tangents = [Array::vector(vec![1.0, 1.0, 1.0]).unwrap()],
+                    primal_outputs = [Array::vector(vec![2.0, 0.0, 0.0]).unwrap()],
+                    tangent_outputs = [Array::vector(vec![1.0, 2.0, 6.0]).unwrap()],
+                },
+            ],
+        );
+        check_operation_differentiation!(
+            @approx(step = 1e-4, epsilon = 1e-6),
+            operation = CumulativeOperation::new(0, CumulativeKind::Product).with_reverse(true),
+            cases = [{
+                primals = [Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 1.0, 1.0, 1.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![24.0, 24.0, 12.0, 4.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![50.0, 26.0, 7.0, 1.0]).unwrap()],
+            }],
+        );
+
+        // A log-sum-exp tangent is the softmax-weighted average of the input tangents over each prefix, which is the
         // complex derivative for complex inputs.
         let e = std::f64::consts::E;
         let complex_first = ComplexNumber::new(0.5f64, 0.25);
         let complex_second = ComplexNumber::new(-0.3f64, 1.0);
         let complex_total = complex_first.exp() + complex_second.exp();
-        let extrema = Array::vector(vec![3.0, 1.0, 4.0, 1.5, 5.0]).unwrap();
-        let ramp = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-        for (operation, primals, tangents, primal_outputs, tangent_outputs) in [
-            (
-                CumulativeOperation::new(0, CumulativeKind::Sum),
-                Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
-                Array::vector(vec![1.0, 1.0, 1.0]).unwrap(),
-                Array::vector(vec![1.0, 3.0, 6.0]).unwrap(),
-                Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Sum).with_reverse(true),
-                Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
-                Array::vector(vec![1.0, 1.0, 1.0]).unwrap(),
-                Array::vector(vec![6.0, 5.0, 3.0]).unwrap(),
-                Array::vector(vec![3.0, 2.0, 1.0]).unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Product),
-                Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
-                Array::vector(vec![1.0, 1.0, 1.0, 1.0]).unwrap(),
-                Array::vector(vec![1.0, 2.0, 6.0, 24.0]).unwrap(),
-                Array::vector(vec![1.0, 3.0, 11.0, 50.0]).unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Product),
-                Array::vector(vec![2.0, 0.0, 3.0]).unwrap(),
-                Array::vector(vec![1.0, 1.0, 1.0]).unwrap(),
-                Array::vector(vec![2.0, 0.0, 0.0]).unwrap(),
-                Array::vector(vec![1.0, 2.0, 6.0]).unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Product).with_reverse(true),
-                Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
-                Array::vector(vec![1.0, 1.0, 1.0, 1.0]).unwrap(),
-                Array::vector(vec![24.0, 24.0, 12.0, 4.0]).unwrap(),
-                Array::vector(vec![50.0, 26.0, 7.0, 1.0]).unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Max),
-                extrema.clone(),
-                ramp.clone(),
-                Array::vector(vec![3.0, 3.0, 4.0, 4.0, 5.0]).unwrap(),
-                Array::vector(vec![1.0, 1.0, 3.0, 3.0, 5.0]).unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Max).with_reverse(true),
-                Array::vector(vec![5.0, 1.0, 4.0, 1.5, 3.0]).unwrap(),
-                ramp.clone(),
-                Array::vector(vec![5.0, 4.0, 4.0, 3.0, 3.0]).unwrap(),
-                Array::vector(vec![1.0, 3.0, 3.0, 5.0, 5.0]).unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Min),
-                extrema.clone(),
-                ramp.clone(),
-                Array::vector(vec![3.0, 1.0, 1.0, 1.0, 1.0]).unwrap(),
-                Array::vector(vec![1.0, 2.0, 2.0, 2.0, 2.0]).unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::Min).with_reverse(true),
-                extrema,
-                ramp,
-                Array::vector(vec![1.0, 1.0, 1.5, 1.5, 5.0]).unwrap(),
-                Array::vector(vec![2.0, 2.0, 4.0, 4.0, 5.0]).unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::LogSumExp),
-                Array::vector(vec![0.0, 1.0, 2.0]).unwrap(),
-                Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
-                Array::vector(vec![0.0, (1.0 + e).ln(), (1.0 + e + e * e).ln()]).unwrap(),
-                Array::vector(vec![
-                    1.0,
-                    (1.0 + 2.0 * e) / (1.0 + e),
-                    (1.0 + 2.0 * e + 3.0 * e * e) / (1.0 + e + e * e),
-                ])
-                .unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::LogSumExp).with_reverse(true),
-                Array::vector(vec![0.0, 1.0, 2.0]).unwrap(),
-                Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
-                Array::vector(vec![(1.0 + e + e * e).ln(), (e + e * e).ln(), 2.0]).unwrap(),
-                Array::vector(vec![
+        check_operation_differentiation!(
+            @approx(step = 1e-4, epsilon = 1e-6),
+            operation = CumulativeOperation::new(0, CumulativeKind::LogSumExp),
+            cases = [
+                {
+                    primals = [Array::vector(vec![0.0, 1.0, 2.0]).unwrap()],
+                    tangents = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                    primal_outputs = [Array::vector(vec![0.0, (1.0 + e).ln(), (1.0 + e + e * e).ln()]).unwrap()],
+                    tangent_outputs = [Array::vector(vec![
+                        1.0,
+                        (1.0 + 2.0 * e) / (1.0 + e),
+                        (1.0 + 2.0 * e + 3.0 * e * e) / (1.0 + e + e * e),
+                    ])
+                    .unwrap()],
+                },
+                {
+                    primals = [Array::vector(vec![complex_first, complex_second]).unwrap()],
+                    tangents = [
+                        Array::vector(vec![ComplexNumber::new(1.0, 0.0), ComplexNumber::new(0.0, 1.0)]).unwrap(),
+                    ],
+                    primal_outputs = [Array::vector(vec![complex_first, complex_total.ln()]).unwrap()],
+                    tangent_outputs = [Array::vector(vec![
+                        ComplexNumber::new(1.0, 0.0),
+                        (complex_first.exp() + complex_second.exp() * ComplexNumber::new(0.0, 1.0)) / complex_total,
+                    ])
+                    .unwrap()],
+                },
+            ],
+        );
+        check_operation_differentiation!(
+            @approx(step = 1e-4, epsilon = 1e-6),
+            operation = CumulativeOperation::new(0, CumulativeKind::LogSumExp).with_reverse(true),
+            cases = [{
+                primals = [Array::vector(vec![0.0, 1.0, 2.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 2.0, 3.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![(1.0 + e + e * e).ln(), (e + e * e).ln(), 2.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![
                     (1.0 + 2.0 * e + 3.0 * e * e) / (1.0 + e + e * e),
                     (2.0 * e + 3.0 * e * e) / (e + e * e),
                     3.0,
                 ])
-                .unwrap(),
-            ),
-            (
-                CumulativeOperation::new(0, CumulativeKind::LogSumExp),
-                Array::vector(vec![complex_first, complex_second]).unwrap(),
-                Array::vector(vec![ComplexNumber::new(1.0, 0.0), ComplexNumber::new(0.0, 1.0)]).unwrap(),
-                Array::vector(vec![complex_first, complex_total.ln()]).unwrap(),
-                Array::vector(vec![
-                    ComplexNumber::new(1.0, 0.0),
-                    (complex_first.exp() + complex_second.exp() * ComplexNumber::new(0.0, 1.0)) / complex_total,
-                ])
-                .unwrap(),
-            ),
-        ] {
-            check_operation_differentiation!(
-                @approx(step = 1e-4, epsilon = 1e-6),
-                operation = operation.clone(),
-                cases = [{
-                    primals = [primals.clone()],
-                    tangents = [tangents.clone()],
-                    primal_outputs = [primal_outputs.clone()],
-                    tangent_outputs = [tangent_outputs.clone()],
-                }],
-            );
-        }
+                .unwrap()],
+            }],
+        );
+
+        // At tie-free inputs, a running extremum's tangent is the tangent of the element that currently attains it.
+        check_operation_differentiation!(
+            @approx(step = 1e-4, epsilon = 1e-6),
+            operation = CumulativeOperation::new(0, CumulativeKind::Max),
+            cases = [{
+                primals = [Array::vector(vec![3.0, 1.0, 4.0, 1.5, 5.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![3.0, 3.0, 4.0, 4.0, 5.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![1.0, 1.0, 3.0, 3.0, 5.0]).unwrap()],
+            }],
+        );
+
+        check_operation_differentiation!(
+            @approx(step = 1e-4, epsilon = 1e-6),
+            operation = CumulativeOperation::new(0, CumulativeKind::Max).with_reverse(true),
+            cases = [{
+                primals = [Array::vector(vec![5.0, 1.0, 4.0, 1.5, 3.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![5.0, 4.0, 4.0, 3.0, 3.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![1.0, 3.0, 3.0, 5.0, 5.0]).unwrap()],
+            }],
+        );
+
+        check_operation_differentiation!(
+            @approx(step = 1e-4, epsilon = 1e-6),
+            operation = CumulativeOperation::new(0, CumulativeKind::Min),
+            cases = [{
+                primals = [Array::vector(vec![3.0, 1.0, 4.0, 1.5, 5.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![3.0, 1.0, 1.0, 1.0, 1.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![1.0, 2.0, 2.0, 2.0, 2.0]).unwrap()],
+            }],
+        );
+
+        check_operation_differentiation!(
+            @approx(step = 1e-4, epsilon = 1e-6),
+            operation = CumulativeOperation::new(0, CumulativeKind::Min).with_reverse(true),
+            cases = [{
+                primals = [Array::vector(vec![3.0, 1.0, 4.0, 1.5, 5.0]).unwrap()],
+                tangents = [Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap()],
+                primal_outputs = [Array::vector(vec![1.0, 1.0, 1.5, 1.5, 5.0]).unwrap()],
+                tangent_outputs = [Array::vector(vec![2.0, 2.0, 4.0, 4.0, 5.0]).unwrap()],
+            }],
+        );
     }
 
     #[test]
@@ -1321,19 +1367,12 @@ mod tests {
         // `cumulative` instruction at all: it is the parallel-prefix construction (two halving levels over a
         // length-four axis) with each of its primitives' own rules interleaved. The primal half is recomputed there
         // rather than taken from the primitive.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::new_static(DataType::F64, [4]));
-        let outputs = builder
-            .add_instruction(
-                ArrayOperation::from(CumulativeOperation::new(0, CumulativeKind::Product)),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let program = builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
-        let jvp = program.jvp().unwrap();
+        let jvp = cumulative_program(
+            CumulativeOperation::new(0, CumulativeKind::Product),
+            ArrayType::new_static(DataType::F64, [4]),
+        )
+        .jvp()
+        .unwrap();
         assert_eq!(
             jvp.to_string(),
             indoc! {"
@@ -1395,19 +1434,12 @@ mod tests {
     fn test_cumulative_differentiation_associative_scan_provenance() {
         // The decomposition that a nonlinear kind differentiates through is staged under the framework's
         // differentiation scope, which wraps the `associative_scan` scope of the function that stages it.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::new_static(DataType::F64, [2]));
-        let outputs = builder
-            .add_instruction(
-                ArrayOperation::from(CumulativeOperation::new(0, CumulativeKind::Max)),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let program = builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
-        let jvp = program.jvp().unwrap();
+        let jvp = cumulative_program(
+            CumulativeOperation::new(0, CumulativeKind::Max),
+            ArrayType::new_static(DataType::F64, [2]),
+        )
+        .jvp()
+        .unwrap();
         assert_eq!(
             std::fmt::from_fn(|formatter| jvp.render(formatter, 0, ProgramRenderingMode::WithProvenance)).to_string(),
             indoc! {"
@@ -1455,101 +1487,87 @@ mod tests {
     #[test]
     fn test_cumulative_differentiation_layout() {
         // The decomposition's manipulation primitives drop an explicit layout, so the rule constrains its output back
-        // onto the input's layout, and the primal and tangent outputs have exactly the primitive's output type. Their
-        // logical values are those of the same derivative without the layout.
+        // onto the input's layout, and the primal and tangent outputs have exactly the primitive's output type. The
+        // layout leaves their logical values, the running maximum of each row and its tangent, unchanged.
         let laid_out =
             ArrayType::new_static(DataType::F64, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 16])));
-        let jvp = |r#type: &ArrayType| {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let input = builder.add_input(r#type.clone());
-            let outputs = builder
-                .add_instruction(
-                    ArrayOperation::from(CumulativeOperation::new(1, CumulativeKind::Max)),
-                    Vec::new(),
-                    vec![input],
-                    None,
-                )
-                .unwrap()
-                .to_vec();
-            builder
-                .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder])
-                .unwrap()
-                .jvp()
-                .unwrap()
-        };
-        let laid_out_jvp = jvp(&laid_out);
-        assert_eq!(laid_out_jvp.output_types(), vec![laid_out.clone(), laid_out.clone()]);
-        let values = |r#type: &ArrayType, values: &[f64]| Array::from_elements::<f64>(r#type.clone(), values).unwrap();
-        let plain = laid_out.clone().with_layout(None);
-        let laid_out_outputs = laid_out_jvp
-            .interpret(vec![values(&laid_out, &[1.0, 3.0, 2.0, 0.0]), values(&laid_out, &[1.0, 2.0, 3.0, 4.0])])
+        let jvp = cumulative_program(CumulativeOperation::new(1, CumulativeKind::Max), laid_out.clone())
+            .jvp()
             .unwrap();
-        let plain_outputs = jvp(&plain)
-            .interpret(vec![values(&plain, &[1.0, 3.0, 2.0, 0.0]), values(&plain, &[1.0, 2.0, 3.0, 4.0])])
-            .unwrap();
+        assert_eq!(jvp.output_types(), vec![laid_out.clone(), laid_out.clone()]);
         assert_eq!(
-            laid_out_outputs.iter().map(|output| output.elements::<f64>()).collect::<Vec<_>>(),
-            plain_outputs.iter().map(|output| output.elements::<f64>()).collect::<Vec<_>>(),
+            jvp.interpret(vec![
+                Array::from_elements::<f64>(laid_out.clone(), &[1.0, 3.0, 2.0, 0.0]).unwrap(),
+                Array::from_elements::<f64>(laid_out.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap(),
+            ]),
+            Ok(vec![
+                Array::from_elements::<f64>(laid_out.clone(), &[1.0, 3.0, 2.0, 2.0]).unwrap(),
+                Array::from_elements::<f64>(laid_out, &[1.0, 2.0, 3.0, 3.0]).unwrap(),
+            ]),
         );
     }
 
     #[test]
     fn test_cumulative_differentiation_dynamic_unscanned_axis() {
         // Only the scanned axis must be static: the decomposition keeps every other axis whole, so each nonlinear kind
-        // differentiates over a dynamic unscanned axis in forward mode, and its linearized tangent transposes too. On a
-        // concrete input, the dynamic program computes exactly what the statically shaped one does.
+        // differentiates over a dynamic unscanned axis in forward mode, and its linearized tangent transposes into a
+        // pullback over the same dynamic type. On a concrete input, the dynamic programs compute exactly what the
+        // statically shaped ones do.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
         let static_type = ArrayType::new_static(DataType::F64, [2, 3]);
-        let program = |r#type: &ArrayType, kind: CumulativeKind| {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let input = builder.add_input(r#type.clone());
-            let outputs = builder
-                .add_instruction(ArrayOperation::from(CumulativeOperation::new(1, kind)), Vec::new(), vec![input], None)
-                .unwrap()
-                .to_vec();
-            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap()
-        };
         let primal = Array::matrix(2, 3, vec![0.5, 2.0, 1.0, -1.0, 3.0, 0.25]).unwrap();
         let tangent = Array::matrix(2, 3, vec![1.0, -2.0, 0.5, 3.0, 1.0, -1.0]).unwrap();
-        for kind in [CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min, CumulativeKind::LogSumExp] {
-            let dynamic = program(&dynamic_type, kind);
+        let cotangent = Array::matrix(2, 3, vec![2.0, -1.0, 0.5, 1.0, 3.0, -2.0]).unwrap();
+
+        // The pullback of a program's linearization at `primal`, applied to `cotangent`, along with its output types.
+        let pullback = |program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>| {
+            let linearization = program.linearize().unwrap();
+            let mut primal_outputs = linearization.primal().interpret(vec![primal.clone()]).unwrap();
+            let residuals = primal_outputs.split_off(1);
+            let transposed = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+            let cotangents = transposed.interpret([vec![cotangent.clone()], residuals].concat());
+            (transposed.output_types(), cotangents)
+        };
+        for kind in [CumulativeKind::Product, CumulativeKind::LogSumExp, CumulativeKind::Max, CumulativeKind::Min] {
+            let dynamic = cumulative_program(CumulativeOperation::new(1, kind), dynamic_type.clone());
+            let r#static = cumulative_program(CumulativeOperation::new(1, kind), static_type.clone());
             let jvp = dynamic.jvp().unwrap();
             assert_eq!(jvp.output_types(), vec![dynamic_type.clone(), dynamic_type.clone()], "{kind}");
             assert_eq!(
                 jvp.interpret(vec![primal.clone(), tangent.clone()]),
-                program(&static_type, kind).jvp().unwrap().interpret(vec![primal.clone(), tangent.clone()]),
+                r#static.jvp().unwrap().interpret(vec![primal.clone(), tangent.clone()]),
                 "{kind}",
             );
-            let linearization = dynamic.linearize().unwrap();
-            assert!(linearization.tangent().transpose_with_respect_to(&[0], &[]).is_ok(), "{kind}");
+            let (dynamic_types, dynamic_cotangents) = pullback(&dynamic);
+            let (_, static_cotangents) = pullback(&r#static);
+            assert_eq!(dynamic_types, vec![dynamic_type.clone()], "{kind}");
+            assert_eq!(dynamic_cotangents, static_cotangents, "{kind}");
         }
     }
 
     #[test]
     fn test_cumulative_differentiation_reverse_mode() {
         // Summing the prefix sums weights each input by the number of outputs it contributes to, which the transposed
-        // sum computes directly. Nonlinear kinds reach reverse mode by transposing the linear operations that their
-        // decomposition stages, which finite differences independently confirm.
+        // sum computes directly. Nonlinear kinds reach reverse mode in either direction by transposing the linear
+        // operations that their decomposition stages, which finite differences independently confirm.
         assert_eq!(
             differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]).unwrap())
                 .gradient(|input| Ok(input.cumulative_sum(0)?.reduce_sum(&[0], None)?))
                 .unwrap(),
             Array::vector(vec![3.0, 2.0, 1.0]).unwrap(),
         );
-        check_gradient!(
-            |input| Ok(input.cumulative_sum(0)?.reduce_sum(&[0], None)?),
-            at = Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
-            step = 1e-3,
-            tolerance = 1e-6,
-        );
-        check_gradient!(
-            |input| Ok(input.reverse_cumulative_product(0)?.reduce_sum(&[0], None)?),
-            at = Array::vector(vec![1.0, 2.0, 3.0]).unwrap(),
-            step = 1e-3,
-            tolerance = 1e-6,
-        );
+        for kind in [CumulativeKind::Product, CumulativeKind::LogSumExp, CumulativeKind::Max, CumulativeKind::Min] {
+            for reverse in [false, true] {
+                check_gradient!(
+                    |input| Ok(input.cumulative(0, kind, reverse)?.reduce_sum(&[0], None)?),
+                    at = Array::vector(vec![1.0, 3.0, 2.0]).unwrap(),
+                    step = 1e-3,
+                    tolerance = 1e-6,
+                );
+            }
+        }
     }
 
     #[test]
@@ -1587,10 +1605,35 @@ mod tests {
     }
 
     #[test]
+    fn test_cumulative_transposition_zero_cotangent() {
+        // A structural zero output cotangent contributes a structural zero input cotangent without staging a scan.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut transposition = TranspositionContext::new(context.clone());
+        let inputs = [PartialValue::Unknown(ArrayType::new_static(DataType::F64, [3]))];
+        let accumulators = transposition.cotangent_accumulators(&inputs, &[]).unwrap();
+        CumulativeOperation::new(0, CumulativeKind::Sum)
+            .transpose(
+                &mut transposition,
+                &EmptyRegionDriver,
+                &inputs,
+                &[MaybeZero::Zero(ArrayType::new_static(DataType::F64, [3]))],
+                &accumulators,
+            )
+            .unwrap();
+        let input_cotangents = transposition.take_cotangents(&accumulators).unwrap();
+        assert_eq!(input_cotangents.len(), 1);
+        assert!(matches!(
+            &input_cotangents[0],
+            MaybeZero::Zero(r#type) if r#type == &ArrayType::new_static(DataType::F64, [3]),
+        ));
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
     fn test_cumulative_transposition_nonlinear_kinds() {
         // Only sums are linear. Every other kind is differentiated through the linear operations staged by its JVP
         // instead, and so direct transposition rejects it, even when the cotangent is a structural zero.
-        for kind in [CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min, CumulativeKind::LogSumExp] {
+        for kind in [CumulativeKind::Product, CumulativeKind::LogSumExp, CumulativeKind::Max, CumulativeKind::Min] {
             let context = TracingContext::<Array, ArrayOperation<Array>>::new();
             let output_cotangent = {
                 let atom = context.builder().borrow_mut().add_input(ArrayType::new_static(DataType::F64, [3]));
@@ -1618,88 +1661,17 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_cumulative_sum() {
-        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
-        assert_eq!(input.cumulative_sum(0), Ok(Array::vector(vec![1.0, 3.0, 6.0]).unwrap()));
-        assert_eq!(input.cumulative_sum(-1), input.cumulative_sum(Axis::from(0usize)));
-    }
-
-    #[test]
-    fn test_cumulative_reverse_cumulative_sum() {
-        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
-        assert_eq!(input.reverse_cumulative_sum(0), Ok(Array::vector(vec![6.0, 5.0, 3.0]).unwrap()));
-        assert_eq!(input.reverse_cumulative_sum(-1), input.reverse_cumulative_sum(Axis::from(0usize)));
-    }
-
-    #[test]
-    fn test_cumulative_cumulative_product() {
-        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
-        assert_eq!(input.cumulative_product(0), Ok(Array::vector(vec![1.0, 2.0, 6.0]).unwrap()));
-        assert_eq!(input.cumulative_product(-1), input.cumulative_product(Axis::from(0usize)));
-    }
-
-    #[test]
-    fn test_cumulative_reverse_cumulative_product() {
-        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
-        assert_eq!(input.reverse_cumulative_product(0), Ok(Array::vector(vec![6.0, 6.0, 3.0]).unwrap()));
-        assert_eq!(input.reverse_cumulative_product(-1), input.reverse_cumulative_product(Axis::from(0usize)));
-    }
-
-    #[test]
-    fn test_cumulative_cumulative_max() {
-        let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
-        assert_eq!(input.cumulative_max(0), Ok(Array::vector(vec![3.0, 3.0, 4.0]).unwrap()));
-        assert_eq!(input.cumulative_max(-1), input.cumulative_max(Axis::from(0usize)));
-    }
-
-    #[test]
-    fn test_cumulative_reverse_cumulative_max() {
-        let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
-        assert_eq!(input.reverse_cumulative_max(0), Ok(Array::vector(vec![4.0, 4.0, 4.0]).unwrap()));
-        assert_eq!(input.reverse_cumulative_max(-1), input.reverse_cumulative_max(Axis::from(0usize)));
-    }
-
-    #[test]
-    fn test_cumulative_cumulative_min() {
-        let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
-        assert_eq!(input.cumulative_min(0), Ok(Array::vector(vec![3.0, 1.0, 1.0]).unwrap()));
-        assert_eq!(input.cumulative_min(-1), input.cumulative_min(Axis::from(0usize)));
-    }
-
-    #[test]
-    fn test_cumulative_reverse_cumulative_min() {
-        let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
-        assert_eq!(input.reverse_cumulative_min(0), Ok(Array::vector(vec![1.0, 1.0, 4.0]).unwrap()));
-        assert_eq!(input.reverse_cumulative_min(-1), input.reverse_cumulative_min(Axis::from(0usize)));
-    }
-
-    #[test]
-    fn test_cumulative_cumulative_log_sum_exp() {
-        let input = Array::vector(vec![0.0, 0.0]).unwrap();
-        assert_eq!(input.cumulative_log_sum_exp(0), Ok(Array::vector(vec![0.0, std::f64::consts::LN_2]).unwrap()));
-        assert_eq!(input.cumulative_log_sum_exp(-1), input.cumulative_log_sum_exp(Axis::from(0usize)));
-    }
-
-    #[test]
-    fn test_cumulative_reverse_cumulative_log_sum_exp() {
-        let input = Array::vector(vec![0.0, 0.0]).unwrap();
-        assert_eq!(
-            input.reverse_cumulative_log_sum_exp(0),
-            Ok(Array::vector(vec![std::f64::consts::LN_2, 0.0]).unwrap()),
-        );
-        assert_eq!(input.reverse_cumulative_log_sum_exp(-1), input.reverse_cumulative_log_sum_exp(Axis::from(0usize)),);
-    }
-
-    #[test]
-    fn test_cumulative_axis_arguments() {
+    fn test_cumulative_cumulative() {
+        // Negative axes count from the end and select the same scan as the corresponding nonnegative axis, for every
+        // kind and direction, both for concrete arrays and for context-carrying values that bind the operation.
         let input = Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         for (axis, position) in [(-1, 1usize), (-2, 0usize)] {
             for kind in [
                 CumulativeKind::Sum,
                 CumulativeKind::Product,
+                CumulativeKind::LogSumExp,
                 CumulativeKind::Max,
                 CumulativeKind::Min,
-                CumulativeKind::LogSumExp,
             ] {
                 for reverse in [false, true] {
                     let expected = input.cumulative(position, kind, reverse).unwrap();
@@ -1716,6 +1688,7 @@ mod tests {
             }
         }
 
+        // Out-of-bounds axes are reported as given, before any operation is bound, on both paths.
         for (input, axis) in [(input.clone(), -3), (input, 2), (Array::scalar(1.0f64).unwrap(), -1)] {
             let error = ProgramError::Type(TypeError::invalid(format!(
                 "`cumulative` axis {axis} is out of bounds for rank {}",
@@ -1728,6 +1701,69 @@ mod tests {
             );
             assert!(matches!(result, Err(actual) if actual == error));
         }
+    }
+
+    #[test]
+    fn test_cumulative_cumulative_sum() {
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(input.cumulative_sum(0), Ok(Array::vector(vec![1.0, 3.0, 6.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_cumulative_reverse_cumulative_sum() {
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(input.reverse_cumulative_sum(0), Ok(Array::vector(vec![6.0, 5.0, 3.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_cumulative_cumulative_product() {
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(input.cumulative_product(0), Ok(Array::vector(vec![1.0, 2.0, 6.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_cumulative_reverse_cumulative_product() {
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(input.reverse_cumulative_product(0), Ok(Array::vector(vec![6.0, 6.0, 3.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_cumulative_cumulative_max() {
+        let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
+        assert_eq!(input.cumulative_max(0), Ok(Array::vector(vec![3.0, 3.0, 4.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_cumulative_reverse_cumulative_max() {
+        let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
+        assert_eq!(input.reverse_cumulative_max(0), Ok(Array::vector(vec![4.0, 4.0, 4.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_cumulative_cumulative_min() {
+        let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
+        assert_eq!(input.cumulative_min(0), Ok(Array::vector(vec![3.0, 1.0, 1.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_cumulative_reverse_cumulative_min() {
+        let input = Array::vector(vec![3.0, 1.0, 4.0]).unwrap();
+        assert_eq!(input.reverse_cumulative_min(0), Ok(Array::vector(vec![1.0, 1.0, 4.0]).unwrap()));
+    }
+
+    #[test]
+    fn test_cumulative_cumulative_log_sum_exp() {
+        let input = Array::vector(vec![0.0, 0.0]).unwrap();
+        assert_eq!(input.cumulative_log_sum_exp(0), Ok(Array::vector(vec![0.0, std::f64::consts::LN_2]).unwrap()));
+    }
+
+    #[test]
+    fn test_cumulative_reverse_cumulative_log_sum_exp() {
+        let input = Array::vector(vec![0.0, 0.0]).unwrap();
+        assert_eq!(
+            input.reverse_cumulative_log_sum_exp(0),
+            Ok(Array::vector(vec![std::f64::consts::LN_2, 0.0]).unwrap()),
+        );
     }
 
     #[test]
@@ -1780,7 +1816,7 @@ mod tests {
         assert_eq!(integers.cumulative_min(0), Ok(Array::vector(vec![7i32, -2, -2, -2]).unwrap()));
         assert_eq!(
             Array::vector(vec![100i8, 100]).unwrap().cumulative_sum(0),
-            Ok(Array::vector(vec![100i8, -56]).unwrap())
+            Ok(Array::vector(vec![100i8, -56]).unwrap()),
         );
 
         // A zero-length scanned axis has nothing to accumulate and keeps the input's exact type.
@@ -1788,9 +1824,9 @@ mod tests {
         for kind in [
             CumulativeKind::Sum,
             CumulativeKind::Product,
+            CumulativeKind::LogSumExp,
             CumulativeKind::Max,
             CumulativeKind::Min,
-            CumulativeKind::LogSumExp,
         ] {
             assert_eq!(empty.cumulative(0, kind, false), Ok(empty.clone()));
         }
@@ -1848,7 +1884,9 @@ mod tests {
         assert_eq!(structural_zero.cumulative_sum(0), Ok(structural_zero.clone()));
         assert_eq!(structural_zero.cumulative_product(0), Ok(structural_zero));
 
-        // Complex payloads accumulate both components and multiply as complex numbers.
+        // Complex payloads accumulate both components and multiply as complex numbers, except that an exact `1 + 0i`
+        // factor returns the other factor, because multiplying an infinite component by its zero imaginary component
+        // would otherwise produce NaN (e.g., `(∞ + 0i)(1 + 0i)` would become `∞ + NaNi`).
         let complex = Array::vector(vec![
             ComplexNumber::new(1.0f64, 1.0),
             ComplexNumber::new(2.0, -1.0),
@@ -1872,6 +1910,16 @@ mod tests {
                 ComplexNumber::new(0.0, -1.0),
             ])
             .unwrap()),
+        );
+        let infinite =
+            Array::vector(vec![ComplexNumber::new(f64::INFINITY, 0.0), ComplexNumber::new(1.0, 0.0)]).unwrap();
+        assert_eq!(
+            infinite.cumulative_product(0),
+            Ok(Array::vector(vec![ComplexNumber::new(f64::INFINITY, 0.0); 2]).unwrap()),
+        );
+        assert_eq!(
+            infinite.reverse_cumulative_product(0),
+            Ok(Array::vector(vec![ComplexNumber::new(f64::INFINITY, 0.0), ComplexNumber::new(1.0, 0.0)]).unwrap()),
         );
 
         // The result carries the input's complete type, including a non-default physical layout.
@@ -1963,7 +2011,7 @@ mod tests {
         let large = Array::vector(vec![1000.0, 1000.0]).unwrap();
         assert_eq!(
             large.cumulative_log_sum_exp(0),
-            Ok(Array::vector(vec![1000.0, 1000.0 + std::f64::consts::LN_2]).unwrap())
+            Ok(Array::vector(vec![1000.0, 1000.0 + std::f64::consts::LN_2]).unwrap()),
         );
         assert_eq!(
             large.reverse_cumulative_log_sum_exp(0),
@@ -2009,7 +2057,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             complex.cumulative_log_sum_exp(0),
-            Ok(Array::vector(vec![first, doubled, doubled, doubled]).unwrap())
+            Ok(Array::vector(vec![first, doubled, doubled, doubled]).unwrap()),
         );
         assert_eq!(
             complex.reverse_cumulative_log_sum_exp(0),
@@ -2033,6 +2081,14 @@ mod tests {
         for value in raw {
             assert!((value - ComplexNumber::new(1.0, 4.0 - 2.0 * std::f64::consts::PI)).norm() < 1e-15);
         }
+
+        // Out-of-range phases are reduced through `atan2` of their sine and cosine, as in the matching reduction, which
+        // stays accurate for huge phases, where a remainder by the rounded `2π` would accumulate its rounding error
+        // once per period.
+        let huge = Array::vector(vec![ComplexNumber::new(1.0f64, 1e16)]).unwrap();
+        let reduced = ComplexNumber::new(1.0f64, 1e16f64.sin().atan2(1e16f64.cos()));
+        assert_eq!(huge.cumulative_log_sum_exp(0), Ok(Array::vector(vec![reduced]).unwrap()));
+        assert_eq!(huge.reduce_log_sum_exp(&[0]), Ok(Array::scalar(reduced).unwrap()));
     }
 
     #[test]
@@ -2106,7 +2162,7 @@ mod tests {
             assert_eq!(
                 ArrayType::new_static(DataType::Boolean, [3, 2]).cumulative(1, kind),
                 Err(TypeError::invalid(format!(
-                    "`cumulative` with kind `{kind}` requires numeric inputs but got `bool`"
+                    "`cumulative` with kind `{kind}` requires numeric inputs but got `bool`",
                 ))),
             );
         }
@@ -2180,11 +2236,11 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         assert_eq!(input.cumulative(0, CumulativeKind::Sum), Ok(input.clone()));
-        for kind in [CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min, CumulativeKind::LogSumExp] {
+        for kind in [CumulativeKind::Product, CumulativeKind::LogSumExp, CumulativeKind::Max, CumulativeKind::Min] {
             assert_eq!(
                 input.cumulative(0, kind),
                 Err(TypeError::invalid(format!(
-                    "`cumulative` with kind `{kind}` cannot scan inputs with unreduced axes"
+                    "`cumulative` with kind `{kind}` cannot scan inputs with unreduced axes",
                 ))),
             );
         }
