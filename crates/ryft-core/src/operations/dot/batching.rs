@@ -16,7 +16,7 @@ where
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
-        // A replicated ragged operand is rejected before alignment, because the broadcast that materializes its batch
+        // A replicated ragged input is rejected before alignment, because the broadcast that materializes its batch
         // axis carries no per-item extents and would drop the metadata that records them.
         for (input, batch_axis) in inputs.iter().zip(batch_axes.iter()) {
             if batch_axis.is_none()
@@ -24,15 +24,15 @@ where
             {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
-                        "`{DOT_OPERATION_NAME}` does not support bounded ragged dimension `{}` on a replicated operand",
+                        "`{DOT_OPERATION_NAME}` does not support bounded ragged dimension `{}` on a replicated input",
                         ragged_axis.dimension(),
                     ),
                 });
             }
         }
-        // Two mapped operands must describe the same mapped extent. Comparing the mapped dimensions validates static
+        // Two mapped inputs must describe the same mapped extent. Comparing the mapped dimensions validates static
         // extents exactly as `ArrayBatch::common_batch_size` does, and it additionally admits a dynamic mapped extent,
-        // which two operands share exactly when it is the same dimension variable.
+        // which two inputs share exactly when it is the same dimension variable.
         let mapped_dimension = |index: usize| batch_axes[index].map(|axis| inputs[index].r#type().dimension(axis));
         if let (Some(left), Some(right)) = (mapped_dimension(0), mapped_dimension(1))
             && left != right
@@ -44,15 +44,15 @@ where
                         // TODO(eaplatanios): Are backticks conventional in Rust for these kinds of error messages?
                         //  If so, can we use them conssitently in the codebase (e.g., replacing single quotes where
                         //  this same convention would apply)?
-                        "`{DOT_OPERATION_NAME}` operands map different batch extents `{left}` and `{right}`"
+                        "`{DOT_OPERATION_NAME}` inputs map different batch extents `{left}` and `{right}`"
                     ),
                 },
             });
         }
-        // Mixed batched/unbatched: materialize a batch axis on the replicated operand at position 0 (JAX's
-        // `matchaxis(0)` convention), then fall through to the both-batched arm of `lift_dot_dimensions`. The active
-        // policy owns that materialization, so the mapped extent never has to be a statically known host size: under a
-        // dimension-valued policy it stays a first-class extent value grounding the staged broadcast.
+        // Mixed batched/unbatched: materialize a batch axis on the replicated input at position 0 (JAX's `matchaxis(0)`
+        // convention), then fall through to the both-batched arm of `lift_dot_dimensions`. The active policy owns that
+        // materialization, so the mapped extent never has to be a statically known host size: under a dimension-valued
+        // policy it stays a first-class extent value grounding the staged broadcast.
         let aligned_inputs: Vec<ArrayBatch<C::Value>> = match (batch_axes[0], batch_axes[1]) {
             (Some(_), Some(_)) | (None, None) => inputs.to_vec(),
             (Some(_), None) => vec![inputs[0].clone(), P::match_axis(context, &inputs[1], Axis::from(0))?],
@@ -75,12 +75,12 @@ where
         }
 
         // A generalized dot lays its result out as the batching dimensions, then the LHS free axes, then the RHS free
-        // axes, so each operand axis either lands at a known result axis or is contracted away.
+        // axes, so each input axis either lands at a known result axis or is contracted away.
         let dimensions = lifted_op.dimensions();
         let batching_count = dimensions.lhs_batching_dimensions().len();
         let lhs_result = lhs_result_axes(dimensions, aligned_inputs[0].r#type().rank());
         let rhs_result = rhs_result_axes(dimensions, aligned_inputs[1].r#type().rank());
-        let operand_output_axes = |rank: usize, batching: &[usize], result: &[usize], offset: usize| {
+        let output_axes_for_input = |rank: usize, batching: &[usize], result: &[usize], offset: usize| {
             (0..rank)
                 .map(|axis| {
                     batching.iter().position(|batching_axis| *batching_axis == axis).or_else(|| {
@@ -93,13 +93,13 @@ where
                 .collect::<Vec<_>>()
         };
         let output_axes = [
-            operand_output_axes(
+            output_axes_for_input(
                 aligned_inputs[0].r#type().rank(),
                 dimensions.lhs_batching_dimensions(),
                 lhs_result.as_slice(),
                 0,
             ),
-            operand_output_axes(
+            output_axes_for_input(
                 aligned_inputs[1].r#type().rank(),
                 dimensions.rhs_batching_dimensions(),
                 rhs_result.as_slice(),
@@ -166,7 +166,7 @@ impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>> Batcha
 where
     RaggedDotOperation: InterpretableOperation<C>,
 {
-    // The explicit group metadata and both data operands must be mapped over their leading axis, matching the exact
+    // The explicit group metadata and both data inputs must be mapped over their leading axis, matching the exact
     // leading-axis restriction of the grouped-dot contract. Bounded ragged-axis metadata is rejected because explicit
     // `group_sizes` are the sole source of raggedness for this primitive.
     fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
@@ -192,7 +192,7 @@ where
         if batch_axes.iter().any(|axis| *axis != Some(0)) {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "`{RAGGED_DOT_OPERATION_NAME}` batching requires every operand to be mapped over leading axis 0",
+                    "`{RAGGED_DOT_OPERATION_NAME}` batching requires every input to be mapped over leading axis 0",
                 ),
             });
         }

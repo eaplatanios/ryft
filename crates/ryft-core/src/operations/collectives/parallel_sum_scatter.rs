@@ -1,5 +1,5 @@
-//! Contains the named-axis [`ParallelSumScatterOperation`], which sums every participant's operand across a named
-//! axis and scatters the result, together with its interpretation, partial-evaluation, batching, forward-mode
+//! Contains the named-axis [`ParallelSumScatterOperation`], which sums every participant's input across a named axis
+//! and scatters the result, together with its interpretation, partial-evaluation, batching, forward-mode
 //! differentiation, and transposition rules.
 
 // TODO(eaplatanios): Review this module.
@@ -59,9 +59,9 @@ use super::{
     resolve_named_axis_size, validate_collective_axis_size,
 };
 
-/// Applies sum-scatter's reduction-state transition. Ordinary operands preserve their variance metadata. An operand
-/// that is unreduced over the scattered manual axis is the cotangent of a reduced all-gather result; sum-scatter
-/// consumes that pending reduction and returns a value varying over the manual axis.
+/// Applies sum-scatter's reduction-state transition. Ordinary inputs preserve their variance metadata. An input that is
+/// unreduced over the scattered manual axis is the cotangent of a reduced all-gather result; sum-scatter consumes that
+/// pending reduction and returns a value varying over the manual axis.
 fn parallel_sum_scatter_output_type(
     input_type: &ArrayType,
     mut output_type: ArrayType,
@@ -72,7 +72,7 @@ fn parallel_sum_scatter_output_type(
     }
     if input_type.unreduced_axes().len() != 1 || !input_type.unreduced_axes().contains(operation.axis_name()) {
         return Err(TypeError::invalid(format!(
-            "`parallel_sum_scatter` only supports an unreduced operand over its own axis `{}`",
+            "`parallel_sum_scatter` only supports an unreduced input over its own axis `{}`",
             operation.axis_name(),
         )));
     }
@@ -188,7 +188,7 @@ pub(crate) fn infer_explicit_parallel_sum_scatter_output_types(
 }
 
 linear_collective! {
-    /// [`Operation`] that sums every participant's operand across the named axis and scatters the result: each
+    /// [`Operation`] that sums every participant's input across the named axis and scatters the result: each
     /// participant receives its own chunk of the sum along `scatter_axis` — the analogue of
     /// [JAX's `psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html) with
     /// `tiled = True` and [StableHLO's `reduce_scatter`](https://openxla.org/stablehlo/spec#reduce_scatter) with a
@@ -200,7 +200,7 @@ linear_collective! {
     name = PARALLEL_SUM_SCATTER_OPERATION_NAME = "parallel_sum_scatter",
     accepts_unreduced = true,
     fields = {
-        /// Axis of the operand along which the summed result is scattered across the participants.
+        /// Axis of the input along which the summed result is scattered across the participants.
         scatter_axis: usize,
 
         /// Shared rank and participant-group semantics.
@@ -256,7 +256,7 @@ linear_collective! {
 }
 
 impl ParallelSumScatterOperation {
-    /// Returns the axis of the operand along which the summed result is scattered across the participants.
+    /// Returns the axis of the input along which the summed result is scattered across the participants.
     #[inline]
     pub fn scatter_axis(&self) -> usize {
         self.scatter_axis
@@ -339,8 +339,7 @@ where
 linear_collective!(@differentiation ParallelSumScatterOperation);
 
 // Transpose rule for [`ParallelSumScatterOperation`]. A sum-scatter is the adjoint of a varying all-gather with the
-// same mode, axis, and participant groups, so the operand cotangent is an [`AllGatherOperation`] of the output
-// cotangent.
+// same mode, axis, and participant groups, so the input cotangent is an [`AllGatherOperation`] of the output cotangent.
 impl<V, O> TransposableOperation<V, O> for ParallelSumScatterOperation
 where
     V: Value<Type = ArrayType>,
@@ -417,7 +416,7 @@ where
         if let Some(ragged_axis) = array.ragged_axes().first() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "`{}` does not support bounded ragged dimension `{}` on operand 0",
+                    "`{}` does not support bounded ragged dimension `{}` on input 0",
                     self.name(),
                     ragged_axis.dimension(),
                 ),
@@ -723,7 +722,7 @@ mod tests {
                 &[input, output_extent],
             ),
             Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_sum_scatter` does not support bounded ragged dimension `length` on operand 0"
+                message: "`parallel_sum_scatter` does not support bounded ragged dimension `length` on input 0"
                     .to_string(),
             }),
         );

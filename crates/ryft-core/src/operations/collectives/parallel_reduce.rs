@@ -93,15 +93,15 @@ impl Display for ParallelReductionKind {
 /// a non-matching level forwards the collective untouched to its parent context via
 /// [`forward_collective_to_parent`], where the next level repeats the same name resolution.
 ///
-/// A matching `parallel_sum` or `parallel_max` accepts bounded ragged operands. Padding is replaced with the
-/// reduction identity before the participant reduction, and each surviving ragged extent is the elementwise maximum
-/// across the participating mapped items. Participants whose local extents exclude a position contribute the identity;
-/// with multiple ragged axes, a position inside the coordinatewise-maximum output bounds that no participant covers
-/// is therefore the identity. For `parallel_sum`, that hole is zero. For `parallel_max`, it is the element type's
-/// maximum identity: the lowest value, which is zero or false for unsigned integers and Booleans rather than an
-/// unconditionally chosen numeric zero. Signed or floating-point negative live values therefore still win correctly.
-/// `parallel_mean` rejects ragged operands because its denominator has no single implied meaning: participant count,
-/// present-value count, and logical-element count define different operations.
+/// A matching `parallel_sum` or `parallel_max` accepts bounded ragged inputs. Padding is replaced with the reduction
+/// identity before the participant reduction, and each surviving ragged extent is the elementwise maximum across the
+/// participating mapped items. Participants whose local extents exclude a position contribute the identity; with
+/// multiple ragged axes, a position inside the coordinatewise-maximum output bounds that no participant covers is
+/// therefore the identity. For `parallel_sum`, that hole is zero. For `parallel_max`, it is the element type's maximum
+/// identity: the lowest value, which is zero or false for unsigned integers and Booleans rather than an unconditionally
+/// chosen numeric zero. Signed or floating-point negative live values therefore still win correctly. `parallel_mean`
+/// rejects ragged inputs because its denominator has no single implied meaning: participant count, present-value count,
+/// and logical-element count define different operations.
 ///
 /// A reduction created with [`with_mesh`](Self::with_mesh) reduces over a manual axis of that mesh inside a manual
 /// region (e.g., the body of a `shard_map` operation in the XLA backend). Its input must vary over the axis, and its
@@ -328,7 +328,7 @@ impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ParallelReduceOp
         // Per-item interpretation is identity: the named axis does not exist in per-item semantics, so reducing across
         // it is a no-op. Staging a collective over an unbound axis is now rejected up front (see `ParallelReduce`), so
         // an enclosing binder always collapses the mapped axis through the batching rule before this per-item fallback
-        // matters; it remains defined for a program interpreted directly, where a collective simply passes its operand
+        // matters; it remains defined for a program interpreted directly, where a collective simply passes its input
         // through per item.
         Ok(vec![inputs[0].clone()])
     }
@@ -409,8 +409,8 @@ impl_differentiable_operation! {
     {
         |operation, context, _driver, inputs| {
             // Forward-mode (JVP) rule for [`ParallelReduceOperation`]. `Sum`/`Mean` are linear, so the tangent is the
-            // same collective applied to the operand tangent: `tangent_out = collective(input.tangent())`. A
-            // structural-zero operand tangent keeps its type through the operation's inference (the mesh form changes
+            // same collective applied to the input tangent: `tangent_out = collective(input.tangent())`. A
+            // structural-zero input tangent keeps its type through the operation's inference (the mesh form changes
             // the variation) rather than staging a collective on a zero, keeping `collective(zero)` out of the tangent
             // program. `Max` is non-linear and reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation)
             // error.
@@ -440,10 +440,10 @@ impl_differentiable_operation! {
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // Transpose rule for [`ParallelReduceOperation`]. An ordinary `parallel_sum`/`parallel_mean` is
-            // self-adjoint, so the operand cotangent is the same collective applied to the output cotangent. A sum
-            // over a manual mesh axis is the linear map `(x_1, …, x_n) ↦ Σ x_i` whose adjoint hands the shared
-            // cotangent to every device, i.e., a `parallel_vary` over the same axis. The single operand is linear (its
-            // [`PartialValue`] is [`Unknown`](PartialValue::Unknown)); a known operand contributes no cotangent and so
+            // self-adjoint, so the input cotangent is the same collective applied to the output cotangent. A sum over a
+            // manual mesh axis is the linear map `(x_1, …, x_n) ↦ Σ x_i` whose adjoint hands the shared cotangent to
+            // every device, i.e., a `parallel_vary` over the same axis. The single input is linear (its
+            // [`PartialValue`] is [`Unknown`](PartialValue::Unknown)); a known input contributes no cotangent and so
             // receives a structural zero. `Max` reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation)
             // error.
             check_count!("input", inputs, 1, ProgramError);
@@ -455,7 +455,7 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
-            // A known (non-linear) operand contributes no cotangent.
+            // A known (non-linear) input contributes no cotangent.
             if inputs[0].is_known() {
                 return Ok(());
             }
@@ -566,20 +566,20 @@ fn parallel_mean_factor_type(data_type: DataType) -> ArrayType {
     ArrayType::new(data_type, Shape::scalar())
 }
 
-/// Re-stages this collective of the same axis name and kind on a single tracer operand, returning its single output.
+/// Re-stages this collective of the same axis name and kind on a single tracer input, returning its single output.
 ///
 /// Both the forward-mode (`jvp`) and the transpose rules below re-stage the collective on a tracer (the primal, the
 /// tangent, or the output cotangent), which is exactly one operation with one input and one output.
 fn stage_collective<C>(
     context: &C,
     operation: &ParallelReduceOperation,
-    operand: &C::Value,
+    input: &C::Value,
 ) -> Result<C::Value, ProgramError>
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<ParallelReduceOperation>,
 {
-    let mut outputs = context.bind(operation.clone(), Vec::new(), std::slice::from_ref(operand))?;
+    let mut outputs = context.bind(operation.clone(), Vec::new(), std::slice::from_ref(input))?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
 }
@@ -1360,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_mean_batching_rejects_ragged_operands_without_a_denominator_definition() {
+    fn test_parallel_mean_batching_rejects_ragged_inputs_without_a_denominator_definition() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()

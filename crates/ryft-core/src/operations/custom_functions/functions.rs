@@ -2169,7 +2169,7 @@ mod tests {
         assert!(matches!(
             program.into_flat_program().batched(3, ShardingDimension::Replicated, &axes, natural.clone()),
             Err(BatchingError::UnsupportedOperation { message })
-                if message == "custom call `my_sin` has no batching rule for operand 0 mapped at batch axis 0; invoke \
+                if message == "custom call `my_sin` has no batching rule for input 0 mapped at batch axis 0; invoke \
                                a kernel that understands the batch axis, or select an explicit batching behavior with \
                                `CustomCallOperation::with_batching`",
         ));

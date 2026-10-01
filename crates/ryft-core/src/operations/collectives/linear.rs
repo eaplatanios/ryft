@@ -1,11 +1,11 @@
-//! Shared machinery of the single-operand linear collectives: [`ParallelPermuteOperation`],
-//! [`AllGatherOperation`], [`ParallelSumScatterOperation`], and [`AllToAllOperation`]. Each of them carries the
-//! referenced axis name together with the participant count resolved from the active [`NamedAxes`] environment when it
-//! is staged, consumes exactly one statically shaped operand, has only degenerate (single-participant) per-item
-//! semantics outside a binder, and is linear, so its tangent rides the same collective and its transpose is another
-//! collective over the same axis. The [`linear_collective!`] macro generates that shared structure and the functions
-//! in this module implement the pieces that the generated code and the hand-written rules have in common. The
-//! collectives that also resize an array axis share additional machinery in the sibling `shape_changing` module.
+//! Shared machinery of the single-input linear collectives: [`ParallelPermuteOperation`], [`AllGatherOperation`],
+//! [`ParallelSumScatterOperation`], and [`AllToAllOperation`]. Each of them carries the referenced axis name together
+//! with the participant count resolved from the active [`NamedAxes`] environment when it is staged, consumes exactly
+//! one statically shaped input, has only degenerate (single-participant) per-item semantics outside a binder, and is
+//! linear, so its tangent rides the same collective and its transpose is another collective over the same axis. The
+//! [`linear_collective!`] macro generates that shared structure and the functions in this module implement the pieces
+//! that the generated code and the hand-written rules have in common. The collectives that also resize an array axis
+//! share additional machinery in the sibling `shape_changing` module.
 //!
 //! [`ParallelPermuteOperation`]: super::ParallelPermuteOperation
 //! [`AllGatherOperation`]: super::AllGatherOperation
@@ -23,13 +23,13 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-/// Validates the shared operand contract of the linear collectives (exactly one statically shaped operand, which may
-/// carry unreduced axes only when the collective accepts them) and returns the operand's static dimensions.
+/// Validates the shared input contract of the linear collectives (exactly one statically shaped input, which may
+/// carry unreduced axes only when the collective accepts them) and returns the input's static dimensions.
 ///
 /// # Parameters
 ///
 ///   - `operation_name`: Name of the collective, used in diagnostics.
-///   - `accepts_unreduced`: Whether the collective accepts operands with unreduced axes (e.g., a sum-scatter, which
+///   - `accepts_unreduced`: Whether the collective accepts inputs with unreduced axes (e.g., a sum-scatter, which
 ///     completes the pending reduction as part of its exchange).
 ///   - `input_types`: Input types of the collective.
 pub(super) fn linear_collective_dimensions(
@@ -42,12 +42,12 @@ pub(super) fn linear_collective_dimensions(
         return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced inputs")));
     }
     let Some(shape) = input_types[0].static_shape() else {
-        return Err(TypeError::invalid(format!("`{operation_name}` does not support dynamically shaped operands")));
+        return Err(TypeError::invalid(format!("`{operation_name}` does not support dynamically shaped inputs")));
     };
     Ok(shape.dimensions().to_vec())
 }
 
-/// Builds a linear collective's output type from its operand and (possibly resized) dimensions, carrying the operand
+/// Builds a linear collective's output type from its input and (possibly resized) dimensions, carrying the input
 /// sharding through with the same per-dimension placement (the dimension count never changes).
 pub(super) fn linear_collective_output_type(
     operation_name: &'static str,
@@ -83,16 +83,16 @@ pub(super) fn interpret_degenerate_collective<V: Clone>(
     Ok(vec![inputs[0].clone()])
 }
 
-/// Implements the shared structure of the single-operand linear collectives: the operation constant and struct with
+/// Implements the shared structure of the single-input linear collectives: the operation constant and struct with
 /// its accessors, the `Display`/`Operation` implementations (with payload-dependent output-shape inference provided as
-/// a closure over the operand dimensions), degenerate interpretation, default partial evaluation, and the linear
+/// a closure over the input dimensions), degenerate interpretation, default partial evaluation, and the linear
 /// forward-mode rule (the tangent rides the same collective). The batching and transposition rules and the
 /// value-level staging capabilities are hand-written next to each macro invocation because each collective
 /// materializes the mapped batch axis, and exposes its named axis to users, differently.
 macro_rules! linear_collective {
     // Public form: generates the operation constant and struct with its accessors, the `Display`/`Operation`
     // implementations, degenerate interpretation, and default partial evaluation. `accepts_unreduced` states whether
-    // type inference accepts operands with unreduced axes.
+    // type inference accepts inputs with unreduced axes.
     (
         $(#[$operation_documentation:meta])*
         operation = $operation:ident,
@@ -229,9 +229,8 @@ macro_rules! linear_collective {
 
 pub(super) use linear_collective;
 
-/// Stages the adjoint collective of a linear collective on the output cotangent: a known operand
-/// receives a structural zero, a zero output cotangent stays symbolic, and a live cotangent rides the provided
-/// adjoint operation.
+/// Stages the adjoint collective of a linear collective on the output cotangent: a known input receives a structural
+/// zero, a zero output cotangent stays symbolic, and a live cotangent rides the provided adjoint operation.
 pub(super) fn transpose_linear_collective<V, O, A>(
     context: &mut TracingContext<V, O>,
     inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],

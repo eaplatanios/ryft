@@ -161,7 +161,7 @@ enum FmhaEligibility {
 /// Checks one attention boundary against the semantic and physical requirements of the cuDNN fMHA adapter.
 fn fmha_eligibility(
     configuration: AttentionConfiguration,
-    signature: ryft_core::operations::attention::AttentionOperandSignature,
+    signature: ryft_core::operations::attention::AttentionInputSignature,
     input_types: &[ArrayType],
     collective_state: &CollectiveLoweringState,
 ) -> Result<FmhaEligibility, LoweringError> {
@@ -199,7 +199,7 @@ fn fmha_eligibility(
 
 /// Canonical operand indices of one attention boundary.
 fn attention_input_indices(
-    signature: ryft_core::operations::attention::AttentionOperandSignature,
+    signature: ryft_core::operations::attention::AttentionInputSignature,
 ) -> AttentionInputs<usize> {
     let indices = (0..3 + signature.count()).collect::<Vec<_>>();
     AttentionInputs::from_values(signature, indices.as_slice())

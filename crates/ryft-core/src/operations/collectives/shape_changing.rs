@@ -45,19 +45,18 @@ use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, TypeError, Typed, Value, ValueProjection,
 };
 
-/// Infers one canonical mixed collective result from an array operand followed by one explicit extent per output
-/// axis.
+/// Infers one canonical mixed collective result from an array input followed by one explicit extent per output axis.
 ///
 /// # Parameters
 ///
 ///   - `operation_name`: Name of the collective, used in diagnostics.
-///   - `accepts_unreduced`: Whether the collective accepts array operands with unreduced axes (refer to
+///   - `accepts_unreduced`: Whether the collective accepts array inputs with unreduced axes (refer to
 ///     [`linear_collective_dimensions`](super::linear::linear_collective_dimensions) for more
 ///     information).
-///   - `input_types`: Array operand type followed by one explicit extent type per output axis.
+///   - `input_types`: Array input type followed by one explicit extent type per output axis.
 ///   - `base_output_type`: Output type whose shape is replaced by the explicit extents.
 ///   - `unchanged_input_axes`: For every output axis, the input axis whose extent it must preserve, if any.
-///   - `validate_exact_extents`: Collective-specific validation of the explicit extents against the array operand.
+///   - `validate_exact_extents`: Collective-specific validation of the explicit extents against the array input.
 pub(super) fn infer_explicit_shape_changing_collective_output_type(
     operation_name: &'static str,
     accepts_unreduced: bool,
@@ -130,7 +129,7 @@ pub(crate) trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType
         dimension: &Dimension,
     ) -> Result<Self::ShapeExtent, BatchingError> {
         let extent = dimension.value().ok_or_else(|| BatchingError::UnsupportedOperation {
-            message: "shape-changing collective batching requires statically shaped operands".to_string(),
+            message: "shape-changing collective batching requires statically shaped inputs".to_string(),
         })?;
         Self::collective_extent_constant(context, extent)
     }
@@ -657,7 +656,7 @@ where
     Ok(vec![DifferentiationDual::new(primal, tangent)?])
 }
 
-/// Splits a mixed collective's inputs into its validated array operand and unchecked explicit result extents.
+/// Splits a mixed collective's inputs into its validated array input and unchecked explicit result extents.
 pub(super) fn explicit_collective_inputs<'a, V: Value<Type = ArrayIrType>>(
     inputs: &'a [ArrayIrBatch<V>],
 ) -> Result<(&'a ArrayIrBatch<V>, &'a [ArrayIrBatch<V>]), BatchingError> {
@@ -793,7 +792,7 @@ mod tests {
         );
 
         // Direct mixed transposition delegates the array contribution through the homogeneous projection and gives
-        // the explicit extent operand a structural-zero cotangent.
+        // the explicit extent input a structural-zero cotangent.
         let context = Context::new();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
         let output_cotangent = context.input(array_type.clone().into());

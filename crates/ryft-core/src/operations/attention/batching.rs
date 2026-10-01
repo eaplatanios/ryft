@@ -2,7 +2,7 @@ use crate::operations::manipulation::broadcasting::DynamicBroadcast;
 
 use super::*;
 
-/// Semantic role of one attention batching operand.
+/// Semantic role of one attention batching input.
 #[derive(Copy, Clone, Debug)]
 enum AttentionBatchInput {
     /// Query, key, value, output, or output cotangent in `TNH`/`BTNH` form.
@@ -31,9 +31,9 @@ enum AttentionBatchOutput {
     Score(usize),
 }
 
-/// Returns the canonical forward operand and result roles for `signature` and `configuration`.
+/// Returns the canonical forward input and result roles for `signature` and `configuration`.
 fn attention_forward_batch_roles(
-    signature: AttentionOperandSignature,
+    signature: AttentionInputSignature,
     configuration: AttentionConfiguration,
 ) -> (Vec<AttentionBatchInput>, Vec<AttentionBatchOutput>) {
     let mut inputs = vec![AttentionBatchInput::Tensor; 3];
@@ -46,9 +46,9 @@ fn attention_forward_batch_roles(
     (inputs, outputs)
 }
 
-/// Returns the canonical backward operand and result roles for `signature`.
+/// Returns the canonical backward input and result roles for `signature`.
 fn attention_backward_batch_roles(
-    signature: AttentionOperandSignature,
+    signature: AttentionInputSignature,
 ) -> (Vec<AttentionBatchInput>, Vec<AttentionBatchOutput>, Option<usize>) {
     let mut inputs = vec![AttentionBatchInput::Tensor; 3];
     let bias_index = signature.has_bias().then_some(inputs.len());
@@ -67,8 +67,8 @@ fn attention_backward_batch_roles(
 /// A mapped level is normalized to a leading prefix and folded into attention's batch axis. Rank-three attention has
 /// an implicit logical batch of one, so `[v, T, N, H]` is already the primitive's canonical rank-four form. Rank-four
 /// attention instead folds `[v, B, T, N, H]` to `[v * B, T, N, H]`. Biases and masks are first materialized to
-/// `[v, B, N, T, S]`, which handles every broadcastable rank and preserves mapped score operands. Results reverse the
-/// normalization, and a bias cotangent is reduced over precisely the axes broadcast by its logical operand.
+/// `[v, B, N, T, S]`, which handles every broadcastable rank and preserves mapped bias and mask inputs. Results reverse
+/// the normalization, and a bias cotangent is reduced over precisely the axes broadcast by its logical bias input.
 fn batch_attention_static<C, O>(
     operation: &O,
     context: &BatchingContext<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
@@ -93,7 +93,7 @@ where
         match value_type.static_shape() {
             Some(shape) => Ok(shape.dimensions().to_vec()),
             None => Err(ProgramError::from(TypeError::invalid(format!(
-                "`{}` batching requires statically shaped operands",
+                "`{}` batching requires statically shaped inputs",
                 operation.name()
             )))
             .into()),
@@ -261,8 +261,8 @@ where
 
 /// First-class-extent normalization adapter shared by the forward and backward fused attention boundaries.
 ///
-/// This is the dynamic counterpart of [`batch_attention_static`]. It stages the same prefix normalization using
-/// mixed `broadcast` and `reshape` operations whose result dimensions are ordinary SSA operands. Consequently a
+/// This is the dynamic counterpart of [`batch_attention_static`]. It stages the same prefix normalization using mixed
+/// `broadcast` and `reshape` operations that take their result dimensions as ordinary staged inputs. Consequently a
 /// dynamic mapped extent, logical batch, or sequence length never becomes host metadata or a specialization key.
 fn batch_attention_dynamic<C, O>(
     operation: &O,

@@ -59,17 +59,18 @@ use super::{
     CollectiveOptions, effective_collective_axis_size, reject_ragged_collective_inputs, resolve_named_axis_size,
 };
 
-/// Operand representation carried by [`RaggedAllToAllOperation`].
+/// Input representation carried by [`RaggedAllToAllOperation`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum RaggedAllToAllRepresentation {
-    /// Public per-participant representation with rank-one metadata operands.
+    /// Public per-participant representation with rank-one metadata inputs.
     Logical,
 
-    /// Batching-internal representation with one leading participant axis on every operand.
+    /// Batching-internal representation with one leading participant axis on every input.
     Physical,
 }
 
-/// Update semantics used by the public forward exchange and its internal operand adjoint.
+/// Update semantics used by the public forward exchange and by the internal adjoint exchange that computes the
+/// `operand` cotangent.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum RaggedAllToAllUpdateKind {
     /// Received segments replace the corresponding output seed regions.
@@ -85,7 +86,7 @@ pub(crate) enum RaggedAllToAllUpdateKind {
 /// capability instead executes already-materialized values in either the public per-participant representation or
 /// the explicitly marked internal batching representation.
 pub(crate) trait RaggedAllToAllEvaluation: Sized {
-    /// Executes `operation` over the six operands in their canonical order.
+    /// Executes `operation` over the six inputs in their canonical order.
     fn evaluate_ragged_all_to_all(
         operation: &RaggedAllToAllOperation,
         operand: &Self,
@@ -292,12 +293,12 @@ pub const RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "ragged_all_to_all";
 
 /// Primitive that exchanges variable-length leading-axis segments between participants of a named axis.
 ///
-/// The six operands, in order, are `operand (N, A, ...)`, `output (M, A, ...)`, and rank-one integer arrays
+/// The six inputs, in order, are `operand (N, A, ...)`, `output (M, A, ...)`, and rank-one integer arrays
 /// `input_offsets`, `send_sizes`, `output_offsets`, and `receive_sizes`, each of length `K`. The result has exactly
 /// `output`'s type and starts with `output`'s value, so elements outside received regions pass through unchanged.
 /// `K` must be positive and divisible by the effective participant-group size.
-/// The batching rule uses one internal physical form that prefixes every operand with the participant axis, making
-/// the data operands `(P, N, A, ...)` and `(P, M, A, ...)` and the metadata operands `(P, K)`; this representation is
+/// The batching rule uses one internal physical form that prefixes every input with the participant axis, making the
+/// data inputs `(P, N, A, ...)` and `(P, M, A, ...)` and the metadata inputs `(P, K)`; this representation is
 /// normalized back to the public contract during type inference and eager interpretation.
 ///
 /// `output_offsets` are supplied by each sender but are expressed in the corresponding receiver's
@@ -309,7 +310,7 @@ pub const RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "ragged_all_to_all";
 /// [JAX's `ragged_all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ragged_all_to_all.html).
 ///
 /// [`RaggedAxis`](crate::arrays::RaggedAxis) is batching-time metadata and does not participate in this explicitly
-/// packed operation contract. Batching rejects operands that carry it because one per-item logical extent does not
+/// packed operation contract. Batching rejects inputs that carry it because one per-item logical extent does not
 /// determine the per-source/per-destination sizes and two coordinate-frame offset vectors required by this operation.
 /// A future adapter must therefore accept an explicit routing descriptor; it cannot infer routing from
 /// [`RaggedAxis`](crate::arrays::RaggedAxis) alone. The two representations also describe different frames:
@@ -321,18 +322,17 @@ pub const RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "ragged_all_to_all";
 /// staged implementation can express the copies with iota-based index arithmetic, gather, and `select` masking at
 /// `O(group_size × M)` staged work.
 ///
-/// The transpose stages additional collectives rather than performing a local rewrite, and its metadata operands are
+/// The transpose stages additional collectives rather than performing a local rewrite, and its metadata inputs are
 /// primal residuals: ordinary runtime values retained by linearization, not compile-time constants. Participant groups
 /// are forwarded through both dense metadata exchanges and the adjoint ragged exchange. This deliberately corrects
 /// JAX's grouped transpose, which accepts groups on the ragged primitive but omits them from its offset exchanges.
 /// The output leading dimension must currently be static so the `M + 1` marker and its final slice can be represented
 /// by the existing static scatter and slice operations.
 ///
-/// Batching over an unrelated mapped axis currently requires a static mapped extent and statically shaped data
-/// operands. Offset rebasing stages `N` and `M` as scalar constants, and the shared reshape interface cannot yet
-/// recover dynamic trailing extents from both homogeneous and composite carriers. Grouped operation batching is
-/// rejected in this case because merging an unrelated mapped axis would change the meaning of each fixed participant
-/// group.
+/// Batching over an unrelated mapped axis currently requires a static mapped extent and statically shaped data inputs.
+/// Offset rebasing stages `N` and `M` as scalar constants, and the shared reshape interface cannot yet recover dynamic
+/// trailing extents from both homogeneous and composite carriers. Grouped operation batching is rejected in this case
+/// because merging an unrelated mapped axis would change the meaning of each fixed participant group.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RaggedAllToAllOperation {
     /// Axis name referenced by this collective.
@@ -344,7 +344,7 @@ pub struct RaggedAllToAllOperation {
     /// Optional ordered partition of logical participant indices.
     axis_index_groups: Option<Vec<Vec<usize>>>,
 
-    /// Public logical or batching-internal physical operand representation.
+    /// Public logical or batching-internal physical input representation.
     representation: RaggedAllToAllRepresentation,
 
     /// Public overwrite or transpose-internal additive update semantics.
@@ -405,20 +405,20 @@ impl RaggedAllToAllOperation {
         effective_collective_axis_size(RAGGED_ALL_TO_ALL_OPERATION_NAME, self.axis_size, self.axis_index_groups())
     }
 
-    /// Returns whether this operation carries the batching-internal physical operand representation, in which every
-    /// operand has one leading axis that enumerates the participants of the named axis. Batching over a named axis
-    /// produces this representation so that one host-side evaluation can exchange segments between all participants.
+    /// Returns whether this operation carries the batching-internal physical input representation, in which every input
+    /// has one leading axis that enumerates the participants of the named axis. Batching over a named axis produces
+    /// this representation so that one host-side evaluation can exchange segments between all participants.
     ///
     /// Backend lowerings must check this predicate and reject physical operations, because a device-level
-    /// `ragged_all_to_all` expects the public logical representation, in which each device holds only its own
-    /// operands and rank-one metadata operands. Lowering a physical operation as if it were logical would misread its
+    /// `ragged_all_to_all` expects the public logical representation, in which each device holds only its own data
+    /// inputs and rank-one metadata inputs. Lowering a physical operation as if it were logical would misread its
     /// leading participant axis as data.
     #[inline]
     pub fn is_physical(&self) -> bool {
         self.representation == RaggedAllToAllRepresentation::Physical
     }
 
-    /// Returns a clone marked with the batching-internal physical operand representation.
+    /// Returns a clone marked with the batching-internal physical input representation.
     #[inline]
     fn with_physical_representation(&self) -> Self {
         Self { representation: RaggedAllToAllRepresentation::Physical, ..self.clone() }
@@ -439,11 +439,11 @@ impl RaggedAllToAllOperation {
     /// Returns whether received segments add into the output seed instead of overwriting it.
     ///
     /// Operations constructed through the public API always overwrite. Only the transpose rule produces accumulating
-    /// operations: its adjoint exchange sends the output cotangent back into a zero seed shaped like the operand, and
-    /// operand regions that several forward segments read must sum the cotangents of all those segments. Backend
-    /// lowerings must check this predicate, because a native `ragged_all_to_all` overwrites its output and would keep
-    /// only one of those contributions, so accumulating operations need a lowering that adds received segments
-    /// explicitly.
+    /// operations: its adjoint exchange sends the output cotangent back into a zero seed shaped like the `operand`
+    /// array, and `operand` regions that several forward segments read must sum the cotangents of all those segments.
+    /// Backend lowerings must check this predicate, because a native `ragged_all_to_all` overwrites its output and
+    /// would keep only one of those contributions, so accumulating operations need a lowering that adds received
+    /// segments explicitly.
     #[inline]
     pub fn accumulates_updates(&self) -> bool {
         self.update_kind == RaggedAllToAllUpdateKind::Add
@@ -484,13 +484,13 @@ impl Operation for RaggedAllToAllOperation {
                             input_type.shape().dimensions().first().and_then(|extent| extent.value())
                         else {
                             return Err(TypeError::invalid(format!(
-                                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` physical operand {index} must have a static \
+                                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` physical input {index} must have a static \
                                  leading participant dimension",
                             )));
                         };
                         if participant_extent != self.axis_size {
                             return Err(TypeError::invalid(format!(
-                                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` physical operand {index} leading participant \
+                                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` physical input {index} leading participant \
                                  dimension {participant_extent} must equal axis size {}",
                                 self.axis_size,
                             )));
@@ -509,21 +509,22 @@ impl Operation for RaggedAllToAllOperation {
 
         if operand.rank() == 0 || output.rank() == 0 {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` data operands must have rank at least 1 but got `{operand}` and \
+                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` data inputs must have rank at least 1 but got `{operand}` and \
                  `{output}`",
             )));
         }
         if operand.data_type() != output.data_type() {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` operand and output data types must match but got `{}` and `{}`",
+                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` `operand` and `output` data types must match but got `{}` and \
+                 `{}`",
                 operand.data_type(),
                 output.data_type(),
             )));
         }
         if operand.shape().dimensions()[1..] != output.shape().dimensions()[1..] {
             return Err(TypeError::invalid(format!(
-                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` operand and output trailing dimensions must match but got `{}` \
-                 and `{}`",
+                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` `operand` and `output` trailing dimensions must match but got \
+                 `{}` and `{}`",
                 operand.shape(),
                 output.shape(),
             )));
@@ -552,7 +553,7 @@ impl Operation for RaggedAllToAllOperation {
             }
             if r#type.data_type() != metadata_data_type {
                 return Err(TypeError::invalid(format!(
-                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata operands must share one integer data type but \
+                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata inputs must share one integer data type but \
                      `input_offsets` has `{metadata_data_type}` and `{name}` has `{}`",
                     r#type.data_type(),
                 )));
@@ -566,7 +567,7 @@ impl Operation for RaggedAllToAllOperation {
             match metadata_length {
                 Some(expected) if length != expected => {
                     return Err(TypeError::invalid(format!(
-                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata operands must have equal lengths but \
+                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` metadata inputs must have equal lengths but \
                          `input_offsets` has length {expected} and `{name}` has length {length}",
                     )));
                 }
@@ -646,13 +647,13 @@ impl<C: Domain<Type = ArrayType, Value: RaggedAllToAllEvaluation>> Interpretable
 }
 
 // Partial evaluation uses the default fold-or-residualize behavior. Known metadata remain ordinary runtime values;
-// the rule never assumes that a known primal operand is a compile-time literal.
+// the rule never assumes that a known primal input is a compile-time literal.
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RaggedAllToAllOperation where
     C::Operation: From<RaggedAllToAllOperation>
 {
 }
 
-// A matching named batch axis is the eager reference implementation's participant axis. All operands are aligned to
+// A matching named batch axis is the eager reference implementation's participant axis. All inputs are aligned to
 // physical axis zero before one parent bind executes the complete exchange. Unresolved non-constant metadata are gated
 // because no existing slicing primitive carries a dynamic segment length. A non-matching mapped axis merges its batch
 // into the packed leading data and metadata axes with sender/receiver offsets rebased by the mapped item index. An
@@ -869,7 +870,7 @@ where
     }
 }
 
-// The two data operands are jointly linear. Metadata remain primal values and therefore become ordinary residuals
+// The two data inputs are jointly linear. Metadata remain primal values and therefore become ordinary residuals
 // whenever the tangent exchange survives partial evaluation.
 impl_differentiable_operation! {
     RaggedAllToAllOperation,
@@ -1257,8 +1258,8 @@ where
         .with_sharding(output_offsets.r#type().sharding().cloned())
         .map_err(|error| TypeError::invalid(error.to_string()))?;
 
-    // Metadata may use any integer width and memory placement. Widen index arithmetic to `u64` before adding and
-    // move it beside the cotangent so scatter's three operands share one memory space.
+    // Metadata may use any integer width and memory placement. Widen index arithmetic to `u64` before adding and move
+    // it beside the cotangent so scatter's three inputs share one memory space.
     let normalize_metadata = |value: &Tracer<TracingContext<V, O>>| -> Result<_, ProgramError> {
         let value = if value.r#type().memory() == output_type.memory() {
             value.clone()
@@ -2106,7 +2107,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` data operands must have rank at least 1 but got `f32[]` and \
+                    error = "`ragged_all_to_all` data inputs must have rank at least 1 but got `f32[]` and \
                              `f32[4, 2]`",
                 },
                 {
@@ -2118,7 +2119,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` operand and output data types must match but got `f32` and `f64`",
+                    error = "`ragged_all_to_all` `operand` and `output` data types must match but got `f32` and `f64`",
                 },
                 {
                     input_types = [
@@ -2129,8 +2130,8 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` operand and output trailing dimensions must match but got `[3, 2]` \
-                             and `[4, 3]`",
+                    error = "`ragged_all_to_all` `operand` and `output` trailing dimensions must match but got \
+                             `[3, 2]` and `[4, 3]`",
                 },
                 {
                     input_types = [
@@ -2174,7 +2175,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` metadata operands must share one integer data type but \
+                    error = "`ragged_all_to_all` metadata inputs must share one integer data type but \
                              `input_offsets` has `i32` and `send_sizes` has `i64`",
                 },
                 {
@@ -2186,7 +2187,7 @@ mod tests {
                         metadata(),
                         metadata(),
                     ],
-                    error = "`ragged_all_to_all` metadata operands must have equal lengths but `input_offsets` has \
+                    error = "`ragged_all_to_all` metadata inputs must have equal lengths but `input_offsets` has \
                              length 2 and `send_sizes` has length 4",
                 },
                 {
@@ -2444,7 +2445,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_batching_rejects_ragged_operands() {
+    fn test_ragged_all_to_all_batching_rejects_ragged_inputs() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let ragged_operand = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
@@ -2467,7 +2468,7 @@ mod tests {
                 ],
             ),
             Err(BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` does not support bounded ragged dimension `length` on operand 0"
+                message: "`ragged_all_to_all` does not support bounded ragged dimension `length` on input 0"
                     .to_string(),
             }),
         );
@@ -2921,7 +2922,7 @@ mod tests {
                 .batch(&context, &EmptyRegionDriver, invalid_inputs.as_slice())
                 .unwrap_err()
                 .to_string(),
-            "`ragged_all_to_all` operand and output data types must match but got `f32` and `f64`",
+            "`ragged_all_to_all` `operand` and `output` data types must match but got `f32` and `f64`",
         );
     }
 

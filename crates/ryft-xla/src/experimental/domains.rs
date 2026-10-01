@@ -6256,8 +6256,8 @@ mod tests {
 
     use ryft_core::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use ryft_core::operations::attention::{
-        AttentionConfiguration, AttentionImplementation, AttentionOperandSignature,
-        DotProductAttentionBackwardOperation, DotProductAttentionOperation,
+        AttentionConfiguration, AttentionImplementation, AttentionInputSignature, DotProductAttentionBackwardOperation,
+        DotProductAttentionOperation,
     };
     use ryft_core::operations::custom_call::CustomCallOperation;
     use ryft_core::operations::manipulation::indexing::index;
@@ -6428,7 +6428,7 @@ mod tests {
         causal: bool,
         residual: bool,
         dropout: Option<(f64, u64)>,
-        signature: AttentionOperandSignature,
+        signature: AttentionInputSignature,
     ) -> DotProductAttentionOperation {
         DotProductAttentionOperation::new(
             AttentionConfiguration::new()
@@ -6449,7 +6449,7 @@ mod tests {
         scale: f64,
         causal: bool,
         dropout: Option<(f64, u64)>,
-        signature: AttentionOperandSignature,
+        signature: AttentionInputSignature,
     ) -> DotProductAttentionBackwardOperation {
         DotProductAttentionBackwardOperation::new(
             AttentionConfiguration::new()
@@ -6891,7 +6891,7 @@ mod tests {
             .unwrap()[0];
         let forward = builder
             .add_instruction(
-                attention_operation(1.0, false, true, None, AttentionOperandSignature::new(false, false, true, true)),
+                attention_operation(1.0, false, true, None, AttentionInputSignature::new(false, false, true, true)),
                 Vec::new(),
                 vec![query, key, value, lengths, lengths],
                 None,
@@ -6900,12 +6900,7 @@ mod tests {
             .to_vec();
         let backward = builder
             .add_instruction(
-                attention_backward_operation(
-                    1.0,
-                    false,
-                    None,
-                    AttentionOperandSignature::new(false, false, true, true),
-                ),
+                attention_backward_operation(1.0, false, None, AttentionInputSignature::new(false, false, true, true)),
                 Vec::new(),
                 vec![query, key, value, lengths, lengths, forward[0], forward[1], output_cotangent],
                 None,
@@ -10639,13 +10634,13 @@ mod tests {
                 false,
                 false,
                 None,
-                AttentionOperandSignature::default(),
+                AttentionInputSignature::default(),
             )),
             ArrayOperation::DotProductAttentionBackward(attention_backward_operation(
                 1.0,
                 false,
                 None,
-                AttentionOperandSignature::default(),
+                AttentionInputSignature::default(),
             )),
         ] {
             assert_eq!(array_data_dependent_padding_discipline(&operation), RyftMasked);
@@ -11080,7 +11075,7 @@ mod tests {
                     false,
                     false,
                     None,
-                    AttentionOperandSignature::default(),
+                    AttentionInputSignature::default(),
                 ),
                 Vec::new(),
                 vec![query, key, value],

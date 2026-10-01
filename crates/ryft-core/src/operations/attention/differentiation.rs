@@ -27,7 +27,7 @@ use crate::tracing::{DomainTracer, TracingContext};
 /// Residuals retained by the fused attention reverse rule.
 #[derive(Clone, Debug, PartialEq, Parameterized)]
 pub struct AttentionResiduals<P: Parameter> {
-    /// Forward operands, including the present optional leaves.
+    /// Forward inputs, including the present optional leaves.
     inputs: AttentionInputs<P>,
 
     /// Attended forward output.
@@ -97,12 +97,12 @@ where
     let signature = inputs.signature();
     let context = inputs.query.dispatch_domain();
     let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
-    let mut operands = inputs.into_values();
-    operands.extend([output, statistic, output_cotangent]);
+    let mut backward_inputs = inputs.into_values();
+    backward_inputs.extend([output, statistic, output_cotangent]);
     let mut outputs = context.bind(
         DotProductAttentionBackwardOperation::new(configuration, signature),
         Vec::new(),
-        operands.as_slice(),
+        backward_inputs.as_slice(),
     )?;
     let has_live_bias_cotangent = bias_cotangent_type.as_ref().is_some_and(|r#type| !r#type.is_zero_space());
     check_count!("output", outputs, 3 + usize::from(has_live_bias_cotangent), ProgramError);

@@ -16,7 +16,7 @@ pub const DOT_PRODUCT_ATTENTION_OPERATION_NAME: &str = "dot_product_attention";
 /// manual variation; the capability aligns inputs before binding. Reduced and unreduced inputs are unsupported:
 /// softmax and the log-sum-exp residual do not preserve partial-sum or zero-filled-replica representations.
 ///
-/// [`AttentionInputs`] defines the complete operand boundary: query, key, value, then an optional broadcastable
+/// [`AttentionInputs`] defines the complete input boundary: query, key, value, then an optional broadcastable
 /// additive bias, Boolean visibility mask, per-batch query lengths, and per-batch key/value lengths. Dot products,
 /// scaling, bias addition, and masking use the query type promoted to at least `f32`; the masked logits are then
 /// converted to `f32` for the numerically stable softmax. Visibility is the conjunction of the explicit mask, causal
@@ -39,14 +39,14 @@ pub struct DotProductAttentionOperation {
     /// Value-independent attention semantics.
     configuration: AttentionConfiguration,
 
-    /// Presence metadata for optional operands.
-    signature: AttentionOperandSignature,
+    /// Presence metadata for optional inputs.
+    signature: AttentionInputSignature,
 }
 
 impl DotProductAttentionOperation {
-    /// Creates a new [`DotProductAttentionOperation`] from its complete semantic configuration and operand signature.
+    /// Creates a new [`DotProductAttentionOperation`] from its complete semantic configuration and input signature.
     #[inline]
-    pub fn new(configuration: AttentionConfiguration, signature: AttentionOperandSignature) -> Self {
+    pub fn new(configuration: AttentionConfiguration, signature: AttentionInputSignature) -> Self {
         Self { configuration, signature }
     }
 
@@ -56,9 +56,9 @@ impl DotProductAttentionOperation {
         self.configuration
     }
 
-    /// Returns the optional-operand signature.
+    /// Returns the optional-input signature.
     #[inline]
-    pub fn signature(&self) -> AttentionOperandSignature {
+    pub fn signature(&self) -> AttentionInputSignature {
         self.signature
     }
 }
@@ -85,7 +85,7 @@ impl Operation for DotProductAttentionOperation {
         let signature = self.signature;
         if input_types.len() != 3 + signature.count() {
             return Err(TypeError::invalid(format!(
-                "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` expects {} inputs for its optional-operand signature but \
+                "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` expects {} inputs for its optional-input signature but \
                  got {}",
                 3 + signature.count(),
                 input_types.len(),
@@ -95,19 +95,19 @@ impl Operation for DotProductAttentionOperation {
             DOT_PRODUCT_ATTENTION_OPERATION_NAME,
             &input_types.iter().collect::<Vec<_>>(),
         )?;
-        let operands = AttentionOperandTypes::forward(signature, input_types)?;
-        let dimensions = validated_attention_operands(
+        let types = AttentionInputTypes::forward(signature, input_types)?;
+        let dimensions = validated_attention_inputs(
             DOT_PRODUCT_ATTENTION_OPERATION_NAME,
-            operands.query,
-            operands.key,
-            operands.value,
-            operands.bias,
-            operands.mask,
+            types.query,
+            types.key,
+            types.value,
+            types.bias,
+            types.mask,
         )?;
-        validated_sequence_length_operands(
+        validated_sequence_length_inputs(
             DOT_PRODUCT_ATTENTION_OPERATION_NAME,
-            operands.query_sequence_lengths,
-            operands.key_value_sequence_lengths,
+            types.query_sequence_lengths,
+            types.key_value_sequence_lengths,
             &dimensions.batch,
         )?;
         validated_dropout(DOT_PRODUCT_ATTENTION_OPERATION_NAME, self.configuration.dropout())?;
@@ -132,10 +132,10 @@ impl Operation for DotProductAttentionOperation {
             }
         }
         // The attended output is query-shaped at the query data type, so the inferred output type is the query type
-        // itself, propagating operand-level metadata such as sharding.
-        let mut output_types = vec![operands.query.clone()];
+        // itself, propagating its metadata such as sharding.
+        let mut output_types = vec![types.query.clone()];
         if self.configuration.return_residual() {
-            output_types.push(attention_activation_type(&dimensions, operands.query)?);
+            output_types.push(attention_activation_type(&dimensions, types.query)?);
         }
         Ok(output_types)
     }
@@ -218,14 +218,14 @@ pub struct DotProductAttentionBackwardOperation {
     /// Value-independent semantics of the differentiated forward operation.
     configuration: AttentionConfiguration,
 
-    /// Presence metadata for optional forward operands.
-    signature: AttentionOperandSignature,
+    /// Presence metadata for optional forward inputs.
+    signature: AttentionInputSignature,
 }
 
 impl DotProductAttentionBackwardOperation {
-    /// Creates a new backward boundary from its complete semantic configuration and operand signature.
+    /// Creates a new backward boundary from its complete semantic configuration and input signature.
     #[inline]
-    pub fn new(configuration: AttentionConfiguration, signature: AttentionOperandSignature) -> Self {
+    pub fn new(configuration: AttentionConfiguration, signature: AttentionInputSignature) -> Self {
         Self { configuration, signature }
     }
 
@@ -235,9 +235,9 @@ impl DotProductAttentionBackwardOperation {
         self.configuration
     }
 
-    /// Returns the optional-operand signature.
+    /// Returns the optional-input signature.
     #[inline]
-    pub fn signature(&self) -> AttentionOperandSignature {
+    pub fn signature(&self) -> AttentionInputSignature {
         self.signature
     }
 }
@@ -264,7 +264,7 @@ impl Operation for DotProductAttentionBackwardOperation {
         let signature = self.signature;
         if input_types.len() != 6 + signature.count() {
             return Err(TypeError::invalid(format!(
-                "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` expects {} inputs for its optional-operand \
+                "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` expects {} inputs for its optional-input \
                  signature but got {}",
                 6 + signature.count(),
                 input_types.len(),
@@ -274,19 +274,19 @@ impl Operation for DotProductAttentionBackwardOperation {
             DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
             &input_types.iter().collect::<Vec<_>>(),
         )?;
-        let operands = AttentionOperandTypes::backward(signature, input_types)?;
-        let dimensions = validated_attention_operands(
+        let types = AttentionInputTypes::backward(signature, input_types)?;
+        let dimensions = validated_attention_inputs(
             DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
-            operands.query,
-            operands.key,
-            operands.value,
-            operands.bias,
-            operands.mask,
+            types.query,
+            types.key,
+            types.value,
+            types.bias,
+            types.mask,
         )?;
-        validated_sequence_length_operands(
+        validated_sequence_length_inputs(
             DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
-            operands.query_sequence_lengths,
-            operands.key_value_sequence_lengths,
+            types.query_sequence_lengths,
+            types.key_value_sequence_lengths,
             &dimensions.batch,
         )?;
         validated_dropout(DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME, self.configuration.dropout())?;
@@ -297,33 +297,33 @@ impl Operation for DotProductAttentionBackwardOperation {
                 "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` dropout requires the fused implementation"
             )));
         }
-        // The forward-output-shaped operands compare by data type and shape only, so operand-level metadata such as
-        // sharding never fails the structural contract.
+        // The forward-output-shaped inputs compare by data type and shape only, so per-input metadata such as sharding
+        // never fails the structural contract.
         let matches_expected = |actual: &ArrayType, expected: &ArrayType| -> bool {
             actual.data_type() == expected.data_type() && actual.shape() == expected.shape()
         };
-        if !matches_expected(operands.output.unwrap(), operands.query) {
+        if !matches_expected(types.output.unwrap(), types.query) {
             return Err(TypeError::invalid(format!(
                 "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` output type {} does not match the expected \
                  forward output type {}",
-                operands.output.unwrap(),
-                operands.query,
+                types.output.unwrap(),
+                types.query,
             )));
         }
-        let expected_output_cotangent_type = operands.query.cotangent()?;
-        if !matches_expected(operands.output_cotangent.unwrap(), &expected_output_cotangent_type) {
+        let expected_output_cotangent_type = types.query.cotangent()?;
+        if !matches_expected(types.output_cotangent.unwrap(), &expected_output_cotangent_type) {
             return Err(TypeError::invalid(format!(
                 "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` output cotangent type {} does not match the \
                  expected cotangent type {expected_output_cotangent_type}",
-                operands.output_cotangent.unwrap(),
+                types.output_cotangent.unwrap(),
             )));
         }
         let expected_activation_type = attention_activation_type(&dimensions, &input_types[0])?;
-        if !matches_expected(operands.activation.unwrap(), &expected_activation_type) {
+        if !matches_expected(types.activation.unwrap(), &expected_activation_type) {
             return Err(TypeError::invalid(format!(
                 "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` activation type {} does not match the \
                      expected activation type {expected_activation_type}",
-                operands.activation.unwrap(),
+                types.activation.unwrap(),
             )));
         }
         for input_type in input_types {
@@ -339,9 +339,8 @@ impl Operation for DotProductAttentionBackwardOperation {
                 )));
             }
         }
-        let mut output_types =
-            vec![operands.query.cotangent()?, operands.key.cotangent()?, operands.value.cotangent()?];
-        if let Some(bias) = operands.bias {
+        let mut output_types = vec![types.query.cotangent()?, types.key.cotangent()?, types.value.cotangent()?];
+        if let Some(bias) = types.bias {
             let bias_cotangent = bias.cotangent()?;
             if !bias_cotangent.is_zero_space() {
                 output_types.push(bias_cotangent);

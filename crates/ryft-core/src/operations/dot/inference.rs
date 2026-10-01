@@ -3,8 +3,8 @@ use super::*;
 /// Merges the [`ShardingDimension`]s of one aligned batch dimension pair, preferring the more informative entry
 /// (`Sharded` over `Replicated` over `Unconstrained`). Returns [`None`] when the two entries are sharded over
 /// different mesh axes, which the caller reports as an inconsistent-sharding error. Note that preferring a one-sided
-/// `Sharded` entry over the other operand's entry intentionally diverges from JAX, which reads output batch
-/// dimension specs from the LHS operand only.
+/// `Sharded` entry over the other input's entry intentionally diverges from JAX, which reads output batch dimension
+/// specs from the LHS only.
 fn merge_batch_sharding_dimensions(lhs: &ShardingDimension, rhs: &ShardingDimension) -> Option<ShardingDimension> {
     match (lhs, rhs) {
         (ShardingDimension::Sharded(left), ShardingDimension::Sharded(right)) if left == right => Some(lhs.clone()),
@@ -111,11 +111,11 @@ pub(crate) fn ragged_dot_abstract(
     Ok(output)
 }
 
-/// Returns whether operands of `operand` element type may accumulate at `accumulation`.
+/// Returns whether inputs of element type `input` may accumulate at `accumulation`.
 ///
-/// The identical type is always valid. Floating-point operands may accumulate at `f32` or `f64`, and integer operands
-/// may accumulate at a same-signedness integer type at least as wide.
-fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) -> bool {
+/// The identical type is always valid. Floating-point inputs may accumulate at `f32` or `f64`, and integer inputs may
+/// accumulate at a same-signedness integer type at least as wide.
+fn accumulation_type_is_compatible(input: DataType, accumulation: DataType) -> bool {
     /// Returns the signedness and bit width of an integer data type, or `None` for any other type.
     fn integer_parts(data_type: DataType) -> Option<(bool, usize)> {
         Some(match data_type {
@@ -137,15 +137,15 @@ fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) ->
         })
     }
 
-    if operand == accumulation {
+    if input == accumulation {
         return true;
     }
-    if operand.is_floating_point() {
+    if input.is_floating_point() {
         return matches!(accumulation, DataType::F32 | DataType::F64);
     }
-    match (integer_parts(operand), integer_parts(accumulation)) {
-        (Some((operand_signed, operand_width)), Some((accumulation_signed, accumulation_width))) => {
-            operand_signed == accumulation_signed && accumulation_width >= operand_width
+    match (integer_parts(input), integer_parts(accumulation)) {
+        (Some((input_signed, input_width)), Some((accumulation_signed, accumulation_width))) => {
+            input_signed == accumulation_signed && accumulation_width >= input_width
         }
         _ => false,
     }
@@ -153,13 +153,13 @@ fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) ->
 
 /// Computes the abstract output type of one generalized dot product.
 ///
-/// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the operand
-/// axes that are neither batching nor contracting, in their original order. The output element type is the requested
-/// compatible accumulation type when one is provided, or otherwise the common operand element type.
+/// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the input axes
+/// that are neither batching nor contracting, in their original order. The output element type is the requested
+/// compatible accumulation type when one is provided, or otherwise the common input element type.
 ///
 /// Floating-point compatibility deliberately does not use the standard elementwise promotion lattice. Backend dot
-/// instructions expose an independent preferred accumulator type, so even sub-byte and 8-bit operands may accumulate
-/// at `f32` or `f64`. Integer accumulation preserves signedness and may only widen the operand type.
+/// instructions expose an independent preferred accumulator type, so even sub-byte and 8-bit inputs may accumulate at
+/// `f32` or `f64`. Integer accumulation preserves signedness and may only widen the input type.
 ///
 /// The output [`Sharding`] follows JAX's `dot_general` sharding rule (`_dot_general_sharding_rule` in
 /// `jax/_src/lax/lax.py`); refer to the
@@ -167,19 +167,19 @@ fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) ->
 /// operation semantics. Concretely:
 ///
 ///   - When `output_sharding` is provided, it is validated (rank, mesh, no auto axes, and the unreduced-output rule
-///     requiring identically sharded contracting dimensions whose sharding axes equal the requested unreduced set)
-///     and returned directly, bypassing the ordinary operand consistency checks.
-///   - Operands must not be unreduced. Reduced operands are legal, and reduced and varying manual axes are unioned
-///     across the operands into the output sharding.
-///   - When neither operand carries a sharding, the output carries none. When exactly one does, the rule runs with
-///     the absent side treated as fully replicated on the present operand's mesh. Operand meshes must match.
+///     requiring identically sharded contracting dimensions whose sharding axes equal the requested unreduced set) and
+///     returned directly, bypassing the ordinary input consistency checks.
+///   - Inputs must not be unreduced. Reduced inputs are legal, and reduced and varying manual axes are unioned across
+///     the inputs into the output sharding.
+///   - When neither input carries a sharding, the output carries none. When exactly one does, the rule runs with the
+///     absent side treated as fully replicated on the present input's mesh. Input meshes must match.
 ///   - Batch dimension entries are merged preferring the more informative entry (`Sharded` over `Replicated` over
 ///     `Unconstrained`); two different `Sharded` entries are an error. This intentionally diverges from JAX, which
-///     reads batch dimension specs from the LHS operand only.
-///   - Contracting dimensions sharded on both operands are an error (identically sharded ones make the output
-///     sharding ambiguous and require an explicit output sharding); a contracting dimension sharded on only one
-///     operand is allowed and its sharding is dropped from the output.
-///   - Result dimension entries are copied from the owning operand, and auto mesh axes are stripped from the final
+///     reads batch dimension specs from the LHS only.
+///   - Contracting dimensions sharded on both inputs are an error (identically sharded ones make the output sharding
+///     ambiguous and require an explicit output sharding); a contracting dimension sharded on only one input is allowed
+///     and its sharding is dropped from the output.
+///   - Result dimension entries are copied from the owning input, and auto mesh axes are stripped from the final
 ///     sharding.
 pub(crate) fn dot_abstract(
     lhs: &ArrayType,
@@ -201,7 +201,7 @@ pub(crate) fn dot_abstract(
         }
         if !accumulation_type_is_compatible(lhs.data_type(), accumulation_type) {
             return Err(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` operand data type `{}` cannot accumulate at data type `{accumulation_type}`",
+                "`{DOT_OPERATION_NAME}` input data type `{}` cannot accumulate at data type `{accumulation_type}`",
                 lhs.data_type(),
             )));
         }
@@ -215,12 +215,12 @@ pub(crate) fn dot_abstract(
 
     if lhs_batching.len() != rhs_batching.len() {
         return Err(TypeError::invalid(format!(
-            "`{DOT_OPERATION_NAME}` batching dimensions have different lengths on the two operands"
+            "`{DOT_OPERATION_NAME}` batching dimensions have different lengths on the two inputs"
         )));
     }
     if lhs_contracting.len() != rhs_contracting.len() {
         return Err(TypeError::invalid(format!(
-            "`{DOT_OPERATION_NAME}` contracting dimensions have different lengths on the two operands"
+            "`{DOT_OPERATION_NAME}` contracting dimensions have different lengths on the two inputs"
         )));
     }
     if lhs_batching.iter().any(|axis| *axis >= lhs_rank) || lhs_contracting.iter().any(|axis| *axis >= lhs_rank) {
@@ -261,31 +261,30 @@ pub(crate) fn dot_abstract(
     let lhs_sharding = lhs.sharding();
     let rhs_sharding = rhs.sharding();
 
-    // Operands unreduced over an Explicit axis are rejected on every path, including the explicit `output_sharding`
+    // Inputs unreduced over an Explicit axis are rejected on every path, including the explicit `output_sharding`
     // bypass: a pending cross-device reduction must be discharged (e.g., through a sharding constraint) before the
     // value is contracted. The check is gated to Explicit axes — a `shard_map` value unreduced over a Manual axis is
-    // the user's to manage. Reduced operands are always legal; this is what lets adjoint dots consume reduced
-    // cotangents.
+    // the user's to manage. Reduced inputs are always legal; this is what lets adjoint dots consume reduced cotangents.
     for sharding in [lhs_sharding, rhs_sharding].into_iter().flatten() {
         if sharding
             .unreduced_axes()
             .iter()
             .any(|axis_name| sharding.mesh().axis_type(axis_name) == Some(MeshAxisType::Explicit))
         {
-            return Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` operands cannot be unreduced")));
+            return Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` inputs cannot be unreduced")));
         }
     }
 
     let mesh = match (lhs_sharding, rhs_sharding) {
         (Some(left), Some(right)) if left.mesh() != right.mesh() => {
-            return Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` operand shardings must use the same mesh")));
+            return Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` input shardings must use the same mesh")));
         }
         (Some(left), _) => Some(left.mesh()),
         (_, Some(right)) => Some(right.mesh()),
         (None, None) => None,
     };
 
-    // A missing operand sharding is treated as fully replicated so that one-sided shardings still propagate.
+    // A missing input sharding is treated as fully replicated so that one-sided shardings still propagate.
     let dimension_of = |sharding: Option<&Sharding>, axis: usize| -> ShardingDimension {
         sharding.map_or(ShardingDimension::Replicated, |sharding| sharding.dimensions()[axis].clone())
     };
@@ -302,7 +301,7 @@ pub(crate) fn dot_abstract(
             && output_sharding.mesh() != mesh
         {
             return Err(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` output sharding must use the same mesh as the operands"
+                "`{DOT_OPERATION_NAME}` output sharding must use the same mesh as the inputs"
             )));
         }
         let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
@@ -372,7 +371,7 @@ pub(crate) fn dot_abstract(
         {
             let left = dimension_of(lhs_sharding, *lhs_axis);
             let right = dimension_of(rhs_sharding, *rhs_axis);
-            // Only Explicit-axis sharding of both contracting operands triggers the ambiguity/consistency errors;
+            // Only Explicit-axis sharding of both contracting inputs triggers the ambiguity/consistency errors;
             // Manual/Auto contracting shardings fall through (handled by `shard_map` / the compiler).
             let both_explicitly_sharded = left.has_explicit_axis(mesh) && right.has_explicit_axis(mesh);
             if both_explicitly_sharded {
@@ -390,7 +389,7 @@ pub(crate) fn dot_abstract(
                          explicit output sharding (e.g., one with unreduced axes) to resolve it"
                 )));
             }
-            // A contracting dimension sharded on only one operand (or only over Manual/Auto axes) is allowed and its
+            // A contracting dimension sharded on only one input (or only over Manual/Auto axes) is allowed and its
             // sharding is dropped from the output, matching JAX (the partitioner inserts the necessary communication).
         }
 

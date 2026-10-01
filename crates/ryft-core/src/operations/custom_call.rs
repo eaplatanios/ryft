@@ -116,7 +116,7 @@ impl From<f64> for CustomCallAttribute {
 ///
 /// Aliasing requires the input and output to describe the same logical array. It allows a backend to reuse the input
 /// buffer for the output without changing Ryft's functional SSA semantics. The indices never include mixed trailing
-/// dimension operands or backend-internal effect tokens.
+/// dimension inputs or backend-internal effect tokens.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomCallInputOutputAlias {
     /// Index of the aliased array input.
@@ -152,34 +152,33 @@ impl Display for CustomCallInputOutputAlias {
     }
 }
 
-/// Behavior a [`CustomCallOperation`] requests when the batching transform maps one of its operands. Ryft cannot
-/// derive a batching rule for an opaque kernel, so the author of the call declares which of the few universally
-/// meaningful strategies applies, using [`with_batching`](CustomCallOperation::with_batching). This mirrors JAX's
-/// `vmap_method` selection on
-/// [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html). A call whose operands are
-/// all replicated never consults this behavior: it is bound unchanged.
+/// Behavior a [`CustomCallOperation`] requests when the batching transform maps one of its inputs. Ryft cannot derive a
+/// batching rule for an opaque kernel, so the author of the call declares which of the few universally meaningful
+/// strategies applies, using [`with_batching`](CustomCallOperation::with_batching). This mirrors JAX's `vmap_method`
+/// selection on [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html). A call whose
+/// inputs are all replicated never consults this behavior: it is bound unchanged.
 ///
 /// Two of JAX's selections are deliberately absent:
 ///
-///   - `expand_dims` (broadcast every operand to a size-1 batch axis and call the kernel once) contradicts Ryft's
-///     input/output aliasing: a replicated operand would enter carrying a size-1 axis while its aliased output must
+///   - `expand_dims` (broadcast every input to a size-1 batch axis and call the kernel once) contradicts Ryft's
+///     input/output aliasing: a replicated input would enter carrying a size-1 axis while its aliased output must
 ///     gain the full batch extent `b`, so the alias would no longer describe one logical array and the buffer could
 ///     not be reused. [`BroadcastAll`](Self::BroadcastAll) is the aliasing-compatible member of that pair.
 ///   - `legacy_vectorized` (a mode in which the kernel silently promises to handle arbitrary leading axes) is an
 ///     XLA-legacy mode that JAX has already removed, so Ryft never introduces it.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum CustomCallBatching {
-    /// Report a [`BatchingError::UnsupportedOperation`] naming the mapped operand. This is the default because a
-    /// foreign kernel's contract is opaque: silently choosing a strategy could execute the kernel on buffers it
-    /// never agreed to accept.
+    /// Report a [`BatchingError::UnsupportedOperation`] naming the mapped input. This is the default because a foreign
+    /// kernel's contract is opaque: silently choosing a strategy could execute the kernel on buffers it never agreed to
+    /// accept.
     #[default]
     Rejected,
 
-    /// Apply the kernel once per batch item through a `scan` whose body performs exactly one unbatched call.
-    /// Mapped operands are realigned to batch axis `0` and sliced one row per iteration, replicated operands become
-    /// invariant loop carries, and the per-iteration results are stacked back on batch axis `0`. The kernel therefore
-    /// observes exactly the buffers it would have seen without the transform, at the cost of `b` sequential calls;
-    /// a side-effecting kernel consequently runs `b` ordered times. The optional `unroll` factor is forwarded to
+    /// Apply the kernel once per batch item through a `scan` whose body performs exactly one unbatched call. Mapped
+    /// inputs are realigned to batch axis `0` and sliced one row per iteration, replicated inputs become invariant loop
+    /// carries, and the per-iteration results are stacked back on batch axis `0`. The kernel therefore observes exactly
+    /// the buffers it would have seen without the transform, at the cost of `b` sequential calls; a side-effecting
+    /// kernel consequently runs `b` ordered times. The optional `unroll` factor is forwarded to
     /// [`ScanOperation::with_unroll`], and is a lowering-only knob that trades code size for loop overhead.
     Sequential {
         /// Lowering-only number of body copies emitted per loop trip, or [`None`] to keep one call per trip. The
@@ -187,10 +186,10 @@ pub enum CustomCallBatching {
         unroll: Option<usize>,
     },
 
-    /// Align every operand to batch axis `0` and call the kernel exactly once on batch-prefixed buffers, declaring
-    /// batch-prefixed output types. The kernel must itself understand the leading batch axis. Replicated operands
-    /// are materialized across the batch first, so every operand and result carries the same leading extent, aliases
-    /// stay type-preserving, and a side-effecting kernel runs exactly once.
+    /// Align every input to batch axis `0` and call the kernel exactly once on batch-prefixed buffers, declaring
+    /// batch-prefixed output types. The kernel must itself understand the leading batch axis. Replicated inputs are
+    /// materialized across the batch first, so every input and result carries the same leading extent, aliases stay
+    /// type-preserving, and a side-effecting kernel runs exactly once.
     BroadcastAll,
 }
 
@@ -205,37 +204,37 @@ impl Display for CustomCallBatching {
     }
 }
 
-/// Names one packed custom-call operand axis whose live extent is carried by another, already-declared operand.
-/// The bound [`DimensionVariable`] gives the ragged dimension stable identity across transformation replays, while
-/// `extent_operand_index` identifies the ordinary integer scalar operand that the unbatched foreign kernel receives.
+/// Names one packed custom-call input axis whose live extent is carried by another, already-declared input. The bound
+/// [`DimensionVariable`] gives the ragged dimension stable identity across transformation replays, while
+/// `extent_input_index` identifies the ordinary integer scalar input that the unbatched foreign kernel receives.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomCallRaggedInputBinding {
     /// Name used by output bindings to refer to this input binding.
     name: String,
 
-    /// Index of the packed array operand.
-    operand_index: usize,
+    /// Index of the packed array input.
+    input_index: usize,
 
-    /// Axis of the packed array operand whose live prefix is ragged.
+    /// Axis of the packed array input whose live prefix is ragged.
     axis: usize,
 
-    /// Index of the existing scalar integer operand carrying the live extent.
-    extent_operand_index: usize,
+    /// Index of the existing scalar integer input carrying the live extent.
+    extent_input_index: usize,
 
     /// Stable identity and runtime bounds of the ragged dimension.
     dimension: DimensionVariable,
 }
 
 impl CustomCallRaggedInputBinding {
-    /// Creates a named input binding between one packed operand axis and one existing scalar extent operand.
+    /// Creates a named input binding between one packed input axis and one existing scalar extent input.
     pub fn new<N: Into<String>>(
         name: N,
-        operand_index: usize,
+        input_index: usize,
         axis: usize,
-        extent_operand_index: usize,
+        extent_input_index: usize,
         dimension: DimensionVariable,
     ) -> Self {
-        Self { name: name.into(), operand_index, axis, extent_operand_index, dimension }
+        Self { name: name.into(), input_index, axis, extent_input_index, dimension }
     }
 
     /// Returns the binding name used by output bindings.
@@ -244,22 +243,22 @@ impl CustomCallRaggedInputBinding {
         self.name.as_str()
     }
 
-    /// Returns the index of the packed array operand.
+    /// Returns the index of the packed array input.
     #[inline]
-    pub fn operand_index(&self) -> usize {
-        self.operand_index
+    pub fn input_index(&self) -> usize {
+        self.input_index
     }
 
-    /// Returns the bound axis of the packed array operand.
+    /// Returns the bound axis of the packed array input.
     #[inline]
     pub fn axis(&self) -> usize {
         self.axis
     }
 
-    /// Returns the index of the existing operand carrying the live extent.
+    /// Returns the index of the existing input carrying the live extent.
     #[inline]
-    pub fn extent_operand_index(&self) -> usize {
-        self.extent_operand_index
+    pub fn extent_input_index(&self) -> usize {
+        self.extent_input_index
     }
 
     /// Returns the stable identity and runtime bounds of the ragged dimension.
@@ -273,8 +272,8 @@ impl Display for CustomCallRaggedInputBinding {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{}:operand({})@{}<=operand({}):{}",
-            self.name, self.operand_index, self.axis, self.extent_operand_index, self.dimension,
+            "{}:input({})@{}<=input({}):{}",
+            self.name, self.input_index, self.axis, self.extent_input_index, self.dimension,
         )
     }
 }
@@ -322,21 +321,21 @@ impl Display for CustomCallRaggedOutputBinding {
 }
 
 /// Declared calling convention that lets [`CustomCallOperation`] discharge one level of ragged batching without
-/// changing the foreign kernel's signature. Input bindings point at extent operands that already exist in the call,
-/// and output bindings either preserve one of those bindings, consume raggedness, or point at an existing extent
-/// output. Declaring this contract promises that no live output element depends on padded input elements.
+/// changing the foreign kernel's signature. Input bindings point at extent inputs that already exist in the call, and
+/// output bindings either preserve one of those bindings, consume raggedness, or point at an existing extent output.
+/// Declaring this contract promises that no live output element depends on padded input elements.
 ///
-/// The contract intentionally supports one ragged axis per operand and one ragged batching level. A second ragged
+/// The contract intentionally supports one ragged axis per input and one ragged batching level. A second ragged
 /// batching level is rejected because representing it requires associating each ragged axis with another independent
 /// extent value. Ordinary dense `BroadcastAll` batching remains composable: the contract records every accumulated
-/// leading dense axis so that its existing extent operands and outputs retain their complete axis mapping. The
+/// leading dense axis so that its existing extent inputs and outputs retain their complete axis mapping. The
 /// declaration supplies no differentiation semantics: ragged custom calls continue to follow the ordinary custom-call
 /// differentiation contract. Padding remains unspecified downstream; the result [`RaggedAxis`] metadata is what lets
 /// extent-aware operations avoid observing it.
 ///
 /// Runtime extent values must lie within the declared [`DimensionVariable`] bounds and must not exceed their packed
 /// physical axis. Eager foreign-kernel implementations are responsible for checking that precondition when decoding
-/// their ordinary extent operands and outputs.
+/// their ordinary extent inputs and outputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomCallRaggedContract {
     /// Named packed-input bindings, in declaration order.
@@ -353,11 +352,11 @@ pub struct CustomCallRaggedContract {
 }
 
 impl CustomCallRaggedContract {
-    /// Creates a ragged calling convention over existing custom-call operands and outputs.
+    /// Creates a ragged calling convention over existing custom-call inputs and outputs.
     ///
     /// # Parameters
     ///
-    ///   - `input_bindings`: Named packed-input axes and their existing scalar extent operands.
+    ///   - `input_bindings`: Named packed-input axes and their existing scalar extent inputs.
     ///   - `output_bindings`: One positional relationship for every declared custom-call output.
     pub fn new(
         input_bindings: Vec<CustomCallRaggedInputBinding>,
@@ -378,8 +377,8 @@ impl CustomCallRaggedContract {
         self.output_bindings.as_slice()
     }
 
-    /// Returns a contract describing the `BroadcastAll` call after all operands and outputs gain another leading
-    /// dense batch dimension.
+    /// Returns a contract describing the `BroadcastAll` call after all inputs and outputs gain another leading dense
+    /// batch dimension.
     fn batch_prefixed(&self, discharges_ragged: bool) -> Self {
         let mut contract = self.clone();
         for binding in &mut contract.input_bindings {
@@ -397,8 +396,8 @@ impl CustomCallRaggedContract {
         contract
     }
 
-    /// Returns a contract recording that active ragged bindings were discharged without changing operand or output
-    /// axes. This transition is used by `Sequential`, whose scan body sees one unbatched slice at a time.
+    /// Returns a contract recording that active ragged bindings were discharged without changing input or output axes.
+    /// This transition is used by `Sequential`, whose scan body sees one unbatched slice at a time.
     fn ragged_discharged(&self) -> Self {
         let mut contract = self.clone();
         contract.ragged_discharged = true;
@@ -427,7 +426,7 @@ impl CustomCallRaggedContract {
         consumed
     }
 
-    /// Returns the complete extent-axis mapping for a new ragged level whose packed data and extent operand carry the
+    /// Returns the complete extent-axis mapping for a new ragged level whose packed data and extent input carry the
     /// current mapped axis at `data_batch_axis` and `extent_batch_axis`, respectively.
     fn active_extent_axes(&self, data_batch_axis: usize, extent_batch_axis: usize) -> Vec<usize> {
         (0..=self.batch_prefix_count)
@@ -487,7 +486,7 @@ impl Display for CustomCallRaggedContract {
 
 /// Universe-neutral view of one custom-call array input during ragged contract validation.
 struct CustomCallRaggedInput<'a, V> {
-    /// Packed value used to verify the declared extent operand.
+    /// Packed value used to verify the declared extent input.
     value: &'a V,
 
     /// Normalized position of the mapped batch axis.
@@ -508,15 +507,15 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 /// its output types are declared up front instead of inferred, and typed [`CustomCallAttribute`]s are forwarded
 /// verbatim to the kernel as its configuration.
 ///
-/// This is an [`ArrayType`] operation that participates in two operand contracts. In homogeneous array programs it
-/// accepts only the foreign kernel's array operands, so every declared output must have a static shape. As a mixed
-/// member of the array IR (through [`MemberOperation<ArrayIrType>`]) it additionally accepts one trailing first-class
-/// dimension operand per dynamic axis occurrence in the declared outputs, ordered first by output and then by axis,
-/// and type inference verifies that each operand defines the exact variable referenced by its corresponding output
-/// axis. These logical result extents do not enter the foreign kernel ABI: only the leading array operands are passed
-/// to the kernel. Eager execution and backend lowering use the trailing operands to verify or attach the declared
-/// logical sizes to the returned buffers. Both contracts share one payload with the same target, output declarations,
-/// attributes, effects, rendering, and backend-kernel semantics.
+/// This is an [`ArrayType`] operation that participates in two input contracts. In homogeneous array programs it
+/// accepts only the foreign kernel's array inputs, so every declared output must have a static shape. As a mixed member
+/// of the array IR (through [`MemberOperation<ArrayIrType>`]) it additionally accepts one trailing first-class
+/// dimension input per dynamic axis occurrence in the declared outputs, ordered first by output and then by axis, and
+/// type inference verifies that each input defines the exact variable referenced by its corresponding output axis.
+/// These logical result extents do not enter the foreign kernel ABI: only the leading array inputs are passed to the
+/// kernel. Eager execution and backend lowering use the trailing inputs to verify or attach the declared logical sizes
+/// to the returned buffers. Both contracts share one payload with the same target, output declarations, attributes,
+/// effects, rendering, and backend-kernel semantics.
 ///
 /// The XLA backend lowers this operation to a
 /// [`stablehlo.custom_call`](https://openxla.org/stablehlo/spec#custom_call) using the typed FFI calling convention
@@ -527,21 +526,21 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 /// Because the kernel is opaque, Ryft cannot derive its transform rules. Differentiating it reports an error directing
 /// users to call the kernel through a [`custom_function`](crate::custom_function) with derivative rules (refer to
 /// [`CustomFunction::from_custom_call`](crate::CustomFunction::from_custom_call)), which supply the missing derivative.
-/// Unless that function also has a batching rule, it structurally batches its own primal region, so a mapped operand
-/// reaches this same operation and meets this same batching contract. Batching a call whose operands are all replicated
-/// binds it unchanged, because a region-free foreign kernel cannot observe the transform's named axis. A mapped operand
+/// Unless that function also has a batching rule, it structurally batches its own primal region, so a mapped input
+/// reaches this same operation and meets this same batching contract. Batching a call whose inputs are all replicated
+/// binds it unchanged, because a region-free foreign kernel cannot observe the transform's named axis. A mapped input
 /// is instead governed by the [`CustomCallBatching`] behavior selected with [`with_batching`](Self::with_batching): the
-/// default [`Rejected`](CustomCallBatching::Rejected) reports an error naming that operand,
+/// default [`Rejected`](CustomCallBatching::Rejected) reports an error naming that input,
 /// [`Sequential`](CustomCallBatching::Sequential) applies the kernel once per batch item through a `scan`, and
 /// [`BroadcastAll`](CustomCallBatching::BroadcastAll) hands the kernel batch-prefixed buffers in a single call. A call
-/// that uses explicit packed buffers and ordinary scalar extent operands may additionally declare a
+/// that uses explicit packed buffers and ordinary scalar extent inputs may additionally declare a
 /// [`CustomCallRaggedContract`] with [`with_ragged_contract`](Self::with_ragged_contract). The declaration never adds,
-/// removes, hides, or reorders operands or outputs. It only lets batching verify that the exact extent value attached
-/// to an input [`RaggedAxis`] is already present at the declared operand index, use the selected [`CustomCallBatching`]
+/// removes, hides, or reorders inputs or outputs. It only lets batching verify that the exact extent value attached to
+/// an input [`RaggedAxis`] is already present at the declared input index, use the selected [`CustomCallBatching`]
 /// strategy unchanged, and attach preserved or fresh ragged metadata to the declared outputs. Calls without this
-/// declaration retain the default ragged-input rejection. The contract deliberately supports one ragged axis per
-/// operand and one ragged batching level; differentiation remains governed by the same custom JVP/VJP wrappers as dense
-/// calls. Marking the call as side-effecting via [`with_side_effect`](Self::with_side_effect) reports
+/// declaration retain the default ragged-input rejection. The contract deliberately supports one ragged axis per input
+/// and one ragged batching level; differentiation remains governed by the same custom JVP/VJP wrappers as dense calls.
+/// Marking the call as side-effecting via [`with_side_effect`](Self::with_side_effect) reports
 /// [`EffectClass::OrderedIo`], which keeps the call alive through dead-code elimination and preserves its execution
 /// order relative to other ordered I/O effects across every participating device; the lowered custom call is then also
 /// marked `has_side_effect = true`. [`with_effect_class`](Self::with_effect_class) selects a different contract:
@@ -560,7 +559,7 @@ pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 /// Backends that cannot execute foreign kernels (like the reference array backend) reject interpretation with a
 /// clear error instead of guessing.
 ///
-/// Array layouts come from the canonical [`ArrayType`] descriptors of the operands and results. Portable flat-array
+/// Array layouts come from the canonical [`ArrayType`] descriptors of the inputs and results. Portable flat-array
 /// buffer aliases are declared with [`CustomCallInputOutputAlias`]. Backend-specific vocabulary must never grow on
 /// this payload: encodings such as XLA's FFI API version, `backend_config` representation, tuple alias paths, result
 /// tiling attributes, or called-computation references belong in the owning backend's lowering (or in a backend-owned
@@ -582,7 +581,7 @@ pub struct CustomCallOperation {
     /// Observable effect of the call, or `None` for a pure call.
     effect_class: Option<EffectClass>,
 
-    /// Behavior requested when the batching transform maps one of this call's operands.
+    /// Behavior requested when the batching transform maps one of this call's inputs.
     batching: CustomCallBatching,
 
     /// Optional declared calling convention for discharging one level of ragged batching.
@@ -646,7 +645,7 @@ impl CustomCallOperation {
     }
 
     /// Returns the [`CustomCallBatching`] behavior requested when the batching transform maps one of this call's
-    /// operands.
+    /// inputs.
     #[inline]
     pub fn batching(&self) -> CustomCallBatching {
         self.batching
@@ -707,8 +706,8 @@ impl CustomCallOperation {
     }
 
     /// Returns this [`CustomCallOperation`] requesting the provided [`CustomCallBatching`] behavior when the batching
-    /// transform maps one of its operands. Refer to the documentation of [`CustomCallBatching`] for the available
-    /// behaviors and for why the default rejects mapped operands.
+    /// transform maps one of its inputs. Refer to the documentation of [`CustomCallBatching`] for the available
+    /// behaviors and for why the default rejects mapped inputs.
     #[inline]
     pub fn with_batching(mut self, batching: CustomCallBatching) -> Self {
         self.batching = batching;
@@ -716,7 +715,7 @@ impl CustomCallOperation {
     }
 
     /// Returns this operation carrying the provided declared ragged calling convention. Structural validation occurs
-    /// during type inference, when the operand types are available.
+    /// during type inference, when the input types are available.
     #[inline]
     pub fn with_ragged_contract(mut self, contract: CustomCallRaggedContract) -> Self {
         self.ragged_contract = Some(contract);
@@ -740,8 +739,8 @@ impl CustomCallOperation {
         })
     }
 
-    /// Returns the number of trailing first-class output-extent operands this call consumes in the mixed universe,
-    /// which is one per dynamic axis occurrence across its declared outputs.
+    /// Returns the number of trailing first-class output-extent inputs this call consumes in the mixed universe, which
+    /// is one per dynamic axis occurrence across its declared outputs.
     fn dynamic_output_dimension_count(&self) -> usize {
         self.output_types
             .iter()
@@ -763,7 +762,7 @@ impl CustomCallOperation {
     ///
     /// # Parameters
     ///
-    ///   - `aligned_input_types`: Packed types of this call's array operands after alignment to the batch axis.
+    ///   - `aligned_input_types`: Packed types of this call's array inputs after alignment to the batch axis.
     ///   - `batch_dimension`: Mapped-axis [`Dimension`] inserted as each output's new leading axis.
     ///   - `axis_sharding`: Placement assigned to the inserted axis of outputs that carry sharding metadata.
     fn batch_prefixed_output_types(
@@ -811,12 +810,12 @@ impl CustomCallOperation {
             .collect()
     }
 
-    /// Returns the [`BatchingError`] reported when operand `index` carries the mapped `batch_axis` and this call has
-    /// no way to thread that axis through its opaque kernel.
-    fn mapped_operand_error(&self, index: usize, batch_axis: BatchAxis) -> BatchingError {
+    /// Returns the [`BatchingError`] reported when input `index` carries the mapped `batch_axis` and this call has no
+    /// way to thread that axis through its opaque kernel.
+    fn mapped_input_error(&self, index: usize, batch_axis: BatchAxis) -> BatchingError {
         BatchingError::UnsupportedOperation {
             message: format!(
-                "custom call `{}` has no batching rule for operand {index} mapped at batch axis {}; invoke a kernel \
+                "custom call `{}` has no batching rule for input {index} mapped at batch axis {}; invoke a kernel \
                  that understands the batch axis, or select an explicit batching behavior with \
                  `CustomCallOperation::with_batching`",
                 self.target_name,
@@ -838,7 +837,7 @@ impl CustomCallOperation {
         }
     }
 
-    /// Validates flat input/output aliases against the array operands of this operation.
+    /// Validates flat input/output aliases against the array inputs of this operation.
     fn validate_input_output_aliases(&self, input_types: &[&ArrayType]) -> Result<(), TypeError> {
         for alias in &self.input_output_aliases {
             let Some(input_type) = input_types.get(alias.input_index) else {
@@ -929,50 +928,50 @@ impl CustomCallOperation {
             }
             if let Some(existing) = contract.input_bindings[..binding_index]
                 .iter()
-                .find(|existing| existing.operand_index == binding.operand_index)
+                .find(|existing| existing.input_index == binding.input_index)
             {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` ragged input bindings `{}` and `{}` both bind operand {}",
-                    existing.name, binding.name, binding.operand_index,
+                    "`{CUSTOM_CALL_OPERATION_NAME}` ragged input bindings `{}` and `{}` both bind input {}",
+                    existing.name, binding.name, binding.input_index,
                 )));
             }
             if let Some(existing) = contract.input_bindings[..binding_index].iter().find(|existing| {
-                existing.dimension == binding.dimension && existing.extent_operand_index != binding.extent_operand_index
+                existing.dimension == binding.dimension && existing.extent_input_index != binding.extent_input_index
             }) {
                 return Err(TypeError::invalid(format!(
                     "`{CUSTOM_CALL_OPERATION_NAME}` ragged input bindings `{}` and `{}` reuse dimension `{}` with \
-                     different extent operands {} and {}",
+                     different extent inputs {} and {}",
                     existing.name,
                     binding.name,
                     binding.dimension,
-                    existing.extent_operand_index,
-                    binding.extent_operand_index,
+                    existing.extent_input_index,
+                    binding.extent_input_index,
                 )));
             }
-            let Some(input_type) = input_types.get(binding.operand_index) else {
+            let Some(input_type) = input_types.get(binding.input_index) else {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` ragged input binding `{}` refers to operand {} but the call has \
+                    "`{CUSTOM_CALL_OPERATION_NAME}` ragged input binding `{}` refers to input {} but the call has \
                      {} array inputs",
                     binding.name,
-                    binding.operand_index,
+                    binding.input_index,
                     input_types.len(),
                 )));
             };
-            self.validate_ragged_axis("input", binding.operand_index, binding.axis, input_type, &binding.dimension)?;
-            let Some(extent_type) = input_types.get(binding.extent_operand_index) else {
+            self.validate_ragged_axis("input", binding.input_index, binding.axis, input_type, &binding.dimension)?;
+            let Some(extent_type) = input_types.get(binding.extent_input_index) else {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` ragged input binding `{}` refers to extent operand {} but the \
+                    "`{CUSTOM_CALL_OPERATION_NAME}` ragged input binding `{}` refers to extent input {} but the \
                      call has {} array inputs",
                     binding.name,
-                    binding.extent_operand_index,
+                    binding.extent_input_index,
                     input_types.len(),
                 )));
             };
             if extent_type.rank() != expected_extent_rank || !extent_type.data_type().is_integer() {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` ragged input binding `{}` requires extent operand {} to be \
+                    "`{CUSTOM_CALL_OPERATION_NAME}` ragged input binding `{}` requires extent input {} to be \
                      {expected_extent_type} but got `{extent_type}`",
-                    binding.name, binding.extent_operand_index,
+                    binding.name, binding.extent_input_index,
                 )));
             }
         }
@@ -997,7 +996,7 @@ impl CustomCallOperation {
                     )?;
                     if let Some(alias) =
                         self.input_output_aliases.iter().find(|alias| alias.output_index == output_index)
-                        && (alias.input_index != input_binding.operand_index || *axis != input_binding.axis)
+                        && (alias.input_index != input_binding.input_index || *axis != input_binding.axis)
                     {
                         return Err(TypeError::invalid(format!(
                             "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` conflicts with preserved ragged binding \
@@ -1010,7 +1009,7 @@ impl CustomCallOperation {
                 CustomCallRaggedOutputBinding::Consumed => {
                     if let Some(alias) = self.input_output_aliases.iter().find(|alias| {
                         alias.output_index == output_index
-                            && contract.input_bindings.iter().any(|binding| binding.operand_index == alias.input_index)
+                            && contract.input_bindings.iter().any(|binding| binding.input_index == alias.input_index)
                     }) {
                         return Err(TypeError::invalid(format!(
                             "`{CUSTOM_CALL_OPERATION_NAME}` consumed ragged output {output_index} cannot retain alias \
@@ -1072,7 +1071,7 @@ impl CustomCallOperation {
                     }
                     if let Some(alias) = self.input_output_aliases.iter().find(|alias| {
                         alias.output_index == output_index
-                            && contract.input_bindings.iter().any(|binding| binding.operand_index == alias.input_index)
+                            && contract.input_bindings.iter().any(|binding| binding.input_index == alias.input_index)
                     }) {
                         return Err(TypeError::invalid(format!(
                             "`{CUSTOM_CALL_OPERATION_NAME}` fresh ragged output {output_index} cannot retain alias \
@@ -1100,11 +1099,11 @@ impl CustomCallOperation {
         self.validate_ragged_contract(&inputs.iter().map(|input| &input.physical_type).collect::<Vec<_>>())?;
 
         let mut active = Vec::new();
-        for (operand_index, input) in inputs.iter().enumerate() {
+        for (input_index, input) in inputs.iter().enumerate() {
             if input.ragged_axes.len() > 1 {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
-                        "custom call `{}` supports at most one ragged axis per operand but operand {operand_index} \
+                        "custom call `{}` supports at most one ragged axis per input but input {input_index} \
                          carries {}",
                         self.target_name,
                         input.ragged_axes.len(),
@@ -1117,7 +1116,7 @@ impl CustomCallOperation {
             let Some(batch_axis) = input.batch_axis else {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
-                        "custom call `{}` cannot discharge ragged operand {operand_index} without a mapped batch axis",
+                        "custom call `{}` cannot discharge ragged input {input_index} without a mapped batch axis",
                         self.target_name,
                     ),
                 });
@@ -1126,11 +1125,11 @@ impl CustomCallOperation {
             let Some(binding) = contract
                 .input_bindings
                 .iter()
-                .find(|binding| binding.operand_index == operand_index && binding.axis == logical_axis)
+                .find(|binding| binding.input_index == input_index && binding.axis == logical_axis)
             else {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
-                        "custom call `{}` ragged contract does not bind operand {operand_index} axis {logical_axis}",
+                        "custom call `{}` ragged contract does not bind input {input_index} axis {logical_axis}",
                         self.target_name,
                     ),
                 });
@@ -1138,8 +1137,8 @@ impl CustomCallOperation {
             if ragged_axis.dimension() != &binding.dimension {
                 return Err(BatchingError::InvalidBatchMetadata {
                     message: format!(
-                        "custom call `{}` ragged input binding `{}` expects dimension `{}` but operand \
-                         {operand_index} carries `{}`",
+                        "custom call `{}` ragged input binding `{}` expects dimension `{}` but input \
+                         {input_index} carries `{}`",
                         self.target_name,
                         binding.name,
                         binding.dimension,
@@ -1147,12 +1146,12 @@ impl CustomCallOperation {
                     ),
                 });
             }
-            let extent_operand = &inputs[binding.extent_operand_index];
-            let Some(extent_batch_axis) = extent_operand.batch_axis else {
+            let extent_input = &inputs[binding.extent_input_index];
+            let Some(extent_batch_axis) = extent_input.batch_axis else {
                 return Err(BatchingError::InvalidBatchMetadata {
                     message: format!(
-                        "custom call `{}` ragged input binding `{}` requires mapped extent operand {}",
-                        self.target_name, binding.name, binding.extent_operand_index,
+                        "custom call `{}` ragged input binding `{}` requires mapped extent input {}",
+                        self.target_name, binding.name, binding.extent_input_index,
                     ),
                 });
             };
@@ -1160,7 +1159,7 @@ impl CustomCallOperation {
             if ragged_axis.extent_axes() != expected_extent_axes {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
-                        "custom call `{}` supports one ragged batching level, but operand {operand_index} ragged \
+                        "custom call `{}` supports one ragged batching level, but input {input_index} ragged \
                          dimension `{}` has extent-axis mapping `{:?}` instead of `{:?}`",
                         self.target_name,
                         ragged_axis.dimension(),
@@ -1169,12 +1168,12 @@ impl CustomCallOperation {
                     ),
                 });
             }
-            if extent_operand.value != ragged_axis.extents() {
+            if extent_input.value != ragged_axis.extents() {
                 return Err(BatchingError::InvalidBatchMetadata {
                     message: format!(
-                        "custom call `{}` ragged input binding `{}` requires operand {} to be the exact extent value \
-                         carried by operand {operand_index}",
-                        self.target_name, binding.name, binding.extent_operand_index,
+                        "custom call `{}` ragged input binding `{}` requires input {} to be the exact extent value \
+                         carried by input {input_index}",
+                        self.target_name, binding.name, binding.extent_input_index,
                     ),
                 });
             }
@@ -1193,7 +1192,7 @@ impl CustomCallOperation {
         {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "custom call `{}` does not support bounded ragged dimension `{}` on operand {}",
+                    "custom call `{}` does not support bounded ragged dimension `{}` on input {}",
                     self.target_name,
                     ragged_axis.dimension(),
                     index,
@@ -1249,7 +1248,7 @@ impl CustomCallOperation {
                             contract.input_bindings.iter().find(|binding| binding.name == *input_binding).unwrap();
                         RaggedAxis::new(
                             *axis + 1,
-                            inputs[binding.extent_operand_index].value().clone(),
+                            inputs[binding.extent_input_index].value().clone(),
                             source.dimension().clone(),
                             extent_axes.clone(),
                         )
@@ -1319,7 +1318,7 @@ impl CustomCallOperation {
                             contract.input_bindings.iter().find(|binding| binding.name == *input_binding).unwrap();
                         RaggedAxis::new(
                             *axis + 1,
-                            inputs[binding.extent_operand_index].value().clone(),
+                            inputs[binding.extent_input_index].value().clone(),
                             source.dimension().clone(),
                             extent_axes.clone(),
                         )
@@ -1369,11 +1368,11 @@ impl Operation for CustomCallOperation {
         self.validate_ragged_contract(&input_types.iter().collect::<Vec<_>>())?;
 
         // The homogeneous universe has no way to ground a dynamic result extent: only the mixed form accepts the
-        // trailing first-class dimension operands that define one.
+        // trailing first-class dimension inputs that define one.
         for output_type in &self.output_types {
             if output_type.static_shape().is_none() {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` requires explicit result-extent operands for dynamic output type \
+                    "`{CUSTOM_CALL_OPERATION_NAME}` requires explicit result-extent inputs for dynamic output type \
                      {output_type}",
                 )));
             }
@@ -1460,33 +1459,33 @@ impl<C: Context<Type = ArrayType, Operation: From<CustomCallOperation>>> Partial
 {
 }
 
-// Homogeneous-array batching rule for [`CustomCallOperation`]. A foreign kernel is opaque, so Ryft cannot derive how
-// a batch axis threads through it. A call whose operands are *all replicated* is nevertheless bound unchanged through
-// the parent context and reports replicated outputs, matching JAX, which only invokes a batching rule once some
-// operand is actually mapped.
+// Homogeneous-array batching rule for [`CustomCallOperation`]. A foreign kernel is opaque, so Ryft cannot derive how a
+// batch axis threads through it. A call whose inputs are *all replicated* is nevertheless bound unchanged through the
+// parent context and reports replicated outputs, matching JAX, which only invokes a batching rule once some input is
+// actually mapped.
 //
 // That all-replicated shortcut is sound *for this operation specifically* because a custom call is region-free by
-// construction: [`Operation::infer_output_types`] rejects every attached region, so the kernel is a leaf whose only
-// observable inputs are its operands. A foreign kernel therefore cannot observe the transform's named axis, and
-// running it unchanged over replicated operands computes exactly what each batch item would have computed on its
-// own. The shortcut must never be generalized to region-carrying operations, because a region can contain a
-// named-axis operation whose value differs per batch item even when every operand of the enclosing instruction is
-// replicated. `.tasks/plan_custom_derivative_batching_axis_parity.md` records the JAX fixture pinning that
-// counterexample (`vmap` with `in_axes=None`, an explicit extent, and a named-axis index still produces
-// `[0, 1, 2]`), which is why the custom-function wrappers always batch their regions structurally.
+// construction: [`Operation::infer_output_types`] rejects every attached region, so the kernel is a leaf that observes
+// only its instruction inputs. A foreign kernel therefore cannot observe the transform's named axis, and running it
+// unchanged over replicated inputs computes exactly what each batch item would have computed on its own. The shortcut
+// must never be generalized to region-carrying operations, because a region can contain a named-axis operation whose
+// value differs per batch item even when every input of the enclosing instruction is replicated.
+// `.tasks/plan_custom_derivative_batching_axis_parity.md` records the JAX fixture pinning that counterexample (`vmap`
+// with `in_axes=None`, an explicit extent, and a named-axis index still produces `[0, 1, 2]`), which is why the
+// custom-function wrappers always batch their regions structurally.
 //
-// A mapped operand is instead governed by the call's own [`CustomCallBatching`] behavior:
-// [`Rejected`](CustomCallBatching::Rejected) reports a [`BatchingError::UnsupportedOperation`] naming that operand
-// and its mapped axis, [`Sequential`](CustomCallBatching::Sequential) stages one [`ScanOperation`] whose body
-// performs a single unbatched call (mapped operands realigned to batch axis `0` and sliced per iteration, replicated
-// operands threaded as invariant carries), and [`BroadcastAll`](CustomCallBatching::BroadcastAll) aligns every
-// operand to batch axis `0` and rebinds one call whose declared outputs gain the same leading batch dimension. Both
-// mapped behaviors keep the staged program's size independent of the batch extent and compose with nested batching,
-// because the rewritten instruction is bound through the parent context and carries the same behavior selection.
+// A mapped input is instead governed by the call's own [`CustomCallBatching`] behavior:
+// [`Rejected`](CustomCallBatching::Rejected) reports a [`BatchingError::UnsupportedOperation`] naming that input and
+// its mapped axis, [`Sequential`](CustomCallBatching::Sequential) stages one [`ScanOperation`] whose body performs a
+// single unbatched call (mapped inputs realigned to batch axis `0` and sliced per iteration, replicated inputs threaded
+// as invariant carries), and [`BroadcastAll`](CustomCallBatching::BroadcastAll) aligns every input to batch axis `0`
+// and rebinds one call whose declared outputs gain the same leading batch dimension. Both mapped behaviors keep the
+// staged program's size independent of the batch extent and compose with nested batching, because the rewritten
+// instruction is bound through the parent context and carries the same behavior selection.
 //
 // [`Sequential`](CustomCallBatching::Sequential) requires a statically known mapped extent: the scan trip count is a
 // host `usize` in this universe. The mixed [`ArrayIrType`] rule below owns the dynamic-extent case, where the trip
-// count is a first-class dimension operand.
+// count is a first-class dimension input.
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for CustomCallOperation
 where
@@ -1526,10 +1525,10 @@ where
         };
 
         match self.batching {
-            CustomCallBatching::Rejected => Err(self.mapped_operand_error(index, mapped.batch_axis())),
+            CustomCallBatching::Rejected => Err(self.mapped_input_error(index, mapped.batch_axis())),
             CustomCallBatching::Sequential { unroll } => {
-                // Realign every mapped operand to batch axis 0 so the scan consumes one per-item row per iteration,
-                // and keep replicated operands as invariant loop carries.
+                // Realign every mapped input to batch axis 0 so the scan consumes one per-item row per iteration, and
+                // keep replicated inputs as invariant loop carries.
                 let mut carry_indices = Vec::new();
                 let mut stacked_indices = Vec::new();
                 let mut aligned = Vec::with_capacity(inputs.len());
@@ -1547,26 +1546,26 @@ where
                 // returning the unchanged carries followed by that item's outputs.
                 let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
                 builder.add_input(ArrayType::scalar(DataType::I64));
-                let mut operands = vec![None; inputs.len()];
+                let mut call_inputs = vec![None; inputs.len()];
                 let carry_inputs = carry_indices
                     .iter()
                     .map(|&index| {
                         let input_type = aligned[index].r#type().unbatched(aligned[index].batch_axis())?;
                         let input = builder.add_input(input_type);
-                        operands[index] = Some(input);
+                        call_inputs[index] = Some(input);
                         Ok(input)
                     })
                     .collect::<Result<Vec<_>, BatchingError>>()?;
                 for &index in &stacked_indices {
                     let input_type = aligned[index].r#type().unbatched(aligned[index].batch_axis())?;
-                    operands[index] = Some(builder.add_input(input_type));
+                    call_inputs[index] = Some(builder.add_input(input_type));
                 }
-                let operands = operands.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+                let call_inputs = call_inputs.into_iter().map(Option::unwrap).collect::<Vec<_>>();
                 let ragged_contract = self.ragged_contract.as_ref().map(|contract| {
                     if active_ragged_bindings.is_empty() { contract.clone() } else { contract.ragged_discharged() }
                 });
                 let operation = Self { ragged_contract, ..self.clone() };
-                let outputs = builder.add_instruction(operation, Vec::new(), operands, None)?.to_vec();
+                let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
                 let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
                 let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
                     body_outputs,
@@ -1642,9 +1641,9 @@ impl_differentiable_operation! {
     transpose = @nonlinear,
 }
 
-// In the mixed array/dimension universe the call additionally consumes one trailing first-class dimension operand per
+// In the mixed array/dimension universe the call additionally consumes one trailing first-class dimension input per
 // dynamic axis occurrence across its declared outputs (ordered by output, then by axis), and type inference verifies
-// that each operand defines exactly the variable referenced by its output axis. The trailing operands never reach the
+// that each input defines exactly the variable referenced by its output axis. The trailing inputs never reach the
 // foreign kernel; they only ground the declared logical result extents.
 impl MemberOperation<ArrayIrType> for CustomCallOperation {
     fn infer_parent_region_input_types(
@@ -1684,7 +1683,7 @@ impl MemberOperation<ArrayIrType> for CustomCallOperation {
             let actual_variable = <&crate::arrays::DimensionType>::try_from(input_type)?.variable();
             if actual_variable != expected_variable {
                 return Err(TypeError::invalid(format!(
-                    "`{CUSTOM_CALL_OPERATION_NAME}` output-extent operand defines dimension variable \
+                    "`{CUSTOM_CALL_OPERATION_NAME}` output-extent input defines dimension variable \
                      `{actual_variable}`, but the corresponding declared output axis refers to \
                      `{expected_variable}`",
                 )));
@@ -1702,9 +1701,9 @@ impl MemberOperation<ArrayIrType> for CustomCallOperation {
     }
 }
 
-// Mixed-universe interpretation splits the operands into the kernel's array inputs and the trailing declared result
+// Mixed-universe interpretation splits the inputs into the kernel's array inputs and the trailing declared result
 // extents, runs the kernel through the projected array value family, and verifies that every dynamic output axis has
-// exactly the extent its operand declared before lifting the outputs back into the parent value family.
+// exactly the extent its input declared before lifting the outputs back into the parent value family.
 impl<C> MemberInterpretableOperation<C> for CustomCallOperation
 where
     C: Domain<
@@ -1746,7 +1745,7 @@ where
                         return Err(ProgramError::InvalidArgument {
                             message: format!(
                                 "`{CUSTOM_CALL_OPERATION_NAME}` output {output_index} axis {axis} has extent \
-                                 {actual_extent}, but its explicit extent operand is {expected_extent}",
+                                 {actual_extent}, but its explicit extent input is {expected_extent}",
                             ),
                         });
                     }
@@ -1760,7 +1759,7 @@ where
 // Mixed array/dimension batching rule for [`CustomCallOperation`]. It applies the same all-replicated shortcut and
 // the same [`CustomCallBatching`] behaviors as the homogeneous rule above, with two composite-universe additions.
 //
-// Every trailing first-class output-extent operand must be replicated: a per-batch-item extent would make the call's
+// Every trailing first-class output-extent input must be replicated: a per-batch-item extent would make the call's
 // results ragged, which the array IR cannot represent. An extent-free call whose mapped extent is statically known is
 // exactly the homogeneous contract, so it delegates to the projected homogeneous rule through
 // [`batch_projected_operation`]. A dynamic mapped extent stays here, because a first-class dimension is not an array
@@ -1835,7 +1834,7 @@ where
         };
 
         match self.batching {
-            CustomCallBatching::Rejected => Err(self.mapped_operand_error(index, mapped.batch_axis())),
+            CustomCallBatching::Rejected => Err(self.mapped_input_error(index, mapped.batch_axis())),
             CustomCallBatching::Sequential { unroll } => {
                 let mut carry_indices = Vec::new();
                 let mut stacked_indices = Vec::new();
@@ -1851,27 +1850,27 @@ where
                 }
 
                 // The replicated extents lead the carries so the body's call can reuse them verbatim as its own
-                // trailing extent operands, exactly as the unbatched call declared them.
+                // trailing extent inputs, exactly as the unbatched call declared them.
                 let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
                 builder.add_input(ArrayType::scalar(DataType::I64).into());
                 let mut carry_inputs =
                     extents.iter().map(|extent| builder.add_input(extent.unbatched_type().clone())).collect::<Vec<_>>();
-                let mut operands = vec![None; arrays.len()];
+                let mut call_inputs = vec![None; arrays.len()];
                 for &index in &carry_indices {
                     let value_type = aligned[index].value().r#type();
                     let input_type =
                         <&ArrayType>::try_from(value_type.as_ref())?.unbatched(aligned[index].batch_axis())?;
                     let input = builder.add_input(input_type.into());
                     carry_inputs.push(input);
-                    operands[index] = Some(input);
+                    call_inputs[index] = Some(input);
                 }
                 for &index in &stacked_indices {
                     let value_type = aligned[index].value().r#type();
                     let input_type =
                         <&ArrayType>::try_from(value_type.as_ref())?.unbatched(aligned[index].batch_axis())?;
-                    operands[index] = Some(builder.add_input(input_type.into()));
+                    call_inputs[index] = Some(builder.add_input(input_type.into()));
                 }
-                let operands = operands
+                let call_inputs = call_inputs
                     .into_iter()
                     .map(Option::unwrap)
                     .chain(carry_inputs[..extents.len()].iter().copied())
@@ -1880,7 +1879,7 @@ where
                     if active_ragged_bindings.is_empty() { contract.clone() } else { contract.ragged_discharged() }
                 });
                 let operation = Self { ragged_contract, ..self.clone() };
-                let outputs = builder.add_instruction(operation, Vec::new(), operands, None)?.to_vec();
+                let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
                 let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
                 let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
                     body_outputs,
@@ -2065,7 +2064,7 @@ mod tests {
         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
     }
 
-    // Returns a one-input preserved-output ragged contract over a packed `f32[4]` value and scalar extent operand.
+    // Returns a one-input preserved-output ragged contract over a packed `f32[4]` value and scalar extent input.
     fn preserved_ragged_contract(dimension: DimensionVariable) -> CustomCallRaggedContract {
         CustomCallRaggedContract::new(
             vec![CustomCallRaggedInputBinding::new("data", 0, 0, 1, dimension)],
@@ -2257,7 +2256,7 @@ mod tests {
             )),
         );
 
-        // Composite output extents are positional SSA operands: output-major and then axis-major.
+        // Composite output extents are positional instruction inputs: output-major and then axis-major.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(17)).unwrap());
         let dynamic_output_type = ArrayType::new(
@@ -2299,7 +2298,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "`custom_call` output-extent operand defines dimension variable `columns`, but the corresponding \
+                "`custom_call` output-extent input defines dimension variable `columns`, but the corresponding \
                  declared output axis refers to `rows`",
             )),
         );
@@ -2382,10 +2381,10 @@ mod tests {
         let extent_type = ArrayType::scalar(DataType::I32);
         let contract = preserved_ragged_contract(length.clone());
         let input_binding = &contract.input_bindings()[0];
-        assert_eq!(input_binding.to_string(), "data:operand(0)@0<=operand(1):length");
+        assert_eq!(input_binding.to_string(), "data:input(0)@0<=input(1):length");
         assert_eq!(
             format!("{input_binding:?}"),
-            "CustomCallRaggedInputBinding { name: \"data\", operand_index: 0, axis: 0, extent_operand_index: 1, \
+            "CustomCallRaggedInputBinding { name: \"data\", input_index: 0, axis: 0, extent_input_index: 1, \
              dimension: DimensionVariable { name: \"length\", bounds: DimensionBounds { lower: 0, upper: Some(5) }, \
              .. } }",
         );
@@ -2402,12 +2401,12 @@ mod tests {
             "Fresh { axis: 1, extent_output_index: 2, dimension: DimensionVariable { name: \"length\", \
              bounds: DimensionBounds { lower: 0, upper: Some(5) }, .. } }",
         );
-        let rendered_contract = "{inputs=[data:operand(0)@0<=operand(1):length], outputs=[preserve(data)@0]}";
+        let rendered_contract = "{inputs=[data:input(0)@0<=input(1):length], outputs=[preserve(data)@0]}";
         assert_eq!(contract.to_string(), rendered_contract);
         assert_eq!(
             format!("{contract:?}"),
             "CustomCallRaggedContract { input_bindings: [CustomCallRaggedInputBinding { name: \"data\", \
-             operand_index: 0, axis: 0, extent_operand_index: 1, dimension: DimensionVariable { name: \"length\", \
+             input_index: 0, axis: 0, extent_input_index: 1, dimension: DimensionVariable { name: \"length\", \
              bounds: DimensionBounds { lower: 0, upper: Some(5) }, .. } }], output_bindings: [Preserved { \
              input_binding: \"data\", axis: 0 }], batch_prefix_count: 0, \
              ragged_discharged: false }",
@@ -2434,7 +2433,7 @@ mod tests {
                 custom_call [
                     target=ryft.test.ragged,
                     batching=broadcast_all,
-                    ragged_contract={inputs=[data:operand(0)@0<=operand(1):length], \
+                    ragged_contract={inputs=[data:input(0)@0<=input(1):length], \
                  outputs=[preserve(data)@0]},
                 ]
             "}
@@ -2517,7 +2516,7 @@ mod tests {
                     vec![CustomCallRaggedOutputBinding::Preserved { input_binding: "left".to_string(), axis: 0 }],
                 ))
                 .infer_output_types(&[packed_type.clone(), extent_type.clone()], &[]),
-            Err(TypeError::invalid("`custom_call` ragged input bindings `left` and `right` both bind operand 0",)),
+            Err(TypeError::invalid("`custom_call` ragged input bindings `left` and `right` both bind input 0",)),
         );
         assert_eq!(
             CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone()])
@@ -2554,7 +2553,7 @@ mod tests {
                 )))
                 .infer_output_types(&[packed_type.clone(), ArrayType::scalar(DataType::F32)], &[]),
             Err(TypeError::invalid(
-                "`custom_call` ragged input binding `data` requires extent operand 1 to be an integer scalar but got \
+                "`custom_call` ragged input binding `data` requires extent input 1 to be an integer scalar but got \
                  `f32[]`",
             )),
         );
@@ -2699,7 +2698,7 @@ mod tests {
                 .with_ragged_contract(twice_prefixed)
                 .infer_output_types(&[packed_type.clone(), ArrayType::new_static(DataType::I32, [2])], &[]),
             Err(TypeError::Invalid { message })
-                if message == "`custom_call` ragged input binding `data` requires extent operand 1 to be a rank-2 \
+                if message == "`custom_call` ragged input binding `data` requires extent input 1 to be a rank-2 \
                     batch-prefixed integer tensor but got `i32[2]`",
         ));
 
@@ -2731,11 +2730,11 @@ mod tests {
         let packed_type = ArrayType::new_static(DataType::F32, [4]);
         let extent_type = ArrayType::scalar(DataType::I32);
         let input_types = [packed_type.clone(), packed_type.clone(), extent_type.clone(), extent_type.clone()];
-        let shared_input_contract = |second_extent_operand_index| {
+        let shared_input_contract = |second_extent_input_index| {
             CustomCallRaggedContract::new(
                 vec![
                     CustomCallRaggedInputBinding::new("lhs", 0, 0, 2, length.clone()),
-                    CustomCallRaggedInputBinding::new("rhs", 1, 0, second_extent_operand_index, length.clone()),
+                    CustomCallRaggedInputBinding::new("rhs", 1, 0, second_extent_input_index, length.clone()),
                 ],
                 vec![CustomCallRaggedOutputBinding::Consumed],
             )
@@ -2752,7 +2751,7 @@ mod tests {
                 .infer_output_types(&input_types, &[]),
             Err(TypeError::Invalid { message })
                 if message == "`custom_call` ragged input bindings `lhs` and `rhs` reuse dimension `length` with \
-                    different extent operands 2 and 3",
+                    different extent inputs 2 and 3",
         ));
 
         let output_types =
@@ -2811,10 +2810,10 @@ mod tests {
     }
 
     /// The homogeneous form has no way to ground a dynamic result extent, because only the mixed form accepts the
-    /// trailing first-class dimension operands that define one. Type inference rejects such a declaration instead of
+    /// trailing first-class dimension inputs that define one. Type inference rejects such a declaration instead of
     /// returning an ungrounded output type.
     #[test]
-    fn test_custom_call_rejects_dynamic_output_types_without_extent_operands() {
+    fn test_custom_call_rejects_dynamic_output_types_without_extent_inputs() {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(3)]));
@@ -2822,7 +2821,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(&[vector_type()], &[]),
             Err(TypeError::invalid(
-                "`custom_call` requires explicit result-extent operands for dynamic output type f32[rows, 3]",
+                "`custom_call` requires explicit result-extent inputs for dynamic output type f32[rows, 3]",
             )),
         );
     }
@@ -2877,13 +2876,13 @@ mod tests {
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(2, extents.clone(), length.clone(), vec![1, 0])])
             .unwrap();
-        let extent_operand = ArrayBatch::new(extents, BatchAxis::new(1)).unwrap();
+        let extent_input = ArrayBatch::new(extents, BatchAxis::new(1)).unwrap();
         let operation =
             CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [3, 4])])
                 .with_batching(CustomCallBatching::BroadcastAll)
                 .with_ragged_contract(preserved_ragged_contract(length.clone()).batch_prefixed(false));
 
-        let outputs = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand]).unwrap().into_parts().0;
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[data, extent_input]).unwrap().into_parts().0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].ragged_axes().len(), 1);
@@ -2919,13 +2918,13 @@ mod tests {
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(2, extents.clone(), length.clone(), vec![1, 0])])
             .unwrap();
-        let extent_operand = ArrayIrBatch::new(extents, BatchAxis::new(1)).unwrap();
+        let extent_input = ArrayIrBatch::new(extents, BatchAxis::new(1)).unwrap();
         let operation =
             CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [3, 4])])
                 .with_batching(CustomCallBatching::BroadcastAll)
                 .with_ragged_contract(preserved_ragged_contract(length).batch_prefixed(false));
         let outputs = operation
-            .batch_in_parent(&context, &EmptyRegionDriver, &[data, extent_operand])
+            .batch_in_parent(&context, &EmptyRegionDriver, &[data, extent_input])
             .unwrap()
             .into_parts()
             .0;
@@ -2953,7 +2952,7 @@ mod tests {
             input_length.clone(),
             vec![0],
         )])?;
-        let extent_operand = ArrayBatch::new(extents, BatchAxis::new(0))?;
+        let extent_input = ArrayBatch::new(extents, BatchAxis::new(0))?;
         let operation = CustomCallOperation::new(
             "ryft.test.fresh_ragged",
             vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
@@ -2970,7 +2969,7 @@ mod tests {
                 CustomCallRaggedOutputBinding::Consumed,
             ],
         ));
-        let (outputs, evidence) = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts();
+        let (outputs, evidence) = operation.batch(&context, &EmptyRegionDriver, &[data, extent_input])?.into_parts();
         assert_eq!(evidence, vec![input_length]);
         assert_eq!(outputs[0].ragged_axes().len(), 1);
         assert_eq!(outputs[0].ragged_axes()[0].dimension(), &output_length);
@@ -3046,17 +3045,17 @@ mod tests {
             ),
             Err(error)
                 if error.to_string()
-                    == "custom call `ryft.test.add_one` has no batching rule for operand 0 mapped at batch axis 0; \
+                    == "custom call `ryft.test.add_one` has no batching rule for input 0 mapped at batch axis 0; \
                         invoke a kernel that understands the batch axis, or select an explicit batching behavior \
                         with `CustomCallOperation::with_batching`",
         ));
     }
 
-    /// A custom call whose operands are all replicated is bound unchanged and reports replicated outputs. This is the
-    /// JAX-parity behavior: a batching rule is consulted only once an operand is actually mapped, and this shortcut is
+    /// A custom call whose inputs are all replicated is bound unchanged and reports replicated outputs. This is the
+    /// JAX-parity behavior: a batching rule is consulted only once an input is actually mapped, and this shortcut is
     /// sound because the region-free foreign kernel cannot observe the transform's axis.
     #[test]
-    fn test_custom_call_batches_all_replicated_operands_unchanged() {
+    fn test_custom_call_batches_all_replicated_inputs_unchanged() {
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
                 let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
@@ -3089,7 +3088,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_call_batch_rejects_ragged_operands_before_binding() {
+    fn test_custom_call_batch_rejects_ragged_inputs_before_binding() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]).unwrap(), BatchAxis::new(0))
             .unwrap()
@@ -3104,7 +3103,7 @@ mod tests {
             operation.batch(&context, &EmptyRegionDriver, &[input]),
             Err(BatchingError::UnsupportedOperation { message })
                 if message == "custom call `ryft.test.side_effect` does not support bounded ragged dimension `length` \
-                    on operand 0",
+                    on input 0",
         ));
     }
 
@@ -3124,7 +3123,7 @@ mod tests {
             operation.batch(&context, &EmptyRegionDriver, &[input]),
             Err(BatchingError::UnsupportedOperation { message })
                 if message
-                    == "custom call `ryft.test.dense` has no batching rule for operand 0 mapped at batch axis 0; \
+                    == "custom call `ryft.test.dense` has no batching rule for input 0 mapped at batch axis 0; \
                         invoke a kernel that understands the batch axis, or select an explicit batching behavior \
                         with `CustomCallOperation::with_batching`",
         ));
@@ -3148,7 +3147,7 @@ mod tests {
                 length.clone(),
                 vec![0],
             )])?;
-            let extent_operand = ArrayBatch::new(extents.clone(), BatchAxis::new(0))?;
+            let extent_input = ArrayBatch::new(extents.clone(), BatchAxis::new(0))?;
             let operation = CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone()])
                 .with_batching(behavior)
                 .with_ragged_contract(preserved_ragged_contract(length.clone()));
@@ -3158,7 +3157,7 @@ mod tests {
             );
 
             let (outputs, evidence) =
-                operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts();
+                operation.batch(&context, &EmptyRegionDriver, &[data, extent_input])?.into_parts();
             assert!(evidence.is_empty());
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -3186,7 +3185,7 @@ mod tests {
                                 let %3:f32[4] = custom_call [
                                     target=ryft.test.ragged,
                                     batching=sequential,
-                                    ragged_contract={inputs=[data:operand(0)@0<=operand(1):length], \
+                                    ragged_contract={inputs=[data:input(0)@0<=input(1):length], \
                          outputs=[preserve(data)@0], ragged_discharged=true},
                                 ] %1 %2
                                 in (%3)
@@ -3204,7 +3203,7 @@ mod tests {
                         let %2:f32[2, 4] = custom_call [
                             target=ryft.test.ragged,
                             batching=broadcast_all,
-                            ragged_contract={inputs=[data:operand(0)@1<=operand(1):length], \
+                            ragged_contract={inputs=[data:input(0)@1<=input(1):length], \
                          outputs=[preserve(data)@1], batch_prefix_count=1, \
                          ragged_discharged=true},
                         ] %0 %1
@@ -3229,15 +3228,15 @@ mod tests {
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(1, extents, length.clone(), vec![0])])
             .unwrap();
-        let extent_operand = ArrayBatch::new(other_extents, BatchAxis::new(0)).unwrap();
+        let extent_input = ArrayBatch::new(other_extents, BatchAxis::new(0)).unwrap();
         let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
             .with_batching(CustomCallBatching::BroadcastAll)
             .with_ragged_contract(preserved_ragged_contract(length));
         assert!(matches!(
-            operation.batch(&context, &EmptyRegionDriver, &[data.clone(), extent_operand.clone()]),
+            operation.batch(&context, &EmptyRegionDriver, &[data.clone(), extent_input.clone()]),
             Err(BatchingError::InvalidBatchMetadata { message })
-                if message == "custom call `ryft.test.ragged` ragged input binding `data` requires operand 1 to be \
-                               the exact extent value carried by operand 0",
+                if message == "custom call `ryft.test.ragged` ragged input binding `data` requires input 1 to be \
+                               the exact extent value carried by input 0",
         ));
 
         let nested = CustomCallOperation {
@@ -3245,7 +3244,7 @@ mod tests {
             ..operation
         };
         assert!(matches!(
-            nested.batch(&context, &EmptyRegionDriver, &[data, extent_operand]),
+            nested.batch(&context, &EmptyRegionDriver, &[data, extent_input]),
             Err(BatchingError::UnsupportedOperation { message })
                 if message == "custom call `ryft.test.ragged` does not support nested ragged batching",
         ));
@@ -3304,9 +3303,9 @@ mod tests {
         assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::UnorderedIo));
     }
 
-    /// `Sequential` stages one carry-free-per-operand `scan` whose body performs exactly one unbatched call: the
-    /// mapped operand is sliced one row per iteration while the replicated operand rides along as an invariant carry.
-    /// A side-effecting kernel therefore runs once per batch item, in iteration order.
+    /// `Sequential` stages one carry-free-per-input `scan` whose body performs exactly one unbatched call: the mapped
+    /// input is sliced one row per iteration while the replicated input rides along as an invariant carry. A
+    /// side-effecting kernel therefore runs once per batch item, in iteration order.
     #[test]
     fn test_custom_call_batches_sequentially_through_a_scan() {
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
@@ -3406,12 +3405,11 @@ mod tests {
         );
     }
 
-    /// `BroadcastAll` materializes every operand on the batch axis and rebinds exactly one call whose declared
-    /// outputs gain the same leading extent. An aliased output takes its aligned input's packed type verbatim, so the
-    /// alias keeps describing one logical array, and an explicit tiled layout shifts to keep the batch axis most
-    /// major.
+    /// `BroadcastAll` materializes every input on the batch axis and rebinds exactly one call whose declared outputs
+    /// gain the same leading extent. An aliased output takes its aligned input's packed type verbatim, so the alias
+    /// keeps describing one logical array, and an explicit tiled layout shifts to keep the batch axis most major.
     #[test]
-    fn test_custom_call_batches_by_broadcasting_all_operands() {
+    fn test_custom_call_batches_by_broadcasting_all_inputs() {
         let column_major = vector_type()
             .with_inserted_dimension(1, Dimension::Static(3))
             .unwrap()
@@ -3445,9 +3443,9 @@ mod tests {
             .unwrap()
             .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
-        // The replicated operand is materialized across the batch and the kernel is invoked exactly once. Output 0
-        // aliases input 0 and therefore takes that operand's packed type, while output 1 keeps its declared tiled
-        // layout with every logical index shifted by one and the inserted batch axis as its most major dimension.
+        // The replicated input is materialized across the batch and the kernel is invoked exactly once. Output 0
+        // aliases input 0 and therefore takes that input's packed type, while output 1 keeps its declared tiled layout
+        // with every logical index shifted by one and the inserted batch axis as its most major dimension.
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -3563,7 +3561,7 @@ mod tests {
                 let %2:f32[2, 3, 4] = custom_call [
                     target=ryft.test.ragged,
                     batching=broadcast_all,
-                    ragged_contract={inputs=[data:operand(0)@2<=operand(1):length], \
+                    ragged_contract={inputs=[data:input(0)@2<=input(1):length], \
                  outputs=[preserve(data)@2], batch_prefix_count=2},
                 ] %0 %1
                 in (%2)
@@ -3666,12 +3664,12 @@ mod tests {
             length.clone(),
             vec![0],
         )])?;
-        let extent_operand = ArrayIrBatch::new(extents.clone(), BatchAxis::new(0))?;
+        let extent_input = ArrayIrBatch::new(extents.clone(), BatchAxis::new(0))?;
         let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
             .with_batching(CustomCallBatching::BroadcastAll)
             .with_ragged_contract(preserved_ragged_contract(length.clone()));
         let (outputs, evidence) =
-            operation.batch_in_parent(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts();
+            operation.batch_in_parent(&context, &EmptyRegionDriver, &[data, extent_input])?.into_parts();
         assert!(evidence.is_empty());
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].ragged_axes().len(), 1);
@@ -3739,7 +3737,7 @@ mod tests {
     /// The mixed `BroadcastAll` rule rebinds one call whose declared outputs gain the mapped batch dimension, and
     /// regroups the trailing extents so each output's new leading dynamic axis is grounded by the transform's extent.
     #[test]
-    fn test_array_ir_custom_call_broadcasts_all_operands_with_regrouped_extents() -> Result<(), ProgramError> {
+    fn test_array_ir_custom_call_broadcasts_all_inputs_with_regrouped_extents() -> Result<(), ProgramError> {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
         let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
@@ -3854,9 +3852,9 @@ mod tests {
     }
 
     /// The mixed universe applies the same all-replicated shortcut, including the trailing first-class output-extent
-    /// operand, which stays an ordinary replicated operand of the unchanged call.
+    /// input, which stays an ordinary replicated input of the unchanged call.
     #[test]
-    fn test_array_ir_custom_call_batches_all_replicated_operands_unchanged() -> Result<(), ProgramError> {
+    fn test_array_ir_custom_call_batches_all_replicated_inputs_unchanged() -> Result<(), ProgramError> {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
         let operation = CustomCallOperation::new("ryft.test.dynamic", vec![output_type.clone()]);
@@ -3896,8 +3894,8 @@ mod tests {
     }
 
     /// The mixed rule threads replicated first-class output extents as leading invariant scan carries, so the body's
-    /// call declares exactly the per-item extents it was given, and it supports a dynamic mapped extent by consuming
-    /// it as the scan's trailing trip-count operand.
+    /// call declares exactly the per-item extents it was given, and it supports a dynamic mapped extent by consuming it
+    /// as the scan's trailing trip-count input.
     #[test]
     fn test_array_ir_custom_call_batches_sequentially_with_extent_carries() -> Result<(), ProgramError> {
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
@@ -3960,12 +3958,12 @@ mod tests {
             length.clone(),
             vec![0],
         )])?;
-        let extent_operand = ArrayIrBatch::new(extents, BatchAxis::new(0))?;
+        let extent_input = ArrayIrBatch::new(extents, BatchAxis::new(0))?;
         let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
             .with_batching(CustomCallBatching::Sequential { unroll: None })
             .with_ragged_contract(preserved_ragged_contract(length));
         let output = operation
-            .batch_in_parent(&context, &EmptyRegionDriver, &[data, extent_operand])?
+            .batch_in_parent(&context, &EmptyRegionDriver, &[data, extent_input])?
             .into_parts()
             .0
             .remove(0);
@@ -4027,7 +4025,7 @@ mod tests {
             operation.batch_in_parent(&batching_context, &EmptyRegionDriver, &[mapped]),
             Err(BatchingError::UnsupportedOperation { message })
                 if message
-                    == "custom call `ryft.test.add_one` has no batching rule for operand 0 mapped at batch axis 0; \
+                    == "custom call `ryft.test.add_one` has no batching rule for input 0 mapped at batch axis 0; \
                         invoke a kernel that understands the batch axis, or select an explicit batching behavior \
                         with `CustomCallOperation::with_batching`",
         ));

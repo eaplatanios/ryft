@@ -141,9 +141,9 @@ impl AttentionConfiguration {
     }
 }
 
-/// Presence metadata for the optional attention operands in their canonical order.
+/// Presence metadata for the optional attention inputs (bias, mask, and sequence lengths) in their canonical order.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct AttentionOperandSignature {
+pub struct AttentionInputSignature {
     /// Whether an additive bias follows query, key, and value.
     bias: bool,
 
@@ -157,8 +157,8 @@ pub struct AttentionOperandSignature {
     key_value_sequence_lengths: bool,
 }
 
-impl AttentionOperandSignature {
-    /// Creates an optional-operand signature.
+impl AttentionInputSignature {
+    /// Creates an optional-input signature.
     #[inline]
     pub fn new(bias: bool, mask: bool, query_sequence_lengths: bool, key_value_sequence_lengths: bool) -> Self {
         Self { bias, mask, query_sequence_lengths, key_value_sequence_lengths }
@@ -188,7 +188,7 @@ impl AttentionOperandSignature {
         self.key_value_sequence_lengths
     }
 
-    /// Returns the number of optional operands described by this signature.
+    /// Returns the number of optional inputs described by this signature.
     #[inline]
     pub fn count(&self) -> usize {
         usize::from(self.bias)
@@ -198,7 +198,7 @@ impl AttentionOperandSignature {
     }
 }
 
-/// Query, key, value, and optional operands supplied to scaled dot-product attention.
+/// Query, key, value, and optional inputs supplied to scaled dot-product attention.
 #[derive(Clone, Debug, PartialEq, Parameterized)]
 pub struct AttentionInputs<P: Parameter> {
     /// Query array in `TNH` or `BTNH` layout.
@@ -224,7 +224,7 @@ pub struct AttentionInputs<P: Parameter> {
 }
 
 impl<P: Parameter> AttentionInputs<P> {
-    /// Creates attention inputs with no optional operands.
+    /// Creates attention inputs with no bias, mask, or sequence lengths.
     #[inline]
     pub fn new(query: P, key: P, value: P) -> Self {
         Self {
@@ -238,10 +238,10 @@ impl<P: Parameter> AttentionInputs<P> {
         }
     }
 
-    /// Returns the optional-operand signature of these inputs.
+    /// Returns the optional-input signature of these inputs.
     #[inline]
-    pub fn signature(&self) -> AttentionOperandSignature {
-        AttentionOperandSignature::new(
+    pub fn signature(&self) -> AttentionInputSignature {
+        AttentionInputSignature::new(
             self.bias.is_some(),
             self.mask.is_some(),
             self.query_sequence_lengths.is_some(),
@@ -249,13 +249,13 @@ impl<P: Parameter> AttentionInputs<P> {
         )
     }
 
-    /// Parses values in canonical attention operand order according to `signature`.
+    /// Parses values in canonical attention input order according to `signature`.
     ///
     /// # Parameters
     ///
-    ///   - `signature`: Presence metadata for the optional operands.
-    ///   - `values`: Query, key, value, and the present optional operands in canonical order.
-    pub fn from_values(signature: AttentionOperandSignature, values: &[P]) -> Result<Self, TypeError>
+    ///   - `signature`: Presence metadata for the optional inputs.
+    ///   - `values`: Query, key, value, and the present optional inputs in canonical order.
+    pub fn from_values(signature: AttentionInputSignature, values: &[P]) -> Result<Self, TypeError>
     where
         P: Clone,
     {
@@ -278,7 +278,7 @@ impl<P: Parameter> AttentionInputs<P> {
         })
     }
 
-    /// Returns the values in canonical attention operand order.
+    /// Returns the values in canonical attention input order.
     pub fn into_values(self) -> Vec<P> {
         vec![self.query, self.key, self.value]
             .into_iter()

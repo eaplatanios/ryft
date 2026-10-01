@@ -7,14 +7,14 @@ pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 
 /// Primitive representing a generalized block-scaled dot product.
 ///
-/// The element operands occupy the first two input positions. Present scale operands follow in left-then-right
-/// order, as recorded by [`Self::has_lhs_scale`] and [`Self::has_rhs_scale`]. A scale has the same rank as its
-/// element operand. Its noncontracting dimensions match the operand exactly, while every contracting scale
-/// dimension divides the corresponding operand dimension with an integer ratio of at least two. Ratios are inferred
-/// independently for every side and contracting dimension.
+/// The element inputs occupy the first two input positions. Present scale inputs follow in left-then-right order, as
+/// recorded by [`Self::has_lhs_scale`] and [`Self::has_rhs_scale`]. A scale has the same rank as its element input. Its
+/// noncontracting dimensions match the element input exactly, while every contracting scale dimension divides the
+/// corresponding element input dimension with an integer ratio of at least two. Ratios are inferred independently for
+/// every side and contracting dimension.
 ///
-/// Semantically this operation expands each present scale to its operand shape, converts elements and scales to `bf16`,
-/// multiplies them, and applies [`DotOperation`](crate::DotOperation) with [`Self::dimensions`] and
+/// Semantically this operation expands each present scale to the shape of its element input, converts elements and
+/// scales to `bf16`, multiplies them, and applies [`DotOperation`](crate::DotOperation) with [`Self::dimensions`] and
 /// [`Self::preferred_element_type`]. That definition is implemented once by [`scaled_dot_composition`] and is also the
 /// decomposition of the XLA `xla.scaled_dot` composite. Like the corresponding JAX primitive, scaled dot is not
 /// differentiable. Batching inserts one leading batch pair and shifts the existing dimension numbers, without a rank
@@ -40,9 +40,9 @@ impl ScaledDotOperation {
     /// # Parameters
     ///
     ///   - `dimensions`: Contracting and batching dimensions of the generalized dot.
-    ///   - `preferred_element_type`: Data type used for the result and dot accumulation. Compatibility with the
-    ///     `bf16` dequantized operands is validated by the generalized dot contract.
-    ///   - `has_lhs_scale`: Whether the input list includes a left scale after the two element operands.
+    ///   - `preferred_element_type`: Data type used for the result and dot accumulation. Compatibility with the `bf16`
+    ///     dequantized inputs is validated by the generalized dot contract.
+    ///   - `has_lhs_scale`: Whether the input list includes a left scale after the two element inputs.
     ///   - `has_rhs_scale`: Whether the input list includes a right scale after the optional left scale.
     #[inline]
     pub fn new(
@@ -54,11 +54,11 @@ impl ScaledDotOperation {
         Self { dimensions, preferred_element_type, has_lhs_scale, has_rhs_scale }
     }
 
-    /// Returns the default dimension numbers for operands of `rank`.
+    /// Returns the default dimension numbers for inputs of `rank`.
     pub fn default_dimensions(rank: usize) -> Result<DotDimensionNumbers, TypeError> {
         if rank < 2 {
             return Err(TypeError::invalid(format!(
-                "`{SCALED_DOT_OPERATION_NAME}` does not support rank-{rank} operands"
+                "`{SCALED_DOT_OPERATION_NAME}` does not support rank-{rank} inputs"
             )));
         }
         Ok(DotDimensionNumbers::new(vec![rank - 1], vec![rank - 2], (0..rank - 2).collect(), (0..rank - 2).collect()))
@@ -94,7 +94,7 @@ impl ScaledDotOperation {
         2 + usize::from(self.has_lhs_scale) + usize::from(self.has_rhs_scale)
     }
 
-    /// Splits an input list into the two element operands and the optional scales.
+    /// Splits an input list into the two element inputs and the optional scales.
     fn inputs<'a, T>(&self, inputs: &'a [T]) -> Result<(&'a T, &'a T, Option<&'a T>, Option<&'a T>), TypeError> {
         if inputs.len() != self.input_count() {
             return Err(TypeError::invalid(format!(
@@ -161,37 +161,37 @@ impl Operation for ScaledDotOperation {
         let dot_lhs = lhs.clone().with_data_type(DataType::BF16);
         let dot_rhs = rhs.clone().with_data_type(DataType::BF16);
         let output_type = dot_abstract(&dot_lhs, &dot_rhs, &self.dimensions, Some(self.preferred_element_type), None)?;
-        for (side, operand, scale, contracting_dimensions) in [
+        for (side, input_type, scale, contracting_dimensions) in [
             ("left", lhs, lhs_scale, self.dimensions.lhs_contracting_dimensions()),
             ("right", rhs, rhs_scale, self.dimensions.rhs_contracting_dimensions()),
         ] {
             let Some(scale) = scale else { continue };
             for axis in 0..rank {
-                let operand_dimension = operand.dimension(axis);
+                let input_dimension = input_type.dimension(axis);
                 let scale_dimension = scale.dimension(axis);
                 if contracting_dimensions.contains(&axis) {
-                    match (operand_dimension.value(), scale_dimension.value()) {
-                        (Some(operand_size), Some(scale_size)) if scale_size == 0 || operand_size % scale_size != 0 => {
+                    match (input_dimension.value(), scale_dimension.value()) {
+                        (Some(input_size), Some(scale_size)) if scale_size == 0 || input_size % scale_size != 0 => {
                             return Err(TypeError::invalid(format!(
-                                "`{SCALED_DOT_OPERATION_NAME}` {side} contracting axis {axis} of size {operand_size} must be divisible by its scale size {scale_size}",
+                                "`{SCALED_DOT_OPERATION_NAME}` {side} contracting axis {axis} of size {input_size} must be divisible by its scale size {scale_size}",
                             )));
                         }
-                        (Some(operand_size), Some(scale_size)) if operand_size / scale_size < 2 => {
+                        (Some(input_size), Some(scale_size)) if input_size / scale_size < 2 => {
                             return Err(TypeError::invalid(format!(
                                 "`{SCALED_DOT_OPERATION_NAME}` {side} contracting axis {axis} to scale ratio must be at least 2 but got {}",
-                                operand_size / scale_size,
+                                input_size / scale_size,
                             )));
                         }
-                        _ if operand_dimension == scale_dimension => {
+                        _ if input_dimension == scale_dimension => {
                             return Err(TypeError::invalid(format!(
                                 "`{SCALED_DOT_OPERATION_NAME}` {side} contracting axis {axis} to scale ratio must be at least 2"
                             )));
                         }
                         _ => {}
                     }
-                } else if operand_dimension != scale_dimension {
+                } else if input_dimension != scale_dimension {
                     return Err(TypeError::invalid(format!(
-                        "`{SCALED_DOT_OPERATION_NAME}` {side} axis {axis} has size {operand_dimension} but its scale has size {scale_dimension}",
+                        "`{SCALED_DOT_OPERATION_NAME}` {side} axis {axis} has size {input_dimension} but its scale has size {scale_dimension}",
                     )));
                 }
             }
@@ -235,8 +235,8 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScaledDo
 }
 
 // Batching rule for [`ScaledDotOperation`]. Every input is aligned to one leading mapped axis. The rule then shifts
-// every existing dimension number past that new axis and records axis zero as an additional batching dimension on
-// both element operands. Repeating the transform applies the same lift again, so batching has no rank ceiling.
+// every existing dimension number past that new axis and records axis zero as an additional batching dimension on both
+// element inputs. Repeating the transform applies the same lift again, so batching has no rank ceiling.
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ScaledDotOperation
 where
@@ -311,9 +311,9 @@ pub trait ScaledDot: Typed<Type = ArrayType> + Sized {
     ///
     /// # Parameters
     ///
-    ///   - `rhs`: Right element operand.
-    ///   - `lhs_scale`: Optional block-scale tensor for the left operand.
-    ///   - `rhs_scale`: Optional block-scale tensor for the right operand.
+    ///   - `rhs`: Right element input.
+    ///   - `lhs_scale`: Optional block-scale tensor for the left element input.
+    ///   - `rhs_scale`: Optional block-scale tensor for the right element input.
     ///   - `dimensions`: Optional generalized-dot dimension numbers.
     ///   - `preferred_element_type`: Optional result and accumulation data type.
     fn scaled_dot(
@@ -409,9 +409,9 @@ where
 
 /// Evaluates generalized scaled dot as its canonical portable composition.
 ///
-/// Each present scale is expanded independently along every contracting axis, converted to `bf16`, and multiplied
-/// into an element operand that is also converted to `bf16`. The resulting tensors are contracted using `dimensions`
-/// and accumulated at `preferred_element_type`. An absent scale leaves its operand unchanged except for the `bf16`
+/// Each present scale is expanded independently along every contracting axis, converted to `bf16`, and multiplied into
+/// an element input that is also converted to `bf16`. The resulting tensors are contracted using `dimensions` and
+/// accumulated at `preferred_element_type`. An absent scale leaves its element input unchanged except for the `bf16`
 /// conversion.
 pub fn scaled_dot_composition<V>(
     lhs: &V,
@@ -441,10 +441,10 @@ where
 
 /// Evaluates generalized scaled dot over the mixed array IR.
 ///
-/// This is the authoritative staged composition. It obtains operand and scale extents through [`DimensionSize`],
-/// proves each dynamic contracting ratio with comparisons and [`Assert`], and supplies every broadcast and reshape
-/// extent as an ordinary first-class dimension operand. Array arithmetic remains delegated to the projected
-/// [`ArrayType`] member, so this function introduces neither another value universe nor backend-specific shape logic.
+/// This is the authoritative staged composition. It obtains element and scale extents through [`DimensionSize`], proves
+/// each dynamic contracting ratio with comparisons and [`Assert`], and supplies every broadcast and reshape extent as
+/// an ordinary first-class dimension input. Array arithmetic remains delegated to the projected [`ArrayType`] member,
+/// so this function introduces neither another value universe nor backend-specific shape logic.
 pub fn scaled_dot_ir_composition<V>(
     lhs: &V,
     rhs: &V,
@@ -487,7 +487,7 @@ where
     })
 }
 
-/// Dequantizes one mixed-IR block-scaled operand for [`scaled_dot_ir_composition`].
+/// Dequantizes one mixed-IR block-scaled element input for [`scaled_dot_ir_composition`].
 fn dequantize_block_scaled_ir<V>(
     elements: &V,
     scale: Option<&V>,
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn test_scaled_dot_batching() {
         // Batching moves each mapped axis to the front and lifts it into the generalized-dot batch dimensions. Scale
-        // operands follow the same rule, so each example retains its own block scales.
+        // inputs follow the same rule, so each example retains its own block scales.
         let elements = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 4.into()]));
         let scales = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 2.into()]));
         let lhs = ArrayBatch::new(Array::from_elements::<f32>(elements.clone(), &[1.0; 8]).unwrap(), BatchAxis::new(0))

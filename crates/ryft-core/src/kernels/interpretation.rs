@@ -919,7 +919,7 @@ mod tests {
     };
     use crate::kernels::operations::NoKernelExtension;
     use crate::operations::attention::{
-        AttentionConfiguration, AttentionImplementation, AttentionOperandSignature, DotProductAttentionOperation,
+        AttentionConfiguration, AttentionImplementation, AttentionInputSignature, DotProductAttentionOperation,
     };
     use crate::operations::{
         AddOperation, ConditionOperation, DimensionMulOperation, DimensionToScalarOperation, ReduceOperation,
@@ -1118,7 +1118,7 @@ mod tests {
         let definition = value_definition(
             ArrayOperation::DotProductAttention(DotProductAttentionOperation::new(
                 AttentionConfiguration::new().with_implementation(AttentionImplementation::Portable),
-                AttentionOperandSignature::new(false, false, false, false),
+                AttentionInputSignature::new(false, false, false, false),
             )),
             &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
         );

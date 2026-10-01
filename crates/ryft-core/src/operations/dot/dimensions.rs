@@ -2,32 +2,30 @@ use super::*;
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
 ///
-/// Mirrors StableHLO's `dot_general` operand: the contracting dimensions index axes that are
-/// summed over (the "K" axes in matrix multiplication), and the batching dimensions index axes
-/// that are aligned 1:1 between the two operands and preserved in the output (the leading "B"
-/// axes in batched matrix multiplication).
+/// Mirrors StableHLO's `dot_general` dimension numbers: the contracting dimensions index axes that are summed over (the
+/// "K" axes in matrix multiplication), and the batching dimensions index axes that are aligned 1:1 between the two
+/// inputs and preserved in the output (the leading "B" axes in batched matrix multiplication).
 ///
-/// Both `lhs_contracting_dimensions` and `rhs_contracting_dimensions` must have the same length
-/// and their corresponding dimensions in the two operands must match in size. The same applies
-/// to `lhs_batching_dimensions` / `rhs_batching_dimensions`.
+/// Both `lhs_contracting_dimensions` and `rhs_contracting_dimensions` must have the same length and their corresponding
+/// dimensions in the two inputs must match in size. The same applies to `lhs_batching_dimensions` /
+/// `rhs_batching_dimensions`.
 ///
-/// The output shape is `[batching..., lhs_result..., rhs_result...]`, where the result
-/// dimensions are the remaining (non-contracting, non-batching) dimensions of each operand, in
-/// their original order.
+/// The output shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the remaining
+/// (non-contracting, non-batching) dimensions of each input, in their original order.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotDimensionNumbers {
-    /// Axes on the LHS operand that contract with `rhs_contracting_dimensions` on the RHS.
+    /// Axes on the LHS that contract with `rhs_contracting_dimensions` on the RHS.
     lhs_contracting_dimensions: Vec<usize>,
 
-    /// Axes on the RHS operand that contract with `lhs_contracting_dimensions` on the LHS.
+    /// Axes on the RHS that contract with `lhs_contracting_dimensions` on the LHS.
     rhs_contracting_dimensions: Vec<usize>,
 
-    /// Axes on the LHS operand that are aligned 1:1 with `rhs_batching_dimensions` on the RHS
-    /// and that are preserved in the output.
+    /// Axes on the LHS that are aligned 1:1 with `rhs_batching_dimensions` on the RHS and that are preserved in the
+    /// output.
     lhs_batching_dimensions: Vec<usize>,
 
-    /// Axes on the RHS operand that are aligned 1:1 with `lhs_batching_dimensions` on the LHS
-    /// and that are preserved in the output.
+    /// Axes on the RHS that are aligned 1:1 with `lhs_batching_dimensions` on the LHS and that are preserved in the
+    /// output.
     rhs_batching_dimensions: Vec<usize>,
 }
 
@@ -56,32 +54,31 @@ impl DotDimensionNumbers {
         Self::new(vec![1], vec![0], Vec::new(), Vec::new())
     }
 
-    /// Dimension numbers for a rank-1 inner product: `[K] · [K] -> []`. The single dimension of
-    /// each operand contracts.
+    /// Dimension numbers for a rank-1 inner product: `[K] · [K] -> []`. The single dimension of each input contracts.
     #[inline]
     pub fn inner_product() -> Self {
         Self::new(vec![0], vec![0], Vec::new(), Vec::new())
     }
 
-    /// Returns the contracting dimensions of the LHS operand.
+    /// Returns the contracting dimensions of the LHS.
     #[inline]
     pub fn lhs_contracting_dimensions(&self) -> &[usize] {
         &self.lhs_contracting_dimensions
     }
 
-    /// Returns the contracting dimensions of the RHS operand.
+    /// Returns the contracting dimensions of the RHS.
     #[inline]
     pub fn rhs_contracting_dimensions(&self) -> &[usize] {
         &self.rhs_contracting_dimensions
     }
 
-    /// Returns the batching dimensions of the LHS operand.
+    /// Returns the batching dimensions of the LHS.
     #[inline]
     pub fn lhs_batching_dimensions(&self) -> &[usize] {
         &self.lhs_batching_dimensions
     }
 
-    /// Returns the batching dimensions of the RHS operand.
+    /// Returns the batching dimensions of the RHS.
     #[inline]
     pub fn rhs_batching_dimensions(&self) -> &[usize] {
         &self.rhs_batching_dimensions
@@ -107,7 +104,7 @@ pub enum RaggedDotMode {
     /// The ragged dimension is a non-contracting result dimension.
     NonContracting,
 
-    /// The ragged dimension is contracted with the RHS operand.
+    /// The ragged dimension is contracted with the RHS.
     Contracting,
 
     /// The ragged dimension is one of the paired batching dimensions.
@@ -198,7 +195,7 @@ impl RaggedDotDimensionNumbers {
         }
     }
 
-    /// Returns the input-prefix axes that index a prefix-shaped `group_sizes` operand.
+    /// Returns the input-prefix axes that index a prefix-shaped `group_sizes` input.
     pub fn group_sizes_prefix_dimensions(&self, lhs_rank: usize) -> Result<Vec<usize>, TypeError> {
         let ragged_axis = *self.lhs_ragged_dimensions.first().ok_or_else(|| {
             TypeError::invalid(format!("`{RAGGED_DOT_OPERATION_NAME}` expects exactly one LHS ragged dimension",))
@@ -264,17 +261,17 @@ pub fn rhs_result_axes(dimensions: &DotDimensionNumbers, rhs_rank: usize) -> Vec
 
 /// Lifts a [`DotDimensionNumbers`] through one batching level.
 ///
-/// Given the unbatched dimension numbers and the batch-axis positions of the two operands (each
-/// optional — `None` indicates a replicated operand), returns the dimension numbers that
-/// describe the same contraction over the parent-physical (batched) operands. The mapping:
+/// Given the unbatched dimension numbers and the batch-axis positions of the two inputs (each optional — `None`
+/// indicates a replicated input), returns the dimension numbers that describe the same contraction over the
+/// parent-physical (batched) inputs. The mapping:
 ///
-/// - When both operands are batched at positions `(k_lhs, k_rhs)`, the lifted op gains one new
-///   batching dimension pair `(k_lhs, k_rhs)` at the front of the batching lists, and every
-///   existing contracting / batching index `i` is shifted to `i + 1` if `i >= k_{lhs|rhs}`. The
-///   new batch axis ends up at position `0` of the output (since batching dims are output-first).
-/// - When neither operand is batched, the dimension numbers are unchanged.
-/// - Mixed cases (exactly one operand batched) are not yet supported and return `Ok(None)` so
-///   the caller can surface `UnsupportedOperation`.
+/// - When both inputs are batched at positions `(k_lhs, k_rhs)`, the lifted op gains one new batching dimension pair
+///   `(k_lhs, k_rhs)` at the front of the batching lists, and every existing contracting / batching index `i` is
+///   shifted to `i + 1` if `i >= k_{lhs|rhs}`. The new batch axis ends up at position `0` of the output (since batching
+///   dims are output-first).
+/// - When neither input is batched, the dimension numbers are unchanged.
+/// - Mixed cases (exactly one input batched) are not yet supported and return `None` so the caller can surface
+///   `UnsupportedOperation`.
 pub fn lift_dot_dimensions(
     dimensions: &DotDimensionNumbers,
     lhs_batch_axis: Option<usize>,
@@ -308,9 +305,9 @@ pub fn lift_dot_dimensions(
 }
 
 /// Lifts an optional requested output sharding through one batching level by inserting `axis_sharding` at the new
-/// output batch axis. `axis_sharding` is the [`ShardingDimension`] derived from the batched inputs' mapped axis
-/// (see [`ArrayBatch::sharding_for_inputs`](crate::ArrayBatch::sharding_for_inputs)), so the batched
-/// dimension carries the same sharding as the operands' mapped axis, mirroring JAX's `get_sharding_for_vmap`.
+/// output batch axis. `axis_sharding` is the [`ShardingDimension`] derived from the batched inputs' mapped axis (see
+/// [`ArrayBatch::sharding_for_inputs`](crate::ArrayBatch::sharding_for_inputs)), so the batched dimension carries the
+/// same sharding as the inputs' mapped axis, mirroring JAX's `get_sharding_for_vmap`.
 pub(super) fn lift_output_sharding(
     output_sharding: Option<&Sharding>,
     output_axis: Option<usize>,

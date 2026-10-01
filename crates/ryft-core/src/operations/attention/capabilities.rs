@@ -1,13 +1,13 @@
 use super::*;
 
 /// Value-level scaled dot-product attention capability. Refer to the documentation of
-/// [`DotProductAttentionOperation`] for the `BTNH` operand convention, the exact semantics, and the transform rules.
+/// [`DotProductAttentionOperation`] for the `BTNH` input convention, the exact semantics, and the transform rules.
 pub trait DotProductAttention: Parameter + Sized {
     /// Computes attention from its canonical input structure and semantic configuration.
     ///
     /// # Parameters
     ///
-    ///   - `inputs`: Query, key, value, and any optional array operands in their canonical structure.
+    ///   - `inputs`: Query, key, value, and any optional array inputs in their canonical structure.
     ///   - `configuration`: Value-independent attention semantics and implementation selection.
     fn dot_product_attention(
         inputs: AttentionInputs<Self>,
@@ -41,13 +41,13 @@ impl DotProductAttention for Array {
 }
 
 /// Value-level backward (gradient) pass of scaled dot-product attention. Refer to the documentation of
-/// [`DotProductAttentionBackwardOperation`] for the operand convention and the exact semantics.
+/// [`DotProductAttentionBackwardOperation`] for the input convention and the exact semantics.
 pub(crate) trait DotProductAttentionBackward: Parameter + Sized {
-    /// Computes cotangents for the differentiable attention operands.
+    /// Computes cotangents for the differentiable attention inputs.
     ///
     /// # Parameters
     ///
-    ///   - `inputs`: Query, key, value, and optional operands from the forward pass.
+    ///   - `inputs`: Query, key, value, and optional inputs of the forward pass.
     ///   - `output`: Attended output produced by the forward pass.
     ///   - `residual`: Log-sum-exp statistic produced by the forward pass.
     ///   - `output_cotangent`: Incoming cotangent of the forward output.
@@ -108,12 +108,12 @@ where
     ) -> Result<(Self, Option<Self>), ProgramError> {
         let signature = inputs.signature();
         let context = inputs.query.dispatch_domain();
-        let operands = inputs.into_values();
-        let operands = ManualVariationAlignment::align_manual_variation(&operands)?;
+        let input_values = inputs.into_values();
+        let input_values = ManualVariationAlignment::align_manual_variation(&input_values)?;
         let mut outputs = context.bind(
             DotProductAttentionOperation::new(configuration, signature),
             Vec::new(),
-            operands.as_slice(),
+            input_values.as_slice(),
         )?;
         let expected_output_count = if configuration.return_residual() { 2 } else { 1 };
         check_count!("output", outputs, expected_output_count, ProgramError);
@@ -138,13 +138,13 @@ where
     ) -> Result<Vec<Self>, ProgramError> {
         let signature = inputs.signature();
         let context = inputs.query.dispatch_domain();
-        let mut operands = inputs.into_values();
-        operands.extend([output, residual, output_cotangent]);
-        let operands = ManualVariationAlignment::align_manual_variation(&operands)?;
+        let mut backward_inputs = inputs.into_values();
+        backward_inputs.extend([output, residual, output_cotangent]);
+        let backward_inputs = ManualVariationAlignment::align_manual_variation(&backward_inputs)?;
         context.bind(
             DotProductAttentionBackwardOperation::new(configuration, signature),
             Vec::new(),
-            operands.as_slice(),
+            backward_inputs.as_slice(),
         )
     }
 }

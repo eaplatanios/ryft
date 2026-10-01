@@ -2,15 +2,14 @@
 //! their interpretation, partial-evaluation, batching, forward-mode differentiation, and transposition rules. These
 //! are the analogues of [JAX's parallel operators](https://docs.jax.dev/en/latest/jax.lax.html#parallel-operators).
 //!
-//! This module owns the vocabulary that every collective shares (i.e., [`CollectiveMode`], [`CollectiveOptions`],
-//! named axis resolution, and [`forward_collective_to_parent`]), while each operation family lives in its own
-//! submodule: [`parallel_reduce`], [`parallel_vary`], [`all_gather`], [`parallel_sum_scatter`], [`parallel_permute`],
+//! This module owns the vocabulary that every collective shares (i.e., [`CollectiveMode`], [`CollectiveOptions`], named
+//! axis resolution, and [`forward_collective_to_parent`]), while each operation family lives in its own submodule:
+//! [`parallel_reduce`], [`parallel_vary`], [`all_gather`], [`parallel_sum_scatter`], [`parallel_permute`],
 //! [`all_to_all`], and [`ragged_all_to_all`]. Two private submodules hold the machinery shared across families:
-//! `linear` implements the common structure of the single-operand linear collectives (`parallel_permute`,
-//! `all_gather`, `parallel_sum_scatter`, and `all_to_all`) through its operation-generating macro, and
-//! `shape_changing` implements the batching, first-class extent, and explicit array IR rules of the collectives that
-//! resize an array axis (`all_gather`, `parallel_sum_scatter`, and `all_to_all`, whose batching policy
-//! `ragged_all_to_all` also reuses).
+//! `linear` implements the common structure of the single-input linear collectives (`parallel_permute`, `all_gather`,
+//! `parallel_sum_scatter`, and `all_to_all`) through its operation-generating macro, and `shape_changing` implements
+//! the batching, first-class extent, and explicit array IR rules of the collectives that resize an array axis
+//! (`all_gather`, `parallel_sum_scatter`, and `all_to_all`, whose batching policy `ragged_all_to_all` also reuses).
 //!
 //! Collectives reference an enclosing named-axis binder by name, validated against the active
 //! [`NamedAxes`] environment at staging time. A name bound by an enclosing `batch` level is
@@ -172,7 +171,7 @@ pub(super) fn effective_collective_axis_size(
     Ok(group_size)
 }
 
-/// Rejects ragged collective operands before any parent binding can stage or execute collective work.
+/// Rejects ragged collective inputs before any parent binding can stage or execute collective work.
 pub(super) fn reject_ragged_collective_inputs<V: Value<Type = ArrayType>>(
     operation_name: &str,
     inputs: &[ArrayBatch<V>],
@@ -184,7 +183,7 @@ pub(super) fn reject_ragged_collective_inputs<V: Value<Type = ArrayType>>(
     {
         return Err(BatchingError::UnsupportedOperation {
             message: format!(
-                "`{}` does not support bounded ragged dimension `{}` on operand {}",
+                "`{}` does not support bounded ragged dimension `{}` on input {}",
                 operation_name,
                 ragged_axis.dimension(),
                 index,
@@ -197,12 +196,11 @@ pub(super) fn reject_ragged_collective_inputs<V: Value<Type = ArrayType>>(
 /// Re-stages a collective that targets a different (outer) named axis into the batching context's parent.
 ///
 /// Under nested `batch` levels, a collective is consumed by the level whose
-/// [`axis_name`](crate::batching::BatchingContext::axis_name) matches its axis name and must pass through
-/// every inner level untouched: each inner batch item participates in the outer collective independently, so the
-/// operands' mapped axes are preserved as-is on the forwarded outputs. The parent may itself be another
-/// [`BatchingContext`] — whose own rule dispatch repeats this name
-/// resolution at the next level — or an ordinary tracing context. Batching rules for custom collective-like
-/// operations should use this helper for their "not my axis" arm.
+/// [`axis_name`](crate::batching::BatchingContext::axis_name) matches its axis name and must pass through every inner
+/// level untouched: each inner batch item participates in the outer collective independently, so the inputs' mapped
+/// axes are preserved as-is on the forwarded outputs. The parent may itself be another [`BatchingContext`] — whose own
+/// rule dispatch repeats this name resolution at the next level — or an ordinary tracing context. Batching rules for
+/// custom collective-like operations should use this helper for their "not my axis" arm.
 pub fn forward_collective_to_parent<C, P: ArrayExtentBatchingPolicy<C>>(
     context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     parent_operation: C::Operation,
@@ -234,9 +232,7 @@ pub(super) fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str
                 .into())
         }
         Some(NamedAxis::Batched { size: None }) => Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "collective axis `{axis_name}` has a dynamic extent that must remain a first-class operand"
-            ),
+            message: format!("collective axis `{axis_name}` has a dynamic extent that must remain a first-class input"),
         }
         .into()),
         None => Err(BatchingError::Axis(AxisError::UnboundAxisName { name: axis_name.to_string() }).into()),

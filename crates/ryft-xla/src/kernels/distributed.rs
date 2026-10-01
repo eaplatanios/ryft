@@ -1,11 +1,11 @@
 //! Experimental distributed kernel execution and native participant admission.
 //!
 //! Native kernels currently execute only on a fixed, fully addressable, single-process device mesh. Multiple local
-//! devices share the existing PJRT [`ExecutionFence`](ryft_pjrt::ExecutionFence); its terminal result joins every
-//! participating device, including asynchronous failures. The check in this module runs at the common XLA submission
-//! boundary before input resharding, donation, or device submission, including restored executables and stateful calls.
+//! devices share the existing PJRT [`ExecutionFence`]; its terminal result joins every participating device, including
+//! asynchronous failures. The check in this module runs at the common XLA submission boundary before input resharding,
+//! donation, or device submission, including restored executables and stateful calls.
 //!
-//! Compilation agreement already belongs to [`DistributedRuntime`](crate::DistributedRuntime). Its
+//! Compilation agreement already belongs to [`DistributedRuntime`]. Its
 //! [`compilation_artifact_exchange`](crate::DistributedRuntime::compilation_artifact_exchange) compares ordered rounds,
 //! process counts, launch identity, and exact persistent compilation keys before exchanging checksummed artifacts.
 //! Kernel compiler, target, plugin, and topology identities participate in those keys. Artifact agreement does not
@@ -16,10 +16,10 @@
 //! multi-process mesh. CPU needs no cross-host PJRT extension for this route; CUDA/ROCm extension presence does not
 //! change its transport or imply native collective qualification. External references and observable I/O are rejected.
 //!
-//! [`DistributedKernel::call_async`] returns the existing [`ReferenceExecution`](ryft_core::ReferenceExecution).
-//! Preflight and host transfers block before submission; its completion retains the existing native fence and runtime.
-//! Awaiting completes the distributed readiness barrier. No background worker advances that barrier, and readiness
-//! queries only report cached terminal results. Blocking [`DistributedKernel::call`] delegates to this same path.
+//! [`DistributedKernel::call_async`] returns the existing [`ReferenceExecution`]. Preflight and host transfers block
+//! before submission; its completion retains the existing native fence and runtime. Awaiting completes the distributed
+//! readiness barrier. No background worker advances that barrier, and readiness queries only report cached terminal
+//! results. Blocking [`DistributedKernel::call`] delegates to this same path.
 //!
 //! The runtime service and participants must be trusted and cooperative. Published/reassembled chunks are bounded,
 //! but the existing KV API allocates returned values before this layer can inspect their lengths; this is not a

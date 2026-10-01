@@ -31,7 +31,7 @@ fn test_attention_configuration() {
 
 #[test]
 fn test_attention_inputs() {
-    let signature = AttentionOperandSignature::new(true, true, true, true);
+    let signature = AttentionInputSignature::new(true, true, true, true);
     let values = (0..7).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
     let inputs = AttentionInputs::from_values(signature, values.as_slice()).unwrap();
 
@@ -53,7 +53,7 @@ fn test_dot_product_attention() {
             .with_local_window((2, 0))
             .with_implementation(AttentionImplementation::Portable)
             .with_residual(true),
-        AttentionOperandSignature::new(true, false, true, true),
+        AttentionInputSignature::new(true, false, true, true),
     );
 
     assert_eq!(
@@ -65,7 +65,7 @@ fn test_dot_product_attention() {
                     local_window=(2, 0),
                     implementation=portable,
                     residual=true,
-                    signature=AttentionOperandSignature { bias: true, mask: false, query_sequence_lengths: true, key_value_sequence_lengths: true },
+                    signature=AttentionInputSignature { bias: true, mask: false, query_sequence_lengths: true, key_value_sequence_lengths: true },
                 ]"},
     );
 }
@@ -91,7 +91,7 @@ fn test_dot_product_attention_manual_variation() {
     let mask = ArrayType::new_static(DataType::Boolean, [1, 1, 1, 1])
         .with_sharding(Sharding::replicated(mesh.clone(), 4))
         .unwrap();
-    let signature = AttentionOperandSignature::new(true, true, true, true);
+    let signature = AttentionInputSignature::new(true, true, true, true);
     let configuration = AttentionConfiguration::new().with_residual(true);
     let inputs = vec![
         varying.clone(),
@@ -194,7 +194,7 @@ fn test_dot_product_attention_manual_variation() {
         .with_sharding(Sharding::replicated(mesh, 4).with_reduced_axes(["x"]).unwrap())
         .unwrap();
     let operation =
-        DotProductAttentionOperation::new(configuration, AttentionOperandSignature::new(false, false, false, false));
+        DotProductAttentionOperation::new(configuration, AttentionInputSignature::new(false, false, false, false));
     assert!(matches!(operation.infer_output_types(&[reduced, invariant.clone(), invariant], &[]),
         Err(TypeError::Invalid { message, .. }) if message == "`dot_product_attention` does not support reduced inputs"));
 }
@@ -207,7 +207,7 @@ fn test_dot_product_attention_type_inference() {
     let mask = ArrayType::new_static(DataType::Boolean, [2, 3]);
     let lengths = ArrayType::new_static(DataType::I32, [1]);
     let residual = ArrayType::new_static(DataType::F32, [2, 2]);
-    let signature = AttentionOperandSignature::new(true, true, true, true);
+    let signature = AttentionInputSignature::new(true, true, true, true);
     let configuration = AttentionConfiguration::new().with_local_window((0, 0)).with_residual(true);
     let operation = DotProductAttentionOperation::new(configuration, signature);
     let input_types =
@@ -227,7 +227,7 @@ fn test_dot_product_attention_type_inference() {
     let key_value = ArrayType::new_static(DataType::F32, [3, 1, 2]);
     let bias = ArrayType::new_static(DataType::I32, [3]);
     let residual = ArrayType::new_static(DataType::F32, [2, 2]);
-    let structural_bias_signature = AttentionOperandSignature::new(true, false, false, false);
+    let structural_bias_signature = AttentionInputSignature::new(true, false, false, false);
     let mut backward_input_types = vec![query.clone(), key_value.clone(), key_value.clone(), bias];
     backward_input_types.extend([query.clone(), residual, query.clone()]);
     assert_eq!(
@@ -238,7 +238,7 @@ fn test_dot_product_attention_type_inference() {
 
     let dropout = AttentionConfiguration::new().with_dropout((0.25, 7));
     assert!(matches!(
-        DotProductAttentionOperation::new(dropout, AttentionOperandSignature::default())
+        DotProductAttentionOperation::new(dropout, AttentionInputSignature::default())
             .infer_output_types(&backward_input_types[..3], &[]),
         Err(TypeError::Invalid { message, .. })
             if message == "`dot_product_attention` dropout requires the fused implementation",
@@ -247,8 +247,9 @@ fn test_dot_product_attention_type_inference() {
 
 #[test]
 fn test_dot_product_attention_interpretation() {
-    // Rank-three operands normalize through an implicit batch. The arbitrary mask, asymmetric local window, and
-    // query lengths compose independently, while the omitted scale defaults to `1 / sqrt(head_dimension)`.
+    // Rank-three query, key, and value inputs normalize through an implicit batch. The arbitrary mask, asymmetric
+    // local window, and query lengths compose independently, while the omitted scale defaults to
+    // `1 / sqrt(head_dimension)`.
     let query =
         Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 1, 2]), &[1.0, 0.0, 0.0, 1.0]).unwrap();
     let key =
@@ -340,23 +341,22 @@ fn test_dot_product_attention_batching() {
         ArrayBatch::new(Array::from_elements::<f32>(r#type.clone(), &[1.0, 1.0]).unwrap(), BatchAxis::new(0)).unwrap();
     let value = ArrayBatch::new(Array::from_elements::<f32>(r#type, &[5.0, 7.0]).unwrap(), BatchAxis::new(0)).unwrap();
 
-    let outputs =
-        DotProductAttentionOperation::new(AttentionConfiguration::new(), AttentionOperandSignature::default())
-            .batch(
-                &BatchingContext::new(crate::contexts::EagerContext::<Array>::new(), 2),
-                &crate::EmptyRegionDriver,
-                &[query, key, value],
-            )
-            .unwrap()
-            .into_parts()
-            .0;
+    let outputs = DotProductAttentionOperation::new(AttentionConfiguration::new(), AttentionInputSignature::default())
+        .batch(
+            &BatchingContext::new(crate::contexts::EagerContext::<Array>::new(), 2),
+            &crate::EmptyRegionDriver,
+            &[query, key, value],
+        )
+        .unwrap()
+        .into_parts()
+        .0;
 
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
     assert_eq!(outputs[0].value().to_f64s(), vec![5.0, 7.0]);
 
     // Rank-three attention has an implicit logical batch of one. A mapped rank-two mask is normalized alongside
-    // the operands rather than being mistaken for a tensor batch prefix.
+    // the query, key, and value rather than being mistaken for a tensor batch prefix.
     let query = ArrayBatch::new(
         Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 1, 1, 1]), &[1.0, 1.0]).unwrap(),
         BatchAxis::new(0),
@@ -380,7 +380,7 @@ fn test_dot_product_attention_batching() {
     .unwrap();
     let outputs = DotProductAttentionOperation::new(
         AttentionConfiguration::new().with_residual(true),
-        AttentionOperandSignature::new(false, true, false, false),
+        AttentionInputSignature::new(false, true, false, false),
     )
     .batch(
         &BatchingContext::new(crate::contexts::EagerContext::<Array>::new(), 2),

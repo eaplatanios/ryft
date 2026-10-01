@@ -1156,7 +1156,7 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        discharge_positional_region_operation(self, context, driver, inputs, 0)
+        discharge_positional_region_operation(self, context, driver, inputs, 0, |_| self.clone())
     }
 }
 
@@ -1722,13 +1722,13 @@ mod tests {
         DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, EffectClass, EffectClasses,
         ErasedOperation, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh, MaybeZero, Memory, MeshAxis,
         MeshAxisType, MulOperation, NoStorage, Operation, OperationPayloadProjection, OperationProvider,
-        OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessOperation,
-        ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
-        ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionDriver, RegionInterface,
-        RegionRef, RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy,
-        ResidualPolicyReference, ResidualRejection, ResidualZeroProvider, ScanOperation, Shape, Sharding,
-        ShardingDimension, StagingContext, TagOperation, Tracer, TracingContext, TransferToMemoryOperation,
+        OptimizationBarrier, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
+        ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
+        RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualCandidate, ResidualDecision,
+        ResidualPolicy, ResidualPolicyReference, ResidualRejection, ResidualZeroProvider, ScanOperation, Shape,
+        Sharding, ShardingDimension, StagingContext, TagOperation, Tracer, TracingContext, TransferToMemoryOperation,
         TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection, ValueResolution,
         WhileOperation, ZeroOperation,
     };
@@ -2244,7 +2244,7 @@ mod tests {
         ));
 
         let rematerialize = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(DotsSaveable))
-            .with_optimization_barrier(false)
+            .with_optimization_barrier(OptimizationBarrier::None)
             .with_differentiated(true);
         let promoted: XlaOperation<XlaConstant> =
             ArrayIrOperation::<XlaArrayConstant>::Rematerialize(rematerialize.clone()).into();

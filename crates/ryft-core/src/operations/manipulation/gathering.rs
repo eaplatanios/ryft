@@ -914,8 +914,8 @@ where
                     self.clone()
                 };
 
-                let transpose_operand_type = input_type.cotangent()?;
-                let transpose_operation = self.adjoint_scatter_operation(transpose_operand_type.sharding().cloned());
+                let input_cotangent_type = input_type.cotangent()?;
+                let transpose_operation = self.adjoint_scatter_operation(input_cotangent_type.sharding().cloned());
                 let mut tangent_outputs = LinearCallOperation::stage(
                     tangent_context,
                     residuals.into_values(),
@@ -929,7 +929,7 @@ where
                     move |residuals, output_cotangents| {
                         let transpose_context = output_cotangents[0].dispatch_domain();
                         let zeros = transpose_context.bind_array(
-                            ZeroOperation::new(transpose_operand_type.clone()),
+                            ZeroOperation::new(input_cotangent_type.clone()),
                             input_shape.dynamic_dimensions(residuals).as_slice(),
                         )?;
                         let contribution = transpose_context.bind_array(
@@ -940,11 +940,11 @@ where
                         // Residual extents may refine singleton dynamic dimensions to static dimensions. Restore
                         // the original cotangent signature, including its dimension identities and storage metadata.
                         let contribution =
-                            if <&ArrayType>::try_from(contribution.r#type().as_ref())? != &transpose_operand_type {
+                            if <&ArrayType>::try_from(contribution.r#type().as_ref())? != &input_cotangent_type {
                                 transpose_context.bind_array(
                                     BroadcastOperation::new(
-                                        transpose_operand_type.clone(),
-                                        (0..transpose_operand_type.rank()).collect(),
+                                        input_cotangent_type.clone(),
+                                        (0..input_cotangent_type.rank()).collect(),
                                     ),
                                     std::slice::from_ref(&contribution),
                                 )?
@@ -1337,8 +1337,8 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
 
         // The collapsed, batching, and start-index-map axis sets must be mutually disjoint where required.
         let collapsed: BTreeSet<usize> = dimensions.collapsed_slice_dimensions().iter().copied().collect();
-        let operand_batching: BTreeSet<usize> = input_batching_dimensions.iter().copied().collect();
-        if collapsed.intersection(&operand_batching).next().is_some() {
+        let input_batching: BTreeSet<usize> = input_batching_dimensions.iter().copied().collect();
+        if collapsed.intersection(&input_batching).next().is_some() {
             return Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` `collapsed_slice_dimensions` and `batching_dimensions input axes` must be \
                  disjoint"
@@ -1386,7 +1386,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
                 .into());
             }
 
-            if operand_batching.contains(&axis) && size > 1 {
+            if input_batching.contains(&axis) && size > 1 {
                 return Err(TypeError::invalid(format!(
                     "`{GATHER_OPERATION_NAME}` input batching dimension {axis} must have slice size at most 1 but \
                      has {size}",
@@ -1395,7 +1395,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             }
         }
 
-        let offset_count = input_rank - collapsed.len() - operand_batching.len();
+        let offset_count = input_rank - collapsed.len() - input_batching.len();
         if dimensions.offset_dimensions().len() != offset_count {
             return Err(TypeError::invalid(format!(
                 "`{GATHER_OPERATION_NAME}` `offset_dimensions` has length {} but the number of non-collapsed, \
@@ -1419,9 +1419,8 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
         // In the output shape, offset positions take the (non-collapsed, non-batching) input window sizes in input-axis
         // order and the remaining positions take the indices' batch axes (i.e., every axis but the index vector)
         // in order.
-        let input_offset_axes: Vec<usize> = (0..input_rank)
-            .filter(|axis| !collapsed.contains(axis) && !operand_batching.contains(axis))
-            .collect();
+        let input_offset_axes: Vec<usize> =
+            (0..input_rank).filter(|axis| !collapsed.contains(axis) && !input_batching.contains(axis)).collect();
         let indices_batch_axes: Vec<usize> = (0..indices_rank).filter(|axis| *axis != index_vector_dimension).collect();
         let batch_query_sizes: Vec<Dimension> =
             indices_batch_axes.iter().map(|&axis| indices.dimension(axis)).collect();
@@ -1529,14 +1528,14 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
         } else if let Some(mesh) = mesh {
             // Indexed or collapsed axes require replication when the gather reads only part of their extent.
             // Full-extent windows can retain their placement. The index-vector axis always requires replication.
-            let replicated_operand_axes: BTreeSet<usize> = dimensions
+            let replicated_input_axes: BTreeSet<usize> = dimensions
                 .start_index_map()
                 .iter()
                 .chain(dimensions.collapsed_slice_dimensions())
                 .copied()
                 .collect();
             if let Some(sharding) = input_sharding {
-                for &axis in &replicated_operand_axes {
+                for &axis in &replicated_input_axes {
                     if input.dimension(axis) != Dimension::Static(slice_sizes[axis])
                         && sharding.dimensions()[axis].has_explicit_axis(&mesh)
                     {

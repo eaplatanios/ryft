@@ -373,8 +373,10 @@ update this file so that they do not need to remind you again in the future.
 - In `ryft-core`, call the values that an operation or instruction consumes its "inputs" (e.g., in names, comments,
   diagnostics, and tests), following `Instruction::inputs`, `Operation::infer_output_types(.., input_types)`, and
   `InputRegionProvenance::Input`, rather than "operands". Write "region input", "instruction input", or "program
-  input" wherever more than one kind appears nearby. Keep "operand" only where it mirrors an external specification
-  (e.g., StableHLO gather/scatter and collective argument names, XLA custom-call operands, and MLIR in `ryft-xla`).
+  input" wherever more than one kind appears nearby. Keep "operand" only where a specification uses it as the role
+  name of one particular input or inside an attribute name (e.g., the `operand` of StableHLO `gather`, `scatter`, and
+  `ragged_all_to_all`, and attributes such as `operand_batching_dims`), and in `ryft-xla` MLIR code. A specification
+  that calls every input an operand (e.g., most StableHLO operations or XLA custom calls) is not a reason to keep it.
 
 ## Testing Guidelines
 

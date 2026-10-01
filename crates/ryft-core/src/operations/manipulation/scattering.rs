@@ -1731,8 +1731,8 @@ impl Scatter for ArrayType {
         }
 
         let inserted = dimensions.inserted_window_dimensions().iter().copied().collect::<BTreeSet<_>>();
-        let operand_batching = dimensions.input_batching_dimensions().iter().copied().collect::<BTreeSet<_>>();
-        if inserted.intersection(&operand_batching).next().is_some() {
+        let input_batching = dimensions.input_batching_dimensions().iter().copied().collect::<BTreeSet<_>>();
+        if inserted.intersection(&input_batching).next().is_some() {
             return Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` `inserted_window_dimensions` and `input_batching_dimensions` \
                  must be disjoint",
@@ -1743,7 +1743,7 @@ impl Scatter for ArrayType {
         if dimensions
             .scatter_dimensions_to_operand_dimensions()
             .iter()
-            .any(|axis| operand_batching.contains(axis))
+            .any(|axis| input_batching.contains(axis))
         {
             return Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` indexed input axes and batching input axes must be disjoint",
@@ -1754,7 +1754,7 @@ impl Scatter for ArrayType {
         // Rank decomposition: the input axes split into window, inserted, and batching axes; the updates axes split
         // into window axes and the scatter/batch axes carried from the indices (every indices axis but the index
         // vector).
-        if input_rank != dimensions.update_window_dimensions().len() + inserted.len() + operand_batching.len() {
+        if input_rank != dimensions.update_window_dimensions().len() + inserted.len() + input_batching.len() {
             return Err(TypeError::invalid(format!(
                 "`{SCATTER_OPERATION_NAME}` input rank {input_rank} must equal update_window + inserted_window + \
                  operand_batching dimension counts"
@@ -1774,7 +1774,7 @@ impl Scatter for ArrayType {
         // in order) pair 1:1 with the sorted update window axes and each update window extent must fit within the input
         // window extent.
         let input_window_axes = (0..input_rank)
-            .filter(|axis| !inserted.contains(axis) && !operand_batching.contains(axis))
+            .filter(|axis| !inserted.contains(axis) && !input_batching.contains(axis))
             .collect::<Vec<_>>();
         for (&input_axis, &update_axis) in input_window_axes.iter().zip(dimensions.update_window_dimensions()) {
             if let (Dimension::Static(update_extent), Dimension::Static(input_extent)) =

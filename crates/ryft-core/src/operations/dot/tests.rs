@@ -113,8 +113,8 @@ fn test_dot_inference_with_dynamic_dimensions() {
 fn test_dot_inference_batched_sharding_propagation() {
     let mesh = test_mesh();
     let operation = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]));
-    // The batch dimension merges the more informative entry (LHS `b` over RHS replicated), and the result
-    // dimensions are copied from their owning operands.
+    // The batch dimension merges the more informative entry (LHS `b` over RHS replicated), and the result dimensions
+    // are copied from their owning inputs.
     let lhs = sharded_array(
         &mesh,
         &[2, 4, 8],
@@ -143,7 +143,7 @@ fn test_dot_inference_batched_sharding_propagation() {
 fn test_dot_inference_matmul_sharding_propagation() {
     let mesh = test_mesh();
     let operation = DotOperation::matmul();
-    // Fully replicated operands stay fully replicated.
+    // Fully replicated inputs stay fully replicated.
     let replicated_lhs =
         sharded_array(&mesh, &[4, 8], vec![ShardingDimension::replicated(), ShardingDimension::replicated()]);
     let replicated_rhs =
@@ -174,7 +174,7 @@ fn test_dot_inference_matmul_sharding_propagation() {
 fn test_dot_inference_one_sided_sharding_propagation() {
     let mesh = test_mesh();
     let operation = DotOperation::matmul();
-    // A missing operand sharding is treated as fully replicated on the present operand's mesh.
+    // A missing input sharding is treated as fully replicated on the present input's mesh.
     let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]);
     assert_eq!(
         operation.infer_output_types(&[lhs, plain_array(&[8, 16])], &[]),
@@ -184,7 +184,7 @@ fn test_dot_inference_one_sided_sharding_propagation() {
             vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()],
         )]),
     );
-    // Without any operand shardings, the output carries none.
+    // Without any input shardings, the output carries none.
     assert_eq!(
         operation.infer_output_types(&[plain_array(&[4, 8]), plain_array(&[8, 16])], &[]),
         Ok(vec![plain_array(&[4, 16])]),
@@ -237,7 +237,7 @@ fn test_dot_inference_contracting_sharding_errors() {
             "`dot` contracting dimensions must have consistent shardings, but got {'k'} and {'m'}".to_string()
         )),
     );
-    // A contracting dimension sharded on only one operand is allowed, and its sharding is dropped.
+    // A contracting dimension sharded on only one input is allowed, and its sharding is dropped.
     let replicated_rhs =
         sharded_array(&mesh, &[8, 16], vec![ShardingDimension::replicated(), ShardingDimension::replicated()]);
     assert_eq!(
@@ -260,15 +260,15 @@ fn test_dot_inference_mesh_mismatch() {
         sharded_array(&other_mesh, &[8, 16], vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]);
     assert_eq!(
         operation.infer_output_types(&[lhs, rhs], &[]),
-        Err(TypeError::invalid("`dot` operand shardings must use the same mesh".to_string())),
+        Err(TypeError::invalid("`dot` input shardings must use the same mesh".to_string())),
     );
 }
 
 #[test]
-fn test_dot_inference_unreduced_and_reduced_operands() {
+fn test_dot_inference_unreduced_and_reduced_inputs() {
     let mesh = test_mesh();
     let operation = DotOperation::matmul();
-    // Unreduced operands are rejected: the pending reduction must be discharged before the contraction.
+    // Unreduced inputs are rejected: the pending reduction must be discharged before the contraction.
     let unreduced_lhs = plain_array(&[4, 8])
         .with_sharding(
             Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
@@ -279,11 +279,11 @@ fn test_dot_inference_unreduced_and_reduced_operands() {
         .unwrap();
     assert_eq!(
         operation.infer_output_types(&[unreduced_lhs, plain_array(&[8, 16])], &[]),
-        Err(TypeError::invalid("`dot` operands cannot be unreduced".to_string())),
+        Err(TypeError::invalid("`dot` inputs cannot be unreduced".to_string())),
     );
 
-    // Reduced operands are legal (this is what lets adjoint dots consume reduced cotangents), and their reduced
-    // axes are unioned into the output sharding.
+    // Reduced inputs are legal (this is what lets adjoint dots consume reduced cotangents), and their reduced axes are
+    // unioned into the output sharding.
     let reduced_lhs = plain_array(&[4, 8])
         .with_sharding(
             Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
@@ -369,7 +369,7 @@ fn test_dot_inference_output_sharding_bypass_and_validation() {
         .with_output_sharding(other_mesh_sharding);
     assert_eq!(
         operation.infer_output_types(&[lhs, rhs], &[]),
-        Err(TypeError::invalid("`dot` output sharding must use the same mesh as the operands".to_string())),
+        Err(TypeError::invalid("`dot` output sharding must use the same mesh as the inputs".to_string())),
     );
 
     // Auto mesh axes cannot be requested explicitly.
@@ -458,13 +458,13 @@ fn test_dot_inference_unreduced_output_sharding() {
 
 #[test]
 fn test_dot_accumulation_type() {
-    // Type inference widens the output to the accumulation type for promotable operand types and rejects
-    // non-promotable ones, combining with a requested output sharding, and differentiation.
+    // Type inference widens the output to the accumulation type for promotable input types and rejects non-promotable
+    // ones, combining with a requested output sharding, and differentiation.
     let operation = DotOperation::matmul().with_accumulation_type(DataType::F32);
     assert_eq!(operation.accumulation_type(), Some(DataType::F32));
     let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
     let rhs = lhs.clone();
-    let bf16_operand = ArrayType::new(DataType::BF16, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+    let bf16_input = ArrayType::new(DataType::BF16, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
     let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
     check_operation_type_inference!(
         operation = operation,
@@ -474,18 +474,18 @@ fn test_dot_accumulation_type() {
                 output_types = [output_type.clone()],
             },
             {
-                input_types = [bf16_operand.clone(), bf16_operand],
+                input_types = [bf16_input.clone(), bf16_input],
                 output_types = [output_type],
             },
         ],
     );
     let narrowing = DotOperation::matmul().with_accumulation_type(DataType::F16);
-    let f32_operand = plain_array(&[2, 2]);
+    let f32_input = plain_array(&[2, 2]);
     check_operation_type_inference!(
         operation = narrowing,
         cases = [{
-            input_types = [f32_operand.clone(), f32_operand],
-            error = "`dot` operand data type `f32` cannot accumulate at data type `f16`",
+            input_types = [f32_input.clone(), f32_input],
+            error = "`dot` input data type `f32` cannot accumulate at data type `f16`",
         }],
     );
     let mesh = test_mesh();
@@ -500,8 +500,8 @@ fn test_dot_accumulation_type() {
         }],
     );
 
-    // The eager reference backend upcasts the operands and accumulates at the accumulation type: every value
-    // below is exactly representable in `f8e4m3fn`, so the `f32` results are exact.
+    // The eager reference backend upcasts the inputs and accumulates at the accumulation type: every value below is
+    // exactly representable in `f8e4m3fn`, so the `f32` results are exact.
     let lhs_values = Array::from_elements::<f8e4m3fn>(
         lhs.clone(),
         &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
@@ -521,9 +521,9 @@ fn test_dot_accumulation_type() {
     );
     assert_eq!(product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
 
-    // Forward-mode differentiation stages accumulation-typed tangent dots over the operand-typed tangents, so
-    // the output tangent lives at the accumulation type exactly like the primal output. Every value below is
-    // exactly representable in `f8e4m3fn` and every product sum is exact in `f32`.
+    // Forward-mode differentiation stages accumulation-typed tangent dots over the input-typed tangents, so the output
+    // tangent lives at the accumulation type exactly like the primal output. Every value below is exactly representable
+    // in `f8e4m3fn` and every product sum is exact in `f32`.
     let mut builder = crate::programs::builders::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
     let lhs_input = builder.add_input(lhs.clone());
     let rhs_input = builder.add_input(rhs.clone());
@@ -585,9 +585,9 @@ fn test_dot_accumulation_type() {
     // Tangent = d_lhs · rhs + lhs · d_rhs = [[1.5, 1.5], [1.5, 1.5]] + [[0.75, 0.75], [1.75, 1.75]].
     assert_eq!(jvp_outputs[1].to_f64s(), vec![2.25, 2.25, 3.25, 3.25]);
 
-    // The transpose rule contracts the adjoint at the accumulation type and converts the result back to the
-    // linear operand's `f8e4m3fn` cotangent representation. With an identity output cotangent, the adjoint of
-    // the linear RHS is exactly `lhsᵀ`.
+    // The transpose rule contracts the adjoint at the accumulation type and converts the result back to the linear
+    // input's `f8e4m3fn` cotangent representation. With an identity output cotangent, the adjoint of the linear RHS is
+    // exactly `lhsᵀ`.
     check_operation_transposition!(
         @exact,
         operation = DotOperation::matmul().with_accumulation_type(DataType::F32),
@@ -769,8 +769,8 @@ fn test_dot_batching_lifts_dimension_numbers() {
         assert_abs_diff_eq!(*actual, *expected, epsilon = 1e-9);
     }
 
-    // A replicated operand is broadcast across the mapped operand's batch axis before the dot dimensions are
-    // lifted. Each row therefore contracts against the same right-hand vector.
+    // A replicated input is broadcast across the mapped input's batch axis before the dot dimensions are lifted. Each
+    // row therefore contracts against the same right-hand vector.
     let lhs = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let lhs = ArrayBatch::new(lhs, BatchAxis::new(0)).unwrap();
     let rhs = ArrayBatch::replicated(Array::vector(vec![10.0, 100.0, 1000.0]).unwrap());
@@ -803,7 +803,7 @@ fn test_dot_batching_validates_mapped_extents() {
         ))
     };
 
-    // Two mapped operands whose mapped axes carry different statically known extents cannot describe one batch.
+    // Two mapped inputs whose mapped axes carry different statically known extents cannot describe one batch.
     assert_eq!(
         operation
             .batch(
@@ -819,8 +819,8 @@ fn test_dot_batching_validates_mapped_extents() {
         BatchingError::MismatchedBatchSizes { expected: 2, actual: 3 },
     );
 
-    // Two mapped operands sharing one dynamic mapped extent describe the same batch, so the lifted contraction is
-    // staged with that dimension on its batching dimension.
+    // Two mapped inputs sharing one dynamic mapped extent describe the same batch, so the lifted contraction is staged
+    // with that dimension on its batching dimension.
     let variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
     let outputs = operation
         .batch(
@@ -857,7 +857,7 @@ fn test_dot_batching_validates_mapped_extents() {
             .map(|outputs| outputs.into_parts().0)
             .unwrap_err(),
         BatchingError::MisalignedBatchAxes {
-            message: "`dot` operands map different batch extents `batch` and `other`".to_string(),
+            message: "`dot` inputs map different batch extents `batch` and `other`".to_string(),
         },
     );
 }
@@ -929,8 +929,8 @@ fn test_dot_batching_rejects_unsupported_ragged_configurations() {
         },
     );
 
-    // A ragged axis declared as a batching dimension of the dot itself would require both operands to agree on
-    // per-item extents along paired batch dimensions, which nothing here establishes.
+    // A ragged axis declared as a batching dimension of the dot itself would require both inputs to agree on per-item
+    // extents along paired batch dimensions, which nothing here establishes.
     assert_eq!(
         DotOperation::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]))
             .batch(&context, &crate::EmptyRegionDriver, &[ragged_matrix(), ragged_matrix()])
@@ -941,7 +941,7 @@ fn test_dot_batching_rejects_unsupported_ragged_configurations() {
         },
     );
 
-    // A replicated ragged operand gains its batch axis through a broadcast that carries no per-item extents.
+    // A replicated ragged input gains its batch axis through a broadcast that carries no per-item extents.
     let replicated = ArrayBatch::replicated(
         Array::from_elements::<f32>(plain_array(&[3, 2]), &(1..=6).map(|value| value as f32).collect::<Vec<_>>())
             .unwrap(),
@@ -965,17 +965,17 @@ fn test_dot_batching_rejects_unsupported_ragged_configurations() {
             .map(|outputs| outputs.into_parts().0)
             .unwrap_err(),
         BatchingError::UnsupportedOperation {
-            message: "`dot` does not support bounded ragged dimension `length` on a replicated operand".to_string(),
+            message: "`dot` does not support bounded ragged dimension `length` on a replicated input".to_string(),
         },
     );
 }
 
 #[test]
 fn test_dot_batching_under_a_dynamic_mapped_extent() -> Result<(), ProgramError> {
-    // A dense contraction is batched under a dynamic mapped extent as well. The mapped operand keeps the dynamic batch
+    // A dense contraction is batched under a dynamic mapped extent as well. The mapped input keeps the dynamic batch
     // dimension it already carries, and the replicated right-hand vector gains one through the policy's dynamic
     // broadcast, whose inserted axis is grounded by the transform's first-class extent value (read off the mapped
-    // operand's own axis). The lifted dot then contracts the trailing axis under a dynamic batching dimension.
+    // input's own axis). The lifted dot then contracts the trailing axis under a dynamic batching dimension.
     let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
     let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5))?);
     let rows = trace.input(
@@ -1149,7 +1149,7 @@ fn test_array_dot() {
     assert_eq!(product.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 2]));
     assert_eq!(product.to_f64s(), vec![58.0, 64.0, 139.0, 154.0]);
 
-    // Both operands are decoded through their physical layouts rather than through dense logical payload copies.
+    // Both inputs are decoded through their physical layouts rather than through dense logical payload copies.
     let lhs_type =
         ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
     let rhs_type =
@@ -1158,7 +1158,7 @@ fn test_array_dot() {
     let rhs = Array::from_elements(rhs_type, &[7u16, 8, 9, 10, 11, 12]).unwrap();
     assert_eq!(lhs.dot(&rhs, &dimensions).unwrap().elements::<u16>(), Ok(vec![58, 64, 139, 154]));
 
-    // Batched generalized contraction places batch axes before both operands' non-contracting axes.
+    // Batched generalized contraction places batch axes before both inputs' non-contracting axes.
     let lhs =
         Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 2]), &[1i32, 2, 3, 4, 5, 6, 7, 8]).unwrap();
     let rhs = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[2i32, 3, 4, 5]).unwrap();
@@ -1825,9 +1825,9 @@ fn test_ragged_dot_transpose_rejects_contracting_and_batch_modes() {
 
 #[test]
 fn test_dot_batching_ragged_dynamic_prefix() -> Result<(), ProgramError> {
-    // End to end, each item broadcasts to its own checked length and contracts that ragged vector with itself.
-    // Zeroing the padded operand elements removes their products from the sums, so each item's result is the inner
-    // product over its live prefix.
+    // End to end, each item broadcasts to its own checked length and contracts that ragged vector with itself. Zeroing
+    // the padded input elements removes their products from the sums, so each item's result is the inner product over
+    // its live prefix.
     let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
     let output: ArrayIrValue<Array> = batch(
         |(value, extent)| {

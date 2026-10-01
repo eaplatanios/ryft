@@ -17,28 +17,28 @@ pub const DOT_OPERATION_NAME: &str = "dot";
 /// products, and arbitrary tensor contractions. It lowers to StableHLO's `dot_general` op in the XLA backend.
 ///
 /// A dot is bilinear. Forward-mode differentiation applies
-/// `d(dot(lhs, rhs)) = dot(dlhs, rhs) + dot(lhs, drhs)`. Transposition therefore accepts exactly one linear operand
-/// and contracts the output cotangent with the other, known operand using the corresponding adjoint dimension
-/// numbers. Accumulation-typed dots perform those contractions at the widened cotangent type before converting the
-/// result back to the linear operand's cotangent representation.
+/// `d(dot(lhs, rhs)) = dot(dlhs, rhs) + dot(lhs, drhs)`. Transposition therefore accepts exactly one linear input and
+/// contracts the output cotangent with the other, known input using the corresponding adjoint dimension numbers.
+/// Accumulation-typed dots perform those contractions at the widened cotangent type before converting the result back
+/// to the linear input's cotangent representation.
 ///
 /// Each forward-mode tangent term is staged as an ordinary dot that preserves the primal dimension numbers,
 /// accumulation type, and requested output sharding without introducing captures. Transposition pins the adjoint
-/// contraction's output sharding to the cotangent dual of the linear operand's sharding. A structural-zero output
+/// contraction's output sharding to the cotangent dual of the linear input's sharding. A structural-zero output
 /// cotangent remains structural zero.
 ///
-/// Batching aligns the operands onto a common mapped axis and lifts the dimension numbers past it. Materializing an
-/// axis on a replicated operand preserves a dynamic mapped extent as a first-class value. Two mapped operands must
-/// describe the same mapped extent; for dynamic extents, they must share the same
+/// Batching aligns the inputs onto a common mapped axis and lifts the dimension numbers past it. Materializing an axis
+/// on a replicated input preserves a dynamic mapped extent as a first-class value. Two mapped inputs must describe the
+/// same mapped extent; for dynamic extents, they must share the same
 /// [`DimensionVariable`](crate::arrays::DimensionVariable).
 ///
 /// Every bounded ragged axis is either contracted or free. A contracted axis is zero-padded and consumed, and its
 /// dimension variable is reported as [`BatchedOutputs`](crate::batching::BatchedOutputs) evidence so carrier validation
-/// can distinguish deliberate consumption from a missing extent. Each operand is padded along only its own contracted
+/// can distinguish deliberate consumption from a missing extent. Each input is padded along only its own contracted
 /// ragged axes because zeroing either factor removes the corresponding product. A free ragged axis propagates to the
 /// result through the dot output layout: batching dimensions, then LHS free axes, then RHS free axes. A bounded ragged
-/// axis on a batching dimension or a replicated operand is unsupported because no shared per-item extent identity
-/// exists. Operands without bounded ragged axes use the dense path unchanged.
+/// axis on a batching dimension or a replicated input is unsupported because no shared per-item extent identity exists.
+/// Inputs without bounded ragged axes use the dense path unchanged.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotOperation {
     /// Contracting and batching dimension specification.
@@ -75,13 +75,13 @@ impl DotOperation {
         self
     }
 
-    /// Returns this [`DotOperation`] with the provided accumulation data type. The operand element types
-    /// must still match each other and must promote to the accumulation type, which becomes the output element
-    /// type: the backend upcasts the operands and accumulates the contraction at the wider type (XLA's
-    /// `preferred_element_type` contract, which is what its low-precision matrix units implement natively — e.g.,
-    /// `f8 × f8 → f32` and `bf16 × bf16 → f32`). Accumulation-typed dots differentiate like ordinary dots, with
-    /// tangents and cotangents carried at the accumulation type (refer to the forward-mode and transpose rule
-    /// documentation on this operation), and cannot yet be combined with a requested output sharding.
+    /// Returns this [`DotOperation`] with the provided accumulation data type. The input element types must still match
+    /// each other and must promote to the accumulation type, which becomes the output element type: the backend upcasts
+    /// the inputs and accumulates the contraction at the wider type (XLA's `preferred_element_type` contract, which is
+    /// what its low-precision matrix units implement natively — e.g., `f8 × f8 → f32` and `bf16 × bf16 → f32`).
+    /// Accumulation-typed dots differentiate like ordinary dots, with tangents and cotangents carried at the
+    /// accumulation type (refer to the forward-mode and transpose rule documentation on this operation), and cannot yet
+    /// be combined with a requested output sharding.
     #[inline]
     pub fn with_accumulation_type(mut self, accumulation_type: impl Into<Option<DataType>>) -> Self {
         self.accumulation_type = accumulation_type.into();
@@ -187,7 +187,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 /// products, and arbitrary tensor contractions.
 pub trait Dot<Rhs = Self>: Sized {
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, and returns a [`ProgramError`] if
-    /// the operands are incompatible with `dimensions` or the contraction cannot be recorded in the value's context.
+    /// the inputs are incompatible with `dimensions` or the contraction cannot be recorded in the value's context.
     fn dot(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError>;
 
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding`
@@ -206,7 +206,7 @@ pub trait Dot<Rhs = Self>: Sized {
         self.dot(rhs, dimensions)
     }
 
-    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, upcasting the operands to
+    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, upcasting the inputs to
     /// `accumulation_type` and accumulating the contraction there, so the result carries the accumulation type.
     /// Refer to the documentation of [`DotOperation::with_accumulation_type`] for the exact contract.
     fn dot_with_accumulation_type(
@@ -319,12 +319,12 @@ pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 /// Grouped expansion modes require an element type that can represent zero; in particular, they reject `f8e8m0fnu`.
 /// Refer to [`RaggedDotDimensionNumbers`] for the dimension-number contract.
 ///
-/// The operation is linear in either data operand separately, while `group_sizes` is nondifferentiable metadata.
+/// The operation is linear in either data input separately, while `group_sizes` is nondifferentiable metadata.
 /// Forward-mode differentiation applies the two-term product rule with the same group metadata. Transposition is
 /// defined only in non-contracting mode and applies another grouped dot followed by the inverse adjoint-axis
 /// permutation.
 ///
-/// Batching accepts either three replicated operands or three operands mapped over leading axis zero. It rejects
+/// Batching accepts either three replicated inputs or three inputs mapped over leading axis zero. It rejects
 /// [`RaggedAxis`](crate::arrays::RaggedAxis) metadata because `group_sizes` is the sole source of ragged extents for
 /// this operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -469,9 +469,9 @@ impl Array {
     }
 
     /// Evaluates grouped generalized dot extent-exactly. Each concrete group's raw cumulative interval is clipped to
-    /// the physical ragged extent, the resulting pair of operand slices is contracted by the ordinary generalized-dot
-    /// kernel, and the result is written into its output window. This keeps temporary storage proportional to one
-    /// group rather than the whole operand times the group count.
+    /// the physical ragged extent, the resulting pair of LHS and RHS slices is contracted by the ordinary
+    /// generalized-dot kernel, and the result is written into its output window. This keeps temporary storage
+    /// proportional to one group rather than a whole input times the group count.
     fn ragged_dot_elements<T: NumericArrayElement>(
         &self,
         rhs: &Self,
@@ -704,7 +704,7 @@ impl Array {
         let mut lhs_index = vec![0usize; lhs_shape.rank()];
         let mut rhs_index = vec![0usize; rhs_shape.rank()];
         for output_flat in 0..output_addressing.element_count() {
-            // Decode the result coordinate directly into the corresponding batch and non-contracting operand axes.
+            // Decode the result coordinate directly into the corresponding batch and non-contracting input axes.
             let mut output_axis = 0usize;
             for (&lhs_axis, &rhs_axis) in lhs_batching.iter().zip(rhs_batching) {
                 let coordinate = (output_flat / output_strides[output_axis]) % output_shape[output_axis];

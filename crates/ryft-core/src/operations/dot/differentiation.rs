@@ -55,9 +55,9 @@ where
     DifferentiationDual::new(primal, tangent)
 }
 
-// Forward-mode differentiation applies the product rule. Each term holds the corresponding primal operand fixed on
-// its original contracting side and stages an ordinary dot with the primal operation's dimensions, accumulation type,
-// and requested output sharding.
+// Forward-mode differentiation applies the product rule. Each term holds the corresponding primal input fixed on its
+// original contracting side and stages an ordinary dot with the primal operation's dimensions, accumulation type, and
+// requested output sharding.
 impl_differentiable_operation! {
     DotOperation,
     jvp<C>
@@ -92,24 +92,24 @@ impl_differentiable_operation! {
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // A generalized dot is bilinear rather than jointly linear, so a valid pullback has exactly one linear
-            // operand. The known operand selects the corresponding adjoint dimensions, and the result is pinned to the
-            // linear operand's cotangent sharding and element representation.
+            // input. The known input selects the corresponding adjoint dimensions, and the result is pinned to the
+            // linear input's cotangent sharding and element representation.
             check_count!("input", inputs, 2, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 2, DifferentiationError);
             match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
-                // Both operands linear is a bilinear product, which is not a linear map in both operands jointly and so
+                // Both inputs linear is a bilinear product, which is not a linear map in both inputs jointly and so
                 // never appears in a valid pushforward.
                 (true, true) => Err(ProgramError::UnsupportedOperation {
-                    message: format!("bilinear `{DOT_OPERATION_NAME}` with two linear operands cannot be transposed"),
+                    message: format!("bilinear `{DOT_OPERATION_NAME}` with two linear inputs cannot be transposed"),
                 }
                 .into()),
-                // Exactly one operand is linear: stage the adjoint dot reading the known operand's value, and emit a
-                // structural zero for the known operand. A zero output cotangent stays a structural zero.
+                // Exactly one input is linear: stage the adjoint dot reading the known input's value, and emit a
+                // structural zero for the known input. A zero output cotangent stays a structural zero.
                 (left_is_linear, _) => {
                     let (linear_index, known_index) = if left_is_linear { (0, 1) } else { (1, 0) };
-                    // Demand is independent of primal knowledge: an ignored linear operand stays unknown, but no
-                    // matrix multiplication or element conversion is needed for its cotangent.
+                    // Demand is independent of primal knowledge: an ignored linear input stays unknown, but no matrix
+                    // multiplication or element conversion is needed for its cotangent.
                     if !accumulators[linear_index].is_needed() {
                         return Ok(());
                     }
@@ -117,11 +117,10 @@ impl_differentiable_operation! {
                     let contribution = match &outputs[0] {
                         MaybeZero::Zero(_) => MaybeZero::Zero(linear_cotangent_type),
                         MaybeZero::Value(output_cotangent) => {
-                            // The dispatch guarantees a `Known` operand carries its pullback value, so read it
-                            // directly.
+                            // The dispatch guarantees a `Known` input carries its pullback value, so read it directly.
                             let known_value = inputs[known_index]
                                 .as_known()
-                                .expect("dispatch guarantees a known operand carries its pullback value");
+                                .expect("dispatch guarantees a known input carries its pullback value");
                             let known_value =
                                 if known_value.r#type().data_type() == output_cotangent.r#type().data_type() {
                                     known_value.clone()
@@ -142,16 +141,16 @@ impl_differentiable_operation! {
                                 let dimensions = adjoint_dimensions_for_left_dot(operation.dimensions(), left_rank);
                                 DotOperation::new(dimensions).with_output_sharding(adjoint_output_sharding)
                             };
-                            let operands = if left_is_linear {
+                            let adjoint_inputs = if left_is_linear {
                                 [output_cotangent.clone(), known_value]
                             } else {
                                 [known_value, output_cotangent.clone()]
                             };
-                            let mut outputs = context.stage_operation(adjoint, Vec::new(), &operands)?;
+                            let mut outputs = context.stage_operation(adjoint, Vec::new(), &adjoint_inputs)?;
                             check_count!("output", outputs, 1, ProgramError);
                             let adjoint_value = outputs.remove(0);
                             // An accumulation-typed primal contracts its adjoint at the widened cotangent type; convert
-                            // the result back to the linear operand's cotangent element type when the two differ.
+                            // the result back to the linear input's cotangent element type when the two differ.
                             let adjoint_value =
                                 if adjoint_value.r#type().data_type() == linear_cotangent_type.data_type() {
                                     adjoint_value
@@ -168,7 +167,7 @@ impl_differentiable_operation! {
     },
 }
 
-// A grouped dot is linear in either data operand separately. Group sizes are integer metadata and therefore carry no
+// A grouped dot is linear in either data input separately. Group sizes are integer metadata and therefore carry no
 // tangent; the two product-rule terms reuse the same grouped-dot dimensions.
 impl_differentiable_operation! {
     RaggedDotOperation,
@@ -202,7 +201,7 @@ impl_differentiable_operation! {
             + From<crate::operations::manipulation::TransposeOperation>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // JAX defines grouped-dot transposition only for the non-contracting mode. Each data-operand adjoint is
+            // JAX defines grouped-dot transposition only for the non-contracting mode. Each data-input adjoint is
             // another grouped dot followed by the inverse of the axis order produced by its adjoint dimension numbers.
             check_count!("input", inputs, 3, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
@@ -223,12 +222,12 @@ impl_differentiable_operation! {
             if inputs[0].is_unknown() && inputs[1].is_unknown() {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
-                        "bilinear `{RAGGED_DOT_OPERATION_NAME}` with two linear operands cannot be transposed",
+                        "bilinear `{RAGGED_DOT_OPERATION_NAME}` with two linear inputs cannot be transposed",
                     ),
                 }
                 .into());
             }
-            let (linear_index, dimensions, output_axes, mut operands) = if inputs[0].is_unknown() {
+            let (linear_index, dimensions, output_axes, mut adjoint_inputs) = if inputs[0].is_unknown() {
                 let known_rhs = inputs[1].as_known().unwrap();
                 let (dimensions, output_axes) = adjoint_ragged_dimensions_for_lhs(
                     operation.dimensions(),
@@ -252,12 +251,13 @@ impl_differentiable_operation! {
                 return Ok(());
             }
             let linear_cotangent_type = inputs[linear_index].r#type().cotangent()?;
-            for operand in &mut operands[..2] {
-                if operand.r#type().data_type() != cotangent.r#type().data_type() {
-                    *operand = operand.convert_element_type(cotangent.r#type().data_type())?;
+            for adjoint_input in &mut adjoint_inputs[..2] {
+                if adjoint_input.r#type().data_type() != cotangent.r#type().data_type() {
+                    *adjoint_input = adjoint_input.convert_element_type(cotangent.r#type().data_type())?;
                 }
             }
-            let mut adjoint = context.stage_operation(RaggedDotOperation::new(dimensions), Vec::new(), &operands)?;
+            let mut adjoint =
+                context.stage_operation(RaggedDotOperation::new(dimensions), Vec::new(), &adjoint_inputs)?;
             check_count!("output", adjoint, 1, ProgramError);
             let adjoint = adjoint.remove(0);
             let mut permutation = vec![0; output_axes.len()];

@@ -73,8 +73,8 @@ pub use custom_functions::{
 };
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::{
-    LINEAR_CALL_OPERATION_NAME, LinearCallOperation, REMATERIALIZE_OPERATION_NAME, RematerializeOperation,
-    STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients,
+    LINEAR_CALL_OPERATION_NAME, LinearCallOperation, OptimizationBarrier, REMATERIALIZE_OPERATION_NAME,
+    RematerializeOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients,
 };
 pub use dimensions::{
     ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME,

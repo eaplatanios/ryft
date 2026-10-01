@@ -1,6 +1,6 @@
-//! Contains the named-axis [`ParallelPermuteOperation`], which sends every participant's operand to another
-//! participant along a named axis, together with its interpretation, partial-evaluation, batching, forward-mode
-//! differentiation, and transposition rules.
+//! Contains the named-axis [`ParallelPermuteOperation`], which sends every participant's input to another participant
+//! along a named axis, together with its interpretation, partial-evaluation, batching, forward-mode differentiation,
+//! and transposition rules.
 
 // TODO(eaplatanios): Review this module.
 
@@ -38,8 +38,8 @@ use super::linear::{
 use super::{forward_collective_to_parent, resolve_named_axis_size, validate_collective_axis_size};
 
 linear_collective! {
-    /// [`Operation`] that sends every participant's operand to another participant along the named axis according
-    /// to explicit `(source, target)` pairs — the analogue of
+    /// [`Operation`] that sends every participant's input to another participant along the named axis according to
+    /// explicit `(source, target)` pairs — the analogue of
     /// [JAX's `ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and
     /// [StableHLO's `collective_permute`](https://openxla.org/stablehlo/spec#collective_permute). Participants that
     /// no pair targets receive zeros. The output shape is unchanged. The collective is linear and its transpose is
@@ -173,7 +173,7 @@ where
 linear_collective!(@differentiation ParallelPermuteOperation);
 
 // Transpose rule for [`ParallelPermuteOperation`]: sending along `(source, target)` pulls cotangents back along
-// `(target, source)`, so the operand cotangent is the permutation with every pair inverted.
+// `(target, source)`, so the input cotangent is the permutation with every pair inverted.
 impl<V, O> TransposableOperation<V, O> for ParallelPermuteOperation
 where
     V: Value<Type = ArrayType>,
@@ -323,7 +323,7 @@ where
     let value = if axis == 0 { value.clone() } else { value.clone().move_axis(axis, 0)? };
     let Some(shape) = value.r#type().static_shape() else {
         return Err(BatchingError::UnsupportedOperation {
-            message: "`parallel_permute` batching requires statically shaped operands and ragged extents".to_string(),
+            message: "`parallel_permute` batching requires statically shaped inputs and ragged extents".to_string(),
         });
     };
     let dimensions = shape.dimensions().to_vec();

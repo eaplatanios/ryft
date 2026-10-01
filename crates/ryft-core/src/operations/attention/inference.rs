@@ -1,7 +1,7 @@
 use super::*;
 
-/// Borrowed canonical view of attention operand types.
-pub(super) struct AttentionOperandTypes<'a> {
+/// Borrowed canonical view of attention input types.
+pub(super) struct AttentionInputTypes<'a> {
     /// Query type.
     pub(super) query: &'a ArrayType,
 
@@ -33,14 +33,11 @@ pub(super) struct AttentionOperandTypes<'a> {
     pub(super) output_cotangent: Option<&'a ArrayType>,
 }
 
-impl<'a> AttentionOperandTypes<'a> {
+impl<'a> AttentionInputTypes<'a> {
     /// Parses one forward operation boundary.
-    pub(super) fn forward(
-        signature: AttentionOperandSignature,
-        input_types: &'a [ArrayType],
-    ) -> Result<Self, TypeError> {
+    pub(super) fn forward(signature: AttentionInputSignature, input_types: &'a [ArrayType]) -> Result<Self, TypeError> {
         let [query, key, value, optional @ ..] = input_types else {
-            return Err(TypeError::invalid("attention requires query, key, and value operands"));
+            return Err(TypeError::invalid("attention requires query, key, and value inputs"));
         };
         let mut index = 0;
         let bias = signature.has_bias().then(|| {
@@ -75,19 +72,19 @@ impl<'a> AttentionOperandTypes<'a> {
 
     /// Parses one backward operation boundary.
     pub(super) fn backward(
-        signature: AttentionOperandSignature,
+        signature: AttentionInputSignature,
         input_types: &'a [ArrayType],
     ) -> Result<Self, TypeError> {
         let optional_count = signature.count();
-        let mut operands = Self::forward(signature, &input_types[..3 + optional_count])?;
-        operands.output = Some(&input_types[3 + optional_count]);
-        operands.activation = Some(&input_types[4 + optional_count]);
-        operands.output_cotangent = Some(&input_types[5 + optional_count]);
-        Ok(operands)
+        let mut types = Self::forward(signature, &input_types[..3 + optional_count])?;
+        types.output = Some(&input_types[3 + optional_count]);
+        types.activation = Some(&input_types[4 + optional_count]);
+        types.output_cotangent = Some(&input_types[5 + optional_count]);
+        Ok(types)
     }
 }
 
-/// Returns canonical `[batch, sequence, heads, head_dimension]` dimensions for a `TNH` or `BTNH` operand.
+/// Returns canonical `[batch, sequence, heads, head_dimension]` dimensions for a `TNH` or `BTNH` input.
 fn attention_dimensions(
     operation_name: &str,
     descriptor: &str,
@@ -107,9 +104,9 @@ fn attention_dimensions(
     }
 }
 
-/// Validated dimensions shared by the attention operations' operand contracts.
+/// Validated dimensions shared by the attention operations' input contracts.
 pub(super) struct AttentionDimensions {
-    /// Shared batch dimension of every operand.
+    /// Shared batch dimension of the query, key, and value.
     pub(super) batch: Dimension,
 
     /// Query sequence length.
@@ -121,18 +118,18 @@ pub(super) struct AttentionDimensions {
     /// Number of key/value heads; divides `query_heads`, with grouped-query attention when strictly smaller.
     pub(super) key_value_heads: usize,
 
-    /// Head (feature) dimension of every operand.
+    /// Head (feature) dimension of the query, key, and value.
     pub(super) head_dimension: usize,
 
-    /// Shared floating-point operand data type.
+    /// Shared floating-point data type of the query, key, and value.
     pub(super) data_type: DataType,
 }
 
-/// Validates the shared operand contract of the attention operations — the `BTNH` query/key/value shapes and data
+/// Validates the shared input contract of the attention operations — the `BTNH` query/key/value shapes and data
 /// types (including the grouped-query heads divisibility), the optional broadcastable bias, and the sliding-window
 /// attribute — and returns the validated [`AttentionDimensions`]. Refer to the documentation of
 /// [`DotProductAttentionOperation`] for the contract itself.
-pub(super) fn validated_attention_operands(
+pub(super) fn validated_attention_inputs(
     operation_name: &str,
     query_type: &ArrayType,
     key_type: &ArrayType,
@@ -146,7 +143,7 @@ pub(super) fn validated_attention_operands(
     let data_type = query_type.data_type();
     if !data_type.is_floating_point() {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` requires floating-point operands but got data type `{data_type}`"
+            "`{operation_name}` requires floating-point inputs but got data type `{data_type}`"
         )));
     }
     for (descriptor, dimensions, input_type) in [("key", &key, key_type), ("value", &value, value_type)] {
@@ -207,62 +204,62 @@ pub(super) fn validated_attention_operands(
             key_value_heads, query_heads,
         )));
     }
-    for (descriptor, operand_type, expected_data_type) in
+    for (descriptor, score_type, expected_data_type) in
         [("bias", bias_type, None), ("mask", mask_type, Some(DataType::Boolean))]
     {
-        let Some(operand_type) = operand_type else {
+        let Some(score_type) = score_type else {
             continue;
         };
-        let operand_dimensions = operand_type.shape().dimensions();
-        if operand_dimensions.len() > 4 {
+        let score_dimensions = score_type.shape().dimensions();
+        if score_dimensions.len() > 4 {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` {descriptor} must have rank at most 4 but got rank {}",
-                operand_dimensions.len(),
+                score_dimensions.len(),
             )));
         }
-        let dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - operand_dimensions.len())
-            .chain(operand_dimensions.iter().cloned())
+        let dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - score_dimensions.len())
+            .chain(score_dimensions.iter().cloned())
             .collect::<Vec<_>>();
-        let [operand_batch, operand_heads, operand_rows, operand_columns] = dimensions.as_slice() else {
-            unreachable!("attention score operands are normalized to exactly four dimensions")
+        let [score_batch, score_heads, score_rows, score_columns] = dimensions.as_slice() else {
+            unreachable!("attention bias and mask shapes are normalized to exactly four dimensions")
         };
         if let Some(expected_data_type) = expected_data_type {
-            if operand_type.data_type() != expected_data_type {
+            if score_type.data_type() != expected_data_type {
                 return Err(TypeError::invalid(format!(
                     "`{operation_name}` {descriptor} must have data type `{expected_data_type}` but got `{}`",
-                    operand_type.data_type(),
+                    score_type.data_type(),
                 )));
             }
-        } else if !operand_type.data_type().is_numeric() && !operand_type.data_type().is_boolean() {
+        } else if !score_type.data_type().is_numeric() && !score_type.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` bias must have a numeric or Boolean data type but got `{}`",
-                operand_type.data_type(),
+                score_type.data_type(),
             )));
         }
-        if operand_batch != &Dimension::Static(1) && operand_batch != &query[0] {
+        if score_batch != &Dimension::Static(1) && score_batch != &query[0] {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} batch dimension ({operand_batch}) must be 1 or match the query \
+                "`{operation_name}` {descriptor} batch dimension ({score_batch}) must be 1 or match the query \
                  batch dimension ({})",
                 query[0],
             )));
         }
-        if operand_heads != &Dimension::Static(1) && operand_heads != &query[2] {
+        if score_heads != &Dimension::Static(1) && score_heads != &query[2] {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} heads dimension ({operand_heads}) must be 1 or match the query \
+                "`{operation_name}` {descriptor} heads dimension ({score_heads}) must be 1 or match the query \
                  heads dimension ({})",
                 query[2],
             )));
         }
-        if operand_rows != &Dimension::Static(1) && operand_rows != &query[1] {
+        if score_rows != &Dimension::Static(1) && score_rows != &query[1] {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} query-sequence dimension ({operand_rows}) must be 1 or match the \
+                "`{operation_name}` {descriptor} query-sequence dimension ({score_rows}) must be 1 or match the \
                  query sequence dimension ({})",
                 query[1],
             )));
         }
-        if operand_columns != &Dimension::Static(1) && operand_columns != &key[1] {
+        if score_columns != &Dimension::Static(1) && score_columns != &key[1] {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} key/value-sequence dimension ({operand_columns}) must be 1 or \
+                "`{operation_name}` {descriptor} key/value-sequence dimension ({score_columns}) must be 1 or \
                  match the key sequence dimension ({})",
                 key[1],
             )));
@@ -278,10 +275,10 @@ pub(super) fn validated_attention_operands(
     })
 }
 
-/// Validates the optional trailing pair of `i32[batch]` sequence-length operands shared by the attention
-/// operations: each operand must be a rank-1 `i32` vector whose dimension exactly matches the shared batch dimension.
-/// Refer to the documentation of [`DotProductAttentionOperation`] for the padding semantics.
-pub(super) fn validated_sequence_length_operands(
+/// Validates the optional trailing pair of `i32[batch]` sequence-length inputs shared by the attention operations:
+/// each sequence-length input must be a rank-1 `i32` vector whose dimension exactly matches the shared batch
+/// dimension. Refer to the documentation of [`DotProductAttentionOperation`] for the padding semantics.
+pub(super) fn validated_sequence_length_inputs(
     operation_name: &str,
     query_lengths_type: Option<&ArrayType>,
     key_value_lengths_type: Option<&ArrayType>,

@@ -302,11 +302,10 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, Dimension, DimensionBounds, DimensionVariable, Shape, StaticShape};
+    use crate::arrays::{Array, ArrayOperation, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::contexts::StagingContext;
     use crate::operations::comparisons::{Compare, ComparisonDirection};
     use crate::operations::control_flow::select::Select;
-    use crate::operations::cumulative::cumulative_evaluate;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramRenderingMode;
     use crate::tracing::TracingContext;
@@ -315,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_associative_scan() {
-        // The decomposition is checked against the sequential scan of the same combiner, over both parities of the
+        // The decomposition is checked against explicit prefix and suffix results, over both parities of the
         // scanned extent and in both directions. Summation pins the positions each output accumulates over, and the
         // left projection (which is associative but not commutative) additionally pins the input order that the
         // construction passes to the combiner: its forward scan is the first element repeated and its reverse scan the
@@ -325,16 +324,26 @@ mod tests {
         for extent in 0..=9usize {
             let values = (1..=extent).map(|value| value as f64).collect::<Vec<_>>();
             let input = Array::vector(values.clone()).unwrap();
-            let shape = StaticShape::new(vec![extent]);
             for reverse in [false, true] {
+                let sums = (0..extent)
+                    .map(|index| {
+                        if reverse {
+                            values[index..].iter().sum::<f64>()
+                        } else {
+                            values[..=index].iter().sum::<f64>()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let first_value = if reverse { values.last() } else { values.first() };
+                let first_values = first_value.map_or_else(Vec::new, |&value| vec![value; extent]);
                 assert_eq!(
                     associative_scan(&input, 0, reverse, &add).map(|output| output.to_f64s()),
-                    cumulative_evaluate(values.as_slice(), &shape, 0, reverse, |left, right| Ok(left + right)),
+                    Ok(sums),
                     "summation over extent {extent}, reverse {reverse}",
                 );
                 assert_eq!(
                     associative_scan(&input, 0, reverse, &first).map(|output| output.to_f64s()),
-                    cumulative_evaluate(values.as_slice(), &shape, 0, reverse, |left, _right| Ok(left)),
+                    Ok(first_values),
                     "left projection over extent {extent}, reverse {reverse}",
                 );
             }

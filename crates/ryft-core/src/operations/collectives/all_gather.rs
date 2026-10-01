@@ -1,6 +1,6 @@
-//! Contains the named-axis [`AllGatherOperation`], which concatenates every participant's operand across a named
-//! axis, together with its interpretation, partial-evaluation, batching, forward-mode differentiation, and
-//! transposition rules.
+//! Contains the named-axis [`AllGatherOperation`], which concatenates every participant's input across a named axis,
+//! together with its interpretation, partial-evaluation, batching, forward-mode differentiation, and transposition
+//! rules.
 
 // TODO(eaplatanios): Review this module.
 
@@ -96,7 +96,7 @@ fn all_gather_output_type(
     };
     if input_type.unreduced_axes().contains(operation.axis_name()) {
         return Err(TypeError::invalid(format!(
-            "`all_gather` does not support an operand that is unreduced over axis `{}`",
+            "`all_gather` does not support an input that is unreduced over axis `{}`",
             operation.axis_name(),
         )));
     }
@@ -107,7 +107,7 @@ fn all_gather_output_type(
         AllGatherOutputVariance::Varying => {
             if reduced_axes.contains(operation.axis_name()) {
                 return Err(TypeError::invalid(format!(
-                    "`all_gather` cannot make axis `{}` varying because the operand records it as reduced",
+                    "`all_gather` cannot make axis `{}` varying because the input records it as reduced",
                     operation.axis_name(),
                 )));
             }
@@ -116,7 +116,7 @@ fn all_gather_output_type(
         AllGatherOutputVariance::Invariant => {
             if reduced_axes.contains(operation.axis_name()) {
                 return Err(TypeError::invalid(format!(
-                    "`all_gather` cannot make axis `{}` invariant because the operand records it as reduced",
+                    "`all_gather` cannot make axis `{}` invariant because the input records it as reduced",
                     operation.axis_name(),
                 )));
             }
@@ -125,13 +125,13 @@ fn all_gather_output_type(
         AllGatherOutputVariance::Reduced => {
             if !varying_axes.remove(operation.axis_name()) {
                 return Err(TypeError::invalid(format!(
-                    "`all_gather` with reduced output variance requires an operand varying over axis `{}`",
+                    "`all_gather` with reduced output variance requires an input varying over axis `{}`",
                     operation.axis_name(),
                 )));
             }
             if !reduced_axes.insert(operation.axis_name.clone()) {
                 return Err(TypeError::invalid(format!(
-                    "`all_gather` operand is already reduced over axis `{}`",
+                    "`all_gather` input is already reduced over axis `{}`",
                     operation.axis_name(),
                 )));
             }
@@ -234,8 +234,8 @@ pub(crate) fn infer_explicit_all_gather_output_types(
 }
 
 linear_collective! {
-    /// [`Operation`] that concatenates every participant's operand along `concat_axis` across the named axis, so
-    /// every participant receives the full concatenation — the analogue of
+    /// [`Operation`] that concatenates every participant's input along `concat_axis` across the named axis, so every
+    /// participant receives the full concatenation — the analogue of
     /// [JAX's `all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html) with `tiled = True`
     /// and [StableHLO's `all_gather`](https://openxla.org/stablehlo/spec#all_gather). The output extends
     /// `concat_axis` by the axis size; all other dimensions are unchanged. The collective is linear and its
@@ -252,7 +252,7 @@ linear_collective! {
     name = ALL_GATHER_OPERATION_NAME = "all_gather",
     accepts_unreduced = false,
     fields = {
-        /// Axis of the operand along which the participants' values are concatenated.
+        /// Axis of the input along which the participants' values are concatenated.
         concat_axis: usize,
 
         /// Shared rank and participant-group semantics.
@@ -286,7 +286,7 @@ linear_collective! {
 }
 
 impl AllGatherOperation {
-    /// Returns the axis of the operand along which the participants' values are concatenated.
+    /// Returns the axis of the input along which the participants' values are concatenated.
     #[inline]
     pub fn concat_axis(&self) -> usize {
         self.concat_axis
@@ -404,7 +404,7 @@ where
 linear_collective!(@differentiation AllGatherOperation);
 
 // Transpose rule for [`AllGatherOperation`]. A varying all-gather is the adjoint of a sum-scatter with the same
-// mode, axis, and participant groups, so the operand cotangent is a [`ParallelSumScatterOperation`] of the output
+// mode, axis, and participant groups, so the input cotangent is a [`ParallelSumScatterOperation`] of the output
 // cotangent. Invariant and reduced variance require the residual-aware composite adjoints because their pullbacks
 // depend on participant-indexed runtime geometry.
 impl<V, O> TransposableOperation<V, O> for AllGatherOperation
@@ -452,7 +452,7 @@ where
 impl_shape_changing_collective_member_operation!(AllGatherOperation, infer_explicit_all_gather_output_types);
 
 // Batching rule for explicit-extent [`AllGatherOperation`]. The logical result extents remain ordinary replicated
-// dimension SSA operands; matching-axis batching delegates its array mechanics to the homogeneous collective kernel.
+// dimension SSA inputs; matching-axis batching delegates its array mechanics to the homogeneous collective kernel.
 impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for AllGatherOperation
 where
     C: Context<
@@ -488,7 +488,7 @@ where
             if let Some(ragged_axis) = array.ragged_axes().first() {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
-                        "`{}` does not support bounded ragged dimension `{}` on operand 0",
+                        "`{}` does not support bounded ragged dimension `{}` on input 0",
                         self.name(),
                         ragged_axis.dimension(),
                     ),
@@ -590,8 +590,8 @@ where
                     }
                     ragged_axis.extents().clone()
                 };
-                // The packed capacity comes from the operand axis. A dimension variable's exclusive upper bound
-                // only constrains logical extents and may be looser than that physical capacity.
+                // The packed capacity comes from the input axis. A dimension variable's exclusive upper bound only
+                // constrains logical extents and may be looser than that physical capacity.
                 let physical_extent = array.value().dimension_size(ragged_axis.axis())?;
                 Ok((
                     output_axis,
@@ -1125,8 +1125,8 @@ mod tests {
         assert!(reduced.sharding().unwrap().varying_manual_axes().is_empty());
         assert_eq!(reduced.sharding().unwrap().reduced_axes(), &["x".to_string()].into_iter().collect());
 
-        // The cotangent of a reduced gather result is unreduced. Sum-scatter consumes exactly that marker and
-        // restores the varying operand-cotangent state without a second reduce-scatter operation type.
+        // The cotangent of a reduced gather result is unreduced. Sum-scatter consumes exactly that marker and restores
+        // the varying input-cotangent state without a second reduce-scatter operation type.
         let reduced_cotangent = reduced.cotangent().unwrap();
         assert_eq!(
             infer_explicit_parallel_sum_scatter_output_types(
@@ -1409,8 +1409,8 @@ mod tests {
 
     #[test]
     fn test_all_gather_of_replicated_input_concatenates_copies() {
-        // A replicated operand at a matching level is first materialized as `axis_size` identical batch items, so
-        // the gather degenerates to the item-major concatenation of that many copies of the shared value.
+        // A replicated input at a matching level is first materialized as `axis_size` identical batch items, so the
+        // gather degenerates to the item-major concatenation of that many copies of the shared value.
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
         let outputs = AllGatherOperation::new(
@@ -1489,7 +1489,7 @@ mod tests {
         assert_eq!(adjoint.options().axis_index_groups(), Some(groups.as_slice()));
 
         // Reduced output variance swaps to an unreduced cotangent type. The same sum-scatter operation consumes that
-        // state and returns the original varying operand cotangent.
+        // state and returns the original varying input cotangent.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = f32_vector(2)
             .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap())
@@ -1651,7 +1651,7 @@ mod tests {
                             DimensionVariable::new("dynamic", DimensionBounds::unbounded()),
                         )]),
                     )],
-                    error = "`all_gather` does not support dynamically shaped operands",
+                    error = "`all_gather` does not support dynamically shaped inputs",
                 },
             ],
         );
@@ -1672,8 +1672,8 @@ mod tests {
     fn test_all_gather_interpretation_requires_an_enclosing_binder() {
         use crate::interpretation::InterpretableOperation;
 
-        // A single-participant axis is degenerate: the gather concatenates exactly one operand, so interpretation is
-        // the identity.
+        // A single-participant axis is degenerate: the gather concatenates exactly one input, so interpretation is the
+        // identity.
         let outputs = AllGatherOperation::new(
             "x".to_string(),
             1,
@@ -1741,8 +1741,8 @@ mod tests {
     }
 
     #[test]
-    fn test_all_gather_batching_materializes_replicated_operands_under_a_dynamic_extent() -> Result<(), ProgramError> {
-        // Matching-axis collective batching consumes a complete logical result shape. A replicated operand is
+    fn test_all_gather_batching_materializes_replicated_inputs_under_a_dynamic_extent() -> Result<(), ProgramError> {
+        // Matching-axis collective batching consumes a complete logical result shape. A replicated input is
         // materialized along the mapped axis from those extents, dynamic unchanged axes keep their boundary-provided
         // identity, and the rule introduces no metadata read from the source array.
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

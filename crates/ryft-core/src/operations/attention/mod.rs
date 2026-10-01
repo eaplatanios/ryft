@@ -52,7 +52,7 @@ use inference::*;
 pub use capabilities::DotProductAttention;
 pub(crate) use capabilities::DotProductAttentionBackward;
 pub use composition::{dot_product_attention_backward_ir_composition, dot_product_attention_ir_composition};
-pub use configuration::{AttentionConfiguration, AttentionImplementation, AttentionInputs, AttentionOperandSignature};
+pub use configuration::{AttentionConfiguration, AttentionImplementation, AttentionInputSignature, AttentionInputs};
 pub use differentiation::{DifferentiableDotProductAttention, differentiable_dot_product_attention};
 pub use operations::{
     DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME, DOT_PRODUCT_ATTENTION_OPERATION_NAME,

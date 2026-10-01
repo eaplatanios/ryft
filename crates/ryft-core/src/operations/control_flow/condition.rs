@@ -226,7 +226,7 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        discharge_positional_region_operation(self, context, driver, inputs, 1)
+        discharge_positional_region_operation(self, context, driver, inputs, 1, |_| self.clone())
     }
 }
 

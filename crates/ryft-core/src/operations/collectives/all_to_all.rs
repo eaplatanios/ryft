@@ -200,9 +200,9 @@ pub(crate) fn infer_explicit_all_to_all_output_types(
 }
 
 linear_collective! {
-    /// [`Operation`] that exchanges chunks between the participants along the named axis: every participant splits
-    /// its operand into `axis_size` chunks along `split_axis` and receives the participants' chunks concatenated
-    /// along `concat_axis` — the analogue of
+    /// [`Operation`] that exchanges chunks between the participants along the named axis: every participant splits its
+    /// input into `axis_size` chunks along `split_axis` and receives the participants' chunks concatenated along
+    /// `concat_axis` — the analogue of
     /// [JAX's `all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_to_all.html) and
     /// [StableHLO's `all_to_all`](https://openxla.org/stablehlo/spec#all_to_all). The output shrinks `split_axis`
     /// by the axis size (the dimension must be divisible by it) and extends `concat_axis` by it. The collective is
@@ -210,14 +210,14 @@ linear_collective! {
     /// level consumes the mapped batch axis with a reshape/transpose block exchange: batch item `i` receives every
     /// item's chunk `i` of `split_axis`, concatenated item-major along `concat_axis`.
     ///
-    /// A bounded ragged operand is rejected even when its logical extents are available. One extent per item does not
+    /// A bounded ragged input is rejected even when its logical extents are available. One extent per item does not
     /// determine how each source partitions its live prefix among destinations; that requires the explicit input and
     /// output offsets and per-destination sizes of [`RaggedAllToAllOperation`](super::RaggedAllToAllOperation).
     operation = AllToAllOperation,
     name = ALL_TO_ALL_OPERATION_NAME = "all_to_all",
     accepts_unreduced = false,
     fields = {
-        /// Axis of the operand that is split into one chunk per participant.
+        /// Axis of the input that is split into one chunk per participant.
         split_axis: usize,
 
         /// Axis of the output along which the received chunks are concatenated.
@@ -271,7 +271,7 @@ linear_collective! {
 }
 
 impl AllToAllOperation {
-    /// Returns the axis of the operand that is split into one chunk per participant.
+    /// Returns the axis of the input that is split into one chunk per participant.
     #[inline]
     pub fn split_axis(&self) -> usize {
         self.split_axis
@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_to_all_rejects_ragged_operands_without_explicit_routing() {
+    fn test_all_to_all_rejects_ragged_inputs_without_explicit_routing() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let input = ArrayBatch::new(Array::matrix(2, 4, vec![1.0_f32; 8]).unwrap(), BatchAxis::new(0))
             .unwrap()

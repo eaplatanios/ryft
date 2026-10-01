@@ -111,74 +111,75 @@ where
 }
 
 /// Expands grouped key/value heads through first-class broadcast and reshape extents.
-fn expand_key_value_heads_ir<V>(operand: &V, dimensions: &AttentionDimensions) -> Result<V, ProgramError>
+fn expand_key_value_heads_ir<V>(key_or_value: &V, dimensions: &AttentionDimensions) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicBroadcast + DynamicReshape + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     V::DispatchDomain: DimensionConstant,
 {
     if dimensions.key_value_heads == dimensions.query_heads {
-        return Ok(operand.clone());
+        return Ok(key_or_value.clone());
     }
-    let context = operand.dispatch_domain();
+    let context = key_or_value.dispatch_domain();
     let group = dimensions.query_heads / dimensions.key_value_heads;
-    let operand_dimensions = array_dimensions(operand)?;
+    let key_or_value_dimensions = array_dimensions(key_or_value)?;
     let key_value_heads = context.dimension_constant(dimensions.key_value_heads)?;
     let group = context.dimension_constant(group)?;
     let query_heads = context.dimension_constant(dimensions.query_heads)?;
-    let expanded = operand.dynamic_broadcast(
+    let expanded = key_or_value.dynamic_broadcast(
         &[
-            operand_dimensions[0].clone(),
-            operand_dimensions[1].clone(),
+            key_or_value_dimensions[0].clone(),
+            key_or_value_dimensions[1].clone(),
             key_value_heads,
             group,
-            operand_dimensions[3].clone(),
+            key_or_value_dimensions[3].clone(),
         ],
         &[0, 1, 2, 4],
     )?;
     expanded.dynamic_reshape(&[
-        operand_dimensions[0].clone(),
-        operand_dimensions[1].clone(),
+        key_or_value_dimensions[0].clone(),
+        key_or_value_dimensions[1].clone(),
         query_heads,
-        operand_dimensions[3].clone(),
+        key_or_value_dimensions[3].clone(),
     ])
 }
 
-/// Adds the implicit batch axis used to evaluate an unbatched attention operand.
-fn normalize_attention_operand_ir<V>(operand: &V) -> Result<V, ProgramError>
+/// Adds the implicit batch axis used to evaluate one unbatched `TNH` attention input (i.e., a query, key, value,
+/// forward output, or output cotangent).
+fn normalize_attention_input_ir<V>(input: &V) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     V::DispatchDomain: DimensionConstant,
 {
-    let r#type = operand.r#type();
+    let r#type = input.r#type();
     let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
     if r#type.rank() == 4 {
-        return Ok(operand.clone());
+        return Ok(input.clone());
     }
-    let batch = operand.dispatch_domain().dimension_constant(1)?;
-    let mut dimensions = array_dimensions(operand)?;
+    let batch = input.dispatch_domain().dimension_constant(1)?;
+    let mut dimensions = array_dimensions(input)?;
     dimensions.insert(0, batch);
-    operand.clone().dynamic_reshape(dimensions.as_slice())
+    input.clone().dynamic_reshape(dimensions.as_slice())
 }
 
-/// Prepends singleton axes until one bias or mask has the normalized `BNTS` score rank.
-fn normalize_attention_score_operand_ir<V>(operand: &V) -> Result<V, ProgramError>
+/// Prepends singleton axes until one bias or mask input has the normalized `BNTS` score rank.
+fn normalize_attention_score_input_ir<V>(input: &V) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     V::DispatchDomain: DimensionConstant,
 {
-    let r#type = operand.r#type();
+    let r#type = input.r#type();
     let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
     if r#type.rank() == 4 {
-        return Ok(operand.clone());
+        return Ok(input.clone());
     }
-    let context = operand.dispatch_domain();
+    let context = input.dispatch_domain();
     let singleton = context.dimension_constant(1)?;
     let mut dimensions = vec![singleton; 4 - r#type.rank()];
-    dimensions.extend(array_dimensions(operand)?);
-    operand.clone().dynamic_reshape(dimensions.as_slice())
+    dimensions.extend(array_dimensions(input)?);
+    input.clone().dynamic_reshape(dimensions.as_slice())
 }
 
 /// Removes the implicit batch axis after evaluating unbatched attention.
@@ -248,7 +249,7 @@ where
     let mut visible = match mask {
         None => None,
         Some(mask) => {
-            let mask = normalize_attention_score_operand_ir(mask)?;
+            let mask = normalize_attention_score_input_ir(mask)?;
             let mask = project_array::<V>(mask)?;
             Some(project_array::<V>(broadcast_like::<V>(mask, &scores, &[0, 1, 2, 3])?)?)
         }
@@ -310,21 +311,21 @@ where
     )?))
 }
 
-/// Shared normalized operands and masked logits consumed by the forward and backward attention compositions.
+/// Shared normalized inputs and masked logits consumed by the forward and backward attention compositions.
 struct PreparedAttention<V>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
 {
-    /// Normalized query operand.
+    /// Normalized query.
     query: V,
 
-    /// Normalized key operand.
+    /// Normalized key.
     key: V,
 
-    /// Key operand expanded from key/value heads to query heads.
+    /// Normalized key expanded from key/value heads to query heads.
     expanded_key: V,
 
-    /// Value operand expanded from key/value heads to query heads.
+    /// Normalized value expanded from key/value heads to query heads.
     expanded_value: V,
 
     /// Masked logits converted to the data type used by softmax.
@@ -340,7 +341,7 @@ where
     scale: f64,
 }
 
-/// Normalizes attention operands and constructs the masked score logits shared by forward and backward.
+/// Normalizes attention inputs and constructs the masked score logits shared by forward and backward.
 fn prepare_attention_ir<V>(
     inputs: &AttentionInputs<V>,
     configuration: AttentionConfiguration,
@@ -369,9 +370,9 @@ where
     V::DispatchDomain: DimensionConstant,
     <ArrayProjection<V> as Value>::DispatchDomain: Fill<f64, ArrayProjection<V>>,
 {
-    let query = normalize_attention_operand_ir(&inputs.query)?;
-    let key = normalize_attention_operand_ir(&inputs.key)?;
-    let value = normalize_attention_operand_ir(&inputs.value)?;
+    let query = normalize_attention_input_ir(&inputs.query)?;
+    let key = normalize_attention_input_ir(&inputs.key)?;
+    let value = normalize_attention_input_ir(&inputs.value)?;
     let expanded_key = expand_key_value_heads_ir(&key, dimensions)?;
     let expanded_value = expand_key_value_heads_ir(&value, dimensions)?;
     let data_type = dimensions.data_type;
@@ -391,7 +392,7 @@ where
         project_array::<V>(scores)?.mul(&project_array::<V>(scale_value)?)?,
     );
     if let Some(bias) = &inputs.bias {
-        let bias = project_array::<V>(normalize_attention_score_operand_ir(bias)?)?;
+        let bias = project_array::<V>(normalize_attention_score_input_ir(bias)?)?;
         let bias =
             if bias.r#type().data_type() == logits_type { bias } else { bias.convert_element_type(logits_type)? };
         let bias = broadcast_like::<V>(bias, &scores, &[0, 1, 2, 3])?;
@@ -476,7 +477,7 @@ where
     );
     operation.infer_output_types(input_types.as_slice(), &[])?;
     let query_rank = input_types[0].rank();
-    let dimensions = validated_attention_operands(
+    let dimensions = validated_attention_inputs(
         DOT_PRODUCT_ATTENTION_OPERATION_NAME,
         &input_types[0],
         &input_types[1],
@@ -615,7 +616,7 @@ where
     ]);
     operation.infer_output_types(input_types.as_slice(), &[])?;
     let input_ranks = [input_types[0].rank(), input_types[1].rank(), input_types[2].rank()];
-    let dimensions = validated_attention_operands(
+    let dimensions = validated_attention_inputs(
         DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
         &input_types[0],
         &input_types[1],
@@ -624,8 +625,8 @@ where
         inputs.mask.as_ref().map(|_| &input_types[3 + usize::from(inputs.bias.is_some())]),
     )?;
     let prepared = prepare_attention_ir(inputs, configuration, &dimensions)?;
-    let output = normalize_attention_operand_ir(output)?;
-    let output_cotangent = normalize_attention_operand_ir(output_cotangent)?;
+    let output = normalize_attention_input_ir(output)?;
+    let output_cotangent = normalize_attention_input_ir(output_cotangent)?;
     let logits = <V as ValueProjection<ArrayType>>::from_projected(prepared.logits.clone());
     let activation = normalize_attention_residual_ir(activation)?;
     let statistic = project_array::<V>(activation)?.transpose([0, 2, 1])?;
@@ -641,11 +642,11 @@ where
         None => project_array::<V>(output_cotangent)?,
         Some(query_lengths) => zero_query_rows_ir::<V>(project_array::<V>(output_cotangent)?, query_lengths, 1)?,
     };
-    let convert = |operand: ArrayProjection<V>| -> Result<ArrayProjection<V>, ProgramError> {
+    let convert = |array: ArrayProjection<V>| -> Result<ArrayProjection<V>, ProgramError> {
         if prepared.data_type == prepared.softmax_type {
-            Ok(operand)
+            Ok(array)
         } else {
-            Ok(operand.convert_element_type(prepared.softmax_type)?)
+            Ok(array.convert_element_type(prepared.softmax_type)?)
         }
     };
     let softmax_query = convert(project_array::<V>(prepared.query.clone())?)?;

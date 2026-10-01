@@ -23,9 +23,9 @@ use ryft_core::compilation::{AnalyzableCompilationDomain, call_function};
 use ryft_core::{
     ArrayIrType, ArrayIrValue, ArrayType, CompilationDomain, CompiledFunction, Context, DataType, Device, DeviceMesh,
     Dimension, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSaveable, LogicalMesh, Memory,
-    MeshAxis, MeshAxisType, NothingSaveable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
-    ResidualPolicy, ScanOperation, Shape, Sharding, StagedFunction, Tanh, Value, ValueProjection, differentiate_at,
-    rematerialize, stage_function,
+    MeshAxis, MeshAxisType, NothingSaveable, OffloadDotsWithNoBatchDimensions, OptimizationBarrier, ProgramError,
+    Reduce, ReductionKind, ResidualPolicy, ScanOperation, Shape, Sharding, StagedFunction, Tanh, Value,
+    ValueProjection, differentiate_at, rematerialize, stage_function,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::experimental::ops::XlaOperation;
@@ -138,7 +138,10 @@ fn rematerialized_layer<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
 ) -> Result<Tracer<'c>, ProgramError> {
     rematerialize(|(hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>)| layer(hidden, up, down))
         .with_policy(policy)
-        .with_optimization_barrier(optimization_barrier)
+        .with_optimization_barrier(match optimization_barrier {
+            true => OptimizationBarrier::All,
+            false => OptimizationBarrier::None,
+        })
         .call((hidden, up, down))
 }
 
