@@ -5,6 +5,7 @@
 //! on that branch. Operation-family membership alone is not target admission: kernel validation and compiler
 //! capability checks still determine which operations a particular kernel may contain.
 
+use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 
@@ -29,9 +30,9 @@ use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    Effects, InputRegionProvenance, Operation, OperationProjection, OutputRegionProvenance, ProgramError,
-    ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, RegionInterface, RegionSlot, Type,
-    TypeError, TypeIdentityRenaming,
+    Effects, ErasedOperation, InputRegionProvenance, Operation, OperationBoundaryPruning, OperationPayloadProjection,
+    OperationProjection, OutputRegionProvenance, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError, TypeIdentityRenaming,
 };
 
 /// Initialization and lifetime behavior not implied by ordinary reference effects.
@@ -325,6 +326,46 @@ impl<Extension: Operation<Type = ArrayIrType>> Operation for KernelOperation<Ext
             Self::MaskedStore(operation) => operation.output_region_provenance(output_index),
             Self::MaskedSwap(operation) => operation.output_region_provenance(output_index),
             Self::Extension(operation) => operation.output_region_provenance(output_index),
+        }
+    }
+
+    fn prune_boundary(
+        &self,
+        input_count: usize,
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        match self {
+            Self::Portable(operation) => Ok(operation
+                .prune_boundary(input_count, used_outputs, regions)?
+                .map(|pruning| pruning.map_operation(Self::Portable))),
+            Self::Call(operation) => Ok(operation
+                .prune_boundary(input_count, used_outputs, regions)?
+                .map(|pruning| pruning.map_operation(Self::Call))),
+            Self::Scratch(operation) => Ok(operation
+                .prune_boundary(input_count, used_outputs, regions)?
+                .map(|pruning| pruning.map_operation(Self::Scratch))),
+            Self::TileLoad(operation) => Ok(operation
+                .prune_boundary(input_count, used_outputs, regions)?
+                .map(|pruning| pruning.map_operation(Self::TileLoad))),
+            Self::AsyncCopy(operation) => Ok(operation
+                .prune_boundary(input_count, used_outputs, regions)?
+                .map(|pruning| pruning.map_operation(Self::AsyncCopy))),
+            Self::Wait(operation) => Ok(operation
+                .prune_boundary(input_count, used_outputs, regions)?
+                .map(|pruning| pruning.map_operation(Self::Wait))),
+            Self::MaskedLoad(operation) => Ok(operation
+                .prune_boundary(input_count, used_outputs, regions)?
+                .map(|pruning| pruning.map_operation(Self::MaskedLoad))),
+            Self::MaskedStore(operation) => Ok(operation
+                .prune_boundary(input_count, used_outputs, regions)?
+                .map(|pruning| pruning.map_operation(Self::MaskedStore))),
+            Self::MaskedSwap(operation) => Ok(operation
+                .prune_boundary(input_count, used_outputs, regions)?
+                .map(|pruning| pruning.map_operation(Self::MaskedSwap))),
+            Self::Extension(operation) => Ok(operation
+                .prune_boundary(input_count, used_outputs, regions)?
+                .map(|pruning| pruning.map_operation(Self::Extension))),
         }
     }
 
@@ -683,6 +724,43 @@ impl<Extension: Operation<Type = ArrayIrType>> OperationProjection<DimensionType
     type Projected = DimensionOperation<DimensionValue>;
 }
 
+impl<Extension: Operation<Type = ArrayIrType>> OperationPayloadProjection for KernelOperation<Extension> {
+    fn project_payload(&self, payload: TypeId) -> Option<&dyn Any> {
+        // Portable operations delegate to the array-IR family, as projected member variants do in derived families,
+        // and the kernel-owned payloads are exposed directly. The adapter-owned extension is a generic payload, so it
+        // exposes nothing, as generic extension variants do in derived families.
+        let operation: &dyn Any = match self {
+            Self::Portable(operation) => return operation.project_payload(payload),
+            Self::Call(operation) => operation,
+            Self::Scratch(operation) => operation,
+            Self::TileLoad(operation) => operation,
+            Self::AsyncCopy(operation) => operation,
+            Self::Wait(operation) => operation,
+            Self::MaskedLoad(operation) => operation,
+            Self::MaskedStore(operation) => operation,
+            Self::MaskedSwap(operation) => operation,
+            Self::Extension(_) => return None,
+        };
+        (operation.type_id() == payload).then_some(operation)
+    }
+
+    fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation> {
+        // The kernel-owned payloads take precedence over the portable family, as a derived family's own variants take
+        // precedence over its member families. The adapter-owned extension is never constructed.
+        payload
+            .downcast()
+            .map(Self::Call)
+            .or_else(|payload| payload.downcast().map(Self::Scratch))
+            .or_else(|payload| payload.downcast().map(Self::TileLoad))
+            .or_else(|payload| payload.downcast().map(Self::AsyncCopy))
+            .or_else(|payload| payload.downcast().map(Self::Wait))
+            .or_else(|payload| payload.downcast().map(Self::MaskedLoad))
+            .or_else(|payload| payload.downcast().map(Self::MaskedStore))
+            .or_else(|payload| payload.downcast().map(Self::MaskedSwap))
+            .or_else(|payload| ArrayIrOperation::<Array>::from_payload(payload).map(Self::Portable))
+    }
+}
+
 impl<'o, Extension: Operation<Type = ArrayIrType>> TryFrom<&'o KernelOperation<Extension>>
     for &'o ReferenceSwapOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>
 {
@@ -715,7 +793,7 @@ mod tests {
 
     use crate::arrays::{ArrayIrValue, ArrayReferenceTransformIndex, DataType};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::{AddOperation, ReferenceRead, ReferenceSwap};
+    use crate::operations::{AddOperation, ReferenceRead, ReferenceSwap, TagOperation};
     use crate::programs::{EmptyRegionDriver, ReferenceType};
     use crate::tracing::TracingContext;
 
@@ -971,5 +1049,34 @@ mod tests {
             panic!("expected a residual kernel call");
         };
         assert_eq!(residual.prefetch_types(), definition.operation().prefetch_types());
+    }
+
+    #[test]
+    fn test_kernel_operation_project_payload() {
+        // Kernel-owned payloads are exposed directly, portable payloads through the array-IR family, and extension
+        // payloads not at all.
+        let wait = KernelOperation::<NoKernelExtension>::from(WaitOperation);
+        let add = KernelOperation::<NoKernelExtension>::from(ArrayOperation::Add(AddOperation::new()));
+        let extension =
+            KernelOperation::Extension(ArrayIrOperation::<Array>::from(ArrayOperation::Add(AddOperation::new())));
+        assert_eq!(wait.projected_payload::<WaitOperation>(), Some(&WaitOperation));
+        assert!(wait.projected_payload::<AddOperation<ArrayType>>().is_none());
+        assert!(add.projected_payload::<AddOperation<ArrayType>>().is_some());
+        assert!(add.projected_payload::<WaitOperation>().is_none());
+        assert!(extension.projected_payload::<AddOperation<ArrayType>>().is_none());
+    }
+
+    #[test]
+    fn test_kernel_operation_from_payload() {
+        // Kernel-owned payloads construct their own variants and portable payloads construct through the array-IR
+        // family, while payloads that no variant holds are returned unchanged.
+        let wait = KernelOperation::<NoKernelExtension>::from_payload(ErasedOperation::new(WaitOperation));
+        assert!(matches!(wait, Ok(KernelOperation::Wait(WaitOperation))));
+        let add = ErasedOperation::new(AddOperation::<ArrayType>::new());
+        let add = KernelOperation::<NoKernelExtension>::from_payload(add);
+        assert!(matches!(add, Ok(KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Add(_))))));
+        let payload = ErasedOperation::new(TagOperation::<ArrayIrType>::new("unsupported"));
+        let payload = KernelOperation::<NoKernelExtension>::from_payload(payload).unwrap_err();
+        assert_eq!(payload.type_name(), std::any::type_name::<TagOperation<ArrayIrType>>());
     }
 }

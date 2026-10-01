@@ -1,0 +1,5 @@
+error: operation family holds constructible payload type 'DotOperation' in more than one variant
+  --> tests/operations/error_duplicate_payload_type.rs:12:5
+   |
+12 |     BoxedDot(Box<DotOperation>),
+   |     ^^^^^^^^

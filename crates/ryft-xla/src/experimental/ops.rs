@@ -14,7 +14,6 @@ use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, Imagi
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::operations::random::RngBitGeneratorOperation;
 use ryft_core::operations::sort::SortOperation;
-use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceTransform, ArrayType,
@@ -23,30 +22,31 @@ use ryft_core::{
     CaptureConstant, CaptureReference, CeilOperation, ClampOperation, CompareOperation, CompiledCallOperation,
     ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, ConstrainShardingOperation, Context,
     ConvertElementTypeOperation, CosOperation, CotangentDestinationKind, CotangentDestinations, CumulativeOperation,
-    CustomFunctionOperation, CustomFunctionTransposeOperation, DataType, DifferentiableOperation,
-    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy, Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation,
-    DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation,
-    DimensionRemOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
-    DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
-    DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
-    ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation, LiftedCustomRules,
-    LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero,
-    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
+    CustomFunctionOperation, CustomFunctionTransposeOperation, DataType, DifferentiableOperation, DifferentiableType,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
+    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
+    DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
+    DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation,
+    GatherOperation, InputRegionProvenance, IotaOperation, LiftedCustomRules, LinearCallOperation, Ln1pOperation,
+    LogAddExpOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation,
+    NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationBoundaryPruning,
     OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation,
     ParallelVaryOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
     PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
     ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation,
-    ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
+    ReducePrecisionOperation, ReferenceAccessDescriptor, ReferenceAccessOperation, ReferenceAddUpdateOperation,
     ReferenceAtomicAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation,
-    ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
-    ScatterOperation, SelectOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation, StagingContext,
-    StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer, TracingContext,
-    TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext, TranspositionDriver,
-    Type, TypeError, TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation, Value, ValueProjection,
-    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionLiveness,
+    RegionSlot, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation, RoundOperation,
+    RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, SignOperation, SinOperation,
+    SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
+    Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext,
+    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation,
+    Value, ValueProjection, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;
 
@@ -879,6 +879,7 @@ impl_array_operation_conversion!(
     DynamicUpdateSliceOperation,
     SelectOperation<ArrayType>,
     ConvertElementTypeOperation<ArrayType>,
+    ReducePrecisionOperation<ArrayType>,
     TransferToMemoryOperation,
     ReshardOperation,
     ConstrainShardingOperation,
@@ -1105,6 +1106,21 @@ impl<T: Type> Operation for JitCallOperation<T> {
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
+    }
+
+    fn prune_boundary(
+        &self,
+        input_count: usize,
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        // Operands map onto the callee inputs one for one, so the operands that the callee does not use are dropped
+        // together with its unused outputs (as in JAX's `dce_jaxpr_pjit_rule`). The lifted capture prefix is always
+        // kept, because the captures in the callee refer to it by absolute position.
+        let mut kept_inputs = regions.used_region_inputs(0, used_outputs)?;
+        kept_inputs.iter_mut().take(self.capture_count).for_each(|kept| *kept = true);
+        check_count!("input", kept_inputs, input_count, ProgramError);
+        Ok(Some(OperationBoundaryPruning { operation: *self, kept_inputs, kept_outputs: used_outputs.to_vec() }))
     }
 
     #[inline]
@@ -1699,19 +1715,22 @@ mod tests {
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, CaptureReference,
-        CapturingContext, Compare, CompareOperation, ComparisonDirection, ConditionOperation, Context,
+        CapturingContext, Compare, CompareOperation, ComparisonDirection, ConditionOperation, Context, CosOperation,
         CotangentDestinationKind, CotangentDestinations, CustomFunctionJvpRule, CustomFunctionOperation,
         CustomFunctionTransposeOperation, DataType, DifferentiableType, DifferentiationError, Dimension,
         DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
-        DomainTracingContext, DynamicBroadcastOperation, EffectClass, EffectClasses, ExternalReferenceBinding,
-        InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation,
+        DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, EffectClass, EffectClasses,
+        ErasedOperation, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh, MaybeZero, Memory, MeshAxis,
+        MeshAxisType, MulOperation, NoStorage, Operation, OperationPayloadProjection, OperationProvider,
         OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessOperation,
         ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
         ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionDriver, RegionInterface,
-        RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension,
-        StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value,
-        ValueProjection, ValueResolution, WhileOperation, ZeroOperation,
+        RegionRef, RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy,
+        ResidualPolicyReference, ResidualRejection, ResidualZeroProvider, ScanOperation, Shape, Sharding,
+        ShardingDimension, StagingContext, TagOperation, Tracer, TracingContext, TransferToMemoryOperation,
+        TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection, ValueResolution,
+        WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -1777,48 +1796,49 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_residual_candidates_classify_through_callee_provenance() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        use ryft_core::tracing_v2::{
-            NoStorage, PolicyFn, RematerializationCandidate, RematerializationDecision, RematerializationRejection,
-            rematerialize,
-        };
-
-        // `jit_call` reports positional output-region provenance, so a residual produced by a computed callee output
-        // is classified through the callee to that output's own leaf producer instead of to the opaque `jit_call`
-        // carrier. The rematerialized body squares its input inside the callee and squares the call's result outside
-        // it, so transposing the outer `mul` needs the call's output as a residual. This is the `jit_call` counterpart
-        // of the core loop pin in `test_while_residual_candidates_classify_through_loop_provenance`.
-        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+    fn test_jit_call_boundary_pruning() {
+        // The callee maps its lifted capture `c` and its operands `(x, y)` to `(cos(x), c * y)`. Using only the first
+        // output drops the operand `y` and the second output, while the capture prefix is kept although nothing uses
+        // it.
+        let r#type = ArrayIrType::Array(vector_type());
         let callee = {
-            let mut builder = XlaProgramBuilder::new();
-            let input = builder.add_input(scalar_type.clone());
-            let squared =
-                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let captured = builder.add_input(r#type.clone());
+            let x = builder.add_input(r#type.clone());
+            let y = builder.add_input(r#type.clone());
+            let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+            let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![captured, y], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![squared], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![cosine, product],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 2],
+                )
                 .unwrap()
         };
-        let names = Rc::new(RefCell::new(Vec::new()));
-        let recorded = names.clone();
-        let policy = PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayIrType, XlaOperation>| {
-            recorded
-                .borrow_mut()
-                .extend(candidate.producers().iter().map(|producer| producer.operation().name().to_string()));
-            Ok::<_, RematerializationRejection>(RematerializationDecision::<NoStorage>::Recompute)
-        });
-        let function = rematerialize::<XlaDomain<'static>, _, _, _>(move |x: XlaTracer<'static>| {
-            let context = x.context().clone();
-            let called = context.bind(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee.clone()], &[x])?;
-            let mut outputs = context.bind(MulOperation::new(), Vec::new(), &[called[0].clone(), called[0].clone()])?;
-            Ok(outputs.remove(0))
-        })
-        .with_policy(policy);
-        let root = DomainTracingContext::<XlaDomain<'static>>::new();
-        function.call(root.input(scalar_type)).unwrap();
-        assert_eq!(names.borrow().clone(), vec!["mul".to_string()]);
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let inputs = (0..3).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(1)), vec![callee], inputs, None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs[0]], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.into_pruned().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4], %2:f64[4] .
+                let %3:f64[4] = jit_call [capture_count=1] %0 %1 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = cos %1
+                        in (%2)
+                    },
+                ]
+                in (%3)"},
+        );
     }
 
     #[test]
@@ -1833,6 +1853,42 @@ mod tests {
         requires_array_operations::<ShardMapTracer>();
         requires_array_ir_operations::<XlaTracer<'static>>();
         requires_array_ir_operations::<Tracer<TracingContext<XlaConstant, XlaOperation>>>();
+    }
+
+    #[test]
+    fn test_xla_operation_payload_projection_and_construction() {
+        // Array payloads are reached through the projected array member in both directions, including tags, while
+        // native payloads construct their own variants.
+        let add = ErasedOperation::new(AddOperation::<ArrayType>::new());
+        let add = XlaOperation::<XlaConstant>::from_payload(add).unwrap();
+        assert!(matches!(add, XlaOperation::Array(ArrayOperation::Add(_))));
+        assert!(add.projected_payload::<AddOperation<ArrayType>>().is_some());
+        let reference = ErasedOperation::new(ReferenceNewOperation::<ArrayType, ArrayIrType>::new());
+        let reference = XlaOperation::<XlaConstant>::from_payload(reference).unwrap();
+        assert!(matches!(reference, XlaOperation::ReferenceNew(_)));
+        assert!(reference.projected_payload::<ReferenceNewOperation<ArrayType, ArrayIrType>>().is_some());
+        assert!(reference.projected_payload::<AddOperation<ArrayType>>().is_none());
+        let tag = ErasedOperation::new(TagOperation::<ArrayType>::new("residual"));
+        let tag = XlaOperation::<XlaConstant>::from_payload(tag).unwrap();
+        assert_eq!(TagOperation::<ArrayIrType>::key_of(&tag), Some("residual"));
+    }
+
+    #[test]
+    fn test_xla_operation_provides_memory_transfers() {
+        // The XLA family provides memory transfers through its projected array member.
+        let destination = Memory::Host { pinned: true };
+        let input_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        let operation =
+            XlaOperation::<XlaConstant>::provide(TransferToMemoryOperation::new(destination), &[&input_type]).unwrap();
+        assert!(matches!(
+            &operation,
+            XlaOperation::Array(ArrayOperation::TransferToMemory(operation)) if operation.destination() == destination,
+        ));
+        assert_eq!(operation.to_string(), "transfer_to_memory [destination=Host[Pinned]]");
+        assert_eq!(
+            XlaOperation::<XlaConstant>::provide(TransferToMemoryOperation::new(destination), &[]).unwrap_err(),
+            ProgramError::InvalidInputCount { expected: 1, actual: 0 },
+        );
     }
 
     #[test]
@@ -2125,9 +2181,11 @@ mod tests {
 
     #[test]
     fn test_core_custom_function_and_rematerialization_promotions_preserve_metadata() {
+        use ryft_core::{DotsSaveable, ResidualPolicyReference};
+
         // These payloads are promoted by move rather than reconstructed, so their complete stored surface must
-        // survive: the rule layout of custom-function calls, the non-differentiated operand split of both, and
-        // additionally the rematerialization optimization-barrier hint. The promoted carrier must also keep
+        // survive: the rule layout and the non-differentiated operand split of custom-function calls, and the policy
+        // and flags of rematerialized calls. The promoted carrier must also keep
         // contributing the payload's own operation name and region slots, because the attached regions are matched
         // against those slots by name.
         for (jvp_rule, has_vjp_rule, non_differentiated_count) in [
@@ -2185,10 +2243,11 @@ mod tests {
                     && operation.output_tangent_types() == std::slice::from_ref(&tangent_type),
         ));
 
-        let rematerialize =
-            RematerializeOperation::<ArrayIrType>::new().with_non_differentiated_count(1).with_prevent_cse(true);
+        let rematerialize = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(DotsSaveable))
+            .with_optimization_barrier(false)
+            .with_differentiated(true);
         let promoted: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::Rematerialize(rematerialize).into();
+            ArrayIrOperation::<XlaArrayConstant>::Rematerialize(rematerialize.clone()).into();
         assert!(matches!(&promoted, XlaOperation::Rematerialize(operation) if operation == &rematerialize));
         assert_eq!(promoted.name(), rematerialize.name());
         assert_eq!(promoted.region_slots(), rematerialize.region_slots());
@@ -2262,14 +2321,14 @@ mod tests {
 
     #[test]
     fn test_rematerialize_rejects_captures_registered_in_its_body() {
-        use ryft_core::tracing_v2::rematerialize;
+        use ryft_core::rematerialize;
 
         // The rematerialized body is traced through a fresh-root context whose capture table is discarded, so a
         // capturing body is rejected at trace time; refer to `TracingContext::trace_with_named_axes` for the full
         // silent-aliasing rationale.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
         let captured_value = XlaConstant::Captured(CaptureReference::new(0, scalar_type.clone()));
-        let function = rematerialize::<XlaDomain<'static>, _, _, _>(
+        let function = rematerialize(
             move |x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
                 let context = x.context().clone();
                 let reference = context.capture(captured_value.clone())?;
@@ -3385,6 +3444,95 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_partial_evaluation_places_callee_residuals_with_the_context_policy() {
+        struct SaveDots;
+
+        impl ResidualPolicy<ArrayIrType> for SaveDots {
+            type Storage = NoStorage;
+
+            fn name(&self) -> &str {
+                "save_dots"
+            }
+
+            fn classify(
+                &self,
+                candidate: &ResidualCandidate<'_, ArrayIrType>,
+            ) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
+                Ok(match candidate.producers().iter().any(|producer| producer.payload::<DotOperation>().is_some()) {
+                    true => ResidualDecision::Save,
+                    false => ResidualDecision::Recompute,
+                })
+            }
+        }
+
+        // The callee computes `cos(dot(x, x)) * t`. Partitioning the caller with `x` known splits the call, and the
+        // policy then plans the callee partition: the known call returns the dot product instead of its cosine, and
+        // the residual call recomputes the cosine.
+        let callee = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let x = builder.add_input(ArrayIrType::Array(vector_type()));
+            let t = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+            let dot = ArrayOperation::<XlaArrayConstant>::from(DotOperation::new(DotDimensionNumbers::new(
+                vec![0],
+                vec![0],
+                vec![],
+                vec![],
+            )));
+            let product = builder.add_instruction(dot, Vec::new(), vec![x, x], None).unwrap()[0];
+            let cosine = ArrayOperation::<XlaArrayConstant>::from(CosOperation::<ArrayType>::new());
+            let cosine = builder.add_instruction(cosine, Vec::new(), vec![product], None).unwrap()[0];
+            let tangent = ArrayOperation::<XlaArrayConstant>::from(MulOperation::<ArrayType>::new());
+            let tangent = builder.add_instruction(tangent, Vec::new(), vec![cosine, t], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![tangent], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let x = builder.add_input(ArrayIrType::Array(vector_type()));
+        let t = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
+        let output = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![x, t], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let partition = program
+            .partition_with_residual_policy(&[true, false], &ResidualPolicyReference::new(SaveDots))
+            .unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [known_inputs=[0], residual_inputs=[Unknown(1), Known(0)], outputs=[Unknown(0)]]
+                known={
+                    lambda %0:f64[4] .
+                    let %1:f64[] = jit_call %0 [
+                        callee={
+                            lambda %0:f64[4] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                            in (%1)
+                        },
+                    ]
+                    in (%1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = jit_call %0 %1 [
+                        callee={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = cos %1
+                                %3:f64[] = mul %2 %0
+                            in (%3)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
+    }
+
+    #[test]
     fn test_nested_jit_call_reference_discharge_threads_callee_state_into_the_caller() {
         // Two nested call levels each swap a distinct reference. Discharge must lift both states to the caller's
         // boundary in public-input order, mark both as mutated with their own final-state output slot, and leave no
@@ -3684,24 +3832,24 @@ mod tests {
 
     #[test]
     fn test_rematerialization_policies_are_available_for_the_xla_operation_family() {
-        use ryft_core::Memory;
-        use ryft_core::tracing_v2::{
-            DotsSaveable, DotsWithNoBatchDimsSaveable, EverythingSaveable, NothingSaveable, OffloadDotsWithNoBatchDims,
-            RematerializationPolicy, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
+        use ryft_core::{
+            DotsSaveable, DotsWithNoBatchDimensionsSaveable, EverythingSaveable, Memory, NothingSaveable,
+            OffloadDotsWithNoBatchDimensions, ResidualPolicy, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies,
+            SaveOnlyTheseNames,
         };
 
-        // The built-in rematerialization policies — including the projection-bounded dot and tag policies and the
-        // transfer-bounded offloading policies — are available for `XlaOperation` through the derive-generated
-        // array projection and its `TransferToMemoryOperation` conversion. This is a compile-time capability
-        // check: the assertions below fail to compile if any projection or conversion bound is unsatisfied.
-        fn assert_policy<P: RematerializationPolicy<ArrayType, ArrayOperation<XlaArrayConstant>>>(_policy: P) {}
+        // The built-in rematerialization policies, including the offloading ones, classify candidates of the
+        // `ArrayIrType` universe of `XlaOperation`, whose producers they recognize through the derive-generated
+        // payload projection. This is a compile-time capability check: the assertions below fail to compile if a
+        // policy is not available for the universe.
+        fn assert_policy<P: ResidualPolicy<ArrayIrType>>(_policy: P) {}
         assert_policy(NothingSaveable);
         assert_policy(EverythingSaveable);
         assert_policy(DotsSaveable);
-        assert_policy(DotsWithNoBatchDimsSaveable);
+        assert_policy(DotsWithNoBatchDimensionsSaveable);
         assert_policy(SaveOnlyTheseNames::new(["u"]));
-        assert_policy(SaveAndOffloadOnlyTheseNames::new(["u"], ["v"], Memory::Host { pinned: true }));
-        assert_policy(OffloadDotsWithNoBatchDims::new(Memory::Host { pinned: true }));
+        assert_policy(SaveAndOffloadOnlyTheseNames::new(["u"], ["v"], Memory::Host { pinned: true }).unwrap());
+        assert_policy(OffloadDotsWithNoBatchDimensions::new(Memory::Host { pinned: true }));
         assert_policy(SaveFromBothPolicies::new(DotsSaveable, SaveOnlyTheseNames::new(["u"])));
     }
 }

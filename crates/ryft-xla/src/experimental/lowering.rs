@@ -23,21 +23,20 @@ use ryft_core::operations::sort::{SORT_OPERATION_NAME, SortDirection, SortOperat
 use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
-    CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME,
-    CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CaptureReference, CeilOperation, ClampOperation, ComparisonDirection,
-    ConstantOperation, ConvertElementTypeOperation, CosOperation, CumulativeKind, DYNAMIC_SLICE_OPERATION_NAME,
-    DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DivOperation, DomainTracingContext,
-    DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
-    ExternalReferenceBinding, FloorOperation, GatherMode, GatherOperation, Instruction, IotaOperation,
-    LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalMesh,
-    LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
-    PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError,
-    ProjectedValue, Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation,
-    ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation, ReverseOperation, RoundOperation,
-    RsqrtOperation, SCAN_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation,
-    ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation,
-    SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed,
-    Value, WHILE_OPERATION_NAME, WhileOperation,
+    CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
+    CaptureReference, CeilOperation, ClampOperation, ComparisonDirection, ConstantOperation,
+    ConvertElementTypeOperation, CosOperation, CumulativeKind, DYNAMIC_SLICE_OPERATION_NAME, DataType, Dimension,
+    DimensionOperation, DimensionType, DimensionValue, DivOperation, DomainTracingContext, DotDimensionNumbers,
+    DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation, ExternalReferenceBinding, FloorOperation,
+    GatherMode, GatherOperation, Instruction, IotaOperation, LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation,
+    LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation,
+    MulOperation, NegOperation, Operation, PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized,
+    PowOperation, Program, ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME,
+    REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReducePrecisionOperation, ReductionKind, RegionId,
+    RegionRef, RemOperation, ReshapeOperation, ReverseOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME,
+    ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, Shape, Sharding,
+    ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation,
+    TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -664,7 +663,7 @@ fn token_threaded_effects(effects: EffectClasses) -> impl Iterator<Item = Effect
         .chain(ordered_io.then_some(EffectClass::OrderedIo))
 }
 
-/// Lowering mode used for plain `tracing_v2` MLIR emission.
+/// Lowering mode used for plain traced-program MLIR emission.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlainMlirLoweringMode {
     /// Lower the program exactly as traced.
@@ -960,6 +959,25 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConvertElementTypeOpera
         }
         let result = lowerer.block.append_operation(stable_hlo::convert(input, output_type, lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.convert should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReducePrecisionOperation<ArrayType> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("input", input_values, 1, ProgramError);
+        let result = lowerer.block.append_operation(stable_hlo::reduce_precision(
+            input_values[0],
+            self.exponent_bits(),
+            self.mantissa_bits(),
+            lowerer.location,
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -5476,6 +5494,15 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     lowerer,
                 )
             }
+            ArrayOperation::ReducePrecision(operation) => {
+                <ReducePrecisionOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             ArrayOperation::Iota(iota) => <IotaOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 iota,
                 input_values,
@@ -7725,7 +7752,7 @@ impl MlirLowerableValue for CpuArray {
     }
 }
 
-/// Lowers a plain traced `tracing_v2` program to a textual StableHLO MLIR module.
+/// Lowers a plain traced [`Program`] to a textual StableHLO MLIR module.
 #[cfg(test)]
 pub(crate) fn to_mlir_module_for_plain_program<
     V: MlirLowerableValue,
@@ -7983,7 +8010,7 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
             context,
             location,
             captured_values,
-            false,
+            OptimizationBarrier::None,
             nested_functions,
             collective_state,
             &mut region_effect_tokens,
@@ -8175,7 +8202,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
             context,
             location,
             captured_values,
-            false,
+            OptimizationBarrier::None,
             nested_functions,
             collective_state,
             effect_tokens,
@@ -8239,7 +8266,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
                 context,
                 location,
                 captured_values,
-                false,
+                OptimizationBarrier::None,
                 nested_functions,
                 collective_state,
                 &mut condition_effect_tokens,
@@ -8301,7 +8328,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
             context,
             location,
             captured_values,
-            false,
+            OptimizationBarrier::None,
             nested_functions,
             collective_state,
             &mut body_effect_tokens,
@@ -8373,7 +8400,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
                 context,
                 location,
                 captured_values,
-                false,
+                OptimizationBarrier::None,
                 nested_functions,
                 collective_state,
                 &mut body_effect_tokens,
@@ -8811,7 +8838,7 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c>(
         context,
         location,
         captured_values,
-        false,
+        OptimizationBarrier::None,
         nested_functions,
         collective_state,
         effect_tokens,
@@ -8978,7 +9005,7 @@ fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
             context,
             location,
             &[],
-            false,
+            OptimizationBarrier::None,
             Some(nested_functions),
             collective_state,
             &mut effect_tokens,
@@ -9280,7 +9307,7 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
             context,
             location,
             &[],
-            false,
+            OptimizationBarrier::None,
             Some(nested_functions),
             collective_state,
             &mut effect_tokens,
@@ -9373,11 +9400,28 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c>(
         context,
         location,
         captured_values.as_slice(),
-        false,
+        OptimizationBarrier::None,
         nested_functions,
         collective_state,
         effect_tokens,
     )
+}
+
+/// Placement of a [`stablehlo.optimization_barrier`](https://openxla.org/stablehlo/spec#optimization_barrier) around
+/// a nested program or region that is inlined into an enclosing block.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum OptimizationBarrier {
+    /// The body is inlined without a barrier.
+    None,
+
+    /// One barrier wraps the body's input values together with the enclosing scope's present effect tokens before the
+    /// body is replayed, and the body consumes the barrier's results. XLA cannot look through the barrier, so it can
+    /// neither schedule the body before its inputs are produced nor deduplicate it against an identical computation
+    /// on the same inputs elsewhere (e.g., a rematerialized recomputation of a primal computation). Because the tokens
+    /// go through the same barrier and the enclosing scope continues from the barrier's token results, the body's
+    /// ordered effects are also sequenced after the barrier. Captured constants are not inputs of the body and do not
+    /// go through the barrier.
+    Inputs,
 }
 
 /// Inlines a nested sub-program into the given block by mapping the provided input
@@ -9386,7 +9430,8 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c>(
 ///
 /// `effect_tokens` are the per-class tokens of the lowering scope the program inlines into. They flow into each
 /// instruction's lowerer and the updated tokens are read back out after the instruction lowers, so same-class effects
-/// chain in program order and the caller observes the program's final tokens.
+/// chain in program order and the caller observes the program's final tokens. `optimization_barrier` selects whether
+/// the inputs and those tokens first go through an [`OptimizationBarrier`].
 #[allow(clippy::too_many_arguments)]
 fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c>(
     program: &FlatXlaProgram,
@@ -9395,7 +9440,7 @@ fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
-    add_optimization_barrier: bool,
+    optimization_barrier: OptimizationBarrier,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
@@ -9407,14 +9452,15 @@ fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c>(
         context,
         location,
         captured_values,
-        add_optimization_barrier,
+        optimization_barrier,
         nested_functions,
         collective_state,
         effect_tokens,
     )
 }
 
-/// Inlines a borrowed nested region into the given block without materializing the region itself.
+/// Inlines a borrowed nested region into the given block without materializing the region itself. Refer to the
+/// documentation of [`lower_nested_program_inline`] for the effect-token and optimization-barrier contracts.
 #[allow(clippy::too_many_arguments)]
 fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c>(
     region: RegionRef<'_, XlaConstant, XlaOperation>,
@@ -9423,14 +9469,37 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
-    add_optimization_barrier: bool,
+    optimization_barrier: OptimizationBarrier,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    let outputs = replay_region_ref_into_block(
+    let mut input_values = input_values.to_vec();
+    let operands = match optimization_barrier {
+        OptimizationBarrier::None => Vec::new(),
+        OptimizationBarrier::Inputs => input_values
+            .iter()
+            .copied()
+            .chain(effect_tokens.ordered_assertion)
+            .chain(effect_tokens.ordered_io)
+            .collect::<Vec<_>>(),
+    };
+    if !operands.is_empty() {
+        // The barrier results mirror its operands: the input values first, followed by the present tokens in the
+        // order in which they were appended.
+        let barrier = block.append_operation(stable_hlo::optimization_barrier(operands.as_slice(), location)?)?;
+        let mut results = (0..operands.len()).map(|index| barrier.result(index).unwrap().as_ref());
+        input_values = results.by_ref().take(input_values.len()).collect();
+        if effect_tokens.ordered_assertion.is_some() {
+            effect_tokens.ordered_assertion = results.next();
+        }
+        if effect_tokens.ordered_io.is_some() {
+            effect_tokens.ordered_io = results.next();
+        }
+    }
+    replay_region_ref_into_block(
         region,
-        input_values.to_vec(),
+        input_values,
         block,
         context,
         location,
@@ -9476,19 +9545,7 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c>(
             *effect_tokens = lowerer.effect_tokens;
             Ok(outputs)
         },
-    )?;
-    if outputs.is_empty() || !add_optimization_barrier {
-        return Ok(outputs);
-    }
-    let barrier = block.append_operation(stable_hlo::optimization_barrier(outputs.as_slice(), location)?)?;
-    Ok((0..outputs.len())
-        .map(|index| {
-            barrier
-                .result(index)
-                .expect("stablehlo.optimization_barrier should return one result per operand")
-                .as_ref()
-        })
-        .collect::<Vec<_>>())
+    )
 }
 
 /// Drives [`Program::interpret_with`] to lower a staged program into MLIR ops appended to `block`.
@@ -9959,7 +10016,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.context,
                 lowerer.location,
                 &[],
-                false,
+                OptimizationBarrier::None,
                 lowerer.nested_functions.as_ref(),
                 &lowerer.collective_state,
                 &mut lowerer.effect_tokens,
@@ -9974,26 +10031,32 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             }
             .into())
         }
-        XlaOperation::Rematerialize(_) => {
-            let [primal, _forward, _backward, _tangent] = regions else {
+        XlaOperation::Rematerialize(operation) => {
+            let [body] = regions else {
                 return Err(LoweringError::UnsupportedOp {
                     op: format!(
-                        "{} expected 4 attached regions but got {}",
+                        "{} expected 1 attached region but got {}",
                         REMATERIALIZE_OPERATION_NAME,
                         regions.len(),
                     ),
                 });
             };
-            // Rematerialized regions are traced through fresh-root contexts and lower with an empty capture
-            // namespace; refer to the `CustomFunction` arm above for the rationale.
+            // Rematerialized bodies are traced through fresh-root contexts and lower with an empty capture namespace;
+            // refer to the `CustomFunction` arm above for the rationale. A differentiated call recomputes values that
+            // the original computation also computes, so a barrier on its inputs keeps XLA from merging the two
+            // computations or from scheduling the recomputation before its inputs are available.
+            let optimization_barrier = match operation.differentiated() && operation.optimization_barrier() {
+                true => OptimizationBarrier::Inputs,
+                false => OptimizationBarrier::None,
+            };
             lower_nested_program_inline(
-                primal,
+                body,
                 input_values,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
                 &[],
-                false,
+                optimization_barrier,
                 lowerer.nested_functions.as_ref(),
                 &lowerer.collective_state,
                 &mut lowerer.effect_tokens,
@@ -10012,7 +10075,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.context,
                 lowerer.location,
                 captured_values,
-                false,
+                OptimizationBarrier::None,
                 lowerer.nested_functions.as_ref(),
                 &lowerer.collective_state,
                 &mut lowerer.effect_tokens,
@@ -13228,6 +13291,78 @@ mod tests {
         assert!(stablehlo.matches("stablehlo.broadcast_in_dim").count() >= 8, "{stablehlo}");
     }
 
+    /// Inlines `program` into the body of a `main` function behind an input [`OptimizationBarrier`], returns the
+    /// inlined outputs from that function, and renders the verified module. When `ordered_io` is set, the enclosing
+    /// scope already holds an ordered-I/O token when the program is inlined, so the barrier must thread it.
+    fn lower_nested_program_inline_behind_input_barrier(
+        program: &FlatXlaProgram,
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        ordered_io: bool,
+    ) -> String {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tensor_types = |types: &[ArrayType]| {
+            types
+                .iter()
+                .map(|r#type| lower_tensor_type(r#type, &context, location).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let input_tensor_types = tensor_types(input_types);
+        let output_tensor_types = tensor_types(output_types);
+        let function_block = context.block(
+            input_tensor_types.iter().map(|tensor_type| (*tensor_type, location)).collect::<Vec<_>>().as_slice(),
+        );
+        {
+            let mut block = function_block.as_ref();
+            let inputs =
+                (0..input_types.len()).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+            let mut effect_tokens = EffectTokens::default();
+            if ordered_io {
+                let token =
+                    block.append_operation(stable_hlo::after_all::<ValueRef, _>(&[], location).unwrap()).unwrap();
+                effect_tokens.ordered_io = Some(token.result(0).unwrap().as_ref());
+            }
+            let outputs = lower_nested_program_inline(
+                program,
+                inputs.as_slice(),
+                &mut block,
+                &context,
+                location.as_ref(),
+                &[],
+                OptimizationBarrier::Inputs,
+                None,
+                &CollectiveLoweringState::new(),
+                &mut effect_tokens,
+            )
+            .unwrap();
+            block.append_operation(func::r#return(outputs.as_slice(), location).unwrap()).unwrap();
+        }
+        let mut function_region = context.region();
+        function_region.append_block(function_block).unwrap();
+        let function = func::func(
+            "main",
+            func::FuncAttributes {
+                arguments: input_tensor_types
+                    .iter()
+                    .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                    .collect(),
+                results: output_tensor_types
+                    .iter()
+                    .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                    .collect(),
+                ..Default::default()
+            },
+            function_region,
+            location,
+        )
+        .unwrap();
+        module.body().unwrap().append_operation(function).unwrap();
+        assert!(module.verify().unwrap());
+        module.to_string()
+    }
+
     #[test]
     fn test_lower_bitcast_to_mlir_unbounded_dimensions() {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
@@ -13305,6 +13440,29 @@ mod tests {
           }
         }
         "#}
+        );
+    }
+
+    #[test]
+    fn test_lower_reduce_precision() {
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
+        let output = builder
+            .add_instruction(ReducePrecisionOperation::<ArrayType>::new(8, 7), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<3xf32>) -> tensor<3xf32> {
+                    %0 = stablehlo.reduce_precision %arg0, format = e8m7 : tensor<3xf32>
+                    return %0 : tensor<3xf32>
+                  }
+                }
+            "#},
         );
     }
 
@@ -16704,7 +16862,7 @@ mod tests {
     #[test]
     fn test_custom_rule_lowering_inlines_only_the_primal_program() {
         use ryft_core::{
-            CustomRuleDefinition, CustomFunctionOperation, CustomRuleRegistration, CustomFunctionTransposeOperation,
+            CustomFunctionOperation, CustomFunctionTransposeOperation, CustomRuleDefinition, CustomRuleRegistration,
         };
 
         // A custom rule call lowers only its primal program: its derivative rules are retained callbacks, not regions.
@@ -16771,33 +16929,29 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_lowering_inlines_primal_effects_on_the_enclosing_token_chain() {
-        use ryft_core::{PrintOperation, RematerializeOperation};
+    fn test_rematerialize_lowering_inlines_body_effects_on_the_enclosing_token_chain() {
+        use ryft_core::{NothingSaveable, PrintOperation, RematerializeOperation, ResidualPolicyReference};
 
-        // Rematerialization is a transform boundary, not an execution boundary. Lowering inlines its primal region,
-        // so prints immediately before, inside, and after the call must form one ordered-I/O token chain.
+        // Rematerialization is a transform boundary, not an execution boundary. Lowering inlines its body, so prints
+        // immediately before, inside, and after the call must form one ordered-I/O token chain.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let primal = {
+        let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let output =
-                builder.add_instruction(PrintOperation::new("primal"), Vec::new(), vec![input], None).unwrap()[0];
+                builder.add_instruction(PrintOperation::new("body"), Vec::new(), vec![input], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let identity = unproject_plain_program(xla_identity_branch(scalar_type.clone()));
         let mut builder = CompositeXlaProgramBuilder::new();
-        let primal_region = builder.import_region(primal.entry_region_ref());
-        let forward_region = builder.import_region(identity.entry_region_ref());
-        let backward_region = builder.import_region(identity.entry_region_ref());
-        let tangent_region = builder.import_region(identity.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone().into());
         let before = builder.add_instruction(PrintOperation::new("before"), Vec::new(), vec![input], None).unwrap()[0];
         let rematerialized = builder
             .add_instruction(
-                XlaOperation::Rematerialize(RematerializeOperation::new()),
-                vec![primal_region, forward_region, backward_region, tangent_region],
+                XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable))),
+                vec![body],
                 vec![before],
                 None,
             )
@@ -16815,22 +16969,22 @@ mod tests {
         assert_eq!(stablehlo.matches("@ryft.print").count(), 3, "{stablehlo}");
         let print_lines = stablehlo.lines().filter(|line| line.contains("@ryft.print")).collect::<Vec<_>>();
         assert!(print_lines[0].contains("label = \"before\""), "{stablehlo}");
-        assert!(print_lines[1].contains("label = \"primal\""), "{stablehlo}");
+        assert!(print_lines[1].contains("label = \"body\""), "{stablehlo}");
         assert!(print_lines[2].contains("label = \"after\""), "{stablehlo}");
         assert!(print_lines[1].contains("%1)"), "{stablehlo}");
         assert!(print_lines[2].contains("%2)"), "{stablehlo}");
     }
 
     #[test]
-    fn test_rematerialize_lowering_rejects_capture_constants_in_its_regions() {
-        use ryft_core::RematerializeOperation;
+    fn test_rematerialize_lowering_rejects_capture_constants_in_its_body() {
+        use ryft_core::{NothingSaveable, RematerializeOperation, ResidualPolicyReference};
 
-        // Rematerialized regions are traced through fresh-root contexts and can therefore never legally reference
-        // the enclosing function's captures. A capture constant smuggled into such a region must fail loudly
-        // instead of silently resolving against the enclosing function's capture prefix, which would alias
-        // whichever captured value happens to occupy the referenced slot.
+        // Rematerialized bodies are traced through fresh-root contexts and can therefore never legally reference the
+        // enclosing function's captures. A capture constant smuggled into such a body must fail loudly instead of
+        // silently resolving against the enclosing function's capture prefix, which would alias whichever captured
+        // value happens to occupy the referenced slot.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let primal = {
+        let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let input = builder.add_input(scalar_type.clone().into());
             let captured = builder
@@ -16841,17 +16995,13 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let identity = unproject_plain_program(xla_identity_branch(scalar_type.clone()));
         let mut builder = CompositeXlaProgramBuilder::new();
-        let primal_region = builder.import_region(primal.entry_region_ref());
-        let forward_region = builder.import_region(identity.entry_region_ref());
-        let backward_region = builder.import_region(identity.entry_region_ref());
-        let tangent_region = builder.import_region(identity.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::Rematerialize(RematerializeOperation::new()),
-                vec![primal_region, forward_region, backward_region, tangent_region],
+                XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable))),
+                vec![body],
                 vec![input],
                 None,
             )
@@ -16860,8 +17010,8 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        // The enclosing function's capture prefix has a matching slot #0, so before rematerialized regions were
-        // scoped to an empty capture namespace this lowering silently forwarded that unrelated captured value.
+        // The enclosing function's capture prefix has a matching slot #0, so before rematerialized bodies were scoped
+        // to an empty capture namespace this lowering silently forwarded that unrelated captured value.
         let result = to_mlir_module_for_program(
             &program,
             &[scalar_type.clone()],
@@ -16872,6 +17022,58 @@ mod tests {
             None,
         );
         assert_eq!(result, Err(LoweringError::MissingCapturedConstant { index: 0 }));
+    }
+
+    #[test]
+    fn test_rematerialize_lowering_places_an_input_barrier_on_differentiated_calls() {
+        use ryft_core::{NothingSaveable, RematerializeOperation, ResidualPolicyReference};
+
+        // Only a differentiated call whose optimization barrier is enabled wraps its inputs in a barrier, which keeps
+        // XLA from merging the recomputation with the original computation.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let body = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone().into());
+            let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let lower = |operation: RematerializeOperation<ArrayIrType>| {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let body = builder.import_region(body.entry_region_ref());
+            let input = builder.add_input(scalar_type.clone().into());
+            let output = builder
+                .add_instruction(XlaOperation::Rematerialize(operation), vec![body], vec![input], None)
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap()
+        };
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable));
+        assert_eq!(
+            lower(operation.clone().with_differentiated(true)),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
+                    %0 = stablehlo.optimization_barrier %arg0 : tensor<f64>
+                    %1 = stablehlo.sine %0 : tensor<f64>
+                    return %1 : tensor<f64>
+                  }
+                }
+            "#},
+        );
+        let unbarriered = indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
+                %0 = stablehlo.sine %arg0 : tensor<f64>
+                return %0 : tensor<f64>
+              }
+            }
+        "#};
+        assert_eq!(lower(operation.clone()), unbarriered);
+        assert_eq!(lower(operation.with_differentiated(true).with_optimization_barrier(false)), unbarriered);
     }
 
     #[test]
@@ -21171,6 +21373,72 @@ mod tests {
         assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 2, "{stablehlo}");
     }
 
+    #[test]
+    fn test_lower_nested_program_inline_input_optimization_barrier() {
+        // A pure body consumes the barrier's results instead of the enclosing scope's values.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = XlaProgramBuilder::new();
+        let left = builder.add_input(array_type.clone());
+        let right = builder.add_input(array_type.clone());
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let program = unproject_plain_program(program);
+        assert_eq!(
+            lower_nested_program_inline_behind_input_barrier(
+                &program,
+                &[array_type.clone(), array_type.clone()],
+                &[array_type],
+                false,
+            ),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>, %arg1: tensor<2xf32>) -> tensor<2xf32> {
+                    %0:2 = stablehlo.optimization_barrier %arg0, %arg1 : tensor<2xf32>, tensor<2xf32>
+                    %1 = stablehlo.multiply %0#0, %0#1 : tensor<2xf32>
+                    return %1 : tensor<2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_nested_program_inline_input_optimization_barrier_orders_effects() {
+        use ryft_core::PrintOperation;
+
+        // The enclosing ordered-I/O token goes through the same barrier as the inputs, so the body's print consumes
+        // the barrier's token result and is sequenced after the barrier.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(array_type.clone());
+        let printed = builder.add_instruction(PrintOperation::new("body"), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![printed, printed], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        assert_eq!(
+            lower_nested_program_inline_behind_input_barrier(&program, &[array_type.clone()], &[array_type], true),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1:2 = stablehlo.optimization_barrier %arg0, %0 : tensor<2xf32>, !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.print(%1#0, %1#1) {api_version = 4 : i32, backend_config = {label = "body"}, has_side_effect = true} : (tensor<2xf32>, !stablehlo.token) -> !stablehlo.token
+                    %3 = stablehlo.add %1#0, %1#0 : tensor<2xf32>
+                    return %3 : tensor<2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Print lowering / effect-token threading tests
     // ---------------------------------------------------------------------------
@@ -24768,58 +25036,6 @@ mod tests {
             !stablehlo.contains("stablehlo.constant"),
             "residuals are runtime inputs, not baked-in constants, but got:\n{stablehlo}",
         );
-    }
-
-    #[test]
-    fn test_rematerialized_pullback_lowers_without_a_rematerialization_boundary() {
-        use ryft_core::tracing_v2::rematerialize;
-        use ryft_core::{Context, CotangentDestinationKind, DomainTracer, Trace, TracingContext};
-
-        // Rematerialization retains its custom transpose in a linear call. The production lowerer inlines that
-        // call's executable region. The default recompute policy saves only `x`, so the pullback recomputes
-        // `cos(x * x)` before scaling the cotangent. The forward/JVP barrier hint does not change this computation.
-        let expected = indoc! {r#"
-            module {
-              func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>) -> tensor<f64> {
-                %0 = stablehlo.multiply %arg1, %arg1 : tensor<f64>
-                %1 = stablehlo.cosine %0 : tensor<f64>
-                %2 = stablehlo.multiply %1, %arg0 : tensor<f64>
-                %3 = stablehlo.multiply %arg1, %2 : tensor<f64>
-                %4 = stablehlo.multiply %arg1, %2 : tensor<f64>
-                %5 = stablehlo.add %3, %4 : tensor<f64>
-                return %5 : tensor<f64>
-              }
-            }
-        "#};
-
-        let scalar_type = ArrayType::scalar(DataType::F64);
-        for prevent_cse in [true, false] {
-            let function = rematerialize::<XlaDomain<'static>, _, _, _>(|x: DomainTracer<XlaDomain<'static>>| {
-                let context = x.context();
-                let squared =
-                    context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[x.clone(), x.clone()])?;
-                Ok(context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &squared)?[0].clone())
-            })
-            .with_prevent_cse(prevent_cse);
-            let (_, program) = XlaDomain::trace(|x| function.call(x), ArrayIrType::Array(scalar_type.clone())).unwrap();
-            let context = TracingContext::<XlaConstant, XlaOperation>::new();
-            let input = context.input(ArrayIrType::Array(scalar_type.clone()));
-            let (_, pullback) = context
-                .vjp(|input, ()| program.interpret_in_context(input.context(), input.clone()), input, ())
-                .unwrap();
-            let pullback = pullback.transposed_program(&[CotangentDestinationKind::Return]).unwrap();
-            let stablehlo = to_mlir_module_for_program(
-                &pullback,
-                &[],
-                &vec![scalar_type.clone(); pullback.input_ids().len()],
-                &scalar_type,
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
-            assert_eq!(stablehlo, expected, "prevent_cse: {prevent_cse}");
-        }
     }
 
     #[test]

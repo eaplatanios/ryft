@@ -319,7 +319,7 @@ mod tests {
         ConvertElementType, ConvertElementTypeOperation, Cos, Cumulative, DenseDifferentiableType, Device, DeviceMesh,
         Differentiate, Dimension, DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather,
         GatherDimensionNumbers, GatherMode, GatherOptions, Ln1p, Log, LogAddExp, LogicalMesh, Logistic, Max, MeshAxis,
-        MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape,
+        MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReducePrecision, ReductionKind, Rem, Reshape,
         ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind,
         Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose,
         TypeError, UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
@@ -1693,6 +1693,105 @@ mod tests {
                     shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(),
                     encodings,
                     "{data_type} from {pieces_type}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_reduce_precision_parity_with_reference_backend() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+
+        // Each case lists element encodings covering ties, rounding carries into the exponent, overflow, underflow,
+        // subnormals, signed zeros, infinities, and NaN payloads, along with the simulated formats to reduce them to.
+        let f16s = [
+            1.125f32,
+            1.375,
+            1.00048828125,
+            65504.0,
+            255.875,
+            256.0,
+            0.015625,
+            0.0078125,
+            -0.0078125,
+            -0.0,
+            f32::INFINITY,
+        ]
+        .map(f16::from_f32)
+        .into_iter()
+        .chain([f16::from_bits(0x0001), f16::from_bits(0x0100), f16::from_bits(0x7c01), f16::from_bits(0xfe00)])
+        .collect::<Vec<_>>();
+        let bf16s = [1.0625f32, 1.1875, 65280.0, 65536.0, 6.1035156e-5, 3.0517578e-5, -3.0517578e-5, f32::NEG_INFINITY]
+            .map(bf16::from_f32)
+            .into_iter()
+            .chain([bf16::from_bits(0x0001), bf16::from_bits(0x0010), bf16::from_bits(0x7f81), bf16::from_bits(0xffc0)])
+            .collect::<Vec<_>>();
+        let f32s = [
+            1.00048828125f32,
+            1.00146484375,
+            f32::from_bits(0x3f801008),
+            65519.0,
+            65520.0,
+            -1e10,
+            6.1035156e-5,
+            3.0517578e-5,
+            -3.0517578e-5,
+            6.1020255e-5,
+            1.5,
+            3.0,
+            -0.0,
+            f32::INFINITY,
+            f32::from_bits(1),
+            f32::from_bits(0x7fc00001),
+            f32::from_bits(0xff800001),
+            f32::from_bits(0x7fffffff),
+        ];
+        let f64s = [
+            1.0f64 + 2.0f64.powi(-24),
+            1.0 + 3.0 * 2.0f64.powi(-24),
+            0.1,
+            f64::from(f32::MAX) + 2.0f64.powi(103),
+            2.0f64.powi(-126),
+            2.0f64.powi(-127),
+            -2.0f64.powi(-127),
+            f64::NEG_INFINITY,
+            f64::from_bits(1),
+            f64::from_bits(0x7ff0000000000001),
+        ];
+        let cases = [
+            (DataType::F16, values_to_bytes(&f16s), [(5, 2), (4, 10), (3, 1), (5, 0), (5, 10)]),
+            (DataType::BF16, values_to_bytes(&bf16s), [(8, 3), (5, 7), (5, 2), (8, 0), (8, 7)]),
+            (DataType::F32, values_to_bytes(&f32s), [(5, 10), (8, 7), (5, 0), (11, 30), (8, 23)]),
+            (DataType::F64, values_to_bytes(&f64s), [(8, 23), (11, 30), (5, 10), (5, 0), (11, 52)]),
+        ];
+        for (data_type, bytes, formats) in cases {
+            let count = bytes.len() / (data_type.bit_width() / 8);
+            let device_input = Array::from_host_buffer(
+                &client,
+                replicated_type(&mesh, data_type, &[count]),
+                mesh.clone(),
+                bytes.as_slice(),
+            )
+            .unwrap();
+            let reference_input =
+                CpuArray::from_logical_bytes(ArrayType::new_static(data_type, [count]), &bytes).unwrap();
+            for (exponent_bits, mantissa_bits) in formats {
+                // NaN payloads are backend-defined (e.g., XLA's CPU backend quiets `bf16` NaNs), so NaNs only need to
+                // agree on being NaN, whereas every other encoding, including signed zeros, must agree exactly. The
+                // widening to `f64` is exact for every one of these element types.
+                let device_output = device_input.reduce_precision(exponent_bits, mantissa_bits).unwrap();
+                let device_output = CpuArray::from_logical_bytes(
+                    ArrayType::new_static(data_type, [count]),
+                    &shard_host_bytes(device_output.addressable_shards().next().unwrap()).unwrap(),
+                )
+                .unwrap();
+                let reference_output = reference_input.reduce_precision(exponent_bits, mantissa_bits).unwrap();
+                let encoding = |value: f64| if value.is_nan() { f64::NAN.to_bits() } else { value.to_bits() };
+                assert_eq!(
+                    device_output.to_f64s().into_iter().map(encoding).collect::<Vec<_>>(),
+                    reference_output.to_f64s().into_iter().map(encoding).collect::<Vec<_>>(),
+                    "`{data_type}` reduced to {exponent_bits} exponent and {mantissa_bits} mantissa bits",
                 );
             }
         }

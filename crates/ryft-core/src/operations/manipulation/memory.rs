@@ -1,9 +1,9 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, Complex, Memory, RaggedAxis, bf16,
-    f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
-    f16, i1, i2, i4, u1, u2, u4,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, Complex, Memory,
+    RaggedAxis, bf16, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
+    f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, u1, u2, u4,
 };
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, StagingContext};
@@ -12,7 +12,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+    MaybeZero, Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface,
+    TypeError, Typed, Value,
 };
 
 /// Canonical operation name for [`TransferToMemoryOperation`].
@@ -186,6 +187,32 @@ impl_differentiable_operation! {
     },
 }
 
+impl<O: Operation<Type = ArrayType> + From<TransferToMemoryOperation>>
+    OperationProvider<ArrayType, TransferToMemoryOperation> for O
+{
+    type Operation = Self;
+
+    #[inline]
+    fn provide(request: TransferToMemoryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        Ok(request.into())
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected: From<TransferToMemoryOperation>>>
+    OperationProvider<ArrayIrType, TransferToMemoryOperation> for O
+{
+    type Operation = Self;
+
+    #[inline]
+    fn provide(request: TransferToMemoryOperation, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        // Composite families select the transfer through their array projection, so that the provided operation is
+        // the canonical array member (e.g., `ArrayIrOperation::Array(ArrayOperation::TransferToMemory(_))`).
+        check_count!("input", input_types, 1, ProgramError);
+        Ok(<Self as OperationProjection<ArrayType>>::Projected::from(request).into())
+    }
+}
+
 /// Transfers a value to a destination [`Memory`] without changing its value or any other of its metadata (e.g., the
 /// shape, layout, or sharding or [`Array`]s). Reference [`Array`] values retain their shared host storage and update
 /// the memory recorded in their type. Traced values stage a [`TransferToMemoryOperation`] and execution on a backend
@@ -293,8 +320,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayElement, ArrayOperation, DataType, DimensionBounds, DimensionVariable, Layout,
-        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Sharding, TiledLayout,
+        Array, ArrayBatch, ArrayElement, ArrayIrOperation, ArrayOperation, DataType, DimensionBounds,
+        DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Sharding, TiledLayout,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
@@ -697,5 +724,38 @@ mod tests {
         assert!(contributions[0].is_zero());
         assert_eq!(contributions[0].r#type().as_ref(), &source_type.cotangent().unwrap());
         assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_transfer_to_memory_provider() {
+        // Homogeneous array families provide the transfer directly.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let operation =
+            ArrayOperation::<Array>::provide(TransferToMemoryOperation::new(PINNED_HOST), &[&array_type]).unwrap();
+        assert!(matches!(
+            &operation,
+            ArrayOperation::TransferToMemory(operation) if operation.destination() == PINNED_HOST,
+        ));
+        assert_eq!(operation.to_string(), "transfer_to_memory [destination=Host[Pinned]]");
+        assert_eq!(
+            ArrayOperation::<Array>::provide(TransferToMemoryOperation::new(PINNED_HOST), &[]).unwrap_err(),
+            ProgramError::InvalidInputCount { expected: 1, actual: 0 },
+        );
+
+        // Composite families provide the transfer through their array projection.
+        let ir_type = ArrayIrType::Array(array_type);
+        let operation =
+            ArrayIrOperation::<Array>::provide(TransferToMemoryOperation::new(PINNED_HOST), &[&ir_type]).unwrap();
+        assert!(matches!(
+            &operation,
+            ArrayIrOperation::Array(ArrayOperation::TransferToMemory(operation))
+                if operation.destination() == PINNED_HOST,
+        ));
+        assert_eq!(operation.to_string(), "transfer_to_memory [destination=Host[Pinned]]");
+        assert_eq!(
+            ArrayIrOperation::<Array>::provide(TransferToMemoryOperation::new(PINNED_HOST), &[&ir_type, &ir_type])
+                .unwrap_err(),
+            ProgramError::InvalidInputCount { expected: 1, actual: 2 },
+        );
     }
 }

@@ -587,7 +587,7 @@ pub trait ShardMapInvocationLeaf: Parameter + Sized {
 /// Stages an arbitrary traced XLA function over global tensor types.
 ///
 /// This is the general XLA tracing entry point used when callers want to compose `shard_map`
-/// with other `tracing_v2` transforms such as `grad` and then lower the resulting whole program to
+/// with differentiation transforms and then lower the resulting whole program to
 /// StableHLO/Shardy MLIR.
 ///
 /// # Parameters
@@ -731,7 +731,7 @@ where
 /// Stages a traced shard-map body over the provided mesh and shardings.
 ///
 /// This is the ergonomic public entry point for traced XLA shard-map staging. It mirrors the
-/// function-first shape of JAX's `shard_map` while adapting it to Rust and `tracing_v2` by
+/// function-first shape of JAX's `shard_map` while adapting it to Rust staging by
 /// requiring explicit `global_input_types`.
 ///
 /// Mesh axes whose type is [`Manual`](ryft_core::arrays::MeshAxisType::Manual) define the default
@@ -824,7 +824,7 @@ where
     Leaf::invoke(function, inputs, mesh, in_specs, out_specs, manual_axes)
 }
 
-/// Traced shard-map program backed by a staged `tracing_v2` program.
+/// Traced shard-map program backed by a staged [`Program`](ryft_core::Program).
 ///
 /// [`TracedShardMap`] extends internal shard-map metadata with both the traced local body program and the
 /// reconstructed global/local boundary types, making it the main inspection and lowering handle
@@ -857,7 +857,7 @@ where
     program: XlaProgram<ShardMapCapturedInput<Input>, ShardMapCapturedOutput<Output>>,
 }
 
-/// Traced XLA program backed by a staged `tracing_v2` program.
+/// Traced XLA program backed by a staged [`Program`](ryft_core::Program).
 #[allow(private_bounds, private_interfaces)]
 pub struct TracedXlaProgram<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>
 where

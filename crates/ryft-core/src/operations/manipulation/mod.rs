@@ -17,8 +17,9 @@
 //!     [NumPy-style](https://numpy.org/doc/stable/user/basics.indexing.html) integers, ranges, strides, new axes,
 //!     array indices, and masks. On array values the selection reads or returns updated copies, and on reference
 //!     values it derives a view that is read and written in place.
-//!   - **Changing Representation and Placement:** [`ConvertElementType`] changes the element data type and
-//!     [`TransferToMemory`] moves an array between memory spaces.
+//!   - **Changing Representation and Placement:** [`ConvertElementType`] changes the element data type,
+//!     [`ReducePrecision`] rounds floating-point elements to a narrower simulated format within their data type,
+//!     and [`TransferToMemory`] moves an array between memory spaces.
 //!
 //! Negative host integers and negative runtime start indices count from the end of their axis once before clamping.
 //! The `Dynamic*` variants take first-class dimension values in the mixed [`ArrayIrValue`](crate::ArrayIrValue)
@@ -86,6 +87,7 @@ pub use broadcasting::{
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, DynamicConcatenate};
 pub use conversions::{
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation, ElementType,
+    REDUCE_PRECISION_OPERATION_NAME, ReducePrecision, ReducePrecisionOperation,
 };
 pub use gathering::{
     DynamicGather, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions,

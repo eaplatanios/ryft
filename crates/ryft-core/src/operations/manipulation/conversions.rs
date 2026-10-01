@@ -1,8 +1,9 @@
 //! Operations that change the element type of a value, either by converting its elements numerically or by
-//! reinterpreting their encoding bits as another [`DataType`]. Numerical conversion keeps the shape, sharding, and
-//! memory space of its input and follows the destination format's rounding, saturation, and exceptional-value rules,
-//! whereas a bitcast keeps every encoding bit and adds or consumes a trailing axis when the two element widths differ.
-//! This module provides the following:
+//! reinterpreting their encoding bits as another [`DataType`], or that reduce the precision of its floating-point
+//! elements within their own [`DataType`]. Numerical conversion keeps the shape, sharding, and memory space of its
+//! input and follows the destination format's rounding, saturation, and exceptional-value rules, whereas a bitcast
+//! keeps every encoding bit and adds or consumes a trailing axis when the two element widths differ. This module
+//! provides the following:
 //!
 //!   - The [`ConvertElementType`] value capability, whose
 //!     [`convert_element_type`](ConvertElementType::convert_element_type) converts elements numerically, whose
@@ -17,15 +18,20 @@
 //!   - The [`ElementType`] type capability, through which the operation infers its output type. Replacing the element
 //!     type of a [`Type`] is a metadata-only change that clears byte-stride layouts when the element width changes,
 //!     and reinterpreting it conserves the number of encoding bits by adjusting the trailing shape.
+//!   - The [`ReducePrecision`] value capability and the [`ReducePrecisionOperation`] that it stages, which round real
+//!     floating-point elements to the values of a format with fewer exponent or mantissa bits while keeping their
+//!     element type, so that the precision of a narrower format can be simulated without converting to it.
 //!
 //! Numerical conversion is linear, so differentiation converts the primal and aligns the tangent with the output's
-//! tangent type, transposition converts the cotangent back to the input's cotangent type, and conversions into or out
-//! of a type without a tangent space (e.g., integers) produce structural zeros. A bitcast has a structural zero
-//! derivative and cannot be transposed. Batching keeps the mapped axis in place, except that a widening bitcast moves
-//! it away from the trailing position it would otherwise consume. Backends lower numerical conversion and bitcasts to
-//! their element-conversion and bit-reinterpretation constructs (e.g.,
-//! [`stablehlo.convert`](https://openxla.org/stablehlo/spec#convert) and
-//! [`stablehlo.bitcast_convert`](https://openxla.org/stablehlo/spec#bitcast_convert) in the XLA backend).
+//! tangent type, transposition converts the cotangent back to the input's cotangent type, and conversions into or
+//! out of a type without a tangent space (e.g., integers) produce structural zeros. A bitcast has a structural zero
+//! derivative and cannot be transposed. Precision reduction is treated as linear and as its own transpose, so that
+//! tangents and cotangents carry the same precision as the primal. Batching keeps the mapped axis in place, except that
+//! a widening bitcast moves it away from the trailing position it would otherwise consume. Backends lower numerical
+//! conversion, bitcasts, and precision reduction to their element-conversion, bit-reinterpretation, and
+//! precision-reduction constructs (e.g., [`stablehlo.convert`](https://openxla.org/stablehlo/spec#convert),
+//! [`stablehlo.bitcast_convert`](https://openxla.org/stablehlo/spec#bitcast_convert), and
+//! [`stablehlo.reduce_precision`](https://openxla.org/stablehlo/spec#reduce_precision) in the XLA backend).
 //!
 //! # Example
 //!
@@ -62,12 +68,12 @@ use std::marker::PhantomData;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension,
-    Layout, ShardingDimension,
+    Layout, ShardingDimension, bf16, f16,
 };
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
@@ -627,6 +633,330 @@ impl ConvertElementType for Array {
         }
 
         Array::from_logical_bytes(output_type, &output)
+    }
+}
+
+/// Canonical operation name for [`ReducePrecisionOperation`].
+pub const REDUCE_PRECISION_OPERATION_NAME: &str = "reduce_precision";
+
+/// [`Operation`] that rounds each real floating-point element of its input to the values
+/// representable by a floating-point format with [`exponent_bits`](Self::exponent_bits) exponent bits and
+/// [`mantissa_bits`](Self::mantissa_bits) mantissa bits, while keeping the input's element type, shape, sharding, and
+/// memory space. This simulates the precision of a narrower format (e.g., `bfloat16` inside `f32` arithmetic) without
+/// changing how the values are stored. Type inference goes through the [`ElementType`] capability of the type
+/// universe `T`, so the same operation serves bare [`DataType`]s and [`ArrayType`]s. Refer to the documentation
+/// of [`ReducePrecision`] for the rounding semantics.
+///
+/// Interpretation reduces the values through the same capability, and batching keeps the mapped axis in place.
+/// Differentiation treats the operation as linear and as its own transpose, although it is piecewise constant,
+/// so that derivatives carry the same simulated precision as the primal computation (this is also the rule of
+/// [`jax.lax.reduce_precision`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.reduce_precision.html)):
+/// the tangent and the cotangent are both reduced to the same precision as the primal, and symbolic zeros stay
+/// symbolic. Backends lower the operation to their precision-reduction constructs (e.g.,
+/// [`stablehlo.reduce_precision`](https://openxla.org/stablehlo/spec#reduce_precision) in the XLA backend).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ReducePrecisionOperation<T: ElementType> {
+    /// Refer to the documentation of [`exponent_bits`](Self::exponent_bits) for more information.
+    exponent_bits: u32,
+
+    /// Refer to the documentation of [`mantissa_bits`](Self::mantissa_bits) for more information.
+    mantissa_bits: u32,
+
+    /// [`PhantomData`] marker tying this [`Operation`] to the [`Type`] universe in which it is valid.
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T: ElementType> ReducePrecisionOperation<T> {
+    /// Creates a new [`ReducePrecisionOperation`] that rounds its input to `exponent_bits` exponent bits and
+    /// `mantissa_bits` mantissa bits. The bit counts are validated during type inference rather than here.
+    ///
+    /// # Parameters
+    ///
+    ///   - `exponent_bits`: Number of exponent bits of the simulated format, which must be at least one.
+    ///   - `mantissa_bits`: Number of explicitly stored mantissa bits of the simulated format (i.e., excluding the
+    ///     implicit leading bit), which may be zero.
+    #[inline]
+    pub fn new(exponent_bits: u32, mantissa_bits: u32) -> Self {
+        Self { exponent_bits, mantissa_bits, marker: PhantomData }
+    }
+
+    /// Returns the number of exponent bits of the format simulated by this [`ReducePrecisionOperation`].
+    #[inline]
+    pub fn exponent_bits(&self) -> u32 {
+        self.exponent_bits
+    }
+
+    /// Returns the number of explicitly stored mantissa bits of the format simulated by this
+    /// [`ReducePrecisionOperation`].
+    #[inline]
+    pub fn mantissa_bits(&self) -> u32 {
+        self.mantissa_bits
+    }
+}
+
+// Implemented manually because deriving `Copy` would require `T: Copy`, although the marker is `Copy` for every `T`.
+impl<T: ElementType> Copy for ReducePrecisionOperation<T> {}
+
+impl<T: ElementType> Display for ReducePrecisionOperation<T> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<T: ElementType> Operation for ReducePrecisionOperation<T> {
+    type Type = T;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        REDUCE_PRECISION_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let data_type = input_types[0].element_type();
+        if !data_type.is_floating_point() {
+            return Err(TypeError::invalid(format!(
+                "`{REDUCE_PRECISION_OPERATION_NAME}` requires real floating-point elements but got `{data_type}`",
+            )));
+        }
+        if self.exponent_bits == 0 {
+            return Err(TypeError::invalid(format!(
+                "`{REDUCE_PRECISION_OPERATION_NAME}` requires at least one exponent bit",
+            )));
+        }
+        Ok(vec![input_types[0].clone()])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("exponent_bits", self.exponent_bits)?;
+            operation.field("mantissa_bits", self.mantissa_bits)
+        })
+    }
+}
+
+impl<C: Domain<Type: ElementType, Value: ReducePrecision>> InterpretableOperation<C>
+    for ReducePrecisionOperation<C::Type>
+{
+    #[inline]
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].reduce_precision(self.exponent_bits, self.mantissa_bits)?])
+    }
+}
+
+impl<C: Context<Type: ElementType, Operation: From<ReducePrecisionOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
+    for ReducePrecisionOperation<C::Type>
+{
+}
+
+impl<C: Context<Type = ArrayType, Value: ReducePrecision>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for ReducePrecisionOperation<ArrayType>
+{
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
+        // Precision reduction is elementwise, so it applies to the packed value directly, keeping the mapped axis and
+        // any ragged axes in place. Rounding padding elements is harmless because they remain padding.
+        check_count!("input", inputs, 1, ProgramError);
+        self.infer_output_types(&[inputs[0].unbatched_type()], &[])?;
+        let mut outputs = self.interpret_with_batch_axes(context, inputs, &[inputs[0].batch_axis()])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(vec![outputs.remove(0).with_ragged_axes(inputs[0].ragged_axes().to_vec())?].into())
+    }
+}
+
+impl_differentiable_operation! {
+    <T> ReducePrecisionOperation<T>,
+    jvp<C>
+    where
+        T: DifferentiableType + ElementType,
+        C: Context<Type = T, Value: ReducePrecision>,
+    {
+        |operation, _context, _driver, inputs| {
+            // Precision reduction is treated as linear, so a live tangent is reduced to the same precision as the
+            // primal and a symbolic-zero tangent stays symbolic.
+            check_count!("input", inputs, 1, ProgramError);
+            let primal = inputs[0].primal().reduce_precision(operation.exponent_bits, operation.mantissa_bits)?;
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                MaybeZero::Value(tangent) => {
+                    MaybeZero::Value(tangent.reduce_precision(operation.exponent_bits, operation.mantissa_bits)?)
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    transpose<V, O>
+    where
+        T: DifferentiableType + ElementType,
+        V: Value<Type = T>,
+        O: Operation<Type = T> + From<ReducePrecisionOperation<T>>,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // The operation is its own transpose, so a live output cotangent is reduced to the same precision before
+            // it is accumulated into the input cotangent. Symbolic-zero cotangents contribute nothing.
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
+            let MaybeZero::Value(cotangent) = &outputs[0] else { return Ok(()); };
+            let mut contributions =
+                context.stage_operation(*operation, Vec::new(), std::slice::from_ref(cotangent))?;
+            check_count!("output", contributions, 1, ProgramError);
+            accumulators[0].accumulate(context, MaybeZero::Value(contributions.remove(0)))?;
+            Ok(())
+        }
+    },
+}
+
+/// Rounds real floating-point elements to the values representable by a narrower floating-point format while keeping
+/// their element type, which simulates the precision of that format (e.g., `bfloat16` inside `f32` arithmetic).
+///
+/// The semantics are those of [`stablehlo.reduce_precision`](https://openxla.org/stablehlo/spec#reduce_precision)
+/// as implemented by XLA, applied to the bit encoding of each element in its own [`DataType`]:
+///
+///   - The mantissa is rounded to `mantissa_bits` bits, to nearest with ties to even. Components whose requested bit
+///     count is at least the element type's own are left unchanged.
+///   - Values whose rounded exponent exceeds the largest finite exponent of the reduced format overflow to an
+///     infinity with the input's sign.
+///   - Values whose exponent is at or below the smallest exponent of the reduced format, including every subnormal
+///     of the reduced format, are flushed to a zero with the input's sign rather than being rounded to a subnormal.
+///   - NaN inputs are returned unchanged, even when `mantissa_bits = 0` leaves the reduced format without NaNs.
+///     Infinities and signed zeros are preserved.
+///
+/// [`ReducePrecision`] is the value capability that stages [`ReducePrecisionOperation`]. Context-carrying values bind
+/// that operation through their own context, whereas concrete values execute their backend's reduction directly. For
+/// the reference [`Array`] backend, reduction supports [`DataType::F16`], [`DataType::BF16`], [`DataType::F32`], and
+/// [`DataType::F64`] elements.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, ProgramError, ReducePrecision};
+/// # fn main() -> Result<(), ProgramError> {
+/// // With `bfloat16` precision (8 exponent bits and 7 mantissa bits), `1 + 2^-8` is a tie that rounds to the even
+/// // mantissa of `1`, whereas `1 + 3 * 2^-8` is a tie that rounds up to `1 + 2^-6`. `1e38` keeps its exponent.
+/// let input = Array::vector(vec![1.00390625f32, 1.01171875, 1e38])?;
+/// let expected = Array::vector(vec![1.0f32, 1.015625, f32::from_bits(0x7e960000)])?;
+/// assert_eq!(input.reduce_precision(8, 7)?, expected);
+///
+/// // With `float16` precision (5 exponent bits and 10 mantissa bits), `1e38` overflows to infinity.
+/// let expected = Array::vector(vec![1.00390625f32, 1.01171875, f32::INFINITY])?;
+/// assert_eq!(input.reduce_precision(5, 10)?, expected);
+/// # Ok(())
+/// # }
+/// ```
+pub trait ReducePrecision: Sized {
+    /// Returns this value with each element rounded to a floating-point format with `exponent_bits` exponent bits and
+    /// `mantissa_bits` mantissa bits. Refer to the documentation of [`ReducePrecision`] for the rounding semantics.
+    /// Non-floating-point elements and `exponent_bits = 0` return a [`ProgramError`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `exponent_bits`: Number of exponent bits of the simulated format, which must be at least one.
+    ///   - `mantissa_bits`: Number of explicitly stored mantissa bits of the simulated format (i.e., excluding the
+    ///     implicit leading bit), which may be zero.
+    fn reduce_precision(&self, exponent_bits: u32, mantissa_bits: u32) -> Result<Self, ProgramError>;
+}
+
+impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<ReducePrecisionOperation<V::Type>>>>>
+    ReducePrecision for V
+{
+    fn reduce_precision(&self, exponent_bits: u32, mantissa_bits: u32) -> Result<Self, ProgramError> {
+        let operation = ReducePrecisionOperation::<V::Type>::new(exponent_bits, mantissa_bits);
+        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+impl ReducePrecision for Array {
+    fn reduce_precision(&self, exponent_bits: u32, mantissa_bits: u32) -> Result<Self, ProgramError> {
+        let output_type = ReducePrecisionOperation::<ArrayType>::new(exponent_bits, mantissa_bits)
+            .infer_output_types(&[self.r#type().into_owned()], &[])?
+            .remove(0);
+
+        // Reduce an IEEE-style encoding in the low `bit_width` bits, preserving its storage format, following OpenXLA's
+        // [`reducePrecision`](https://github.com/openxla/xla/blob/main/xla/mlir_hlo/mhlo/transforms/transformation_helpers.h),
+        // used by the CPU backend's MLIR-based fusion emitters: round the mantissa with a ties-to-even bias and
+        // truncate (including a carry into the exponent), select signed infinity or zero from the rounded exponent,
+        // and restore NaN inputs. The legacy `EmitReducePrecisionIR` in `xla/service/llvm_ir/llvm_util.cc` computes
+        // the same bits except that it maps NaNs to positive infinity when `mantissa_bits = 0`. Input bits above
+        // `bit_width` must be cleared; `source_mantissa_bits` excludes the implicit leading bit. Type inference
+        // has already validated that `exponent_bits` is positive.
+        let reduce = |bits: u64, bit_width: u32, source_mantissa_bits: u32| {
+            let width_mask = u64::MAX >> (64 - bit_width);
+            let source_exponent_bits = bit_width - 1 - source_mantissa_bits;
+            let sign_mask = 1u64 << (bit_width - 1);
+            let exponent_mask = ((1u64 << source_exponent_bits) - 1) << source_mantissa_bits;
+            let is_nan = (bits & !sign_mask) > exponent_mask;
+
+            let mut result = bits;
+            if mantissa_bits < source_mantissa_bits {
+                // The rounding bias is `0111...` below the last retained mantissa bit, plus one when that bit is set,
+                // so that adding it and truncating rounds to nearest with ties to even.
+                let shift = source_mantissa_bits - mantissa_bits;
+                let last_mantissa_bit = 1u64 << shift;
+                let rounding_bias = (last_mantissa_bit >> 1) - 1 + ((result & last_mantissa_bit) >> shift);
+                result = result.wrapping_add(rounding_bias) & width_mask & !(last_mantissa_bit - 1);
+            }
+
+            if exponent_bits < source_exponent_bits {
+                // A biased exponent of `2^(n - 1) - 1` denotes `1.0` for every exponent width `n`, so the reduced
+                // format's largest finite and smallest (i.e., zero or subnormal) exponents are that bias offset by
+                // the reduced bias.
+                let exponent_bias = (1u64 << (source_exponent_bits - 1)) - 1;
+                let reduced_exponent_bias = (1u64 << (exponent_bits - 1)) - 1;
+                let reduced_max_exponent = (exponent_bias + reduced_exponent_bias) << source_mantissa_bits;
+                let reduced_min_exponent = (exponent_bias - reduced_exponent_bias) << source_mantissa_bits;
+                let exponent = result & exponent_mask;
+                let signed_zero = result & sign_mask;
+                if exponent > reduced_max_exponent {
+                    result = signed_zero | exponent_mask;
+                } else if exponent <= reduced_min_exponent {
+                    result = signed_zero;
+                }
+            }
+
+            // The exponent handling turns NaNs into infinities and mantissa rounding may carry a NaN payload into the
+            // sign bit, so NaN inputs are restored here.
+            if is_nan { bits } else { result }
+        };
+
+        match output_type.data_type() {
+            DataType::F16 => self.map_elements::<f16, f16>(output_type, |value| {
+                Ok(f16::from_bits(reduce(value.to_bits().into(), 16, 10) as u16))
+            }),
+            DataType::BF16 => self.map_elements::<bf16, bf16>(output_type, |value| {
+                Ok(bf16::from_bits(reduce(value.to_bits().into(), 16, 7) as u16))
+            }),
+            DataType::F32 => self.map_elements::<f32, f32>(output_type, |value| {
+                Ok(f32::from_bits(reduce(value.to_bits().into(), 32, 23) as u32))
+            }),
+            DataType::F64 => {
+                self.map_elements::<f64, f64>(output_type, |value| Ok(f64::from_bits(reduce(value.to_bits(), 64, 52))))
+            }
+            data_type => Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{REDUCE_PRECISION_OPERATION_NAME}` is not supported for `{data_type}` elements \
+                     of reference arrays",
+                ),
+            }),
+        }
     }
 }
 
@@ -1793,5 +2123,371 @@ mod tests {
         let pieces = Array::scalar(0xabu8).unwrap().bitcast_element_type(DataType::U4).unwrap();
         assert_eq!(pieces.elements::<u4>().unwrap(), vec![u4::new(11).unwrap(), u4::new(10).unwrap()]);
         assert_eq!(pieces.bitcast_element_type(DataType::U8), Ok(Array::scalar(0xabu8).unwrap()));
+    }
+
+    #[test]
+    fn test_reduce_precision() {
+        let operation = ReducePrecisionOperation::<ArrayType>::new(5, 10);
+        assert_eq!(operation.name(), REDUCE_PRECISION_OPERATION_NAME);
+        assert_eq!(operation.exponent_bits(), 5);
+        assert_eq!(operation.mantissa_bits(), 10);
+        assert_eq!(operation.to_string(), "reduce_precision [exponent_bits=5, mantissa_bits=10]");
+    }
+
+    #[test]
+    fn test_reduce_precision_type_inference() {
+        // Precision reduction keeps the complete input type and accepts only real floating-point element types.
+        let array_operation = ReducePrecisionOperation::<ArrayType>::new(5, 10);
+        let input_type = ArrayType::new_static(DataType::BF16, [2, 3]).with_memory(Memory::Host { pinned: true });
+        check_operation_type_inference!(
+            operation = array_operation,
+            cases = [
+                {
+                    input_types = [input_type.clone()],
+                    output_types = [input_type],
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::F8E4M3FN)],
+                    output_types = [ArrayType::scalar(DataType::F8E4M3FN)],
+                },
+                {
+                    input_types = [],
+                    error = "expected 1 input but got 0",
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F32)],
+                    error = "expected 1 input but got 2",
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::I32)],
+                    error = "`reduce_precision` requires real floating-point elements but got `i32`",
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::Boolean)],
+                    error = "`reduce_precision` requires real floating-point elements but got `bool`",
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::C64)],
+                    error = "`reduce_precision` requires real floating-point elements but got `c64`",
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::Token)],
+                    error = "`reduce_precision` requires real floating-point elements but got `token`",
+                },
+            ],
+        );
+
+        // The simulated format needs an exponent, but it may have no explicitly stored mantissa bits.
+        check_operation_type_inference!(
+            operation = ReducePrecisionOperation::<ArrayType>::new(0, 10),
+            cases = [{
+                input_types = [ArrayType::scalar(DataType::F32)],
+                error = "`reduce_precision` requires at least one exponent bit",
+            }],
+        );
+
+        check_operation_type_inference!(
+            operation = ReducePrecisionOperation::<ArrayType>::new(5, 0),
+            cases = [{
+                input_types = [ArrayType::scalar(DataType::F32)],
+                output_types = [ArrayType::scalar(DataType::F32)],
+            }],
+        );
+
+        // The same operation infers bare element types in the `DataType` universe.
+        check_operation_type_inference!(
+            operation = ReducePrecisionOperation::<DataType>::new(8, 7),
+            cases = [{
+                input_types = [DataType::F64],
+                output_types = [DataType::F64],
+            }],
+        );
+
+        // The operation cannot own nested regions.
+        assert_eq!(
+            array_operation.infer_output_types(
+                &[ArrayType::scalar(DataType::F32)],
+                &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)],
+            ),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+    }
+
+    #[test]
+    fn test_reduce_precision_interpretation() {
+        // `1 + 2^-11` is a tie between two `f16` mantissas and rounds to the even one.
+        let output = ReducePrecisionOperation::<ArrayType>::new(5, 10)
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(1.00048828125f32).unwrap()])
+            .unwrap();
+        assert_eq!(output, vec![Array::scalar(1.0f32).unwrap()]);
+    }
+
+    #[test]
+    fn test_reduce_precision_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = ReducePrecisionOperation::<ArrayType>::new(5, 10),
+            inputs = [Array::vector(vec![1.00048828125f32, 1e10]).unwrap()],
+            expected = Array::vector(vec![1.0f32, f32::INFINITY]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_reduce_precision_batching() {
+        // Precision reduction is elementwise and so it preserves leading and non-leading mapped axes.
+        let array_operation = ReducePrecisionOperation::<ArrayType>::new(5, 10);
+        check_operation_batching!(
+            @exact,
+            operation = array_operation,
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.00048828125f32, 1e10]).unwrap())],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0f32, f32::INFINITY]).unwrap())],
+            }],
+        );
+        check_operation_batching!(
+            @exact,
+            operation = array_operation,
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.00048828125f32, 1e10]).unwrap())],
+                outputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0f32, f32::INFINITY]).unwrap())],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_reduce_precision_differentiation() {
+        // The tangent is reduced to the same precision as the primal, so `1 + 2^-40` loses its low bits. The primal
+        // shifts by the finite-difference step are exactly representable, so finite differences agree.
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 0.0),
+            operation = ReducePrecisionOperation::new(11, 30),
+            cases = [{
+                primals = [Array::scalar(2.0f64).unwrap()],
+                tangents = [Array::scalar(1.0f64 + 2.0f64.powi(-40)).unwrap()],
+                primal_outputs = [Array::scalar(2.0f64).unwrap()],
+                tangent_outputs = [Array::scalar(1.0f64).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = reduce_precision [exponent_bits=11, mantissa_bits=30] %0
+                        %3:f64[] = reduce_precision [exponent_bits=11, mantissa_bits=30] %1
+                    in (%2, %3)
+                "},
+            }],
+        );
+
+        // A symbolic-zero tangent stays symbolic, so only the primal reduction is staged.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let primal = context.input(ArrayType::scalar(DataType::F32));
+        let outputs = ReducePrecisionOperation::new(5, 10)
+            .jvp(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new_with_zero_tangent(primal).unwrap()],
+            )
+            .unwrap();
+        assert!(outputs[0].tangent().is_zero());
+        assert_eq!(outputs[0].tangent().r#type().as_ref(), &ArrayType::scalar(DataType::F32));
+        assert_eq!(context.builder().borrow().instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_reduce_precision_transposition() {
+        // The operation is its own transpose, so the cotangent is reduced to the same precision.
+        check_operation_transposition!(
+            @exact,
+            operation = ReducePrecisionOperation::new(5, 10),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F32)))],
+                output_cotangents = [Array::scalar(1.00048828125f32).unwrap()],
+                input_cotangents = [Array::scalar(1.0f32).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f32[] .
+                    let %1:f32[] = reduce_precision [exponent_bits=5, mantissa_bits=10] %0
+                    in (%1)
+                "},
+            }],
+        );
+
+        // A symbolic-zero cotangent contributes nothing and stages nothing.
+        let input_type = ArrayType::scalar(DataType::F32);
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut rule_context = TranspositionContext::new(context.clone());
+        let inputs = [PartialValue::Unknown(input_type.clone())];
+        let accumulators = rule_context.cotangent_accumulators(&inputs, &[]).unwrap();
+        ReducePrecisionOperation::new(5, 10)
+            .transpose(&mut rule_context, &EmptyRegionDriver, &inputs, &[MaybeZero::Zero(input_type)], &accumulators)
+            .unwrap();
+        let contributions = rule_context.take_cotangents(&accumulators).unwrap();
+        assert!(contributions[0].is_zero());
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_reduce_precision_reduce_precision() {
+        // Context-carrying values stage one reduction through their own context, even when it is a no-op.
+        let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| input.reduce_precision(8, 7)?.reduce_precision(8, 23),
+            ArrayType::new_static(DataType::F32, [2]),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::new_static(DataType::F32, [2]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = reduce_precision [exponent_bits=8, mantissa_bits=7] %0
+                    %2:f32[2] = reduce_precision [exponent_bits=8, mantissa_bits=23] %1
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_array_reduce_precision() {
+        // Reference arrays keep their type while rounding every element.
+        let input = Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1.00048828125f32, 1e10]).unwrap();
+        let output = input.reduce_precision(5, 10).unwrap();
+        assert_eq!(output.r#type(), input.r#type());
+        assert_eq!(output, Array::vector(vec![1.0f32, f32::INFINITY]).unwrap());
+
+        // Invalid requests fail type inference, and other floating-point element types are unsupported.
+        assert_eq!(
+            Array::scalar(1i32).unwrap().reduce_precision(5, 10),
+            Err(TypeError::invalid("`reduce_precision` requires real floating-point elements but got `i32`").into()),
+        );
+        assert_eq!(
+            Array::scalar(1.0f32).unwrap().reduce_precision(0, 10),
+            Err(TypeError::invalid("`reduce_precision` requires at least one exponent bit").into()),
+        );
+        assert_eq!(
+            Array::scalar(f8e4m3fn::from_f32(1.0).unwrap()).unwrap().reduce_precision(4, 2),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`reduce_precision` is not supported for `f8e4m3fn` elements of reference arrays".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_reduce_precision_f32() {
+        // Each case lists an input encoding and its expected encoding after reduction to `f16` precision.
+        let cases = [
+            // Ties round to the even mantissa, and other values round to nearest.
+            (1.00048828125f32.to_bits(), 1.0f32.to_bits()),
+            (1.00146484375f32.to_bits(), 1.001953125f32.to_bits()),
+            (0x3f801008, 1.0009765625f32.to_bits()),
+            // Values above the largest finite `f16` overflow after rounding, keeping their sign.
+            (65519.0f32.to_bits(), 65504.0f32.to_bits()),
+            (65520.0f32.to_bits(), f32::INFINITY.to_bits()),
+            ((-1e10f32).to_bits(), f32::NEG_INFINITY.to_bits()),
+            // Values below the smallest normal `f16` flush to signed zero, unless rounding carries them up to it.
+            (2.0f32.powi(-14).to_bits(), 2.0f32.powi(-14).to_bits()),
+            (2.0f32.powi(-15).to_bits(), 0.0f32.to_bits()),
+            ((-2.0f32.powi(-15)).to_bits(), (-0.0f32).to_bits()),
+            ((2.0f32.powi(-14) * (1.0 - 2.0f32.powi(-12))).to_bits(), 2.0f32.powi(-14).to_bits()),
+            // Infinities, signed zeros, and NaN payloads are preserved.
+            (f32::INFINITY.to_bits(), f32::INFINITY.to_bits()),
+            (f32::NEG_INFINITY.to_bits(), f32::NEG_INFINITY.to_bits()),
+            ((-0.0f32).to_bits(), (-0.0f32).to_bits()),
+            (0x7fc00001, 0x7fc00001),
+            (0xff800001, 0xff800001),
+            (0x7fffffff, 0x7fffffff),
+        ];
+        let input = Array::vector(cases.iter().map(|(input, _)| f32::from_bits(*input)).collect()).unwrap();
+        let output = input.reduce_precision(5, 10).unwrap().elements::<f32>().unwrap();
+        let expected = cases.iter().map(|(_, expected)| *expected).collect::<Vec<_>>();
+        assert_eq!(output.into_iter().map(f32::to_bits).collect::<Vec<_>>(), expected);
+
+        // Without mantissa bits, ties round toward an even exponent and NaNs are still preserved.
+        let input = Array::vector(vec![1.5f32, 3.0, f32::from_bits(0xffc00000)]).unwrap();
+        let output = input.reduce_precision(5, 0).unwrap().elements::<f32>().unwrap();
+        assert_eq!(output.into_iter().map(f32::to_bits).collect::<Vec<_>>(), vec![0x40000000, 0x40000000, 0xffc00000]);
+
+        // Requested widths at least as large as those of `f32` leave every encoding unchanged, including subnormals.
+        let input = Array::vector(vec![f32::from_bits(1), 1.0 + f32::EPSILON, f32::from_bits(0x7fc00001)]).unwrap();
+        assert_eq!(input.reduce_precision(8, 23).unwrap().logical_bytes(), input.logical_bytes());
+        assert_eq!(input.reduce_precision(11, 52).unwrap().logical_bytes(), input.logical_bytes());
+    }
+
+    #[test]
+    fn test_array_reduce_precision_f64() {
+        // Within the normal `f32` range, reduction to `f32` precision agrees with rounding conversion to `f32`.
+        let values = [1.0f64 + 2.0f64.powi(-24), 1.0 + 3.0 * 2.0f64.powi(-24), 0.1, -123.456, f32::MAX as f64];
+        let input = Array::vector(values.to_vec()).unwrap();
+        let expected = values.iter().map(|value| *value as f32 as f64).collect::<Vec<_>>();
+        assert_eq!(input.reduce_precision(8, 23).unwrap().elements::<f64>().unwrap(), expected);
+        assert_eq!(expected[..2], [1.0, 1.0 + 2.0f64.powi(-22)]);
+
+        // Overflow, underflow, and exceptional values follow the same rules as for the other element types.
+        let cases = [
+            ((f32::MAX as f64 + 2.0f64.powi(103)).to_bits(), f64::INFINITY.to_bits()),
+            (2.0f64.powi(128).to_bits(), f64::INFINITY.to_bits()),
+            (2.0f64.powi(-126).to_bits(), 2.0f64.powi(-126).to_bits()),
+            (2.0f64.powi(-127).to_bits(), 0.0f64.to_bits()),
+            ((-2.0f64.powi(-127)).to_bits(), (-0.0f64).to_bits()),
+            (f64::NEG_INFINITY.to_bits(), f64::NEG_INFINITY.to_bits()),
+            (0x7ff0000000000001, 0x7ff0000000000001),
+        ];
+        let input = Array::vector(cases.iter().map(|(input, _)| f64::from_bits(*input)).collect()).unwrap();
+        let output = input.reduce_precision(8, 23).unwrap().elements::<f64>().unwrap();
+        let expected = cases.iter().map(|(_, expected)| *expected).collect::<Vec<_>>();
+        assert_eq!(output.into_iter().map(f64::to_bits).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn test_array_reduce_precision_f16() {
+        // Reducing only the mantissa (to `f8e5m2` precision) rounds to nearest even, lets a mantissa carry overflow
+        // into infinity, and keeps subnormals and NaN payloads.
+        let cases = [
+            (f16::from_f32(1.125).to_bits(), f16::from_f32(1.0).to_bits()),
+            (f16::from_f32(1.375).to_bits(), f16::from_f32(1.5).to_bits()),
+            (f16::MAX.to_bits(), f16::INFINITY.to_bits()),
+            (0x0100, 0x0100),
+            (0x7c01, 0x7c01),
+        ];
+        let input = Array::vector(cases.iter().map(|(input, _)| f16::from_bits(*input)).collect()).unwrap();
+        let output = input.reduce_precision(5, 2).unwrap().elements::<f16>().unwrap();
+        let expected = cases.iter().map(|(_, expected)| *expected).collect::<Vec<_>>();
+        assert_eq!(output.into_iter().map(f16::to_bits).collect::<Vec<_>>(), expected);
+
+        // Reducing only the exponent overflows above the largest and flushes below the smallest reduced exponent.
+        let cases = [
+            (f16::from_f32(255.875).to_bits(), f16::from_f32(255.875).to_bits()),
+            (f16::from_f32(256.0).to_bits(), f16::INFINITY.to_bits()),
+            (f16::from_f32(2.0f32.powi(-6)).to_bits(), f16::from_f32(2.0f32.powi(-6)).to_bits()),
+            (f16::from_f32(2.0f32.powi(-7)).to_bits(), f16::ZERO.to_bits()),
+            (f16::from_f32(-2.0f32.powi(-7)).to_bits(), f16::NEG_ZERO.to_bits()),
+        ];
+        let input = Array::vector(cases.iter().map(|(input, _)| f16::from_bits(*input)).collect()).unwrap();
+        let output = input.reduce_precision(4, 10).unwrap().elements::<f16>().unwrap();
+        let expected = cases.iter().map(|(_, expected)| *expected).collect::<Vec<_>>();
+        assert_eq!(output.into_iter().map(f16::to_bits).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn test_array_reduce_precision_bf16() {
+        // Reducing only the mantissa rounds to nearest even and keeps subnormals and NaN payloads.
+        let cases = [
+            (bf16::from_f32(1.0625).to_bits(), bf16::from_f32(1.0).to_bits()),
+            (bf16::from_f32(1.1875).to_bits(), bf16::from_f32(1.25).to_bits()),
+            (0x0010, 0x0010),
+            (0x7f81, 0x7f81),
+        ];
+        let input = Array::vector(cases.iter().map(|(input, _)| bf16::from_bits(*input)).collect()).unwrap();
+        let output = input.reduce_precision(8, 3).unwrap().elements::<bf16>().unwrap();
+        let expected = cases.iter().map(|(_, expected)| *expected).collect::<Vec<_>>();
+        assert_eq!(output.into_iter().map(bf16::to_bits).collect::<Vec<_>>(), expected);
+
+        // Reducing only the exponent (to `f16` range) overflows and flushes like the other element types.
+        let cases = [
+            (bf16::from_f32(65280.0).to_bits(), bf16::from_f32(65280.0).to_bits()),
+            (bf16::from_f32(65536.0).to_bits(), bf16::INFINITY.to_bits()),
+            (bf16::from_f32(2.0f32.powi(-14)).to_bits(), bf16::from_f32(2.0f32.powi(-14)).to_bits()),
+            (bf16::from_f32(2.0f32.powi(-15)).to_bits(), bf16::ZERO.to_bits()),
+            (bf16::from_f32(-2.0f32.powi(-15)).to_bits(), bf16::NEG_ZERO.to_bits()),
+        ];
+        let input = Array::vector(cases.iter().map(|(input, _)| bf16::from_bits(*input)).collect()).unwrap();
+        let output = input.reduce_precision(5, 7).unwrap().elements::<bf16>().unwrap();
+        let expected = cases.iter().map(|(_, expected)| *expected).collect::<Vec<_>>();
+        assert_eq!(output.into_iter().map(bf16::to_bits).collect::<Vec<_>>(), expected);
     }
 }

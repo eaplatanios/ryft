@@ -1116,6 +1116,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::While(_)
                 | ArrayOperation::Scan(_)
                 | ArrayOperation::ConvertElementType(_)
+                | ArrayOperation::ReducePrecision(_)
                 | ArrayOperation::TransferToMemory(_)
                 | ArrayOperation::Reshard(_)
                 | ArrayOperation::ConstrainSharding(_)

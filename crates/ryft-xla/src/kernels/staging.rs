@@ -16,12 +16,13 @@ use ryft_core::{
     Context, CotangentAccumulator, CustomFunctionJvpRule, CustomFunctionOperation, CustomRuleSource,
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     DifferentiationPolicy, Domain, Effects, InputRegionProvenance, Instruction, InterpretableOperation,
-    InterpretationDriver, MaybeZero, Operation, OutputRegionProvenance, PartialEvaluationContext,
-    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program,
-    ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    Region, RegionInterface, RegionSlot, Tracer, TracingContext, TransposableOperation, TranspositionContext,
-    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+    InterpretationDriver, MaybeZero, Operation, OperationBoundaryPruning, OutputRegionProvenance,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, Placeholder, Program, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, Region, RegionInterface, RegionLiveness, RegionSlot,
+    Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value,
 };
 
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation};
@@ -184,6 +185,20 @@ impl Operation for XlaKernelExtension {
         }
     }
 
+    fn prune_boundary(
+        &self,
+        _input_count: usize,
+        _used_outputs: &[bool],
+        _regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        match *self {
+            #[cfg(feature = "mosaic-gpu")]
+            Self::Mosaic(ref operation) => Ok(operation
+                .prune_boundary(_input_count, _used_outputs, _regions)?
+                .map(|pruning| pruning.map_operation(Self::Mosaic))),
+        }
+    }
+
     fn is_zero(&self, _output_index: usize) -> bool {
         match *self {
             #[cfg(feature = "mosaic-gpu")]
@@ -308,6 +323,18 @@ impl Operation for XlaKernelOperation {
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         self.0.output_region_provenance(output_index)
+    }
+
+    fn prune_boundary(
+        &self,
+        input_count: usize,
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        Ok(self
+            .0
+            .prune_boundary(input_count, used_outputs, regions)?
+            .map(|pruning| pruning.map_operation(Self)))
     }
 
     fn is_zero(&self, output_index: usize) -> bool {
@@ -2219,18 +2246,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_select_kernels_preserves_call_and_rematerialization_regions() {
-        use ryft_core::RematerializeOperation;
+        use ryft_core::{NothingSaveable, RematerializeOperation, ResidualPolicyReference};
 
         use crate::experimental::ops::JitCallOperation;
 
         let definition = differentiable_definition();
         let body = kernel_primal(&definition).unwrap();
         let scalar = body.input_types()[0].clone();
-        let mut identity = XlaProgramBuilder::new();
-        let input = identity.add_input(scalar.clone());
-        let identity = identity
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
         let binding = XlaKernelCompilerBinding::new(
             Compiler,
             FixtureTarget(true),
@@ -2242,17 +2264,12 @@ pub(crate) mod tests {
         .unwrap();
         for operation in [
             XlaOperation::JitCall(JitCallOperation::new(0)),
-            XlaOperation::Rematerialize(RematerializeOperation::new()),
+            XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable))),
         ] {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(scalar.clone());
-            let primal = builder.import_region(body.entry_region_ref());
-            let mut regions = vec![primal];
-            if matches!(operation, XlaOperation::Rematerialize(_)) {
-                let derivative = builder.import_region(identity.entry_region_ref());
-                regions.extend([derivative; 3]);
-            }
-            let outputs = builder.add_instruction(operation.clone(), regions, vec![input], None).unwrap().to_vec();
+            let body = builder.import_region(body.entry_region_ref());
+            let outputs = builder.add_instruction(operation.clone(), vec![body], vec![input], None).unwrap().to_vec();
             let program = builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();

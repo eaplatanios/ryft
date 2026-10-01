@@ -369,6 +369,22 @@ impl OperationParser {
     /// Normalizes the enum metadata shared by all generated implementations.
     fn normalize_input(&mut self, input: &syn::DeriveInput) -> Option<OperationEnum> {
         let variants = self.extract_variants(input);
+        let mut payload_types = std::collections::HashSet::new();
+        for variant in variants.iter().filter(|variant| {
+            !variant.is_generic_extension
+                && matches!(variant.class, OperationVariantClass::CompositeNative)
+                && is_generic_independent(&variant.payload_type, &input.generics)
+        }) {
+            if !payload_types.insert(variant.payload_type.to_token_stream().to_string()) {
+                self.add_error(
+                    &variant.ident,
+                    format_args!(
+                        "operation family holds constructible payload type '{}' in more than one variant",
+                        variant.payload_type.to_token_stream().to_string().replace(' ', ""),
+                    ),
+                );
+            }
+        }
         let mut member_types = std::collections::HashSet::new();
         for variant in &variants {
             if let Some(member_type) = variant.class.projected_member_type()
@@ -707,6 +723,7 @@ impl OperationEnum {
         let interpretation = self.generate_interpretable_operation();
         let partial_evaluation = self.generate_partially_evaluatable_operation();
         let projections = variants.iter().filter_map(|variant| self.generate_operation_projection_impl(variant));
+        let payload_projection = self.generate_payload_projection_impl();
         let conversion_impls = variants
             .iter()
             .filter(|variant| !variant.is_generic_extension)
@@ -720,6 +737,8 @@ impl OperationEnum {
             #partial_evaluation
 
             #(#projections)*
+
+            #payload_projection
 
             #[automatically_derived]
             impl #operation_impl_generics ::std::fmt::Display for #operation_self_type
@@ -888,6 +907,25 @@ impl OperationEnum {
             self.operation_forwarding_arms(quote!(input_region_provenance), quote!(, region_index, input_index));
         let output_region_provenance_arms =
             self.operation_forwarding_arms(quote!(output_region_provenance), quote!(, output_index));
+        let prune_boundary_arms = self.variants.iter().map(|variant| {
+            // Boundary pruning exchanges only liveness flags, so every variant class delegates to the payload's own
+            // hook and wraps the pruned payload back into its variant.
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            let wrapped = if variant.is_boxed { quote!(::std::boxed::Box::new(operation)) } else { quote!(operation) };
+            quote! {
+                Self::#variant_ident(operation) => ::std::result::Result::Ok(
+                    <#payload_type as #ryft::Operation>::prune_boundary(
+                        #receiver,
+                        input_count,
+                        used_outputs,
+                        regions,
+                    )?
+                    .map(|pruning| pruning.map_operation(|operation| Self::#variant_ident(#wrapped))),
+                ),
+            }
+        });
         let is_zero_arms = self.operation_forwarding_arms(quote!(is_zero), quote!(, output_index));
         let region_capture_input_count_arms =
             self.operation_forwarding_arms(quote!(region_capture_input_count), quote!(, region_index));
@@ -958,6 +996,18 @@ impl OperationEnum {
                     output_index: usize,
                 ) -> ::std::vec::Vec<#ryft::OutputRegionProvenance> {
                     match self { #(#output_region_provenance_arms)* }
+                }
+
+                fn prune_boundary(
+                    &self,
+                    input_count: usize,
+                    used_outputs: &[bool],
+                    regions: &mut dyn #ryft::RegionLiveness,
+                ) -> ::std::result::Result<
+                    ::std::option::Option<#ryft::OperationBoundaryPruning<Self>>,
+                    #ryft::ProgramError,
+                > {
+                    match self { #(#prune_boundary_arms)* }
                 }
 
                 fn is_zero(&self, output_index: usize) -> bool {
@@ -1940,6 +1990,92 @@ impl OperationEnum {
             }
         })
     }
+
+    /// Generates the [`OperationPayloadProjection`](ryft_core::OperationPayloadProjection) implementation. Projected
+    /// member variants delegate to their member family in both directions, lifting constructed member operations
+    /// through the enum's `From<Member>` conversion. Every other concrete variant projects into its payload when the
+    /// payload type is `'static` independently of the enum's generic parameters (refer to [`is_generic_independent`]),
+    /// and such composite-native variants are also constructed from their payloads, before any projected member is
+    /// tried. Mixed member variants are never constructed, and generic extension variants neither project nor are
+    /// constructed.
+    fn generate_payload_projection_impl(&self) -> TokenStream {
+        let ryft = &self.ryft_crate;
+        let enum_type = &self.self_type;
+        let mut generics = self.conversion_generics.clone();
+        let mut projection_arms = Vec::new();
+        let mut native_steps = Vec::new();
+        let mut member_steps = Vec::new();
+        for variant in self.variants.iter().filter(|variant| !variant.is_generic_extension) {
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            if variant.class.projected_member_type().is_some() {
+                generics
+                    .make_where_clause()
+                    .predicates
+                    .push(syn::parse_quote!(#payload_type: #ryft::OperationPayloadProjection));
+                projection_arms.push(quote! {
+                    Self::#variant_ident(operation) => {
+                        <#payload_type as #ryft::OperationPayloadProjection>::project_payload(#receiver, payload)
+                    }
+                });
+                member_steps.push(quote! {
+                    let payload = match <#payload_type as #ryft::OperationPayloadProjection>::from_payload(payload) {
+                        ::std::result::Result::Ok(operation) => {
+                            return ::std::result::Result::Ok(<Self as ::std::convert::From<#payload_type>>::from(
+                                operation,
+                            ));
+                        }
+                        ::std::result::Result::Err(payload) => payload,
+                    };
+                });
+            } else if is_generic_independent(payload_type, &self.conversion_generics) {
+                projection_arms.push(quote! {
+                    Self::#variant_ident(operation) if payload == ::std::any::TypeId::of::<#payload_type>() => {
+                        ::std::option::Option::Some(#receiver as &dyn ::std::any::Any)
+                    }
+                });
+                if matches!(variant.class, OperationVariantClass::CompositeNative) {
+                    let operation =
+                        if variant.is_boxed { quote!(::std::boxed::Box::new(operation)) } else { quote!(operation) };
+                    native_steps.push(quote! {
+                        let payload = match payload.downcast::<#payload_type>() {
+                            ::std::result::Result::Ok(operation) => {
+                                return ::std::result::Result::Ok(Self::#variant_ident(#operation));
+                            }
+                            ::std::result::Result::Err(payload) => payload,
+                        };
+                    });
+                }
+            }
+        }
+        let (impl_generics, _, where_clause) = generics.split_for_impl();
+        quote! {
+            #[automatically_derived]
+            impl #impl_generics #ryft::OperationPayloadProjection for #enum_type
+            #where_clause
+            {
+                #[allow(unreachable_patterns)]
+                fn project_payload(
+                    &self,
+                    payload: ::std::any::TypeId,
+                ) -> ::std::option::Option<&dyn ::std::any::Any> {
+                    match self {
+                        #(#projection_arms)*
+                        _ => ::std::option::Option::None,
+                    }
+                }
+
+                fn from_payload(
+                    payload: #ryft::ErasedOperation,
+                ) -> ::std::result::Result<Self, #ryft::ErasedOperation> {
+                    #(#native_steps)*
+                    #(#member_steps)*
+                    ::std::result::Result::Err(payload)
+                }
+            }
+        }
+    }
     /// Builds the generics for the generated [`InterpretableOperation`] dispatcher: the enum generics with
     /// program-shaped value substitutions applied, one generated `__Context` parameter, the context's [`Domain`]
     /// equalities, the constant-lifting `Constant` context bound, and one `InterpretableOperation` predicate per
@@ -2269,6 +2405,22 @@ fn type_mentions_ident(ty: &syn::Type, ident: &syn::Ident) -> bool {
         syn::Type::Tuple(ty) => ty.elems.iter().any(|ty| type_mentions_ident(ty, ident)),
         _ => false,
     }
+}
+
+/// Returns whether `ty` is `'static` independently of `generics`, which holds when `ty` mentions none of the generic
+/// type parameters and no lifetime. This check is syntactic and therefore conservative: every identifier that matches a
+/// type parameter counts as a mention, and so does every lifetime (including `'static`).
+fn is_generic_independent(ty: &syn::Type, generics: &syn::Generics) -> bool {
+    fn mentions(tokens: TokenStream, parameters: &[&syn::Ident]) -> bool {
+        tokens.into_iter().any(|token| match token {
+            proc_macro2::TokenTree::Group(group) => mentions(group.stream(), parameters),
+            proc_macro2::TokenTree::Ident(ident) => parameters.contains(&&ident),
+            proc_macro2::TokenTree::Punct(punct) => punct.as_char() == '\'',
+            proc_macro2::TokenTree::Literal(_) => false,
+        })
+    }
+    let parameters = generics.type_params().map(|parameter| &parameter.ident).collect::<Vec<_>>();
+    !mentions(ty.to_token_stream(), &parameters)
 }
 
 /// Substitutes bare type identifiers in `ty` according to the provided substitutions, returning the substituted
@@ -2958,6 +3110,29 @@ mod tests {
         assert!(parser.normalize_input(&input).is_none());
         assert_eq!(parser.errors.len(), 1);
         assert_eq!(parser.errors[0].to_string(), "operation family declares member type 'DataType' more than once");
+
+        let mut input: syn::DeriveInput = syn::parse_quote! {
+            enum DuplicatePayloadOperation<V: Value<Type = DataType>> {
+                First(FirstOperation),
+                Second(Box<FirstOperation>),
+                Third(GenericOperation<V>),
+                Fourth(GenericOperation<V>),
+                #[ryft(mixed(DataType))]
+                Fifth(FirstOperation),
+                Extension(V),
+                Other(V),
+            }
+        };
+        replace_self_type(&mut input);
+
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        assert!(parser.normalize_input(&input).is_none());
+        assert_eq!(parser.errors.len(), 1);
+        assert_eq!(
+            parser.errors[0].to_string(),
+            "operation family holds constructible payload type 'FirstOperation' in more than one variant",
+        );
     }
 
     #[test]
@@ -3181,6 +3356,95 @@ mod tests {
         assert!(!generated.contains("ryft::ZeroOperation<DimensionType>"));
     }
 
+    /// Returns the derive input of the payload projection test. It covers a projected member declared before the
+    /// variants that construction tries first, a mixed member, a direct and a boxed generic-independent payload, a
+    /// payload that mentions a generic parameter, and a generic extension.
+    fn payload_operation_enum() -> OperationEnum {
+        let mut input: syn::DeriveInput = syn::parse_quote! {
+            #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
+            enum PayloadOperation<A: Value<Type = ArrayType>, Extension> {
+                #[ryft(projected(ArrayType))]
+                Array(ArrayOperation<A>),
+                #[ryft(mixed(ArrayType))]
+                Collective(AllGatherOperation),
+                Dot(DotOperation),
+                Tag(Box<TagOperation<ArrayIrType>>),
+                Scan(ScanOperation<A>),
+                Extension(Extension),
+            }
+        };
+        replace_self_type(&mut input);
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        parser.normalize_input(&input).expect("failed to normalize payload operation enum")
+    }
+
+    #[test]
+    fn test_operation_generate_payload_projection_impl() {
+        // Mixed payloads project like native ones but are never constructed, native payloads are constructed before the
+        // projected member even though the member is declared first, and the generic-dependent payload and the generic
+        // extension neither project nor are constructed.
+        let generated: syn::ItemImpl =
+            syn::parse2(payload_operation_enum().generate_payload_projection_impl()).unwrap();
+        let expected: syn::ItemImpl = syn::parse_quote! {
+            #[automatically_derived]
+            impl<A: Value<Type = ArrayType>, Extension> ryft::OperationPayloadProjection
+                for PayloadOperation<A, Extension>
+            where
+                ArrayOperation<A>: ryft::OperationPayloadProjection
+            {
+                #[allow(unreachable_patterns)]
+                fn project_payload(
+                    &self,
+                    payload: ::std::any::TypeId,
+                ) -> ::std::option::Option<&dyn ::std::any::Any> {
+                    match self {
+                        Self::Array(operation) => {
+                            <ArrayOperation<A> as ryft::OperationPayloadProjection>::project_payload(operation, payload)
+                        }
+                        Self::Collective(operation) if payload == ::std::any::TypeId::of::<AllGatherOperation>() => {
+                            ::std::option::Option::Some(operation as &dyn ::std::any::Any)
+                        }
+                        Self::Dot(operation) if payload == ::std::any::TypeId::of::<DotOperation>() => {
+                            ::std::option::Option::Some(operation as &dyn ::std::any::Any)
+                        }
+                        Self::Tag(operation) if payload == ::std::any::TypeId::of::<TagOperation<ArrayIrType>>() => {
+                            ::std::option::Option::Some(&**operation as &dyn ::std::any::Any)
+                        }
+                        _ => ::std::option::Option::None,
+                    }
+                }
+
+                fn from_payload(
+                    payload: ryft::ErasedOperation,
+                ) -> ::std::result::Result<Self, ryft::ErasedOperation> {
+                    let payload = match payload.downcast::<DotOperation>() {
+                        ::std::result::Result::Ok(operation) => {
+                            return ::std::result::Result::Ok(Self::Dot(operation));
+                        }
+                        ::std::result::Result::Err(payload) => payload,
+                    };
+                    let payload = match payload.downcast::<TagOperation<ArrayIrType>>() {
+                        ::std::result::Result::Ok(operation) => {
+                            return ::std::result::Result::Ok(Self::Tag(::std::boxed::Box::new(operation)));
+                        }
+                        ::std::result::Result::Err(payload) => payload,
+                    };
+                    let payload = match <ArrayOperation<A> as ryft::OperationPayloadProjection>::from_payload(payload) {
+                        ::std::result::Result::Ok(operation) => {
+                            return ::std::result::Result::Ok(<Self as ::std::convert::From<ArrayOperation<A>>>::from(
+                                operation,
+                            ));
+                        }
+                        ::std::result::Result::Err(payload) => payload,
+                    };
+                    ::std::result::Result::Err(payload)
+                }
+            }
+        };
+        assert_eq!(generated.to_token_stream().to_string(), expected.to_token_stream().to_string());
+    }
+
     #[test]
     fn test_boxed_inner_type() {
         let inner = boxed_inner_type(&syn::parse_quote!(Box<CustomJvpOperation<T, V>>)).unwrap();
@@ -3198,6 +3462,18 @@ mod tests {
         assert!(is_bare_generic_parameter(&syn::parse_quote!(Extension), &input.generics));
         assert!(!is_bare_generic_parameter(&syn::parse_quote!(Box<Extension>), &input.generics));
         assert!(!is_bare_generic_parameter(&syn::parse_quote!(Other), &input.generics));
+    }
+
+    #[test]
+    fn test_is_generic_independent() {
+        let generics: syn::Generics = syn::parse_quote!(<'a, V: Value, const N: usize>);
+        assert!(is_generic_independent(&syn::parse_quote!(DotOperation), &generics));
+        assert!(is_generic_independent(&syn::parse_quote!(TagOperation<ArrayType>), &generics));
+        assert!(is_generic_independent(&syn::parse_quote!(FixedOperation<N>), &generics));
+        assert!(!is_generic_independent(&syn::parse_quote!(ScanOperation<V>), &generics));
+        assert!(!is_generic_independent(&syn::parse_quote!(Box<[(u8, fn(V))]>), &generics));
+        assert!(!is_generic_independent(&syn::parse_quote!(BorrowedOperation<'a>), &generics));
+        assert!(!is_generic_independent(&syn::parse_quote!(&'static str), &generics));
     }
 
     #[test]

@@ -98,6 +98,21 @@ struct OutputRegionProvenance {
     output_index: usize,
 }
 
+/// Stand-in for `ryft_core::RegionLiveness`.
+trait RegionLiveness {}
+
+/// Stand-in for `ryft_core::OperationBoundaryPruning`.
+struct OperationBoundaryPruning<O> {
+    operation: O,
+}
+
+impl<O> OperationBoundaryPruning<O> {
+    /// Stand-in for `ryft_core::OperationBoundaryPruning::map_operation`.
+    fn map_operation<P>(self, function: impl FnOnce(O) -> P) -> OperationBoundaryPruning<P> {
+        OperationBoundaryPruning { operation: function(self.operation) }
+    }
+}
+
 /// Stand-in for `ryft_core::RegionDriver`.
 trait RegionDriver<V: Value, O: Operation<Type = V::Type>> {
     fn region_count(&self) -> usize {
@@ -314,6 +329,15 @@ trait Operation: Clone {
         Vec::new()
     }
 
+    fn prune_boundary(
+        &self,
+        _input_count: usize,
+        _used_outputs: &[bool],
+        _regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        Ok(None)
+    }
+
     fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
         let _ = region_index;
         None
@@ -362,6 +386,36 @@ enum ReferenceAccessMode {
 /// Stand-in for `ryft_core::OperationProjection`.
 trait OperationProjection<T: Type>: Operation + From<Self::Projected> {
     type Projected: Operation<Type = T>;
+}
+
+/// Stand-in for `ryft_core::OperationPayloadProjection`.
+trait OperationPayloadProjection {
+    fn project_payload(&self, payload: std::any::TypeId) -> Option<&dyn std::any::Any>;
+
+    fn projected_payload<P: 'static>(&self) -> Option<&P>
+    where
+        Self: Sized,
+    {
+        self.project_payload(std::any::TypeId::of::<P>()).and_then(|payload| payload.downcast_ref::<P>())
+    }
+
+    fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation>
+    where
+        Self: Sized;
+}
+
+/// Stand-in for `ryft_core::ErasedOperation`.
+#[derive(Debug)]
+struct ErasedOperation(Box<dyn std::any::Any>);
+
+impl ErasedOperation {
+    fn new<P: 'static + Operation>(operation: P) -> Self {
+        Self(Box::new(operation))
+    }
+
+    fn downcast<P: 'static>(self) -> Result<P, Self> {
+        self.0.downcast::<P>().map(|operation| *operation).map_err(Self)
+    }
 }
 
 /// Stand-in for the associated operation contract emitted by the derive. These fixtures test generated bounds;
@@ -1151,6 +1205,15 @@ impl Operation for PrintOperation {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
 
+    fn prune_boundary(
+        &self,
+        _input_count: usize,
+        _used_outputs: &[bool],
+        _regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        Ok(Some(OperationBoundaryPruning { operation: Self }))
+    }
+
     fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
         (region_index == 0).then_some(2)
     }
@@ -1308,6 +1371,16 @@ impl<T: Type, Constant: Clone, C: Context<Type = T>> DifferentiableOperation<C> 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProjectedMemberOperation<const MEMBER: u8>;
 
+impl<const MEMBER: u8> OperationPayloadProjection for ProjectedMemberOperation<MEMBER> {
+    fn project_payload(&self, payload: std::any::TypeId) -> Option<&dyn std::any::Any> {
+        (payload == std::any::TypeId::of::<Self>()).then_some(self as &dyn std::any::Any)
+    }
+
+    fn from_payload(payload: ErasedOperation) -> Result<Self, ErasedOperation> {
+        payload.downcast()
+    }
+}
+
 impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
     type Type = ProjectedMemberType<MEMBER>;
 
@@ -1418,6 +1491,43 @@ fn test_operation_generates_projected_member_dispatch() {
     assert_eq!(
         <&ProjectedMemberOperation<2>>::try_from(&first),
         Err(TypeError::invalid("cannot project operation 'projected' into a 'ProjectedMemberOperation<2>' payload")),
+    );
+}
+
+#[test]
+fn test_operation_generates_payload_projection_and_construction() {
+    type Array = ArrayOperation<Factor>;
+    type Projected = ProjectedProgramOperation<ProjectedMemberValue<0>>;
+
+    // Generic-independent native payloads are projected and constructed directly, while payloads that mention a
+    // generic parameter and generic extension payloads are neither projected nor constructed.
+    let dot = Array::from(DotOperation);
+    let factor = Array::from(FactorOperation { factor: Factor(17), marker: PhantomData });
+    assert_eq!(dot.projected_payload::<DotOperation>(), Some(&DotOperation));
+    assert_eq!(dot.projected_payload::<ZeroOperation<ArrayType>>(), None);
+    assert_eq!(factor.projected_payload::<FactorOperation<ArrayType, Factor>>(), None);
+    assert_eq!(Array::from_payload(ErasedOperation::new(DotOperation)).unwrap(), dot);
+    assert_eq!(
+        Array::from_payload(ErasedOperation::new(ZeroOperation { r#type: ArrayType })).unwrap(),
+        Array::from(ZeroOperation { r#type: ArrayType }),
+    );
+    let payload =
+        ErasedOperation::new(FactorOperation::<ArrayType, Factor> { factor: Factor(17), marker: PhantomData });
+    assert!(Array::from_payload(payload).unwrap_err().downcast::<FactorOperation<ArrayType, Factor>>().is_ok());
+
+    // Projected members delegate to their member families in both directions, and a payload that no variant holds is
+    // returned unchanged.
+    let first = Projected::from(ProjectedMemberOperation::<0>);
+    let third = Projected::from(ProjectedMemberOperation::<2>);
+    assert_eq!(first.projected_payload::<ProjectedMemberOperation<0>>(), Some(&ProjectedMemberOperation));
+    assert_eq!(first.projected_payload::<ProjectedMemberOperation<2>>(), None);
+    assert_eq!(third.projected_payload::<ProjectedMemberOperation<2>>(), Some(&ProjectedMemberOperation));
+    assert_eq!(Projected::from_payload(ErasedOperation::new(ProjectedMemberOperation::<2>)).unwrap(), third);
+    assert!(
+        Projected::from_payload(ErasedOperation::new(DotOperation))
+            .unwrap_err()
+            .downcast::<DotOperation>()
+            .is_ok()
     );
 }
 
@@ -1551,6 +1661,13 @@ fn test_operation_generates_operation_forwarding() {
     assert_eq!(print.rename_type_identities(&TypeIdentityRenaming::new()), Ok(print.clone()));
     assert_eq!(print.infer_region_input_types(&[DataType], &[]), Ok(vec![Some(vec![DataType])]));
     assert_eq!(print.output_region_provenance(3), vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],);
+    struct NoRegionLiveness;
+    impl RegionLiveness for NoRegionLiveness {}
+    assert!(matches!(add.prune_boundary(2, &[true], &mut NoRegionLiveness), Ok(None)));
+    assert!(matches!(
+        print.prune_boundary(1, &[false], &mut NoRegionLiveness),
+        Ok(Some(OperationBoundaryPruning { operation: DataOperation::Print(PrintOperation) })),
+    ));
     assert_eq!(add.region_capture_input_count(0), None);
     assert_eq!(print.region_capture_input_count(0), Some(2));
     assert_eq!(print.region_capture_input_count(1), None);
@@ -3443,6 +3560,7 @@ fn test_errors() {
     test_cases.compile_fail("tests/operations/error_conflicting_variant_classes.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatch_attribute.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_dispatcher.rs");
+    test_cases.compile_fail("tests/operations/error_duplicate_payload_type.rs");
     test_cases.compile_fail("tests/operations/error_duplicate_variant_class.rs");
     test_cases.compile_fail("tests/operations/error_empty_dispatch.rs");
     test_cases.compile_fail("tests/operations/error_members_attribute.rs");
