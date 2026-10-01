@@ -2819,6 +2819,26 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         inputs: &[C::Value],
         primal_output_count: usize,
     ) -> Result<Vec<C::Value>, DifferentiationError> {
+        self.interpret_in_context_with(context, inputs, primal_output_count, |program, inputs| {
+            Ok(program.interpret_in_context(context.tangent(), inputs)?)
+        })
+    }
+
+    /// Interprets this partitioned fused Jacobian-Vector Product (JVP) program like
+    /// [`interpret_in_context`](Self::interpret_in_context), except that `interpret_residual_program` computes the
+    /// outputs of the residual program in [`DifferentiationContext::tangent`] from its inputs (e.g., by binding an
+    /// operation that wraps the residual program instead of interpreting it).
+    pub(crate) fn interpret_in_context_with<
+        C: Context<Type = V::Type, Constant = V, Operation = O>,
+        P: DifferentiationPolicy<C>,
+        InterpretFn: FnOnce(&Program<V, O, Vec<V>, Vec<V>>, Vec<C::Value>) -> Result<Vec<C::Value>, DifferentiationError>,
+    >(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        inputs: &[C::Value],
+        primal_output_count: usize,
+        interpret_residual_program: InterpretFn,
+    ) -> Result<Vec<C::Value>, DifferentiationError> {
         // Known inputs and unknown residual inputs together retain the original fused input boundary. Saved
         // residual values are not original inputs. Check this boundary before known work can execute effects.
         let input_count = self
@@ -2865,7 +2885,8 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
                 }
             })
             .collect::<Result<Vec<_>, DifferentiationError>>()?;
-        let residual_outputs = self.residual_program().interpret_in_context(context.tangent(), residual_inputs)?;
+        let residual_outputs = interpret_residual_program(self.residual_program(), residual_inputs)?;
+        check_count!("output", residual_outputs, self.residual_program().output_ids().len(), ProgramError);
 
         self.outputs()
             .iter()

@@ -78,7 +78,8 @@ impl<P> PolicyReferences<P> {
         Self { policy, references: Mutex::new(Vec::new()) }
     }
 
-    /// Returns the [`ResidualPolicyReference`] to the policy in the type universe `T`, which is registered on first use.
+    /// Returns the [`ResidualPolicyReference`] to the policy in the type universe `T`, which is registered on first
+    /// use.
     fn reference<T: 'static + Type>(&self) -> ResidualPolicyReference<T>
     where
         P: Clone + ResidualPolicy<T>,
@@ -359,7 +360,22 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-            PLACEHOLDER"},
+                lambda %0:f64[] .
+                let %1:f64[] = rematerialize %0 [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                ]
+                    %2:f64[] = rematerialize %1 [
+                        body={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                            in (%1)
+                        },
+                    ]
+                in (%2)"},
         );
         assert_eq!(operation(&program, 0), operation(&program, 1));
         assert_eq!(program.interpret(Array::scalar(0.5f64).unwrap()), Ok(Array::scalar(0.5f64.sin().sin()).unwrap()),);

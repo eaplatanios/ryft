@@ -6,8 +6,8 @@
 //! Every built-in policy recognizes the producers of a residual by their payload operations (refer to
 //! [`ResidualProducer::payload`]) rather than by their operation family, so the same policy works for every family,
 //! including composite and backend families that hold array operations through projected members. A residual that
-//! several producers may produce (e.g., the corresponding outputs of the two branches of a `condition`) matches a policy
-//! when any of its producers does.
+//! several producers may produce (e.g., the corresponding outputs of the two branches of a `condition`) matches a
+//! policy when any of its producers does.
 //!
 //! The built-in policies are generic over the type universe and declare their instantiations for the array universes
 //! [`ArrayType`] and [`ArrayIrType`] (refer to [`ResidualPolicy::native_instantiations`]), so that promoting a staged
