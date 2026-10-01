@@ -211,8 +211,8 @@ impl WhilePredicate for Array<'_> {
         if !self.data_type().is_boolean() || on_true.r#type() != on_false.r#type() {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "mask_select requires a Boolean prefix-shaped predicate and congruent operands, but got \
-                     predicate {} with operands {} and {}",
+                    "mask_select requires a Boolean prefix-shaped predicate and congruent inputs, but got \
+                     predicate {} with inputs {} and {}",
                     self.r#type().as_ref(),
                     on_true.r#type().as_ref(),
                     on_false.r#type().as_ref(),

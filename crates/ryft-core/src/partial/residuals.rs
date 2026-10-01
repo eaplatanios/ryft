@@ -1496,7 +1496,6 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
         Ok(Self::from_programs_and_metadata(new_known_program, new_residual_program, metadata))
     }
 
-    // TODO(eaplatanios): Review this function.
     /// Returns this partition with the residual edges that the known program also consumes itself rounded right after
     /// their producers by the operations that `rounding` returns for their types, so that the known work that consumes
     /// such a residual and the residual work that receives it observe the same value. Backends may compute inexact
@@ -1504,20 +1503,21 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     /// `--xla_allow_excess_precision` setting), and only the edge is materialized at its declared type, so without the
     /// rounding the known consumers of a residual and its residual consumers could observe different values (refer to
     /// [JAX PR #22244](https://github.com/jax-ml/jax/pull/22244), whose `remat_partial_eval` applies the same
-    /// rounding). An edge that a chain of store operations of a [`ResidualStorage`] produces (i.e., of operations for
-    /// which `is_storage` returns `true`) is rounded at the value that the chain stores, before it is stored, if the
-    /// known program also consumes that value elsewhere. Edges that only the residual program consumes, constant edges,
-    /// and edges whose types `rounding` returns no operation for are left unchanged. Each rounding operation is
-    /// constructed in the operation family of this partition through [`OperationPayloadProjection::from_payload`].
+    /// rounding for more information). An edge that a chain of store operations of a [`ResidualStorage`] produces
+    /// (i.e., of operations for which `is_storage` returns `true`) is rounded at the value that the chain stores,
+    /// before it is stored, if the known program also consumes that value elsewhere. Edges that only the residual
+    /// program consumes, constant edges, and edges whose types `rounding` returns no operation for are left unchanged.
+    /// Each rounding operation is constructed in the operation family of this partition through
+    /// [`OperationPayloadProjection::from_payload`].
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] when the operation family cannot hold a rounding operation or when rebuilding the
-    /// known program fails.
-    pub(crate) fn with_rounded_residuals(
+    /// Returns a [`ProgramError`] when the operation family cannot hold a rounding operation
+    /// or when rebuilding the known program fails.
+    pub(crate) fn with_rounded_residuals<R: Fn(&V::Type) -> Option<ErasedOperation>, S: Fn(&O) -> bool>(
         self,
-        rounding: impl Fn(&V::Type) -> Option<ErasedOperation>,
-        is_storage: impl Fn(&O) -> bool,
+        rounding: R,
+        is_storage: S,
     ) -> Result<Self, ProgramError> {
         let known_output_count = self.outputs().iter().filter(|output| output.is_known()).count();
         let (known_program, residual_program, metadata) = self.into_programs_and_metadata();
@@ -1585,6 +1585,7 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
             let copy = builder.add_input(known_program.atoms()[input.index()].r#type().into_owned());
             atoms[input.index()] = Some(round(&mut builder, *input, copy)?);
         }
+
         let mut remapping = HashMap::new();
         for instruction in known_program.instructions() {
             let inputs = instruction
@@ -1611,6 +1612,7 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                 atoms[source.index()] = Some(round(&mut builder, *source, output)?);
             }
         }
+
         let outputs = known_program
             .output_ids()
             .iter()

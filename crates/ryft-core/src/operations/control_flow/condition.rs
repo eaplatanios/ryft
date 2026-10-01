@@ -2032,10 +2032,8 @@ mod tests {
             Err(TypeError::invalid("expected 2 inputs but got 0".to_string())),
         );
         assert_eq!(
-            operation.infer_output_types(
-                &[branch_input_type.clone(), branch_input_type.clone()],
-                interfaces.as_slice(),
-            ),
+            operation
+                .infer_output_types(&[branch_input_type.clone(), branch_input_type.clone()], interfaces.as_slice()),
             Err(TypeError::invalid(
                 "condition predicate type must be a scalar boolean invariant over manual axes, but got f64[]"
                     .to_string()

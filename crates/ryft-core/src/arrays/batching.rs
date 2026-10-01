@@ -1083,7 +1083,7 @@ impl<V: Value<Type = ArrayIrType>> Display for ArrayIrBatch<V> {
 /// single semantic output `%2`, so the program returned by [`BatchedProgram::into_parts`] has one more input and output
 /// than that metadata describes. Consumers that instead need an ordinary [`Region`] boundary shed the widening through
 /// [`BatchingPolicy::adapt_batched_program`] and complete the adapted program's inputs with
-/// [`BatchingPolicy::boundary_operands`].
+/// [`BatchingPolicy::boundary_inputs`].
 pub struct ThreadedExtentBatchedProgram<V: Typed<Type = ArrayIrType> + Parameter, O> {
     /// Structurally transformed program, including its leading bookkeeping input and output.
     program: Program<V, O, Vec<V>, Vec<V>>,
@@ -2099,8 +2099,8 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
     }
 
     #[inline]
-    fn boundary_operands(axis_extent: &Self::Extent) -> Vec<C::Value> {
-        P::boundary_operands(axis_extent)
+    fn boundary_inputs(axis_extent: &Self::Extent) -> Vec<C::Value> {
+        P::boundary_inputs(axis_extent)
     }
 
     #[inline]
@@ -2383,7 +2383,7 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
     }
 
     #[inline]
-    fn boundary_operands(axis_extent: &Self::Extent) -> Vec<C::Value> {
+    fn boundary_inputs(axis_extent: &Self::Extent) -> Vec<C::Value> {
         // The adapted program's leading input still defines the `DimensionVariable` referenced by every inserted
         // dynamic batch dimension, so the first-class mapped extent value must become its matching program input.
         vec![axis_extent.clone()]
@@ -2513,7 +2513,7 @@ where
         // current parent context). Such a value is neither stable cache-key material nor something a retained region
         // artifact may capture. This function makes the required template/runtime split: the level carries only the
         // live extent's _type_, which becomes a fresh leading input/output of the transformed program, while each
-        // consumer supplies the current extent through `BatchingPolicy::boundary_operands` and removes the bookkeeping
+        // consumer supplies the current extent through `BatchingPolicy::boundary_inputs` and removes the bookkeeping
         // output through `BatchingPolicy::adapt_batched_program`. A future cache could therefore retain this widened,
         // context-neutral template. It would need its own marker and a complete normalized key containing the extent
         // type and identity contract, named-axis scope, sharding, input axes, and output policy. The live extent would
@@ -5706,10 +5706,7 @@ mod tests {
             ),
             Ok(()),
         );
-        assert_eq!(
-            <ArrayBatchingPolicy as BatchingPolicy<TestArrayContext>>::boundary_operands(&2),
-            Vec::<Array>::new()
-        );
+        assert_eq!(<ArrayBatchingPolicy as BatchingPolicy<TestArrayContext>>::boundary_inputs(&2), Vec::<Array>::new());
     }
 
     #[test]
@@ -6340,12 +6337,12 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_batching_policy_boundary_operands() {
+    fn test_array_ir_batching_policy_boundary_inputs() {
         // The adapted program's leading input still defines the dimension variable referenced by every inserted batch
         // dimension, so the first-class extent value becomes its matching program input.
         let extent = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
         assert_eq!(
-            <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrEagerContext>>::boundary_operands(&extent),
+            <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrEagerContext>>::boundary_inputs(&extent),
             vec![extent],
         );
     }

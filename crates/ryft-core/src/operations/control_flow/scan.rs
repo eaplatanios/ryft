@@ -1989,10 +1989,8 @@ where
             )));
         }
         let (carry_inputs, stacked_inputs) = inputs.split_at(carry_count);
-        let carries = carry_inputs
-            .iter()
-            .map(|input| context.boundary_allocation(input))
-            .collect::<Result<Vec<_>, _>>()?;
+        let carries =
+            carry_inputs.iter().map(|input| context.boundary_allocation(input)).collect::<Result<Vec<_>, _>>()?;
 
         let source_body = driver.region(0)?;
         let source_input_types = source_body.input_types();
@@ -3567,12 +3565,12 @@ where
 /// *scanned inputs* (known residual stacks) instead of capture payloads, so the rule reads them from the pullback and
 /// threads them back through as known scanned inputs of a transposed scan with the same scan-loop geometry.
 ///
-/// The scan's instruction inputs correspond to the body's inputs after its intrinsic index as `[carries...,
-/// scanned_inputs...]`. The reversed loop regenerates the index. Each instruction input is independently linear (a
-/// tangent the reverse accumulates) or known (a residual stack the pullback reads). The forward typically marks the
-/// carry-and-scanned tangents linear and the residual stacks known, but the linear inputs need not form a leading run:
-/// vmapping a bounded `while` threads a non-differentiable Boolean mask as a known *carry*, so a known input can sit
-/// among the linear carries. This rule therefore:
+/// The scan's instruction inputs correspond to the body's inputs after its intrinsic index as
+/// `[carries..., scanned_inputs...]`. The reversed loop regenerates the index. Each instruction input is independently
+/// linear (a tangent the reverse accumulates) or known (a residual stack the pullback reads). The forward typically
+/// marks the carry-and-scanned tangents linear and the residual stacks known, but the linear inputs need not form a
+/// leading run: vmapping a bounded `while` threads a non-differentiable Boolean mask as a known *carry*, so a known
+/// input can sit among the linear carries. This rule therefore:
 ///
 ///   1. Transposes the body through its instruction-scoped driver under each
 ///      input's own linearity. The transposed body maps every body output's cotangent followed by the cotangent
@@ -3602,23 +3600,22 @@ where
 ///
 ///   - `operation`: Primal scan staged into the tangent program.
 ///   - `context`: Active transpose tracing context the pullback is staged into.
-///   - `inputs`: Per-input [`PartialValue`] knowledge, ordered as `[carries..., scanned_inputs...]` and excluding
-///     the body's intrinsic index.
-///     A linear input is [`Unknown`](PartialValue::Unknown); a known input is
+///   - `inputs`: Per-input [`PartialValue`] knowledge, ordered as `[carries..., scanned_inputs...]` and excluding the
+///     body's intrinsic index. A linear input is [`Unknown`](PartialValue::Unknown); a known input is
 ///     [`Known`](PartialValue::Known) of the residual-stack tracer the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the scan's outputs.
 ///   - `cotangents`: Cotangent destinations of the inputs (refer to the documentation of
 ///     [`TranspositionContext::cotangent_destinations`]). A live (`Reference`-kind) reference carry is threaded through
-///     the reversed scan as a carry at its own position: the reversed body receives its
-///     cotangent reference as that carry's input and passes it back out by identity as that carry's output, so every
-///     reversed iteration accumulates into and reads from one shared cotangent reference. A live reference *stack*
-///     (a linear reference-typed scanned input whose body input is the whole root) is threaded as a scanned
-///     input of the reversed scan at its own position: its cotangent reference is the
-///     enclosing context's whole stacked cotangent reference. The reversed body selects the per-iteration cotangent
-///     view using its own index and accumulates into it in place, while the reversed scan has
-///     no output for it. A dead (`Ignore`-kind) reference input has no slot in the transposed body and is dropped
-///     from the reversed scan's inputs. A *known* reference stack is rejected, since a linear body that reads a
-///     primal reference is residualized whole by the partial-evaluation split and never reaches a tangent program.
+///     the reversed scan as a carry at its own position: the reversed body receives its cotangent reference as that
+///     carry's input and passes it back out by identity as that carry's output, so every reversed iteration accumulates
+///     into and reads from one shared cotangent reference. A live reference *stack* (a linear reference-typed scanned
+///     input whose body input is the whole root) is threaded as a scanned input of the reversed scan at its own
+///     position: its cotangent reference is the enclosing context's whole stacked cotangent reference. The reversed
+///     body selects the per-iteration cotangent view using its own index and accumulates into it in place, while the
+///     reversed scan has no output for it. A dead (`Ignore`-kind) reference input has no slot in the transposed body
+///     and is dropped from the reversed scan's inputs. A *known* reference stack is rejected, since a linear body that
+///     reads a primal reference is residualized whole by the partial-evaluation split and never reaches a tangent
+///     program.
 pub fn transpose_primal_scan<V, O, F, D: TranspositionDriver<V, O>>(
     operation: &ScanOperation<F>,
     context: &mut TracingContext<V, O>,
@@ -3781,7 +3778,11 @@ where
     }
     for (cotangent, output_type) in outputs[carry_count..].iter().zip(&body.output_types()[carry_count..]) {
         if !output_type.is_reference() && !output_type.cotangent()?.is_zero_space() {
-            reversed_inputs.push(O::materialize_zero_from_residual_sources(context, cotangent.clone(), dimension_sources())?);
+            reversed_inputs.push(O::materialize_zero_from_residual_sources(
+                context,
+                cotangent.clone(),
+                dimension_sources(),
+            )?);
         }
     }
 
@@ -4269,12 +4270,12 @@ mod tests {
             )),
         );
 
-        // A dynamic runtime-length operand must carry the scan length's nominal identity. An unrelated dynamic
-        // identity with compatible bounds cannot redefine the stacked axis. An operand whose bounds pin one exact
-        // extent fixes the trip count to that extent and is admissible only when every stacked operand is refined to
-        // the same extent; a stacked axis left symbolic would otherwise be read a fixed number of times regardless of
-        // its independently determined runtime size. The accepted refinement also types the stacked outputs at the
-        // concrete extent instead of at the still-symbolic declared length.
+        // A dynamic runtime-length input must carry the scan length's nominal identity. An unrelated dynamic identity
+        // with compatible bounds cannot redefine the stacked axis. A runtime length input whose bounds pin one exact
+        // extent fixes the trip count to that extent and is admissible only when every stacked input is refined to the
+        // same extent; a stacked axis left symbolic would otherwise be read a fixed number of times regardless of its
+        // independently determined runtime size. The accepted refinement also types the stacked outputs at the concrete
+        // extent instead of at the still-symbolic declared length.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
         let unrelated = DimensionVariable::new("unrelated", DimensionBounds::positive(Some(5)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
@@ -4289,7 +4290,7 @@ mod tests {
                 std::slice::from_ref(&body_interface),
             ),
             Err(TypeError::invalid(
-                "`scan` runtime length operand has type dimension<unrelated ∈ [1, 5)> but scan length requires length"
+                "`scan` runtime length input has type dimension<unrelated ∈ [1, 5)> but scan length requires length"
                     .to_string(),
             )),
         );
@@ -4299,7 +4300,7 @@ mod tests {
                 std::slice::from_ref(&body_interface),
             ),
             Err(TypeError::invalid(
-                "`scan` runtime length operand has type dimension<3> but stacked input 1 has type f32[length, extent] \
+                "`scan` runtime length input has type dimension<3> but stacked input 1 has type f32[length, extent] \
                  whose leading dimension is not refined to extent 3"
                     .to_string(),
             )),
@@ -4451,8 +4452,8 @@ mod tests {
             Ok(ArrayIrType::Array(stacked_type)),
         );
 
-        // A runtime length operand that pins one exact extent applies the same refinement rule to stacked references
-        // as to stacked arrays.
+        // A runtime length input that pins one exact extent applies the same refinement rule to stacked references as
+        // to stacked arrays.
         let dynamic_length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
         let three = DimensionType::new("three", DimensionBounds::new(3, Some(4)).unwrap());
         assert_eq!(
@@ -4477,7 +4478,7 @@ mod tests {
                 &Dimension::Dynamic(dynamic_length),
             ),
             Err(TypeError::invalid(
-                "`scan` runtime length operand has type dimension<4> but stacked input 0 has type ref<f32[length, 2]> \
+                "`scan` runtime length input has type dimension<4> but stacked input 0 has type ref<f32[length, 2]> \
                  whose leading dimension is not refined to extent 4"
                     .to_string(),
             )),
@@ -5038,7 +5039,7 @@ mod tests {
         ));
 
         // The body maps `[carry, x]` to `[carry + x, carry]`, so the scan produces a final carry and a stacked
-        // per-iteration output. Both halves are linear in the operands.
+        // per-iteration output. Both halves are linear in the inputs.
         let mut body_builder = ProgramBuilder::<CompositeValue, CompositeOperation>::new();
         let _index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(item_type.clone());
@@ -5079,9 +5080,9 @@ mod tests {
             )
             .unwrap();
 
-        // Transposing with respect to the carry initializer and the stacked operand reaches the dead stacked
-        // cotangent. The pullback reads the inner extent off the live carry cotangent, reuses the runtime length
-        // operand, and stages the mixed dynamic zero over both.
+        // Transposing with respect to the carry initializer and the stacked input reaches the dead stacked cotangent.
+        // The pullback reads the inner extent off the live carry cotangent, reuses the runtime length input, and stages
+        // the mixed dynamic zero over both.
         let pullback = program.transpose_with_respect_to(&[1, 2], &[]).unwrap();
         assert_eq!(
             pullback.to_string(),
@@ -5417,7 +5418,7 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "scan transpose received a known reference-typed scanned operand at position 1; \
+                if message == "scan transpose received a known reference-typed scanned input at position 1; \
                                reference stacks are linear or absent",
         ));
     }
@@ -5464,11 +5465,11 @@ mod tests {
         let stacked_type = ArrayType::new_static(DataType::F32, [3]);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
-        // A scan carries reference state in its leading carry prefix rather than after its declared operands. The body
-        // declares one ordinary carry, one reference carry, and one per-iteration slice of a stacked operand, and the
-        // rewrite keeps that split intact: the state joins the carry prefix on the parent operand list, on the body's
-        // input boundary, and on the body's output boundary, while the stacked operand and the stacked output stay
-        // behind the prefix on their own side.
+        // A scan carries reference state in its leading carry prefix rather than after its declared inputs. The body
+        // declares one ordinary carry, one reference carry, and one per-iteration slice of a stacked input, and the
+        // rewrite keeps that split intact: the state joins the carry prefix on the parent input list, on the body's
+        // input boundary, and on the body's output boundary, while the stacked input and the stacked output stay behind
+        // the prefix on their own side.
         let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let _index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
@@ -5782,9 +5783,9 @@ mod tests {
 
     #[test]
     fn test_scan_reference_discharge_appends_the_synthesized_carry_after_the_declared_carry_prefix() {
-        // A scan that already declares an ordinary carry pins the synthesized-state placement exactly: the state
-        // operand joins the carry prefix behind every declared carry and ahead of the trailing stacked inputs, on the
-        // parent operand list, the body boundary, and the rewritten carry count alike.
+        // A scan that already declares an ordinary carry pins the synthesized-state placement exactly: the state input
+        // joins the carry prefix behind every declared carry and ahead of the trailing stacked inputs, on the parent
+        // input list, the body boundary, and the rewritten carry count alike.
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let mut body_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
         let _index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
@@ -6232,10 +6233,10 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_reference_discharge_dynamic_length_accepts_the_trailing_runtime_length_operand() {
-        // A dynamic-length scan carries one runtime-length operand after the body's inputs, so the scan discharge
-        // rule's arity validation must accept the one-past-body parent arity instead of rejecting the canonical dynamic
-        // form.
+    fn test_scan_reference_discharge_dynamic_length_accepts_the_trailing_runtime_length_input() {
+        // A dynamic-length scan carries one runtime-length instruction input after the body's inputs, so the scan
+        // discharge rule's arity validation must accept the one-past-body parent arity instead of rejecting the
+        // canonical dynamic form.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(9)).unwrap());
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
         let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -6404,7 +6405,7 @@ mod tests {
     #[test]
     fn test_scan_reference_discharge_reads_stacked_reference_as_stacked_array() {
         // A stacked reference the body only reads through its per-iteration view becomes an ordinary stacked array
-        // operand carrying the allocation's state, and the scan gains no output for it: the frozen allocation is the
+        // input carrying the allocation's state, and the scan gains no output for it: the frozen allocation is the
         // unchanged state that entered the scan.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -6875,7 +6876,7 @@ mod tests {
     fn test_scan_reference_discharge_publishes_stacked_reference() {
         // The body reads the per-iteration view into a reference carry and writes the carry's new value back into the
         // view, so both the carry and the stacked allocation are mutated. The rewrite discharges the carry into the
-        // carry prefix as usual and the stacked reference into a stacked array operand plus one stacked output holding
+        // carry prefix as usual and the stacked reference into a stacked array input plus one stacked output holding
         // the view's final states, which is the allocation's successor state (a reversed scan pins that the stacked
         // output is indexed by the iteration's position rather than by iteration order).
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -6963,7 +6964,7 @@ mod tests {
         assert_eq!(discharged.program().interpret(inputs.clone()), Ok(expected.clone()));
 
         // Under partial discharge that preserves the stacked allocation, the scan keeps its reference-typed stacked
-        // operand and the body replays its accesses through the per-iteration view, while the discharged carry still
+        // input and the body replays its accesses through the per-iteration view, while the discharged carry still
         // joins the carry prefix as state.
         let targets = program.reference_discharge_targets(0).unwrap();
         assert_eq!(targets.len(), 2);
@@ -7131,8 +7132,8 @@ mod tests {
     fn test_scan_reference_discharge_rejects_aliased_stacked_reference() {
         // A per-iteration view is region-local state inside the rebuilt body, so every other handle of its allocation
         // reaching the body is rejected: a carry is a complete handle that always overlaps the view, another stacked
-        // operand of the same allocation selects the same indices on every iteration, and a capture is a complete
-        // handle the body reaches without any boundary position.
+        // input of the same allocation selects the same indices on every iteration, and a capture is a complete handle
+        // the body reaches without any boundary position.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let stacked_type = ArrayType::new_static(DataType::F32, [3]);
         let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -7225,7 +7226,7 @@ mod tests {
         ));
 
         // The capture-lifted body reads the complete stack through capture 0 while the scan also passes that same
-        // capture as its stacked reference operand.
+        // capture as its stacked reference input.
         type Capture = CaptureReference<ArrayIrType>;
         type CaptureOperation = ArrayIrOperation<CaptureReference<ArrayType>>;
         let stack_reference_type = ReferenceType::new(stacked_type.clone());
@@ -7269,7 +7270,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_stacked_reference_operand() {
+    fn test_scan_stacked_reference_input() {
         // The body accumulates the carry into the per-iteration slice of the stacked reference and then folds the
         // updated slice back into the carry, so both the carry and the referent depend on the order of iteration.
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -7359,9 +7360,9 @@ mod tests {
         );
 
         // Forward mode needs no scan-specific rule for stacked references: the tangent allocation of the stack is an
-        // active stacked reference operand of the fused scan, whose body creates per-iteration views of both the
-        // primal and the tangent stack using the body's index. The function is linear in `(carry, elements)`,
-        // so the tangent outputs are the function applied to the tangent inputs.
+        // active stacked reference input of the fused scan, whose body creates per-iteration views of both the primal
+        // and the tangent stack using the body's index. The function is linear in `(carry, elements)`, so the tangent
+        // outputs are the function applied to the tangent inputs.
         let jvp = program.jvp().unwrap();
         assert_eq!(
             jvp.to_string(),
@@ -7400,9 +7401,9 @@ mod tests {
             ]),
         );
 
-        // Transposition and batching of stacked reference operands are covered by
+        // Transposition and batching of stacked reference inputs are covered by
         // `test_scan_transpose_threads_reference_stack_cotangents` and `test_scan_batching_threads_reference_stacks`.
-        // Discharge rewrites the stacked reference into a stacked array operand carrying the allocation's state and,
+        // Discharge rewrites the stacked reference into a stacked array input carrying the allocation's state and,
         // because the body mutates the per-iteration view, one stacked output holding the view's final states, which
         // becomes the allocation's successor state; refer to
         // `test_scan_reference_discharge_publishes_stacked_reference` for the boundary itself.
@@ -7435,9 +7436,9 @@ mod tests {
     }
 
     /// A dead *stacked* output's cotangent has the scan-length-prefixed type `f64[length, k]`, which no single value at
-    /// the transpose boundary carries: the length rides the runtime length operand and the inner extent rides the
+    /// the transpose boundary carries: the length rides the runtime length input and the inner extent rides the
     /// per-iteration carry cotangent. Identity-directed materialization assembles the zero from both, so the reversed
-    /// scan gets a well-typed operand instead of failing on an unconstructible nullary zero.
+    /// scan gets a well-typed input instead of failing on an unconstructible nullary zero.
     #[test]
     fn test_scan_batching_infers_zero_length_mapped_and_replicated_outputs_eagerly() {
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
@@ -7596,7 +7597,7 @@ mod tests {
     }
 
     /// A reference stack that the scan only stores into, and that nothing reads afterwards, has a provably zero state
-    /// cotangent: the scan operand takes the `Ignore` kind, the reversed scan drops the stack and its body's store, and
+    /// cotangent: the scan input takes the `Ignore` kind, the reversed scan drops the stack and its body's store, and
     /// the elements receive a structural zero cotangent.
     #[test]
     fn test_scan_partial_evaluation_preserves_order_between_known_and_unknown_effects() {
@@ -7887,9 +7888,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_partial_evaluation_forwards_known_stacked_operands() {
+    fn test_scan_partial_evaluation_forwards_known_stacked_inputs() {
         // Body `[a, k, x] -> [a * x, k + x]` over an unknown carry `a`, a known carry `k`, and known stacked `xs`. The
-        // unknown side consumes the known slices `x` directly, so the residual scan takes the original `xs` operand
+        // unknown side consumes the known slices `x` directly, so the residual scan takes the original `xs` input
         // instead of a copy that the known scan stacks again, while the known scan still carries `k`.
         let scalar = ArrayType::scalar(DataType::F64);
         let body = {
@@ -8321,7 +8322,7 @@ mod tests {
 
     #[test]
     fn test_scan_batching_threads_batched_carries_and_inputs() {
-        // Batching both operands pairs batch item `i` of the carries with batch item `i` of the stacked inputs.
+        // Batching every input pairs batch item `i` of the carries with batch item `i` of the stacked inputs.
         let (scan, scan_body) = product_scan();
         let context = BatchingContext::new(TestEagerContext::new(), 2);
         let carries = {

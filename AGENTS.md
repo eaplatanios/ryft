@@ -370,9 +370,11 @@ update this file so that they do not need to remind you again in the future.
   readability-driven sentence breaks.
 - In documentation strings, use "function" for callable APIs, including methods, rather than distinguishing methods
   from free functions in prose.
-- In `ryft-core` program, partial-evaluation, and residual-planning code, call the values that an instruction consumes
-  its "inputs", following `Instruction::inputs` and `InputRegionProvenance::Input`, rather than "operands" (in names,
-  comments, and diagnostics). Write "region input" (or "instruction input") wherever both kinds appear nearby.
+- In `ryft-core`, call the values that an operation or instruction consumes its "inputs" (e.g., in names, comments,
+  diagnostics, and tests), following `Instruction::inputs`, `Operation::infer_output_types(.., input_types)`, and
+  `InputRegionProvenance::Input`, rather than "operands". Write "region input", "instruction input", or "program
+  input" wherever more than one kind appears nearby. Keep "operand" only where it mirrors an external specification
+  (e.g., StableHLO gather/scatter and collective argument names, XLA custom-call operands, and MLIR in `ryft-xla`).
 
 ## Testing Guidelines
 

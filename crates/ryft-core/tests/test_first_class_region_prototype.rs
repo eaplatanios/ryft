@@ -526,7 +526,7 @@ mod model {
 
     impl<C: Context<Value = f64>> InterpretableOperation<C> for Cond {
         fn interpret<D: InterpretationDriver<C>>(&self, _context: &C, driver: &D, inputs: &[f64]) -> R<Vec<f64>> {
-            // Predicate first, branch operands after; nonzero selects the `true` region.
+            // Predicate first, branch inputs after; nonzero selects the `true` region.
             let index = if inputs[0] != 0.0 { 0 } else { 1 };
             driver.interpret_region(index, inputs[1..].to_vec())
         }
@@ -585,13 +585,13 @@ mod model {
                 }
             }
             for instruction in &region_data.instructions {
-                let operands = instruction
+                let input_values = instruction
                     .inputs
                     .iter()
-                    .map(|input| values[*input].clone().ok_or_else(|| "unbound operand".to_string()))
+                    .map(|input| values[*input].clone().ok_or_else(|| "unbound input".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayInterpret { program: self, instruction, context, lift };
-                let outputs = instruction.operation.interpret(context, &replay, &operands)?;
+                let outputs = instruction.operation.interpret(context, &replay, &input_values)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -644,8 +644,12 @@ mod model {
             inputs: &[PartialValue<C::Value>],
         ) -> R<Vec<PartialValue<C::Value>>> {
             if inputs.iter().all(|input| input.known().is_some()) {
-                let operands = inputs.iter().map(|input| input.known().unwrap().clone()).collect::<Vec<_>>();
-                Ok(context.bind(Op::Prim(*self), &[], &[], &operands)?.into_iter().map(PartialValue::Known).collect())
+                let known_inputs = inputs.iter().map(|input| input.known().unwrap().clone()).collect::<Vec<_>>();
+                Ok(context
+                    .bind(Op::Prim(*self), &[], &[], &known_inputs)?
+                    .into_iter()
+                    .map(PartialValue::Known)
+                    .collect())
             } else {
                 Ok(vec![PartialValue::Unknown; self.output_count()])
             }
@@ -739,13 +743,13 @@ mod model {
                 }
             }
             for instruction in &region_data.instructions {
-                let operands = instruction
+                let input_values = instruction
                     .inputs
                     .iter()
-                    .map(|input| values[*input].clone().ok_or_else(|| "unbound operand".to_string()))
+                    .map(|input| values[*input].clone().ok_or_else(|| "unbound input".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayPartial { program: self, instruction, context, lift };
-                let outputs = instruction.operation.partially_evaluate(context, &replay, &operands)?;
+                let outputs = instruction.operation.partially_evaluate(context, &replay, &input_values)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -820,8 +824,8 @@ mod model {
             inputs: &[PartialValue<P::Value>],
         ) -> R<Vec<PartialValue<P::Value>>> {
             if inputs.iter().all(|input| input.known().is_some()) {
-                let operands = inputs.iter().map(|input| input.known().unwrap().clone()).collect::<Vec<_>>();
-                let outputs = self.parent.bind(operation, regions, callees, &operands)?;
+                let known_inputs = inputs.iter().map(|input| input.known().unwrap().clone()).collect::<Vec<_>>();
+                let outputs = self.parent.bind(operation, regions, callees, &known_inputs)?;
                 Ok(outputs.into_iter().map(PartialValue::Known).collect())
             } else {
                 Ok(vec![PartialValue::Unknown; operation.output_count()])
@@ -945,13 +949,13 @@ mod model {
                 }
             }
             for instruction in &region_data.instructions {
-                let operands = instruction
+                let input_values = instruction
                     .inputs
                     .iter()
-                    .map(|input| values[*input].ok_or_else(|| "unbound operand".to_string()))
+                    .map(|input| values[*input].ok_or_else(|| "unbound input".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayBatch { program: self, instruction };
-                let outputs = instruction.operation.batch(context, &replay, &operands)?;
+                let outputs = instruction.operation.batch(context, &replay, &input_values)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -1030,7 +1034,7 @@ mod model {
             inputs: &[Dual<C::Value>],
         ) -> R<Vec<Dual<C::Value>>> {
             // Semantics stub: production emits one primal condition and one tangent condition over the jvp'd
-            // branches with proper operand wiring. The solver-relevant parts are the driver-based region re-entry and
+            // branches with proper input wiring. The solver-relevant parts are the driver-based region re-entry and
             // attachment-aware emission with no bound on the operation enum.
             let true_region = driver.jvp_program(driver.region(0)?)?;
             let false_region = driver.jvp_program(driver.region(1)?)?;
@@ -1136,13 +1140,13 @@ mod model {
                 }
             }
             for instruction in &region_data.instructions {
-                let operands = instruction
+                let input_values = instruction
                     .inputs
                     .iter()
-                    .map(|input| values[*input].clone().ok_or_else(|| "unbound operand".to_string()))
+                    .map(|input| values[*input].clone().ok_or_else(|| "unbound input".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayJvp { program: self, instruction };
-                let outputs = instruction.operation.jvp(context, &replay, &operands)?;
+                let outputs = instruction.operation.jvp(context, &replay, &input_values)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -1196,13 +1200,13 @@ mod model {
                 }
             }
             for instruction in &region_data.instructions {
-                let operands = instruction
+                let input_values = instruction
                     .inputs
                     .iter()
-                    .map(|input| values[*input].clone().ok_or_else(|| "unbound operand".to_string()))
+                    .map(|input| values[*input].clone().ok_or_else(|| "unbound input".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayLinearize { program: self, instruction };
-                let outputs = instruction.operation.jvp(context, &replay, &operands)?;
+                let outputs = instruction.operation.jvp(context, &replay, &input_values)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }
@@ -1307,13 +1311,13 @@ mod model {
                 }
             }
             for instruction in &entry.instructions {
-                let operands = instruction
+                let input_values = instruction
                     .inputs
                     .iter()
-                    .map(|input| values[*input].ok_or_else(|| "unbound operand".to_string()))
+                    .map(|input| values[*input].ok_or_else(|| "unbound input".to_string()))
                     .collect::<R<Vec<_>>>()?;
                 let replay = ReplayTranspose { program: self, instruction };
-                let outputs = instruction.operation.transpose(&mut context, &replay, &operands)?;
+                let outputs = instruction.operation.transpose(&mut context, &replay, &input_values)?;
                 for (output, value) in instruction.outputs.iter().zip(outputs) {
                     values[*output] = Some(value);
                 }

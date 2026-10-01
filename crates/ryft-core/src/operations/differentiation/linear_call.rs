@@ -192,7 +192,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ///
     /// The batching policy owns the boundary shape of its structurally batched programs.
     /// [`BatchingPolicy::adapt_batched_program`] adapts each batched region to the plain two-region linear-call
-    /// boundary, and any [`BatchingPolicy::boundary_operands`] (e.g., a composite program's first-class mapped extent)
+    /// boundary, and any [`BatchingPolicy::boundary_inputs`] (e.g., a composite program's first-class mapped extent)
     /// become additional leading residuals of the batched call.
     ///
     /// # Parameters
@@ -282,7 +282,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         // results are plain values that cannot carry batch metadata, so each output carrier is restored through the
         // driver from the source region's per-item logical output type and the input carriers; wrapping them as bare
         // `P::batch` carriers would present bound padding as live data.
-        let mut packed_inputs = P::boundary_operands(context.axis_extent());
+        let mut packed_inputs = P::boundary_inputs(context.axis_extent());
         let boundary_input_count = packed_inputs.len();
         packed_inputs.extend(input_values);
         let forward_input_types = packed_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();

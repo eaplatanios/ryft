@@ -869,7 +869,7 @@ where
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let primal_region = driver.region(0)?;
-        let boundary_inputs = P::boundary_operands(context.axis_extent());
+        let boundary_inputs = P::boundary_inputs(context.axis_extent());
         let (operation, regions, output_axes) = match &self.rules {
             CustomFunctionRules::Attached { .. } => {
                 // Batch every attached region contract while retaining the call and its rules:
@@ -2099,7 +2099,7 @@ where
             output_axes.as_slice(),
         )?;
 
-        let boundary_inputs = P::boundary_operands(context.axis_extent());
+        let boundary_inputs = P::boundary_inputs(context.axis_extent());
         let mut batching = batching.clone().unwrap_or_else(|| CustomRuleBatching {
             input_types: inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect(),
             output_types: self.output_tangent_types.clone(),

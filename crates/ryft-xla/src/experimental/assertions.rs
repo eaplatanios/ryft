@@ -668,16 +668,16 @@ fn validate_arithmetic(kind: &str, left_name: &str, left: i64, right_name: &str,
     }
     Err(match kind {
         ASSERT_ADD_KIND => format!(
-            "dimension arithmetic overflow while adding dimensions with operands {left_name}={left}, \
+            "dimension arithmetic overflow while adding dimensions with inputs {left_name}={left}, \
              {right_name}={right}",
         ),
         ASSERT_SUB_KIND => format!("{left_name} >= {right_name}; observed {left_name}={left}, {right_name}={right}"),
         ASSERT_MUL_KIND => format!(
-            "dimension arithmetic overflow while multiplying dimensions with operands {left_name}={left}, \
+            "dimension arithmetic overflow while multiplying dimensions with inputs {left_name}={left}, \
              {right_name}={right}",
         ),
         ASSERT_POW_KIND => format!(
-            "dimension arithmetic overflow while raising a dimension to a dimension power with operands \
+            "dimension arithmetic overflow while raising a dimension to a dimension power with inputs \
              {left_name}={left}, {right_name}={right}",
         ),
         ASSERT_DIV_KIND | ASSERT_REM_KIND => {
@@ -1005,7 +1005,7 @@ mod tests {
     #[test]
     fn test_validate_arithmetic_matches_eager_checked_diagnostics() {
         // The host callback recomputes each checked predicate, so its wording must match the eager path exactly for
-        // the same named operands; these pairs fail on both paths and must render identically.
+        // the same named inputs; these pairs fail on both paths and must render identically.
         let compiled = |kind, left, right| validate_arithmetic(kind, "left", left, "right", right).unwrap_err();
         assert_eq!(
             compiled(ASSERT_SUB_KIND, 2, 5),
@@ -1030,11 +1030,11 @@ mod tests {
         // template instead of a reproduced eager error.
         assert_eq!(
             compiled(ASSERT_ADD_KIND, i64::MAX - 1, 2),
-            "dimension arithmetic overflow while adding dimensions with operands left=9223372036854775806, right=2",
+            "dimension arithmetic overflow while adding dimensions with inputs left=9223372036854775806, right=2",
         );
         assert_eq!(
             compiled(ASSERT_MUL_KIND, i64::MAX / 2, 3),
-            "dimension arithmetic overflow while multiplying dimensions with operands left=4611686018427387903, \
+            "dimension arithmetic overflow while multiplying dimensions with inputs left=4611686018427387903, \
              right=3",
         );
     }
@@ -1050,7 +1050,7 @@ mod tests {
 
         assert_eq!(
             validate_arithmetic(ASSERT_ADD_KIND, "left", i64::MAX, "right", 1),
-            Err("dimension arithmetic overflow while adding dimensions with operands left=9223372036854775807, \
+            Err("dimension arithmetic overflow while adding dimensions with inputs left=9223372036854775807, \
                  right=1"
                 .to_string(),),
         );
@@ -1060,13 +1060,13 @@ mod tests {
         );
         assert_eq!(
             validate_arithmetic(ASSERT_MUL_KIND, "left", i64::MAX, "right", 2),
-            Err("dimension arithmetic overflow while multiplying dimensions with operands left=9223372036854775807, \
+            Err("dimension arithmetic overflow while multiplying dimensions with inputs left=9223372036854775807, \
                  right=2"
                 .to_string(),),
         );
         assert_eq!(
             validate_arithmetic(ASSERT_POW_KIND, "left", i64::MAX, "right", 2),
-            Err("dimension arithmetic overflow while raising a dimension to a dimension power with operands \
+            Err("dimension arithmetic overflow while raising a dimension to a dimension power with inputs \
                  left=9223372036854775807, right=2"
                 .to_string(),),
         );

@@ -415,7 +415,7 @@ pub struct CustomRuleBatchingLevel<T> {
     pub(super) level: BatchingLevel<T>,
 
     /// Number of policy boundary inputs (e.g., a first-class batch extent) that batching at this level prepended to the
-    /// operation's inputs (refer to the documentation of [`BatchingPolicy::boundary_operands`]).
+    /// operation's inputs (refer to the documentation of [`BatchingPolicy::boundary_inputs`]).
     pub(super) boundary_input_count: usize,
 
     /// Batch axes of the operation's inputs at this level, excluding the boundary inputs prepended at this level.

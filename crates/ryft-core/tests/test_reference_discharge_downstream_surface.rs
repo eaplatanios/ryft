@@ -683,7 +683,7 @@ impl Operation for RegisterOperation {
     ) -> Result<Vec<RegisterIrType>, TypeError> {
         let referent = || match input_types.first() {
             Some(RegisterIrType::Reference(reference)) => Ok(reference.referent().clone()),
-            _ => Err(TypeError::invalid(format!("`{}` expects a reference operand", self.name()))),
+            _ => Err(TypeError::invalid(format!("`{}` expects a reference input", self.name()))),
         };
         match self {
             Self::Negate => {
@@ -882,8 +882,8 @@ where
                         self.name(),
                     )));
                 }
-                let operand_allocations = declared.iter().copied().flatten().collect::<BTreeSet<_>>();
-                let widening = context.boundary_widening(&summary, &operand_allocations)?;
+                let input_allocations = declared.iter().copied().flatten().collect::<BTreeSet<_>>();
+                let widening = context.boundary_widening(&summary, &input_allocations)?;
                 let entering = widening.entering().to_vec();
                 let source_output_count = region.output_ids().len();
 
@@ -905,14 +905,15 @@ where
                 result.validate_predicted_mutations(widening.published(), self.name())?;
                 result.validate_predicted_output_allocations(summary.output_allocations(), self.name())?;
 
-                let mut operands = Vec::with_capacity(inputs.len() + entering.len());
+                let mut boundary_values = Vec::with_capacity(inputs.len() + entering.len());
                 for input in inputs {
-                    operands.push(context.boundary_value(input)?);
+                    boundary_values.push(context.boundary_value(input)?);
                 }
                 for allocation in &entering {
-                    operands.push(context.discharged_state(*allocation)?);
+                    boundary_values.push(context.discharged_state(*allocation)?);
                 }
-                let outputs = context.parent().bind(self.clone(), vec![result.into_program()], operands.as_slice())?;
+                let outputs =
+                    context.parent().bind(self.clone(), vec![result.into_program()], boundary_values.as_slice())?;
                 check_count!("output", outputs, source_output_count + widening.published().len(), ProgramError);
 
                 let mut results = Vec::with_capacity(source_output_count);

@@ -2342,9 +2342,11 @@ where
     }
     let fused_regions = [Arc::new(fused_condition), fused_body];
     let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
-        context
-            .primal()
-            .bind(C::Operation::from(fused_while), CalleeRegionDriver::new(&fused_regions), &fused_inputs)?
+        context.primal().bind(
+            C::Operation::from(fused_while),
+            CalleeRegionDriver::new(&fused_regions),
+            &fused_inputs,
+        )?
     } else {
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
         let arguments =

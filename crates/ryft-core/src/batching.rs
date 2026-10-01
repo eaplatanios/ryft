@@ -339,7 +339,7 @@ pub enum BatchingLevelExtent<T> {
     Static(usize),
 
     /// First-class extent value of the provided type. Its runtime value is not part of the level and is instead
-    /// supplied as a leading boundary input. Refer to the documentation of [`BatchingPolicy::boundary_operands`]
+    /// supplied as a leading boundary input. Refer to the documentation of [`BatchingPolicy::boundary_inputs`]
     /// for more information on dynamic batching extents.
     Dynamic(T),
 }
@@ -349,7 +349,7 @@ pub enum BatchingLevelExtent<T> {
 /// only after the operation itself was batched records the level through [`BatchingDriver::batching_level`] and later
 /// batches those programs with [`RecursiveBatchingPolicy::batch_program_at_level`]. A level never contains a runtime
 /// value: first-class extents contribute only their type, and their value reaches batched programs as the leading
-/// boundary input that [`BatchingPolicy::boundary_operands`] supplies to every consumer of that policy's batched
+/// boundary input that [`BatchingPolicy::boundary_inputs`] supplies to every consumer of that policy's batched
 /// programs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BatchingLevel<T> {
@@ -596,8 +596,8 @@ pub trait BatchableType: Type {
 ///     static transform metadata.
 ///   - **The Structurally Batched Program (i.e., [`Self::BatchedProgram`]):** Programs over homogeneous arrays preserve
 ///     source region's boundary exactly and produce [`BoundaryPreservingBatchedProgram`]s, while a composite universe
-///     may thread bookkeeping values such as its first-class mapped extent through standalone nested programs. Every
-///     selected carrier implements [`BatchedProgram`], while [`Self::boundary_operands`] and
+///     may thread bookkeeping values such as its first-class mapped extent through standalone nested programs.
+///     Every selected carrier implements [`BatchedProgram`], while [`Self::boundary_inputs`] and
 ///     [`Self::adapt_batched_program`] let consumers complete or shed policy-specific widening.
 ///
 /// The policy is deliberately limited to carrier selection, construction, access, and invariant enforcement.
@@ -703,7 +703,7 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// Refer to the documentation of [`Self::adapt_batched_program`] for the output-side counterpart of this contract,
     /// along with a complete boundary example.
     #[inline]
-    fn boundary_operands(_axis_extent: &Self::Extent) -> Vec<C::Value> {
+    fn boundary_inputs(_axis_extent: &Self::Extent) -> Vec<C::Value> {
         Vec::new()
     }
 
@@ -711,7 +711,7 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// policy's bookkeeping outputs and reducing each mapped output whose requested target axis is replicated.
     ///
     /// Structural batching widens some policies' program boundaries with bookkeeping state (refer to the documentation
-    /// of [`Self::boundary_operands`] for more information on that bookkeeping state). Extent-threading higher-order
+    /// of [`Self::boundary_inputs`] for more information on that bookkeeping state). Extent-threading higher-order
     /// operations such as `condition`, `while`, and `scan` consume that widened boundary as-is, but an operation whose
     /// attached regions are plain programs must adapt it first. For example, batched program with support for dynamic
     /// dimensions and shapes may have the boundary:
@@ -728,7 +728,7 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     /// operation can chain it through its own sealed regions (e.g., a batched while body must return the extent it
     /// consumed so the next iteration's boundary can be fed). A consumer that does not thread extents has no use for
     /// the relay, so adapting the program drops the forwarded output, producing `[extent, inputs...] ↦ [outputs...]`,
-    /// while [`Self::boundary_operands`] supplies the value for the kept input (e.g., a batched linear call consumes
+    /// while [`Self::boundary_inputs`] supplies the value for the kept input (e.g., a batched linear call consumes
     /// the extent as one more leading residual). Homogeneous array policies adapt without any boundary change.
     ///
     /// When `required_output_axes` is provided, the adaptation additionally reconciles each remaining output with
@@ -1639,7 +1639,7 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
     /// Alignment happens before adaptation because the reconciled `target_output_axes` describe the source region's
     /// outputs, which is exactly the axis vector both steps are stated over (a policy's bookkeeping outputs never
     /// appear in [`BatchedProgram::output_axes`]). Callers must reintroduce the shed inputs by prepending
-    /// [`BatchingPolicy::boundary_operands`] to the inputs of the operation they attach the result to.
+    /// [`BatchingPolicy::boundary_inputs`] to the inputs of the operation they attach the result to.
     ///
     /// Like [`Self::align_batched_program_outputs`], this performs no mapped-to-replicated collapse. Alignment resolves
     /// every structurally movable mismatch, and collapsing a genuinely mapped output requires [`Operation`]-specific
