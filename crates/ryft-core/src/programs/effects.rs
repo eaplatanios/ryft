@@ -213,7 +213,7 @@ pub enum ReferenceAccessMode {
     ReadWrite,
 
     /// Combines an update with the current state as an _ordered_ additive accumulation. Accumulation stays distinct
-    /// from [`ReferenceAccessMode::Write`] because it is linear in the update operand and therefore transposable,
+    /// from [`ReferenceAccessMode::Write`] because it is linear in the update input and therefore transposable,
     /// unlike a replacement. It carries no commutativity or atomicity promise: same-allocation accumulations execute
     /// in program order (floating-point addition cannot generally be reordered while preserving results), and
     /// atomic/commutative accumulation is not supported by this mode.
@@ -257,11 +257,11 @@ impl Display for ReferenceAccessMode {
     }
 }
 
-/// [`Reference`](crate::Reference) effect of an [`Operation`](crate::Operation), expressed in the operation's own
-/// input/operand and output/result index space. Unlike an [`EffectClass`], a reference effect names the operand or
-/// result it targets so that program-level reference analysis can resolve it to a canonical allocation (i.e., an entry
-/// input, a capture, or an allocation instruction). The indices are never resource identifiers, so the same declaration
-/// is valid for every application of the operation.
+/// [`Reference`](crate::Reference) effect of an [`Operation`](crate::Operation), expressed in the operation's own input
+/// and output index space. Unlike an [`EffectClass`], a reference effect names the input or output it targets so that
+/// program-level reference analysis can resolve it to a canonical allocation (i.e., an entry input, a capture, or an
+/// allocation instruction). The indices are never resource identifiers, so the same declaration is valid for every
+/// application of the operation.
 ///
 /// Every reference effect is an occurrence of [`EffectClass::OrderedState`]: [`Effects::classes`] derives that class
 /// from the presence of any reference effect, and so reference operations never declare it separately. Aliasing is
@@ -300,12 +300,12 @@ pub enum ReferenceEffect {
 /// [`ReferenceAnalysis`](crate::ReferenceAnalysis) and discharge, and the retention decision of
 /// dead-code elimination are all derived.
 ///
-/// The declaration is _intrinsic_ to the operation and expressed in its own input/operand and output/result index
-/// space. [`Region`](crate::Region)-bearing operations (e.g., loops and conditionals) declare only what they do
-/// themselves, which is usually nothing, even when their nested programs are effectful or touch references (region
-/// sealing aggregates nested effects into region metadata, and reference analysis recurses into attached regions
-/// rather than trusting per-instruction declarations alone). How values cross an attached region's boundary is a
-/// separate contract, declared through the region-boundary hooks of [`Operation`](crate::Operation) (e.g.,
+/// The declaration is _intrinsic_ to the operation and expressed in its own input and output index space.
+/// [`Region`](crate::Region)-bearing operations (e.g., loops and conditionals) declare only what they do themselves,
+/// which is usually nothing, even when their nested programs are effectful or touch references (region sealing
+/// aggregates nested effects into region metadata, and reference analysis recurses into attached regions rather than
+/// trusting per-instruction declarations alone). How values cross an attached region's boundary is a separate contract,
+/// declared through the region-boundary hooks of [`Operation`](crate::Operation) (e.g.,
 /// [`Operation::reference_output_identity_input`](crate::Operation::reference_output_identity_input) and
 /// [`Operation::output_region_provenance`](crate::Operation::output_region_provenance)), which are positional
 /// constraints that analysis applies only to reference-typed positions; this declaration never restates them.
@@ -538,13 +538,13 @@ impl Effects {
     /// Validates this [`Effects`] declaration against one [`Operation`](crate::Operation) application. For validation
     /// to succeed, every named input and output position must exist in the application, and every named position must
     /// be reference-typed, because reference effects describe reference allocations and a declaration on a
-    /// non-reference operand or result could never be resolved by reference analysis. Opaque state on
+    /// non-reference input or output could never be resolved by reference analysis. Opaque state on
     /// non-reference values is declared through an explicit [`EffectClass::OrderedState`] instead.
     ///
     /// # Parameters
     ///
     ///   - `operation_name`: Name of the operation whose declaration is being validated, used for diagnostic purposes.
-    ///   - `input_types`: Types of the inputs/operands of the application.
+    ///   - `input_types`: Types of the inputs of the application.
     ///   - `output_types`: Types of the outputs/results inferred for the application.
     pub(crate) fn validate_application<T: Type>(
         &self,

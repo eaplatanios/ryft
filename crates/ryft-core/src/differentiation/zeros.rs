@@ -14,17 +14,17 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 /// # Why this Protocol Exists
 ///
 /// Differentiation is the one transform that must synthesize values with no data edge to derive them from. For
-/// example, transposition is *defined* to return a cotangent for every differentiated input, including inputs that
-/// are disconnected from every output, and the mathematically determined value for such an input is a zero of its
-/// cotangent type. For a static type this is easy as [`OperationProvider::provide`] constructs the zero from the type,
-/// with no operands. For a type with dynamic axes it is impossible as a [`Type`] carries only dimension _identities_
-/// and bounds, never defining values, and so the zero operation needs one explicit dimension operand per dynamic axis.
-/// Also, the value that could supply those operands (i.e., the primal input the cotangent corresponds to) is _not an
-/// input of the pullback program_ where the zero must be staged. The only moment both the required zero type and its
-/// dimensions are in scope is during linearization, and so the required extents must be captured then and threaded to
-/// transposition as ordinary residuals. This trait is that capture/spend contract, expressed once per operation
-/// _family_. It is a set of associated functions with no receiver (i.e., `self` argument), because it is invoked
-/// precisely when no [`Operation`](crate::Operation) instance exists.
+/// example, transposition is *defined* to return a cotangent for every differentiated input, including inputs that are
+/// disconnected from every output, and the mathematically determined value for such an input is a zero of its cotangent
+/// type. For a static type this is easy as [`OperationProvider::provide`] constructs the zero from the type, with no
+/// instruction inputs. For a type with dynamic axes it is impossible as a [`Type`] carries only dimension _identities_
+/// and bounds, never defining values, and so the zero operation needs one explicit dimension input per dynamic axis.
+/// Also, the value that could supply those dimension inputs (i.e., the primal program input that the cotangent
+/// corresponds to) is _not an input of the pullback program_ where the zero must be staged. The only moment both the
+/// required zero type and its dimensions are in scope is during linearization, and so the required extents must be
+/// captured then and threaded to transposition as ordinary residuals. This trait is that capture/spend contract,
+/// expressed once per operation _family_. It is a set of associated functions with no receiver (i.e., `self` argument),
+/// because it is invoked precisely when no [`Operation`](crate::Operation) instance exists.
 ///
 /// The provider itself need not be an operation. Its emitted family is [`OperationProvider::Operation`], which fixes
 /// the operation type of every builder, context, and assembled zero in the protocol. This separates residual semantics
@@ -47,7 +47,7 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 ///      reusable derivative callables that close over concrete or tracer values. Program transposition appends captured
 ///      residuals to its ordinary trailing residual suffix. Reusable callables retain boundary-reconstruction residuals
 ///      beside that executable program.
-///   3. **Spend:** [`Self::zero_operation_with_residuals`] assembles the zero operation and its operands from the
+///   3. **Spend:** [`Self::zero_operation_with_residuals`] assembles the zero operation and its inputs from the
 ///      captured residuals. Callers then stage that operation inside a pullback program or bind it in the originating
 ///      [`Context`] of a reusable value-level derivative callable.
 ///
@@ -57,16 +57,16 @@ use crate::programs::{AtomId, MaybeZero, OperationProvider, ProgramBuilder, Prog
 ///
 /// [`Self::materialize_zero_from_residual_sources`] runs the same three steps at a transform _boundary_, where the
 /// primal that pinned a zero's extents is out of scope and the named quantities must instead be gathered one at a time
-/// from the peers that are (i.e., live sibling cotangents, known operands, and first-class dimension operands). It
-/// replaces the exemplar-matching materialization that structural zeros previously used, which could only construct a
-/// zero whose type some live value reproduced exactly and therefore rejected every widened differential representation.
+/// from the peers that are (i.e., live sibling cotangents, known inputs, and first-class dimension inputs). It replaces
+/// the exemplar-matching materialization that structural zeros previously used, which could only construct a zero whose
+/// type some live value reproduced exactly and therefore rejected every widened differential representation.
 ///
 /// # Who Implements It
 ///
 /// Homogeneous array families with a `From<ZeroOperation<ArrayType>>` conversion receive the input-free defaults:
 /// they declare nothing, capture nothing, and construct a type-only zero. Unexpected residuals are rejected rather
 /// than silently ignored. Eligible [`ArrayIrType`](crate::ArrayIrType) operation families share a second blanket
-/// implementation that captures runtime dimensions and assembles zeros with explicit extent operands. This includes
+/// implementation that captures runtime dimensions and assembles zeros with explicit extent inputs. This includes
 /// both the core composite family and its XLA counterpart; neither needs its own residual-protocol implementation.
 ///
 /// Other type universes opt in explicitly. An input-free family can use an empty implementation when it already
@@ -147,7 +147,7 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
         Ok(None)
     }
 
-    /// Returns the canonical zero operation for `r#type` and expands `residuals` into its operand order. The default
+    /// Returns the canonical zero operation for `r#type` and expands `residuals` into its input order. The default
     /// represents an input-free zero operation. Families whose zero consumes runtime dimensions override this function
     /// so that value-level binding, residualization, and builder-level staging share one operation assembly.
     #[inline]
@@ -167,11 +167,11 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
     /// it alone by reading the runtime dimensions it names from the values in `sources`. This is the boundary form of
     /// the residual protocol. [`Self::capture_zero_residuals`] and [`Self::capture_zero_residual_values`] capture from
     /// _the_ primal, which every linearization site has in hand. A transform boundary often does not. A transposed
-    /// control-flow instruction needs a real operand for the cotangent of a dead output, and the primal that pinned
-    /// that output's extents is long out of scope. What is in scope is a set of peers (i.e., live sibling cotangents,
-    /// known operands, and first-class dimension operands), among which the named runtime quantities are collectively
-    /// available even when no single peer has the zero's type. This function therefore works _per declared residual_
-    /// rather than per exemplar: it asks each candidate in turn for one named quantity through
+    /// control-flow instruction needs a real instruction input for the cotangent of a dead output, and the primal
+    /// that pinned that output's extents is long out of scope. What is in scope is a set of peers (i.e., live sibling
+    /// cotangents, known inputs, and first-class dimension inputs), among which the named runtime quantities are
+    /// collectively available even when no single peer has the zero's type. This function therefore works _per declared
+    /// residual_ rather than per exemplar: it asks each candidate in turn for one named quantity through
     /// [`Self::capture_zero_residual_value`] and assembles the zero from the answers.
     ///
     /// Being identity-directed rather than exemplar-directed is what makes it type-general. A tangent or cotangent type
@@ -234,8 +234,8 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
             }
             residuals.push(residual);
         }
-        let (operation, operands) = Self::zero_operation_with_residuals(r#type, residuals.as_slice())?;
-        let mut outputs = context.bind(operation, Vec::new(), operands.as_slice())?;
+        let (operation, zero_inputs) = Self::zero_operation_with_residuals(r#type, residuals.as_slice())?;
+        let mut outputs = context.bind(operation, Vec::new(), zero_inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -252,7 +252,7 @@ pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> 
 /// provider declares one dimension residual per distinct dynamic identity, `[dimension(n), dimension(m)]`, and captures
 /// the runtime extents `[n, m]` from the first source axis carrying each identity. This helper validates those two
 /// captured values. Later, [`ResidualZeroProvider::zero_operation_with_residuals`] expands them into the per-axis
-/// operand order `[n, n, m]`. A static zero declares and captures no residuals.
+/// input order `[n, n, m]`. A static zero declares and captures no residuals.
 ///
 /// This function neither chooses which runtime dimensions to retain nor constructs the zero; those responsibilities
 /// belong to the operation family. It only enforces the declaration/capture contract for concrete or tracer [`Value`]s.
@@ -523,9 +523,9 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
                     continue;
                 }
                 let residuals = self.residuals.get(zero_leaf.residual_range.clone()).unwrap();
-                let (operation, operands) =
+                let (operation, zero_inputs) =
                     C::Operation::zero_operation_with_residuals(zero_leaf.r#type.clone(), residuals)?;
-                let mut outputs = context.bind(operation, Vec::new(), operands.as_slice())?;
+                let mut outputs = context.bind(operation, Vec::new(), zero_inputs.as_slice())?;
                 check_count!("output", outputs, 1, ProgramError);
                 Some(outputs.remove(0))
             } else {
@@ -575,9 +575,9 @@ mod tests {
         );
 
         // Spending no residuals assembles the type-only zero, which the transposition path stages normally.
-        let (operation, operands) =
+        let (operation, zero_inputs) =
             ArrayOperation::<Array>::zero_operation_with_residuals(r#type.clone(), &[] as &[AtomId]).unwrap();
-        let zero = builder.add_instruction(operation, Vec::new(), operands, None).unwrap()[0];
+        let zero = builder.add_instruction(operation, Vec::new(), zero_inputs, None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(program.interpret(vec![Array::scalar(3.0).unwrap()]), Ok(vec![Array::scalar(0.0).unwrap()]));
@@ -637,7 +637,7 @@ mod tests {
         // The boundary form of the residual protocol assembles a zero's runtime geometry from the values in scope,
         // one named quantity at a time. This is what makes it type-general where exemplar matching was not: a widened
         // differential representation has no live value of its own type anywhere, and a scan's stacked cotangent
-        // geometry is split across a first-class dimension operand and a per-iteration peer.
+        // geometry is split across a first-class dimension input and a per-iteration peer.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let k = DimensionVariable::new("k", DimensionBounds::positive(Some(8)).unwrap());
         let context = TestContext::new();
@@ -673,7 +673,7 @@ mod tests {
         .unwrap();
         assert_eq!(widened.r#type().as_ref(), &ArrayIrType::Array(widened_tangent_type));
 
-        // The scan stacked-output geometry: no peer has the `f64[length, k]` type, but the runtime length operand is a
+        // The scan stacked-output geometry: no peer has the `f64[length, k]` type, but the runtime length input is a
         // first-class dimension that is reused directly and a per-iteration peer names `k` on its own axis `0`.
         let stacked_type = ArrayType::new(
             DataType::F64,
@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(outputs[0].r#type().as_ref(), &key_tangent_type);
         assert_eq!(outputs[1].atom_id(), accumulator.atom_id());
 
-        // The captured dimension-size result is the sole operand of the dynamic zero constructor, proving that the
+        // The captured dimension-size result is the sole input of the dynamic zero constructor, proving that the
         // stored residual range—not a type-only zero—is used during reconstruction.
         let builder = context.builder().borrow();
         assert_eq!(builder.instructions().len(), 2);

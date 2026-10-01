@@ -127,7 +127,7 @@ impl Operation for DotProductAttentionOperation {
             }
             if !input_type.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
-                    "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` does not support unreduced operands"
+                    "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` does not support unreduced inputs"
                 )));
             }
         }
@@ -335,7 +335,7 @@ impl Operation for DotProductAttentionBackwardOperation {
             }
             if !input_type.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
-                    "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` does not support unreduced operands"
+                    "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` does not support unreduced inputs"
                 )));
             }
         }

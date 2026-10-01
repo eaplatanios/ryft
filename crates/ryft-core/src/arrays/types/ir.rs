@@ -18,7 +18,7 @@ use crate::programs::{
 /// The sum is a storage boundary rather than the contract ordinary primitives are written against. Array-only
 /// [`Operation`](crate::Operation)s and transform rules keep consuming [`ArrayType`], dimension-only operations keep
 /// consuming [`DimensionType`], and genuinely mixed operations consume this type directly. Those mixed operations
-/// include shape-carrying operations with explicit dimension operands and reference operations whose signatures cross
+/// include shape-carrying operations with explicit dimension inputs and reference operations whose signatures cross
 /// the array/reference boundary. [`From`] lifts each member type into the sum, and the borrowing [`TryFrom`]
 /// implementations project it back out with a checked kind diagnostic. The same bridge backs the value-level
 /// [`ValueProjection`](crate::ValueProjection) implementations.
@@ -40,15 +40,15 @@ pub enum ArrayIrType {
 }
 
 impl ArrayIrType {
-    /// Projects a run of explicit extent operand types into the [`Dimension`]s they define, in operand order.
+    /// Projects a run of explicit extent input types into the [`Dimension`]s they define, in input order.
     ///
-    /// Mixed shape-carrying operations derive their result shape from exactly this projection, so every mixed
-    /// inference rule that consumes a trailing extent-operand run shares one member-kind diagnostic for an operand
-    /// that is not a dimension.
+    /// Mixed shape-carrying operations derive their result shape from exactly this projection, so every mixed inference
+    /// rule that consumes a trailing extent-input run shares one member-kind diagnostic for an input that is not a
+    /// dimension.
     ///
     /// # Parameters
     ///
-    ///   - `types`: Extent operand types, in operand order. The [`Borrow`] item bound lets type slices, owned [`Type`]
+    ///   - `types`: Extent input types, in input order. The [`Borrow`] item bound lets type slices, owned [`Type`]
     ///     iterators, and borrowed [`Type`]s all be projected in place, so value-level callers need no intermediate
     ///     type collection.
     pub(crate) fn extents<T: IntoIterator<Item: Borrow<Self>>>(types: T) -> Result<Vec<Dimension>, TypeError> {
@@ -415,7 +415,7 @@ mod tests {
         let declared_variable = DimensionVariable::new("declared", DimensionBounds::non_negative(Some(8)).unwrap());
         let actual_variable = DimensionVariable::new("actual", DimensionBounds::non_negative(Some(4)).unwrap());
 
-        // Extent projection accepts an empty run, preserves operand order, recognizes singleton-bounded dimensions as
+        // Extent projection accepts an empty run, preserves input order, recognizes singleton-bounded dimensions as
         // static, retains wider-bounded dimensions as dynamic, and rejects non-dimension members.
         let exact_variable = DimensionVariable::new("exact", DimensionBounds::new(4, Some(5)).unwrap());
         let extent_types = [

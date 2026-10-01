@@ -3,8 +3,10 @@
 use ryft_macros::Parameterized;
 
 use crate::arrays::ArrayType;
+use crate::axes::NamedAxes;
+use crate::batching::{BatchableType, RecursiveBatchingPolicy};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiableType;
+use crate::differentiation::{CotangentBatchingPolicy, DifferentiableType};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::attention::{
     AttentionConfiguration, AttentionInputs, DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
@@ -13,14 +15,17 @@ use crate::operations::attention::{
 };
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
-use crate::operations::differentiation::custom_derivatives::CustomDerivativeOperation;
-use crate::operations::differentiation::custom_vjp::{CustomVjp, custom_vjp};
+use crate::operations::custom_functions::functions::{
+    CustomFunction, CustomFunctionVjp, DefaultJvp, WithVjp, custom_function,
+};
+use crate::operations::custom_functions::operations::CustomFunctionOperation;
+use crate::operations::custom_functions::rules::CustomRuleRegistration;
 use crate::parameters::Parameter;
 use crate::programs::{OperationProvider, ProgramError, Typed, Value};
-use crate::tracing::DomainTracer;
+use crate::tracing::{DomainTracer, TracingContext};
 
 /// Residuals retained by the fused attention reverse rule.
-#[derive(Clone, Debug, Parameterized)]
+#[derive(Clone, Debug, PartialEq, Parameterized)]
 pub struct AttentionResiduals<P: Parameter> {
     /// Forward operands, including the present optional leaves.
     inputs: AttentionInputs<P>,
@@ -42,7 +47,7 @@ impl_differentiable_operation! {
         |_operation, _context, _driver, _inputs| {
             // The operation is the inference fast path, so there is no differentiation rule: differentiating reports an
             // error directing users to the [`differentiable_dot_product_attention`] training entry point, which pairs
-            // the activation-producing forward with [`DotProductAttentionBackwardOperation`] through [`custom_vjp`].
+            // the activation-producing forward with [`DotProductAttentionBackwardOperation`] through a custom VJP.
             Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` does not support differentiation; use \
@@ -117,38 +122,61 @@ where
     })
 }
 
-/// Attention training function whose input variation transitions precede its custom derivative boundary.
-/// This lets the transitions' transposes accumulate invariant-input contributions exactly once.
-pub struct DifferentiableDotProductAttention<D: Domain<Type = ArrayType>, Primal, Forward, Backward> {
-    /// Refer to the documentation of [`call`](Self::call) for the aligned custom derivative boundary.
-    function: CustomVjp<
+/// Boxed primal rule of a [`DifferentiableDotProductAttention`] function.
+type AttentionPrimal<D> =
+    Box<dyn Fn(AttentionInputs<DomainTracer<D>>) -> Result<DomainTracer<D>, ProgramError> + Send + Sync>;
+
+/// Boxed reverse-mode forward rule of a [`DifferentiableDotProductAttention`] function.
+type AttentionForward<D> = Box<
+    dyn Fn(
+            AttentionInputs<DomainTracer<D>>,
+        ) -> Result<(DomainTracer<D>, AttentionResiduals<DomainTracer<D>>), ProgramError>
+        + Send
+        + Sync,
+>;
+
+/// Boxed reverse-mode backward rule of a [`DifferentiableDotProductAttention`] function.
+type AttentionBackward<D> = Box<
+    dyn Fn(
+            AttentionResiduals<DomainTracer<D>>,
+            DomainTracer<D>,
+        ) -> Result<AttentionInputs<DomainTracer<D>>, ProgramError>
+        + Send
+        + Sync,
+>;
+
+/// Differentiable scaled dot-product attention training function, built by [`differentiable_dot_product_attention`].
+/// It is a [`CustomFunction`] with reverse-mode rules whose input variation transitions precede its custom function
+/// boundary, which lets the transitions' transposes accumulate invariant-input contributions exactly once. Its forward
+/// and backward rules are retained: an ordinary call traces only the attention primal, and the rules are traced on the
+/// first reverse-mode request of each specialization and cached for as long as the function lives.
+pub struct DifferentiableDotProductAttention<D: Domain<Type = ArrayType>> {
+    /// Custom function that stages the attention training call.
+    function: CustomFunction<
         AttentionInputs<DomainTracer<D>>,
         DomainTracer<D>,
-        AttentionResiduals<DomainTracer<D>>,
-        Primal,
-        Forward,
-        Backward,
+        AttentionPrimal<D>,
+        DefaultJvp,
+        WithVjp<AttentionResiduals<DomainTracer<D>>, AttentionForward<D>, AttentionBackward<D>>,
     >,
 }
 
-impl<D, Primal, Forward, Backward> DifferentiableDotProductAttention<D, Primal, Forward, Backward>
+impl<D: Domain<Type = ArrayType>> DifferentiableDotProductAttention<D>
 where
-    D: Domain<Type = ArrayType>,
-    Primal: Fn(AttentionInputs<DomainTracer<D>>) -> Result<DomainTracer<D>, ProgramError>,
-    Forward: Fn(
-        AttentionInputs<DomainTracer<D>>,
-    ) -> Result<(DomainTracer<D>, AttentionResiduals<DomainTracer<D>>), ProgramError>,
-    Backward: Fn(
-        AttentionResiduals<DomainTracer<D>>,
-        DomainTracer<D>,
-    ) -> Result<AttentionInputs<DomainTracer<D>>, ProgramError>,
+    D::Constant: 'static,
+    D::Operation: 'static,
 {
     /// Aligns the inputs' manual variation and stages the attention training call.
     pub fn call<C, V>(&self, inputs: AttentionInputs<V>) -> Result<V, ProgramError>
     where
-        C: Context<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
-        C::Operation: From<CustomDerivativeOperation<ArrayType>>,
+        C: Context<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation> + NamedAxes,
+        C::Operation: From<CustomFunctionOperation<C::Constant, C::Operation>>,
         V: Value<Type = ArrayType, DispatchDomain = C> + ManualVariationAlignment<ArrayType>,
+        <ArrayType as BatchableType>::Policy: RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>
+            + CotangentBatchingPolicy<TracingContext<C::Constant, C::Operation>>,
+        CustomRuleRegistration<C::Constant, C::Operation>: Send,
+        WithVjp<AttentionResiduals<DomainTracer<D>>, AttentionForward<D>, AttentionBackward<D>>:
+            CustomFunctionVjp<C::Constant, C::Operation, AttentionInputs<DomainTracer<D>>, DomainTracer<D>>,
     {
         let signature = inputs.signature();
         let inputs = inputs.into_values();
@@ -165,59 +193,56 @@ where
 /// zero-space machinery, while a present floating-point bias receives the cotangent returned by the backward program.
 /// This one structured entry point replaces separate query/key/value, bias, and sequence-length tuple families.
 ///
-/// The custom derivative carries regions and must be staged in a homogeneous array context. To embed the resulting
-/// program in a composite value universe, use [`Program::into_unprojected`](crate::programs::Program::into_unprojected);
-/// projected contexts cannot bind region-carrying operations directly.
+/// The returned function retains its rules (refer to [`DifferentiableDotProductAttention`]), so it should be created
+/// once and called many times, which shares the traced rule specializations across its calls. To embed the resulting
+/// programs in a composite value universe, use
+/// [`Program::into_unprojected`](crate::programs::Program::into_unprojected), which converts the staged calls together
+/// with their rules.
 ///
 /// # Parameters
 ///
 ///   - `configuration`: Value-independent attention semantics and implementation selection.
 pub fn differentiable_dot_product_attention<D>(
     configuration: AttentionConfiguration,
-) -> DifferentiableDotProductAttention<
-    D,
-    impl Fn(AttentionInputs<DomainTracer<D>>) -> Result<DomainTracer<D>, ProgramError>,
-    impl Fn(
-        AttentionInputs<DomainTracer<D>>,
-    ) -> Result<(DomainTracer<D>, AttentionResiduals<DomainTracer<D>>), ProgramError>,
-    impl Fn(AttentionResiduals<DomainTracer<D>>, DomainTracer<D>) -> Result<AttentionInputs<DomainTracer<D>>, ProgramError>,
->
+) -> DifferentiableDotProductAttention<D>
 where
     D: Domain<Type = ArrayType>,
-    D::Operation: From<DotProductAttentionBackwardOperation>
+    D::Constant: 'static,
+    D::Operation: 'static
+        + From<DotProductAttentionBackwardOperation>
         + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = D::Operation>,
     DomainTracer<D>: DotProductAttention,
 {
+    let primal: AttentionPrimal<D> = Box::new(move |inputs| {
+        let (output, _) = DomainTracer::<D>::dot_product_attention(inputs, configuration.with_residual(false))?;
+        Ok(output)
+    });
+    let forward: AttentionForward<D> = Box::new(move |inputs: AttentionInputs<DomainTracer<D>>| {
+        let (output, statistic) =
+            DomainTracer::<D>::dot_product_attention(inputs.clone(), configuration.with_residual(true))?;
+        let statistic = statistic.unwrap();
+        Ok((output.clone(), AttentionResiduals { inputs, output, statistic }))
+    });
+    let backward: AttentionBackward<D> =
+        Box::new(move |residuals: AttentionResiduals<DomainTracer<D>>, output_cotangent| {
+            let structural_inputs = residuals.inputs.clone();
+            let mut cotangents = bind_attention_backward::<D>(
+                residuals.inputs,
+                residuals.output,
+                residuals.statistic,
+                output_cotangent,
+                configuration.with_residual(true),
+            )?;
+            let zero = |value: &DomainTracer<D>| value.context().zero(&value.r#type().cotangent()?);
+            cotangents.mask = structural_inputs.mask.as_ref().map(zero).transpose()?;
+            cotangents.query_sequence_lengths =
+                structural_inputs.query_sequence_lengths.as_ref().map(zero).transpose()?;
+            cotangents.key_value_sequence_lengths =
+                structural_inputs.key_value_sequence_lengths.as_ref().map(zero).transpose()?;
+            Ok(cotangents)
+        });
     DifferentiableDotProductAttention {
-        function: custom_vjp(
-            move |inputs: AttentionInputs<DomainTracer<D>>| {
-                let (output, _) = DomainTracer::<D>::dot_product_attention(inputs, configuration.with_residual(false))?;
-                Ok(output)
-            },
-            move |inputs: AttentionInputs<DomainTracer<D>>| {
-                let (output, statistic) =
-                    DomainTracer::<D>::dot_product_attention(inputs.clone(), configuration.with_residual(true))?;
-                let statistic = statistic.unwrap();
-                Ok((output.clone(), AttentionResiduals { inputs, output, statistic }))
-            },
-            move |residuals: AttentionResiduals<DomainTracer<D>>, output_cotangent| {
-                let structural_inputs = residuals.inputs.clone();
-                let mut cotangents = bind_attention_backward::<D>(
-                    residuals.inputs,
-                    residuals.output,
-                    residuals.statistic,
-                    output_cotangent,
-                    configuration.with_residual(true),
-                )?;
-                let zero = |value: &DomainTracer<D>| value.context().zero(&value.r#type().cotangent()?);
-                cotangents.mask = structural_inputs.mask.as_ref().map(zero).transpose()?;
-                cotangents.query_sequence_lengths =
-                    structural_inputs.query_sequence_lengths.as_ref().map(zero).transpose()?;
-                cotangents.key_value_sequence_lengths =
-                    structural_inputs.key_value_sequence_lengths.as_ref().map(zero).transpose()?;
-                Ok(cotangents)
-            },
-        ),
+        function: custom_function(primal).with_vjp(forward, backward).with_name(DOT_PRODUCT_ATTENTION_OPERATION_NAME),
     }
 }
 
@@ -264,7 +289,7 @@ mod tests {
         assert_eq!(output, varying);
         assert_eq!(
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["parallel_vary", "parallel_vary", "custom_derivative"],
+            vec!["parallel_vary", "parallel_vary", "custom_function"],
         );
     }
 

@@ -150,7 +150,7 @@ mod tests {
         let predicate: Array = left.less_than_or_equal(&DimensionValue::constant(8).unwrap()).unwrap();
         predicate.assert("dimension is at most `8`", &[]).unwrap();
 
-        // Concrete capabilities derive fresh result types from their operands without exposing IR operations in the
+        // Concrete capabilities derive fresh result types from their inputs without exposing IR operations in the
         // value-level API.
         let left_type = DimensionType::new("left", DimensionBounds::new(0, Some(10)).unwrap());
         let right_type = DimensionType::new("right", DimensionBounds::new(0, Some(10)).unwrap());
@@ -160,8 +160,8 @@ mod tests {
         assert_eq!(sum.r#type().bounds(), DimensionBounds::new(0, Some(19)).unwrap());
         assert_eq!(sum.extent(), 10);
 
-        // Concrete backend capability implementations retain operand-specific diagnostics for invalid observed
-        // extents admitted by otherwise valid operand bounds.
+        // Concrete backend capability implementations retain input-specific diagnostics for invalid observed extents
+        // admitted by otherwise valid input bounds.
         let error = DimensionValue::new(left_type.clone(), 1).unwrap().sub(&right).unwrap_err();
         assert_eq!(
             error.downcast_custom::<DimensionError>(),

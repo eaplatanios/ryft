@@ -29,7 +29,7 @@
 //! [`Program::interpret_in_context`] first checks the input [`Parameterized`] structure and the complete input type
 //! signature. Refinements are established across the whole signature so repeated dynamic type identities cannot receive
 //! contradictory concrete bindings. Structured inputs are then flattened into an atom-indexed environment. Only live
-//! constants are lifted through [`Context::lift`], and every instruction reads its operands and writes its results in
+//! constants are lifted through [`Context::lift`], and every instruction reads its inputs and writes its results in
 //! that environment. After validating the original boundary, staged replay carries permitted input definition
 //! [`TypeIdentityRenaming`]s into operation payloads and nested regions. Fresh instruction definitions extend that
 //! [`TypeIdentityRenaming`]. Staging also freshens local constant definitions so separate retained replays can share
@@ -48,8 +48,8 @@
 //! lets the same replay evaluate through an [`EagerContext`], append instructions through a staging context, or invoke
 //! batching, differentiation, and partial-evaluation rules through transform contexts.
 //!
-//! Eager rules should request only the context capabilities they consume. Operand-driven rules often need only their
-//! input values, while nullary constructors and captured constants may require focused capabilities such as zero
+//! Eager rules should request only the context capabilities they consume. Rules that consume inputs often need only
+//! those input values, while nullary constructors and captured constants may require focused capabilities such as zero
 //! construction or constant materialization. The generic context parameter on [`InterpretableOperation`] is therefore
 //! deliberately bounded by [`Domain`] rather than by [`Context`]. The trait's type-compatibility caveat is documented
 //! on the trait itself.
@@ -68,9 +68,9 @@
 //! [`InterpretableOperation`] describes eager semantics in an operation's native value universe.
 //! [`MemberInterpretableOperation`] handles a payload whose enclosing instruction consumes or produces several member
 //! kinds. [`interpret_projected_operation`] adapts a region-free native member rule to a composite domain by projecting
-//! operands, executing once through the member's eager context, and lifting results back into the composite value
-//! family. Region-carrying and genuinely mixed operations remain composite-native because their region contracts may
-//! span several member kinds.
+//! inputs, executing once through the member's eager context, and lifting results back into the composite value family.
+//! Region-carrying and genuinely mixed operations remain composite-native because their region contracts may span
+//! several member kinds.
 //!
 //! # Extending Interpretation
 //!
@@ -250,7 +250,7 @@ pub trait MemberInterpretableOperation<C: Domain>: Operation {
     ///   - `context`: Parent [`Domain`] in which the complete mixed [`Instruction`] executes.
     ///   - `driver`: [`InterpretationDriver`] providing [`Instruction`]-scoped access to the attached
     ///     application [`Region`](crate::Region)s.
-    ///   - `inputs`: Parent-universe inputs/operands in [`Instruction`] order.
+    ///   - `inputs`: Parent-universe inputs in [`Instruction`] order.
     fn interpret_in_parent<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -430,7 +430,7 @@ pub(crate) struct RegionInterpreter<'r, C: Context> {
 
     /// Borrowed source region together with its resumable instruction position, runtime atom values, and remaining-use
     /// counts. The region's atom types, boundary identifiers, and type-identity signature define the contract checked
-    /// by this interpreter. Each [`Self::step`] supplies context-aware dispatch to this state, which gathers operands
+    /// by this interpreter. Each [`Self::step`] supplies context-aware dispatch to this state, which gathers inputs
     /// and retains live results. Refinement checks, identity substitutions, and attached-region mappings stay in this
     /// interpreter so ordinary replay and scheduler-selected steps share the same traversal and value-transfer rules.
     state: RegionInterpreterState<'r, C::Constant, C::Operation, C::Value>,
@@ -444,7 +444,7 @@ pub(crate) struct RegionInterpreter<'r, C: Context> {
 
     /// Input refinement facts retained under the source signature's original identities. An instruction can receive
     /// a concrete dimension value reified from an input array without that value having been a region input itself.
-    /// [`Self::step`] checks such operands against these original facts before choosing an instruction-local identity
+    /// [`Self::step`] checks such inputs against these original facts before choosing an instruction-local identity
     /// substitution. Separate reifications may have different identities, but must satisfy the same boundary facts;
     /// these local substitutions do not replace the shared mappings in [`Self::identity_renaming`].
     input_refinements: <C::Type as Type>::Refinements,
@@ -635,14 +635,14 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
     }
 
     /// Dispatches the next outer instruction and returns the interpreter positioned after it. [`Self::state`]
-    /// supplies the operands; this interpreter validates reified boundary dimensions, applies the appropriate type
+    /// supplies the inputs; this interpreter validates reified boundary dimensions, applies the appropriate type
     /// identity substitutions, and binds through [`Self::context`] with the source instruction's provenance and a
     /// [`ReplayRegionDriver`]. Fresh region-owned definitions extend [`Self::identity_renaming`] before later steps
     /// can use them, while [`Self::region_mappings`] preserves attached-region sharing across bindings.
     ///
     /// A step handles one complete outer binding, including any attached-region work performed by its operation
     /// rule. Stepping an already complete interpreter is an error. The function consumes `self`, so a failed binding
-    /// or validation cannot resume from operands already transferred or repeat effects through the same state. This
+    /// or validation cannot resume from inputs already transferred or repeat effects through the same state. This
     /// interpreter does not roll back effects already performed by the context.
     pub(crate) fn step(self) -> Result<Self, ProgramError> {
         let Self { context, state, refinements, input_refinements, identity_renaming, region_mappings } = self;
@@ -669,7 +669,7 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
                 if !reified_inputs.is_empty() {
                     // An input array can establish q without carrying its first-class dimension value.
                     // Replaying `size = dimension_size(x); zero[q](size)` at `x: Array[2]` reifies `q` as a fresh
-                    // exact dimension. Use that explicit operand's identity for this constructor and its regions.
+                    // exact dimension. Use that explicit input's identity for this constructor and its regions.
                     // Keep this local as a second `dimension_size` may reify the same `q` under another fresh
                     // identity, and so globally renaming `q` would incorrectly make those two instructions define
                     // one identity. Original boundary facts still require every reification of `q` to have the
@@ -843,7 +843,7 @@ impl<'r, C: Context> RegionInterpreter<'r, C> {
 /// Resumable interpretation state for a borrowed [`Region`](crate::Region). This is the same atom environment and
 /// last-use transfer used by [`RegionRef::interpret_with`] and context-driven kernel scheduling. Constants are lifted
 /// once, and each successful step dispatches exactly one instruction. Consuming steps prevent reuse after a dispatcher
-/// failure has consumed operands or performed an effect.
+/// failure has consumed inputs or performed an effect.
 ///
 /// [`RegionRef::interpret_with`] supplies constant lifting and instruction dispatch through functions that can use
 /// arbitrary runtime values and errors without a [`Context`]. [`RegionInterpreter`] wraps this state to add context
@@ -855,11 +855,12 @@ struct RegionInterpreterState<'r, V: Value, O: Operation<Type = V::Type>, Runtim
     /// Runtime atom values retained only while a future instruction or output needs them.
     values: Vec<Option<RuntimeValue>>,
 
-    /// Number of unconsumed operand and region-output occurrences for each atom, indexed like [`Self::values`].
-    /// Each operand gathered by [`Self::step`] and each output gathered by [`Self::finish`] decrements its atom's
-    /// count. Repeated occurrences count separately. A value is cloned while later consumers remain and moved out
-    /// of `values` on its last use; instruction results with no consumers are not stored. Counting region outputs
-    /// keeps their values available after [`Self::next_instruction`] reaches the end of the instruction list.
+    /// Number of unconsumed instruction-input and region-output occurrences for each atom, indexed like
+    /// [`Self::values`]. Each instruction input gathered by [`Self::step`] and each output gathered by [`Self::finish`]
+    /// decrements its atom's count. Repeated occurrences count separately. A value is cloned while later consumers
+    /// remain and moved out of `values` on its last use; instruction results with no consumers are not stored. Counting
+    /// region outputs keeps their values available after [`Self::next_instruction`] reaches the end of the instruction
+    /// list.
     remaining_uses: Vec<usize>,
 
     /// Position of the next instruction in [`Self::region`]'s instruction list. It starts at zero and advances
@@ -869,12 +870,12 @@ struct RegionInterpreterState<'r, V: Value, O: Operation<Type = V::Type>, Runtim
     /// makes [`Self::is_complete`] true; [`Self::finish`] must still gather the region's outputs.
     next_instruction: usize,
 
-    /// Reusable buffer holding operands in the order required by the instruction selected by
-    /// [`Self::next_instruction`]. Each [`Self::step`] clears the previous contents, then fills this buffer from
-    /// [`Self::values`], cloning or moving each operand according to [`Self::remaining_uses`]. The dispatcher borrows
-    /// the resulting slice; its live results are stored back in `values`. Capacity is reserved for the largest
-    /// instruction's operand count so successive steps reuse the allocation. Operands remain here until the next
-    /// step clears them or this interpretation state is finished or dropped.
+    /// Reusable buffer holding inputs in the order required by the instruction selected by [`Self::next_instruction`].
+    /// Each [`Self::step`] clears the previous contents, then fills this buffer from [`Self::values`], cloning or
+    /// moving each input according to [`Self::remaining_uses`]. The dispatcher borrows the resulting slice; its live
+    /// results are stored back in `values`. Capacity is reserved for the largest instruction's input count so
+    /// successive steps reuse the allocation. Inputs remain here until the next step clears them or this interpretation
+    /// state is finished or dropped.
     instruction_inputs: Vec<RuntimeValue>,
 }
 
@@ -948,7 +949,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>, RuntimeValue: Clone> RegionInte
     }
 
     /// Dispatches exactly one instruction with the supplied semantics and validates its output arity. This consumes
-    /// the state so an error cannot resume with operands already transferred or an effect already executed.
+    /// the state so an error cannot resume with inputs already transferred or an effect already executed.
     fn step<
         Error: From<ProgramError>,
         InterpretFn: FnMut(&Instruction<O>, &[RuntimeValue]) -> Result<Vec<RuntimeValue>, Error>,

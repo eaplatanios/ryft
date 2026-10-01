@@ -9,7 +9,7 @@ pub const DIMENSION_DIV_OPERATION_NAME: &str = "dimension_div";
 
 define_dimension_arithmetic_operation!(
     /// Checked integer division of non-negative [`DimensionValue`]s used by [`Div`] that returns the quotient rounded
-    /// down (equivalently, truncated towards zero for non-negative operands). Division by zero returns an error.
+    /// down (equivalently, truncated towards zero for non-negative inputs). Division by zero returns an error.
     /// Construction rejects bounds that admit only a zero divisor. Otherwise, a divisor that may be zero requires
     /// a runtime assertion.
     DimensionDivOperation,

@@ -156,7 +156,7 @@ pub trait ElementwiseOperation: Operation<Type = ArrayType> {
 
     /// Infers the broadcasted output [`ArrayType`] for this elementwise [`Operation`]. Operations whose output
     /// [`Sharding`](crate::Sharding) does not follow plain broadcasting semantics (e.g., [`MulOperation`], which is
-    /// bilinear in its operands and combines their reduction state accordingly) must override this function, typically
+    /// bilinear in its inputs and combines their reduction state accordingly) must override this function, typically
     /// using [`infer_elementwise_broadcast_type`](Self::infer_elementwise_broadcast_type) for the data type, shapes,
     /// and placement, and layering their own sharding rule on top.
     #[inline]

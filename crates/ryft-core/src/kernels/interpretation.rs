@@ -550,14 +550,14 @@ impl KernelCallOperation {
             .collect()
     }
 
-    /// Copies only valid selected coordinates between a logical edge tile and the original operand. Physical layout
+    /// Copies only valid selected coordinates between a logical edge tile and the original full array. Physical layout
     /// may differ because the tile is private; shape, dtype, placement, and distributed dependencies must agree.
     fn copy_window(source: &ArrayReference<Array>, destination: &ArrayReference<Array>) -> Result<(), ProgramError> {
         let value = source.read()?;
         let destination_type = destination.r#type().referent().clone();
         if value.r#type().into_owned().with_layout(None) != destination_type.clone().with_layout(None) {
             return Err(
-                TypeError::invalid("kernel edge tile and operand window have incompatible logical types").into()
+                TypeError::invalid("kernel edge tile and full array window have incompatible logical types").into()
             );
         }
         destination.write(Array::from_logical_bytes(destination_type, &value.logical_bytes())?)
@@ -581,7 +581,7 @@ impl<C: Domain> InterpretableOperation<C> for ScratchOperation {
 struct QualifiedKernelContext<Extension: Operation<Type = ArrayIrType>> {
     /// Canonical eager arithmetic and reference semantics.
     eager: EagerContext<ArrayIrValue<Array>, KernelOperation<Extension>>,
-    /// Per-tile valid coordinates; private physical padding never counts as readable operand storage.
+    /// Per-tile valid coordinates; private physical padding never counts as readable full array storage.
     validity: BTreeMap<ReferenceId, ArrayReference<Array>>,
     /// Logical program being replayed for diagnostics.
     coordinate: Vec<usize>,
@@ -785,7 +785,7 @@ where
                 }
             } else {
                 // Writes may fill private padding because only valid coordinates are published. An unmasked read or
-                // read-modify-write must never expose physical padding as initialized operand data.
+                // read-modify-write must never expose physical padding as initialized full array data.
                 for (input_index, mode) in operation.effects().accesses() {
                     if mode != ReferenceAccessMode::Write
                         && let Some(reference) = selected_references.get(&input_index)

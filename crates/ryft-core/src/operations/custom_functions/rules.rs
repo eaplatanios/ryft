@@ -276,14 +276,14 @@ where
 }
 
 /// Retained custom batching rule, which batches a call of a [`CustomRuleDefinition`] instead of structurally batching
-/// its primal region. It receives the batching level, the level's boundary operands (e.g., a first-class batch extent),
+/// its primal region. It receives the batching level, the level's boundary inputs (e.g., a first-class batch extent),
 /// the call's batched inputs, and their batch axes, and it returns the batched outputs together with their batch axes.
 trait CustomBatchingRule<V: Typed, O>: Send + Sync {
     /// Applies this rule to the provided batched inputs.
     fn apply(
         &self,
         level: &BatchingLevel<V::Type>,
-        boundary_operands: &[CustomRuleTracer<V, O>],
+        boundary_inputs: &[CustomRuleTracer<V, O>],
         inputs: &[CustomRuleTracer<V, O>],
         input_axes: &[BatchAxis],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
@@ -307,11 +307,11 @@ where
     fn apply(
         &self,
         level: &BatchingLevel<V::Type>,
-        boundary_operands: &[CustomRuleTracer<V, O>],
+        boundary_inputs: &[CustomRuleTracer<V, O>],
         inputs: &[CustomRuleTracer<V, O>],
         input_axes: &[BatchAxis],
     ) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError> {
-        self(level, boundary_operands, inputs, input_axes)
+        self(level, boundary_inputs, inputs, input_axes)
     }
 }
 
@@ -381,7 +381,7 @@ enum CustomRuleBatchedOutputs {
 
 /// Structural batching of a traced rule program at one recorded [`BatchingLevel`] with the provided input batch axes.
 /// Each output is aligned to its required batch axis, or keeps its natural batch axis when the requirement is [`None`].
-/// The result is the batched program, which consumes the level's boundary operands before the source program's inputs,
+/// The result is the batched program, which consumes the level's boundary inputs before the source program's inputs,
 /// together with its output batch axes. [`CustomRuleDefinition::with_batching`] captures it where the operation
 /// family's batching bounds are known, because requiring them on the operations' own rules would form a cycle with the
 /// family's payload bounds.
@@ -414,11 +414,11 @@ pub struct CustomRuleBatchingLevel<T> {
     /// Context-neutral description of the level.
     pub(super) level: BatchingLevel<T>,
 
-    /// Number of policy boundary operands (e.g., a first-class batch extent) that batching at this level prepended to
-    /// the operation's inputs (refer to the documentation of [`BatchingPolicy::boundary_operands`]).
-    pub(super) boundary_operand_count: usize,
+    /// Number of policy boundary inputs (e.g., a first-class batch extent) that batching at this level prepended to the
+    /// operation's inputs (refer to the documentation of [`BatchingPolicy::boundary_operands`]).
+    pub(super) boundary_input_count: usize,
 
-    /// Batch axes of the operation's inputs at this level, excluding the boundary operands prepended at this level.
+    /// Batch axes of the operation's inputs at this level, excluding the boundary inputs prepended at this level.
     pub(super) input_axes: Vec<BatchAxis>,
 
     /// Batch axes of the operation's outputs at this level.
@@ -430,7 +430,7 @@ pub struct CustomRuleBatchingLevel<T> {
 /// batched.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct CustomRuleBatching<T> {
-    /// Unbatched types of the operation's inputs, excluding all boundary operands.
+    /// Unbatched types of the operation's inputs, excluding all boundary inputs.
     pub(super) input_types: Vec<T>,
 
     /// Unbatched types of the operation's outputs.
@@ -441,9 +441,9 @@ pub(super) struct CustomRuleBatching<T> {
 }
 
 impl<T: Type> CustomRuleBatching<T> {
-    /// Returns the number of boundary operands that all levels together prepended to the operation's inputs.
-    pub(super) fn boundary_operand_count(&self) -> usize {
-        boundary_operand_count(&self.levels)
+    /// Returns the number of boundary inputs that all levels together prepended to the operation's inputs.
+    pub(super) fn boundary_input_count(&self) -> usize {
+        boundary_input_count(&self.levels)
     }
 
     /// Returns this [`CustomRuleBatching`] with its types converted into the type family `U`, as when its operation is
@@ -467,7 +467,7 @@ impl<T: Type> CustomRuleBatching<T> {
                         level.level.axis_name().map(str::to_owned),
                         level.level.axis_sharding().clone(),
                     ),
-                    boundary_operand_count: level.boundary_operand_count,
+                    boundary_input_count: level.boundary_input_count,
                     input_axes: level.input_axes,
                     output_axes: level.output_axes,
                 })
@@ -523,7 +523,7 @@ impl<T: Display> Display for CustomRuleBatching<T> {
 /// Specialization key of the forward-mode and reverse-mode primal rules of a [`CustomRuleDefinition`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomRuleSpecializationKey<T> {
-    /// Unbatched types of every input of the call, excluding boundary operands.
+    /// Unbatched types of every input of the call, excluding boundary inputs.
     pub(super) input_types: Vec<T>,
 
     /// Unbatched types of every output of the call. The key must include them, even though rules are traced from the
@@ -531,7 +531,7 @@ pub struct CustomRuleSpecializationKey<T> {
     /// calls with the same inputs but different primal outputs must never share a specialization.
     pub(super) output_types: Vec<T>,
 
-    /// Number of leading inputs that parameterize the rule without being differentiated, excluding boundary operands.
+    /// Number of leading inputs that parameterize the rule without being differentiated, excluding boundary inputs.
     pub(super) non_differentiated_count: usize,
 
     /// Whether each differentiated input's tangent is active (i.e., not a structural zero) in a forward-mode request,
@@ -561,7 +561,7 @@ impl<T: Type + Eq + Hash> CustomRuleSpecializationKey<T> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomRuleBackwardSpecializationKey<T> {
     /// Unbatched types of the known leading inputs (i.e., the non-differentiated inputs, the residuals, and the seed
-    /// geometry), excluding boundary operands.
+    /// geometry), excluding boundary inputs.
     pub(super) leading_input_types: Vec<T>,
 
     /// Number of trailing leading inputs that carry seed geometry (refer to [`CustomFunctionTransposeOperation`]).
@@ -597,16 +597,16 @@ impl<T: Type + Eq + Hash> CustomRuleBackwardSpecializationKey<T> {
 
 /// Specialization key of the custom batching rule of a [`CustomRuleDefinition`] (refer to
 /// [`CustomRuleDefinition::with_batching_rule`]). It contains only static information: the level and the types and
-/// batch axes of the batched call's operands.
+/// batch axes of the batched call's inputs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CustomRuleBatchingRuleKey<T> {
     /// Batching level at which the call is batched.
     pub(super) level: BatchingLevel<T>,
 
-    /// Types of the level's boundary operands (e.g., a first-class batch extent).
-    pub(super) boundary_operand_types: Vec<T>,
+    /// Types of the level's boundary inputs (e.g., a first-class batch extent).
+    pub(super) boundary_input_types: Vec<T>,
 
-    /// Types of the call's batched inputs, which include any boundary operands of earlier levels.
+    /// Types of the call's batched inputs, which include any boundary inputs of earlier levels.
     pub(super) input_types: Vec<T>,
 
     /// Per-item types of the call's batched inputs at this level (i.e., the input types of the call's primal region
@@ -1062,11 +1062,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
 
     /// Returns this [`CustomRuleDefinition`] with the provided custom batching rule, which batches its calls instead of
     /// structurally batching their primal regions (i.e., the analogue of JAX's `custom_vmap`). The rule receives the
-    /// batching level, the level's boundary operands (e.g., a first-class batch extent), the call's batched inputs, and
+    /// batching level, the level's boundary inputs (e.g., a first-class batch extent), the call's batched inputs, and
     /// their batch axes, and it returns the batched outputs together with their batch axes. It is traced when a call is
-    /// batched, once per batching level and operand signature, and its program becomes the batched call's primal
-    /// region, so it also determines the batch axes of the call's outputs (instead of
-    /// [`Self::with_batched_output_axes`]).
+    /// batched, once per batching level and input signature, and its program becomes the batched call's primal region,
+    /// so it also determines the batch axes of the call's outputs (instead of [`Self::with_batched_output_axes`]).
     ///
     /// Batching a call with this rule preserves the call and its derivative rules: derivative requests of a batched
     /// call still trace the derivative rules at the unbatched types and batch them structurally (refer to
@@ -1547,7 +1546,7 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>;
 
-    /// Returns the destination-specialized backward rule for `key`, whose program consumes the boundary operands, then
+    /// Returns the destination-specialized backward rule for `key`, whose program consumes the boundary inputs, then
     /// the live seeds, then the caller buffers, then the remaining known leading inputs, and returns the cotangents of
     /// the differentiated inputs with returned destinations.
     fn backward_specialization(
@@ -1559,8 +1558,8 @@ pub trait CustomRuleSpecializer<V: Typed<Type: Eq + Hash> + Parameter, O>: Custo
         O: Operation<Type = V::Type> + From<CustomFunctionTransposeOperation<V, O>>;
 
     /// Returns the batched primal program that the custom batching rule produces for `key`, whose program takes the
-    /// level's boundary operands followed by the call's batched inputs and returns the batched outputs, together with
-    /// the batch axes of those outputs.
+    /// level's boundary inputs followed by the call's batched inputs and returns the batched outputs, together with the
+    /// batch axes of those outputs.
     fn batching_rule_specialization(
         &self,
         key: CustomRuleBatchingRuleKey<V::Type>,
@@ -1762,7 +1761,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
 
             // Each active tangent follows the batch axis of its primal, and each output tangent follows its output.
             let differentiated_input_start =
-                key.non_differentiated_count + boundary_operand_count(&key.levels[..key.levels.len() - 1]);
+                key.non_differentiated_count + boundary_input_count(&key.levels[..key.levels.len() - 1]);
             let differentiated_input_axes = level.input_axes.get(differentiated_input_start..).ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
                     "`{CUSTOM_FUNCTION_OPERATION_NAME}` `{}` batching level has too few input axes",
@@ -1944,14 +1943,13 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 return Ok(Arc::new(CustomRuleSpecialization { program, output_axes: Vec::new() }));
             };
 
-            // The inner program consumes its inner boundary operands, then the live seeds, then the caller
-            // buffers, then the remaining leading inputs. Each seed follows its output, each caller buffer follows
-            // its input, and each leading input keeps its recorded axis. Each returned cotangent is aligned to its
-            // input.
-            let inner_boundary_operand_count = boundary_operand_count(&key.levels[..key.levels.len() - 1]);
+            // The inner program consumes its inner boundary inputs, then the live seeds, then the caller buffers, then
+            // the remaining leading inputs. Each seed follows its output, each caller buffer follows its input, and
+            // each leading input keeps its recorded axis. Each returned cotangent is aligned to its input.
+            let inner_boundary_input_count = boundary_input_count(&key.levels[..key.levels.len() - 1]);
             let (leading_axes, tangent_axes) =
-                level.input_axes.split_at(inner_boundary_operand_count + leading_input_count);
-            let mut input_axes = leading_axes[..inner_boundary_operand_count].to_vec();
+                level.input_axes.split_at(inner_boundary_input_count + leading_input_count);
+            let mut input_axes = leading_axes[..inner_boundary_input_count].to_vec();
             input_axes.extend(
                 level
                     .output_axes
@@ -1965,7 +1963,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     .zip(&key.destination_kinds)
                     .filter_map(|(axis, kind)| (*kind == CotangentDestinationKind::Reference).then_some(*axis)),
             );
-            input_axes.extend_from_slice(&leading_axes[inner_boundary_operand_count..]);
+            input_axes.extend_from_slice(&leading_axes[inner_boundary_input_count..]);
             let output_axes = tangent_axes
                 .iter()
                 .zip(&key.destination_kinds)
@@ -1988,7 +1986,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         V: Value<Type: DifferentiableType>,
         O: Operation<Type = V::Type>,
     {
-        // Traces the custom batching rule over the level's boundary operands followed by the batched inputs, recording
+        // Traces the custom batching rule over the level's boundary inputs followed by the batched inputs, recording
         // the batch axes that it declares for its outputs. A derived definition applies the JVP of its source's rule
         // instead.
         let Some(rule) = &self.definition.batching_rule else {
@@ -2004,12 +2002,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             });
         };
         self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
-            let boundary_operand_count = key.boundary_operand_types.len();
+            let boundary_input_count = key.boundary_input_types.len();
             let mut output_axes = Vec::new();
             let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
                 |values: Vec<CustomRuleTracer<V, O>>| {
-                    let (boundary_operands, inputs) = values.split_at(boundary_operand_count);
-                    let (outputs, axes) = rule.apply(&key.level, boundary_operands, inputs, &key.input_axes)?;
+                    let (boundary_inputs, inputs) = values.split_at(boundary_input_count);
+                    let (outputs, axes) = rule.apply(&key.level, boundary_inputs, inputs, &key.input_axes)?;
                     if axes.len() != outputs.len() {
                         return Err(TypeError::invalid(format!(
                             "`{CUSTOM_FUNCTION_OPERATION_NAME}` `{}` batching rule returned {} outputs but {} output \
@@ -2023,7 +2021,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     output_axes = axes;
                     Ok(outputs)
                 },
-                key.boundary_operand_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
+                key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
                 self.definition.named_axes.clone(),
             )?;
             Ok(Arc::new(CustomRuleSpecialization { program, output_axes }))
@@ -2207,7 +2205,7 @@ impl<Vm: Typed<Type: Eq + Hash> + Parameter, Om> LiftedCustomRules<Vm, Om> {
                         level.level.axis_name().map(str::to_owned),
                         level.level.axis_sharding().clone(),
                     ),
-                    boundary_operand_count: level.boundary_operand_count,
+                    boundary_input_count: level.boundary_input_count,
                     input_axes: level.input_axes.clone(),
                     output_axes: level.output_axes.clone(),
                 })
@@ -2434,7 +2432,7 @@ where
         Vc: Value<Type: DifferentiableType>,
         Oc: Operation<Type = Vc::Type>,
     {
-        // The member rule batches the call at the projected operand types, and its program is converted back.
+        // The member rule batches the call at the projected input types, and its program is converted back.
         let member = self.member()?;
         let project = |r#type: &Vc::Type| {
             <&Vm::Type>::try_from(r#type).cloned().map_err(|_| {
@@ -2457,7 +2455,7 @@ where
                 key.level.axis_name().map(str::to_owned),
                 key.level.axis_sharding().clone(),
             ),
-            boundary_operand_types: key.boundary_operand_types.iter().map(project).collect::<Result<_, _>>()?,
+            boundary_input_types: key.boundary_input_types.iter().map(project).collect::<Result<_, _>>()?,
             input_types: key.input_types.iter().map(project).collect::<Result<_, _>>()?,
             unbatched_input_types: key.unbatched_input_types.iter().map(project).collect::<Result<_, _>>()?,
             input_axes: key.input_axes.clone(),
@@ -2481,8 +2479,8 @@ where
 
 impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type>> CustomRuleDerivation<V, O> {
     /// Returns the batched program of a derived call for `key` (refer to [`CustomRuleDerivation`] for its two modes),
-    /// which consumes the level's boundary operands followed by the derived call's batched inputs (i.e., its primal
-    /// inputs, including the boundary operands of earlier levels, followed by its active tangents) and returns its
+    /// which consumes the level's boundary inputs followed by the derived call's batched inputs (i.e., its primal
+    /// inputs, including the boundary inputs of earlier levels, followed by its active tangents) and returns its
     /// batched outputs, together with their batch axes.
     ///
     /// # Parameters
@@ -2518,31 +2516,31 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
                 ))
             })?;
 
-        // The primal inputs of a derived call that was already batched start with the boundary operands of the earlier
+        // The primal inputs of a derived call that was already batched start with the boundary inputs of the earlier
         // levels, which have no tangents.
-        let earlier_boundary_operand_count = primal_count - self.key.input_count;
+        let earlier_boundary_input_count = primal_count - self.key.input_count;
         let tangent_primal_indices = self
             .key
             .active_input_indices
             .iter()
-            .map(|index| earlier_boundary_operand_count + index)
+            .map(|index| earlier_boundary_input_count + index)
             .collect::<Vec<_>>();
         let (primal_axes, tangent_axes) = key.input_axes.split_at(primal_count);
         let mut primal_tangents = vec![None; primal_count];
         for (tangent, &primal) in tangent_primal_indices.iter().enumerate() {
             primal_tangents[primal] = Some(tangent);
         }
-        let boundary_operand_count = key.boundary_operand_types.len();
+        let boundary_input_count = key.boundary_input_types.len();
         let jvp_input_indices =
-            tangent_primal_indices.iter().map(|index| boundary_operand_count + index).collect::<Vec<_>>();
+            tangent_primal_indices.iter().map(|index| boundary_input_count + index).collect::<Vec<_>>();
         let rule_key = |input_types: Vec<V::Type>, input_axes: Vec<BatchAxis>| CustomRuleBatchingRuleKey {
             level: key.level.clone(),
-            boundary_operand_types: key.boundary_operand_types.clone(),
+            boundary_input_types: key.boundary_input_types.clone(),
             input_types,
             unbatched_input_types: key.unbatched_input_types[..primal_count].to_vec(),
             input_axes,
         };
-        let program_types = key.boundary_operand_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>();
+        let program_types = key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>();
 
         // Structural mode: no input that the source rule could map is mapped on both sides.
         let rule_can_map = (0..primal_count).any(|primal| {
@@ -2556,7 +2554,7 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
             ))?;
             if rule.output_axes.iter().all(BatchAxis::is_replicated) {
                 let jvp = self.jvp_program(name, differentiator.as_ref(), &rule.program, &jvp_input_indices)?;
-                let mut input_axes = vec![BatchAxis::replicated(); boundary_operand_count];
+                let mut input_axes = vec![BatchAxis::replicated(); boundary_input_count];
                 input_axes.extend_from_slice(&key.input_axes);
                 let (batched, output_axes) = batcher(
                     &key.level,
@@ -2567,11 +2565,11 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
                 )
                 .map_err(ProgramError::from)?;
 
-                // The batched program consumes the level's boundary operands before the JVP program's own copy of them.
+                // The batched program consumes the level's boundary inputs before the JVP program's own copy of them.
                 let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
                     |values: Vec<CustomRuleTracer<V, O>>| {
                         let context = values[0].context().clone();
-                        let mut inputs = values[..boundary_operand_count].to_vec();
+                        let mut inputs = values[..boundary_input_count].to_vec();
                         inputs.extend(values);
                         Ok(batched.interpret_in_context(&context, inputs)?)
                     },
@@ -2643,17 +2641,17 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
         let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
             |values: Vec<CustomRuleTracer<V, O>>| {
                 let context = values[0].context().clone();
-                let (boundary_operands, inputs) = values.split_at(boundary_operand_count);
+                let (boundary_inputs, inputs) = values.split_at(boundary_input_count);
                 let mut inputs = inputs.to_vec();
                 if let Some(alignment) = &alignment {
-                    let mut alignment_inputs = boundary_operands.to_vec();
+                    let mut alignment_inputs = boundary_inputs.to_vec();
                     alignment_inputs.extend(aligned_inputs.iter().map(|&index| inputs[index].clone()));
                     let aligned = alignment.interpret_in_context(&context, alignment_inputs)?;
                     for (&index, value) in aligned_inputs.iter().zip(aligned) {
                         inputs[index] = value;
                     }
                 }
-                let mut jvp_inputs = boundary_operands.to_vec();
+                let mut jvp_inputs = boundary_inputs.to_vec();
                 jvp_inputs.extend(inputs);
                 Ok(jvp.interpret_in_context(&context, jvp_inputs)?)
             },
@@ -2728,10 +2726,9 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
     }
 }
 
-/// Returns the number of boundary operands that the provided batching levels together prepended to an operation's
-/// inputs.
-pub(super) fn boundary_operand_count<T>(levels: &[CustomRuleBatchingLevel<T>]) -> usize {
-    levels.iter().map(|level| level.boundary_operand_count).sum()
+/// Returns the number of boundary inputs that the provided batching levels together prepended to an operation's inputs.
+pub(super) fn boundary_input_count<T>(levels: &[CustomRuleBatchingLevel<T>]) -> usize {
+    levels.iter().map(|level| level.boundary_input_count).sum()
 }
 
 /// Validates that a retained rule of the custom rule set named `name` returned the `expected` output types.
@@ -2883,7 +2880,7 @@ mod tests {
                 None,
                 ShardingDimension::Replicated,
             ),
-            boundary_operand_count: 1,
+            boundary_input_count: 1,
             input_axes: vec![BatchAxis::new(0)],
             output_axes: vec![BatchAxis::new(0)],
         };
@@ -2941,8 +2938,8 @@ mod tests {
 
     #[test]
     fn test_custom_rule_definition_batched_specialization_dynamic_extent() {
-        // A first-class batch extent reaches batched specializations as a leading boundary operand, so the traced rule
-        // is batched at a level that records only the extent's type.
+        // A first-class batch extent reaches batched specializations as a leading boundary input, so the traced rule is
+        // batched at a level that records only the extent's type.
         let invocations = Arc::new(AtomicUsize::new(0));
         let definition = CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("cube")
             .with_jvp({
@@ -2968,7 +2965,7 @@ mod tests {
                 None,
                 ShardingDimension::Replicated,
             ),
-            boundary_operand_count: 1,
+            boundary_input_count: 1,
             input_axes: vec![BatchAxis::new(0)],
             output_axes: vec![BatchAxis::new(0)],
         };

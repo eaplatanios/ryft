@@ -711,9 +711,10 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// rules drive both entry points, and they differ only in what happens to the known side.
     ///
     /// The known program executes before the residual program under the global effect ordering contract of
-    /// [`PartialEvaluationContext`]. Known operands do not permit moving later effects ahead of a deferred effect,
-    /// even when their reference roots differ. This function constructs programs without executing effects. Therefore,
-    /// callers must preserve the resulting invocation order and the lifetime of any reference-valued residuals.
+    /// [`PartialEvaluationContext`]. Known instruction inputs do not permit moving later effects ahead of a deferred
+    /// effect, even when their reference roots differ. This function constructs programs without executing effects.
+    /// Therefore, callers must preserve the resulting invocation order and the lifetime of any reference-valued
+    /// residuals.
     ///
     /// # Parameters
     ///
@@ -1188,7 +1189,7 @@ mod tests {
         let program =
             builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
 
-        // The write has known operands and no outputs. Its deferred execution must still pull the allocation into
+        // The write has known inputs and no outputs. Its deferred execution must still pull the allocation into
         // each residual call, rather than retain a reference created once by the known program.
         let (partition, _) = program
             .entry_region_ref()

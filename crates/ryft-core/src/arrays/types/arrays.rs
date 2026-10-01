@@ -294,8 +294,8 @@ impl ArrayType {
     /// Returns an [`ArrayType`] whose [`Sharding`] (if any) has its unreduced and reduced axis sets cleared while its
     /// per-dimension placement and varying-manual axes are preserved. Array types with no [`Sharding`] are returned
     /// unchanged. Bilinear type-inference rules (e.g., elementwise multiplication rules) use this so the shared
-    /// elementwise broadcast does not reject operands that only disagree on their reduction state, which those
-    /// rules combine separately.
+    /// elementwise broadcast does not reject inputs that only disagree on their reduction state, which those rules
+    /// combine separately.
     #[inline]
     pub fn without_reduction_axes(&self) -> Self {
         let Some(sharding) = &self.sharding else {

@@ -24,7 +24,7 @@ define_dimension_arithmetic_operation!(
         let lower = left_lower.checked_mul(right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
                 "dimension arithmetic overflow while deriving `{DIMENSION_MUL_OPERATION_NAME}` output bounds \
-                 with operands `{left}` and `{right}`",
+                 with inputs `{left}` and `{right}`",
             ),
         })?;
         let maximum = left_maximum.saturating_mul(right_maximum).min(MAX_DIMENSION_EXTENT);
@@ -61,7 +61,7 @@ impl Mul for DimensionValue {
         let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent = self.extent().checked_mul(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
-                "dimension arithmetic overflow while multiplying dimensions with operands {}={}, {}={}",
+                "dimension arithmetic overflow while multiplying dimensions with inputs {}={}, {}={}",
                 self.r#type().variable(),
                 self.extent(),
                 right.r#type().variable(),

@@ -156,7 +156,7 @@ impl_member_interpretable_operation_for_array_ir_constant_operation!(
 impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: IotaOperation<ArrayType>) -> Self {
-        // Prefer the homogeneous member encoding for static iotas and the mixed dimension-operand encoding for dynamic
+        // Prefer the homogeneous member encoding for static iotas and the mixed dimension-input encoding for dynamic
         // output types. Explicit mixed static constructors remain valid, but canonical lifts normalize them to the
         // homogeneous form.
         if operation
@@ -211,7 +211,7 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
                 dimension.value().ok_or_else(|| {
                     TypeError::invalid(format!(
                         "cannot materialize an iota of dynamically sized type {type}; stage it in an array program \
-                         over `ArrayIrOperation`, whose `Iota` constructor consumes one dimension operand per \
+                         over `ArrayIrOperation`, whose `Iota` constructor consumes one dimension input per \
                          dynamic axis",
                     ))
                 })
@@ -404,7 +404,7 @@ mod tests {
             TypeError::invalid("`iota` dimension 2 is out of bounds for rank 2"),
         );
         assert_eq!(
-            IotaOperation::new(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])), 0,)
+            IotaOperation::new(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])), 0)
                 .unwrap_err(),
             TypeError::invalid("`iota` requires a numeric element type but has bool"),
         );
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(
             IotaOperation::new(dynamic_type, 0).unwrap().infer_output_types(&[], &[]),
             Err(TypeError::invalid(format!(
-                "`iota` cannot construct type f64[extent] without operands because it references identity {variable}",
+                "`iota` cannot construct type f64[extent] without inputs because it references identity {variable}",
             ))),
         );
     }
@@ -597,7 +597,7 @@ mod tests {
             context.iota(&dynamic_type, 0),
             Err(ProgramError::Type(TypeError::invalid(
                 "cannot materialize an iota of dynamically sized type f32[size]; stage it in an array program over \
-                 `ArrayIrOperation`, whose `Iota` constructor consumes one dimension operand per dynamic axis",
+                 `ArrayIrOperation`, whose `Iota` constructor consumes one dimension input per dynamic axis",
             ))),
         );
 
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(
             context.iota(&dynamic_type, 1).unwrap_err().to_string(),
             "cannot materialize an iota of dynamically sized type f64[dynamic, 3]; stage it in an array program over \
-             `ArrayIrOperation`, whose `Iota` constructor consumes one dimension operand per dynamic axis",
+             `ArrayIrOperation`, whose `Iota` constructor consumes one dimension input per dynamic axis",
         );
     }
 
@@ -648,7 +648,7 @@ mod tests {
         let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
         let output = context.iota(&output_type, 1).unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).unwrap(),);
+        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).unwrap());
     }
 
     #[test]
@@ -721,8 +721,8 @@ mod tests {
 
     #[test]
     fn test_iota_transposition_dynamic() {
-        // Dynamic constructors depend on their extent operands only as non-differentiable shape inputs, so every
-        // extent receives a structural zero cotangent regardless of the output cotangent being live.
+        // Dynamic constructors use their extent inputs only as non-differentiable shape information, so every extent
+        // receives a structural zero cotangent regardless of the output cotangent being live.
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
@@ -832,13 +832,13 @@ mod tests {
         assert_eq!(
             context.dynamic_iota(&output_type, 0, &[]),
             Err(TypeError::invalid(
-                "`iota` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+                "`iota` expects one dimension input per dynamic output dimension (1) but got 0 inputs",
             )
             .into()),
         );
         assert_eq!(
             context.dynamic_iota(&output_type, 0, &[ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())]),
-            Err(TypeError::invalid("`iota` operand 0 must be a dimension but has type f32[]").into()),
+            Err(TypeError::invalid("`iota` input 0 must be a dimension but has type f32[]").into()),
         );
 
         // Matching diagnostic names and bounds do not make separately created identities interchangeable.
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(
             context.dynamic_iota(&output_type, 0, &[dimension]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`iota` operand 0 has type dimension<extent ∈ [0, ∞)> but the output shape requires \
+                "`iota` input 0 has type dimension<extent ∈ [0, ∞)> but the output shape requires \
                  dimension<extent ∈ [0, ∞)>",
             ))),
         );
@@ -881,7 +881,7 @@ mod tests {
             program.interpret(vec![extent.clone()]),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap())]),
         );
-        // Transform replay retains the extent operand for both coordinates and their zero tangent.
+        // Transform replay retains the extent input for both coordinates and their zero tangent.
         assert_eq!(
             program.jvp().unwrap().interpret(vec![extent]),
             Ok(vec![

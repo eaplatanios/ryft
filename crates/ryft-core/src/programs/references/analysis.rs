@@ -32,7 +32,7 @@
 //! operation-owned local inputs and the nested region's local allocations. Only [`RegionRole::Computation`] regions
 //! are entered, because a dormant [`RegionRole::Rule`] region (e.g., a custom derivative rule) is an input to a later
 //! transform rather than an executed child of the attaching instruction, its reference-typed inputs are bound by that
-//! transform rather than by the instruction's operands, and the transform validates it separately, so the analysis
+//! transform rather than by the instruction's inputs, and the transform validates it separately, so the analysis
 //! neither enters it nor attributes its accesses to the instruction (i.e., the same rule by which
 //! [`Effects`](crate::Effects) exclude [`RegionRole::Rule`] regions).
 //!
@@ -1456,7 +1456,7 @@ impl<
     ///
     /// Transposition uses this after replaying the primal lifecycles that a transposed program recomputes (via
     /// [`RegionRef::transpose`]), because a replayed lifecycle may only have fed transpose rules that ignore their
-    /// known operands.
+    /// known inputs.
     ///
     /// # Parameters
     ///
@@ -1976,9 +1976,9 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             for (region_index, attached_id) in instruction.regions().iter().copied().enumerate() {
                 // Dormant rule regions are inputs to later transforms rather than executed children of this
                 // instruction, exactly as for effects: their reference-typed inputs are bound by the transform that
-                // instantiates them rather than by this instruction's operands, so they are neither entered nor
-                // folded into this instruction's summary. The placeholder keeps region indices aligned for output
-                // provenance, which may only name computation regions.
+                // instantiates them rather than by this instruction's inputs, so they are neither entered nor folded
+                // into this instruction's summary. The placeholder keeps region indices aligned for output provenance,
+                // which may only name computation regions.
                 if matches!(operation.region_role(region_index), Some(RegionRole::Rule | RegionRole::DeferredRule)) {
                     attached.push(AttachedRegion { id: attached_id, entering: Vec::new(), outputs: Vec::new() });
                     continue;
@@ -2808,7 +2808,7 @@ mod tests {
         build(builder, outputs)
     }
 
-    /// Builds a `scan`-like program over one reference carry `%0:ref<value<0>>` and one stacked reference operand
+    /// Builds a `scan`-like program over one reference carry `%0:ref<value<0>>` and one stacked reference input
     /// `%1:ref<value<1>>`. The body receives both complete roots.
     fn stacked_scan_program(body: TestProgram) -> TestProgram {
         let mut builder = TestBuilder::new();

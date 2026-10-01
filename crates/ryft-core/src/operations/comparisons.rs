@@ -850,19 +850,19 @@ mod tests {
             operation = CompareOperation::<ArrayType>::new(ComparisonDirection::Equal),
             cases = [{
                 input_types = [unreduced.clone(), unreduced.clone()],
-                error = "`compare` does not support unreduced operands",
+                error = "`compare` does not support unreduced inputs",
             }, {
                 input_types = [unreduced.clone(), plain.clone()],
-                error = "`compare` does not support unreduced operands",
+                error = "`compare` does not support unreduced inputs",
             }, {
                 input_types = [reduced.clone(), plain.clone()],
-                error = "`compare` operands must be reduced over the same axes",
+                error = "`compare` inputs must be reduced over the same axes",
             }, {
                 input_types = [plain.clone(), reduced.clone()],
-                error = "`compare` operands must be reduced over the same axes",
+                error = "`compare` inputs must be reduced over the same axes",
             }, {
                 input_types = [reduced.clone(), replicated],
-                error = "`compare` operands must be reduced over the same axes",
+                error = "`compare` inputs must be reduced over the same axes",
             }, {
                 input_types = [reduced.clone(), reduced.clone()],
                 output_types = [reduced.with_data_type(DataType::Boolean)],
@@ -1186,7 +1186,7 @@ mod tests {
         let unreduced = Array::from_elements(unreduced_type, &[1f32]).unwrap();
         assert_eq!(
             unreduced.equal(&unreduced),
-            Err(TypeError::invalid("`compare` does not support unreduced operands").into()),
+            Err(TypeError::invalid("`compare` does not support unreduced inputs").into()),
         );
 
         // A replicated peer cannot acquire another input's reduced state implicitly.
@@ -1196,7 +1196,7 @@ mod tests {
         let reduced = Array::from_elements(reduced_type.clone(), &[1f32]).unwrap();
         assert_eq!(
             reduced.equal(&Array::scalar(1f32).unwrap()),
-            Err(TypeError::invalid("`compare` operands must be reduced over the same axes").into()),
+            Err(TypeError::invalid("`compare` inputs must be reduced over the same axes").into()),
         );
         assert_eq!(
             reduced.equal(&reduced),

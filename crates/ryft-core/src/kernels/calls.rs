@@ -135,7 +135,7 @@ impl KernelParameter {
         let referent = if mapping.boundary_policy() == BoundaryPolicy::Masked {
             let shape = r#type
                 .static_shape()
-                .ok_or_else(|| TypeError::invalid("masked kernel windows require a static operand shape"))?;
+                .ok_or_else(|| TypeError::invalid("masked kernel windows require a static full array shape"))?;
             let valid_shape = mapping
                 .block_shape()
                 .iter()
@@ -1354,7 +1354,7 @@ mod tests {
             BoundaryPolicy::Masked,
         )
         .unwrap();
-        // Full, partial, empty, and oversized operand windows all have the same fixed logical block type.
+        // Full, partial, empty, and oversized full array windows all have the same fixed logical block type.
         for extent in [8, 4, 2, 0] {
             let full_type = ArrayType::new_static(DataType::F32, [extent])
                 .with_layout(Layout::Tiled(TiledLayout::new(vec![0], vec![])));

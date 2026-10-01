@@ -18,7 +18,7 @@ use crate::programs::types::Typed;
 /// etc.), and is not a runtime value that happens to contain zeros. Differentiation rules branch on the variant to skip
 /// work entirely. A rule that sees a zero tangent or cotangent emits no operations for it, and "zero-ness" propagates
 /// transitively through rules without ever inspecting a program or materializing a buffer. A zero is _materialized_
-/// into a real value only at boundaries where one is structurally required (e.g., a nested sub-program operand, a
+/// into a real value only at boundaries where one is structurally required (e.g., a nested sub-program input, a
 /// program output, or an eagerly returned tangent), which is also where its carried [`Type`](crate::Type) is consumed.
 #[derive(Clone, Debug, Parameter)]
 pub enum MaybeZero<V: Typed> {

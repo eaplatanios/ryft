@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_and_batching() {
-        // Check both mixed mapped/replicated operand orderings.
+        // Check both mixed mapped/replicated input orderings.
         check_operation_batching!(
             @exact,
             operation = AndOperation::new(),
@@ -951,7 +951,7 @@ mod tests {
         assert_eq!(strided.r#type().as_ref(), &strided_type);
         assert_eq!(strided.storage_bytes(), [1, 0, 1]);
 
-        // Operands must share a Boolean or integer element type.
+        // Inputs must share a Boolean or integer element type.
         for (left, right, data_types) in [
             (Array::scalar(1.0).unwrap(), Array::scalar(0.0).unwrap(), "`f64` and `f64`"),
             (Array::scalar(true).unwrap(), Array::scalar(1u8).unwrap(), "`bool` and `u8`"),

@@ -113,61 +113,63 @@ pub enum CotangentDestinationKind {
     Ignore,
 }
 
-/// Information about the cotangent destinations of an [`Instruction`] whose [`Region`] inputs mirror its operands.
-/// Non-reference operands follow their accumulation handles: requested values use [`CotangentDestinationKind::Return`],
-/// supplied buffers use [`CotangentDestinationKind::Reference`], and unrequested gradients use
-/// [`CotangentDestinationKind::Ignore`]. Known operands remain as [`CotangentDestinationKind::Return`]
-/// placeholders and are not transposed.
+/// Information about the cotangent destinations of an [`Instruction`] whose [`Region`] inputs mirror its
+/// instruction inputs. Non-reference instruction inputs follow their accumulation handles: requested values use
+/// [`CotangentDestinationKind::Return`], supplied buffers use [`CotangentDestinationKind::Reference`], and unrequested
+/// gradients use [`CotangentDestinationKind::Ignore`]. Known instruction inputs remain as
+/// [`CotangentDestinationKind::Return`] placeholders and are not transposed.
 ///
-/// Reference-state operands have a different contract. A live state cotangent passes its reference into the nested
-/// region and returns that reference by identity. An unused state cotangent uses [`CotangentDestinationKind::Ignore`],
-/// allowing the nested region to allocate temporary state only if needed. An gradient buffer for a non-reference input
-/// is updated without producing an output. [`returns_cotangent`](Self::returns_cotangent) records this distinction for
-/// reconstruction of the nested results.
+/// Reference-state instruction inputs have a different contract. A live state cotangent passes its
+/// reference into the nested region and returns that reference by identity. An unused state cotangent uses
+/// [`CotangentDestinationKind::Ignore`], allowing the nested region to allocate temporary state only if needed.
+/// A gradient buffer for a non-reference input is updated without producing an output.
+/// [`returns_cotangent`](Self::returns_cotangent) records this distinction for reconstruction of the nested results.
 ///
-/// [`kinds`](Self::kinds) and [`references`](Self::references) both follow operand order. For example, for the
-/// `condition` operation, the known predicate is omitted when selecting the branch boundary and the remaining operands
-/// keep that order. Reference-state liveness can require a nested transpose even when every non-reference output
-/// cotangent is zero.
+/// [`kinds`](Self::kinds) and [`references`](Self::references) both follow instruction input order. For example, for
+/// the `condition` operation, the known predicate is omitted when selecting the branch boundary and the remaining
+/// instruction inputs keep that order. Reference-state liveness can require a nested transpose even when every
+/// non-reference output cotangent is zero.
 #[derive(Clone, Debug)]
 pub struct CotangentDestinations<V> {
-    /// [`CotangentDestinationKind`] of every operand, in operand order.
+    /// [`CotangentDestinationKind`] of every instruction input, in input order.
     kinds: Vec<CotangentDestinationKind>,
 
-    /// Cotangent references of the [`Reference`](CotangentDestinationKind::Reference)-kind operands, in operand order.
+    /// Cotangent references of the [`Reference`](CotangentDestinationKind::Reference)-kind instruction inputs, in input
+    /// order.
     references: Vec<V>,
 
-    /// Contains a boolean value for each operand specifying whether it carries reference state,
-    /// rather than a non-reference gradient that may use a buffer.
+    /// Contains a boolean value for each instruction input specifying whether it carries reference state, rather than
+    /// a non-reference gradient that may use a buffer.
     reference_inputs: Vec<bool>,
 }
 
 impl<V> CotangentDestinations<V> {
-    /// Creates a new [`CotangentDestinations`] instance from the provided operand-ordered components.
+    /// Creates a new [`CotangentDestinations`] instance from the provided input-ordered components.
     /// Callers supply one `reference_inputs` entry per [`CotangentDestinationKind`] and one reference per
-    /// [`Reference`](CotangentDestinationKind::Reference)-kind operand, preserving operand order.
+    /// [`Reference`](CotangentDestinationKind::Reference)-kind instruction input, preserving input order.
     ///
     /// # Parameters
     ///
-    ///   - `kinds`: Destination kind of every operand.
-    ///   - `references`: Cotangent references for the `Reference`-kind operands.
-    ///   - `reference_inputs`: Whether each operand carries reference state rather than a non-reference value.
+    ///   - `kinds`: Destination kind of every instruction input.
+    ///   - `references`: Cotangent references for the `Reference`-kind instruction inputs.
+    ///   - `reference_inputs`: Whether each instruction input carries reference state rather than a non-reference
+    ///     value.
     fn new(kinds: Vec<CotangentDestinationKind>, references: Vec<V>, reference_inputs: Vec<bool>) -> Self {
         Self { kinds, references, reference_inputs }
     }
 
     /// Creates a [`CotangentDestinations`] instance for a reference-free boundary, using
     /// [`CotangentDestinationKind::Return`] for requested gradients for non-reference inputs and
-    /// [`CotangentDestinationKind::Ignore`] for the others. The mask iterator follows operand order. An all-`true`
-    /// iterator requests the conservative value-returning boundary used for `scan` operation carries and scanned
-    /// inputs.
+    /// [`CotangentDestinationKind::Ignore`] for the others. The mask iterator follows instruction input order. An
+    /// all-`true` iterator requests the conservative value-returning boundary used for `scan` operation carries and
+    /// scanned inputs.
     ///
     /// # Parameters
     ///
-    ///   - `cotangent_mask`: One boolean per operand, in operand order, specifying whether its gradient is requested.
-    ///     `true` selects [`CotangentDestinationKind::Return`], so the nested transpose returns that operand's
-    ///     cotangent. `false` selects [`CotangentDestinationKind::Ignore`], so it returns no cotangent for that
-    ///     operand. For example, `[true, false, true]` requests gradients for the first and third operands. This
+    ///   - `cotangent_mask`: One boolean per instruction input, in input order, specifying whether its gradient is
+    ///     requested. `true` selects [`CotangentDestinationKind::Return`], so the nested transpose returns that
+    ///     input's cotangent. `false` selects [`CotangentDestinationKind::Ignore`], so it returns no cotangent for
+    ///     that input. For example, `[true, false, true]` requests gradients for the first and third inputs. This
     ///     describes which gradients are needed, and not whether their values are nonzero; a requested gradient
     ///     may still be zero.
     pub fn without_references<R: IntoIterator<Item = bool>>(cotangent_mask: R) -> Self {
@@ -179,41 +181,41 @@ impl<V> CotangentDestinations<V> {
         Self::new(kinds, Vec::new(), reference_inputs)
     }
 
-    /// Returns the [`CotangentDestinationKind`] of the operand at `index`.
+    /// Returns the [`CotangentDestinationKind`] of the instruction input at `index`.
     #[inline]
     pub fn kind(&self, index: usize) -> CotangentDestinationKind {
         self.kinds[index]
     }
 
-    /// Returns the [`CotangentDestinationKind`] of every operand, in operand order.
+    /// Returns the [`CotangentDestinationKind`] of every instruction input, in input order.
     #[inline]
     pub fn kinds(&self) -> &[CotangentDestinationKind] {
         self.kinds.as_slice()
     }
 
-    /// Returns the cotangent references of the [`Reference`](CotangentDestinationKind::Reference)-kind operands,
-    /// in operand order.
+    /// Returns the cotangent references of the [`Reference`](CotangentDestinationKind::Reference)-kind instruction
+    /// inputs, in input order.
     #[inline]
     pub fn references(&self) -> &[V] {
         self.references.as_slice()
     }
 
-    /// Returns whether the operand at `index` carries reference state whose cotangent is handled by the transpose.
-    /// Known reference operands and non-reference values whose gradients use reference buffers return `false`.
+    /// Returns whether the instruction input at `index` carries reference state whose cotangent is handled by the
+    /// transpose. Known reference inputs and non-reference values whose gradients use reference buffers return `false`.
     #[inline]
     pub fn is_reference_input(&self, index: usize) -> bool {
         self.reference_inputs[index]
     }
 
-    /// Returns whether the operand at `index` has a corresponding output in the nested transposed program. A
+    /// Returns whether the instruction input at `index` has a corresponding output in the nested transposed program. A
     /// [`Return`](CotangentDestinationKind::Return) destination produces the gradient value. A reference-state input
     /// with a [`Reference`](CotangentDestinationKind::Reference) destination returns the same accumulator reference it
     /// received, so the enclosing operation can pass that state onward. A non-reference value with a `Reference`
     /// destination instead adds its gradient into the supplied buffer without returning an output. An
     /// [`Ignore`](CotangentDestinationKind::Ignore) destination produces no output.
     ///
-    /// Callers use this when matching the nested program's outputs back to the operands being transposed. Known
-    /// operands are excluded separately as their `Return` entries are placeholders and not requests for gradients.
+    /// Callers use this when matching the nested program's outputs back to the instruction inputs being transposed.
+    /// Known inputs are excluded separately as their `Return` entries are placeholders and not requests for gradients.
     #[inline]
     pub fn returns_cotangent(&self, index: usize) -> bool {
         self.kind(index) == CotangentDestinationKind::Return
@@ -353,8 +355,8 @@ impl<V: Typed> Typed for CotangentReferenceAccumulator<V> {
 }
 
 /// Handle to one non-reference input's cotangent storage in a [`TranspositionContext`]. Cloning a handle keeps the same
-/// underlying storage, so repeated operands can each contribute to one gradient value. Handles are valid only in their
-/// [`TranspositionContext`]s that created them; reference-state adjoints use the context's separate reference
+/// underlying storage, so repeated instruction inputs can each contribute to one gradient value. Handles are valid only
+/// in their [`TranspositionContext`]s that created them; reference-state adjoints use the context's separate reference
 /// operations instead.
 #[derive(Clone, Debug, Parameter)]
 pub struct CotangentAccumulator {
@@ -374,7 +376,7 @@ pub struct CotangentAccumulator {
 
 impl CotangentAccumulator {
     /// Returns whether this [`CotangentAccumulator`] needs a value cotangent. Rules can check this before constructing
-    /// an expensive contribution. Known operands and reference-state operands do not request non-reference cotangents.
+    /// an expensive contribution. Known inputs and reference-state inputs do not request non-reference cotangents.
     #[inline]
     pub fn is_needed(&self) -> bool {
         self.needed
@@ -518,7 +520,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O> {
 /// Context passed to [`TransposableOperation::transpose`] rules. It wraps the parent [`TracingContext`] into which
 /// the transposed [`Program`] is staged and owns the cotangent storage used by those rules. It dereferences to the
 /// parent so rules can stage operations directly. Each rule receives [`CotangentAccumulator`] handles aligned with
-/// its operands and accesses reference-state cotangents through this context's reference functions.
+/// its instruction inputs and accesses reference-state cotangents through this context's reference functions.
 ///
 /// [`Self::new`] supports direct rule invocations for non-reference values, including projected member rules, without
 /// reference analysis. During program transposition, the engine also installs the source region's [`ReferenceAnalysis`]
@@ -628,7 +630,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     /// [`Self::take_cotangents`].
     ///
     /// This function does not derive a cotangent type from a primal type or allocate a reference-state buffer.
-    /// Use [`Self::cotangent_accumulators`] to derive types and eligibility from rule operands, and the context's
+    /// Use [`Self::cotangent_accumulators`] to derive types and eligibility from rule inputs, and the context's
     /// reference functions to work with reference-state cotangents.
     ///
     /// # Parameters
@@ -646,13 +648,13 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     }
 
     /// Creates new cotangent storage and returns [`CotangentAccumulator`] handles aligned with `inputs` for a direct
-    /// transposition rule invocation. Each call creates independent storage. Clone a returned handle when two operand
+    /// transposition rule invocation. Each call creates independent storage. Clone a returned handle when two input
     /// positions must share their contributions.
     ///
     /// # Parameters
     ///
-    ///   - `inputs`: The rule's operands in operand order, each carrying either a known primal value or the type of
-    ///     an unknown value. One handle is returned per operand, including operands whose cotangent is not requested.
+    ///   - `inputs`: The rule's instruction inputs in order, each carrying either a known primal value or the type of
+    ///     an unknown value. One handle is returned per input, including inputs whose cotangent is not requested.
     ///     Known values must belong to this context's parent trace.
     ///   - `cotangent_mask`: Whether a value cotangent is needed for each input, in the same order as `inputs`.
     ///     An empty slice requests cotangents for all eligible inputs. Otherwise, it must have exactly one flag per
@@ -699,7 +701,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
 
     /// Returns the retained [`ReferenceAnalysis`] of the source region's reference roots, views, and accesses, or
     /// [`None`] when the context is detached or the region closure contains no references. The analysis accounts for
-    /// which reference inputs may be consumed by this invocation. Retaining it keeps operand resolution and access
+    /// which reference inputs may be consumed by this invocation. Retaining it keeps input resolution and access
     /// checks consistent throughout the reverse mode differentiation sweep.
     #[inline]
     pub fn reference_analysis(&self) -> Option<&Arc<ReferenceAnalysis>> {
@@ -716,7 +718,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     /// different. A slice's length does not necessarily supply the length of its root buffer, so view indices alone
     /// are insufficient. Zero materialization searches these values for the dimension identities it needs.
     ///
-    /// A transpose rule can chain its known operands after these sources and pass the resulting iterator to
+    /// A transpose rule can chain its known inputs after these sources and pass the resulting iterator to
     /// [`ResidualZeroProvider::materialize_zero_from_residual_sources`] when it needs a concrete zero, for example
     /// to clear the state cotangent when transposing a reference write or swap operation.
     #[inline]
@@ -724,7 +726,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         self.dimension_sources.iter()
     }
 
-    /// Returns the cotangent reference of the reference-typed operand at `input_index` of the current instruction,
+    /// Returns the cotangent reference of the reference-typed input at `input_index` of the current instruction,
     /// allocating the root's accumulator with a zero initial value first when it is still unallocated. This lookup
     /// serves rules that must produce a cotangent reference regardless of prior use: the transposes of the
     /// `reference_read` and `reference_freeze` operations accumulate a live output cotangent into it, `reference_swap`
@@ -733,8 +735,8 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     /// # Parameters
     ///
     ///   - `driver`: [`TranspositionDriver`] for the source instruction whose cotangents are being processed.
-    ///     Reference operands require a source region consistent with this context's reference analysis.
-    ///   - `input_index`: Position of the reference input/operand among the current instruction's inputs/operands.
+    ///     Reference inputs require a source region consistent with this context's reference analysis.
+    ///   - `input_index`: Position of the reference input among the current instruction's inputs.
     ///
     /// # Errors
     ///
@@ -776,8 +778,8 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     /// # Parameters
     ///
     ///   - `driver`: [`TranspositionDriver`] for the source instruction whose cotangents are being processed.
-    ///     Reference operands require a source region consistent with this context's reference analysis.
-    ///   - `input_index`: Position of the reference input/operand among the current instruction's inputs/operands.
+    ///     Reference inputs require a source region consistent with this context's reference analysis.
+    ///   - `input_index`: Position of the reference input among the current instruction's inputs.
     ///
     /// # Errors
     ///
@@ -798,9 +800,9 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         }
     }
 
-    /// Resolves the reference-typed input/operand at `input_index` of the current instruction to the [`InstructionId`]
-    /// of that instruction, the operand's [`ValueId`], and its canonical linear [`ReferenceRoot`], rejecting operands
-    /// that are not linear reference operands of the region.
+    /// Resolves the reference-typed input at `input_index` of the current instruction to the [`InstructionId`] of that
+    /// instruction, the input's [`ValueId`], and its canonical linear [`ReferenceRoot`], rejecting inputs that are not
+    /// linear reference inputs of the region.
     fn reference_input<D: TranspositionDriver<V, O>>(
         &self,
         driver: &D,
@@ -815,7 +817,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         };
         let atom = instruction.inputs().get(input_index).copied().ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
-                "input {} is out of range for `{}` with {} operands",
+                "input {} is out of range for `{}` with {} inputs",
                 input_index,
                 instruction.operation().name(),
                 instruction.inputs().len(),
@@ -832,7 +834,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         if !self.reference_accumulators.contains_key(&root) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "operand {} of `{}` denotes a known reference; transposing a linear access to a known \
+                    "input {} of `{}` denotes a known reference; transposing a linear access to a known \
                      reference is not supported",
                     input_index,
                     instruction.operation().name(),
@@ -866,7 +868,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         let expected = region.atoms()[value.atom().index()].r#type().cotangent()?;
         if reference.r#type().as_ref() != &expected {
             return Err(ProgramError::MalformedProgram(format!(
-                "the cotangent reference of reference operand {:?} has type {} but the operand's cotangent type is {}",
+                "the cotangent reference of reference input {:?} has type {} but the input's cotangent type is {}",
                 value,
                 reference.r#type().as_ref(),
                 expected,
@@ -876,21 +878,21 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         Ok(reference)
     }
 
-    /// Resolves the [`CotangentDestinations`] of the instruction whose operands are described by `inputs`. A linear
-    /// reference operand receives [`CotangentDestinationKind::Reference`] when its root already has a cotangent buffer,
+    /// Resolves the [`CotangentDestinations`] of the instruction whose inputs are described by `inputs`. A linear
+    /// reference input receives [`CotangentDestinationKind::Reference`] when its root already has a cotangent buffer,
     /// or when the instruction reads, swaps, or consumes that root, directly or in a nested [`Region`]. Its buffer is
-    /// obtained through [`Self::cotangent_reference`], allocating it if needed. Other linear reference operands receive
+    /// obtained through [`Self::cotangent_reference`], allocating it if needed. Other linear reference inputs receive
     /// [`CotangentDestinationKind::Ignore`], avoiding an allocation when the instruction only writes into a root whose
     /// state cotangent is zero. Structured operations such as `scan` and `condition` use these destinations to pass
-    /// buffers and value cotangents into their transposed regions in operand order.
+    /// buffers and value cotangents into their transposed regions in instruction input order.
     ///
     /// # Parameters
     ///
     ///   - `driver`: [`TranspositionDriver`] for the source instruction whose cotangents are being processed.
-    ///     Reference operands require a source region consistent with this context's reference analysis.
-    ///   - `inputs`: The [`Instruction`]'s inputs/operands in order. Each entry contains either a known primal value
-    ///     or the type of an unknown value whose cotangent is being propagated.
-    ///   - `accumulators`: [`CotangentAccumulator`]s in input/operand order. Empty requests returned non-reference
+    ///     Reference inputs require a source region consistent with this context's reference analysis.
+    ///   - `inputs`: The [`Instruction`]'s inputs in order. Each entry contains either a known primal value or the type
+    ///     of an unknown value whose cotangent is being propagated.
+    ///   - `accumulators`: [`CotangentAccumulator`]s in instruction input order. Empty requests returned non-reference
     ///     cotangents (i.e., cotangents of non-reference values), used when a nested recurrence must compute carry
     ///     gradients independently of the outer requested outputs.
     pub fn cotangent_destinations<D: TranspositionDriver<V, O>>(
@@ -910,7 +912,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     {
         if !accumulators.is_empty() {
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-            // Validate every handle, including ignored and known operands, before resolving any reference state.
+            // Validate every handle, including ignored and known inputs, before resolving any reference state.
             accumulators.iter().try_for_each(|accumulator| self.cotangent_storage(accumulator).map(|_| ()))?;
         }
 
@@ -918,10 +920,10 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         let kinds = inputs
             .iter()
             .enumerate()
-            .map(|(operand_index, input)| {
+            .map(|(input_index, input)| {
                 Ok(match input {
                     PartialValue::Unknown(r#type) if r#type.is_reference() => {
-                        let (id, _, root) = self.reference_input(driver, operand_index)?;
+                        let (id, _, root) = self.reference_input(driver, input_index)?;
                         // An existing buffer carries state cotangents from later instructions; even a write operation
                         // must receive it. Otherwise, reads, swaps, or consumes in this instruction or its nested
                         // regions can introduce a state cotangent, so they also need a shared buffer. Pure writes into
@@ -940,14 +942,14 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
                                 })
                             });
                         if needs_reference {
-                            references.push(self.cotangent_reference(driver, operand_index)?);
+                            references.push(self.cotangent_reference(driver, input_index)?);
                             CotangentDestinationKind::Reference
                         } else {
                             CotangentDestinationKind::Ignore
                         }
                     }
                     PartialValue::Unknown(_) if !accumulators.is_empty() => {
-                        let accumulator = &accumulators[operand_index];
+                        let accumulator = &accumulators[input_index];
                         if !accumulator.is_needed() {
                             CotangentDestinationKind::Ignore
                         } else if let Some(reference) = accumulator.reference(self)? {
@@ -1034,7 +1036,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ///   - `driver`: [`TranspositionDriver`] identifying the current source instruction. It must identify the
     ///     instruction that allocated the reference and not a later instruction that reads or updates it.
     ///   - `output_index`: Position of the allocating output among that instruction's outputs. This identifies a
-    ///     reference allocation, not a value cotangent handle or an operand index.
+    ///     reference allocation, not a value cotangent handle or an input index.
     ///
     /// # Errors
     ///
@@ -1777,7 +1779,7 @@ pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDri
     ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError>;
 
     /// Returns the source scope for this rule invocation that consists of its containing [`Region`], [`InstructionId`],
-    /// and [`Instruction`]. Reference rules use this scope to resolve operand positions to primal values and reference
+    /// and [`Instruction`]. Reference rules use this scope to resolve input positions to primal values and reference
     /// views. The source instruction is distinct from its attached child regions exposed by [`RegionDriver::regions`].
     ///
     /// Drivers for detached rules may return [`None`], which is the default. A driver that provides a source scope
@@ -1885,9 +1887,9 @@ impl<
 /// instruction in reverse program order, these rules compute the Vector-Jacobian Product (VJP) `x̄ = (∂f/∂x)(x)ᵀ · ȳ`
 /// that reverse mode differentiation is built on. Cotangents flow symbolically as [`MaybeZero`]s: rules may reuse
 /// existing cotangents, omit structural-zero contributions, or stage additional linear operations in the active
-/// [`TracingContext`]. The rule does not receive concrete primal values. Instead, it receives each input's/operand's
-/// [`PartialValue`] knowledge (i.e., its [`Type`] when the operand is linear, or the staged [`Tracer`] carrying its
-/// runtime value when the operand is a known factor) and any further metadata must be encoded in the operation itself.
+/// [`TracingContext`]. The rule does not receive concrete primal values. Instead, it receives each input's
+/// [`PartialValue`] knowledge (i.e., its [`Type`] when the input is linear, or the staged [`Tracer`] carrying its
+/// runtime value when the input is a known factor) and any further metadata must be encoded in the operation itself.
 ///
 /// Refer to the documentation of [`Program::transpose`] for more information on what _transposition_ means here and
 /// how it relates to the algebraic notion of transposition.
@@ -1977,20 +1979,20 @@ impl<
 /// }
 /// ```
 pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation<Type = V::Type> {
-    /// Applies this operation's transpose rule to symbolic output cotangents, accumulating `x̄ = Lᵀ(ȳ)` for the
-    /// linear map `y = L(x)`. Each operand has an opaque [`CotangentAccumulator`], and the implementor must check
-    /// [`is_needed`](CotangentAccumulator::is_needed) before computing an expensive contribution, and then submit
-    /// it with [`accumulate`](CotangentAccumulator::accumulate). A rule may submit multiple contributions or none.
-    /// Repeated operands can share storage, so each operand's mathematical contribution must be submitted
-    /// independently. Unneeded accumulators do not suppress unrelated obligations. Specifically, an operation
-    /// that carries deferred work (refer to the [Deferred Work](crate::Effects#deferred-work) section of the
-    /// [`Effects`](crate::Effects) documentation for more information on what that is) is still transposed
-    /// with ignored destinations and structural-zero seeds, so that its retained rule runs.
+    /// Applies this operation's transpose rule to symbolic output cotangents, accumulating `x̄ = Lᵀ(ȳ)` for the linear
+    /// map `y = L(x)`. Each input has an opaque [`CotangentAccumulator`], and the implementor must check
+    /// [`is_needed`](CotangentAccumulator::is_needed) before computing an expensive contribution, and then submit it
+    /// with [`accumulate`](CotangentAccumulator::accumulate). A rule may submit multiple contributions or none.
+    /// Repeated inputs can share storage, so each input's mathematical contribution must be submitted independently.
+    /// Unneeded accumulators do not suppress unrelated obligations. Specifically, an operation that carries deferred
+    /// work (refer to the [Deferred Work](crate::Effects#deferred-work) section of the [`Effects`](crate::Effects)
+    /// documentation for more information on what that is) is still transposed with ignored destinations and
+    /// structural-zero seeds, so that its retained rule runs.
     ///
     /// A rule capable of updating a gradient buffer directly can query [`reference`](CotangentAccumulator::reference).
     /// For example, a slice rule can add its output cotangent into a view of that buffer instead of constructing a
     /// full-sized padded gradient. When no buffer is available, it uses its value formula. Handles expose whether a
-    /// cotangent is needed and its optional storage without changing which primal operands are linear or known.
+    /// cotangent is needed and its optional storage without changing which primal inputs are linear or known.
     ///
     /// Rules must be deterministic structural functions of their inputs (i.e., of this operation, the input knowledge,
     /// the output cotangents, and the attached regions reachable through `driver`), because the programs derived from
@@ -2002,7 +2004,7 @@ pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operati
     /// # Parameters
     ///
     ///   - `context`: Active [`TranspositionContext`], which dereferences to the [`TracingContext`] in which rules
-    ///     stage additional linear operations. Reference-state rules access the instruction's reference operands
+    ///     stage additional linear operations. Reference-state rules access the instruction's reference inputs
     ///     through this context; their state updates do not use the `accumulators` handles.
     ///   - `driver`: Call-scoped nested-region [`TranspositionDriver`] for the current instruction.
     ///   - `inputs`: Per-input [`PartialValue`] knowledge, in operation input order. A [`PartialValue::Unknown`]
@@ -2017,9 +2019,9 @@ pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operati
     ///   - `outputs`: Symbolic cotangents for the instruction's outputs, in operation output order. A reference-typed
     ///     output never carries a live cotangent (its state cotangent lives in the accumulator of the root it forwards)
     ///     and always arrives as a structural zero.
-    ///   - `accumulators`: [`CotangentAccumulator`]s, one per input in operand order, owned by `context`. Known,
-    ///     ignored, and reference-state operands have unneeded handles. Contributions must have the operand's cotangent
-    ///     type and belong to this context's builder, including when the handle is unneeded.
+    ///   - `accumulators`: [`CotangentAccumulator`]s, one per input in operation input order, owned by `context`.
+    ///     Known, ignored, and reference-state inputs have unneeded handles. Contributions must have the input's
+    ///     cotangent type and belong to this context's builder, including when the handle is unneeded.
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TranspositionContext<V, O>,
@@ -2052,7 +2054,7 @@ pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>:
     ///
     ///   - `context`: Active [`TranspositionContext`] for the enclosing operation family, which dereferences to the
     ///     [`TracingContext`] in which rules stage additional linear operations. Reference-state rules access the
-    ///     instruction's reference operands through this context; their state updates do not use the `accumulators`
+    ///     instruction's reference inputs through this context; their state updates do not use the `accumulators`
     ///     handles.
     ///   - `driver`: Call-scoped nested-region [`TranspositionDriver`] for the current instruction, exposing attached
     ///     regions in the enclosing operation family.
@@ -2064,9 +2066,9 @@ pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>:
     ///   - `outputs`: Symbolic cotangents for the instruction's outputs, in operation output order, expressed using
     ///     the enclosing family's tracers. A reference-typed output never carries a live cotangent (its state cotangent
     ///     lives in the accumulator of the root it forwards) and always arrives as a structural zero.
-    ///   - `accumulators`: [`CotangentAccumulator`]s, one per input in operand order, owned by `context`. Known,
-    ///     ignored, and reference-state operands have unneeded handles. Contributions must have the operand's cotangent
-    ///     type and belong to this context's builder, including when the handle is unneeded.
+    ///   - `accumulators`: [`CotangentAccumulator`]s, one per input in operation input order, owned by `context`.
+    ///     Known, ignored, and reference-state inputs have unneeded handles. Contributions must have the input's
+    ///     cotangent type and belong to this context's builder, including when the handle is unneeded.
     fn transpose_in_parent<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TranspositionContext<V, O>,
@@ -2292,7 +2294,7 @@ impl<
                         }
                         if *linear.get(current.index()).ok_or(ProgramError::UnboundAtomId { id: current })? {
                             return Err(ProgramError::MalformedProgram(
-                                "a linear atom was requested as a known transpose operand".to_string(),
+                                "a linear atom was requested as a known transpose input".to_string(),
                             ));
                         }
                         let source =
@@ -2451,10 +2453,10 @@ impl<
         // Stage the pullback into a fresh tracing context's builder, and reserve the main structural vectors up
         // front. These are conservative lower bounds that cover cotangent inputs, one instruction per reversed primal
         // instruction, and possible zero outputs for disconnected primal inputs. The context is scoped to this region
-        // so that reference rules can reach the accumulators of their operands. A linear input represents tangent state
-        // owned by this invocation and may be consumed by its source program. Known residual references remain
-        // borrowed. Transposition replaces consumption with accumulation into the input's cotangent reference,
-        // so the caller's cotangent destination remains live after replay.
+        // so that reference rules can reach the accumulators of their inputs. A linear program input represents tangent
+        // state owned by this invocation and may be consumed by its source program. Known residual references remain
+        // borrowed. Transposition replaces consumption with accumulation into the input's cotangent reference, so the
+        // caller's cotangent destination remains live after replay.
         let consumable_inputs = self
             .input_ids()
             .iter()
@@ -2503,7 +2505,7 @@ impl<
         // a root through its handle would observe the root's state when the pullback runs rather than at its primal
         // position, so it is rejected. Otherwise, the lifecycle instructions that transpose rules may need are replayed
         // into the pullback as one slice, in program order, the first time any of their values is materialized. Rules
-        // may need the known operands of every instruction that the reverse walk may visit.
+        // may need the known inputs of every instruction that the reverse walk may visit.
         let instruction_by_output = self.region().instruction_by_output();
         let lifecycles = analysis
             .as_deref()
@@ -2769,8 +2771,8 @@ impl<
             // the instruction cannot contribute to any input cotangent. Reads and consumes are driven by their output
             // adjoints alone, while stores, swaps, accumulations, and allocations are driven by the state of their
             // root's accumulator, because their transposes produce value cotangents from the accumulator even though
-            // they have no Single Static Assignment (SSA) outputs. This is the only operand-side guard. A live
-            // transpose rule may read non-linear operands; pure known producer subgraphs are materialized lazily below,
+            // they have no Single Static Assignment (SSA) outputs. This is the only input-side guard. A live
+            // transpose rule may read non-linear inputs; pure known producer subgraphs are materialized lazily below,
             // while effectful known producers are rejected rather than duplicated or reordered in the pullback.
             let mut has_output_adjoint = false;
             for output in instruction.outputs().iter().copied() {
@@ -2840,9 +2842,9 @@ impl<
                 .collect::<Vec<_>>();
             let instruction_output_cotangents = context.take_cotangents(&output_accumulators)?;
 
-            // Prepare the primitive rule's primal knowledge separately from its cotangent mask. Each input/operand
-            // becomes a self-describing `PartialValue`: a linear operand is `Unknown` of its type (the rule produces
-            // a cotangent of that type), and a known operand is `Known` of the tracer reading its pullback value atom
+            // Prepare the primitive rule's primal knowledge separately from its cotangent mask. Each instruction input
+            // becomes a self-describing `PartialValue`: a linear input is `Unknown` of its type (the rule produces
+            // a cotangent of that type), and a known input is `Known` of the tracer reading its pullback value atom
             // from `known_map`. Known inputs are seeded above, constants are copied lazily, and pure known
             // intermediates iteratively replay their producer subgraphs exactly once before the rule runs.
             let inputs = instruction
@@ -2890,7 +2892,7 @@ impl<
                 );
             }
 
-            let operand_accumulators = instruction
+            let input_accumulators = instruction
                 .inputs()
                 .iter()
                 .map(|input| atom_accumulators[input.index()].clone())
@@ -2904,7 +2906,7 @@ impl<
                     &transposition_driver,
                     inputs.as_slice(),
                     instruction_output_cotangents.as_slice(),
-                    &operand_accumulators,
+                    &input_accumulators,
                 )
             })?;
         }
@@ -2969,14 +2971,15 @@ impl<
                             })
                         })
                         .collect::<Result<Vec<_>, ProgramError>>()?;
-                    let (operation, operands) = O::zero_operation_with_residuals(cotangent_type, residuals.as_slice())?;
-                    outputs.push(builder_borrow.add_instruction(operation, Vec::new(), operands, None)?[0]);
+                    let (operation, zero_inputs) =
+                        O::zero_operation_with_residuals(cotangent_type, residuals.as_slice())?;
+                    outputs.push(builder_borrow.add_instruction(operation, Vec::new(), zero_inputs, None)?[0]);
                 }
             }
         }
 
         // Record the pullback allocations of the replayed known lifecycles, whose observations may have fed only rules
-        // that ignore their known operands.
+        // that ignore their known inputs.
         let replayed_allocations = known_lifecycles
             .slice
             .iter()
@@ -3019,7 +3022,7 @@ impl<
     /// per-atom linearity mask together with the linear local roots.
     ///
     /// A program input is linear when it has a selected destination kind, and a constant is always known. An
-    /// instruction result is linear when any of its operands is linear, or when the instruction accesses the state of
+    /// instruction result is linear when any of its inputs is linear, or when the instruction accesses the state of
     /// a linear root, directly or inside its attached computation regions. A reference allocated by an instruction of
     /// this region is linear state (e.g., a tangent reference) when a linear value flows into it, either as its initial
     /// value or through a value that a later instruction stores into it (including another linear root's contents).
@@ -3058,7 +3061,7 @@ impl<
 
                 // The handle of a local root is linear exactly when its root is, which may have changed since the
                 // handle was produced.
-                let operands = instruction
+                let inputs = instruction
                     .inputs()
                     .iter()
                     .map(|input| {
@@ -3072,13 +3075,13 @@ impl<
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 let accesses_linear_state =
                     access.is_some_and(|access| access.roots().any(|root| linear_roots.contains(&root)));
-                let result_is_linear = operands.iter().any(|(_, is_linear)| *is_linear) || accesses_linear_state;
+                let result_is_linear = inputs.iter().any(|(_, is_linear)| *is_linear) || accesses_linear_state;
 
                 // A mutated local root becomes linear when a linear value other than its own handle flows into it.
                 if let Some(access) = access {
                     for root in access.roots().filter(|root| is_local(*root) && access.is_mutated(*root)) {
                         let receives_linear_value =
-                            operands.iter().any(|(operand_root, is_linear)| *is_linear && *operand_root != Some(root))
+                            inputs.iter().any(|(input_root, is_linear)| *is_linear && *input_root != Some(root))
                                 || access.roots().any(|other| other != root && linear_roots.contains(&other));
                         if receives_linear_value {
                             linear_roots.insert(root);
@@ -3173,10 +3176,10 @@ where
     ///
     /// Linearity is propagated forward from the program inputs: a program-input [`Atom`] is linear exactly when its
     /// index appears in `input_indices`, constant atoms are always known, and an operation result is linear when any
-    /// of its operands is linear. Local reference allocations are always treated as linear state, including allocations
+    /// of its inputs is linear. Local reference allocations are always treated as linear state, including allocations
     /// initialized from known zeros; their stores and reads participate in the reverse sweep through
     /// [`CotangentAccumulator`]s. Each operation's [`transpose`](TransposableOperation::transpose) rule
-    /// receives the per-operand linearity knowledge derived from this propagation.
+    /// receives the per-input linearity knowledge derived from this propagation.
     ///
     /// For programs with no reference inputs or outputs, the pullback's inputs are the cotangents of this program's
     /// outputs followed by the runtime values of the known inputs (in program-input order). Its outputs are the
@@ -3591,8 +3594,8 @@ where
 }
 
 /// Applies a member operation's transpose rule through a projected view of a composite [`TracingContext`]. Use this
-/// function from a composite operation dispatcher when the linear operation is [`Region`]-free and every operand and
-/// result belongs to the same projectable member type `T`. Because [`TransposableOperation`] rules stage through a
+/// function from a composite operation dispatcher when the linear operation is [`Region`]-free and every input and
+/// output belongs to the same projectable member type `T`. Because [`TransposableOperation`] rules stage through a
 /// member-typed [`TracingContext`], this function records the rule in a short-lived member program, converts that
 /// program to the composite type, and splices it into the active trace. Known primal inputs and live output cotangents
 /// become splice inputs in encounter order; structural zeros remain types and do not materialize values. The member
@@ -3609,7 +3612,7 @@ where
 ///
 ///   - `context`: Active composite [`TranspositionContext`] into which the projected transpose program is spliced.
 ///   - `operation`: Region-free linear operation expressed in the projected member operation family.
-///   - `inputs`: Per-operand primal knowledge, preserving whether each primal is known or is a linear unknown.
+///   - `inputs`: Per-input primal knowledge, preserving whether each primal is known or is a linear unknown.
 ///   - `outputs`: Composite output cotangents, represented as live traced values or structural zeros.
 ///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by `context`.
 pub fn transpose_projected_operation<
@@ -3649,7 +3652,7 @@ where
 
     // Build the member rule's boundary and the matching source atoms together. Unknown primals contribute only their
     // projected types. Known primals become leading member-program inputs and their composite atoms become the leading
-    // splice inputs, preserving the transposition rule's operand order. Validate builder ownership before taking atom
+    // splice inputs, preserving the transposition rule's input order. Validate builder ownership before taking atom
     // IDs: the same index in another trace names an unrelated value.
     let mut splice_inputs = Vec::new();
     let rule_inputs = inputs
@@ -3726,21 +3729,21 @@ where
 }
 
 /// Applies a member operation's transpose rule to an instruction whose parent boundary is _mixed_, meaning that the
-/// instruction consumes its `T`-typed member operands together with operands belonging to other members of the parent
+/// instruction consumes its `T`-typed member inputs together with inputs belonging to other members of the parent
 /// type universe (e.g., the first-class dimensions that supply a dynamic result shape), in any arrangement. Use this
 /// function from a composite operation dispatcher for a [`Region`]-free payload that keeps its native member operation
 /// type while its instruction crosses member kinds.
 ///
-/// Each operand is classified individually rather than by position. An operand whose type projects into `T` is a _data_
-/// operand and every other operand is a parent-universe shape operand. The data operands, in operand order, are
+/// Each instruction input is classified individually rather than by position. An input whose type projects into `T`
+/// is a _data_ input and every other input is a parent-universe shape input. The data inputs, in input order, are
 /// delegated to the payload's homogeneous [`TransposableOperation`] rule through [`transpose_projected_operation`],
-/// together with their corresponding accumulator handles. Shape operands only select the result shape and carry no
-/// differential contribution, so they receive no contribution. This classification makes the helper independent of how
-/// the two operand kinds are arranged, so it handles interleaved signatures exactly like the "data-operands-first"
-/// arrangement every current payload uses. A payload with no data operands at all (i.e., a dynamic constructor whose
-/// operands are all extents) is a constant linear map, so no member rule runs.
+/// together with their corresponding accumulator handles. Shape inputs only select the result shape and carry no
+/// differential contribution, so they receive no contribution. This classification makes the helper independent of
+/// how the two input kinds are arranged, so it handles interleaved signatures exactly like the "data-inputs-first"
+/// arrangement every current payload uses. A payload with no data inputs at all (i.e., a dynamic constructor whose
+/// inputs are all extents) is a constant linear map, so no member rule runs.
 ///
-/// Delegating reconstructs the member instruction from type metadata alone, so a mixed instruction whose operands carry
+/// Delegating reconstructs the member instruction from type metadata alone, so a mixed instruction whose inputs carry
 /// runtime (i.e., [`Reference`](TypeIdentityPosition::Reference)-position) identities is rejected. Recovering that
 /// runtime-dependent type metadata requires linearization, which retains the relevant primal information as explicit
 /// residuals.
@@ -3749,8 +3752,8 @@ where
 ///
 ///   - `context`: Active composite [`TranspositionContext`] the delegated member rule is spliced into.
 ///   - `operation`: Region-free linear member operation whose instruction has a mixed parent boundary. Its homogeneous
-///     rule sees exactly the data operands, in the order they appear in the mixed instruction.
-///   - `inputs`: Per-operand primal knowledge in the mixed instruction's operand order.
+///     rule sees exactly the data inputs, in the order they appear in the mixed instruction.
+///   - `inputs`: Per-input primal knowledge in the mixed instruction's input order.
 ///   - `outputs`: Composite output cotangents, represented as live traced values or structural zeros.
 ///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by `context`.
 pub fn transpose_mixed_operation<
@@ -3773,9 +3776,9 @@ where
     check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
     accumulators.iter().try_for_each(|accumulator| context.cotangent_storage(accumulator).map(|_| ()))?;
 
-    // Classify each operand by whether its type projects into the member universe. Data operands keep their operand
-    // order so the delegated member rule sees the same boundary it would see in a homogeneous instruction. Filter
-    // handles alongside inputs to preserve the association between each operand and its enclosing storage.
+    // Classify each input by whether its type projects into the member universe. Data inputs keep their input order so
+    // the delegated member rule sees the same boundary it would see in a homogeneous instruction. Filter handles
+    // alongside inputs to preserve the association between each input and its enclosing storage.
     let (data_inputs, data_accumulators): (Vec<_>, Vec<_>) = inputs
         .iter()
         .zip(accumulators)
@@ -3783,15 +3786,15 @@ where
         .map(|(input, accumulator)| (input.clone(), accumulator.clone()))
         .unzip();
 
-    // A mixed instruction with no member-typed operands stages a value that does not depend on any of them, so every
-    // operand receives a structural zero and the member rule is never consulted.
+    // A mixed instruction with no member-typed inputs stages a value that does not depend on any of them, so every
+    // input receives a structural zero and the member rule is never consulted.
     if data_inputs.is_empty() {
         return Ok(());
     }
 
-    // The delegated member rule sees only the member-typed operands, so it must be able to derive every cotangent shape
-    // from those operands alone. A runtime identity anywhere in the mixed signature means the runtime shape information
-    // lives in the parent-universe operands instead, and only linearization can retain it.
+    // The delegated member rule sees only the member-typed inputs, so it must be able to derive every cotangent shape
+    // from those inputs alone. A runtime identity anywhere in the mixed signature means the runtime shape information
+    // lives in the parent-universe inputs instead, and only linearization can retain it.
     if inputs
         .iter()
         .any(|input| input.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference))
@@ -4032,7 +4035,7 @@ pub(crate) mod tests {
         /// Effectful passthrough used to verify that known-side producer replay never duplicates observable effects.
         EffectfulIdentity,
 
-        /// Effectful single-input sink without outputs, used to verify that a non-state effect over a linear operand
+        /// Effectful single-input sink without outputs, used to verify that a non-state effect over a linear input
         /// contributes no cotangent and is dropped from the pullback rather than rejected.
         EffectfulSink,
 
@@ -4043,7 +4046,7 @@ pub(crate) mod tests {
         /// Two-input addition used to verify cotangent accumulation through repeated primal inputs.
         Add,
 
-        /// Named linear rule with a runtime coefficient followed by its linear operand. Its transpose is retained
+        /// Named linear rule with a runtime coefficient followed by its linear input. Its transpose is retained
         /// as executable Rust behavior rather than an attached backward program or captured closure.
         ScaleLinear,
 
@@ -4398,7 +4401,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_cotangent_destinations_without_references() {
-        // A universe without references resolves every operand to the `Return` kind.
+        // A universe without references resolves every instruction input to the `Return` kind.
         let cotangents = CotangentDestinations::<ReferenceTestTracer>::without_references([true; 3]);
         assert_eq!(cotangents.kinds(), &[CotangentDestinationKind::Return; 3]);
         assert!(cotangents.references().is_empty());
@@ -4618,7 +4621,7 @@ pub(crate) mod tests {
         );
         let sum = builder.instructions()[1].outputs()[0];
         drop(builder);
-        // Aliased handles share the sum, rather than consuming a contribution once per operand occurrence.
+        // Aliased handles share the sum, rather than consuming a contribution once per input occurrence.
         let values = context.take_cotangents(&[accumulator.clone(), accumulator.clone()]).unwrap();
         assert_eq!(values[0].as_value().unwrap().atom_id().unwrap(), sum);
         assert_eq!(values[1].as_value().unwrap().atom_id().unwrap(), sum);
@@ -4682,7 +4685,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_transposition_context_new() {
-        // A driver without a source instruction cannot identify reference operands or allocating outputs.
+        // A driver without a source instruction cannot identify reference inputs or allocating outputs.
         let driver = EmptyRegionDriver;
         let mut context =
             TranspositionContext::new(TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new());
@@ -4807,7 +4810,7 @@ pub(crate) mod tests {
         let first_driver = RecursiveTranspositionDriver::new(region, 0).unwrap();
         let second_driver = RecursiveTranspositionDriver::new(region, 1).unwrap();
 
-        // Operand zero names different roots in these instructions. Each driver preserves its source scope even
+        // Input zero names different roots in these instructions. Each driver preserves its source scope even
         // when the same context serves interleaved lookups for both instructions.
         assert_eq!(context.cotangent_reference(&first_driver, 0).unwrap().atom_id(), first_destination.atom_id());
         assert_eq!(context.cotangent_reference(&second_driver, 0).unwrap().atom_id(), second_destination.atom_id());
@@ -4877,7 +4880,7 @@ pub(crate) mod tests {
             PartialValue::Unknown(scalar_type.clone()),
         ];
 
-        // With an unallocated accumulator and no read anywhere in the branches, the reference operand's state cotangent
+        // With an unallocated accumulator and no read anywhere in the branches, the reference input's state cotangent
         // is provably zero: it resolves to the `Ignore` kind and nothing is allocated.
         context.reference_accumulators.insert(
             root,
@@ -5725,7 +5728,7 @@ pub(crate) mod tests {
         assert_eq!(returned.instructions()[0].inputs(), &[AtomId::new(1), AtomId::new(0)]);
         assert_eq!(returned.output_ids(), &[AtomId::new(2)]);
 
-        // Demand is chosen only after importing the same source rule. Ignoring its linear operand emits no rule work
+        // Demand is chosen only after importing the same source rule. Ignoring its linear input emits no rule work
         // and does not manufacture a scratch reference. This fixture does not model nonlinear VJP registration.
         let ignored = region.transpose(&[1], &[], &[CotangentDestinationKind::Ignore]).unwrap();
         assert!(ignored.instructions().is_empty());
@@ -5928,7 +5931,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_program_transpose_repeated_operands() {
+    fn test_program_transpose_repeated_inputs() {
         // Test that repeated uses of one input accumulate their cotangent contributions through a staged `add`.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -6426,7 +6429,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_program_transpose_with_respect_to_drops_effectful_sink() {
-        // An effectful *sink* over a linear operand (e.g., an I/O sink over a tangent) has no linear output and touches
+        // An effectful *sink* over a linear input (e.g., an I/O sink over a tangent) has no linear output and touches
         // no reference state, so it contributes no cotangent: the dead-edge skip drops it from the pullback instead of
         // the effect gate rejecting it, and the surrounding linear program stays transposable.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
@@ -6472,7 +6475,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_program_transpose_with_respect_to_non_reference_destinations() {
-        // A repeated operand submits both contributions to the same buffer. Destination arguments retain primal
+        // A repeated input submits both contributions to the same buffer. Destination arguments retain primal
         // input order even when the selection is reversed; returned cotangents follow the selection order instead.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let first = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
@@ -7256,8 +7259,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_program_transpose_with_respect_to_removes_unobserved_known_reference_lifecycle() {
-        // `(t, r) ↦ read(new(r)) · r + t` gives the transpose of `add` a known operand that it ignores. Materializing
-        // that operand replays the known lifecycle, which nothing observes afterwards, so the pullback removes it
+        // `(t, r) ↦ read(new(r)) · r + t` gives the transpose of `add` a known input that it ignores. Materializing
+        // that input replays the known lifecycle, which nothing observes afterwards, so the pullback removes it
         // together with its dead product and simply returns the cotangent.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
@@ -7417,7 +7420,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_program_transpose_with_respect_to_reference_view() {
-        // A view operand accumulates through the same view of its root's cotangent reference: `add_update(r[1], x)`
+        // A view input accumulates through the same view of its root's cotangent reference: `add_update(r[1], x)`
         // transposes into `x̄ = read(r̄[1])`, so only the selected element of the destination flows into `x̄`.
         let vector_reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
@@ -8355,7 +8358,7 @@ pub(crate) mod tests {
         assert_eq!(input_cotangent.atom_id(), output_cotangent.atom_id());
         assert_eq!(input_cotangent.r#type(), output_cotangent.r#type());
 
-        // Known primal inputs are replay operands rather than linear inputs, so the member rule returns a structural
+        // Known primal inputs are replay values rather than linear inputs, so the member rule returns a structural
         // zero for them. Structural-zero output cotangents also cross the adapter without becoming replay values.
         let known_input = context.input(member_type.clone());
         let inputs = &[PartialValue::Known(known_input)];
@@ -8577,9 +8580,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_transpose_mixed_operation() {
-        /// Test-only linear member operation consuming two member-typed data operands. No production mixed payload
-        /// interleaves its data and shape operands, so this fixture is what pins that mixed transposition classifies
-        /// operands one by one instead of splitting the operand list at its first shape operand.
+        /// Test-only linear member operation consuming two member-typed data inputs. No production mixed payload
+        /// interleaves its data and shape inputs, so this fixture is what pins that mixed transposition classifies
+        /// inputs one by one instead of splitting the input list at its first shape input.
         #[derive(Clone, Debug)]
         enum InterleavedMemberOperation {
             Interleaved,
@@ -8682,7 +8685,7 @@ pub(crate) mod tests {
 
         type Context = TracingContext<ProjectedProgramValue, InterleavedProgramOperation>;
 
-        // Data operands at positions 0 and 2 are delegated to the member rule in that order, and the shape operands
+        // Data inputs at positions 0 and 2 are delegated to the member rule in that order, and the shape inputs
         // between and after them receive structural zeros in their own member universe.
         let data_type = ProjectedProgramType::Third(ProjectedMemberType::<2>);
         let shape_type = ProjectedProgramType::First(ProjectedMemberType::<0>);
@@ -8711,15 +8714,15 @@ pub(crate) mod tests {
             MaybeZero::Zero(fourth_cotangent_type),
         ] = cotangents.as_slice()
         else {
-            panic!("mixed transposition must classify each operand individually: {cotangents:?}");
+            panic!("mixed transposition must classify each input individually: {cotangents:?}");
         };
         assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
         assert_eq!(third_cotangent.atom_id(), output_cotangent.atom_id());
         assert_eq!(second_cotangent_type, &shape_type);
         assert_eq!(fourth_cotangent_type, &shape_type);
 
-        // Interleaved known data operands stay known operands of the member rule, so their structural zeros are the
-        // member rule's own and remain at their operand positions.
+        // Interleaved known data inputs stay known inputs of the member rule, so their structural zeros are the member
+        // rule's own and remain at their input positions.
         let known_data = context.input(data_type.clone());
         let inputs = &[
             PartialValue::Known(known_data),
@@ -8745,8 +8748,8 @@ pub(crate) mod tests {
             ],
         ));
 
-        // The data-operands-first arrangement every current payload uses degenerates to the same result, so the
-        // classification is a strict generalization of splitting the operand list at its first shape operand.
+        // The data-inputs-first arrangement every current payload uses degenerates to the same result, so the
+        // classification is a strict generalization of splitting the input list at its first shape input.
         let inputs = &[
             PartialValue::Unknown(data_type.clone()),
             PartialValue::Unknown(data_type),

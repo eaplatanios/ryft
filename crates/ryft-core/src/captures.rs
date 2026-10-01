@@ -86,7 +86,7 @@ use crate::tracing::{NestedTracingContext, TracingContext};
 /// compiled program therefore depends only on the captured values' abstract types and never on their concrete data,
 /// which buys three things:
 ///
-///   - **Executable Reuse:** Compiled executables are cached by operand type and shape, not by value, so a single
+///   - **Executable Reuse:** Compiled executables are cached by input type and shape, not by value, so a single
 ///     compilation serves any captured value of a given type. Baking a value in as a literal would make the executable
 ///     value-specific and force a recompilation whenever the captured data changes.
 ///   - **On-Device Buffers:** Captured values are typically device (e.g., GPU) buffers. Passing them as arguments keeps
@@ -551,7 +551,7 @@ impl<
             .collect::<Vec<_>>();
 
         // The original program inputs follow the capture inputs and must be re-added before any instruction is replayed
-        // so that instruction operands referencing them resolve through `mapped_atoms` instead of being treated as
+        // so that instruction inputs referencing them resolve through `mapped_atoms` instead of being treated as
         // unmapped atoms. `mapped_atoms` tracks the rebuilt `AtomId` of every source atom so that an atom shared across
         // instructions maps to a single rebuilt atom instead of being duplicated.
         let mut mapped_atoms = vec![None; self.program.atoms().len()];
@@ -574,7 +574,7 @@ impl<
             }
         }
 
-        // Replay the instructions in order, mapping their operands and recording their rebuilt outputs so that later
+        // Replay the instructions in order, mapping their inputs and recording their rebuilt outputs so that later
         // instructions (and the program outputs) can resolve them. This borrows `self`, and so the operations are
         // cloned into the rebuilt program (cheaply, since nested regions are copied by arena splicing with sharing
         // preserved).
@@ -614,7 +614,7 @@ impl<
         }
 
         // Program outputs may be original inputs, instruction outputs, or captured constants,
-        // and so they are resolved through the same atom mapping as instruction operands.
+        // and so they are resolved through the same atom mapping as instruction inputs.
         let output_ids = map_atoms(
             self.program.atoms(),
             mapped_atoms.as_slice(),

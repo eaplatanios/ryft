@@ -10,9 +10,11 @@ use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::rounding::Floor;
 use crate::programs::{ProgramError, TypeError, Value};
 
+// TODO(eaplatanios): Review this module.
+
 /// Value-level block-quantization capability: splits a full-precision (`f32` or `f64`) tensor of rank 1 through 3
 /// into a narrow element tensor and a tensor of per-block scales along the trailing dimension (which must be
-/// divisible by the block size), producing operands for [`ScaledDot`](crate::ScaledDot). This enables on-the-fly
+/// divisible by the block size), producing inputs for [`ScaledDot`](crate::ScaledDot). This enables on-the-fly
 /// quantization (e.g., of a KV cache) without a dedicated primitive: the recipe is a pure composition of existing
 /// operations, so it inherits its transform rules from them.
 ///
@@ -213,7 +215,7 @@ mod tests {
             vec![3.0, 1.5, 0.5, 6.0, 2.0, 4.0, 1.0, 6.0, -6.0, 3.0, 1.5, -0.5, 0.0, 0.0, 0.0, 0.0],
         );
 
-        // Round trip: the quantized operands contract through `scaled_dot` to the exact full-precision dot.
+        // Round trip: the quantized inputs contract through `scaled_dot` to the exact full-precision dot.
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
         let product = elements
             .scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))
@@ -278,7 +280,7 @@ mod tests {
             vec![256.0, 128.0, 64.0, 32.0, 448.0, 128.0, -256.0, 64.0, -256.0, 128.0, 64.0, 32.0, 0.0, 0.0, 0.0, 0.0],
         );
 
-        // Round trip: the quantized operands contract through `scaled_dot` to the exact full-precision dot.
+        // Round trip: the quantized inputs contract through `scaled_dot` to the exact full-precision dot.
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
         let product = elements
             .scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))

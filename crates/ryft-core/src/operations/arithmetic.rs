@@ -24,7 +24,7 @@
 //! corresponding [`std::ops`] operators, which values additionally implement as panicking sugar. Eager integer arrays
 //! wrap at their element width, whereas the host integer primitives report overflow as an error.
 //!
-//! Negation, addition, and subtraction are linear. Multiplication is linear in either operand when the other one is
+//! Negation, addition, and subtraction are linear. Multiplication is linear in either input when the other one is
 //! known, and division is linear in its numerator when its denominator is known, so all of them can be transposed.
 //! [`Sign`] is piecewise constant and has zero derivatives, and the remaining operations are nonlinear, so reverse-mode
 //! differentiation transposes their linearizations instead.
@@ -175,9 +175,9 @@ pub const ADD_OPERATION_NAME: &str = "add";
 define_elementwise_operation!(
     @binary
     /// [`Operation`] that adds two numeric values elementwise, promoting their element [`DataType`]s and broadcasting
-    /// their [`Shape`](crate::arrays::Shape)s. Array operands that carry partial sums must both be unreduced over
-    /// exactly the same mesh axes. Mixing an unreduced operand with an already reduced operand would duplicate the
-    /// reduced contribution when the result is subsequently reduced. Their reduced-axis markers must likewise agree.
+    /// their [`Shape`](crate::arrays::Shape)s. Array inputs that carry partial sums must both be unreduced over exactly
+    /// the same mesh axes. Mixing an unreduced input with an already reduced input would duplicate the reduced
+    /// contribution when the result is subsequently reduced. Their reduced-axis markers must likewise agree.
     AddOperation,
     ADD_OPERATION_NAME,
     Add,
@@ -270,10 +270,10 @@ pub const SUB_OPERATION_NAME: &str = "sub";
 define_elementwise_operation!(
     @binary
     /// [`Operation`] that subtracts two numeric values elementwise, promoting their element types and broadcasting
-    /// their shapes. Array operands that carry partial sums must both be unreduced over exactly the same mesh axes
+    /// their shapes. Array inputs that carry partial sums must both be unreduced over exactly the same mesh axes
     /// (subtraction is linear, so the difference of two partial sums over the same axes is another valid partial sum).
-    /// Mixing an unreduced operand with an already reduced operand would duplicate the reduced contribution when the
-    /// result is subsequently reduced. Their reduced-axis markers must likewise agree.
+    /// Mixing an unreduced input with an already reduced input would duplicate the reduced contribution when the result
+    /// is subsequently reduced. Their reduced-axis markers must likewise agree.
     SubOperation,
     SUB_OPERATION_NAME,
     Sub,
@@ -366,14 +366,14 @@ pub const MUL_OPERATION_NAME: &str = "mul";
 define_elementwise_operation!(
     @binary
     /// [`Operation`] that multiplies two numeric values elementwise, promoting their element types and broadcasting
-    /// their shapes. Its bilinear reduction-state rule permits one unreduced operand only when the other operand is
-    /// reduced over exactly the same mesh axes.
+    /// their shapes. Its bilinear reduction-state rule permits one unreduced input only when the other input is reduced
+    /// over exactly the same mesh axes.
     MulOperation,
     MUL_OPERATION_NAME,
     Mul,
     mul,
     infer_array_types = |input_types: &[ArrayType]| {
-        // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced state by the
+        // Multiplication is bilinear, so its output sharding combines the inputs' unreduced/reduced state by the
         // bilinear rule rather than the congruent rule used by generic elementwise broadcasting. The reduction state
         // is combined independently of per-dimension placement, so the placement is broadcast with that state stripped
         // and the recomputed state is reattached afterward.
@@ -384,20 +384,20 @@ define_elementwise_operation!(
         let right_unreduced = input_types[1].unreduced_axes();
         let right_reduced = input_types[1].reduced_axes();
 
-        // An operand unreduced over some axes is a partial sum still awaiting an all-reduce over them. The product
-        // of two partial sums is not a partial sum, so at most one operand may be unreduced. The other must then be
-        // reduced over exactly those axes, and the product stays unreduced over them (its matching reduced marker is
-        // consumed when the reduced set is computed below).
+        // An input unreduced over some axes is a partial sum still awaiting an all-reduce over them. The product of two
+        // partial sums is not a partial sum, so at most one input may be unreduced. The other must then be reduced over
+        // exactly those axes, and the product stays unreduced over them (its matching reduced marker is consumed when
+        // the reduced set is computed below).
         let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
             (false, false) => {
                 return Err(TypeError::invalid(format!(
-                    "`{MUL_OPERATION_NAME}` cannot multiply two operands that are both unreduced",
+                    "`{MUL_OPERATION_NAME}` cannot multiply two inputs that are both unreduced",
                 )));
             }
             (false, true) => {
                 if left_unreduced != right_reduced {
                     return Err(TypeError::invalid(format!(
-                        "`{MUL_OPERATION_NAME}` requires the second operand to be reduced over the axes \
+                        "`{MUL_OPERATION_NAME}` requires the second input to be reduced over the axes \
                          the first is unreduced over",
                     )));
                 }
@@ -406,7 +406,7 @@ define_elementwise_operation!(
             (true, false) => {
                 if right_unreduced != left_reduced {
                     return Err(TypeError::invalid(format!(
-                        "`{MUL_OPERATION_NAME}` requires the first operand to be reduced over the axes \
+                        "`{MUL_OPERATION_NAME}` requires the first input to be reduced over the axes \
                          the second is unreduced over",
                     )));
                 }
@@ -415,9 +415,9 @@ define_elementwise_operation!(
             (true, true) => BTreeSet::new(),
         };
 
-        // Plain reduced axes must agree. The only one-sided reduced marker that is valid is the marker consumed
-        // by the partial-sum-times-reduced case above. A one-sided marker without a matching unreduced operand
-        // would incorrectly propagate reduction state from only one input.
+        // Plain reduced axes must agree. The only one-sided reduced marker that is valid is the marker consumed by the
+        // partial-sum-times-reduced case above. A one-sided marker without a matching unreduced input would incorrectly
+        // propagate reduction state from only one input.
         let mut output_reduced = if left_reduced == right_reduced {
             left_reduced.clone()
         } else if left_reduced.is_empty() && right_reduced == &output_unreduced {
@@ -426,13 +426,13 @@ define_elementwise_operation!(
             left_reduced.clone()
         } else {
             return Err(TypeError::invalid(format!(
-                "`{MUL_OPERATION_NAME}` operands must be reduced over the same axes",
+                "`{MUL_OPERATION_NAME}` inputs must be reduced over the same axes",
             )));
         };
         output_reduced.retain(|axis| !output_unreduced.contains(axis));
 
-        // A non-empty result reduction state means some operand was sharded, so the broadcast output (already stripped
-        // of reduction axes) carries a sharding onto which the recomputed state is reattached. Otherwise, it is already
+        // A non-empty result reduction state means some input was sharded, so the broadcast output (already stripped of
+        // reduction axes) carries a sharding onto which the recomputed state is reattached. Otherwise, it is already
         // correct as is.
         if output_unreduced.is_empty() && output_reduced.is_empty() {
             return Ok(vec![output]);
@@ -463,9 +463,9 @@ impl_differentiable_elementwise_operation! {
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
-            // Transposition accepts exactly one linear operand and scales its output cotangent by the other, known
-            // operand. The contribution is unbroadcast to the linear operand's exact cotangent type, while the known
-            // operand receives a structural zero.
+            // Transposition accepts exactly one linear input and scales its output cotangent by the other, known input.
+            // The contribution is unbroadcast to the linear input's exact cotangent type, while the known input
+            // receives a structural zero.
             check_count!("input", inputs, 2, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 2, DifferentiationError);
@@ -527,8 +527,8 @@ define_elementwise_capability!(
 
 impl Mul for Array {
     fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
-        // Multiplication combines reduction states bilinearly rather than requiring congruent operand metadata.
-        // Use the operation's inference before evaluating elements so empty inputs obey the same contract.
+        // Multiplication combines reduction states bilinearly rather than requiring congruent input metadata. Use the
+        // operation's inference before evaluating elements so empty inputs obey the same contract.
         let output_type = MulOperation::<ArrayType>::new()
             .infer_output_types(&[self.r#type().into_owned(), right.r#type().into_owned()], &[])?
             .remove(0);
@@ -775,8 +775,8 @@ pub const REM_OPERATION_NAME: &str = "rem";
 
 define_elementwise_operation!(
     @binary
-    /// [`Operation`] that computes the elementwise remainder of a dividend (its left operand) and a divisor (its right
-    /// operand), promoting their element types and broadcasting their shapes. For finite inputs with a nonzero divisor,
+    /// [`Operation`] that computes the elementwise remainder of a dividend (its left input) and a divisor (its right
+    /// input), promoting their element types and broadcasting their shapes. For finite inputs with a nonzero divisor,
     /// the output takes the sign of the dividend and has magnitude less than the divisor's (i.e., truncation semantics,
     /// matching [`std::ops::Rem`]). Integer arrays return the dividend for a zero divisor and zero for the minimum
     /// signed value divided by `-1`. Floating-point exceptional inputs follow IEEE arithmetic. Only integer and
@@ -902,9 +902,9 @@ pub const ABS_OPERATION_NAME: &str = "abs";
 define_elementwise_operation!(
     @unary
     /// [`Operation`] that computes the elementwise absolute value of a value (i.e., `x ↦ |x|` and the magnitude `|z|`
-    /// for complex operands with a real result) while preserving all other type metadata. Inputs that still represent
+    /// for complex inputs with a real result) while preserving all other type metadata. Inputs that still represent
     /// partial sums over unreduced mesh axes are rejected because taking an absolute value does not preserve partial
-    /// sum semantics. Matching the operand constraints of StableHLO's [`abs`](https://openxla.org/stablehlo/spec#abs),
+    /// sum semantics. Matching the input constraints of StableHLO's [`abs`](https://openxla.org/stablehlo/spec#abs),
     /// signed-integer (including the sub-byte [`DataType::I2`] and [`DataType::I4`] types, with the minimum value
     /// wrapping to itself), floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token,
     /// structural-zero, and single-bit [`DataType::I1`] inputs (whose only negative value `-1` has no representable
@@ -1095,12 +1095,12 @@ pub const SIGN_OPERATION_NAME: &str = "sign";
 define_elementwise_operation!(
     @unary
     /// [`Operation`] that computes the elementwise sign of one value while preserving its array metadata. Matching
-    /// the operand constraints of StableHLO's [`sign`](https://openxla.org/stablehlo/spec#sign), signed-integer,
-    /// floating-point, and complex operands are supported, while unsigned-integer, Boolean, token, and structural-zero
-    /// operands are rejected (unsigned magnitudes carry no sign to extract). Signed integers map to `-1`, `0`, or `1`,
+    /// the input constraints of StableHLO's [`sign`](https://openxla.org/stablehlo/spec#sign), signed-integer,
+    /// floating-point, and complex inputs are supported, while unsigned-integer, Boolean, token, and structural-zero
+    /// inputs are rejected (unsigned magnitudes carry no sign to extract). Signed integers map to `-1`, `0`, or `1`,
     /// floating-point values map to `-1.0` or `1.0` away from zero while signed zeros and NaNs pass through unchanged,
-    /// and complex values map to `z / |z|`, with `0` mapping to `0`. Operands that still carry partial sums are
-    /// rejected because the sign of a partial sum is not the sign of the total.
+    /// and complex values map to `z / |z|`, with `0` mapping to `0`. Inputs that still carry partial sums are rejected
+    /// because the sign of a partial sum is not the sign of the total.
     SignOperation,
     SIGN_OPERATION_NAME,
     Sign,
@@ -1203,8 +1203,8 @@ define_elementwise_operation!(
     /// power defined as the principal value `exp(y · log(x))`), promoting their element types and broadcasting their
     /// shapes. Only floating-point and complex inputs are supported; integer inputs must first be explicitly converted
     /// to a supported element type. Refer to the StableHLO [`power`](https://openxla.org/stablehlo/spec#power)
-    /// documentation for the floating-point and complex semantics. Array operands that still carry partial sums
-    /// are rejected, and their reduced-axis markers must agree.
+    /// documentation for the floating-point and complex semantics. Array inputs that still carry partial sums are
+    /// rejected, and their reduced-axis markers must agree.
     PowOperation,
     POW_OPERATION_NAME,
     Pow,
@@ -1247,8 +1247,8 @@ define_elementwise_capability!(
     /// Value capability for elementwise powers on floating-point and complex inputs. Eager values compute directly
     /// while contextual values bind [`PowOperation`]. Failures are returned as [`ProgramError`]s.
     Pow,
-    /// Raises this value to the power `exponent` elementwise, promoting both operands to a common floating-point
-    /// or complex element type.
+    /// Raises this value to the power `exponent` elementwise, promoting both inputs to a common floating-point or
+    /// complex element type.
     pow(exponent),
     PowOperation,
 );
@@ -1285,8 +1285,8 @@ pub const SQRT_OPERATION_NAME: &str = "sqrt";
 define_elementwise_operation!(
     @unary @accuracy
     /// [`Operation`] that computes the elementwise square root of one value (i.e., `x ↦ √x`, the principal branch
-    /// `√z` on complex operands) while preserving its array metadata. Only floating-point and complex operands are
-    /// supported, and operands that still carry partial sums are rejected.
+    /// `√z` on complex inputs) while preserving its array metadata. Only floating-point and complex inputs are
+    /// supported, and inputs that still carry partial sums are rejected.
     SqrtOperation,
     SQRT_OPERATION_NAME,
     Sqrt,
@@ -1348,9 +1348,9 @@ pub const RSQRT_OPERATION_NAME: &str = "rsqrt";
 
 define_elementwise_operation!(
     @unary @accuracy
-    /// [`Operation`] that computes the elementwise reciprocal square root of one value (i.e., `x ↦ 1/√x`, the
-    /// principal branch `1/√z` on complex operands) while preserving its array metadata. Only floating-point
-    /// and complex operands are supported, and operands that still carry partial sums are rejected.
+    /// [`Operation`] that computes the elementwise reciprocal square root of one value (i.e., `x ↦ 1/√x`, the principal
+    /// branch `1/√z` on complex inputs) while preserving its array metadata. Only floating-point and complex inputs are
+    /// supported, and inputs that still carry partial sums are rejected.
     RsqrtOperation,
     RSQRT_OPERATION_NAME,
     Rsqrt,
@@ -1693,11 +1693,11 @@ mod tests {
                 },
                 {
                     input_types = [unreduced.clone(), plain.clone()],
-                    error = "`add` operands must be unreduced over the same axes",
+                    error = "`add` inputs must be unreduced over the same axes",
                 },
                 {
                     input_types = [plain.clone(), unreduced.clone()],
-                    error = "`add` operands must be unreduced over the same axes",
+                    error = "`add` inputs must be unreduced over the same axes",
                 },
             ],
         );
@@ -1844,7 +1844,7 @@ mod tests {
         let vector = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(vector.add(&Array::scalar(1.0).unwrap()).unwrap(), Array::vector(vec![2.0, 3.0, 4.0]).unwrap());
 
-        // Mixed-precision operands promote to the common element data type.
+        // Mixed-precision inputs promote to the common element data type.
         let promoted =
             Array::vector(vec![1.0f32, 2.0]).unwrap().add(&Array::vector(vec![0.5f64, 0.5]).unwrap()).unwrap();
         assert_eq!(promoted, Array::vector(vec![1.5f64, 2.5]).unwrap());
@@ -1988,11 +1988,11 @@ mod tests {
                 },
                 {
                     input_types = [unreduced.clone(), plain.clone()],
-                    error = "`sub` operands must be unreduced over the same axes",
+                    error = "`sub` inputs must be unreduced over the same axes",
                 },
                 {
                     input_types = [plain.clone(), unreduced.clone()],
-                    error = "`sub` operands must be unreduced over the same axes",
+                    error = "`sub` inputs must be unreduced over the same axes",
                 },
             ],
         );
@@ -2227,41 +2227,41 @@ mod tests {
         assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::from(["x".to_string()]));
         assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::new());
 
-        // Two operands both unreduced cannot be multiplied (the product of two partial sums is not a partial sum).
+        // Two inputs both unreduced cannot be multiplied (the product of two partial sums is not a partial sum).
         check_operation_type_inference!(
             operation = MulOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [unreduced_x.clone(), unreduced_x.clone()],
-                error = format!("`{MUL_OPERATION_NAME}` cannot multiply two operands that are both unreduced"),
+                error = format!("`{MUL_OPERATION_NAME}` cannot multiply two inputs that are both unreduced"),
             }],
         );
 
-        // Unreduced over `x` requires the other operand to be reduced over exactly `x`, not a different axis.
+        // Unreduced over `x` requires the other input to be reduced over exactly `x`, not a different axis.
         check_operation_type_inference!(
             operation = MulOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [unreduced_x.clone(), reduced_y.clone()],
                 error = format!(
-                    "`{MUL_OPERATION_NAME}` requires the second operand to be reduced over the axes the first is \
+                    "`{MUL_OPERATION_NAME}` requires the second input to be reduced over the axes the first is \
                      unreduced over",
                 ),
             }],
         );
 
-        // Two operands reduced over the same axis multiply to a value reduced over that axis.
+        // Two inputs reduced over the same axis multiply to a value reduced over that axis.
         let output = MulOperation::<ArrayType>::new()
             .infer_output_types(&[reduced_x.clone(), reduced_x.clone()], &[])
             .unwrap();
         assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::from(["x".to_string()]));
         assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::new());
 
-        // A reduced operand cannot be multiplied by an otherwise replicated operand because the result would inherit
-        // a reduction marker that does not describe both inputs.
+        // A reduced input cannot be multiplied by an otherwise replicated input because the result would inherit a
+        // reduction marker that does not describe both inputs.
         check_operation_type_inference!(
             operation = MulOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [reduced_x.clone(), vector_type.clone()],
-                error = format!("`{MUL_OPERATION_NAME}` operands must be reduced over the same axes"),
+                error = format!("`{MUL_OPERATION_NAME}` inputs must be reduced over the same axes"),
             }],
         );
     }
@@ -2460,7 +2460,7 @@ mod tests {
         let right = Array::from_elements(reduced_type, &[4.0f32, 5.0]).unwrap();
         let expected = Array::from_elements(partial_type, &[8.0f32, 15.0]).unwrap();
 
-        // A partial sum times an operand reduced over the same mesh axes remains a partial sum in either order.
+        // A partial sum times an input reduced over the same mesh axes remains a partial sum in either order.
         assert_eq!(Mul::mul(&left, &right), Ok(expected.clone()));
         assert_eq!(Mul::mul(&right, &left), Ok(expected));
 
@@ -2468,14 +2468,14 @@ mod tests {
         assert!(matches!(
             Mul::mul(&left, &left),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`mul` cannot multiply two operands that are both unreduced",
+                if message == "`mul` cannot multiply two inputs that are both unreduced",
         ));
         let empty_type = left.r#type().into_owned().with_shape(Shape::new(vec![Dimension::Static(0)]));
         let empty = Array::from_elements(empty_type, &[] as &[f32]).unwrap();
         assert!(matches!(
             Mul::mul(&empty, &empty),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`mul` cannot multiply two operands that are both unreduced",
+                if message == "`mul` cannot multiply two inputs that are both unreduced",
         ));
     }
 
@@ -3295,7 +3295,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         let input = Array::from_elements(input_type, &[-1.0f32]).unwrap();
-        assert_eq!(input.abs(), Err(TypeError::invalid("`abs` does not support unreduced operands").into()));
+        assert_eq!(input.abs(), Err(TypeError::invalid("`abs` does not support unreduced inputs").into()));
     }
 
     #[test]
@@ -3492,7 +3492,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         let input = Array::from_elements(input_type, &[-1.0f32]).unwrap();
-        assert_eq!(input.sign(), Err(TypeError::invalid("`sign` does not support unreduced operands").into()));
+        assert_eq!(input.sign(), Err(TypeError::invalid("`sign` does not support unreduced inputs").into()));
     }
 
     #[test]

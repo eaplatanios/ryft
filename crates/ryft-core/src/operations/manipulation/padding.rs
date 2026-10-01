@@ -645,7 +645,7 @@ where
 
         let aligned_batch = driver.align_batch_axis(context, input.clone(), Axis::from(batch_axis))?;
         let aligned_ragged_axes = aligned_batch.ragged_axes().to_vec();
-        let operand_batch = ArrayBatch::new(
+        let input_batch = ArrayBatch::new(
             <C::Value as ValueProjection<ArrayType>>::into_projected(aligned_batch.into_value())?,
             BatchAxis::from_position(batch_axis),
         )?;
@@ -669,7 +669,7 @@ where
 
         if padding_value_batch.batch_axis().is_replicated() {
             let mut lifted_inputs = Vec::with_capacity(lifted_output_extents.len() + 2);
-            lifted_inputs.push(<C::Value as ValueProjection<ArrayType>>::from_projected(operand_batch.into_value()));
+            lifted_inputs.push(<C::Value as ValueProjection<ArrayType>>::from_projected(input_batch.into_value()));
             lifted_inputs.push(padding_value.value().clone());
             lifted_inputs.extend(lifted_output_extents);
 
@@ -693,7 +693,7 @@ where
         let padding_scalar_type = padding_value_batch.unbatched_type();
         let placeholder_padding =
             <C::Value as ValueProjection<ArrayType>>::from_projected(array_context.one(&padding_scalar_type)?);
-        let input = <C::Value as ValueProjection<ArrayType>>::from_projected(operand_batch.into_value());
+        let input = <C::Value as ValueProjection<ArrayType>>::from_projected(input_batch.into_value());
         let mut padded_inputs = Vec::with_capacity(lifted_output_extents.len() + 2);
         padded_inputs.push(input.clone());
         padded_inputs.push(placeholder_padding);
@@ -706,12 +706,12 @@ where
         check_count!("output", padded, 1, ProgramError);
         let padded = padded.remove(0);
 
-        let operand_type = <&ArrayType>::try_from(input.r#type().as_ref())?
+        let mask_input_type = <&ArrayType>::try_from(input.r#type().as_ref())?
             .clone()
             .with_data_type(DataType::Boolean)
             .with_layout(None);
         let mask_input_dimensions =
-            operand_type
+            mask_input_type
                 .shape()
                 .dimensions()
                 .iter()
@@ -724,7 +724,7 @@ where
         let mut mask_input =
             context
                 .parent()
-                .bind(OneOperation::new(operand_type), Vec::new(), mask_input_dimensions.as_slice())?;
+                .bind(OneOperation::new(mask_input_type), Vec::new(), mask_input_dimensions.as_slice())?;
         check_count!("output", mask_input, 1, ProgramError);
         let mask_input = mask_input.remove(0);
         let mask_padding_type = padding_scalar_type.with_data_type(DataType::Boolean).with_layout(None);
@@ -790,9 +790,9 @@ impl_differentiable_operation! {
             // The pad needs both the input and padding-value tangents as real values, so materialize every structurally
             // zero side. The shared all-zero fast path normally short-circuits the case where both are zero; a direct
             // rule call with two structural zeros simply pads a materialized zero with a materialized zero.
-            let operand_tangent = inputs[0].tangent().clone().materialize(context.tangent())?;
+            let input_tangent = inputs[0].tangent().clone().materialize(context.tangent())?;
             let padding_tangent = inputs[1].tangent().clone().materialize(context.tangent())?;
-            let tangent = operand_tangent.pad(
+            let tangent = input_tangent.pad(
                 &padding_tangent,
                 operation.edge_padding_low(),
                 operation.edge_padding_high(),
@@ -1035,9 +1035,9 @@ impl_differentiable_operation! {
                         )?))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let operand_cotangent_type =
+                let input_cotangent_type =
                     <&ArrayType>::try_from(array_inputs[0].primal().r#type().as_ref())?.cotangent()?;
-                if operand_cotangent_type
+                if input_cotangent_type
                     .shape()
                     .dimensions()
                     .iter()
@@ -1054,11 +1054,11 @@ impl_differentiable_operation! {
                     let mut residuals = LinearResiduals::new();
                     let output_extents =
                         residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
-                    let operand_shape = residuals.retain_shape(tangent_context, array_inputs[0].primal())?;
+                    let input_shape = residuals.retain_shape(tangent_context, array_inputs[0].primal())?;
                     let forward_operation = operation.clone();
                     let forward_output_extents = output_extents.clone();
                     let transpose_operation = operation.clone();
-                    let transpose_operand_type = operand_cotangent_type.clone();
+                    let transpose_input_type = input_cotangent_type.clone();
                     let transpose_padding_type =
                         <&ArrayType>::try_from(array_inputs[1].primal().r#type().as_ref())?.cotangent()?;
                     let transpose_output_type =
@@ -1081,8 +1081,8 @@ impl_differentiable_operation! {
                             check_count!("output", output_cotangents, 1, ProgramError);
                             let transpose_context = output_cotangents[0].dispatch_domain();
                             let output_cotangent = output_cotangents[0].clone();
-                            let input_extents = operand_shape.dimensions(&transpose_context, residuals)?;
-                            let all_cropped = transpose_operand_type.shape().dimensions().iter().enumerate().any(
+                            let input_extents = input_shape.dimensions(&transpose_context, residuals)?;
+                            let all_cropped = transpose_input_type.shape().dimensions().iter().enumerate().any(
                                 |(axis, dimension)| {
                                     dimension.bounds().upper().is_some_and(|upper| {
                                         if upper <= 1 {
@@ -1105,7 +1105,7 @@ impl_differentiable_operation! {
                                 },
                             );
                             let input_cotangent = if all_cropped {
-                                let dimensions = transpose_operand_type
+                                let dimensions = transpose_input_type
                                     .shape()
                                     .dimensions()
                                     .iter()
@@ -1114,7 +1114,7 @@ impl_differentiable_operation! {
                                     .map(|(axis, _)| input_extents[axis].clone())
                                     .collect::<Vec<_>>();
                                 let mut zeros = transpose_context.bind(
-                                    ZeroOperation::new(transpose_operand_type.clone()),
+                                    ZeroOperation::new(transpose_input_type.clone()),
                                     Vec::new(),
                                     &dimensions,
                                 )?;
@@ -1123,11 +1123,11 @@ impl_differentiable_operation! {
                             } else {
                                 // Inverse edge padding first recovers the dilated input. Its exact result extents are
                                 // `n + max(n - 1, 0) * interior`, derived from the retained input geometry.
-                                let mut dilated_extents = Vec::with_capacity(transpose_operand_type.rank());
+                                let mut dilated_extents = Vec::with_capacity(transpose_input_type.rank());
                                 for (axis, input_extent) in input_extents.iter().enumerate() {
                                     let interior = transpose_operation.interior_padding()[axis];
                                     if interior == 0
-                                        || transpose_operand_type
+                                        || transpose_input_type
                                             .dimension(axis)
                                             .bounds()
                                             .upper()
@@ -1225,7 +1225,7 @@ impl_differentiable_operation! {
                                     PadOperation::<ArrayIrType>::new(
                                         inverse_low,
                                         inverse_high,
-                                        vec![0; transpose_operand_type.rank()],
+                                        vec![0; transpose_input_type.rank()],
                                     )?
                                     .with_input_types(
                                         &inverse_inputs
@@ -1244,8 +1244,8 @@ impl_differentiable_operation! {
                                 )?;
                                 check_count!("output", start_zero, 1, ProgramError);
                                 let start_zero = start_zero.remove(0);
-                                let starts = vec![start_zero; transpose_operand_type.rank()];
-                                let mut slice_inputs = Vec::with_capacity(1 + 2 * transpose_operand_type.rank());
+                                let starts = vec![start_zero; transpose_input_type.rank()];
+                                let mut slice_inputs = Vec::with_capacity(1 + 2 * transpose_input_type.rank());
                                 slice_inputs.push(unpadded);
                                 slice_inputs.extend(starts);
                                 slice_inputs.extend(input_extents.iter().cloned());
@@ -1254,7 +1254,7 @@ impl_differentiable_operation! {
                                     .iter()
                                     .enumerate()
                                     .map(|(axis, padding)| {
-                                        if transpose_operand_type
+                                        if transpose_input_type
                                             .dimension(axis)
                                             .bounds()
                                             .upper()
@@ -1271,7 +1271,7 @@ impl_differentiable_operation! {
                                     })
                                     .collect::<Result<Vec<_>, _>>()?;
                                 let mut input_cotangent = transpose_context.bind(
-                                    DynamicSliceOperation::<ArrayIrType>::from_rank(transpose_operand_type.rank())
+                                    DynamicSliceOperation::<ArrayIrType>::from_rank(transpose_input_type.rank())
                                         .with_strides(strides)?,
                                     Vec::new(),
                                     slice_inputs.as_slice(),
@@ -1283,7 +1283,7 @@ impl_differentiable_operation! {
                             // Select padding positions before summing so non-finite cotangents at input positions
                             // cannot contaminate the padding-value contribution.
                             let mask_input_type =
-                                transpose_operand_type.clone().with_data_type(DataType::Boolean).with_layout(None);
+                                transpose_input_type.clone().with_data_type(DataType::Boolean).with_layout(None);
                             let mask_input_extents = mask_input_type
                                 .shape()
                                 .dimensions()
@@ -1334,7 +1334,7 @@ impl_differentiable_operation! {
                             )?;
                             Ok(vec![
                                 ValueProjection::<ArrayType>::into_projected(input_cotangent)?
-                                    .unalign_cotangent(&transpose_operand_type)?
+                                    .unalign_cotangent(&transpose_input_type)?
                                     .into_value(),
                                 ValueProjection::<ArrayType>::into_projected(padding_cotangent)?
                                     .unalign_cotangent(&transpose_padding_type)?
@@ -1399,8 +1399,8 @@ impl_differentiable_operation! {
                 PadOperation::<ArrayType>::from(operation.clone()),
             );
 
-            // The explicit output extents are shape operands with no cotangent contribution, so their accumulators
-            // are left untouched and default to structural zeros.
+            // The explicit output extents are shape inputs with no cotangent contribution, so their accumulators are
+            // left untouched and default to structural zeros.
             transpose_projected_operation(context, &projected_operation, array_inputs, outputs, &accumulators[..2])?;
             Ok(())
         }
@@ -3799,7 +3799,7 @@ mod tests {
             ArrayIrOperation::Pad(operation) if operation.requires_runtime_assertion(),
         ));
 
-        // Program rendering uses the canonical operation name and includes the trailing output-extent operand.
+        // Program rendering uses the canonical operation name and includes the trailing output-extent input.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let program_input = builder.add_input(ArrayType::new_static(DataType::F64, [3]).into());
         let program_padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
@@ -3903,7 +3903,7 @@ mod tests {
 
         // The conservative form accepts every well-formed signature: a static extent must equal the padded extent, a
         // supplied dynamic identity names the output axis, layouts are cleared, and the array validation shared with
-        // the homogeneous form applies. Malformed operand lists report exact errors.
+        // the homogeneous form applies. Malformed input lists report exact errors.
         check_operation_type_inference!(
             operation = operation.clone(),
             cases = [
@@ -5592,7 +5592,7 @@ mod tests {
     #[test]
     fn test_array_ir_pad_transposition() {
         // Static geometry delegates to the homogeneous pullback, so the pullback is the same strided slice, zero pad,
-        // and masked sum. The explicit extent is a shape operand with no cotangent contribution.
+        // and masked sum. The explicit extent is a shape input with no cotangent contribution.
         let eight = ArrayIrValue::Dimension(DimensionValue::constant(8).unwrap());
         let input_types = [
             ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3])),

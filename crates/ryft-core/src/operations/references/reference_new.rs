@@ -861,7 +861,7 @@ mod tests {
         assert_eq!(context.discharged_state(reference.allocation_id()), Ok(TestValue::new(REFERENT, 4)));
         assert_eq!(context.is_mutated(reference.allocation_id()), Ok(false));
 
-        // A reference operand is not an initial state, and the diagnostic says which operand the rule expected.
+        // A reference input is not an initial state, and the diagnostic says which input the rule expected.
         let context = TestDischargeContext::new(TestDestination::new());
         let handle = ReferenceDischargeValue::Reference(reference);
         assert_eq!(

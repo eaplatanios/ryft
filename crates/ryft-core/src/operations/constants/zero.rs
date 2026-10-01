@@ -134,9 +134,9 @@ impl_member_interpretable_operation_for_array_ir_constant_operation!(
 impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: ZeroOperation<ArrayType>) -> Self {
-        // Prefer the homogeneous member encoding for identity-free static zeros and the mixed dimension-operand
-        // encoding for dynamic output types. Explicit mixed static constructors remain valid, but canonical lifts
-        // normalize them to the homogeneous form.
+        // Prefer the homogeneous member encoding for identity-free static zeros and the mixed dimension-input encoding
+        // for dynamic output types. Explicit mixed static constructors remain valid, but canonical lifts normalize them
+        // to the homogeneous form.
         if operation
             .r#type()
             .shape()
@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
 
         // Nullary construction rejects output types with ungrounded identity _references_ (a dynamic array axis),
-        // which must instead be constructed through the mixed dimension-operand contract owned by the composite
+        // which must instead be constructed through the mixed dimension-input contract owned by the composite
         // operation family. Definition-position identities remain constructible: a dimension value's type defines
         // its own variable, so nullary construction leaves no dangling reference.
         let rows = crate::arrays::DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
@@ -424,11 +424,11 @@ mod tests {
         assert_eq!(
             ZeroOperation::new(dynamic_type.clone()).infer_output_types(&[], &[]),
             Err(TypeError::invalid(
-                "`zero` cannot construct type f32[rows, 3] without operands because it references identity rows",
+                "`zero` cannot construct type f32[rows, 3] without inputs because it references identity rows",
             )),
         );
         let dimension_type = DimensionType::from(rows);
-        assert_eq!(ZeroOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
+        assert_eq!(ZeroOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]));
     }
 
     #[test]
@@ -759,8 +759,8 @@ mod tests {
 
     #[test]
     fn test_zero_transposition_dynamic() {
-        // Dynamic constructors depend on their extent operands only as non-differentiable shape inputs, so every
-        // extent receives a structural-zero cotangent regardless of the output cotangent being live.
+        // Dynamic constructors use their extent inputs only as non-differentiable shape information, so every extent
+        // receives a structural-zero cotangent regardless of the output cotangent being live.
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
@@ -792,7 +792,7 @@ mod tests {
         };
         assert_eq!(operation.r#type(), &static_type);
 
-        // Output types belong to the request; nullary construction rejects any operand types.
+        // Output types belong to the request; nullary construction rejects any input types.
         assert_eq!(
             ArrayOperation::<Array>::provide(ZeroOperation::new(static_type.clone()), &[&static_type]).unwrap_err(),
             ProgramError::InvalidInputCount { expected: 0, actual: 1 },
@@ -804,7 +804,7 @@ mod tests {
             ProgramError::InvalidInputCount { expected: 0, actual: 1 },
         );
 
-        // The composite provider projects a valid operand-free array zero into the homogeneous member family.
+        // The composite provider projects a valid input-free array zero into the homogeneous member family.
         let ArrayIrOperation::<Array>::Array(ArrayOperation::Zero(operation)) =
             ArrayIrOperation::<Array>::provide(ZeroOperation::new(ArrayIrType::Array(static_type.clone())), &[])
                 .unwrap()
@@ -813,14 +813,14 @@ mod tests {
         };
         assert_eq!(operation.r#type(), &static_type);
 
-        // Operand-free construction cannot resolve a dynamic identity. Dynamic mixed zeros must instead receive their
-        // concrete extents as dimension operands.
+        // Input-free construction cannot resolve a dynamic identity. Dynamic mixed zeros must instead receive their
+        // concrete extents as dimension inputs.
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
         assert_eq!(
             ArrayIrOperation::<Array>::provide(ZeroOperation::new(ArrayIrType::Array(dynamic_type)), &[]).unwrap_err(),
             ProgramError::Type(TypeError::invalid(
-                "`zero` cannot construct type f32[size] without operands because it references identity size",
+                "`zero` cannot construct type f32[size] without inputs because it references identity size",
             )),
         );
 
@@ -920,7 +920,7 @@ mod tests {
             )),
         );
 
-        // The same API accepts static output types without fabricating dimension operands.
+        // The same API accepts static output types without fabricating dimension inputs.
         assert_eq!(
             context.dynamic_zero(&ArrayType::new_static(DataType::I32, [2]), &[]),
             Ok(ArrayIrValue::Array(Array::vector(vec![0i32, 0]).unwrap())),
@@ -947,19 +947,19 @@ mod tests {
         assert_eq!(
             context.dynamic_zero(&output_type, &[]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`zero` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+                "`zero` expects one dimension input per dynamic output dimension (1) but got 0 inputs",
             ))),
         );
         assert_eq!(
             context.dynamic_zero(&output_type, &[ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())]),
-            Err(ProgramError::Type(TypeError::invalid("`zero` operand 0 must be a dimension but has type f32[]",))),
+            Err(ProgramError::Type(TypeError::invalid("`zero` input 0 must be a dimension but has type f32[]"))),
         );
         let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
         let extent = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(other), 3).unwrap());
         assert_eq!(
             context.dynamic_zero(&output_type, &[extent]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`zero` operand 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
+                "`zero` input 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
                  dimension<rows ∈ [0, 8)>",
             ))),
         );
@@ -970,7 +970,7 @@ mod tests {
         assert_eq!(
             context.dynamic_zero(&output_type, &[dimension]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`zero` operand 0 has type dimension<rows ∈ [0, 8)> but the output shape requires dimension<rows ∈ [0, 8)>",
+                "`zero` input 0 has type dimension<rows ∈ [0, 8)> but the output shape requires dimension<rows ∈ [0, 8)>",
             ))),
         );
 
@@ -979,7 +979,7 @@ mod tests {
         assert_eq!(
             context.dynamic_zero(&output_type, &[]).unwrap_err(),
             ProgramError::Type(TypeError::invalid(
-                "`zero` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+                "`zero` expects one dimension input per dynamic output dimension (1) but got 0 inputs",
             )),
         );
         assert!(context.builder().borrow().instructions().is_empty());
@@ -1082,7 +1082,7 @@ mod tests {
             Some(&ArrayIrValue::Array(Array::vector(vec![0.0f32; 3]).unwrap()))
         );
 
-        // Unknown dimensions remain operands of a residual constructor instead of forcing a static shape.
+        // Unknown dimensions remain inputs of a residual constructor instead of forcing a static shape.
         let unknown = PartialTracer::new(context.clone(), context.unknown_input(extent_type.into(), 0));
         let output = context.dynamic_zero(&output_type, &[unknown]).unwrap();
         assert_eq!(output.value().unwrap().as_known(), None);

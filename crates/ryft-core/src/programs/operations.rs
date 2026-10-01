@@ -234,7 +234,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) implementation, and replays every
 ///     member variant and every bare generic extension variant as the complete enum through
 ///     [`discharge_reference_free_operation`](crate::discharge_reference_free_operation), which rewrites nothing and
-///     instead rejects an application that carries regions or receives a live reference handle as an operand. The
+///     instead rejects an application that carries regions or receives a live reference handle as an input. The
 ///     dispatcher stays generic over the [`ReferenceDischargePolicy`](crate::ReferenceDischargePolicy) it threads,
 ///     because a policy names the reference universe being discharged rather than the element universe the family's
 ///     values belong to. It also leaves the destination context's constant type free, unlike the interpretation and
@@ -270,17 +270,17 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// | Projected       | `#[ryft(projected(U))]` | `#[ryft(projected(U, structural))]` |
 /// | Mixed           | `#[ryft(mixed(U))]`     | `#[ryft(mixed(U, structural))]`     |
 ///
-///   - A **projected** boundary means that every operand and result of the instruction belongs to `U`, so inference and
+///   - A **projected** boundary means that every input and result of the instruction belongs to `U`, so inference and
 ///     eager execution project the composite boundary down to `U` and lift the results back into `T`. The member type
 ///     may occur only once per boundary because [`OperationProjection<U>`] names one canonical projected family.
 ///   - A **mixed** boundary means the instruction crosses member kinds: the payload keeps its native `Operation<Type =
-///     U>` contract while its parent instruction also consumes operands belonging to other members of `T` (e.g., the
+///     U>` contract while its parent instruction also consumes inputs belonging to other members of `T` (e.g., the
 ///     first-class dimensions that supply a dynamic result geometry) and may produce results in those members too. The
-///     mixed machinery classifies each operand and each result by the member universe it belongs to rather than by its
-///     position, so the two operand kinds may be arranged in any order. The payload supplies that boundary through
+///     mixed machinery classifies each input and each result by the member universe it belongs to rather than by its
+///     position, so the two input kinds may be arranged in any order. The payload supplies that boundary through
 ///     [`MemberOperation`] and, for interpretation, through
-///     [`MemberInterpretableOperation`](crate::MemberInterpretableOperation).
-///     Several mixed variants may share one member type.
+///     [`MemberInterpretableOperation`](crate::MemberInterpretableOperation). Several mixed variants may share one
+///     member type.
 ///   - A **computational** role means that transforms recurse into the payload's own rules. A projected payload uses
 ///     the member family's ordinary batching rules, and both projected and mixed payloads state their parent-universe
 ///     derivative through [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation). A projected payload
@@ -288,23 +288,22 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     cotangent buffers in the enclosing family. A mixed payload supplies its parent-universe batching rule through
 ///     [`MemberBatchableOperation`](crate::MemberBatchableOperation). Transposition never needs a mixed rule because
 ///     [`transpose_mixed_operation`](crate::transpose_mixed_operation) delegates the instruction's `U`-typed data
-///     operands, in operand order, to the payload's ordinary homogeneous
-///     [`TransposableOperation`](crate::TransposableOperation) rule and gives every other operand a structural zero
+///     inputs, in input order, to the payload's ordinary homogeneous
+///     [`TransposableOperation`](crate::TransposableOperation) rule and gives every other input a structural zero
 ///     cotangent.
 ///   - A **structural** role declares that the payload is bookkeeping. There is nothing to differentiate (i.e., the
 ///     type has a zero differential space) and nothing to batch per item, so batched inputs must be replicated. A
 ///     structural projected member reaches that behavior through its member family's rules and its projected batching
 ///     policy, and its generated forward-mode and transposition arms stage a zero tangent and contribute no cotangents
 ///     respectively. A structural mixed member instead has its forward-mode rule generated as the payload's primal plus
-///     one zero tangent per declared parent output, staged over the same operands so that the runtime geometry those
-///     operands carry stays available to both. Each output's tangent is constructed in the computational member
-///     universe that output belongs to, discovered by projecting the declared output type across the family's
-///     computational members (see [Member Universes](#member-universes)). An output outside all of them, such as a
-///     structural member output, has a zero differential space and receives a symbolic zero tangent instead of a
-///     staged instruction. Batching is the one transform the structural role does not cover for a mixed boundary,
-///     because a mixed signature cannot be projected into one member kind. A structural mixed payload therefore still
-///     implements [`MemberBatchableOperation`](crate::MemberBatchableOperation), normally as a replicated-operands-only
-///     rule.
+///     one zero tangent per declared parent output, staged over the same inputs so that the runtime geometry those
+///     inputs carry stays available to both. Each output's tangent is constructed in the computational member universe
+///     that output belongs to, discovered by projecting the declared output type across the family's computational
+///     members (see [Member Universes](#member-universes)). An output outside all of them, such as a structural member
+///     output, has a zero differential space and receives a symbolic zero tangent instead of a staged instruction.
+///     Batching is the one transform the structural role does not cover for a mixed boundary, because a mixed signature
+///     cannot be projected into one member kind. A structural mixed payload therefore still implements
+///     [`MemberBatchableOperation`](crate::MemberBatchableOperation), normally as a replicated-inputs-only rule.
 ///
 /// ### Defaulting The Member Type
 ///
@@ -323,7 +322,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// accumulator handles. This lets an array member update a reference cotangent buffer even when its homogeneous
 /// type cannot represent references. The member rule can delegate to
 /// [`transpose_projected_operation`](crate::transpose_projected_operation) when it only needs homogeneous values.
-/// That adapter projects the operands and forwards cotangent contributions to the original accumulators.
+/// That adapter projects the inputs and forwards cotangent contributions to the original accumulators.
 ///
 /// ### Suppressing The Owned Conversion
 ///
@@ -433,7 +432,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
 /// #[ryft(members(ArrayType, structural(DimensionType)))]
 /// enum CompositeOperation<A: Value<Type = ArrayType>> {
-///     /// Mixed structural constructor whose operands are the stored type's dynamic extents, its data universe
+///     /// Mixed structural constructor whose inputs are the stored type's dynamic extents, its data universe
 ///     /// defaults to `ArrayType` (i.e., the unique computational member), and its transforms are fully generated.
 ///     #[ryft(mixed(structural))]
 ///     Zero(ZeroOperation<ArrayType>),
@@ -532,14 +531,14 @@ pub trait Operation: Clone {
     /// arguments describe.
     ///
     /// [`ProgramBuilder`](crate::ProgramBuilder)s never ask their callers to provide region interfaces. They receive
-    /// input/operand atoms plus attached [`RegionId`](crate::RegionId)s referencing sealed [`Region`](crate::Region)s,
-    /// derive the interface slice from their own [`Region`](crate::Region) arena, and invoke this function internally.
-    /// Calling this function directly with synthetic [`RegionInterface`] performs a pure hypothetical inference and
-    /// cannot mutate or create a [`Program`].
+    /// input atoms plus attached [`RegionId`](crate::RegionId)s referencing sealed [`Region`](crate::Region)s, derive
+    /// the interface slice from their own [`Region`](crate::Region) arena, and invoke this function internally. Calling
+    /// this function directly with synthetic [`RegionInterface`] performs a pure hypothetical inference and cannot
+    /// mutate or create a [`Program`].
     ///
     /// # Parameters
     ///
-    ///   - `input_types`: Input/operand [`Type`]s in instruction input order.
+    ///   - `input_types`: Input [`Type`]s in instruction input order.
     ///   - `region_interfaces`: Boundary [`RegionInterface`] derived from the instruction's attached regions, in the
     ///     [`Operation`]-defined [`region_slots`](Self::region_slots) order. Region-free operations receive an
     ///     empty slice and ignore it.
@@ -573,7 +572,7 @@ pub trait Operation: Clone {
     ///
     /// # Parameters
     ///
-    ///   - `input_types`: Input/operand [`Type`]s in instruction input order.
+    ///   - `input_types`: Input [`Type`]s in instruction input order.
     ///   - `region_interfaces`: Boundary [`RegionInterface`] derived from the instruction's attached regions, in the
     ///     [`Operation`]-defined [`region_slots`](Self::region_slots) order. Region-free operations receive an
     ///     empty slice and ignore it.
@@ -652,22 +651,24 @@ pub trait Operation: Clone {
         Ok(Some(replacements))
     }
 
-    /// Describes how this operation supplies input `input_index` of the attached [`Region`](crate::Region) at
-    /// `region_index`. [`InputRegionProvenance::Input`] records operand correspondence rather than equal runtime values
-    /// (e.g., a `scan` operation may supply a slice of a stacked array or an evolving carry). Forwarded references
-    /// preserve complete handle identity and construct any views inside the region. [`InputRegionProvenance::Local`]
-    /// instead declares an input created by the operation; its type determines the reference ownership rules.
+    /// Describes how this operation supplies region input `input_index` of the attached [`Region`](crate::Region)
+    /// at `region_index`. [`InputRegionProvenance::Input`] records instruction input correspondence rather than
+    /// equal runtime values (e.g., a `scan` operation may supply a slice of a stacked array or an evolving carry).
+    /// Forwarded references preserve complete handle identity and construct any views inside the region.
+    /// [`InputRegionProvenance::Local`] instead declares a region input created by the operation; its type determines
+    /// the reference ownership rules.
     ///
-    /// This is the input counterpart of [`Self::output_region_provenance`]. For a condition with operands
-    /// `(predicate, value)`, branch input `0` corresponds to operand `1`, while instruction output `0` may come from
-    /// output `0` of either branch. Analyses use these declarations to carry identities and resource roots across
-    /// boundaries without guessing from equal types or matching positions. Unlike diagnostic
+    /// This is the input counterpart of [`Self::output_region_provenance`]. For a condition with instruction inputs
+    /// `(predicate, value)`, branch region input `0` corresponds to instruction input `1`, while instruction output `0`
+    /// may come from output `0` of either branch. Analyses use these declarations to carry identities and resource
+    /// roots across boundaries without guessing from equal types or matching positions. Unlike diagnostic
     /// [`Provenance`](crate::Provenance), these declarations carry semantics used by analyses and transforms.
     ///
-    /// The default declares no provenance. Executed reference inputs require an explicit operand or local origin;
-    /// local references remain borrowed, cannot escape or be consumed, and gain no initialization or access permission
-    /// from this declaration. Region access policies still apply and executed region effects still contribute to the
-    /// operation. The operation owns initialization and publication of local references as ordinary value outputs.
+    /// The default declares no provenance. Executed reference region inputs require an explicit instruction input or
+    /// local origin; local references remain borrowed, cannot escape or be consumed, and gain no initialization or
+    /// access permission from this declaration. Region access policies still apply and executed region effects still
+    /// contribute to the operation. The operation owns initialization and publication of local references as ordinary
+    /// value outputs.
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
         let _ = (region_index, input_index);
@@ -697,8 +698,8 @@ pub trait Operation: Clone {
     /// and [`OperationBoundaryPruning`] describes its contract.
     ///
     /// The default keeps every instruction whole, which is always correct. Operations whose attached regions forward
-    /// operands and outputs positionally override it: a `condition` drops the operands that neither branch uses, and a
-    /// `scan` drops unused stacked operands and outputs together with the carries that nothing depends on. Operations
+    /// inputs and outputs positionally override it: a `condition` drops the inputs that neither branch uses, and a
+    /// `scan` drops unused stacked inputs and outputs together with the carries that nothing depends on. Operations
     /// whose attached regions have coupled boundaries (e.g., the rule regions of a custom function, which mirror its
     /// primal region) keep the default.
     ///
@@ -1174,19 +1175,18 @@ impl std::fmt::Debug for ErasedOperation {
 /// Selects and constructs the concrete [`Operation`] staged by one value-level capability for program type `T`.
 ///
 /// Capabilities such as [`Mul`](crate::Mul) are declared once through the elementwise capability macro and are
-/// blanket-implemented for every [`Value`]. The same call, for example `left.mul(&right)`, must therefore stage
-/// a different concrete operation depending on the operands' type family (e.g., multiplying arrays stages the
-/// stateless [`MulOperation`](crate::MulOperation) itself, while multiplying first-class dimensions must stage a
-/// [`DimensionMulOperation`](crate::DimensionMulOperation) whose payload is computed from the operand types).
-/// This trait is that selection point. The generated capability implementation calls `<OperationMarker as
+/// blanket-implemented for every [`Value`]. The same call, for example `left.mul(&right)`, must therefore stage a
+/// different concrete operation depending on the inputs' type family (e.g., multiplying arrays stages the stateless
+/// [`MulOperation`](crate::MulOperation) itself, while multiplying first-class dimensions must stage a
+/// [`DimensionMulOperation`](crate::DimensionMulOperation) whose payload is computed from the input types). This trait
+/// is that selection point. The generated capability implementation calls `<OperationMarker as
 /// OperationProvider<V::Type>>::provide((), &[..input types..])` and binds the returned operation with the declared
 /// operation marker acting as its own family's provider.
 ///
-/// The default `Request = ()` needs no construction arguments beyond operand types, as used by elementwise
-/// capabilities. A caller can instead pass an operation payload as a request to its context's operation family.
-/// For example, `ZeroOperation::new(output_type)` requests a zero with no operands. The selected operation may
-/// differ from the request (e.g., composite families select their member operations, and unsupported families
-/// return an error).
+/// The default `Request = ()` needs no construction arguments beyond input types, as used by elementwise capabilities.
+/// A caller can instead pass an operation payload as a request to its context's operation family. For example,
+/// `ZeroOperation::new(output_type)` requests a zero with no inputs. The selected operation may differ from the request
+/// (e.g., composite families select their member operations, and unsupported families return an error).
 ///
 /// Explicit requests use the same payload types as ordinary operation construction. The default unit request keeps
 /// self-provision separate from family selection, including when a family is a single operation.
@@ -1201,18 +1201,18 @@ impl std::fmt::Debug for ErasedOperation {
 ///     implementation exactly because the marker does not implement `Operation<Type = T>` for that type family, which
 ///     is also precisely the situation that requires providing a different concrete operation.
 ///
-/// The contract is deliberately narrow. `input_types` contains exactly the operation's input type descriptors in
-/// operand order, callers (i.e., the generated capability implementations) always pass borrowed stack arrays, and
-/// provider implementations validate the arity they support. Selection receives construction metadata and operand
-/// types, never runtime values. Region-carrying operations and operations requiring explicit user parameters keep
-/// their ordinary constructors unless their request explicitly carries those arguments.
+/// The contract is deliberately narrow. `input_types` contains exactly the operation's input type descriptors in input
+/// order, callers (i.e., the generated capability implementations) always pass borrowed stack arrays, and provider
+/// implementations validate the arity they support. Selection receives construction metadata and input types, never
+/// runtime values. Region-carrying operations and operations requiring explicit user parameters keep their ordinary
+/// constructors unless their request explicitly carries those arguments.
 pub trait OperationProvider<T: Type, Request = ()> {
     /// Concrete [`Operation`] type provided for program [`Type`] `T`.
     type Operation: Operation<Type = T>;
 
-    /// Selects and constructs the [`Operation`] for `request` and its ordered operand types. Constructor arguments
-    /// belong in `request`. `input_types` contains only operands and is empty for nullary operations. A family may
-    /// reject requests for operations that it does not support.
+    /// Selects and constructs the [`Operation`] for `request` and its ordered input types. Constructor arguments belong
+    /// in `request`. `input_types` contains only input types and is empty for nullary operations. A family may reject
+    /// requests for operations that it does not support.
     fn provide(request: Request, input_types: &[&T]) -> Result<Self::Operation, ProgramError>;
 }
 
@@ -1230,13 +1230,13 @@ impl<O: Default + Operation> OperationProvider<O::Type> for O {
 /// of [`MemberBatchableOperation`](crate::MemberBatchableOperation) and
 /// [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation).
 ///
-/// Most [`Operation`] enum variants do not need this capability. Composite-native payloads already
-/// implement `Operation<Type = U>`, while homogeneous member payloads use projected boundary helpers like
+/// Most [`Operation`] enum variants do not need this capability. Composite-native payloads already implement
+/// `Operation<Type = U>`, while homogeneous member payloads use projected boundary helpers like
 /// [`infer_projected_operation_region_input_types`] and [`infer_projected_operation_output_types`]. A mixed member
 /// needs this trait only when it deliberately retains a native payload type `T` but its enclosing instruction has a
 /// different or mixed `U`-typed signature. Dynamic array constructors and shape-changing collectives are examples.
 /// Their payloads remain canonical array operations, while their [`Instruction`]s additionally consume first-class
-/// dimension inputs/operands.
+/// dimension inputs.
 ///
 /// Implementations own only the boundary-dependent parts of [`Operation`]. Name, [`Region`](crate::Region) slots,
 /// provenance, structural zero classification, effects, and rendering remain properties of the native payload and are
@@ -1305,15 +1305,16 @@ pub enum OperationFoldReplacement<V> {
 ///
 /// The kept boundary of each attached region follows from the region provenance that the operation declares (i.e.,
 /// [`Operation::input_region_provenance`] and [`Operation::output_region_provenance`]). A region input is kept unless
-/// it is supplied by an operand that is dropped, and a region output is kept unless every instruction output that it
-/// supplies is dropped. Region inputs that the operation creates itself or that have no declared provenance, and region
-/// outputs that supply no instruction output, are therefore always kept.
+/// it is supplied by an instruction input that is dropped, and a region output is kept unless every instruction output
+/// that it supplies is dropped. Region inputs that the operation creates itself or that have no declared provenance,
+/// and region outputs that supply no instruction output, are therefore always kept.
 ///
-/// A pruning must keep every output of the instruction that is used, and every operand that supplies a region input
-/// that is live once only the kept outputs of that region are used (i.e., [`RegionLiveness::used_region_inputs`]).
-/// Operands whose region inputs are not live may still be kept, which is how operations keep region boundaries that
-/// must agree (e.g., the two branches of a `condition` operation). [`Program::into_pruned`] checks both requirements
-/// and validates the pruned instruction with [`Operation::infer_output_types`].
+/// A pruning must keep every output of the instruction that is used, and every instruction input that supplies a region
+/// input that is live once only the kept outputs of that region are used (i.e.,
+/// [`RegionLiveness::used_region_inputs`]). Instruction inputs whose region inputs are not live may still be kept,
+/// which is how operations keep region boundaries that must agree (e.g., the two branches of a `condition` operation).
+/// [`Program::into_pruned`] checks both requirements and validates the pruned instruction with
+/// [`Operation::infer_output_types`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OperationBoundaryPruning<O> {
     /// Operation that applies to the kept inputs and produces the kept outputs (e.g., a `scan` with fewer carries).
@@ -1372,8 +1373,8 @@ impl<O: Operation> OperationBoundaryPruning<O> {
 
     /// Returns whether each input and each output of each region attached to `instruction` is kept, in attachment
     /// order, as derived from the kept boundary of the instruction that this pruning describes through the region
-    /// provenance of its operation. A region input is kept unless the operand that supplies it is dropped, and a
-    /// region output is kept unless every instruction output that it supplies is dropped.
+    /// provenance of its operation. A region input is kept unless the instruction input that supplies it is dropped,
+    /// and a region output is kept unless every instruction output that it supplies is dropped.
     pub(crate) fn kept_region_boundaries<V: Value<Type = O::Type>>(
         &self,
         instruction: &Instruction<O>,
@@ -1498,7 +1499,7 @@ where
 ///
 /// # Parameters
 ///
-///   - `input_types`: Composite types of the member operation's ordinary operands.
+///   - `input_types`: Composite types of the member operation's ordinary inputs.
 ///   - `region_interfaces`: Composite input/output type contracts and effects of its attached regions.
 fn project_operation_boundary<T: Type, U: Type>(
     input_types: &[U],
@@ -1774,7 +1775,7 @@ mod tests {
         let operation = StopGradientOperation::<DataType>::new();
 
         // Check required inference and the default operation contract. The fixture operation is variadic,
-        // so its inference forwards every operand type, including for an empty operand list.
+        // so its inference forwards every input type, including for an empty input list.
         assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
         assert_eq!(
             operation.infer_output_types(&[DataType::F64, DataType::I32], &[]),

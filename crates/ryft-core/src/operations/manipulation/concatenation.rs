@@ -827,7 +827,7 @@ impl_differentiable_operation! {
                     ConcatenateOperation::<ArrayType>::from(operation.clone()),
                 );
 
-                // The trailing result extent is a shape operand with no cotangent contribution, so its accumulator is
+                // The trailing result extent is a shape input with no cotangent contribution, so its accumulator is
                 // left untouched and defaults to a structural zero.
                 return transpose_projected_operation(
                     context,
@@ -1636,7 +1636,7 @@ mod tests {
         let operation = ConcatenateOperation::<ArrayType>::new(0, 2).unwrap();
 
         // Type inference sums static concatenated axes, preserves matching non-concatenated axes, and reports exact
-        // validation errors. The homogeneous operation has no result-extent operand, so a dynamic concatenated axis
+        // validation errors. The homogeneous operation has no result-extent input, so a dynamic concatenated axis
         // cannot be represented without manufacturing an unstable identity and is rejected; the mixed
         // `ConcatenateOperation<ArrayIrType>` carries that extent as its trailing input instead.
         let first_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
@@ -2448,7 +2448,7 @@ mod tests {
             ))),
         );
 
-        // Program rendering uses the canonical operation name and includes the trailing result-extent operand.
+        // Program rendering uses the canonical operation name and includes the trailing result-extent input.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let program_first = builder.add_input(first_type.into());
         let program_second = builder.add_input(second_type.into());
@@ -2496,7 +2496,7 @@ mod tests {
 
         // The conservative form accepts every well-formed signature: static extents must sum to the declared result
         // extent, a sole input is returned unchanged, and the common memory space is preserved while layouts are
-        // cleared. Malformed operand lists report exact errors.
+        // cleared. Malformed input lists report exact errors.
         check_operation_type_inference!(
             operation = checked_operation,
             cases = [

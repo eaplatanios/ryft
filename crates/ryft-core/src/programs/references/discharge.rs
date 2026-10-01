@@ -2,10 +2,10 @@
 //! its references becomes explicit immutable dataflow.
 //!
 //! A program that uses references is not purely functional dataflow. A read depends on the latest write to the same
-//! allocation, but that dependency travels through a reference handle rather than through an operand that carries the
-//! current value. Many transforms and backends need the dependency to be explicit. Discharge makes it explicit by
-//! replaying the program while replacing each selected allocation with an immutable value that is threaded from one
-//! access to the next.
+//! allocation, but that dependency travels through a reference handle rather than through an instruction input that
+//! carries the current value. Many transforms and backends need the dependency to be explicit. Discharge makes it
+//! explicit by replaying the program while replacing each selected allocation with an immutable value that is threaded
+//! from one access to the next.
 //!
 //! # Example
 //!
@@ -70,7 +70,7 @@
 //!      added to their region boundaries, and everything else replays unchanged. Three shared rule bodies cover the
 //!      common cases: [`discharge_reference_free_operation`] for operations that touch no reference,
 //!      [`discharge_local_reference_operation`] for operations whose reference state stays within individual regions,
-//!      and [`discharge_positional_region_operation`] for region-carrying operations that forward their operands to
+//!      and [`discharge_positional_region_operation`] for region-carrying operations that forward their inputs to
 //!      their regions positionally, such as a condition or a call. Loop-shaped operations such as `while` and `scan`
 //!      write their own rules on top of the same machinery.
 //!
@@ -837,7 +837,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeValue<C, P> {
     ///
     /// # Parameters
     ///
-    ///   - `expectation`: Description of the operand the caller expected, used in the diagnostic.
+    ///   - `expectation`: Description of the input the caller expected, used in the diagnostic.
     #[inline]
     pub fn try_as_value(&self, expectation: &str) -> Result<&C::Value, ProgramError> {
         match self {
@@ -853,7 +853,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeValue<C, P> {
     ///
     /// # Parameters
     ///
-    ///   - `expectation`: Description of the operand the caller expected, used in the diagnostic.
+    ///   - `expectation`: Description of the input the caller expected, used in the diagnostic.
     #[inline]
     pub fn try_as_reference(&self, expectation: &str) -> Result<&ReferenceDischargeReference<C, P>, ProgramError> {
         match self {
@@ -1125,11 +1125,11 @@ pub enum ReferenceDischargeRegionOutput {
 }
 
 /// Boundary that a structured reference discharge rule requests for one rebuilt [`Region`](crate::Region) through
-/// [`ReferenceDischargeDriver::rebuild_region`]. The rule owns the mapping from its operands onto the region's declared
-/// inputs, because that mapping is part of what the operation is. The boundary therefore states what enters at each
-/// declared input position, in region order, and separately names the reference-related positions the rebuilt region
-/// gains (i.e., the allocations that enter as added inputs and the allocation or view states published by output
-/// groups). Each group specifies its insertion position in the source boundary.
+/// [`ReferenceDischargeDriver::rebuild_region`]. The rule owns the mapping from its instruction inputs onto the
+/// region's declared inputs, because that mapping is part of what the operation is. The boundary therefore states what
+/// enters at each declared input position, in region order, and separately names the reference-related positions the
+/// rebuilt region gains (i.e., the allocations that enter as added inputs and the allocation or view states published
+/// by output groups). Each group specifies its insertion position in the source boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceDischargeRegionBoundary {
     /// Refer to the documentation of [`Self::declared_inputs`].
@@ -1147,11 +1147,12 @@ pub struct ReferenceDischargeRegionBoundary {
 
 impl ReferenceDischargeRegionBoundary {
     /// Creates a [`ReferenceDischargeRegionBoundary`] for one rebuilt region. Added positions are described separately
-    /// from the declared positions because only the declared positions are replayed. An added input occupies a position
-    /// in the rebuilt region's boundary and in the caller's operand list, but the source region's body never named it
-    /// and so cannot consume it. The region's capture prefix is read from `operation` rather than supplied by the rule,
-    /// so that the prefix used here always agrees with the one that [`ReferenceDischargeContext::region_summary`]
-    /// computes from the same operation. A rule therefore never reasons about captures.
+    /// from the declared positions because only the declared positions are replayed. An added region input occupies a
+    /// position in the rebuilt region's boundary and in the caller's instruction input list, but the source region's
+    /// body never named it and so cannot consume it. The region's capture prefix is read from `operation` rather than
+    /// supplied by the rule, so that the prefix used here always agrees with the one that
+    /// [`ReferenceDischargeContext::region_summary`] computes from the same operation.
+    /// A rule therefore never reasons about captures.
     ///
     /// # Parameters
     ///
@@ -2207,10 +2208,10 @@ where
                 Ok(ReferenceDischargeValue::from(region_reference))
             };
 
-            // Only the declared positions are replayed. An added input occupies a destination boundary position
-            // and a caller operand position, but the source region's body never named it and so cannot consume it.
-            // A preserved allocation occupies an added position only when an inherited capture is returned without
-            // a declared operand.
+            // Only the declared positions are replayed. An added region input occupies a destination boundary position
+            // and a caller instruction input position, but the source region's body never named it and so cannot
+            // consume it. A preserved allocation occupies an added position only when an inherited capture is
+            // returned without a declared instruction input.
             let mut declared = Vec::with_capacity(source_input_count);
             let mut view_inputs = Vec::new();
             for position in 0..=source_input_count {
@@ -2455,7 +2456,7 @@ where
 /// acts on the allocation's current state through the policy's alias mechanics, and a freeze yields the current state
 /// and unbinds the allocation). Structured operations implement their own boundary widening, because widening is a
 /// property of what the operation does with its regions and therefore belongs to the operation. Everything else replays
-/// as-is over rewritten operands. The system is consequently open over primitives: a third-party operation family
+/// as-is over rewritten inputs. The system is consequently open over primitives: a third-party operation family
 /// participates by implementing this trait, with no companion declaration surface beyond the generic
 /// [`Operation::effects`] and region-provenance hooks it already implements.
 ///
@@ -2491,7 +2492,7 @@ pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError`] when this application cannot be rewritten because an operand is of the wrong kind,
+    /// Returns [`ProgramError`] when this application cannot be rewritten because an input is of the wrong kind,
     /// because the references its regions touch cannot be threaded through its boundary, or because the destination
     /// rejected the rewritten work.
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
@@ -3420,7 +3421,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }
 
         // Re-run inference over the inputs' current types before binding the unchanged operation. This preserves
-        // the operation's own operand-relationship diagnostics instead of allowing a destination binding failure
+        // the operation's own input-relationship diagnostics instead of allowing a destination binding failure
         // to obscure them.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
@@ -4194,8 +4195,8 @@ impl<
 }
 
 /// Discharges one [`Operation`] application that touches no reference by replaying it verbatim over its rewritten
-/// operands. This is the rule body that a [`ReferenceDischargeableOperation`] implementation delegates to for every
-/// operation whose operands, outputs, and attached [`Region`](crate::Region)s are all reference-free, and it is the
+/// inputs. This is the rule body that a [`ReferenceDischargeableOperation`] implementation delegates to for every
+/// operation whose inputs, outputs, and attached [`Region`](crate::Region)s are all reference-free, and it is the
 /// discharge counterpart of ordinary interpretation. The destination decides what replaying means (e.g., an eager
 /// destination executes the operation and a staging destination records it).
 ///
@@ -4203,10 +4204,10 @@ impl<
 /// operation with ordered or other effects replays here unchanged, because the replay reproduces those effects in the
 /// destination exactly as the source performed them. Attached regions are copied into the destination as they stand,
 /// which is the complete rewrite for regions that hold no state to thread. An application is rejected as soon as a
-/// reference appears among its operands or anywhere inside an attached region's closure. If references are confined
-/// to individual regions, [`discharge_local_reference_operation`] rebuilds those regions without adding state inputs
-/// or outputs. If references cross a region boundary, the operation's rule must specify how state is threaded through
-/// that boundary. For operations that forward their operands to their regions positionally, use
+/// reference appears among its inputs or anywhere inside an attached region's closure. If references are confined to
+/// individual regions, [`discharge_local_reference_operation`] rebuilds those regions without adding state inputs or
+/// outputs. If references cross a region boundary, the operation's rule must specify how state is threaded through that
+/// boundary. For operations that forward their inputs to their regions positionally, use
 /// [`discharge_positional_region_operation`].
 ///
 /// # Parameters
@@ -4219,7 +4220,7 @@ impl<
 /// # Errors
 ///
 /// Returns [`ProgramError::UnsupportedOperation`] when a region-carrying application touches a reference, returns
-/// [`ProgramError::MalformedProgram`] when a region-free application receives a reference operand, and propagates the
+/// [`ProgramError::MalformedProgram`] when a region-free application receives a reference input, and propagates the
 /// destination's error from the replay itself.
 pub fn discharge_reference_free_operation<
     O: Operation<Type = C::Type>,
@@ -4246,7 +4247,7 @@ pub fn discharge_reference_free_operation<
         .iter()
         .enumerate()
         .map(|(input_index, input)| {
-            input.try_as_value(&format!("a value operand {} of `{}`", input_index, operation.name())).cloned()
+            input.try_as_value(&format!("a value input {} of `{}`", input_index, operation.name())).cloned()
         })
         .collect::<Result<Vec<_>, _>>()?;
     let outputs = context.parent().bind(operation.clone(), regions, values.as_slice())?;
@@ -4341,28 +4342,28 @@ pub fn discharge_local_reference_operation<
         result.validate_predicted_mutations(&[], name)?;
         regions.push(result.into_program());
     }
-    let operands = inputs.iter().map(|input| context.boundary_value(input)).collect::<Result<Vec<_>, _>>()?;
-    let outputs = context.parent().bind(operation.clone(), regions, operands.as_slice())?;
+    let boundary_values = inputs.iter().map(|input| context.boundary_value(input)).collect::<Result<Vec<_>, _>>()?;
+    let outputs = context.parent().bind(operation.clone(), regions, boundary_values.as_slice())?;
     Ok(outputs.into_iter().map(ReferenceDischargeValue::Value).collect())
 }
 
 /// Discharges one region-carrying [`Operation`] application whose [`Region`](crate::Region)s positionally forward its
-/// operands, so that the references its region closures touch become explicit immutable state. This is the rule body
-/// that a [`ReferenceDischargeableOperation`] implementation delegates to for structured operations whose attached
-/// regions all mirror the operand list after a constant number of leading operands and whose outputs are each
-/// region's own outputs, such as a condition, whose branches follow its predicate, and a call, whose callee follows
-/// nothing. Loop-shaped operations such as `while` and `scan` carry their state symmetrically through a fixed point
-/// and need a rule of their own built on [`ReferenceDischargeRegionBoundary::symmetric`]. When the application touches
-/// no references, [`discharge_reference_free_operation`] can replay it unchanged. When reference state is confined to
-/// individual regions and their interfaces need no additional state inputs or outputs,
+/// inputs, so that the references its region closures touch become explicit immutable state. This is the rule body that
+/// a [`ReferenceDischargeableOperation`] implementation delegates to for structured operations whose attached regions
+/// all mirror the instruction input list after a constant number of leading instruction inputs and whose outputs are
+/// each region's own outputs, such as a condition, whose branches follow its predicate, and a call, whose callee
+/// follows nothing. Loop-shaped operations such as `while` and `scan` carry their state symmetrically through a fixed
+/// point and need a rule of their own built on [`ReferenceDischargeRegionBoundary::symmetric`]. When the application
+/// touches no references, [`discharge_reference_free_operation`] can replay it unchanged. When reference state is
+/// confined to individual regions and their interfaces need no additional state inputs or outputs,
 /// [`discharge_local_reference_operation`] can rebuild them independently without requiring positional forwarding.
 /// This function additionally supports references crossing the regions' boundaries by explicitly threading their
 /// state through a shared positional interface.
 ///
 /// All attached regions receive one shared boundary, which is widened as follows:
 ///
-///   - every allocation that some region closure reaches enters as an operand appended after the declared ones, unless
-///     a declared reference operand already carries it, in which case it enters at its own position;
+///   - every allocation that some region closure reaches enters as an input appended after the declared ones, unless a
+///     declared reference input already carries it, in which case it enters at its own position;
 ///   - only the allocations that some closure mutates are published back, as outputs appended after the declared ones,
 ///     unless a declared reference output already publishes them. An allocation the closures merely read needs no
 ///     successor state, which keeps a read-only branch's boundary identical to its source boundary; and
@@ -4371,22 +4372,22 @@ pub fn discharge_local_reference_operation<
 ///
 /// # Parameters
 ///
-///   - `operation`: Operation application being rewritten. It is bound unchanged over the widened operand list,
-///     because threading state past a positional boundary changes only the boundary.
+///   - `operation`: Operation application being rewritten. It is bound unchanged over the widened input list, because
+///     threading state past a positional boundary changes only the boundary.
 ///   - `context`: Active [`ReferenceDischargeContext`] owning the allocation environment.
 ///   - `driver`: Application-scoped [`ReferenceDischargeDriver`] supplying the attached regions.
 ///   - `inputs`: Carrier [`ReferenceDischargeValue`]s supplied as this application's inputs,
 ///     in operation-defined order.
-///   - `leading_input_count`: Number of leading inputs/operands that parameterize the operation itself rather than
-///     being forwarded to its regions, which is one for a condition's predicate and zero for a call.
+///   - `leading_input_count`: Number of leading inputs that parameterize the operation itself rather than being
+///     forwarded to its regions, which is one for a condition's predicate and zero for a call.
 ///
 /// # Errors
 ///
-/// Returns [`ProgramError::MalformedProgram`] when the application has fewer inputs than `leading_input_count`,
-/// when a leading operand is a reference, when an attached region's boundary does not forward the remaining operands
-/// positionally, when a region closure reaches an allocation that never entered the boundary or consumes one, when a
-/// region returns an allocation its caller never threaded, when the attached regions disagree on which outputs denote
-/// references, or when a region mutates an allocation the widening did not predict.
+/// Returns [`ProgramError::MalformedProgram`] when the application has fewer inputs than `leading_input_count`, when a
+/// leading input is a reference, when an attached region's boundary does not forward the remaining inputs positionally,
+/// when a region closure reaches an allocation that never entered the boundary or consumes one, when a region returns
+/// an allocation its caller never threaded, when the attached regions disagree on which outputs denote references, or
+/// when a region mutates an allocation the widening did not predict.
 pub fn discharge_positional_region_operation<
     O: Operation<Type = C::Type>,
     C: Context<Type: From<P::Referent>, Operation: From<O>>,
@@ -4468,16 +4469,16 @@ pub fn discharge_positional_region_operation<
     }
     let output_allocations = summary.output_allocations();
 
-    let mut operands = Vec::with_capacity(inputs.len() + entering.len());
+    let mut boundary_values = Vec::with_capacity(inputs.len() + entering.len());
     for input in inputs {
-        operands.push(context.boundary_value(input)?);
+        boundary_values.push(context.boundary_value(input)?);
     }
     for allocation in entering {
-        operands.push(
+        boundary_values.push(
             context.boundary_value(&ReferenceDischargeValue::Reference(context.allocation_reference(*allocation)?))?,
         );
     }
-    let outputs = context.parent().bind(operation.clone(), regions, operands.as_slice())?;
+    let outputs = context.parent().bind(operation.clone(), regions, boundary_values.as_slice())?;
     check_count!("output", outputs, source_output_count + leaving.len(), ProgramError);
 
     // A declared output that denotes a reference is reported as the handle the caller already holds rather than as a
@@ -4944,7 +4945,7 @@ mod tests {
         ) -> Result<Vec<ListIrType>, TypeError> {
             let referent = |index: usize| match input_types.get(index) {
                 Some(ListIrType::Reference(reference)) => Ok(reference.referent().clone()),
-                _ => Err(TypeError::invalid(format!("`{}` expects a reference operand", self.name()))),
+                _ => Err(TypeError::invalid(format!("`{}` expects a reference input", self.name()))),
             };
             match self {
                 Self::Add => {
@@ -4954,7 +4955,7 @@ mod tests {
                 Self::Select { offset, length } => {
                     check_count!("input", input_types, 1, TypeError);
                     let ListIrType::List(source) = &input_types[0] else {
-                        return Err(TypeError::invalid("`list.select` expects a list operand"));
+                        return Err(TypeError::invalid("`list.select` expects a list input"));
                     };
                     if offset + length > source.length {
                         return Err(TypeError::invalid(format!(
@@ -4968,7 +4969,7 @@ mod tests {
                     check_count!("input", input_types, 2, TypeError);
                     let (ListIrType::List(target), ListIrType::List(update)) = (&input_types[0], &input_types[1])
                     else {
-                        return Err(TypeError::invalid("`list.splice` expects two list operands"));
+                        return Err(TypeError::invalid("`list.splice` expects two list inputs"));
                     };
                     if offset + update.length > target.length {
                         return Err(TypeError::invalid(format!(
@@ -4981,7 +4982,7 @@ mod tests {
                 Self::ReferenceNew => {
                     check_count!("input", input_types, 1, TypeError);
                     let ListIrType::List(referent) = &input_types[0] else {
-                        return Err(TypeError::invalid("`list.reference_new` expects a list operand"));
+                        return Err(TypeError::invalid("`list.reference_new` expects a list input"));
                     };
                     Ok(vec![ListIrType::Reference(ReferenceType::new(referent.clone()))])
                 }
@@ -5833,7 +5834,7 @@ mod tests {
 
         // A retained reference operation is disqualifying even when every value in the program is non-reference.
         // Checked construction refuses such an application outright, because its declared access names a non-reference
-        // operand, so the program is assembled unchecked: the proof's independent declaration scan exists precisely for
+        // input, so the program is assembled unchecked: the proof's independent declaration scan exists precisely for
         // programs that bypassed construction-time validation.
         let retained = {
             let list = ListIrType::List(ListType { length: 2 });
@@ -6148,7 +6149,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_value_reports_operand_kind_mismatches() {
+    fn test_reference_discharge_value_reports_input_kind_mismatches() {
         // A rule that receives the wrong carrier kind gets a diagnostic naming what it expected, which is what keeps
         // an open set of third-party rules diagnosable without each of them inventing its own message.
         let context = ListDischargeContext::new(ListDestination::new());
@@ -7772,7 +7773,7 @@ mod tests {
 
     #[test]
     fn test_recursive_reference_discharge_driver_rebuild_region_inserts_added_state() {
-        // Added state is what a region closure reaches without receiving it as a declared operand. No source construct
+        // Added state is what a region closure reaches without receiving it as a declared input. No source construct
         // the interpreter currently accepts produces one (a reference reaches a region only through its boundary,
         // because a reference-typed constant is rejected outright) so the mechanics are exercised here directly,
         // against the boundary request a rule would make once capture-scoped references resolve.
@@ -8701,7 +8702,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_context_replay_preserved_access() {
-        // An access whose every declared reference operand is preserved replays verbatim: the operation is bound again
+        // An access whose every declared reference input is preserved replays verbatim: the operation is bound again
         // over each handle's destination reference value. A staging destination is used because the eager destination
         // of this universe declines to execute a reference primitive, and recording is what production discharge does.
         let referent = ListType { length: 2 };
@@ -9236,7 +9237,7 @@ mod tests {
     #[test]
     fn test_program_discharge_references_widens_positional_callee() {
         /// Array-IR family extended with one positional call, mirroring how a backend attaches a compiled callee
-        /// region, forwards its operands positionally, and reports its outputs positionally.
+        /// region, forwards its inputs positionally, and reports its outputs positionally.
         #[derive(Clone, Debug)]
         enum CallingOperation {
             /// Native array-IR operation.
@@ -9472,7 +9473,7 @@ mod tests {
             .unwrap();
 
         // Discharge appends the callee's final state to its outputs and threads that result into the freeze, leaving
-        // the call itself in place with its positional operand and output contract intact.
+        // the call itself in place with its positional input and output contract intact.
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().to_string(),
@@ -9955,7 +9956,7 @@ mod tests {
     fn test_program_partially_discharge_references_threads_a_preserved_allocation_beside_discharged_state() {
         // A structured boundary carries both kinds of allocation at once: a discharged carry crosses as immutable
         // state and is widened with a published successor, while a preserved carry crosses as the reference it already
-        // is, at its own declared operand position, and widens nothing at all.
+        // is, at its own declared input position, and widens nothing at all.
         let mut callee_builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let callee_state = callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let callee_kernel = callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
@@ -9982,8 +9983,8 @@ mod tests {
         let targets = source.reference_discharge_targets(0).unwrap();
         let discharged = source.partially_discharge_references(0, &targets[..1]).unwrap();
 
-        // The selected allocation's entering state occupies its own operand position and its successor is appended as
-        // a published output; the preserved reference's operand position still carries a reference, and the rebuilt
+        // The selected allocation's entering state occupies its own input position and its successor is appended as
+        // a published output; the preserved reference's input position still carries a reference, and the rebuilt
         // callee performs the read on it exactly as the source did.
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(
@@ -10170,7 +10171,7 @@ mod tests {
 
     #[test]
     fn test_discharge_reference_free_operation() {
-        // Value operands replay verbatim through the destination, which executes the operation eagerly here.
+        // Value inputs replay verbatim through the destination, which executes the operation eagerly here.
         let context = ListDischargeContext::new(ListDestination::new());
         let inputs = vec![
             ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2])),
@@ -10181,7 +10182,7 @@ mod tests {
             Ok(vec![ReferenceDischargeValue::Value(ListIrValue::List(vec![11, 22]))]),
         );
 
-        // A reference operand is rejected, because an operation that receives a reference owns its own rule.
+        // A reference input is rejected, because an operation that receives a reference owns its own rule.
         let allocated = ReferenceDischargeValue::from(
             context
                 .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
@@ -10196,7 +10197,7 @@ mod tests {
                 &[allocated, inputs[1].clone()],
             ),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a value operand 0 of `list.add` but received {allocation} ref<list<2>>",
+                "reference discharge expected a value input 0 of `list.add` but received {allocation} ref<list<2>>",
             ))),
         );
     }
@@ -10304,7 +10305,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discharge_local_reference_operation_rejects_reference_operands() {
+    fn test_discharge_local_reference_operation_rejects_reference_inputs() {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let input = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let callee = builder
@@ -10464,8 +10465,8 @@ mod tests {
 
     #[test]
     fn test_discharge_positional_region_operation_recovers_a_returned_capture_scoped_allocation() {
-        // This allocation reaches the region through its inherited capture scope, not through any forwarded operand.
-        // The declared result must therefore be recovered from the context rather than from the empty operand list.
+        // This allocation reaches the region through its inherited capture scope, not through any forwarded input.
+        // The declared result must therefore be recovered from the context rather than from the empty input list.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let captured = builder.add_constant(ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })));
         let program = builder

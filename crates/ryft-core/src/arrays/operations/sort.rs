@@ -1,7 +1,7 @@
 //! Reference [`Array`] kernels for the sorting operation family contracts.
 //!
 //! Sorting ranks keys through a total order computed directly from each element's encoding, then applies the
-//! resulting permutation by moving whole element encodings. Non-key operands therefore sort without being decoded,
+//! resulting permutation by moving whole element encodings. Non-key inputs therefore sort without being decoded,
 //! including element data types that have no scalar representation.
 
 use crate::arrays::addressing::ArrayAddressing;
@@ -54,12 +54,12 @@ impl Array {
 
 impl Sort for Array {
     fn sort_with_key_count(
-        operands: &[Self],
+        inputs: &[Self],
         axis: usize,
         direction: SortDirection,
         key_count: usize,
     ) -> Result<Vec<Self>, ProgramError> {
-        let Some(key) = operands.first() else {
+        let Some(key) = inputs.first() else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!("`{SORT_OPERATION_NAME}` needs at least one input"),
             });
@@ -69,12 +69,12 @@ impl Sort for Array {
                 message: format!("`{SORT_OPERATION_NAME}` key_count must be at least 1"),
             });
         }
-        if key_count > operands.len() {
+        if key_count > inputs.len() {
             return Err(TypeError::invalid(format!(
-                "`{}` key_count {} exceeds operand count {}",
+                "`{}` key_count {} exceeds input count {}",
                 SORT_OPERATION_NAME,
                 key_count,
-                operands.len(),
+                inputs.len(),
             ))
             .into());
         }
@@ -88,21 +88,21 @@ impl Sort for Array {
             ))
             .into());
         }
-        for operand in operands {
-            if operand.r#type().shape() != key.r#type().shape() {
+        for input in inputs {
+            if input.r#type().shape() != key.r#type().shape() {
                 return Err(TypeError::invalid(format!(
-                    "`{}` operands must agree on shape but got {} and {}",
+                    "`{}` inputs must agree on shape but got {} and {}",
                     SORT_OPERATION_NAME,
                     key.r#type().shape(),
-                    operand.r#type().shape(),
+                    input.r#type().shape(),
                 ))
                 .into());
             }
         }
         SortOperation::new(axis, direction)
             .with_key_count(key_count)?
-            .infer_output_types(&operands.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-        let key_ranks = operands[..key_count]
+            .infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
+        let key_ranks = inputs[..key_count]
             .iter()
             .map(|key| {
                 let data_type = key.r#type().data_type();
@@ -125,18 +125,18 @@ impl Sort for Array {
             .collect::<Result<Vec<_>, _>>()?;
         let key_rank_slices = key_ranks.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let gather = sort_permutation(key_rank_slices.as_slice(), shape.dimensions(), axis, direction);
-        // Applying the gather map moves whole element encodings, so non-key operands of any element data type
-        // (including the sub-byte ones without a scalar representation) sort without being decoded.
-        operands
+        // Applying the gather map moves whole element encodings, so non-key inputs of any element data type (including
+        // the sub-byte ones without a scalar representation) sort without being decoded.
+        inputs
             .iter()
-            .map(|operand| operand.gather_elements(operand.r#type().into_owned(), |index| gather[index]))
+            .map(|input| input.gather_elements(input.r#type().into_owned(), |index| gather[index]))
             .collect()
     }
 }
 
 /// Materializes the `i32` index passenger that rides a ranking sort for the concrete eager [`Array`] backend
 /// (the transform tracers stage it as an [`IotaOperation`](crate::operations::constants::IotaOperation) instead),
-/// returning it together with the operand's static dimensions.
+/// returning it together with the static dimensions of `value`.
 fn eager_index_passenger(value: &Array, axis: usize) -> Result<(Array, Vec<usize>), ProgramError> {
     let shape = value.r#type().static_shape().unwrap();
     let dimensions = shape.dimensions().to_vec();
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_array_sort() {
-        // Non-key operands sort by moving whole element encodings, so sub-byte operands (which have no scalar
+        // Non-key inputs sort by moving whole element encodings, so sub-byte inputs (which have no scalar
         // representation) ride an f32 key without being decoded.
         let key = Array::vector(vec![3.0f32, 1.0, 2.0]).unwrap();
         let passenger = Array::from_elements(

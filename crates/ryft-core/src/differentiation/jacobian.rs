@@ -249,7 +249,7 @@ where
     // Output types are validated inside the closure, before linearization materializes a structural zero in a nonzero
     // dynamic array differential space, so a non-finite coordinate space retains the precise Jacobian diagnostic.
     // Validate here because a dynamic structural zero still cannot be materialized by a nullary type-only constructor.
-    // A future operand-relative zero operation may make this early validation redundant.
+    // A future input-relative zero operation may make this early validation redundant.
     let mut auxiliary = None;
     let (output, pushforward) = context.linearize(
         |input, capture| {
@@ -452,7 +452,7 @@ where
     // reports its input role instead of the type-identity-dependent nullary-constructor error that materializing a zero
     // input cotangent during the pullback trace would otherwise raise first. This pre-validation remains necessary
     // while pullback tracing can materialize a dynamic nullary cotangent before reporting that the corresponding
-    // coordinate space is non-finite. A future operand-relative zero operation may make it redundant.
+    // coordinate space is non-finite. A future input-relative zero operation may make it redundant.
     coordinate_prefix_offsets::<C, _>(
         &input_types,
         DerivativeTransform::JacobianReverse,

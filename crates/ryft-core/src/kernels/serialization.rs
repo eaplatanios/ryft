@@ -898,7 +898,7 @@ impl Encoder {
                         WireOperation::DimensionConstant(self.value(&operation.value().clone().into())?)
                     }
                     DimensionOperation::Add(operation) => {
-                        // Refinement may retain cached assertion effects and diagnostic names from wider operands.
+                        // Refinement may retain cached assertion effects and diagnostic names from wider inputs.
                         let reconstructed =
                             DimensionAddOperation::new(operation.left_type(), operation.right_type())
                                 .map_err(|_| unsupported(format!("{} cached inference metadata", operation.name())))?;
@@ -911,7 +911,7 @@ impl Encoder {
                         }
                     }
                     DimensionOperation::Sub(operation) => {
-                        // Refinement may retain cached assertion effects and diagnostic names from wider operands.
+                        // Refinement may retain cached assertion effects and diagnostic names from wider inputs.
                         let reconstructed =
                             DimensionSubOperation::new(operation.left_type(), operation.right_type())
                                 .map_err(|_| unsupported(format!("{} cached inference metadata", operation.name())))?;
@@ -924,7 +924,7 @@ impl Encoder {
                         }
                     }
                     DimensionOperation::Mul(operation) => {
-                        // Refinement may retain cached assertion effects and diagnostic names from wider operands.
+                        // Refinement may retain cached assertion effects and diagnostic names from wider inputs.
                         let reconstructed =
                             DimensionMulOperation::new(operation.left_type(), operation.right_type())
                                 .map_err(|_| unsupported(format!("{} cached inference metadata", operation.name())))?;
@@ -937,7 +937,7 @@ impl Encoder {
                         }
                     }
                     DimensionOperation::Div(operation) => {
-                        // Refinement may retain cached assertion effects and diagnostic names from wider operands.
+                        // Refinement may retain cached assertion effects and diagnostic names from wider inputs.
                         let reconstructed =
                             DimensionDivOperation::new(operation.left_type(), operation.right_type())
                                 .map_err(|_| unsupported(format!("{} cached inference metadata", operation.name())))?;
@@ -950,7 +950,7 @@ impl Encoder {
                         }
                     }
                     DimensionOperation::Rem(operation) => {
-                        // Refinement may retain cached assertion effects and diagnostic names from wider operands.
+                        // Refinement may retain cached assertion effects and diagnostic names from wider inputs.
                         let reconstructed =
                             DimensionRemOperation::new(operation.left_type(), operation.right_type())
                                 .map_err(|_| unsupported(format!("{} cached inference metadata", operation.name())))?;

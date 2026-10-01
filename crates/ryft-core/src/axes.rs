@@ -23,7 +23,7 @@
 //! seeded with device-mesh axes, and nested tracing may introduce nearer bindings that shadow outer ones. Projection,
 //! partial evaluation, differentiation, and other transparent wrappers delegate unresolved names to their parent.
 //!
-//! A binding deliberately does not identify a dimension of every value. A replicated operand has no mapped dimension
+//! A binding deliberately does not identify a dimension of every value. A replicated input has no mapped dimension
 //! even when a collective over the enclosing logical axis is meaningful. The operation rule that consumes the name
 //! combines the binding with its transform-specific per-value metadata.
 //!
@@ -518,7 +518,7 @@ pub const AXIS_INDEX_OPERATION_NAME: &str = "axis_index";
 /// trace-time binder. Its per-device coordinate is known only at execution time, and so the operation stays in the
 /// staged body and lowers inside a `shard_map` manual region to `partition_id`-based coordinate arithmetic. Only mesh
 /// uses therefore reach interpretation, which is why this operation is *not* eagerly interpretable and, having no
-/// operands, is [partially evaluated](PartiallyEvaluatableOperation) by residualizing rather than folding (that is
+/// inputs, is [partially evaluated](PartiallyEvaluatableOperation) by residualizing rather than folding (that is
 /// because folding a nullary operation would result in trying to interpret it).
 ///
 /// # Examples
@@ -853,7 +853,7 @@ mod tests {
     #[test]
     fn test_batch_axis_index_produces_per_item_indices() {
         // `axis_index("i")` gives each batch item its own position along the mapped axis `"i"` (size 3), so the
-        // batched result is the `u64` index vector `[0, 1, 2]` regardless of the operand values.
+        // batched result is the `u64` index vector `[0, 1, 2]` regardless of the input values.
         let output: Array = batch(
             |item| item.context().axis_index("i"),
             Array::vector(vec![10.0, 20.0, 30.0]).unwrap(),

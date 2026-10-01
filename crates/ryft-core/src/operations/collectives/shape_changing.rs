@@ -70,7 +70,7 @@ pub(super) fn infer_explicit_shape_changing_collective_output_type(
     check_count!("input", input_types, expected, TypeError);
     let input_type = <&ArrayType>::try_from(&input_types[0])?;
     if !accepts_unreduced && !input_type.unreduced_axes().is_empty() {
-        return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced operands")));
+        return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced inputs")));
     }
     let output_extents = ArrayIrType::extents(&input_types[1..])?;
     if unchanged_input_axes.len() != output_extents.len() {

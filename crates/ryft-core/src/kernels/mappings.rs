@@ -1,4 +1,4 @@
-//! Pure dimension programs describing kernel operand windows.
+//! Pure dimension programs describing kernel windows over full arrays.
 //!
 //! Mappings reuse ordinary Ryft programs and checked dimension arithmetic. Their boundary accepts host-bound grid
 //! coordinates, extents, and static parameters, never arrays or mutable references. The initial straight-line subset
@@ -17,7 +17,7 @@ use crate::programs::{
     Atom, FlatProgram, Operation, ProgramBuilder, ProgramError, ReferenceViewOverlap, TypeError, Typed,
 };
 
-/// Invalid mapping program, index arithmetic, or operand window.
+/// Invalid mapping program, index arithmetic, or full array window.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum BlockMappingError {
     /// The existing interpreter rejected dimension bindings or arithmetic.
@@ -40,10 +40,10 @@ pub enum BlockMappingError {
         operation: &'static str,
     },
 
-    /// A mapping output or operand shape has the wrong rank.
+    /// A mapping output or full array shape has the wrong rank.
     #[error("block mapping {boundary} has rank {actual}, but the block shape has rank {expected}")]
     RankMismatch {
-        /// Mapping output or operand shape being checked.
+        /// Mapping output or full array shape being checked.
         boundary: &'static str,
         /// Static block rank.
         expected: usize,
@@ -54,30 +54,30 @@ pub enum BlockMappingError {
     /// An extent or window limit exceeds the canonical dimension width.
     #[error("block mapping {boundary} at axis {axis} exceeds the maximum dimension extent {MAX_DIMENSION_EXTENT}")]
     Overflow {
-        /// Block shape, operand shape, or window limit being checked.
+        /// Block shape, full array shape, or window limit being checked.
         boundary: &'static str,
         /// Axis whose extent or arithmetic exceeded the dimension width.
         axis: usize,
     },
 
-    /// An unmasked window reaches outside its operand.
-    #[error("block mapping axis {axis} selects `{start}..{limit}` outside operand extent {extent}")]
+    /// An unmasked window reaches outside its full array.
+    #[error("block mapping axis {axis} selects `{start}..{limit}` outside array extent {extent}")]
     OutOfBounds {
-        /// Operand axis whose window is invalid.
+        /// Full array axis whose window is invalid.
         axis: usize,
         /// Inclusive window start.
         start: usize,
         /// Exclusive window limit.
         limit: usize,
-        /// Concrete operand extent.
+        /// Concrete full array extent.
         extent: usize,
     },
 }
 
-/// Required handling of a window that crosses an operand boundary.
+/// Required handling of a window that crosses a full array boundary.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BoundaryPolicy {
-    /// Every selected coordinate must belong to the operand.
+    /// Every selected coordinate must belong to the full array.
     InBounds,
 
     /// Consumers must explicitly mask invalid coordinates before memory access. This policy does not authorize
@@ -96,7 +96,7 @@ pub struct BlockMapping {
     program: FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>,
     /// Logical extents of each block, including any explicitly masked coordinates.
     block_shape: Vec<usize>,
-    /// Required treatment of coordinates outside the operand.
+    /// Required treatment of coordinates outside the full array.
     boundary_policy: BoundaryPolicy,
 }
 
@@ -144,7 +144,7 @@ impl BlockMapping {
         &self.block_shape
     }
 
-    /// Returns the required operand boundary handling.
+    /// Returns the required full array boundary handling.
     pub fn boundary_policy(&self) -> BoundaryPolicy {
         self.boundary_policy
     }
@@ -241,23 +241,20 @@ impl BlockMapping {
             .collect()
     }
 
-    /// Interprets dimension bindings and intersects the resulting block with the concrete operand shape. The returned
-    /// valid transform selects only valid memory; the original starts remain available for constructing explicit masks.
+    /// Interprets dimension bindings and intersects the resulting block with the concrete full array shape. The
+    /// returned valid transform selects only valid memory; the original starts remain available for constructing
+    /// explicit masks.
     ///
     /// # Parameters
     ///
     ///   - `inputs`: dimension bindings in the mapping program's input order.
-    ///   - `operand_shape`: concrete root extents in block-axis order.
-    pub fn evaluate(
-        &self,
-        inputs: &[DimensionValue],
-        operand_shape: &[usize],
-    ) -> Result<BlockWindow, BlockMappingError> {
-        if operand_shape.len() != self.block_shape.len() {
+    ///   - `array_shape`: concrete full array extents in block-axis order.
+    pub fn evaluate(&self, inputs: &[DimensionValue], array_shape: &[usize]) -> Result<BlockWindow, BlockMappingError> {
+        if array_shape.len() != self.block_shape.len() {
             return Err(BlockMappingError::RankMismatch {
-                boundary: "operand",
+                boundary: "array shape",
                 expected: self.block_shape.len(),
-                actual: operand_shape.len(),
+                actual: array_shape.len(),
             });
         }
         let outputs = self.program.interpret(inputs.iter().cloned().map(ArrayIrValue::Dimension).collect())?;
@@ -265,10 +262,10 @@ impl BlockMapping {
         let mut axes = Vec::with_capacity(outputs.len());
         let mut requires_mask = false;
         for (axis, ((output, &size), &extent)) in
-            outputs.into_iter().zip(&self.block_shape).zip(operand_shape).enumerate()
+            outputs.into_iter().zip(&self.block_shape).zip(array_shape).enumerate()
         {
             if extent > MAX_DIMENSION_EXTENT {
-                return Err(BlockMappingError::Overflow { boundary: "operand shape", axis });
+                return Err(BlockMappingError::Overflow { boundary: "array shape", axis });
             }
             let ArrayIrValue::Dimension(start) = output else {
                 unreachable!("validated mapping outputs are dimensions");
@@ -291,12 +288,12 @@ impl BlockMapping {
     }
 }
 
-/// Evaluated block starts and their valid operand intersection. No storage or reference handle is owned here.
+/// Evaluated block starts and their valid full array intersection. No storage or reference handle is owned here.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockWindow {
-    /// Original element starts before intersecting with the operand bounds.
+    /// Original element starts before intersecting with the full array bounds.
     starts: Vec<usize>,
-    /// Canonical unit-stride slice containing only valid operand coordinates.
+    /// Canonical unit-stride slice containing only valid full array coordinates.
     valid_transform: ArrayReferenceTransform,
     /// Whether explicit masks are required before using the full logical block.
     requires_mask: bool,
@@ -313,12 +310,12 @@ impl BlockWindow {
         &self.valid_transform
     }
 
-    /// Returns whether the original logical window extends beyond the operand.
+    /// Returns whether the original logical window extends beyond the full array.
     pub fn requires_mask(&self) -> bool {
         self.requires_mask
     }
 
-    /// Compares valid coordinates of windows on the same operand root. Empty intersections are disjoint, identical
+    /// Compares valid coordinates of windows on the same full array. Empty intersections are disjoint, identical
     /// nonempty intersections are the same, and partially intersecting windows may overlap. Different ranks are
     /// conservatively reported as possibly overlapping; root identity remains the caller's responsibility.
     pub fn overlap(&self, other: &Self) -> ReferenceViewOverlap {
@@ -639,11 +636,11 @@ mod tests {
         ));
         assert!(matches!(
             mapping.evaluate(&inputs(&mapping, &[0]), &[MAX_DIMENSION_EXTENT + 1]),
-            Err(BlockMappingError::Overflow { boundary: "operand shape", axis: 0 }),
+            Err(BlockMappingError::Overflow { boundary: "array shape", axis: 0 }),
         ));
         assert!(matches!(
             mapping.evaluate(&inputs(&mapping, &[0]), &[4, 4]),
-            Err(BlockMappingError::RankMismatch { boundary: "operand", expected: 1, actual: 2 }),
+            Err(BlockMappingError::RankMismatch { boundary: "array shape", expected: 1, actual: 2 }),
         ));
         assert!(matches!(
             mapping.evaluate(&[], &[4]),

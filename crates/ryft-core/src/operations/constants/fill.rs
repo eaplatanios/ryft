@@ -274,7 +274,7 @@ where
         }
 
         // Dynamic broadcast consumes every output axis. Static axes become dimension constants, while the
-        // caller's dynamic axes remain explicit operands and retain their declared identity.
+        // caller's dynamic axes remain explicit inputs and retain their declared identity.
         let mut dimensions = dimensions.iter();
         let mut static_dimensions = static_dimensions.into_iter();
         let mut inputs = Vec::with_capacity(r#type.rank() + 1);
@@ -348,7 +348,7 @@ mod tests {
             Ok(vec![u4::new(2).unwrap(); 2]),
         );
 
-        // Eager arrays have no runtime extent operands from which to materialize a dynamically shaped result.
+        // Eager arrays have no runtime extent inputs from which to materialize a dynamically shaped result.
         let dynamic_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::unbounded()))]),
@@ -377,7 +377,7 @@ mod tests {
         let output_type = ArrayType::new_static(DataType::F32, [2]);
         let output = context.fill(&output_type, 4.5f32).unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[4.5f32; 2]).unwrap(),);
+        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[4.5f32; 2]).unwrap());
     }
 
     #[test]
@@ -592,7 +592,7 @@ mod tests {
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into()]));
         assert!(matches!(context.dynamic_fill(&output_type, 1.0_f32, &[]),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`fill` expects one dimension operand per dynamic output dimension (1) but got 0 operands"));
+                if message == "`fill` expects one dimension input per dynamic output dimension (1) but got 0 inputs"));
         assert!(context.builder().borrow().instructions().is_empty());
         let extent = context.input(DimensionType::from(rows).into());
         let output_type = output_type.with_layout(Layout::Strided(StridedLayout::new(vec![4, 4])));

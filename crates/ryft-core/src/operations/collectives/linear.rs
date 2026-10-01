@@ -39,7 +39,7 @@ pub(super) fn linear_collective_dimensions(
 ) -> Result<Vec<usize>, TypeError> {
     check_count!("input", input_types, 1, TypeError);
     if !accepts_unreduced && !input_types[0].unreduced_axes().is_empty() {
-        return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced operands")));
+        return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced inputs")));
     }
     let Some(shape) = input_types[0].static_shape() else {
         return Err(TypeError::invalid(format!("`{operation_name}` does not support dynamically shaped operands")));

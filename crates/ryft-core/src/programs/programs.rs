@@ -1783,7 +1783,7 @@ impl RegionSimplificationShape {
     /// both shape flags hold: (1) an output-free instruction's survival and position are invisible to the mapping
     /// (i.e., [`Self::atoms_pin_every_instruction`]), and (2) atom evidence pins instruction order only when the source
     /// numbers its atoms in instruction order (i.e., [`Self::atoms_are_instruction_ordered`]). The rebuilt region's
-    /// instructions may still have their attached [`RegionId`] operands renumbered afterward by [`compact_regions`],
+    /// instructions may still have their attached [`RegionId`]s renumbered afterward by [`compact_regions`],
     /// so the recognized identity is an identity _up to region-identifier renumbering_. That is sound for cache sharing
     /// for the same reason [`RegionArena::append`] keeps derived metadata valid: renumbering preserves the complete
     /// reachable region graph's topology and changes no region boundary, [`Operation`], or [`Atom`].
@@ -3139,14 +3139,14 @@ mod tests {
 
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let operand = builder.add_input(array_type.clone());
+        let input = builder.add_input(array_type.clone());
         let constant = builder.add_constant(Array::scalar(2.0_f64).unwrap());
         let shared_branch = builder.import_program(branch);
         let output = builder
             .add_instruction(
                 ConditionOperation::<Array>::new(),
                 vec![shared_branch, shared_branch],
-                vec![predicate, operand],
+                vec![predicate, input],
                 None,
             )
             .unwrap()[0];
@@ -3658,13 +3658,13 @@ mod tests {
 
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let operand = builder.add_input(ArrayType::scalar(DataType::F64));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let branch_region = builder.import_program(branch);
         let output = builder
             .add_instruction(
                 ConditionOperation::<Array>::new(),
                 vec![branch_region, branch_region],
-                vec![predicate, operand],
+                vec![predicate, input],
                 None,
             )
             .unwrap()[0];
@@ -3911,7 +3911,7 @@ mod tests {
     #[test]
     fn test_program_into_pruned() {
         // `f(p, x, y)` returns only the first output of a condition over `pruning_branch`, so the condition drops its
-        // second output together with the operand `y`, which only that output uses.
+        // second output together with the input `y`, which only that output uses.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let p = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -4026,7 +4026,7 @@ mod tests {
     #[test]
     fn test_program_into_pruned_keeps_retained_work() {
         // The second output of the condition is unused, but the branch prints `y`, so the condition drops the output
-        // and keeps the operand `y` for the print, which stays in the branch.
+        // and keeps the input `y` for the print, which stays in the branch.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let p = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -4116,8 +4116,8 @@ mod tests {
 
     #[test]
     fn test_program_into_pruned_rejects_invalid_prunings() {
-        // Operations over a `neg` body, which they supply with their operand, whose prunings drop the output that is
-        // used or the operand that supplies the body input that it needs.
+        // Operations over a `neg` body, which they supply with their input, whose prunings drop the output that is
+        // used or the instruction input that supplies the body input that it needs.
         #[derive(Clone, Debug)]
         enum InvalidPruningOperation {
             Neg,
@@ -4251,7 +4251,7 @@ mod tests {
             Ok(vec![Array::scalar(-2.0).unwrap()]),
         );
 
-        // Observable effects are implicit roots even when neither their results nor their operands are explicitly
+        // Observable effects are implicit roots even when neither their results nor their inputs are explicitly
         // kept alive.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));

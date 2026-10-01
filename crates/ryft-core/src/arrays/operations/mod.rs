@@ -42,27 +42,27 @@ use crate::operations::{
     Abs, AbsOperation, Add, AddOperation, And, AndOperation, Assert, AssertOperation, Atan2, Atan2Operation, Broadcast,
     BroadcastOperation, Ceil, CeilOperation, Clamp, ClampOperation, Compare, CompareOperation, Concatenate,
     ConcatenateOperation, ConditionOperation, ConstantOperation, ConstrainShardingOperation, ConvertElementType,
-    ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeOperation, CustomDerivativeOperation,
-    DimensionAddOperation, DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
-    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
-    DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation,
-    DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div,
-    DivOperation, Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape,
-    DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf,
-    ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation,
-    LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
-    LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation,
-    OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation,
-    ParallelVaryOperation, Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation,
-    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
-    ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem,
-    RemOperation, Reshape, ReshapeOperation, ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt,
-    RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation,
-    Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient,
-    StopGradientOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose,
-    TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    ConvertElementTypeOperation, Cos, CosOperation, Cumulative, CumulativeOperation, CustomFunctionOperation,
+    CustomFunctionTransposeOperation, DimensionAddOperation, DimensionDivOperation, DimensionFromScalar,
+    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
+    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionSaturatingSub,
+    DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
+    DimensionToScalarOperation, Div, DivOperation, Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation,
+    DynamicReshape, DynamicReshapeOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
+    DynamicUpdateSliceOperation, Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation,
+    IotaOperation, LiftedCustomRules, LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation,
+    LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
+    NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation,
+    ParallelReduceOperation, ParallelVaryOperation, Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation,
+    Reduce, ReduceOperation, ReducePrecisionOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+    ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
+    ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, Reshape, ReshapeOperation,
+    ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot,
+    ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign, SignOperation, Sin,
+    SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation,
+    TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice,
+    UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -71,7 +71,6 @@ use crate::programs::{
     ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::RematerializeOperation;
 
 mod control_flow;
 mod random;
@@ -168,6 +167,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     While(WhileOperation<ArrayType>),
     Scan(ScanOperation<V>),
     ConvertElementType(ConvertElementTypeOperation<ArrayType>),
+    ReducePrecision(ReducePrecisionOperation<ArrayType>),
     TransferToMemory(TransferToMemoryOperation),
     Reshard(ReshardOperation),
     ConstrainSharding(ConstrainShardingOperation),
@@ -177,7 +177,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Print(PrintOperation<ArrayType>),
     Assert(AssertOperation<ArrayType>),
     CustomCall(CustomCallOperation),
-    CustomDerivative(CustomDerivativeOperation<ArrayType>),
+    CustomFunction(CustomFunctionOperation<V, ArrayOperation<V>>),
+    CustomFunctionTranspose(CustomFunctionTransposeOperation<V, ArrayOperation<V>>),
     LinearCall(LinearCallOperation<ArrayType>),
 }
 
@@ -383,25 +384,25 @@ where
 )]
 pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Mixed zero constructor whose stored [`ArrayType`] defines the array result and whose dynamic dimensions are
-    /// consumed as explicit first-class dimension operands, one per dynamic axis in axis order. A static stored type
-    /// therefore consumes no operands and remains valid, although canonical lifts prefer the homogeneous
+    /// consumed as explicit first-class dimension inputs, one per dynamic axis in axis order. A static stored type
+    /// therefore consumes no inputs and remains valid, although canonical lifts prefer the homogeneous
     /// [`ArrayOperation`] encoding. This constructor lives at the composite-family level because its dynamic signature
-    /// crosses member kinds: a homogeneous [`ArrayOperation`] cannot consume dimension operands, while the stored
+    /// crosses member kinds: a homogeneous [`ArrayOperation`] cannot consume dimension inputs, while the stored
     /// structural type carries identities and bounds but not the concrete runtime extents required to materialize the
     /// result.
     #[ryft(mixed(structural), skip_from)]
     Zero(ZeroOperation<ArrayType>),
 
-    /// Mixed one constructor whose stored [`ArrayType`] fully defines the output type and whose dynamic dimensions
-    /// are consumed as explicit first-class dimension operands, one per dynamic axis in axis order. A static stored
-    /// type consumes no operands and remains valid, although canonical lifts prefer the homogeneous [`ArrayOperation`]
+    /// Mixed one constructor whose stored [`ArrayType`] fully defines the output type and whose dynamic dimensions are
+    /// consumed as explicit first-class dimension inputs, one per dynamic axis in axis order. A static stored type
+    /// consumes no inputs and remains valid, although canonical lifts prefer the homogeneous [`ArrayOperation`]
     /// encoding.
     #[ryft(mixed(structural), skip_from)]
     One(OneOperation<ArrayType>),
 
     /// Mixed iota constructor whose stored [`ArrayType`] and iota axis define the complete output, and whose dynamic
-    /// dimensions are consumed as explicit first-class dimension operands in axis order. A static stored type consumes
-    /// no operands and remains valid, although canonical lifts prefer the homogeneous [`ArrayOperation`] encoding.
+    /// dimensions are consumed as explicit first-class dimension inputs in axis order. A static stored type consumes no
+    /// inputs and remains valid, although canonical lifts prefer the homogeneous [`ArrayOperation`] encoding.
     #[ryft(mixed(structural), skip_from)]
     Iota(IotaOperation<ArrayType>),
 
@@ -410,8 +411,11 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// regions are programs in the *composite* universe, and no projected view can present them in the member
     /// universe. This variant therefore holds only region-free array operations: the array-operation lift promotes
     /// every region-carrying member payload to its composite carrier — [`Condition`](Self::Condition),
-    /// [`While`](Self::While), [`Scan`](Self::Scan), [`CustomDerivative`](Self::CustomDerivative),
-    /// [`LinearCall`](Self::LinearCall) (both interface forms), and [`Rematerialize`](Self::Rematerialize).
+    /// [`While`](Self::While), [`Scan`](Self::Scan), [`LinearCall`](Self::LinearCall),
+    /// [`Rematerialize`](Self::Rematerialize), and the custom function calls and carriers
+    /// ([`CustomFunction`](Self::CustomFunction) and [`CustomFunctionTranspose`](Self::CustomFunctionTranspose)
+    /// with attached rules, and [`LiftedCustomFunction`](Self::LiftedCustomFunction) and
+    /// [`LiftedCustomFunctionTranspose`](Self::LiftedCustomFunctionTranspose) with retained rules).
     ///
     /// No region-carrying array payload therefore reaches this variant. Should one ever be constructed directly, it is
     /// not silently mis-transformed: each transform rejects a region-carrying projected payload with an exact
@@ -471,37 +475,37 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Mixed operation that converts a first-class dimension into ordinary scalar-array data.
     DimensionToScalar(DimensionToScalarOperation),
 
-    /// Mixed operation that reshapes an array using one first-class dimension operand per output axis.
+    /// Mixed operation that reshapes an array using one first-class dimension input per output axis.
     Reshape(DynamicReshapeOperation),
 
-    /// Mixed operation that broadcasts an array using one first-class dimension operand per output axis.
+    /// Mixed operation that broadcasts an array using one first-class dimension input per output axis.
     Broadcast(DynamicBroadcastOperation),
 
-    /// Mixed operation that concatenates array operands using one trailing result-extent operand.
+    /// Mixed operation that concatenates array inputs using one trailing result-extent input.
     Concatenate(ConcatenateOperation<ArrayIrType>),
 
-    /// Mixed foreign-kernel call whose trailing dimension operands define its dynamic output axes.
+    /// Mixed foreign-kernel call whose trailing dimension inputs define its dynamic output axes.
     #[ryft(mixed)]
     CustomCall(CustomCallOperation),
 
-    /// Mixed padding operation with one explicit result-extent operand per output axis.
+    /// Mixed padding operation with one explicit result-extent input per output axis.
     Pad(PadOperation<ArrayIrType>),
 
-    /// Mixed slice whose starts and output sizes are first-class dimension operands.
+    /// Mixed slice whose starts and output sizes are first-class dimension inputs.
     DynamicSlice(DynamicSliceOperation<ArrayIrType>),
 
-    /// Mixed bit generator whose trailing dimension operands define its dynamic bits-output axes.
+    /// Mixed bit generator whose trailing dimension inputs define its dynamic bits-output axes.
     RngBitGenerator(RngBitGeneratorOperation<ArrayIrType>),
 
-    /// Mixed all-gather whose trailing dimension operands define every result axis in axis order.
+    /// Mixed all-gather whose trailing dimension inputs define every result axis in axis order.
     #[ryft(mixed)]
     AllGather(AllGatherOperation),
 
-    /// Mixed sum-scatter whose trailing dimension operands define every result axis in axis order.
+    /// Mixed sum-scatter whose trailing dimension inputs define every result axis in axis order.
     #[ryft(mixed)]
     ParallelSumScatter(ParallelSumScatterOperation),
 
-    /// Mixed all-to-all whose trailing dimension operands define every result axis in axis order.
+    /// Mixed all-to-all whose trailing dimension inputs define every result axis in axis order.
     #[ryft(mixed)]
     AllToAll(AllToAllOperation),
 
@@ -525,17 +529,34 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// unsupported until discharge.
     Scan(ScanOperation<ArrayIrValue<A>>),
 
-    /// Composite custom derivative call whose primal and rule regions use the complete array IR storage universe.
-    /// Generic differentiation rejects reference members because they have no tangent or cotangent representation.
-    CustomDerivative(CustomDerivativeOperation<ArrayIrType>),
+    /// Composite custom function call whose primal region uses the complete array IR storage universe, with either
+    /// attached rule regions in that universe or retained rules registered in this family. Generic differentiation
+    /// rejects reference members because they have no tangent or cotangent representation.
+    CustomFunction(CustomFunctionOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
-    /// Differentiation-owned linear call with ordinary trailing residual operands, in either its executable
-    /// forward-and-transpose form or its reverse-only transpose-only form.
+    /// Reverse-mode carrier of a [`CustomFunction`](Self::CustomFunction) call, which transposition replaces with
+    /// the call's backward rule.
+    CustomFunctionTranspose(CustomFunctionTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
+
+    /// Differentiation-owned linear call with ordinary trailing residual inputs.
     LinearCall(LinearCallOperation<ArrayIrType>),
 
-    /// Composite rematerialized call whose primal, forward, backward, and tangent regions use the complete array IR
-    /// storage universe. Local reference lifecycles inside the body are recomputed, reads of external references are
-    /// saved rather than recomputed, and bodies that mutate external references are rejected.
+    /// Custom function call whose retained rules are registered in the [`ArrayOperation`] member family, promoted
+    /// from its member payload by the array-operation lift. Its derivative rules are specialized by the member
+    /// definition and converted into this family (refer to [`LiftedCustomRules`]). Conversions never produce such a
+    /// call with attached rules, which follow their call into the [`CustomFunction`](Self::CustomFunction)
+    /// variant instead.
+    LiftedCustomFunction(
+        CustomFunctionOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
+    ),
+
+    /// Reverse-mode carrier of a [`LiftedCustomFunction`](Self::LiftedCustomFunction) call, whose backward rule is
+    /// specialized by the member definition and converted into this family.
+    LiftedCustomFunctionTranspose(
+        CustomFunctionTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
+    ),
+
+    /// Composite rematerialized call whose body uses the complete array IR storage universe.
     Rematerialize(RematerializeOperation<ArrayIrType>),
 }
 
@@ -702,22 +723,25 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
                 let captures = operation.captures().iter().cloned().map(ArrayIrValue::Array).collect();
                 Self::Scan(operation.with_captures(captures))
             }
-            // The payload stores no types, only the rule layout and the non-differentiated split, both of which carry
-            // over unchanged.
-            ArrayOperation::CustomDerivative(operation) => {
-                let converted = CustomDerivativeOperation::new()
-                    .with_jvp_rule(operation.jvp_rule())
-                    .with_non_differentiated_count(operation.non_differentiated_count());
-                Self::CustomDerivative(if operation.has_vjp_rule() { converted.with_vjp_rule() } else { converted })
+            // Custom function calls and carriers with attached rules store no source, so they follow their regions
+            // into the native variants. Those with retained rules keep their member definition, which specializes their
+            // rules for this family on demand.
+            ArrayOperation::CustomFunction(operation) => match operation.into_attached_family() {
+                Ok(operation) => Self::CustomFunction(operation),
+                Err(operation) => Self::LiftedCustomFunction(operation.into_family(LiftedCustomRules::Member)),
+            },
+            ArrayOperation::CustomFunctionTranspose(operation) => match operation.into_attached_family() {
+                Ok(operation) => Self::CustomFunctionTranspose(operation),
+                Err(operation) => Self::LiftedCustomFunctionTranspose(operation.into_family(LiftedCustomRules::Member)),
+            },
+            // A linear call stores no types, so it reaches the carrier that owns the extent-threaded region rule
+            // unchanged.
+            ArrayOperation::LinearCall(operation) => {
+                Self::LinearCall(LinearCallOperation::new(operation.residual_count()))
             }
-            // The executable form stores no types. The transpose-only form maps its unavailable forward interface into
-            // the composite universe, so both reach the carrier that owns the extent-threaded region rule.
-            ArrayOperation::LinearCall(operation) => Self::LinearCall(operation.map_types(ArrayIrType::Array)),
-            ArrayOperation::Rematerialize(operation) => Self::Rematerialize(
-                RematerializeOperation::new()
-                    .with_prevent_cse(operation.prevent_cse())
-                    .with_non_differentiated_count(operation.non_differentiated_count()),
-            ),
+            // Lifting a rematerialized call lifts its residual policy, which keeps the identity of the policy (refer to
+            // `ResidualPolicyReference::lift`).
+            ArrayOperation::Rematerialize(operation) => Self::Rematerialize(operation.lift()),
             operation => Self::Array(operation),
         }
     }
@@ -726,7 +750,7 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
 // Cotangent accumulation adds two composite cotangents by binding an `AddOperation<ArrayIrType>` (refer to
 // `Linearization::pullback` and the reverse-mode `From<AddOperation<C::Type>>` bounds), so the composite family lifts
 // the type-generic add into the homogeneous array member that owns elementwise addition. The source payload is
-// stateless, so no operand type survives the conversion, and member type inference rejects a dimension operand.
+// stateless, so no input type survives the conversion, and member type inference rejects a dimension input.
 impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayIrType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(_operation: AddOperation<ArrayIrType>) -> Self {
@@ -753,27 +777,25 @@ impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for Con
     }
 }
 
-/// Replicates the operands of an implicitly broadcasting elementwise [`ArrayOperation`] into its result geometry, when
-/// that geometry carries a runtime extent, so that the projected member rule differentiates operands that already have
+/// Replicates the inputs of an implicitly broadcasting elementwise [`ArrayOperation`] into its result geometry, when
+/// that geometry carries a runtime extent, so that the projected member rule differentiates inputs that already have
 /// the result shape.
 ///
 /// The member-family alignment ([`ElementwiseDerivativeAlignment`](crate::ElementwiseDerivativeAlignment)) cannot
 /// replicate into a runtime extent itself, because its [`BroadcastOperation`] carries the complete output geometry as
-/// payload metadata and program replay never refines a payload type. Such an extent is therefore only reachable
-/// through an operand edge, which this composite arm supplies: it reads each runtime extent off the operand that owns
-/// that axis as a first-class dimension value and replicates with [`DynamicBroadcastOperation`]. Linearization then
-/// keeps one scalar dimension value per runtime axis alive as a residual, instead of one result-shaped array per
-/// aligned operand.
+/// payload metadata and program replay never refines a payload type. Such an extent is therefore only reachable through
+/// an input edge, which this composite arm supplies: it reads each runtime extent off the input that owns that axis as
+/// a first-class dimension value and replicates with [`DynamicBroadcastOperation`]. Linearization then keeps one scalar
+/// dimension value per runtime axis alive as a residual, instead of one result-shaped array per aligned input.
 ///
-/// Returns `None` when the replication does not apply, in which case the caller differentiates the operands as they
-/// are: the operation is not one of the implicitly broadcasting elementwise variants, its result has no tangent space
-/// (so no operand is ever aligned), its result geometry is fully static, or every operand already has the result
-/// shape.
+/// Returns `None` when the replication does not apply, in which case the caller differentiates the inputs as they are:
+/// the operation is not one of the implicitly broadcasting elementwise variants, its result has no tangent space (so no
+/// input is ever aligned), its result geometry is fully static, or every input already has the result shape.
 ///
 /// # Parameters
 ///
 ///   - `context`: Construction destinations for extent reads and primal and tangent replications.
-///   - `operation`: Elementwise [`ArrayOperation`] whose operands are being replicated.
+///   - `operation`: Elementwise [`ArrayOperation`] whose inputs are being replicated.
 ///   - `inputs`: Input [`DifferentiationDual`]s that the rule received.
 fn replicated_elementwise_duals<A, C, P: DifferentiationPolicy<C>>(
     context: &DifferentiationContext<C, P>,
@@ -787,8 +809,8 @@ where
         From<DynamicBroadcastOperation> + From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
     ArrayOperation<A>: Operation<Type = ArrayType>,
 {
-    // The variants whose type inference broadcasts several operands into one result, and whose differentiation rules
-    // therefore align narrower operands (both live tangents and primal coefficients) with that result type.
+    // The variants whose type inference broadcasts several inputs into one result, and whose differentiation rules
+    // therefore align narrower inputs (both live tangents and primal coefficients) with that result type.
     if !matches!(
         operation,
         ArrayOperation::Add(_)
@@ -828,7 +850,7 @@ where
         return Ok(None);
     }
 
-    // One first-class dimension operand per result axis, as the mixed broadcast requires. A repeated dimension denotes
+    // One first-class dimension input per result axis, as the mixed broadcast requires. A repeated dimension denotes
     // one runtime extent, so it is read once and shared by every axis that carries it.
     let mut extents = Vec::<C::Value>::with_capacity(output_shape.rank());
     for (axis, dimension) in output_shape.dimensions().iter().enumerate() {
@@ -848,7 +870,7 @@ where
                 });
                 let Some((index, input_axis)) = source else {
                     return Err(TypeError::invalid(format!(
-                        "cannot replicate `{}` operands into result shape {output_shape} because no operand carries \
+                        "cannot replicate `{}` inputs into result shape {output_shape} because no input carries \
                          its runtime axis {axis}",
                         operation.name(),
                     ))
@@ -867,7 +889,7 @@ where
         extents.push(extent);
     }
 
-    // Replication is structurally linear, so the primal and the tangent of a narrower operand ride the same mixed
+    // Replication is structurally linear, so the primal and the tangent of a narrower input ride the same mixed
     // broadcast, and a structural-zero tangent stays structural at the replicated tangent type.
     inputs
         .iter()
@@ -1071,7 +1093,8 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableType, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
+        DifferentiableType, DotsSaveable, ForwardModeDifferentiate, LinearizationTracer, NothingSaveable,
+        ReverseModeDifferentiate,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
@@ -1079,12 +1102,13 @@ mod tests {
     use crate::operations::random::RandomAlgorithm;
     use crate::operations::{
         AddOperation, AssertOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
-        CustomDerivativeJvpRule, DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation,
+        CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation, CustomRuleDefinition,
+        CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation,
         DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation,
         ReductionKind, ScanOperation, SinOperation, WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::partial::PartialValue;
+    use crate::partial::{PartialValue, ResidualPolicyReference};
     use crate::programs::{
         AtomId, EffectClass, EffectClasses, EmptyRegionDriver, OperationProjection, Program, ProgramBuilder,
         ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
@@ -1724,14 +1748,14 @@ mod tests {
         assert_eq!(
             dynamic_one.infer_output_types(&[], &[]),
             Err(TypeError::invalid(
-                "`one` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+                "`one` expects one dimension input per dynamic output dimension (1) but got 0 inputs",
             )),
         );
         let other = DimensionVariable::new("other", bounds);
         assert_eq!(
             dynamic_one.infer_output_types(&[DimensionType::from(other).into()], &[]),
             Err(TypeError::invalid(
-                "`one` operand 0 has type dimension<other ∈ [1, 9)> but the output shape requires \
+                "`one` input 0 has type dimension<other ∈ [1, 9)> but the output shape requires \
                  dimension<source ∈ [1, 9)>",
             )),
         );
@@ -1785,7 +1809,7 @@ mod tests {
             Ok(vec![DimensionType::from(source).into()]),
         );
 
-        // Canonical reshape derives its entire result shape from its ordered first-class dimension operand types.
+        // Canonical reshape derives its entire result shape from its ordered first-class dimension input types.
         let reshape = ArrayIrOperation::<Array>::from(DynamicReshapeOperation::new());
         assert!(matches!(reshape, ArrayIrOperation::Reshape(_)));
         let two = DimensionValue::constant(2).unwrap();
@@ -2004,8 +2028,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(one, vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]).unwrap())]);
-        // Explicit static mixed constructors consume no dimension operands and interpret identically to their
-        // preferred homogeneous encodings.
+        // Explicit static mixed constructors consume no dimension inputs and interpret identically to their preferred
+        // homogeneous encodings.
         let static_float_type = ArrayType::scalar(DataType::F32);
         assert_eq!(
             context.bind(ArrayIrOperation::Zero(ZeroOperation::new(static_float_type.clone())), Vec::new(), &[],),
@@ -2089,10 +2113,10 @@ mod tests {
             ],
         );
 
-        // A runtime extent outside the stored output axis's authoritative bounds is rejected before allocation,
-        // even though eager binds skip inference: the operand's own variable admits the extent, so only the stored
-        // axis's bounds can catch it. The input may use an equivalent dimension identity supplied by the calling
-        // program, so its identity does not need to exactly match the one stored on the operation.
+        // A runtime extent outside the stored output axis's authoritative bounds is rejected before allocation, even
+        // though eager binds skip inference: the input's own variable admits the extent, so only the stored axis's
+        // bounds can catch it. The input may use an equivalent dimension identity supplied by the calling program, so
+        // its identity does not need to exactly match the one stored on the operation.
         let bounded = DimensionVariable::new("bounded", DimensionBounds::new(1, Some(4)).unwrap());
         let error = context
             .bind(
@@ -2430,9 +2454,9 @@ mod tests {
             .unwrap()[0]
     }
 
-    /// Builds the `["primal", "jvp"]` regions of a composite `custom_derivative` call with a JVP rule, implementing
+    /// Builds the `["primal", "jvp"]` regions of a composite `custom_function` call with a JVP rule, implementing
     /// `primal(x) = 2 * x` with the deliberately wrong rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a surviving
-    /// custom-derivative boundary stays detectable in a transformed program's numbers.
+    /// custom-function boundary stays detectable in a transformed program's numbers.
     fn composite_custom_jvp_regions() -> Vec<TestProgram> {
         vec![
             composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0)]),
@@ -2442,7 +2466,7 @@ mod tests {
         ]
     }
 
-    /// Builds the `["primal", "forward", "backward"]` regions of a composite `custom_derivative` call with reverse-mode
+    /// Builds the `["primal", "forward", "backward"]` regions of a composite `custom_function` call with reverse-mode
     /// rules, implementing `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, and the deliberately wrong rule
     /// `backward(r, ȳ) = 3 * ȳ`.
     fn composite_custom_vjp_regions() -> Vec<TestProgram> {
@@ -2453,15 +2477,7 @@ mod tests {
         ]
     }
 
-    /// Builds the `["primal", "forward", "backward", "tangent"]` regions of a composite `rematerialize` implementing
-    /// `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, `backward(r, ȳ) = 3 * ȳ`, and `tangent(r, dx) = 3 * dx`.
-    fn composite_rematerialize_regions() -> Vec<TestProgram> {
-        let mut regions = composite_custom_vjp_regions();
-        regions.push(composite_scalar_program(2, |builder, inputs| vec![composite_scaled(builder, inputs[1], 3.0)]));
-        regions
-    }
-
-    /// Batches one composite region-carrying payload over a single operand mapped along axis zero and returns the
+    /// Batches one composite region-carrying payload over a single input mapped along axis zero and returns the
     /// rendered staged program together with the result's [`BatchAxis`].
     fn batched_composite_payload(operation: ArrayOperation<Array>, regions: Vec<TestProgram>) -> (String, BatchAxis) {
         let extent = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
@@ -2488,50 +2504,55 @@ mod tests {
     #[test]
     fn test_composite_lift_promotes_every_region_carrying_array_payload() {
         // Every region-carrying array payload has a composite carrier, so none of them reaches the region-free
-        // projected `Array` variant. Custom-derivative calls carry their rule layout and non-differentiated operand
-        // split, and rematerialization its split and lowering hint, across the lift.
-        for jvp_rule in
-            [CustomDerivativeJvpRule::Absent, CustomDerivativeJvpRule::Region, CustomDerivativeJvpRule::Primal]
+        // projected `Array` variant. Custom-function calls carry their rule layout and non-differentiated input split,
+        // and rematerialization its policy, whose identity the lift keeps, and its flags, across the lift.
+        for jvp_rule in [CustomFunctionJvpRule::Absent, CustomFunctionJvpRule::Explicit, CustomFunctionJvpRule::Primal]
         {
             for has_vjp_rule in [false, true] {
-                let operation =
-                    CustomDerivativeOperation::new().with_jvp_rule(jvp_rule).with_non_differentiated_count(2);
-                let operation = if has_vjp_rule { operation.with_vjp_rule() } else { operation };
+                let operation = CustomFunctionOperation::from_rule_regions(jvp_rule, has_vjp_rule)
+                    .with_non_differentiated_count(2)
+                    .unwrap();
                 assert!(matches!(
-                    TestOperation::from(ArrayOperation::CustomDerivative(operation)),
-                    ArrayIrOperation::CustomDerivative(operation)
+                    TestOperation::from(ArrayOperation::CustomFunction(operation)),
+                    ArrayIrOperation::CustomFunction(operation)
                         if operation.jvp_rule() == jvp_rule
                             && operation.has_vjp_rule() == has_vjp_rule
                             && operation.non_differentiated_count() == 2,
                 ));
             }
         }
+        let policy = ResidualPolicyReference::<ArrayType>::new(DotsSaveable);
         assert!(matches!(
             TestOperation::from(ArrayOperation::Rematerialize(
-                RematerializeOperation::new().with_prevent_cse(true).with_non_differentiated_count(1),
+                RematerializeOperation::new(policy.clone()).with_optimization_barrier(false).with_differentiated(true),
             )),
             ArrayIrOperation::Rematerialize(operation)
-                if operation.prevent_cse() && operation.non_differentiated_count() == 1,
+                if operation.policy().id() == policy.id()
+                    && operation.policy().name() == "dots_saveable"
+                    && !operation.optimization_barrier()
+                    && operation.differentiated(),
         ));
         assert!(matches!(
             TestOperation::from(ArrayOperation::LinearCall(LinearCallOperation::new(1))),
             ArrayIrOperation::LinearCall(operation) if operation.residual_count() == 1,
         ));
 
-        // The transpose-only form stores the member types of the forward map it does not attach, so its lift maps
-        // each of them into the composite type universe instead of dropping the interface.
+        // A carrier with an attached backward rule maps its stored tangent types into the composite type universe and
+        // follows its region into the native carrier variant.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let promoted = TestOperation::from(ArrayOperation::LinearCall(LinearCallOperation::transpose_only(
-            1,
-            vec![scalar_type.clone()],
-            vec![scalar_type.clone()],
-        )));
-        let ArrayIrOperation::LinearCall(promoted) = promoted else {
-            panic!("expected a promoted composite linear call");
+        let promoted = TestOperation::from(ArrayOperation::CustomFunctionTranspose(
+            CustomFunctionTransposeOperation::from_backward_region(
+                1,
+                vec![scalar_type.clone()],
+                vec![scalar_type.clone()],
+            ),
+        ));
+        let ArrayIrOperation::CustomFunctionTranspose(promoted) = promoted else {
+            panic!("expected a promoted composite custom function carrier");
         };
         assert_eq!(
             promoted,
-            LinearCallOperation::transpose_only(
+            CustomFunctionTransposeOperation::from_backward_region(
                 1,
                 vec![ArrayIrType::Array(scalar_type.clone())],
                 vec![ArrayIrType::Array(scalar_type)],
@@ -2540,13 +2561,14 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_batching_of_a_custom_derivative_jvp_rule_payload() {
+    fn test_composite_batching_of_a_custom_function_jvp_rule_payload() {
         // The composite carrier batches both regions structurally and threads the first-class mapped extent into
-        // them as one additional leading non-differentiated operand of the batched call.
+        // them as one additional leading non-differentiated input of the batched call.
         let (program, batch_axis) = batched_composite_payload(
-            ArrayOperation::CustomDerivative(
-                CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region),
-            ),
+            ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                CustomFunctionJvpRule::Explicit,
+                false,
+            )),
             composite_custom_jvp_regions(),
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2554,7 +2576,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = custom_derivative [non_differentiated_count=1] %0 %1 [
+                let %2:f64[batch] = custom_function [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const 2.0
@@ -2580,11 +2602,14 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_batching_of_a_custom_derivative_vjp_rule_payload() {
+    fn test_composite_batching_of_a_custom_function_vjp_rule_payload() {
         // The backward region receives the threaded extent ahead of its residuals, and its result cotangents align
-        // with the differentiated operands only.
+        // with the differentiated inputs only.
         let (program, batch_axis) = batched_composite_payload(
-            ArrayOperation::CustomDerivative(CustomDerivativeOperation::new().with_vjp_rule()),
+            ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                CustomFunctionJvpRule::Absent,
+                true,
+            )),
             composite_custom_vjp_regions(),
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2592,7 +2617,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = custom_derivative [non_differentiated_count=1] %0 %1 [
+                let %2:f64[batch] = custom_function [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const 2.0
@@ -2622,15 +2647,16 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_batching_of_a_custom_derivative_payload() {
+    fn test_composite_batching_of_a_custom_function_payload() {
         // A call with both a JVP rule and reverse-mode rules rebuilds all four regions around the threaded extent,
         // keeping every rule attached in region order.
         let mut regions = composite_custom_jvp_regions();
         regions.extend(composite_custom_vjp_regions().into_iter().skip(1));
         let (program, batch_axis) = batched_composite_payload(
-            ArrayOperation::CustomDerivative(
-                CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region).with_vjp_rule(),
-            ),
+            ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                CustomFunctionJvpRule::Explicit,
+                true,
+            )),
             regions,
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -2638,7 +2664,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = custom_derivative [non_differentiated_count=1] %0 %1 [
+                let %2:f64[batch] = custom_function [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const 2.0
@@ -2679,44 +2705,24 @@ mod tests {
 
     #[test]
     fn test_composite_batching_of_a_rematerialize_payload() {
-        // All four regions are rebuilt around the threaded extent, keeping the rematerialization boundary intact.
+        // The body is rebuilt around the threaded extent, which becomes a leading body input, keeping the
+        // rematerialization boundary intact.
         let (program, batch_axis) = batched_composite_payload(
-            ArrayOperation::Rematerialize(RematerializeOperation::new()),
-            composite_rematerialize_regions(),
+            ArrayOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable))),
+            vec![composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0)])],
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
         assert_eq!(
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = rematerialize [non_differentiated_count=1] %0 %1 [
-                    primal={
+                let %2:f64[batch] = rematerialize %0 %1 [
+                    body={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const 2.0
                             %3:f64[batch] = broadcast [output_axes=[]] %2 %0
                             %4:f64[batch] = mul %1 %3
                         in (%4)
-                    },
-                    forward={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const 2.0
-                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
-                            %4:f64[batch] = mul %1 %3
-                        in (%4, %1)
-                    },
-                    backward={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
-                        let %3:f64[] = const 3.0
-                            %4:f64[batch] = broadcast [output_axes=[]] %3 %0
-                            %5:f64[batch] = mul %2 %4
-                        in (%5)
-                    },
-                    tangent={
-                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
-                        let %3:f64[] = const 3.0
-                            %4:f64[batch] = broadcast [output_axes=[]] %3 %0
-                            %5:f64[batch] = mul %2 %4
-                        in (%5)
                     },
                 ]
                 in (%2)
@@ -2728,7 +2734,7 @@ mod tests {
     #[test]
     fn test_composite_batching_of_a_linear_call_payload() {
         // The executable linear call threads the mapped extent as one more leading residual, which is the precedent
-        // the custom-derivative carriers follow with their non-differentiated operand split.
+        // the custom-function carriers follow with their non-differentiated input split.
         let array_type = ArrayType::scalar(DataType::F64);
         let identity_program = || -> TestProgram {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -2760,7 +2766,7 @@ mod tests {
         assert_eq!(output, linear);
     }
 
-    /// Builds a composite program holding one `custom_jvp` call over a scalar input.
+    /// Builds a composite program holding one `custom_function` call with a JVP rule over a scalar input.
     fn composite_custom_jvp_program() -> TestProgram {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let regions = composite_custom_jvp_regions()
@@ -2770,9 +2776,10 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let output = builder
             .add_instruction(
-                ArrayOperation::CustomDerivative(
-                    CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region),
-                ),
+                ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                    CustomFunctionJvpRule::Explicit,
+                    false,
+                )),
                 regions,
                 vec![input],
                 None,
@@ -2812,9 +2819,10 @@ mod tests {
                     let context = input.context().clone();
                     Ok(context
                         .bind(
-                            ArrayOperation::CustomDerivative(
-                                CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region),
-                            ),
+                            ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                                CustomFunctionJvpRule::Explicit,
+                                false,
+                            )),
                             composite_custom_jvp_regions(),
                             &[input],
                         )?
@@ -2833,7 +2841,7 @@ mod tests {
         assert_eq!(
             composite_custom_jvp_program().transpose_with_respect_to(&[0], &[]).unwrap_err(),
             DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: "operation `custom_derivative` is not transposable".to_string(),
+                message: "operation `custom_function` is not transposable".to_string(),
             }),
         );
     }
@@ -3160,7 +3168,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_variable.clone())]));
 
         // Build one stored program in which ordinary dimension arithmetic supplies explicit reshape and broadcast
-        // operands. The repeated extent edge deliberately feeds both shape operations.
+        // inputs. The repeated extent edge deliberately feeds both shape operations.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone().into());
         let extent = builder.add_input(extent_type.clone().into());
@@ -3569,9 +3577,12 @@ mod tests {
             ArrayIrOperation::Condition(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::While(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::Scan(_) => MemberKindSignature::RegionForwarding,
-            ArrayIrOperation::CustomDerivative(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::CustomFunction(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::LinearCall(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::Rematerialize(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::CustomFunctionTranspose(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::LiftedCustomFunction(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::LiftedCustomFunctionTranspose(_) => MemberKindSignature::RegionForwarding,
         }
     }
 
@@ -3583,6 +3594,12 @@ mod tests {
         let first_type = DimensionType::from(first.clone());
         let second_type = DimensionType::from(second.clone());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
+        let composite_rules = CustomRuleRegistration::new(CustomRuleDefinition::<
+            ArrayIrValue<Array>,
+            ArrayIrOperation<Array>,
+        >::new("ir"));
+        let member_rules =
+            CustomRuleRegistration::new(CustomRuleDefinition::<Array, ArrayOperation<Array>>::new("array"));
         let dynamic_integer_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
 
@@ -3719,17 +3736,54 @@ mod tests {
             (ArrayIrOperation::While(WhileOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::Scan(ScanOperation::new(1, 4)), MemberKindSignature::RegionForwarding),
             (
-                ArrayIrOperation::CustomDerivative(
-                    CustomDerivativeOperation::new().with_jvp_rule(CustomDerivativeJvpRule::Region),
-                ),
+                ArrayIrOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                    CustomFunctionJvpRule::Explicit,
+                    false,
+                )),
                 MemberKindSignature::RegionForwarding,
             ),
             (
-                ArrayIrOperation::CustomDerivative(CustomDerivativeOperation::new().with_vjp_rule()),
+                ArrayIrOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
+                    CustomFunctionJvpRule::Absent,
+                    true,
+                )),
                 MemberKindSignature::RegionForwarding,
             ),
             (ArrayIrOperation::LinearCall(LinearCallOperation::new(0)), MemberKindSignature::RegionForwarding),
-            (ArrayIrOperation::Rematerialize(RematerializeOperation::new()), MemberKindSignature::RegionForwarding),
+            (
+                ArrayIrOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(
+                    NothingSaveable,
+                ))),
+                MemberKindSignature::RegionForwarding,
+            ),
+            (
+                ArrayIrOperation::CustomFunction(CustomFunctionOperation::new(composite_rules.reference())),
+                MemberKindSignature::RegionForwarding,
+            ),
+            (
+                ArrayIrOperation::CustomFunctionTranspose(CustomFunctionTransposeOperation::new(
+                    composite_rules.reference(),
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                )),
+                MemberKindSignature::RegionForwarding,
+            ),
+            (
+                ArrayIrOperation::from(ArrayOperation::CustomFunction(CustomFunctionOperation::new(
+                    member_rules.reference(),
+                ))),
+                MemberKindSignature::RegionForwarding,
+            ),
+            (
+                ArrayIrOperation::from(ArrayOperation::CustomFunctionTranspose(CustomFunctionTransposeOperation::new(
+                    member_rules.reference(),
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                ))),
+                MemberKindSignature::RegionForwarding,
+            ),
         ];
 
         assert_eq!(
@@ -3739,7 +3793,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 35);
+        assert_eq!(expected.len(), 39);
         assert_eq!(
             expected
                 .iter()

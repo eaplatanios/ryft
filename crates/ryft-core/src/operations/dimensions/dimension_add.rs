@@ -24,7 +24,7 @@ define_dimension_arithmetic_operation!(
         let lower = left_lower.checked_add(right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
                 "dimension arithmetic overflow while deriving `{DIMENSION_ADD_OPERATION_NAME}` output bounds \
-                 with operands `{left}` and `{right}`",
+                 with inputs `{left}` and `{right}`",
             ),
         })?;
         let maximum = left_maximum.saturating_add(right_maximum).min(MAX_DIMENSION_EXTENT);
@@ -61,7 +61,7 @@ impl Add for DimensionValue {
         let output_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent = self.extent().checked_add(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
-                "dimension arithmetic overflow while adding dimensions with operands {}={}, {}={}",
+                "dimension arithmetic overflow while adding dimensions with inputs {}={}, {}={}",
                 self.r#type().variable(),
                 self.extent(),
                 right.r#type().variable(),

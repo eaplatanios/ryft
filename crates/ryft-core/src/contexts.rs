@@ -203,7 +203,7 @@ pub trait Context: Domain + Clone {
     ///   - `driver`: Application-scoped [`BindingRegionDriver`] providing the complete ordered
     ///     [`Region`](crate::Region)s supplied by this [`Operation`] application. Binding consumes the driver because
     ///     staging may import or intern its roots into the destination [`Program`].
-    ///   - `inputs`: Input values supplied as the operation's operands, in operation-defined order.
+    ///   - `inputs`: Input values supplied to the operation, in operation-defined order.
     fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
         &self,
         operation: O,
@@ -446,7 +446,7 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
 /// and operation families selected by [`ValueProjection<T>`] and [`OperationProjection<T>`]), while every actual
 /// effect happens in the composite parent `C`.
 ///
-/// [`bind`](Context::bind) works by round-tripping through the parent. It lifts each member operand into the composite
+/// [`bind`](Context::bind) works by round-tripping through the parent. It lifts each member input into the composite
 /// value family (i.e., using [`ValueProjection::from_projected`]), lifts the member operation into the composite
 /// operation family (i.e., using the [`From`] super-trait of [`OperationProjection`]), binds *once* through the parent
 /// context, and projects the results back to the member kind (i.e., using [`ValueProjection::into_projected`]). Staged
@@ -456,7 +456,7 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
 ///
 /// The adapter is deliberately zero-state. It stores its parent and nothing else. It never inspects a staged program,
 /// never reconstructs dependencies, and never carries dimensions, source arrays, identity mappings, or replay
-/// substitutions. Every dependency of a bound operation must therefore arrive as an explicit operand, which keeps
+/// substitutions. Every dependency of a bound operation must therefore arrive as an explicit input, which keeps
 /// the program graph the sole source of data dependencies.
 ///
 /// A bound member operation may carry [`Region`](crate::Region)s (e.g., a
@@ -696,10 +696,10 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
         check_builders!(self.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
             .map_err(|error| self.error(error))?;
 
-        // Region input identities are instantiated from the caller operand types before the regions enter this builder.
-        // First validate the operation's complete attachment declaration so later zips cannot silently omit either a
-        // region or its instantiation request. Region-free operations avoid collecting input types here as the checked
-        // builder path will infer them directly from its atoms.
+        // Region input identities are instantiated from the instruction input types before the regions enter this
+        // builder. First validate the operation's complete attachment declaration so later zips cannot silently omit
+        // either a region or its instantiation request. Region-free operations avoid collecting input types here as
+        // the checked builder path will infer them directly from its atoms.
         let declared_region_count = operation.region_slots().len();
         let (input_types, region_interfaces, region_input_types) = if declared_region_count == 0 {
             operation.validate_region_count(driver.region_count()).map_err(|error| self.error(error))?;
@@ -1392,7 +1392,9 @@ mod tests {
                     )));
                 };
                 if region_interface.input_types() != input_types {
-                    return Err(TypeError::invalid("staging region input types do not match its operand types"));
+                    return Err(TypeError::invalid(
+                        "staging region input types do not match the instruction input types",
+                    ));
                 }
                 Ok(region_interface.output_types().to_vec())
             }

@@ -110,7 +110,7 @@ impl<Extension: KernelExtension> KernelDefinition<Extension> {
                 .build(starts, vec![Placeholder; inputs.len() + 1], vec![Placeholder; shape.len()])
                 .map_err(KernelError::from)?;
             // No invocation exists for an empty batch. Padding preserves the formal selected referent type without
-            // constructing an invalid one-element slice of the empty full operand.
+            // constructing an invalid one-element slice of the empty full array.
             let policy = if axis.is_some() && batch_size == 0 {
                 BoundaryPolicy::Masked
             } else {

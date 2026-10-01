@@ -105,7 +105,7 @@ pub enum CumulativeKind {
     /// Prefix product. The identity is `1` and the combiner is multiplication. Real and complex numeric inputs are
     /// supported, as is the payload-free structural zero, every prefix product of which is again zero. Integer inputs
     /// wrap in their element data type. Note that, like [`ReductionKind::Product`](crate::ReductionKind::Product), a
-    /// complex operand that is exactly `1 + 0i` returns the other operand, because complex multiplication by it is not
+    /// complex factor that is exactly `1 + 0i` yields the other factor, because complex multiplication by it is not
     /// exact for infinite components.
     Product,
 
@@ -127,11 +127,11 @@ pub enum CumulativeKind {
     /// differently in their last bits.
     ///
     /// Real floating-point and complex inputs are supported. Complex prefixes use the principal logarithm of the
-    /// elementwise [`LogAddExp`] operation, so their imaginary components stay in `[-π, π]`. An operand whose real
+    /// elementwise [`LogAddExp`] operation, so their imaginary components stay in `[-π, π]`. An argument whose real
     /// component is negative infinity has a zero exponential whatever its imaginary component, and so the combiner
-    /// returns the other operand unchanged. That shortcut is exact, and it is what keeps complex prefixes over such
-    /// operands defined: the elementwise complex combination of two of them would subtract `-∞` from `-∞` and produce
-    /// NaN (real combinations already return the other operand). A prefix that no combination produced (i.e., the
+    /// returns the other argument unchanged. That shortcut is exact, and it is what keeps complex prefixes over such
+    /// elements defined: the elementwise complex combination of two of them would subtract `-∞` from `-∞` and produce
+    /// NaN (real combinations already return the other argument). A prefix that no combination produced (i.e., the
     /// first one, or one following a prefix whose real component is negative infinity) is wrapped onto the same
     /// principal branch, so that every prefix, and in particular the last one, agrees with the matching
     /// [`ReductionKind::LogSumExp`](crate::ReductionKind::LogSumExp) reduction. Differentiation goes through the
@@ -382,11 +382,11 @@ impl_differentiable_operation! {
                 return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
             };
             // The primal output of a nonlinear kind comes from the decomposition, which interleaves its halves by
-            // adding zero-padded operands. That addition turns a `-0.0` result into `+0.0`, so under differentiation
+            // zero-padding and adding them. That addition turns a `-0.0` result into `+0.0`, so under differentiation
             // the primal output of an extremum scan over signed zeros can differ from the undifferentiated one in the
             // sign of a zero. Similarly, the decomposition combines log-sum-exp prefixes with the unguarded elementwise
-            // `log_add_exp`, so a complex prefix that combines two operands with negative-infinite real components is
-            // NaN there, while the primitive returns the other operand, and its first complex prefix is the raw first
+            // `log_add_exp`, so a complex prefix that combines two arguments with negative-infinite real components is
+            // NaN there, while the primitive returns the other argument, and its first complex prefix is the raw first
             // input, while the primitive wraps it onto the principal branch.
             let dual = match kind {
                 CumulativeKind::Sum => {
@@ -1967,7 +1967,7 @@ mod tests {
         );
 
         // Folding the guarded pairwise primitive keeps the scan exact where exponentiating directly would overflow: two
-        // equal operands add exactly `log(2)` at any magnitude, in both directions.
+        // equal elements add exactly `log(2)` at any magnitude, in both directions.
         let large = Array::vector(vec![1000.0, 1000.0]).unwrap();
         assert_eq!(
             large.cumulative_log_sum_exp(0),
@@ -2002,8 +2002,8 @@ mod tests {
         let lowest = Array::vector(vec![f8e4m3fnuz::MIN; 3000]).unwrap();
         assert_eq!(lowest.cumulative_log_sum_exp(0), Ok(lowest));
 
-        // Complex prefixes use the principal logarithm, and an operand whose real component is negative infinity has a
-        // zero exponential, so it leaves the other operand unchanged. That includes a pair of such operands, whose
+        // Complex prefixes use the principal logarithm, and an argument whose real component is negative infinity has
+        // a zero exponential, so it leaves the other argument unchanged. That includes a pair of such arguments, whose
         // elementwise complex combination would subtract `-∞` from `-∞` and produce NaN; the reverse scan combines one.
         let first = ComplexNumber::new(1.0f64, 2.0);
         let doubled = FloatingPointArrayElement::log_add_exp(first, first).unwrap();

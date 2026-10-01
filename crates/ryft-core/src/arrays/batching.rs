@@ -49,7 +49,7 @@ use crate::tracing::{Tracer, TracingContext};
 
 /// Describes one bounded ragged axis of an [`ArrayBatch`]. `axis` identifies the physical packed axis whose storage
 /// extent is the declared upper bound of `dimension`, while `extents` contains the actual per-item extents. The
-/// [`DimensionVariable`] is the semantic identity shared by compatible ragged operands. This metadata exists only while
+/// [`DimensionVariable`] is the semantic identity shared by compatible ragged inputs. This metadata exists only while
 /// batching (i.e., it is not a [`Type`] variant and consumers such as reductions own the masks that distinguish live
 /// elements from padding).
 #[derive(Clone, Debug, PartialEq, Parameter)]
@@ -133,11 +133,11 @@ impl<V> RaggedAxis<V> {
     }
 
     /// Returns this [`RaggedAxis`] after its packed array has flowed through a broadcast. A broadcast relocates each
-    /// operand axis `i` to `output_axes[i]` in its result, with newly inserted result axes appearing nowhere in that
+    /// input axis `i` to `output_axes[i]` in its result, with newly inserted result axes appearing nowhere in that
     /// mapping, so every stored packed-axis position (i.e., [`axis`](Self::axis) and each entry of
     /// [`extent_axes`](Self::extent_axes)) is remapped through the same table. `output_axes` must be the broadcast's
-    /// complete operand-to-result axis mapping, indexed by operand axis: its length must equal the operand rank, so
-    /// that every stored position is covered, and passing a shorter mapping panics on the first uncovered position.
+    /// complete input-to-result axis mapping, indexed by input axis: its length must equal the input rank, so that
+    /// every stored position is covered, and passing a shorter mapping panics on the first uncovered position.
     pub fn broadcasted(mut self, output_axes: &[usize]) -> Self {
         self.axis = output_axes[self.axis];
         self.extent_axes.iter_mut().for_each(|axis| *axis = output_axes[*axis]);
@@ -162,10 +162,10 @@ impl<V> RaggedAxis<V> {
         Some(self)
     }
 
-    /// Returns this [`RaggedAxis`] relocated onto the result axes of an operation that keeps only some of its operand's
+    /// Returns this [`RaggedAxis`] relocated onto the result axes of an operation that keeps only some of its input's
     /// axes and reorders the survivors (e.g., a contraction such as `dot`), or [`None`] when any stored packed-axis
-    /// position does not survive. `output_axes` maps each operand axis to the result axis it becomes, indexed by
-    /// operand axis, with [`None`] marking an axis the operation consumes, which makes it the partial counterpart of
+    /// position does not survive. `output_axes` maps each input axis to the result axis it becomes, indexed by input
+    /// axis, with [`None`] marking an axis the operation consumes, which makes it the partial counterpart of
     /// [`broadcasted`](Self::broadcasted)'s total mapping. Both [`axis`](Self::axis) and every entry of
     /// [`extent_axes`](Self::extent_axes) are remapped through that table, and losing either kind of position means
     /// the result can no longer describe this ragged axis, so the whole relocation fails instead of silently dropping
@@ -237,11 +237,11 @@ impl<V> RaggedAxis<V> {
 /// ragged axis. It names the value rather than the combining operator, so one masking hook serves every consumer
 /// whose operator has one of these identities.
 ///
-/// [`Lowest`](Self::Lowest) and [`Highest`](Self::Highest) are the operand data type's lowest and highest values under
+/// [`Lowest`](Self::Lowest) and [`Highest`](Self::Highest) are the input data type's lowest and highest values under
 /// the ordering that Ryft's extrema use (i.e., negative and positive infinity for the floating-point formats that have
 /// infinities and the largest-magnitude finite values for the ones that do not, those same extremes in both components
 /// for the complex types, which order lexicographically, `MIN` and `MAX` for the integers, and `false` and `true` for
-/// Booleans). [`LowestReal`](Self::LowestReal) is the lowest real value embedded in the operand data type, which is
+/// Booleans). [`LowestReal`](Self::LowestReal) is the lowest real value embedded in the input data type, which is
 /// [`Lowest`](Self::Lowest) for every real data type and the lowest real component paired with a zero imaginary one
 /// (i.e., `-∞ + 0i`) for the complex types. [`One`](Self::One) is the element type's canonical multiplicative identity
 /// (i.e., [`ArrayElement::one`]): `true` for Booleans, `1 + 0i` for the complex types, and the all-ones encoding `-1`
@@ -251,7 +251,7 @@ impl<V> RaggedAxis<V> {
 /// element types are rejected.
 ///
 /// [`Zero`](Self::Zero), the additive identity, never reaches that rejection in practice. Instead, a masking
-/// implementation takes the operand's own [`ZeroLikeOperation`] for it, which needs no data type reasoning and
+/// implementation takes the input's own [`ZeroLikeOperation`] for it, which needs no data type reasoning and
 /// imposes its own contract.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RaggedMaskIdentity {
@@ -261,15 +261,15 @@ pub enum RaggedMaskIdentity {
     /// Multiplicative identity.
     One,
 
-    /// Lowest value of the operand data type, and the identity of a maximum operation.
+    /// Lowest value of the input data type, and the identity of a maximum operation.
     Lowest,
 
-    /// Lowest real value embedded in the operand data type, and the identity of a `log_add_exp` operation. Unlike
+    /// Lowest real value embedded in the input data type, and the identity of a `log_add_exp` operation. Unlike
     /// [`Lowest`](Self::Lowest), it has a zero imaginary component for complex types, so its exponential is exactly
     /// zero instead of depending on how a backend resolves the undefined `cos(-∞)` and `sin(-∞)`.
     LowestReal,
 
-    /// Highest value of the operand data type, and the identity of a minimum operation.
+    /// Highest value of the input data type, and the identity of a minimum operation.
     Highest,
 }
 
@@ -296,8 +296,8 @@ pub enum DimensionSource<V> {
     /// Dimension with the provided static extent.
     Static(usize),
 
-    /// Dynamic per-item dimension readable from axis `axis` of the broadcast-compatible source value `source`,
-    /// which is a clone of the corresponding operand's parent-owned value.
+    /// Dynamic per-item dimension readable from axis `axis` of the broadcast-compatible source value `source`, which is
+    /// a clone of the corresponding input's parent-owned value.
     Value {
         /// Parent-owned value whose axis carries this dimension.
         source: V,
@@ -477,8 +477,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     {
         if !self.batch_axis().is_replicated() {
             return Err(BatchingError::MisalignedBatchAxes {
-                message: "`ArrayBatch::broadcast` expects a replicated operand but received a batched value"
-                    .to_string(),
+                message: "`ArrayBatch::broadcast` expects a replicated input but received a batched value".to_string(),
             });
         }
 
@@ -1020,9 +1019,9 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     }
 
     /// Validates that this [`ArrayIrBatch`] holds a replicated dimension member, which is what a rule requires of a
-    /// dimension operand that must be shared by every batch item (e.g., a shape operand).
-    /// Both mapped first-class dimensions and dimension values carrying mapped axes are rejected, resulting in
-    /// a [`BatchingError::MappedDimension`], and array or reference members fail the dimension type projection.
+    /// dimension input that must be shared by every batch item (e.g., a shape input). Both mapped first-class
+    /// dimensions and dimension values carrying mapped axes are rejected, resulting in a
+    /// [`BatchingError::MappedDimension`], and array or reference members fail the dimension type projection.
     pub fn validate_replicated_dimension(&self) -> Result<(), BatchingError> {
         let value_type = self.value.r#type();
         let r#type = match &self.member {
@@ -1083,7 +1082,7 @@ impl<V: Value<Type = ArrayIrType>> Display for ArrayIrBatch<V> {
 /// input as `f32[2, 3]`. [`Self::output_axes`] excludes the bookkeeping output and reports one mapped axis `0` for the
 /// single semantic output `%2`, so the program returned by [`BatchedProgram::into_parts`] has one more input and output
 /// than that metadata describes. Consumers that instead need an ordinary [`Region`] boundary shed the widening through
-/// [`BatchingPolicy::adapt_batched_program`] and complete the adapted program's operands with
+/// [`BatchingPolicy::adapt_batched_program`] and complete the adapted program's inputs with
 /// [`BatchingPolicy::boundary_operands`].
 pub struct ThreadedExtentBatchedProgram<V: Typed<Type = ArrayIrType> + Parameter, O> {
     /// Structurally transformed program, including its leading bookkeeping input and output.
@@ -1147,10 +1146,11 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> BatchedProg
 ///
 ///   - **Extent Representation:** Ordinary batching knows its mapped-axis extent as one static host `usize`. Projected
 ///     batching's extent is an ordinary parent-owned first-class dimension value, so a dynamic batch extent remains a
-///     Single Static Assignment (SSA) value flowing through operand edges rather than static transform metadata.
+///     Single Static Assignment (SSA) value flowing through instruction input edges rather than static transform
+///     metadata.
 ///   - **Replicated-Array Materialization:** Aligning a replicated array with mapped inputs requires broadcasting it
 ///     across the mapped axis. Ordinary batching can use broadcasting operation with static output metadata, while
-///     projected batching must stage the mixed broadcast that consumes explicit dimension operands.
+///     projected batching must stage the mixed broadcast that consumes explicit dimension inputs.
 ///
 /// An [`ArrayExtentBatchingPolicy`] is a type-level selector packaging those two differences, so each policy owns the
 /// complete translation from a homogeneous rule's extent and broadcast requests to its universe's operations. Every
@@ -1205,18 +1205,18 @@ pub trait ArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>:
         axis: Axis,
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
 
-    /// Materializes one input/operand at `r#type`, broadcasting its per-item dimensions to the common target
-    /// shape and inserting the mapped batch axis. The shared elementwise algorithm computes the complete broadcast
-    /// geometry, including one [`DimensionSource`] per batched output axis, and delegates only the materialization
-    /// itself, which is the policy-specific step. [`StaticArrayExtentBatchingPolicy`] broadcasts with static output
-    /// metadata and ignores the sources, while a dimension-valued policy spends each source mechanically (i.e., exact
-    /// constants for static dimensions, `dimension_size` reads of the provided source values for dynamic per-item
-    /// dimensions, and the transform's extent value for the mapped axis itself).
+    /// Materializes one instruction input at `r#type`, broadcasting its per-item dimensions to the common target shape
+    /// and inserting the mapped batch axis. The shared elementwise algorithm computes the complete broadcast geometry,
+    /// including one [`DimensionSource`] per batched output axis, and delegates only the materialization itself, which
+    /// is the policy-specific step. [`StaticArrayExtentBatchingPolicy`] broadcasts with static output metadata and
+    /// ignores the sources, while a dimension-valued policy spends each source mechanically (i.e., exact constants for
+    /// static dimensions, `dimension_size` reads of the provided source values for dynamic per-item dimensions, and the
+    /// transform's extent value for the mapped axis itself).
     ///
     /// # Parameters
     ///
     ///   - `context`: Active [`BatchingContext`] for the transform level being applied.
-    ///   - `input`: Input/operand batch to materialize.
+    ///   - `input`: Instruction input batch to materialize.
     ///   - `r#type`: Complete batched type of the materialized result (i.e., the common per-item target type
     ///     with the mapped axis inserted at `batch_axis`).
     ///   - `output_axes`: Mapping from each of `input`'s axes to its output axis.
@@ -1262,9 +1262,9 @@ pub trait RaggedArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayEx
     /// discipline, owned by contractions (e.g., `dot`), and it is the second of the two consuming disciplines, the
     /// other being the reduction masking of [`Self::mask_reduction_input`]. Zero is the contraction identity (a padded
     /// element enters a contraction only as a factor of a product that is then summed, so zeroing it removes its
-    /// product from the sum). Consumers zero every ragged operand along its own contracted ragged axes, which is
+    /// product from the sum). Consumers zero every ragged input along its own contracted ragged axes, which is
     /// sufficient because zeroing either factor of a contracted pair already neutralizes that product, and it requires
-    /// no agreement between the two operands about which of them is ragged.
+    /// no agreement between the two inputs about which of them is ragged.
     fn pad_contraction_input(
         context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         input: &ArrayBatch<C::Value>,
@@ -1281,7 +1281,7 @@ pub trait RaggedArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayEx
     /// # Parameters
     ///
     ///   - `context`: Active [`BatchingContext`] for the transform level being applied.
-    ///   - `input`: Operand batch whose padding is masked.
+    ///   - `input`: Instruction input batch whose padding is masked.
     ///   - `masked_axes`: Packed axes whose ragged padding must be neutralized; ragged axes of `input` outside this
     ///     set are left untouched.
     ///   - `identity`: Value written over the padding.
@@ -1613,7 +1613,7 @@ where
 
         // The broadcast is a mixed operation, so it is staged in the composite parent (i.e., two levels up, past this
         // batching level and past the projected array view) on the lifted composite value, and the result is projected
-        // back into the array member afterward. Ragged metadata follows the operand-to-output axis mapping.
+        // back into the array member afterward. Ragged metadata follows the input-to-output axis mapping.
         let value = <C::Value as ValueProjection<ArrayType>>::from_projected(batch.value().clone());
         let (value, output_axes) =
             broadcast_replicated_array(value, &array_type, position, context.axis_extent(), context.axis_sharding())?;
@@ -1659,9 +1659,9 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // The algorithm already decided where every operand axis lands (i.e., `output_axes`) and which batch axis
-        // the result carries, so this step only stages the mixed broadcast in the composite parent and relocates
-        // the operand's ragged metadata through that same axis mapping.
+        // The algorithm already decided where every input axis lands (i.e., `output_axes`) and which batch axis the
+        // result carries, so this step only stages the mixed broadcast in the composite parent and relocates the
+        // input's ragged metadata through that same axis mapping.
         let value = <C::Value as ValueProjection<ArrayType>>::from_projected(input.value().clone());
         let value = value.dynamic_broadcast_with_output_sharding(
             &output_dimensions,
@@ -1747,13 +1747,13 @@ where
         masked_axes: &[usize],
         identity: RaggedMaskIdentity,
     ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
-        // This is the identity masking behind every ragged discipline of the dynamic policy: each ragged axis
-        // of `input` named in `masked_axes` contributes an `iota < extents` predicate over the packed shape,
-        // the predicates are combined, and the padded elements are selected away in favor of `identity`.
-        // `RaggedMaskIdentity::Zero` takes the operand's own zero-like value, which needs no data type reasoning.
-        // Every other identity stages a rank-zero constant of the operand's element data type and broadcasts it across
-        // the packed shape. Input with no masked ragged axis is returned unchanged, so nothing is staged for an operand
-        // this discipline does not touch.
+        // This is the identity masking behind every ragged discipline of the dynamic policy: each ragged axis of
+        // `input` named in `masked_axes` contributes an `iota < extents` predicate over the packed shape, the
+        // predicates are combined, and the padded elements are selected away in favor of `identity`.
+        // `RaggedMaskIdentity::Zero` takes the input's own zero-like value, which needs no data type reasoning. Every
+        // other identity stages a rank-zero constant of the input's element data type and broadcasts it across the
+        // packed shape. Input with no masked ragged axis is returned unchanged, so nothing is staged for an input this
+        // discipline does not touch.
         //
         // The staged instructions carry the nested `ryft::batching::ragged_identity_mask` provenance scopes.
         // Those scopes are purely diagnostic; nothing may match on them for correctness.
@@ -1775,14 +1775,14 @@ where
         let lifted_input_value = <C::Value as ValueProjection<ArrayType>>::from_projected(input_value.clone());
         let packed_type = input.r#type().into_owned();
 
-        // A non-zero identity is written over padding as a broadcast rank-zero constant of the operand's element type,
+        // A non-zero identity is written over padding as a broadcast rank-zero constant of the input's element type,
         // which is built here on the host before anything is staged. The extrema reuse the element-level reduction
         // identities, so `Lowest` writes exactly the value a maximum reduction starts from, and `LowestReal` projects
         // that value onto its real component, which is exact and only discards the complex types' infinite imaginary
         // component. The arithmetic identity uses the element's canonical one, including the all-ones encoding `-1`
         // that is the multiplicative identity for `i1` arithmetic modulo two. The payload-free element types hold no
-        // constant of any kind. The zero identity instead takes the operand's own zero-like value below and needs no
-        // data type reasoning.
+        // constant of any kind. The zero identity instead takes the input's own zero-like value below and needs no data
+        // type reasoning.
         let data_type = packed_type.data_type();
         let identity_scalar = match identity {
             RaggedMaskIdentity::Zero => None,
@@ -1814,7 +1814,7 @@ where
                 outer_context.invoke_with_provenance_scope(
                     ProvenanceScope::new("ragged_identity_mask"),
                     || -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, BatchingError> {
-                        // Every broadcast below targets the operand's full packed shape, so its first-class dimensions
+                        // Every broadcast below targets the input's full packed shape, so its first-class dimensions
                         // are read once and shared.
                         let output_dimensions = (0..packed_type.rank())
                             .map(|axis| lifted_input_value.dimension_size(axis))
@@ -1877,7 +1877,7 @@ where
                         }
 
                         // The replacement written over padding is the requested identity materialized at the packed
-                        // shape, and the final select keeps live elements from the operand and takes the identity
+                        // shape, and the final select keeps live elements from the input and takes the identity
                         // everywhere else.
                         let replacement = match identity_scalar {
                             None => {
@@ -2353,10 +2353,10 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
         outputs: &[Self::Batch],
         evidence: &Self::Evidence,
     ) -> Result<(), BatchingError> {
-        // Every bounded ragged dimension carried by an operand must survive the rule that consumed it, either as a
-        // ragged output axis, as a mapped output dimension holding its per-item extents, or as a dimension the rule's
-        // evidence claims it consumed deliberately. Anything else would silently forget per-item extents that no
-        // `ArrayIrType` records, and so the operation is rejected while naming the exact dimension that was lost.
+        // Every bounded ragged dimension carried by an input must survive the rule that consumed it, either as a ragged
+        // output axis, as a mapped output dimension holding its per-item extents, or as a dimension the rule's evidence
+        // claims it consumed deliberately. Anything else would silently forget per-item extents that no `ArrayIrType`
+        // records, and so the operation is rejected while naming the exact dimension that was lost.
         inputs
             .iter()
             .flat_map(ArrayIrBatch::ragged_axes)
@@ -2385,7 +2385,7 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
     #[inline]
     fn boundary_operands(axis_extent: &Self::Extent) -> Vec<C::Value> {
         // The adapted program's leading input still defines the `DimensionVariable` referenced by every inserted
-        // dynamic batch dimension, so the first-class mapped extent value must become its matching operand.
+        // dynamic batch dimension, so the first-class mapped extent value must become its matching program input.
         vec![axis_extent.clone()]
     }
 
@@ -2517,7 +2517,7 @@ where
         // output through `BatchingPolicy::adapt_batched_program`. A future cache could therefore retain this widened,
         // context-neutral template. It would need its own marker and a complete normalized key containing the extent
         // type and identity contract, named-axis scope, sharding, input axes, and output policy. The live extent would
-        // remain a per-call boundary operand. The current measured cache consumer is the simpler homogeneous path, so
+        // remain a per-call boundary input. The current measured cache consumer is the simpler homogeneous path, so
         // adding that separate specialization mechanism here would be premature rather than technically impossible.
         check_count!("input", input_axes, region.input_types().len(), ProgramError);
         let BatchingLevelExtent::Dynamic(extent_type) = level.extent() else {
@@ -3125,15 +3125,15 @@ where
 // Blanket `BatchableOperation` implementation for any `ElementwiseOperation`, so per-operation `BatchableOperation`
 // implementations do not have to be written for elementwise primitives (e.g., `ZeroLike`, `OneLike`, `Add`, `Sub`,
 // `Mul`, `Div`, `Neg`, `Sin`, `Cos`, `Select`, etc.). Operations with non-trivial axis arithmetic (e.g., `Dot`,
-// `Transpose`, `Reshape`, etc.) keep their explicit implementations. Coherence is preserved because none of those
-// types implement `ElementwiseOperation`. The rule follows JAX's `defbroadcasting` policy where every input is
-// broadcast to the common batched shape before the operation is applied, so the value-level primitive only ever
-// sees inputs that agree on shape. When no input is mapped there is no batch axis to thread, and so the inputs are
-// interpreted as given and every output is replicated. Otherwise, mapped inputs retain the first mapped input's
-// position when that position is valid for every mapped operand. For mixed ranks where it is not, they are temporarily
-// realigned to leading axis `0`. Every input is then broadcast to the common per-item shape with the batch axis
-// inserted there. Operands whose per-item shapes are not broadcast-compatible are left at their batch-axis-inserted
-// shapes so the operation surfaces its own shape error.
+// `Transpose`, `Reshape`, etc.) keep their explicit implementations. Coherence is preserved because none of those types
+// implement `ElementwiseOperation`. The rule follows JAX's `defbroadcasting` policy where every input is broadcast to
+// the common batched shape before the operation is applied, so the value-level primitive only ever sees inputs that
+// agree on shape. When no input is mapped there is no batch axis to thread, and so the inputs are interpreted as given
+// and every output is replicated. Otherwise, mapped inputs retain the first mapped input's position when that position
+// is valid for every mapped input. For mixed ranks where it is not, they are temporarily realigned to leading axis `0`.
+// Every input is then broadcast to the common per-item shape with the batch axis inserted there. Inputs whose per-item
+// shapes are not broadcast-compatible are left at their batch-axis-inserted shapes so the operation surfaces its own
+// shape error.
 impl<
     C: Context<Type = ArrayType, Value: Transpose>,
     O: ElementwiseOperation + InterpretableOperation<C>,
@@ -3188,8 +3188,8 @@ impl<
             .collect::<Result<Vec<_>, _>>()?;
         let inputs = inputs.iter().map(|input| input.move_axis(batch_axis)).collect::<Result<Vec<_>, _>>()?;
 
-        // Broadcast every operand to the common unbatched per-item shape when one exists. Otherwise, retain
-        // each input's own per-item shape and let the operation's inference report the incompatibility.
+        // Broadcast every input to the common unbatched per-item shape when one exists. Otherwise, retain each input's
+        // own per-item shape and let the operation's inference report the incompatibility.
         let common_unbatched_type = Broadcastable::broadcasted(unbatched_types.as_slice()).ok();
         let axis_dimension = M::axis_dimension(context)?;
         let broadcasted_inputs = inputs
@@ -3273,8 +3273,8 @@ impl<
         let input_types = broadcasted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_count = Operation::infer_output_types(self, input_types.as_slice(), &[])?.len();
 
-        // Ragged elementwise operands must agree wherever they describe the same physical axis. Replicated and fully
-        // dense operands impose no raggedness of their own and can be combined with a ragged operand normally.
+        // Ragged elementwise inputs must agree wherever they describe the same physical axis. Replicated and fully
+        // dense inputs impose no raggedness of their own and can be combined with a ragged input normally.
         let mut ragged_axes = Vec::<RaggedAxis<C::Value>>::new();
         for ragged_axis in broadcasted_inputs.iter().flat_map(|input| input.ragged_axes()) {
             if let Some(existing) = ragged_axes.iter().find(|existing| existing.axis() == ragged_axis.axis()) {
@@ -3356,7 +3356,7 @@ impl<
     /// [`Batch::batch`](crate::Batch::batch) entry point does, which must recover the batch size from a mapped value's
     /// own type. A dynamic dimension in an input's per-item type is therefore never the batch axis: it crosses the
     /// rewritten boundary unchanged, and where a [`BatchableOperation`] rule needs its runtime extent (such as the
-    /// broadcast that aligns a replicated elementwise operand against a mapped one) that extent is resolved through
+    /// broadcast that aligns a replicated elementwise input against a mapped one) that extent is resolved through
     /// [`DimensionSource`] from the source axis that supplied it, or rejected with an exact type diagnostic when no
     /// source axis carries it.
     ///
@@ -4020,8 +4020,8 @@ fn normalized_batch_axis_type(
 /// Broadcasts the replicated array `value`, whose per-item type is `r#type`, so that it gains the mapped batch axis at
 /// `position` with the transform's `axis_extent` and `axis_sharding`. The per-item shape survives unchanged, so each of
 /// its axes is read through [`DimensionSize`], which folds statically known extents into literals, and the inserted
-/// axis takes the transform's own extent. Returns the broadcast value together with the operand-to-output axis
-/// mapping, through which callers relocate their ragged-axis metadata.
+/// axis takes the transform's own extent. Returns the broadcast value together with the input-to-output axis mapping,
+/// through which callers relocate their ragged-axis metadata.
 ///
 /// # Parameters
 ///
@@ -4039,7 +4039,7 @@ fn broadcast_replicated_array<V: DimensionSize + DynamicBroadcast>(
 ) -> Result<(V, Vec<usize>), BatchingError> {
     // The output shape is the per-item shape with the mapped extent inserted at `position`. Every per-item axis is read
     // back from `value` (or folded to a constant when static) and keeps its relative order, shifting by one past the
-    // inserted axis. The resulting operand-to-output mapping is also what callers use to relocate ragged metadata.
+    // inserted axis. The resulting input-to-output mapping is also what callers use to relocate ragged metadata.
     let mut output_dimensions =
         (0..r#type.rank()).map(|axis| value.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
     output_dimensions.insert(position, axis_extent.clone());
@@ -4132,7 +4132,7 @@ mod tests {
     #[test]
     fn test_ragged_axis_broadcasted() {
         // Broadcasting maps every packed input axis to its output axis, so both the ragged axis and its extent axes
-        // follow the operand-to-output mapping (here a leading axis is inserted in front of them).
+        // follow the input-to-output mapping (here a leading axis is inserted in front of them).
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let extents = Array::vector(vec![1.0_f32, 3.0]).unwrap();
         assert_eq!(
@@ -5022,9 +5022,9 @@ mod tests {
 
     #[test]
     fn test_static_array_extent_batching_policy_broadcast_input() {
-        // The algorithm has already decided the operand-to-output axis mapping and the result's batch axis, so the
-        // static policy only broadcasts the packed value to the requested type and relocates ragged metadata through
-        // that same mapping. The dimension sources are not needed because the type is fully static.
+        // The algorithm has already decided the input-to-output axis mapping and the result's batch axis, so the static
+        // policy only broadcasts the packed value to the requested type and relocates ragged metadata through that same
+        // mapping. The dimension sources are not needed because the type is fully static.
         let context = BatchingContext::new(TestArrayContext::new(), 2);
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let replicated = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]).unwrap());
@@ -5265,11 +5265,11 @@ mod tests {
 
     #[test]
     fn test_dynamic_array_extent_batching_policy_broadcast_input() -> Result<(), ProgramError> {
-        // The algorithm has already decided the operand-to-output axis mapping and the result's batch axis. The policy
+        // The algorithm has already decided the input-to-output axis mapping and the result's batch axis. The policy
         // materializes each output dimension source in first-class form (an exact constant for a static dimension, a
-        // `dimension_size` read for a per-item dimension taken from another operand, and the transform's own extent
-        // for the mapped axis), stages the mixed broadcast in the composite parent, and relocates ragged metadata
-        // through the same axis mapping.
+        // `dimension_size` read for a per-item dimension taken from another input, and the transform's own extent for
+        // the mapped axis), stages the mixed broadcast in the composite parent, and relocates ragged metadata through
+        // the same axis mapping.
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let width = DimensionVariable::new("width", DimensionBounds::new(1, Some(9)).unwrap());
@@ -5361,7 +5361,7 @@ mod tests {
             Ok(input.clone()),
         );
 
-        // A sum zeroes the padding through the zero identity mask, which takes the operand's own zero-like value.
+        // A sum zeroes the padding through the zero identity mask, which takes the input's own zero-like value.
         let output =
             DynamicArrayExtentBatchingPolicy::mask_reduction_input(&context, &input, &[1], ReductionKind::Sum)?;
         assert_eq!(output.batch_axis(), BatchAxis::new(0));
@@ -5398,7 +5398,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_array_extent_batching_policy_pad_contraction_input() -> Result<(), ProgramError> {
-        // Zeroing the padding of a contraction operand is the zero identity mask without any further validation.
+        // Zeroing the padding of a contraction input is the zero identity mask without any further validation.
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
@@ -5447,8 +5447,8 @@ mod tests {
     #[test]
     fn test_dynamic_array_extent_batching_policy_mask_identity_input() -> Result<(), BatchingError> {
         // A `[items, 3]` carrier whose axis 1 is ragged, masked with the greatest `f32` value: the staged mask is the
-        // `iota < extents` predicate of the packed axis and the replacement is a broadcast scalar constant rather
-        // than the operand's own zero.
+        // `iota < extents` predicate of the packed axis and the replacement is a broadcast scalar constant rather than
+        // the input's own zero.
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
@@ -5521,11 +5521,11 @@ mod tests {
 
     #[test]
     fn test_dynamic_array_extent_batching_policy_mask_identity_input_element_types() {
-        // A non-zero identity is written over padding as a broadcast rank-zero constant of the operand's element type,
+        // A non-zero identity is written over padding as a broadcast rank-zero constant of the input's element type,
         // built on the host before anything is staged. The extrema reuse the element-level reduction identities, the
         // arithmetic one uses the element's canonical multiplicative identity, and the payload-free types hold no
         // constant of any kind. Each case stages identity masking of the ragged axis 1 (physical bound 3) of one mapped
-        // `[items, 3]` operand and inspects the staged constant or the rejection.
+        // `[items, 3]` input and inspects the staged constant or the rejection.
         for (data_type, identity, expected) in [
             (DataType::F32, RaggedMaskIdentity::Lowest, Ok(Array::scalar(f32::NEG_INFINITY).unwrap())),
             (DataType::F32, RaggedMaskIdentity::LowestReal, Ok(Array::scalar(f32::NEG_INFINITY).unwrap())),
@@ -5696,7 +5696,7 @@ mod tests {
         );
 
         // The static extent policy keeps the defaults: no operation validation beyond the rules themselves, and no
-        // boundary operands because the extent is a host `usize` rather than a first-class value.
+        // boundary program inputs because the extent is a host `usize` rather than a first-class value.
         assert_eq!(
             <ArrayBatchingPolicy as BatchingPolicy<TestArrayContext>>::validate_operation_outputs(
                 "add",
@@ -6201,9 +6201,9 @@ mod tests {
 
     #[test]
     fn test_array_ir_batching_policy_validate_operation_outputs() {
-        // Every bounded ragged dimension carried by an operand must survive the rule that consumed it: as a ragged
-        // output axis, as a mapped output dimension holding its per-item extents, or as a dimension the rule's evidence
-        // claims it consumed deliberately. Anything else silently forgets per-item extents that no type records.
+        // Every bounded ragged dimension carried by an input must survive the rule that consumed it: as a ragged output
+        // axis, as a mapped output dimension holding its per-item extents, or as a dimension the rule's evidence claims
+        // it consumed deliberately. Anything else silently forgets per-item extents that no type records.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let extents = ArrayIrValue::<Array>::Array(Array::vector(vec![1_i32, 3]).unwrap());
         let ragged_axis = RaggedAxis::new(1, extents.clone(), length.clone(), vec![0]);
@@ -6313,7 +6313,7 @@ mod tests {
             }),
         );
 
-        // Mixed shape operations without a ragged contract reject the carrier before inspecting their shape operands.
+        // Mixed shape operations without a ragged contract reject the carrier before inspecting their shape inputs.
         let reshape: Result<ArrayIrValue<Array>, BatchingError> = batch(
             |(value, extent)| {
                 let extent = extent.to_dimension(variable.clone())?;
@@ -6342,7 +6342,7 @@ mod tests {
     #[test]
     fn test_array_ir_batching_policy_boundary_operands() {
         // The adapted program's leading input still defines the dimension variable referenced by every inserted batch
-        // dimension, so the first-class extent value becomes its matching operand.
+        // dimension, so the first-class extent value becomes its matching program input.
         let extent = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
         assert_eq!(
             <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrEagerContext>>::boundary_operands(&extent),
@@ -7452,9 +7452,9 @@ mod tests {
         );
 
         // Under a trace with a symbolic extent, a lifted mixed operation keeps the mapped extent as an ordinary SSA
-        // operand, and generic homogeneous dispatch stages the alignment of its operands explicitly: a replicated
-        // operand gains the mapped axis through a dynamic broadcast that consumes the extent, and differently
-        // positioned mapped operands are reconciled by one transpose.
+        // input, and generic homogeneous dispatch stages the alignment of its inputs explicitly: a replicated input
+        // gains the mapped axis through a dynamic broadcast that consumes the extent, and differently positioned mapped
+        // inputs are reconciled by one transpose.
         let trace = ArrayIrTraceContext::new();
         let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
         let batch_extent = trace.input(DimensionType::from(batch_variable.clone()).into());
@@ -7598,7 +7598,7 @@ mod tests {
         let rejection =
             Err(BatchingError::MappedDimension { r#type: Box::new(dimension_type.clone()), axis: BatchAxis::new(0) });
 
-        // Member rules of the dimension family and mixed rules that take a dimension operand reject it directly.
+        // Member rules of the dimension family and mixed rules that take a dimension input reject it directly.
         assert_eq!(
             ArrayIrOperation::<Array>::from(DimensionToScalarOperation).batch(
                 &context,
@@ -7693,7 +7693,7 @@ mod tests {
             Err(BatchingError::MappedDimension { r#type: Box::new(extent_type), axis: BatchAxis::new(0) }),
         );
 
-        // Nullary array constructors that take their dynamic extents as dimension operands report the operand instead.
+        // Nullary array constructors that take their dynamic extents as dimension inputs report the input instead.
         let dynamic_zero = ArrayIrOperation::<Array>::from(ZeroOperation::new(ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(dimension_type.variable().clone())]),
@@ -7701,7 +7701,7 @@ mod tests {
         assert_eq!(
             dynamic_zero.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&mapped_dimension)),
             Err(BatchingError::UnsupportedOperation {
-                message: "member operand 0 of type dimension<extent ∈ [0, 9)> must be replicated but is mapped at \
+                message: "member input 0 of type dimension<extent ∈ [0, 9)> must be replicated but is mapped at \
                           axis 0"
                     .to_string(),
             }),
@@ -7710,9 +7710,9 @@ mod tests {
 
     #[test]
     fn test_elementwise_operation_batch() {
-        // The blanket `BatchableOperation` for elementwise operations lifts `interpret` over the mapped batch axis.
-        // It realigns every mapped operand onto the common axis, broadcasts replicated operands across the batch,
-        // and reports each output on that common axis.
+        // The blanket `BatchableOperation` for elementwise operations lifts `interpret` over the mapped batch axis. It
+        // realigns every mapped input onto the common axis, broadcasts replicated inputs across the batch, and reports
+        // each output on that common axis.
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
 
@@ -7720,7 +7720,7 @@ mod tests {
         // through its parent context.
         let context = BatchingContext::new(TestArrayContext::new(), 2);
 
-        // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
+        // Two inputs mapped on the same axis add per item, and the output stays mapped on that axis.
         let left = ArrayBatch::new(
             Array::from_elements::<f64>(matrix_type.clone(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
             Some(0),
@@ -7740,7 +7740,7 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]).unwrap());
 
-        // A replicated operand is broadcast across the mapped operand's batch before adding.
+        // A replicated input is broadcast across the mapped input's batch before adding.
         let replicated =
             ArrayBatch::new(Array::from_elements::<f64>(vector_type.clone(), &[10.0, 20.0, 30.0]).unwrap(), None)
                 .unwrap();
@@ -7752,7 +7752,7 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::matrix(2, 3, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]).unwrap());
 
-        // Operands mapped on different axes are realigned onto the first mapped operand's axis before adding.
+        // Inputs mapped on different axes are realigned onto the first mapped input's axis before adding.
         let transposed_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let right_axis_one = ArrayBatch::new(
@@ -7768,9 +7768,9 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]).unwrap());
 
-        // Packed mapped-axis positions are canonicalized independently of operand rank. The rank-3 left operand
-        // maps its trailing axis while the rank-1 right operand maps its only axis; their unbatched per-item shapes are
-        // `[3, 4]` and scalar, respectively. The output is restored to the first mapped input's trailing axis.
+        // Packed mapped-axis positions are canonicalized independently of input rank. The rank-3 left input maps its
+        // trailing axis while the rank-1 right input maps its only axis; their unbatched per-item shapes are `[3, 4]`
+        // and scalar, respectively. The output is restored to the first mapped input's trailing axis.
         let left_type = ArrayType::new(
             DataType::F64,
             Shape::new(vec![Dimension::Static(3), Dimension::Static(4), Dimension::Static(2)]),
@@ -7797,8 +7797,8 @@ mod tests {
             .unwrap(),
         );
 
-        // A replicated per-item scalar is broadcast across the batch and against the mapped operand's per-item shape,
-        // and mapped operands with different per-item ranks broadcast their per-item shapes item by item.
+        // A replicated per-item scalar is broadcast across the batch and against the mapped input's per-item shape, and
+        // mapped inputs with different per-item ranks broadcast their per-item shapes item by item.
         let mapped = ArrayBatch::new(Array::vector(vec![1.0, 2.0]).unwrap(), Some(0)).unwrap();
         let scalar = ArrayBatch::replicated(Array::scalar(10.0).unwrap());
         let outputs =
@@ -7811,7 +7811,7 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::matrix(2, 3, vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]).unwrap());
 
-        // With no operand mapped, the operands are interpreted as given and the output is replicated.
+        // With no input mapped, the inputs are interpreted as given and the output is replicated.
         let left_replicated =
             ArrayBatch::new(Array::from_elements::<f64>(vector_type.clone(), &[1.0, 2.0, 3.0]).unwrap(), None).unwrap();
         let right_replicated =
@@ -7837,12 +7837,12 @@ mod tests {
 
     #[test]
     fn test_elementwise_operation_batch_normalizes_replicated_and_sharded_mapped_axes() {
-        // Mapped operands whose packed placements differ are normalized onto the context's batch axis placement before
+        // Mapped inputs whose packed placements differ are normalized onto the context's batch axis placement before
         // the operation runs, so the output carries that placement rather than a mixture.
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            // The mapped axis of one operand is placed on `x`, which makes that operand vary along `x` when the axis is
-            // manual, while the other operand's mapped axis is replicated.
+            // The mapped axis of one input is placed on `x`, which makes that input vary along `x` when the axis is
+            // manual, while the other input's mapped axis is replicated.
             let sharded_type =
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
                     .with_sharding(
@@ -7885,8 +7885,8 @@ mod tests {
 
     #[test]
     fn test_elementwise_operation_batch_preserves_explicit_mapped_axis_sharding() {
-        // The per-item type of a mapped operand drops the mapped dimension's placement, and the batched output restores
-        // exactly that placement at the operand's own mapped position, whichever position that is.
+        // The per-item type of a mapped input drops the mapped dimension's placement, and the batched output restores
+        // exactly that placement at the input's own mapped position, whichever position that is.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let context = BatchingContext::new(TestArrayContext::new(), 2);
         for (batch_axis, dimensions) in [vec![2, 3, 4], vec![3, 2, 4], vec![3, 4, 2]].into_iter().enumerate() {
@@ -7922,7 +7922,7 @@ mod tests {
     #[test]
     fn test_elementwise_operation_batch_stages_broadcast_to_full_shape() {
         // A replicated scalar constant added to a mapped [3, 4] input: the elementwise rule materializes a broadcasting
-        // operation to the full common batched shape so the staged add receives shape-congruent operands. This is
+        // operation to the full common batched shape so the staged add receives shape-congruent inputs. This is
         // required for backends such as XLA whose elementwise lowering (e.g., `stablehlo.add`) has no implicit
         // broadcasting.
         let parent = DomainTracingContext::<TestArrayContext>::new();
@@ -8280,7 +8280,7 @@ mod tests {
 
         // The condition therefore seals against one coherent shared interface.
         let predicate = outer.add_input(ArrayType::scalar(DataType::Boolean));
-        let operand = outer.add_input(
+        let input = outer.add_input(
             source
                 .batched(
                     2,
@@ -8295,12 +8295,7 @@ mod tests {
                 .clone(),
         );
         let output = outer
-            .add_instruction(
-                ConditionOperation::new(),
-                vec![first_region, second_region],
-                vec![predicate, operand],
-                None,
-            )
+            .add_instruction(ConditionOperation::new(), vec![first_region, second_region], vec![predicate, input], None)
             .unwrap()[0];
         let outer = outer
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -8418,7 +8413,7 @@ mod tests {
     #[test]
     fn test_program_batched_preserves_source_provenance() {
         // Batching rewrites each source instruction into the instructions its rule stages, so every instruction of the
-        // batched program records the source instruction it came from. The mapped/replicated operand pair forces the
+        // batched program records the source instruction it came from. The mapped/replicated input pair forces the
         // elementwise rule down its broadcasting path, which makes the first rewrite one-to-many.
         let first = Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown());
         let second = Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown());
@@ -8771,7 +8766,7 @@ mod tests {
             batch(|row| Ok(row), matrix.clone(), BatchAxis::new(0), BatchAxis::new(1), None)?;
         assert_eq!(moved, ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f32, 4.0, 2.0, 5.0, 3.0, 6.0],).unwrap()),);
 
-        // A replicated array output is dynamically broadcast with the inferred extent operand.
+        // A replicated array output is dynamically broadcast with the inferred extent input.
         let replicated = ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0]).unwrap());
         let broadcasted: ArrayIrValue<Array> = batch(
             |(_, replicated)| Ok(replicated),
@@ -9194,8 +9189,8 @@ mod tests {
         );
 
         // A second structural pass over the already-batched program introduces one new leading threaded extent and
-        // recursively re-batches the attached regions. The source extent stays an ordinary replicated dimension
-        // operand, so nested batching never recovers either extent from array metadata.
+        // recursively re-batches the attached regions. The source extent stays an ordinary replicated dimension input,
+        // so nested batching never recovers either extent from array metadata.
         let outer_batch = DimensionVariable::new("outer_batch", DimensionBounds::new(1, Some(5))?);
         let nested = program.batched_with_threaded_extent(
             DimensionType::from(outer_batch.clone()),
@@ -9739,7 +9734,7 @@ mod tests {
     #[test]
     fn test_broadcast_replicated_array() -> Result<(), ProgramError> {
         // The output shape is the per-item shape with the extent inserted at the requested position: static per-item
-        // axes fold to exact constants, dynamic ones are read back from the value, the operand-to-output axis mapping
+        // axes fold to exact constants, dynamic ones are read back from the value, the input-to-output axis mapping
         // shifts the axes past the insertion point, and the sharding gains the batch axis placement at that position.
         let trace = ArrayIrTraceContext::new();
         let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);

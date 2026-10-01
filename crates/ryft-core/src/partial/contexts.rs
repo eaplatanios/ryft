@@ -89,15 +89,15 @@ pub enum ReferencePlacement {
 /// The split executes all known work before residual work. Once any ordered operation residualizes, every later
 /// ordered operation residualizes too, irrespective of its input knowledge, reference root, or effect class. This
 /// preserves the order in which reference accesses can fail or synchronize relative to later mutations, assertions,
-/// and I/O. Pure operations keep folding whenever their operands permit.
+/// and I/O. Pure operations keep folding whenever their inputs permit.
 ///
 ///   | Work                                    | Default Placement                                     |
 ///   | --------------------------------------- | ----------------------------------------------------- |
-///   | Pure operation with known operands      | Parent context                                        |
-///   | Operation with an unknown operand       | Residual program                                      |
-///   | Ordered effect with none yet deferred   | Parent context when its operands are known            |
+///   | Pure operation with known inputs        | Parent context                                        |
+///   | Operation with an unknown input         | Residual program                                      |
+///   | Ordered effect with none yet deferred   | Parent context when its inputs are known              |
 ///   | Ordered effect after one is deferred    | Residual program, including effects on distinct roots |
-///   | Any effect in a deferred sibling        | Residual program, even with known operands            |
+///   | Any effect in a deferred sibling        | Residual program, even with known inputs              |
 ///   | Eager reference work with `Stage`       | Residual program, including allocation and accesses   |
 ///
 /// [`deferred_sibling`](Self::deferred_sibling) retains every effect in residual execution, including allocations with
@@ -303,7 +303,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     }
 
     /// Creates a fresh sibling [`PartialEvaluationContext`] that folds pure known work into this context's parent
-    /// and retains every effectful operation in its residual program, even when all operands are known. Each residual
+    /// and retains every effectful operation in its residual program, even when all inputs are known. Each residual
     /// invocation therefore executes its own effects, including fresh reference allocations. The shared parent identity
     /// permits explicit known-value transfers between these contexts without relying on constant-value resolution.
     /// The sibling preserves this context's reference placement, including staging folded reference accesses under
@@ -499,8 +499,8 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///   - `regions`: Owned [`Program`]s whose entry [`Region`](crate::Region)s are attached to `operation`, in
     ///     the order defined by [`Operation::region_slots`]. Folding binds these regions with the operation, while
     ///     residualization imports them into the residual [`Program`].
-    ///   - `inputs`: Partially evaluated inputs/operands supplied to `operation`, in [`Operation`]-defined order.
-    ///     Their known-ness determines whether the operation is folded or residualized.
+    ///   - `inputs`: Partially evaluated inputs supplied to `operation`, in [`Operation`]-defined order. Their
+    ///     known-ness determines whether the operation is folded or residualized.
     pub fn fold_or_residualize<P: Into<C::Operation>>(
         &self,
         operation: P,
@@ -636,8 +636,8 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///   - `regions`: Owned [`Program`]s whose entry [`Region`](crate::Region)s are attached to `operation`, in the
     ///     order defined by [`Operation::region_slots`]. These programs are imported into the residual [`Program`]
     ///     before the operation is emitted.
-    ///   - `inputs`: Partially evaluated inputs/operands supplied to `operation`, in [`Operation`]-defined order. Known
-    ///     inputs are materialized as residual inputs or constants, while unknown inputs reuse their existing residual
+    ///   - `inputs`: Partially evaluated inputs supplied to `operation`, in [`Operation`]-defined order. Known inputs
+    ///     are materialized as residual program inputs or constants, while unknown inputs reuse their existing residual
     ///     atoms.
     pub fn residualize<P: Into<C::Operation>>(
         &self,
@@ -1930,8 +1930,8 @@ mod tests {
         let folded = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known).unwrap();
         assert_eq!(folded[0].as_known(), Some(&Array::scalar(1.0).unwrap()));
 
-        // A state access with an unknown operand stages. All later ordered operations must then stage too, even
-        // with known operands and no shared reference allocation. Pure work keeps folding.
+        // A state access with an unknown input stages. All later ordered operations must then stage too, even with
+        // known inputs and no shared reference allocation. Pure work keeps folding.
         let staged = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &unknown).unwrap();
         assert!(staged[0].is_unknown());
         let later = context.fold_or_residualize(TestOrderedStateOperation::State(0), Vec::new(), &known).unwrap();
@@ -1975,7 +1975,7 @@ mod tests {
             ReferencePlacement::Execute,
         );
 
-        // Under the specialization placement every reference operation stages, all-known operands notwithstanding:
+        // Under the specialization placement every reference operation stages, all-known inputs notwithstanding:
         // the update leaves the live state untouched, the allocation is deferred to the residual program, and only
         // reference-free work (pure or ordered) folds.
         let update = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32).unwrap()));
@@ -2053,7 +2053,7 @@ mod tests {
         use crate::programs::ReferenceError;
 
         // The default execution policy must also preserve order when the earlier reference is an unknown input.
-        // Its failure prevents a later write to another root, including when that write has entirely known operands.
+        // Its failure prevents a later write to another root, including when that write has entirely known inputs.
         let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         frozen.freeze().unwrap();
         let other = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
@@ -2510,7 +2510,7 @@ mod tests {
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].value().unwrap().as_known(), Some(&Array::scalar(4.0).unwrap()));
         assert_eq!(folded[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
-        // A mixed bind retains the known operand as a feeder and stages the multiplication.
+        // A mixed bind retains the known input as a feeder and stages the multiplication.
         let unknown = PartialTracer::new(context.clone(), context.unknown_input(ArrayType::scalar(DataType::F64), 0));
         let mixed = context.bind(MulOperation::new(), Vec::new(), &[folded[0].clone(), unknown.clone()]).unwrap();
         assert!(mixed[0].value().unwrap().is_unknown());
@@ -2540,7 +2540,7 @@ mod tests {
     #[test]
     fn test_partial_evaluation_context_bind_retains_materialization_error() {
         // A staged reference incorrectly marked as a literal has no constant payload to materialize. Binding a
-        // swap retains that error, so later reads with valid operands also fail without emitting parent work.
+        // swap retains that error, so later reads with valid inputs also fail without emitting parent work.
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
         let outer = TracingContext::<TestValue, TestOperation>::new();
@@ -2608,7 +2608,7 @@ mod tests {
         let failed = context.bind(ReferenceWriteOperation::new(), Vec::new(), &[failed_reference, update.clone()]);
         assert!(failed.unwrap().is_empty());
 
-        // Clones retain the same failure and prevent unrelated later mutations, even without a poisoned operand.
+        // Clones retain the same failure and prevent unrelated later mutations, even without a poisoned input.
         let later = context.clone().bind(ReferenceWriteOperation::new(), Vec::new(), &[later_reference, update]);
         assert!(later.unwrap().is_empty());
         assert_eq!(live.read(), Ok(Array::scalar(2.0_f32).unwrap()));

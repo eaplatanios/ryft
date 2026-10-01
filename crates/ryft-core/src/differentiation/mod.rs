@@ -150,7 +150,7 @@
 //! selection inherited by recursive drivers; explicit hook calls do not change it. Implement [`TransposableOperation`]
 //! for linear primitives that may occur in a homogeneous pushforward. A member payload whose parent instruction has a
 //! mixed signature needs no separate rule, because [`transpose_mixed_operation`] delegates that instruction's
-//! member-typed data operands, wherever they sit in its operand list, to that same homogeneous rule. Higher-order
+//! member-typed data inputs, wherever they sit in its input list, to that same homogeneous rule. Higher-order
 //! [`Operation`] logic belongs with the operation whose instruction attaches to the nested [`Region`](crate::Region).
 //! Wrapper operation enums should provide family dispatch and forward to those payload rules.
 
@@ -188,8 +188,8 @@ pub mod zeros;
 
 pub use batching::CotangentBatchingPolicy;
 pub use elementwise::{
-    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, ElementwiseDerivativeAlignment,
-    UnaryElementwiseJvpOperands, binary_elementwise_jvp, unary_elementwise_jvp,
+    BinaryElementwiseJvpInputs, BroadcastDerivativeAlignment, ElementwiseDerivativeAlignment,
+    UnaryElementwiseJvpInputs, binary_elementwise_jvp, unary_elementwise_jvp,
 };
 pub use forward::{
     DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy,

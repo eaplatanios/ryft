@@ -1,13 +1,13 @@
 //! Contains shared differentiation scaffolding for [`ElementwiseOperation`](crate::ElementwiseOperation)s. Elementwise
 //! arithmetic rules all follow the same shape. They first compute the primal through the operation's own value-level
-//! capability. Then, they resolve the tangent target type of the primal output, convert and broadcast every live
-//! operand tangent (and any primal coefficients) into that widened differential representation, and combine the
-//! per-operand contributions. Finally, they pair the primal with the combined tangent. This module owns that
-//! scaffolding (including the structural-zero policy for outputs without a tangent space) so that each operation's
+//! capability. Then, they resolve the tangent target type of the primal output, convert and broadcast every live input
+//! tangent (and any primal coefficients) into that widened differential representation, and combine the per-input
+//! contributions. Finally, they pair the primal with the combined tangent. This module owns that scaffolding
+//! (including the structural-zero policy for outputs without a tangent space) so that each operation's
 //! [`DifferentiableOperation`](crate::DifferentiableOperation) implementation only supplies its mathematical content
-//! (i.e., the primal computation and the per-operand tangent terms), and the [`ElementwiseDerivativeAlignment`] trait
+//! (i.e., the primal computation and the per-input tangent terms), and the [`ElementwiseDerivativeAlignment`] trait
 //! those rules (and the broadcasting, selection, and reduction rules) use to align derivative contributions between
-//! operand types and the common type inferred for an implicitly broadcasting result.
+//! input types and the common type inferred for an implicitly broadcasting result.
 
 use crate::arrays::{ArrayType, DataType, Dimension};
 use crate::contexts::Context;
@@ -21,9 +21,9 @@ use crate::operations::{
 use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
 
 /// [`Value`] whose derivative contributions can be _aligned_ with the common [`Type`](crate::Type) inferred for an
-/// implicitly broadcasting elementwise result and _unaligned_ back to an operand type. The two methods form an adjoint
+/// implicitly broadcasting elementwise result and _unaligned_ back to an input type. The two methods form an adjoint
 /// pair: [`align_tangent`](Self::align_tangent) applies the implicit element-type promotion, broadcast, and resharding
-/// an [`ElementwiseOperation`](crate::ElementwiseOperation) performs on an operand, and
+/// an [`ElementwiseOperation`](crate::ElementwiseOperation) performs on an input, and
 /// [`unalign_cotangent`](Self::unalign_cotangent) applies the adjoint of that linear map
 /// (i.e., demotion, sum-reduction over broadcasting axes, and the reverse reshard).
 pub trait ElementwiseDerivativeAlignment<T: DifferentiableType>: Value<Type = T> {
@@ -42,18 +42,18 @@ pub trait ElementwiseDerivativeAlignment<T: DifferentiableType>: Value<Type = T>
     fn align_tangent(&self, target: &T, exemplar: &Self) -> Result<Self, DifferentiationError>;
 
     /// Maps this cotangent [`Value`], which has the type of an implicitly broadcasting elementwise result, back to
-    /// the type `target` of one of that result's operands, returning the cotangent of that operand.
+    /// the type `target` of one of the inputs of the operation that produced it, returning the cotangent of that input.
     ///
     /// This is the adjoint of the linear map that [`align_tangent`](Self::align_tangent) applies when it takes an
-    /// operand of type `target` to the result type. Every contribution that the implicit broadcast spread over axes
-    /// the operand does not have (i.e., the leading axes of this [`Value`] beyond `target`'s rank, and any axis that
-    /// `target` holds at unit extent) is summed back onto the operand's axes, the element type is converted back to
+    /// input of type `target` to the result type. Every contribution that the implicit broadcast spread over axes
+    /// the input does not have (i.e., the leading axes of this [`Value`] beyond `target`'s rank, and any axis that
+    /// `target` holds at unit extent) is summed back onto the input's axes, the element type is converted back to
     /// `target`'s, and a differing sharding is resharded back. The result has exactly type `target`. This [`Value`]
-    /// must have at least `target`'s rank, since an operand never has more axes than the result.
+    /// must have at least `target`'s rank, since an input never has more axes than the result.
     ///
     /// # Parameters
     ///
-    ///   - `target`: [`Type`](crate::Type) of the operand whose cotangent is being recovered (i.e., the type that
+    ///   - `target`: [`Type`](crate::Type) of the input whose cotangent is being recovered (i.e., the type that
     ///     [`align_tangent`](Self::align_tangent) converted and broadcast _from_).
     fn unalign_cotangent(&self, target: &T) -> Result<Self, DifferentiationError>;
 }
@@ -102,7 +102,7 @@ impl<
         // Replicating into a target axis whose extent is only known at run time is not a metadata-only broadcast.
         // That operation stores its output type in its payload, and program replay refines boundary types rather than
         // payload types, so the replication count would never become known. Such an alignment therefore takes its
-        // geometry from `exemplar` through an operand edge instead, which is what makes the runtime extent available.
+        // geometry from `exemplar` through an input edge instead, which is what makes the runtime extent available.
         let value_type = value.r#type().into_owned();
         let requires_runtime_shape = target.shape().dimensions().iter().enumerate().any(|(axis, target_dimension)| {
             matches!(target_dimension, Dimension::Dynamic(_))
@@ -119,7 +119,7 @@ impl<
             }
 
             // The zero carries the exemplar's runtime extents, so adding it replicates this value through exactly the
-            // implicit broadcast that the elementwise operation being differentiated performs on its own operands.
+            // implicit broadcast that the elementwise operation being differentiated performs on its own inputs.
             let exemplar = if exemplar_type.data_type() == target.data_type() {
                 exemplar.clone()
             } else {
@@ -145,7 +145,7 @@ impl<
             value = value.reshard(&sharding.without_manual_reduction_axes())?;
         }
 
-        // The exemplar path infers its result type from its operands, so pin any remaining metadata-only difference
+        // The exemplar path infers its result type from its inputs, so pin any remaining metadata-only difference
         // (e.g., a memory placement or layout that the addition did not carry) with an axis-identity broadcast, which
         // maps every axis from an identical input dimension and therefore accepts runtime extents.
         if requires_runtime_shape && value.r#type().as_ref() != target {
@@ -179,7 +179,7 @@ impl<
 }
 
 /// [`ArrayType`]-typed [`Value`] whose cotangents can additionally be _unaligned_ through the adjoint of an *explicit*
-/// broadcast (e.g., using [`Broadcast`]) that placed the operand's axes at arbitrary result positions. This extends
+/// broadcast (e.g., using [`Broadcast`]) that placed the input's axes at arbitrary result positions. This extends
 /// [`ElementwiseDerivativeAlignment`] as a separate trait because axis placement is a concept that is specific to
 /// [`ArrayType`]-typed values. Scalar types have no axes and participate only in implicit suffix-aligned alignment
 /// maps.
@@ -222,13 +222,13 @@ where
             }
         }
 
-        // Convert back to the operand's cotangent element type (the adjoint of the element-type promotion the
+        // Convert back to the input's cotangent element type (the adjoint of the element-type promotion the
         // broadcast side performed).
         if contribution.r#type().data_type() != target.data_type() {
             contribution = contribution.convert_element_type(target.data_type())?;
         }
 
-        // Redistribute the contribution onto the operand cotangent's placement. Like in `align_tangent`, this is a
+        // Redistribute the contribution onto the input cotangent's placement. Like in `align_tangent`, this is a
         // semantic redistribution that must be staged explicitly rather than relabeled by backend lowering.
         if contribution.r#type().sharding() != target.sharding()
             && let Some(sharding) = target.sharding()
@@ -269,7 +269,7 @@ pub(crate) fn reduce_broadcast_cotangent<V: Value<Type = ArrayType> + Reduce + T
 ) -> Result<V, DifferentiationError> {
     // The broadcast being transposed mapped each `target` axis to the axis of this cotangent named by the
     // corresponding `output_axes` entry, so the mapping must name one in-range axis per `target` axis.
-    // Anything else means the caller's axis mapping and the operand type disagree.
+    // Anything else means the caller's axis mapping and the input type disagree.
     let value_type = cotangent.r#type();
     if output_axes.len() != target.rank() || output_axes.iter().any(|axis| *axis >= value_type.rank()) {
         return Err(TypeError::invalid(format!(
@@ -339,10 +339,10 @@ pub(crate) fn reduce_broadcast_cotangent<V: Value<Type = ArrayType> + Reduce + T
     Ok(contribution)
 }
 
-/// Represents operands handed to the tangent term of a unary elementwise JVP rule by [`unary_elementwise_jvp`]. The
+/// Represents the inputs handed to the tangent term of a unary elementwise JVP rule by [`unary_elementwise_jvp`]. The
 /// input accessors convert and broadcast lazily to the output tangent [`Type`](crate::Type), while the output primal
 /// stays at its own (possibly narrower) type so terms can reuse it when no widening is required.
-pub struct UnaryElementwiseJvpOperands<'o, C: Context, F> {
+pub struct UnaryElementwiseJvpInputs<'o, C: Context, F> {
     /// Context used when re-evaluating a widened primal coefficient for the tangent computation.
     tangent_context: &'o C,
 
@@ -365,7 +365,7 @@ pub struct UnaryElementwiseJvpOperands<'o, C: Context, F> {
 impl<
     C: Context<Type: DifferentiableType, Value: ElementwiseDerivativeAlignment<C::Type>>,
     F: Fn(&C, &C::Value) -> Result<C::Value, ProgramError>,
-> UnaryElementwiseJvpOperands<'_, C, F>
+> UnaryElementwiseJvpInputs<'_, C, F>
 {
     /// Returns the input primal [`Value`] converted and broadcast to the output tangent [`Type`](crate::Type).
     #[inline]
@@ -394,19 +394,19 @@ impl<
 }
 
 /// Computes the Jacobian-Vector Product (JVP) for a unary elementwise [`Operation`]. This function computes the output
-/// primal via `primal_fn`, resolves the tangent target [`Type`](crate::Type), converts the operand primal and any live
-/// operand tangent into that representation, and delegates the mathematical content to `tangent_fn`. The prepared
-/// operands retain `primal_fn` so that a rule can re-evaluate the output at the tangent type without repeating the
-/// evaluator at the call site. A structural-zero operand tangent propagates as a structural zero, including through
-/// outputs without a tangent space (e.g., integer outputs), which only reject *live* tangents.
+/// primal via `primal_fn`, resolves the tangent target [`Type`](crate::Type), converts the input primal and any live
+/// input tangent into that representation, and delegates the mathematical content to `tangent_fn`. The prepared inputs
+/// retain `primal_fn` so that a rule can re-evaluate the output at the tangent type without repeating the evaluator at
+/// the call site. A structural-zero input tangent propagates as a structural zero, including through outputs without a
+/// tangent space (e.g., integer outputs), which only reject *live* tangents.
 ///
 /// # Parameters
 ///
 ///   - `context`: [`Context`] that computes primal results and transfers coefficients to the tangent computation.
 ///   - `operation`: [`Operation`] whose JVP rule is being evaluated.
 ///   - `inputs`: Input [`DifferentiationDual`]s passed to the JVP rule.
-///   - `primal_fn`: Function that computes the primal output in the supplied context from the operand primal.
-///   - `tangent_fn`: Function that computes the output tangent from the prepared [`UnaryElementwiseJvpOperands`].
+///   - `primal_fn`: Function that computes the primal output in the supplied context from the input primal.
+///   - `tangent_fn`: Function that computes the output tangent from the prepared [`UnaryElementwiseJvpInputs`].
 pub fn unary_elementwise_jvp<
     T: DifferentiableType,
     V: ElementwiseDerivativeAlignment<T>,
@@ -414,7 +414,7 @@ pub fn unary_elementwise_jvp<
     C: Context<Type = T, Value = V>,
     P: DifferentiationPolicy<C>,
     PrimalFn: Fn(&C, &V) -> Result<V, ProgramError>,
-    TangentFn: FnOnce(UnaryElementwiseJvpOperands<'_, C, PrimalFn>) -> Result<V, DifferentiationError>,
+    TangentFn: FnOnce(UnaryElementwiseJvpInputs<'_, C, PrimalFn>) -> Result<V, DifferentiationError>,
 >(
     context: &DifferentiationContext<C, P>,
     operation: &O,
@@ -437,7 +437,7 @@ pub fn unary_elementwise_jvp<
         MaybeZero::Value(input_tangent) => {
             let input_primal = context.primal_to_tangent(input.primal().clone())?;
             let tangent_output_primal = context.primal_to_tangent(output_primal.clone())?;
-            let operands = UnaryElementwiseJvpOperands {
+            let jvp_inputs = UnaryElementwiseJvpInputs {
                 tangent_context: context.tangent(),
                 input_primal: &input_primal,
                 input_tangent,
@@ -445,20 +445,20 @@ pub fn unary_elementwise_jvp<
                 output_tangent_type: &target,
                 evaluate_primal: &primal_fn,
             };
-            MaybeZero::Value(tangent_fn(operands)?)
+            MaybeZero::Value(tangent_fn(jvp_inputs)?)
         }
     };
     Ok(vec![DifferentiationDual::new(output_primal, output_tangent)?])
 }
 
-/// Represents operands handed to the per-side tangent terms of a binary elementwise JVP rule by
+/// Represents the inputs handed to the per-side tangent terms of a binary elementwise JVP rule by
 /// [`binary_elementwise_jvp`]. Primal accessors convert and broadcast lazily so that a term only stages
 /// the conversions that it actually consumes.
-pub struct BinaryElementwiseJvpOperands<'o, T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> {
-    /// Primal [`Value`] of the left operand.
+pub struct BinaryElementwiseJvpInputs<'o, T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> {
+    /// Primal [`Value`] of the left input.
     left_primal: &'o V,
 
-    /// Primal [`Value`] of the right operand.
+    /// Primal [`Value`] of the right input.
     right_primal: &'o V,
 
     /// Primal output [`Value`] of the operation, which carries the result [`Type`].
@@ -468,7 +468,7 @@ pub struct BinaryElementwiseJvpOperands<'o, T: DifferentiableType, V: Elementwis
     output_tangent_type: &'o T,
 }
 
-impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementwiseJvpOperands<'_, T, V> {
+impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementwiseJvpInputs<'_, T, V> {
     /// Returns the left input's primal [`Value`] converted and broadcast to the tangent target [`Type`](crate::Type).
     pub fn left_primal(&self) -> Result<V, DifferentiationError> {
         self.left_primal.align_tangent(self.output_tangent_type, self.output_primal)
@@ -481,10 +481,10 @@ impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementw
 }
 
 /// Computes the Jacobian-Vector Product (JVP) for a binary elementwise [`Operation`]. This function computes the output
-/// primal via `primal_fn`, resolves the tangent target [`Type`](crate::Type), converts each live operand tangent into
+/// primal via `primal_fn`, resolves the tangent target [`Type`](crate::Type), converts each live input tangent into
 /// that representation, and delegates the mathematical content to the per-side terms, invoking each term only when that
 /// side's tangent is live so terms stay lazy in staged programs. Live contributions are summed, and structural-zero
-/// operand tangents propagate as structural zeros,including through outputs without a tangent space (e.g., integer
+/// input tangents propagate as structural zeros, including through outputs without a tangent space (e.g., integer
 /// outputs), which only reject *live* tangents.
 ///
 /// # Parameters
@@ -492,12 +492,12 @@ impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementw
 ///   - `context`: [`Context`] that computes primal results and transfers coefficients to the tangent computation.
 ///   - `operation`: [`Operation`] whose JVP rule is being evaluated.
 ///   - `inputs`: Input [`DifferentiationDual`]s passed to the JVP rule.
-///   - `primal_fn`: Function that computes the primal output in the supplied context from both operand primals.
-///   - `left_tangent_term_fn`: Function that computes the left operand's tangent contribution from the prepared
-///     [`BinaryElementwiseJvpOperands`] and the left operand's live tangent (already converted and broadcast to the
+///   - `primal_fn`: Function that computes the primal output in the supplied context from both input primals.
+///   - `left_tangent_term_fn`: Function that computes the left input's tangent contribution from the prepared
+///     [`BinaryElementwiseJvpInputs`] and the left input's live tangent (already converted and broadcast to the
 ///     tangent target type).
-///   - `right_tangent_term_fn`: Function that computes the right operand's tangent contribution from the prepared
-///     [`BinaryElementwiseJvpOperands`] and the right operand's live tangent (already converted and broadcast to the
+///   - `right_tangent_term_fn`: Function that computes the right input's tangent contribution from the prepared
+///     [`BinaryElementwiseJvpInputs`] and the right input's live tangent (already converted and broadcast to the
 ///     tangent target type).
 pub fn binary_elementwise_jvp<
     T: DifferentiableType,
@@ -506,8 +506,8 @@ pub fn binary_elementwise_jvp<
     C: Context<Type = T, Value = V>,
     P: DifferentiationPolicy<C>,
     PrimalFn: FnOnce(&C, &V, &V) -> Result<V, ProgramError>,
-    LeftTangentTermFn: FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
-    RightTangentTermFn: FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
+    LeftTangentTermFn: FnOnce(&BinaryElementwiseJvpInputs<'_, T, V>, V) -> Result<V, DifferentiationError>,
+    RightTangentTermFn: FnOnce(&BinaryElementwiseJvpInputs<'_, T, V>, V) -> Result<V, DifferentiationError>,
 >(
     context: &DifferentiationContext<C, P>,
     operation: &O,
@@ -533,7 +533,7 @@ pub fn binary_elementwise_jvp<
     let left_primal = context.primal_to_tangent(left.primal().clone())?;
     let right_primal = context.primal_to_tangent(right.primal().clone())?;
     let tangent_primal = context.primal_to_tangent(primal.clone())?;
-    let operands = BinaryElementwiseJvpOperands {
+    let jvp_inputs = BinaryElementwiseJvpInputs {
         left_primal: &left_primal,
         right_primal: &right_primal,
         output_primal: &tangent_primal,
@@ -542,12 +542,12 @@ pub fn binary_elementwise_jvp<
     let left_contribution = left
         .tangent()
         .as_value()
-        .map(|tangent| left_tangent_term_fn(&operands, tangent.align_tangent(&target, &tangent_primal)?))
+        .map(|tangent| left_tangent_term_fn(&jvp_inputs, tangent.align_tangent(&target, &tangent_primal)?))
         .transpose()?;
     let right_contribution = right
         .tangent()
         .as_value()
-        .map(|tangent| right_tangent_term_fn(&operands, tangent.align_tangent(&target, &tangent_primal)?))
+        .map(|tangent| right_tangent_term_fn(&jvp_inputs, tangent.align_tangent(&target, &tangent_primal)?))
         .transpose()?;
     let output_tangent = match (left_contribution, right_contribution) {
         (Some(left), Some(right)) => MaybeZero::Value(left.add(&right)?),
@@ -628,7 +628,7 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
         let bias_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
 
-        // The exemplar supplies the runtime extents through an operand edge, so one whose shape does not describe the
+        // The exemplar supplies the runtime extents through an input edge, so one whose shape does not describe the
         // alignment target cannot stand in for it.
         let value = Array::vector(vec![1.0, 2.0]).unwrap();
         assert!(matches!(
@@ -639,7 +639,7 @@ mod tests {
         ));
 
         // An implicitly broadcasting result with a runtime extent is served by the composite arm instead. The narrow
-        // operand is replicated explicitly against first-class extents read off the operand that owns the runtime
+        // input is replicated explicitly against first-class extents read off the input that owns the runtime
         // axis, because the metadata-only broadcast's payload output type is one that program replay never refines.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(dynamic_type.into());
@@ -904,9 +904,9 @@ mod tests {
                 primal_evaluations.set(primal_evaluations.get() + 1);
                 Ok(input.clone())
             },
-            |operands| {
+            |jvp_inputs| {
                 tangent_calls.set(tangent_calls.get() + 1);
-                Ok(operands.output_primal_at_tangent_type()? * operands.input_tangent()?)
+                Ok(jvp_inputs.output_primal_at_tangent_type()? * jvp_inputs.input_tangent()?)
             },
         )
         .unwrap();
@@ -925,7 +925,7 @@ mod tests {
                 primal_evaluations.set(primal_evaluations.get() + 1);
                 Ok(input.clone())
             },
-            |operands| operands.output_primal_at_tangent_type(),
+            |jvp_inputs| jvp_inputs.output_primal_at_tangent_type(),
         )
         .unwrap();
         assert_eq!(outputs[0].primal(), &input_primal);
@@ -1072,13 +1072,13 @@ mod tests {
                 DifferentiationDual::new(right_primal.clone(), Array::scalar(4.0f64).unwrap()).unwrap(),
             ],
             |_, left, right| Ok(left.clone() + right.clone()),
-            |operands, tangent| {
+            |jvp_inputs, tangent| {
                 left_calls.set(left_calls.get() + 1);
-                Ok(operands.right_primal()? * tangent)
+                Ok(jvp_inputs.right_primal()? * tangent)
             },
-            |operands, tangent| {
+            |jvp_inputs, tangent| {
                 right_calls.set(right_calls.get() + 1);
-                Ok(operands.left_primal()? * tangent)
+                Ok(jvp_inputs.left_primal()? * tangent)
             },
         )
         .unwrap();
@@ -1235,7 +1235,7 @@ mod tests {
     #[test]
     fn test_bilinear_elementwise_differentiation_with_dynamic_output_axes() {
         // `sum(x * scale)` with a runtime-sized leading axis. A bilinear rule aligns the primal coefficient of each
-        // side as well as the tangents, so this pins the replicated operands against the eager gradients of the same
+        // side as well as the tangents, so this pins the replicated inputs against the eager gradients of the same
         // computation at two concrete extents.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type =

@@ -96,12 +96,12 @@ macro_rules! check_types {
         let types = &$types[..];
         if types.iter().any(|r#type| !r#type.unreduced_axes().is_empty()) {
             return Err(
-                $crate::TypeError::invalid(format!("`{descriptor}` does not support unreduced operands")).into()
+                $crate::TypeError::invalid(format!("`{descriptor}` does not support unreduced inputs")).into()
             );
         }
     }};
 
-    // This branch requires a binary operation's operands to carry identical unreduced-axis sets.
+    // This branch requires a binary operation's inputs to carry identical unreduced-axis sets.
     (@same_unreduced_axes, $descriptor:expr, $types:expr $(,)?) => {{
         let descriptor = $descriptor;
         let types = &$types[..];
@@ -109,12 +109,12 @@ macro_rules! check_types {
             return Err($crate::TypeError::invalid(format!("expected 2 inputs but got {}", types.len())).into());
         }
         if types[0].unreduced_axes() != types[1].unreduced_axes() {
-            return Err($crate::TypeError::invalid(format!("`{descriptor}` operands must be unreduced over the same axes"))
+            return Err($crate::TypeError::invalid(format!("`{descriptor}` inputs must be unreduced over the same axes"))
             .into());
         }
     }};
 
-    // This branch requires a binary operation's operands to carry identical reduced-axis sets.
+    // This branch requires a binary operation's inputs to carry identical reduced-axis sets.
     (@same_reduced_axes, $descriptor:expr, $types:expr $(,)?) => {{
         let descriptor = $descriptor;
         let types = &$types[..];
@@ -122,7 +122,7 @@ macro_rules! check_types {
             return Err($crate::TypeError::invalid(format!("expected 2 inputs but got {}", types.len())).into());
         }
         if types[0].reduced_axes() != types[1].reduced_axes() {
-            return Err($crate::TypeError::invalid(format!("`{descriptor}` operands must be reduced over the same axes"))
+            return Err($crate::TypeError::invalid(format!("`{descriptor}` inputs must be reduced over the same axes"))
             .into());
         }
     }};
@@ -309,8 +309,8 @@ macro_rules! check_builders {
 ///   - `$provider`: Explicit marker type whose provider validates two inputs and constructs the generated operation.
 ///     This argument is mutually exclusive with `capability`.
 ///   - `capability`: Documentation attributes before `trait;` document the generated capability trait. Attributes
-///     before `fn($argument);` document its binary function. `$argument` names the non-receiver operand. This argument
-///     is mutually exclusive with `provider`.
+///     before `fn($argument);` document its binary function. `$argument` names the non-receiver input. This argument is
+///     mutually exclusive with `provider`.
 #[macro_export]
 macro_rules! define_dimension_arithmetic_operation {
     // Defines an operation selected through an existing capability's explicit provider marker.
@@ -1299,8 +1299,8 @@ macro_rules! define_elementwise_capability {
         }
     };
 
-    // This branch defines a two-operand capability whose binary operation is provided by the value type family,
-    // using the caller-provided name for the right operand.
+    // This branch defines a two-input capability whose binary operation is provided by the value type family, using the
+    // caller-provided name for the right input.
     (
         @binary
         $(#[$capability_documentation:meta])*
@@ -1359,13 +1359,13 @@ macro_rules! define_elementwise_capability {
 ///   - `@reference_free` delegates to
 ///     [`discharge_reference_free_operation`](crate::discharge_reference_free_operation). The operation is replayed
 ///     verbatim, executing eagerly or staging according to the parent context. Attached regions are copied unchanged,
-///     and reference operands or references anywhere in their closures are rejected.
+///     and reference instruction inputs or references anywhere in their closures are rejected.
 ///   - `@local_reference` delegates to
 ///     [`discharge_local_reference_operation`](crate::discharge_local_reference_operation). Every attached region is
-///     rebuilt to discharge local reference state, including dormant derivative regions. Reference operands, reference
-///     region inputs, and captures reaching caller allocations are rejected. This rule does not widen interfaces to
-///     thread external state. Each region is rewritten independently, so their signatures need not match. The operation
-///     is rebound with those regions and validates their rebuilt interfaces.
+///     rebuilt to discharge local reference state, including dormant derivative regions. Reference instruction inputs,
+///     reference region inputs, and captures reaching caller allocations are rejected. This rule does not widen
+///     interfaces to thread external state. Each region is rewritten independently, so their signatures need not match.
+///     The operation is rebound with those regions and validates their rebuilt interfaces.
 ///
 /// The `@reference_free` precondition is _reference freedom_, not effect purity. An operation with ordered
 /// or other effects replays here perfectly well, because replaying it reproduces those effects in the destination
@@ -1374,8 +1374,9 @@ macro_rules! define_elementwise_capability {
 /// With `@reference_free`, an application carrying regions replays verbatim when their closures are reference-free
 /// (i.e., the regions are copied into the destination as they stand). The generated implementation is a rejection
 /// rather than a rewrite in the two cases it cannot serve: (i) a region closure that does reach a reference, because
-/// how a reference boundary widens is knowledge that belongs to the operation, and (ii) an operand that is a live
-/// reference handle, because a reference-touching operation owns its own rewrite. Both diagnostics name the operation.
+/// how a reference boundary widens is knowledge that belongs to the operation, and (ii) an instruction input that is a
+/// live reference handle, because a reference-touching operation owns its own rewrite. Both diagnostics name the
+/// operation.
 ///
 /// The optional leading generic list declares operation-specific type parameters, and an optional `where` clause can
 /// provide any bounds needed to make the operation type well-formed.
@@ -1387,7 +1388,7 @@ macro_rules! define_elementwise_capability {
 ///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
 #[macro_export]
 macro_rules! impl_reference_dischargeable_operation {
-    // Selects verbatim replay, rejecting references in operands or attached region closures.
+    // Selects verbatim replay, rejecting references in instruction inputs or attached region closures.
     (@reference_free $($arguments:tt)+) => {
         $crate::impl_reference_dischargeable_operation!(@parse discharge_reference_free_operation; $($arguments)+);
     };
@@ -1448,9 +1449,9 @@ macro_rules! impl_reference_dischargeable_operation {
 /// transformation driver. Elementwise operations should generally use [`impl_differentiable_elementwise_operation!`]
 /// instead because it provides lazy tangent contributions, primal alignment, and structured transposition cases. The
 /// closure-like syntax only names the generated method arguments; it does not allocate or dynamically dispatch a
-/// runtime closure. The transposition body receives the full [`TranspositionContext`](crate::TranspositionContext)
-/// and one [`CotangentAccumulator`](crate::CotangentAccumulator) per operand. It submits contributions through these
-/// handles and returns `Result<(), DifferentiationError>`; omitted contributions remain structural zeros.
+/// runtime closure. The transposition body receives the full [`TranspositionContext`](crate::TranspositionContext) and
+/// one [`CotangentAccumulator`](crate::CotangentAccumulator) per instruction input. It submits contributions through
+/// these handles and returns `Result<(), DifferentiationError>`; omitted contributions remain structural zeros.
 ///
 /// An optional leading generic list declares type parameters owned by the operation payload. Those parameters are
 /// available to both generated implementations, so each rule can tie the payload's type universe to the abstraction
@@ -1459,7 +1460,7 @@ macro_rules! impl_reference_dischargeable_operation {
 /// # Examples
 ///
 /// A structural linear operation can provide both algorithms directly. The JVP body receives differentiation duals,
-/// while the transposition body receives partial primal inputs, output cotangents, and operand accumulators:
+/// while the transposition body receives partial primal inputs, output cotangents, and input accumulators:
 ///
 /// ```rust,ignore
 /// impl_differentiable_operation! {
@@ -1514,7 +1515,7 @@ macro_rules! impl_reference_dischargeable_operation {
 ///   - `$driver_binding`: Name bound to the instruction-scoped region driver inside a rule body.
 ///   - `$inputs`: Name bound to the complete input slice inside a rule body.
 ///   - `$outputs`: Name bound to the complete output-cotangent slice inside a transposition body.
-///   - `$accumulators`: Name bound to the operand-aligned cotangent accumulator slice inside a transposition body.
+///   - `$accumulators`: Name bound to the input-aligned cotangent accumulator slice inside a transposition body.
 #[macro_export]
 macro_rules! impl_differentiable_operation {
     // This branch normalizes an operation-generic invocation before parsing its JVP and transposition rules.
@@ -1913,7 +1914,7 @@ macro_rules! impl_differentiable_operation {
 /// its operation-specific bounds in a `jvp<C> where ... { ... }` block. Unary rules contain one contribution and may
 /// additionally bind the primal output after `->`. That value is evaluated at the output tangent type only when the
 /// contribution is live. Binary rules list the left-tangent contribution first and the right-tangent contribution
-/// second. The tangent slot for the other operand is `_` in each contribution, making the contribution's dependency
+/// second. The tangent slot for the other input is `_` in each contribution, making the contribution's dependency
 /// explicit at the call site.
 ///
 /// `@linear` implements both JVP and transposition from signed coefficients: unary rules take one `@positive` or
@@ -1924,12 +1925,12 @@ macro_rules! impl_differentiable_operation {
 /// unary, single-output operation whose result is constant with respect to its exemplar input. Its transpose therefore
 /// returns a structural-zero exemplar cotangent.
 ///
-/// Binary rules may describe transposition as knownness cases. Each supported case marks one operand `@linear` and the
-/// other `@known`, then gives the contribution to the linear operand as an ordinary Rust expression. The macro aligns
-/// the known value to the live output cotangent, unaligns the contribution to the linear operand's cotangent type, and
-/// returns structural zeros for known operands. Symmetric bilinear rules provide both operand orderings. One-sided
-/// linear rules provide only the supported ordering. Unsupported patterns and missing cotangent spaces receive
-/// diagnostics derived from the operation and operand names.
+/// Binary rules may describe transposition as knownness cases. Each supported case marks one input `@linear` and the
+/// other `@known`, then gives the contribution to the linear input as an ordinary Rust expression. The macro aligns the
+/// known value to the live output cotangent, unaligns the contribution to the linear input's cotangent type, and
+/// returns structural zeros for known inputs. Symmetric bilinear rules provide both input orderings. One-sided linear
+/// rules provide only the supported ordering. Unsupported patterns and missing cotangent spaces receive diagnostics
+/// derived from the operation and input names.
 ///
 /// `@nonlinear` implements the standard erroring primitive transpose rule. Reverse-mode differentiation remains
 /// available by transposing the linear operations produced by the JVP. Operations whose rules cannot be expressed as
@@ -1964,8 +1965,8 @@ macro_rules! impl_differentiable_operation {
 /// ```
 ///
 /// A binary rule provides one independently lazy contribution per input tangent. It can additionally describe the
-/// supported primitive-transposition knownness cases. The macro derives diagnostics for omitted knownness patterns
-/// and linear inputs without cotangent spaces from the operation and operand names:
+/// supported primitive-transposition knownness cases. The macro derives diagnostics for omitted knownness patterns and
+/// linear inputs without cotangent spaces from the operation and input names:
 ///
 /// ```rust,ignore
 /// impl_differentiable_elementwise_operation! {
@@ -2023,18 +2024,17 @@ macro_rules! impl_differentiable_operation {
 ///   - `$operation_binding`: Optional name, written before a unary rule's input pattern (e.g.,
 ///     `|operation, (input, input_tangent)| ...`), bound to the operation whose JVP is being evaluated, so that
 ///     the rule can read its configuration (e.g., the result accuracy that a JVP forwards to its coefficient).
-///   - `$operands_binding`: Name used by the alternative unary form `|operation, operands| ...`, bound to the
-///     lazy [`UnaryElementwiseJvpOperands`](crate::UnaryElementwiseJvpOperands) accessor whose `input_primal`,
-///     `input_tangent`, and `output_primal_at_tangent_type` functions align only the values that the chosen
-///     formula reads.
+///   - `$inputs_binding`: Name used by the alternative unary form `|operation, inputs| ...`, bound to the lazy
+///     [`UnaryElementwiseJvpInputs`](crate::UnaryElementwiseJvpInputs) accessor whose `input_primal`, `input_tangent`,
+///     and `output_primal_at_tangent_type` functions align only the values that the chosen formula reads.
 ///   - `$output_primal`: Optional name following `->`, bound to the primal output evaluated at its tangent type.
 ///   - `$left_primal`, `$right_primal`: Names bound to aligned binary input primals. `_` omits a primal without
 ///     evaluating it.
 ///   - `$left_tangent`, `$right_tangent`: Names bound to the live, aligned tangent for the corresponding binary
 ///     contribution. The other contribution's tangent slot must be `_`.
 ///   - `$term`: Ordinary Rust expression computing one tangent contribution.
-///   - `@linear`: Marks an operand that is unknown because it belongs to the linear program being transposed.
-///   - `@known`: Marks an operand that is available as a known primal value during transposition.
+///   - `@linear`: Marks an input that is unknown because it belongs to the linear program being transposed.
+///   - `@known`: Marks an input that is available as a known primal value during transposition.
 ///   - `$output_cotangent`: Name bound to the live output cotangent in a transposition case.
 #[macro_export]
 macro_rules! impl_differentiable_elementwise_operation {
@@ -2417,9 +2417,9 @@ macro_rules! impl_differentiable_elementwise_operation {
                         $crate::check_count!("output", outputs, 1, ProgramError);
                         Ok(outputs.remove(0))
                     },
-                    |operands| {
+                    |jvp_inputs| {
                         $crate::impl_differentiable_elementwise_operation! {
-                            @unary_rule operation, operands, $($rule)*
+                            @unary_rule operation, jvp_inputs, $($rule)*
                         }
                     },
                 )
@@ -2628,7 +2628,7 @@ macro_rules! impl_differentiable_elementwise_operation {
 
     // This internal helper branch emits the shared binary linear JVP and transposition algorithms after a public sign
     // rule has selected the minimal arithmetic bounds. The two signs remain explicit because they determine both the
-    // natural staged tangent expression and each operand's cotangent contribution.
+    // natural staged tangent expression and each input's cotangent contribution.
     (
         @linear_binary [$left_sign:ident, $right_sign:ident]
         impl<$context:ident $(, $generic:ident)*> $operation:ty
@@ -2760,7 +2760,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     (@combine_linear_tangents [positive, negative], $left:expr, $right:expr) => { $crate::Sub::sub(&$left, &$right)? };
 
     // This internal helper branch subtracts a negative left contribution from a positive right contribution. The
-    // reversed operand order implements `-left + right` directly while retaining the minimal `Sub` requirement.
+    // reversed input order implements `-left + right` directly while retaining the minimal `Sub` requirement.
     (@combine_linear_tangents [negative, positive], $left:expr, $right:expr) => { $crate::Sub::sub(&$right, &$left)? };
 
     // This internal helper branch adds two magnitudes and negates the result when both tangent contributions are
@@ -2787,7 +2787,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     };
 
     // This internal helper branch converts one live output cotangent into a signed input contribution for a binary
-    // linear rule. It centralizes zero-space validation and broadcast unalignment because both operands require exactly
+    // linear rule. It centralizes zero-space validation and broadcast unalignment because both inputs require exactly
     // that boundary handling even though their signs can differ.
     (@linear_transpose_contribution $sign:ident, $operation_name:ident, $input:expr, $cotangent:ident $(,)?) => {{
         let target = $crate::DifferentiableType::cotangent($crate::Typed::r#type($input).as_ref())?;
@@ -2805,9 +2805,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         $crate::MaybeZero::Value($crate::ElementwiseDerivativeAlignment::unalign_cotangent(&contribution, &target)?)
     }};
 
-    // This internal helper branch generates a binary rule whose transposition supports either operand being linear
-    // while the other is known. It must remain distinct from one-sided rules because it selects between two
-    // user-provided cotangent formulas at runtime and reports the actual unsupported knownness pattern.
+    // This internal helper branch generates a binary rule whose transposition supports either input being linear while
+    // the other is known. It must remain distinct from one-sided rules because it selects between two user-provided
+    // cotangent formulas at runtime and reports the actual unsupported knownness pattern.
     (
         @binary_ready
         impl<$context:ident $(, $generic:ident)*> $operation:ty
@@ -2861,7 +2861,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                                     }
                                     .into());
                                 }
-                                // The surrounding knownness match guarantees that this operand is known.
+                                // The surrounding knownness match guarantees that this input is known.
                                 let $transpose_right = $crate::ElementwiseDerivativeAlignment::align_tangent(
                                     inputs[1].as_known().unwrap(),
                                     $crate::Typed::r#type($left_output_cotangent).as_ref(),
@@ -2895,7 +2895,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                                     }
                                     .into());
                                 }
-                                // The surrounding knownness match guarantees that this operand is known.
+                                // The surrounding knownness match guarantees that this input is known.
                                 let $transpose_left_again = $crate::ElementwiseDerivativeAlignment::align_tangent(
                                     inputs[0].as_known().unwrap(),
                                     $crate::Typed::r#type($right_output_cotangent).as_ref(),
@@ -2931,8 +2931,8 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper branch generates a binary rule that can transpose only a linear left operand with a known
-    // right operand. A dedicated branch keeps one-sided operations from pretending to support the mirrored case and
+    // This internal helper branch generates a binary rule that can transpose only a linear left input with a known
+    // right input. A dedicated branch keeps one-sided operations from pretending to support the mirrored case and
     // avoids requiring a second formula that is mathematically invalid or unavailable.
     (
         @binary_ready
@@ -3076,9 +3076,9 @@ macro_rules! impl_differentiable_elementwise_operation {
         }
     };
 
-    // This internal helper branch emits the common binary JVP implementation from two per-operand tangent formulas. It
+    // This internal helper branch emits the common binary JVP implementation from two per-input tangent formulas. It
     // owns primal replay, derivative alignment, structural-zero handling, and contribution summation so operation rules
-    // only state the mathematics unique to each operand.
+    // only state the mathematics unique to each input.
     (
         @binary_jvp
         impl<$context:ident $(, $generic:ident)*> $operation:ty
@@ -3116,21 +3116,21 @@ macro_rules! impl_differentiable_elementwise_operation {
                         $crate::check_count!("output", outputs, 1, ProgramError);
                         Ok(outputs.remove(0))
                     },
-                    |_operands, $left_tangent| {
+                    |_jvp_inputs, $left_tangent| {
                         $crate::impl_differentiable_elementwise_operation! {
-                            @bind_binary_left_primal _operands, $left_primal_for_left
+                            @bind_binary_left_primal _jvp_inputs, $left_primal_for_left
                         }
                         $crate::impl_differentiable_elementwise_operation! {
-                            @bind_binary_right_primal _operands, $right_primal_for_left
+                            @bind_binary_right_primal _jvp_inputs, $right_primal_for_left
                         }
                         Ok($left_term)
                     },
-                    |_operands, $right_tangent| {
+                    |_jvp_inputs, $right_tangent| {
                         $crate::impl_differentiable_elementwise_operation! {
-                            @bind_binary_left_primal _operands, $left_primal_for_right
+                            @bind_binary_left_primal _jvp_inputs, $left_primal_for_right
                         }
                         $crate::impl_differentiable_elementwise_operation! {
-                            @bind_binary_right_primal _operands, $right_primal_for_right
+                            @bind_binary_right_primal _jvp_inputs, $right_primal_for_right
                         }
                         Ok($right_term)
                     },
@@ -3142,71 +3142,69 @@ macro_rules! impl_differentiable_elementwise_operation {
     // This internal helper branch evaluates the ordinary unary rule form, which names the input primal, the live input
     // tangent, and optionally the operation and the output primal. Named primals are bound eagerly when the rule runs.
     (
-        @unary_rule $operation:ident, $operands:ident,
+        @unary_rule $operation:ident, $jvp_inputs:ident,
         |$($operation_binding:ident,)? ($input_primal:tt, $input_tangent:ident) $(-> $output_primal:ident)?|
         $term:expr
     ) => {{
         $(let $operation_binding = $operation;)?
         $crate::impl_differentiable_elementwise_operation! {
-            @bind_unary_input_primal $operands, $input_primal
+            @bind_unary_input_primal $jvp_inputs, $input_primal
         }
         $($crate::impl_differentiable_elementwise_operation! {
-            @bind_unary_output_primal $operands, $output_primal
+            @bind_unary_output_primal $jvp_inputs, $output_primal
         })?
-        let $input_tangent = $operands.input_tangent()?;
+        let $input_tangent = $jvp_inputs.input_tangent()?;
         Ok($term)
     }};
 
-    // This internal helper branch evaluates the unary rule form that receives the operation and the lazy operand
+    // This internal helper branch evaluates the unary rule form that receives the operation and the lazy input
     // accessor, so that rules whose formula depends on the operation's configuration only align the primals they use.
     (
-        @unary_rule $operation:ident, $operands:ident,
-        |$operation_binding:ident, $operands_binding:ident|
+        @unary_rule $operation:ident, $jvp_inputs:ident,
+        |$operation_binding:ident, $inputs_binding:ident|
         $term:expr
     ) => {{
         let $operation_binding = $operation;
-        let $operands_binding = $operands;
+        let $inputs_binding = $jvp_inputs;
         Ok($term)
     }};
 
     // This internal helper branch handles `_` for a unary input primal by emitting no binding and, importantly,
     // no accessor call. Avoiding the call preserves the DSL's promise that omitted primals are not evaluated
     // unnecessarily.
-    (@bind_unary_input_primal $operands:ident, _) => {};
+    (@bind_unary_input_primal $jvp_inputs:ident, _) => {};
 
-    // This internal helper branch binds a named unary input primal through the lazy operand accessor. It is separate
-    // from the `_` arm so only formulas that reference the primal pay for alignment and possible replay.
-    (@bind_unary_input_primal $operands:ident, $input_primal:ident) => {
-        let $input_primal = $operands.input_primal()?;
+    // This internal helper branch binds a named unary input primal through the lazy input accessor. It is separate from
+    // the `_` arm so only formulas that reference the primal pay for alignment and possible replay.
+    (@bind_unary_input_primal $jvp_inputs:ident, $input_primal:ident) => {
+        let $input_primal = $jvp_inputs.input_primal()?;
     };
 
     // This internal helper branch binds the optional unary output primal at the tangent target type. The whole
     // invocation is conditionally expanded by the caller, so rules without an `-> output` binding never recompute
     // that value.
-    (@bind_unary_output_primal $operands:ident, $output_primal:ident) => {
-        let $output_primal = $operands.output_primal_at_tangent_type()?;
+    (@bind_unary_output_primal $jvp_inputs:ident, $output_primal:ident) => {
+        let $output_primal = $jvp_inputs.output_primal_at_tangent_type()?;
     };
 
     // This internal helper branch handles `_` for a binary left primal by emitting neither a binding nor an accessor
-    // call. The explicit arm preserves lazy primal evaluation for tangent formulas that depend only on the right
-    // operand.
-    (@bind_binary_left_primal $operands:ident, _) => {};
+    // call. The explicit arm preserves lazy primal evaluation for tangent formulas that depend only on the right input.
+    (@bind_binary_left_primal $jvp_inputs:ident, _) => {};
 
-    // This internal helper branch binds a named binary left primal through the lazy operand accessor. It complements
-    // the `_` arm so the generated rule evaluates and aligns the left primal only when its formula references it.
-    (@bind_binary_left_primal $operands:ident, $left_primal:ident) => {
-        let $left_primal = $operands.left_primal()?;
+    // This internal helper branch binds a named binary left primal through the lazy input accessor. It complements the
+    // `_` arm so the generated rule evaluates and aligns the left primal only when its formula references it.
+    (@bind_binary_left_primal $jvp_inputs:ident, $left_primal:ident) => {
+        let $left_primal = $jvp_inputs.left_primal()?;
     };
 
     // This internal helper branch handles `_` for a binary right primal by emitting neither a binding nor an accessor
-    // call. The explicit arm preserves lazy primal evaluation for tangent formulas that depend only on the left
-    // operand.
-    (@bind_binary_right_primal $operands:ident, _) => {};
+    // call. The explicit arm preserves lazy primal evaluation for tangent formulas that depend only on the left input.
+    (@bind_binary_right_primal $jvp_inputs:ident, _) => {};
 
-    // This internal helper branch binds a named binary right primal through the lazy operand accessor. It complements
-    // the `_` arm so the generated rule evaluates and aligns the right primal only when its formula references it.
-    (@bind_binary_right_primal $operands:ident, $right_primal:ident) => {
-        let $right_primal = $operands.right_primal()?;
+    // This internal helper branch binds a named binary right primal through the lazy input accessor. It complements the
+    // `_` arm so the generated rule evaluates and aligns the right primal only when its formula references it.
+    (@bind_binary_right_primal $jvp_inputs:ident, $right_primal:ident) => {
+        let $right_primal = $jvp_inputs.right_primal()?;
     };
 
 }
@@ -3214,10 +3212,10 @@ macro_rules! impl_differentiable_elementwise_operation {
 /// Implements the [`DifferentiableOperation`](crate::DifferentiableOperation) rule for an operation whose outputs carry
 /// no tangent, such as a Boolean-codomain predicate or an explicit gradient barrier. The primal operation is replayed
 /// on the input primals, and each output is paired with a structural zero tangent, which stays symbolic and stages
-/// nothing. Because such a rule stages no live tangent, an input-bearing operation can never appear on a linear operand
+/// nothing. Because such a rule stages no live tangent, an input-bearing operation can never appear on a linear input
 /// in a valid tangent program and is typically paired with [`impl_non_transposable_operation!`]. A regionless nullary
 /// operation should instead use [`impl_nullary_transposable_operation!`] so that transposition accepts its outputs and
-/// returns its empty operand-cotangent list. The optional leading generic list declares operation-specific type
+/// returns its empty input-cotangent list. The optional leading generic list declares operation-specific type
 /// parameters, and an optional `where` clause can provide any bounds needed to make the operation type well-formed.
 ///
 /// # Parameters
@@ -3276,12 +3274,12 @@ macro_rules! impl_non_differentiable_operation {
 }
 
 /// Implements the erroring [`TransposableOperation`](crate::TransposableOperation) rule for an operation that is not a
-/// linear map on any input/operand. A valid tangent program never contains such an operation on a linear operand (its
+/// linear map on any input. A valid tangent program never contains such an operation on a linear input (its
 /// forward-mode rule pairs replayed primals with tangents computed by other operations), so the generated rule reports
 /// an [`UnsupportedOperation`](crate::ProgramError::UnsupportedOperation) error. The reason non-transposable operations
 /// still implement [`TransposableOperation`](crate::TransposableOperation) at all is that transposition is driven
-/// through whole operation families. Ryft used to have a separate linear operation family type, but that resulted
-/// in overly complicated backend and operation implementations for very little benefit in practice, and so the two
+/// through whole operation families. Ryft used to have a separate linear operation family type, but that resulted in
+/// overly complicated backend and operation implementations for very little benefit in practice, and so the two
 /// families were unified. The optional leading generic list declares operation-specific type parameters, and an
 /// optional `where` clause can provide bounds needed to make the operation type well-formed.
 ///
@@ -3340,8 +3338,8 @@ macro_rules! impl_non_transposable_operation {
 
 /// Implements the [`TransposableOperation`](crate::TransposableOperation) trait for a [`Region`](crate::Region)-less
 /// nullary [`Operation`](crate::Operation). The generated implementation validates that the operation application has
-/// no inputs, infers and validates its output count, and returns no operand cotangents. The optional leading generic
-/// list declares operation-specific type parameters; the macro supplies its internal transposition type, value,
+/// no inputs, infers and validates its output count, and returns no input cotangents. The optional leading generic list
+/// declares operation-specific type parameters; the macro supplies its internal transposition type, value,
 /// operation-family, and driver parameters and derives behavioral bounds from [`Operation`](crate::Operation). An
 /// optional `where` clause can provide bounds required to make the operation type itself well-formed.
 ///
@@ -3404,10 +3402,10 @@ macro_rules! impl_nullary_transposable_operation {
 ///
 /// The `@member<U, P>` policy supports a nullary operation embedded as a member of a parent type universe `U` under
 /// batching policy `P`. Although the member operation is nullary in its native type universe, its parent instruction
-/// may consume representation operands. The generated rule requires every such operand to be replicated, binds the
-/// member operation once in the parent context, and marks every output as replicated. Neither policy assumes a
-/// concrete type, value, batch carrier, or batching implementation. Nullary operations whose result depends on the
-/// mapped axis, such as [`AxisIndexOperation`](crate::AxisIndexOperation), require a custom batching rule instead.
+/// may consume representation inputs. The generated rule requires every such input to be replicated, binds the member
+/// operation once in the parent context, and marks every output as replicated. Neither policy assumes a concrete type,
+/// value, batch carrier, or batching implementation. Nullary operations whose result depends on the mapped axis, such
+/// as [`AxisIndexOperation`](crate::AxisIndexOperation), require a custom batching rule instead.
 ///
 /// The optional leading generic list declares operation-specific type parameters. Behavioral bounds for `@replicated`
 /// are derived from [`InterpretableOperation<C>`](crate::InterpretableOperation). An optional `where` clause can
@@ -3416,8 +3414,8 @@ macro_rules! impl_nullary_transposable_operation {
 /// # Parameters
 ///
 ///   - `@replicated`: Selects batching that evaluates the operation once and marks every output as replicated.
-///   - `@member<U, P>`: Selects parent-universe member batching under batching policy `P`, requiring all
-///     representation operands to be replicated.
+///   - `@member<U, P>`: Selects parent-universe member batching under batching policy `P`, requiring all representation
+///     inputs to be replicated.
 ///   - `$generic`: Optional operation-specific type parameters used by `$operation`.
 ///   - `$operation`: Regionless nullary operation type for which the implementation is generated.
 ///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
@@ -3464,7 +3462,7 @@ macro_rules! impl_nullary_batchable_operation {
                     if !axis.is_replicated() {
                         return Err($crate::BatchingError::UnsupportedOperation {
                             message: format!(
-                                "member operand {} of type {} must be replicated but is mapped at {}",
+                                "member input {} of type {} must be replicated but is mapped at {}",
                                 index,
                                 <$policy as $crate::BatchingPolicy<__C>>::unbatched_type(input),
                                 axis,
@@ -3752,8 +3750,8 @@ macro_rules! define_tracer_operator {
 ///   - `@elementwise @unary`: Checks unary element-type inference and successful array-type lifting.
 ///   - `@elementwise @binary`: Checks binary element-type inference and successful array-type lifting.
 ///   - `@reject @unreduced`: Checks that array inputs carrying an unreduced mesh axis are rejected.
-///   - `@reject @mismatched_reduced`: Checks both operand orders for a binary operation whose operands
-///     must carry the same reduced-axis markers.
+///   - `@reject @mismatched_reduced`: Checks both input orders for a binary operation whose inputs must carry the same
+///     reduced-axis markers.
 ///
 /// # Examples
 ///
@@ -3877,13 +3875,13 @@ macro_rules! check_operation_type_inference {
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(&operation, input_types.as_slice(), &[]),
             Err($crate::programs::types::TypeError::invalid(format!(
-                "`{descriptor}` does not support unreduced operands",
+                "`{descriptor}` does not support unreduced inputs",
             ))),
         );
     }};
 
-    // This branch generates both operand orderings with mismatched reduced-axis markers and checks that
-    // a binary operation rejects each ordering with the same diagnostic.
+    // This branch generates both input orderings with mismatched reduced-axis markers and checks that a binary
+    // operation rejects each ordering with the same diagnostic.
     (
         @reject @mismatched_reduced,
         operation = $operation:expr,
@@ -3912,7 +3910,7 @@ macro_rules! check_operation_type_inference {
             .with_sharding(right.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap())
             .unwrap();
         let expected = Err($crate::programs::types::TypeError::invalid(format!(
-            "`{descriptor}` operands must be reduced over the same axes",
+            "`{descriptor}` inputs must be reduced over the same axes",
         )));
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(
@@ -5849,8 +5847,8 @@ mod tests {
             check_count!("accumulator", values, 1, DifferentiationError);
             Ok(())
         };
-        let check_operand = |values: &[usize], expected: usize| -> Result<(), TypeError> {
-            check_count!("operand", values, expected, TypeError);
+        let check_input_types = |values: &[usize], expected: usize| -> Result<(), TypeError> {
+            check_count!("input", values, expected, TypeError);
             Ok(())
         };
         assert_eq!(check_input(&[0]), Ok(()));
@@ -5866,9 +5864,9 @@ mod tests {
             check_accumulator(&[]).unwrap_err().to_string(),
             "invalid number of accumulators; expected 1 but got 0",
         );
-        assert_eq!(check_operand(&[0], 1), Ok(()));
-        assert_eq!(check_operand(&[], 1), Err(TypeError::invalid("expected 1 operand but got 0".to_string())),);
-        assert_eq!(check_operand(&[0], 2), Err(TypeError::invalid("expected 2 operands but got 1".to_string())),);
+        assert_eq!(check_input_types(&[0], 1), Ok(()));
+        assert_eq!(check_input_types(&[], 1), Err(TypeError::invalid("expected 1 input but got 0".to_string())),);
+        assert_eq!(check_input_types(&[0], 2), Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),);
     }
 
     #[test]
@@ -5993,12 +5991,12 @@ mod tests {
         assert_eq!(check_no_unreduced(std::slice::from_ref(&plain)), Ok(()));
         assert_eq!(
             check_no_unreduced(std::slice::from_ref(&unreduced_x)),
-            Err(TypeError::invalid("`test` does not support unreduced operands".to_string())),
+            Err(TypeError::invalid("`test` does not support unreduced inputs".to_string())),
         );
         assert_eq!(check_unreduced_axes(&[unreduced_x.clone(), unreduced_x.clone()]), Ok(()));
         assert_eq!(
             check_unreduced_axes(&[unreduced_x, unreduced_y]),
-            Err(TypeError::invalid("`test` operands must be unreduced over the same axes".to_string())),
+            Err(TypeError::invalid("`test` inputs must be unreduced over the same axes".to_string())),
         );
         assert_eq!(
             check_unreduced_axes(std::slice::from_ref(&plain)),
@@ -6007,7 +6005,7 @@ mod tests {
         assert_eq!(check_reduced_axes(&[reduced_x.clone(), reduced_x.clone()]), Ok(()));
         assert_eq!(
             check_reduced_axes(&[reduced_x, reduced_y]),
-            Err(TypeError::invalid("`test` operands must be reduced over the same axes".to_string())),
+            Err(TypeError::invalid("`test` inputs must be reduced over the same axes".to_string())),
         );
         assert_eq!(
             check_reduced_axes(std::slice::from_ref(&plain)),
@@ -6054,7 +6052,7 @@ mod tests {
         let right_type = DimensionType::new("right", DimensionBounds::new(2, Some(6)).unwrap());
         let operation = TestArithmeticDimensionOperation::new(&left_type, &right_type).unwrap();
 
-        // The generated operation owns stable operand metadata and the result name and bounds needed to infer a fresh
+        // The generated operation owns stable input metadata and the result name and bounds needed to infer a fresh
         // program-atom identity.
         assert_eq!(format!("{operation}"), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME);
         assert_eq!(operation.name(), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,);
@@ -6069,7 +6067,7 @@ mod tests {
             Operation::infer_output_types(&operation, std::slice::from_ref(&left_type), &[]),
             Err(TypeError::invalid("expected 2 inputs but got 1".to_string())),
         );
-        // Providers check arity before indexing and preserve the constructor's operand metadata.
+        // Providers check arity before indexing and preserve the constructor's input metadata.
         let provided = TestBinaryOperation::<DimensionType>::provide((), &[&left_type, &right_type]).unwrap();
         assert_eq!(provided.left_type(), &left_type);
         assert_eq!(provided.right_type(), &right_type);
@@ -6084,8 +6082,8 @@ mod tests {
         fn assert_arithmetic_dimension_operation<O: ArithmeticDimensionOperation>() {}
         assert_arithmetic_dimension_operation::<TestArithmeticDimensionOperation>();
 
-        // The generated identity-renaming implementation rewrites both declared operand identities while preserving
-        // the result metadata from which the output atom's identity will be inferred.
+        // The generated identity-renaming implementation rewrites both declared input identities while preserving the
+        // result metadata from which the output atom's identity will be inferred.
         let renamed_left = DimensionType::new("renamed_left", left_type.bounds());
         let renamed_right = DimensionType::new("renamed_right", right_type.bounds());
         let mut renaming = TypeIdentityRenaming::new();
@@ -6184,7 +6182,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             Operation::infer_output_types(&array_operation, &[unreduced_type], &[]),
-            Err(TypeError::invalid("`test_unary` does not support unreduced operands".to_string())),
+            Err(TypeError::invalid("`test_unary` does not support unreduced inputs".to_string())),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array, TestUnaryOperation<ArrayType>>>::interpret(
@@ -6268,7 +6266,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             Operation::infer_output_types(&array_operation, &[unreduced_x, unreduced_y], &[]),
-            Err(TypeError::invalid("`test_binary` operands must be unreduced over the same axes".to_string())),
+            Err(TypeError::invalid("`test_binary` inputs must be unreduced over the same axes".to_string())),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array, TestBinaryOperation<ArrayType>>>::interpret(
@@ -6354,7 +6352,7 @@ mod tests {
     #[test]
     fn test_impl_reference_dischargeable_operation() {
         // The array universe has no reference-typed spelling, which is valid here because the generated rule only
-        // replays ordinary operands and rejects every live reference handle before inspecting its type.
+        // replays ordinary instruction inputs and rejects every live reference handle before inspecting its type.
         #[derive(Copy, Clone, Debug, PartialEq)]
         struct WholeArray;
 
@@ -6398,8 +6396,8 @@ mod tests {
             Ok(vec![ReferenceDischargeValue::Value(Array::scalar(-2.0f32).unwrap())]),
         );
 
-        // An operand that is a live reference handle is rejected too, because a reference-touching operation owns
-        // its own rewrite. The handle's own rendering is spliced into the expected diagnostic because a top-level
+        // An instruction input that is a live reference handle is rejected too, because a reference-touching operation
+        // owns its own rewrite. The handle's own rendering is spliced into the expected diagnostic because a top-level
         // environment identity is minted process-globally and is therefore not stable across runs.
         let reference = ReferenceDischargeValue::from(
             context
@@ -6409,7 +6407,7 @@ mod tests {
         assert_eq!(
             operation.discharge_references(&context, &EmptyRegionDriver, &[reference.clone()]),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a value operand 0 of `test_unary` but received {reference}",
+                "reference discharge expected a value input 0 of `test_unary` but received {reference}",
             ))),
         );
 

@@ -142,9 +142,9 @@ impl<V: Typed + Display> Display for DifferentiationDual<V> {
     }
 }
 
-/// Returns whether the types permit materializing a structural zero tangent without runtime operands. A
+/// Returns whether the types permit materializing a structural zero tangent without runtime inputs. A
 /// reference primal requires its rule to allocate a tangent reference, and a tangent type carrying a runtime (i.e.,
-/// [`Reference`](TypeIdentityPosition::Reference)-position) identity needs live operands to construct its zero. This
+/// [`Reference`](TypeIdentityPosition::Reference)-position) identity needs live inputs to construct its zero. This
 /// checks type requirements, not whether the operation family provides zero construction. It is shared by the all-zero
 /// fast paths and [`DifferentiationDual::is_tangent_active`].
 fn can_materialize_zero_tangent_from_type<T: Type>(primal_type: &T, tangent_type: &T) -> bool {
@@ -446,7 +446,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     /// residuals `r` and produces the input cotangents `x̄ = (∂f/∂x)(x)ᵀ · ȳ`. It is the derived third member of this
     /// [`Linearization`]'s program family, alongside the stored [`primal`](Self::primal) and [`tangent`](Self::tangent)
     /// sub-programs. Rather than re-keying each bilinear operation of the tangent sub-program into a closed captured
-    /// factor (e.g., folding a scalar `Mul` against a known operand into a multiply-by-a-captured-constant) by folding
+    /// factor (e.g., folding a scalar `Mul` against a known input into a multiply-by-a-captured-constant) by folding
     /// the consuming residual value, this function leaves the tangent sub-program in the primal operation family `O`
     /// and transposes it through [`RegionRef::transpose_shared`], including the saved dimension mappings needed for
     /// disconnected cotangent zeros. The tangent sub-program's inputs are `(ẋ, r)`, so it is transposed with respect
@@ -1102,7 +1102,7 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
 
     /// Binds an operation to dual values using the differentiation context's binding semantics, including its
     /// structural zero checks. Rules can recursively differentiate newly constructed operations or replay operations
-    /// from a region without wrapping each operand in a [`DifferentiationTracer`]. For example, an eager `while`
+    /// from a region without wrapping each input in a [`DifferentiationTracer`]. For example, an eager `while`
     /// operation, this function replays its body this way, while a masked `while` operation differentiates its
     /// rewritten operation and regions.
     ///
@@ -1117,7 +1117,7 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     ///   - `context`: Differentiation context that computes the operation's primal and tangent results.
     ///   - `operation`: Operation to differentiate.
     ///   - `programs`: Complete attached region programs, in operation-defined order.
-    ///   - `inputs`: Operand duals, in operation-input order.
+    ///   - `inputs`: Input duals, in operation input order.
     fn bind_jvp_operation<P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
@@ -1324,7 +1324,7 @@ pub trait DifferentiableOperation<C: Context>: Operation {
     ///     values become available to tangent construction.
     ///   - `driver`: [`DifferentiationDriver`] that provides [`Instruction`](crate::Instruction)-scoped access to
     ///     attached [`Region`]s.
-    ///   - `inputs`: Input [`DifferentiationDual`]s aligned with this operation's inputs/operands.
+    ///   - `inputs`: Input [`DifferentiationDual`]s aligned with this operation's inputs.
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
@@ -1420,7 +1420,7 @@ pub trait MemberDifferentiableOperation<C: Context>: Operation<Type: Differentia
     ///
     ///   - `context`: Parent [`Context`] through which the rule stages member and mixed operations.
     ///   - `driver`: Instruction-scoped [`DifferentiationDriver`] that exposes any attached [`Region`]s.
-    ///   - `inputs`: Parent-universe primal/tangent pairs aligned with this operation's operands.
+    ///   - `inputs`: Parent-universe primal/tangent pairs aligned with this operation's inputs.
     fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
@@ -1725,7 +1725,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     /// Transfers each dual's primal value to the tangent context while retaining its existing tangent value. Use this
     /// when a rule needs primal coefficients alongside tangents, such as the input shapes used to construct a tangent
     /// reshape operation. As with [`Self::primal_to_tangent`], the transfer preserves reference identity and does not
-    /// force residual materialization. The returned [`DifferentiationDual`]s are operands for tangent work; their
+    /// force residual materialization. The returned [`DifferentiationDual`]s are inputs for tangent work; their
     /// primals no longer belong to the original primal context when the policy uses separate contexts.
     ///
     /// # Parameters
@@ -1761,7 +1761,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
     ///
     ///   - `operation`: Operation whose primal and tangent results are required.
     ///   - `driver`: Complete ordered regions attached to this application.
-    ///   - `inputs`: Operand duals, in operation-input order.
+    ///   - `inputs`: Input duals, in operation input order.
     fn bind_duals<D: BindingRegionDriver<C::Constant, C::Operation>>(
         &self,
         operation: &C::Operation,
@@ -1780,14 +1780,14 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
 
         // All-zero fast path mirroring `Program::jvp`. When an operation consumes at least one input and every input
         // tangent is a structural zero, skip its rule only when each output tangent can later be materialized without
-        // runtime identity operands. Zero-input operations remain excluded so their dedicated rules keep handling
+        // runtime identity inputs. Zero-input operations remain excluded so their dedicated rules keep handling
         // primal synthesis and tangent typing. Reference operations are differentiated by their own rules: a reference
         // input whose tangent is a symbolic zero is plumbing, every rule decides what plumbing means for it, and a
         // reference output has no structural zero because its rule must allocate the tangent reference.
         let zero_input_tangents = !inputs.is_empty() && inputs.iter().all(|dual| dual.tangent().is_zero());
 
         // Region-carrying operations retain structural zero tangents because the transform boundary captures their
-        // runtime geometry from the staged primal outputs, but only while no reference is involved. A reference operand
+        // runtime geometry from the staged primal outputs, but only while no reference is involved. A reference input
         // or an attached region that allocates or accesses references (e.g., a `condition` whose branches allocate and
         // return a reference) must reach the rule so that every reference result carries its tangent reference.
         // Region-free operations can instead inspect their outputs without reproducing the primal's region-identity
@@ -1834,8 +1834,8 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
                 })
                 .collect::<Result<Vec<_>, DifferentiationError>>()?
         } else {
-            // Rules differentiate attached regions structurally, so regions whose types the primal operands strictly
-            // refine are first specialized to those operands (e.g., a region replayed with a concrete batch extent
+            // Rules differentiate attached regions structurally, so regions whose types the primal inputs strictly
+            // refine are first specialized to those inputs (e.g., a region replayed with a concrete batch extent
             // whose body still declares the dynamic extent). Otherwise, borrow the complete region driver directly,
             // preserving operation-defined ordering without collecting it into temporary storage.
             let primal_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
@@ -2153,7 +2153,7 @@ where
                     .collect::<Result<Vec<_>, ProgramError>>()?;
 
                 // All-zero fast path: skip the operation's rule only when every input tangent is structural zero and
-                // every output zero tangent can later be materialized without runtime identity operands (or by reusing
+                // every output zero tangent can later be materialized without runtime identity inputs (or by reusing
                 // a zero-producing primal). Zero-input operations remain excluded so their dedicated rules keep
                 // handling primal synthesis and tangent typing. Dynamic one already relies on this routing to stage
                 // an explicit dynamic-zero tangent. Other dynamic output rules must retain any runtime extents needed
@@ -2267,9 +2267,9 @@ where
                                     &tangent_type,
                                     "jvp output tangent",
                                 )?;
-                                let (operation, operands) =
+                                let (operation, zero_inputs) =
                                     O::zero_operation_with_residuals(tangent_type, residuals.as_slice())?;
-                                let mut outputs = context.stage_operation(operation, Vec::new(), &operands)?;
+                                let mut outputs = context.stage_operation(operation, Vec::new(), &zero_inputs)?;
                                 check_count!("output", outputs, 1, ProgramError);
                                 outputs.remove(0)
                             }
@@ -2697,7 +2697,7 @@ where
     /// Atoms that are not reached by any input tangent are structurally zero. Their tangents stay symbolic as typed
     /// [`MaybeZero::Zero`]s and stage nothing. The shared all-zero fast path short-circuits operations whose every
     /// input tangent is structural zero only when each output zero tangent can be materialized without runtime identity
-    /// operands (or by reusing a compatible zero-producing primal). It stages the primal directly and pairs each output
+    /// inputs (or by reusing a compatible zero-producing primal). It stages the primal directly and pairs each output
     /// with a typed structural zero tangent. Structural zeros are materialized as typed
     /// [`ZeroOperation`](crate::ZeroOperation) instructions only when a nonzero differential output requires a real
     /// value, preserving a compact `(primal_outputs ++ live_tangent_outputs)` program contract.
@@ -2757,7 +2757,7 @@ where
     /// silently mask a nonlinear rule.
     ///
     /// Rules bind effects to their primal or tangent destination. Primal effects execute once at the linearization
-    /// point, while tangent effects execute on each tangent invocation even when their operands are entirely known.
+    /// point, while tangent effects execute on each tangent invocation even when their inputs are entirely known.
     /// Higher-order operations own their nested splitting through their existing differentiation and partial evaluation
     /// rules. The final pair's program interfaces are validated by [`Linearization::new`].
     ///
@@ -3020,9 +3020,9 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
                 MaybeZero::Zero(r#type) => {
                     let residuals =
                         capture_and_validate_zero_residual_values(self, &primal, &r#type, "jvp output tangent")?;
-                    let (operation, operands) =
+                    let (operation, zero_inputs) =
                         Self::Operation::zero_operation_with_residuals(r#type, residuals.as_slice())?;
-                    let mut outputs = self.bind(operation, Vec::new(), operands.as_slice())?;
+                    let mut outputs = self.bind(operation, Vec::new(), zero_inputs.as_slice())?;
                     check_count!("output", outputs, 1, ProgramError);
                     outputs.remove(0)
                 }
@@ -3322,7 +3322,7 @@ impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 
 /// Applies a member operation's Jacobian-Vector Product (JVP) rule through a projected view of a composite
 /// differentiation context. Use this function from a composite operation dispatcher when the operation is
-/// [`Region`]-free and every operand and result belongs to the same projectable member type `T`. It projects primal
+/// [`Region`]-free and every input and output belongs to the same projectable member type `T`. It projects primal
 /// values and live tangent values into the member value family, carries structural-zero tangents as types without
 /// materializing values, runs the member's existing [`DifferentiableOperation`] rule, and lifts the resulting duals
 /// back into the composite value family. This named adapter always selects [`DifferentiableOperation::jvp`], including
@@ -3340,7 +3340,7 @@ impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 ///   - `context`: Active composite [`Context`] through which the projected member rule stages its primal and tangent
 ///     operations.
 ///   - `operation`: Region-free operation expressed in the projected member operation family.
-///   - `inputs`: Composite [`DifferentiationDual`]s corresponding to the operation's operands.
+///   - `inputs`: Composite [`DifferentiationDual`]s corresponding to the operation's inputs.
 #[inline]
 pub fn jvp_projected_operation<
     T: DifferentiableType,
@@ -3448,8 +3448,8 @@ fn residualize_zero_from_residual_values<
     residual_values: Vec<C::Value>,
 ) -> Result<PartialEvaluationValue<C::Value>, ProgramError> {
     let residual_values = residual_values.into_iter().map(PartialEvaluationValue::known_input).collect::<Vec<_>>();
-    let (operation, operands) = C::Operation::zero_operation_with_residuals(r#type, residual_values.as_slice())?;
-    let mut outputs = context.residualize(operation, Vec::new(), operands.as_slice())?;
+    let (operation, zero_inputs) = C::Operation::zero_operation_with_residuals(r#type, residual_values.as_slice())?;
+    let mut outputs = context.residualize(operation, Vec::new(), zero_inputs.as_slice())?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
 }
@@ -5483,7 +5483,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_differentiation_context_bind_region_reference_outputs() {
-        // Both branches allocate a local reference from the numeric operand and return it: `f(p, x) = new(x)`.
+        // Both branches allocate a local reference from the numeric input and return it: `f(p, x) = new(x)`.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let branch = || {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -5504,7 +5504,7 @@ pub(crate) mod tests {
             context.clone(),
         );
 
-        // Every operand tangent is a structural zero, but the branches allocate a reference, so the all-zero fast path
+        // Every input tangent is a structural zero, but the branches allocate a reference, so the all-zero fast path
         // defers to the `condition` rule and the escaping allocation carries a tangent reference holding zero instead
         // of a symbolic zero that no later store could land in.
         let outputs = context.bind(ConditionOperation::new(), vec![branch(), branch()], &[predicate, value]).unwrap();
@@ -5610,9 +5610,9 @@ pub(crate) mod tests {
     #[test]
     fn test_differentiation_context_bind_specializes_refined_regions() {
         // Batching with a threaded extent `b` and then replaying at the concrete extent 2 instantiates `b` as an exact
-        // dynamic dimension in attached regions, while the eager array operands carry the static extent 2. The rules
+        // dynamic dimension in attached regions, while the eager array inputs carry the static extent 2. The rules
         // of `scan`, `condition`, and `linear_call` differentiate their regions structurally, so those regions must be
-        // specialized to the static operands first, or the tangents that the rules construct disagree with the primal
+        // specialized to the static inputs first, or the tangents that the rules construct disagree with the primal
         // outputs. Each program maps `x: f64[3]` to an output whose derivative is applied to a ones seed.
         type Value = ArrayIrValue<Array>;
         let vector = ArrayType::new_static(DataType::F64, [3]);

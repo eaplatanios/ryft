@@ -154,15 +154,15 @@ pub trait ArrayElement: private::Codec {
     /// value. Complex elements use negative infinity in both components to bound their lexicographic ordering.
     fn max_identity() -> Self;
 
-    /// Returns the smaller of `self` and `other`, preserving the selected operand's exact encoding. Integers use
-    /// their ordinary ordering, and Booleans order `false` below `true`. Real floating-point values propagate NaN
-    /// values (preferring `self` when both operands are NaN-valued), order negative zero below positive zero, and
-    /// preserve `self` on exact ties. Unlike the primitive floating-point `min` functions, a single NaN value is never
-    /// discarded. Complex values compare real components first, and then imaginary components when the real components
-    /// are equal. They select `other` on ties or when the deciding comparison is unordered because of a NaN.
+    /// Returns the smaller of `self` and `other`, preserving the selected value's exact encoding. Integers use their
+    /// ordinary ordering, and Booleans order `false` below `true`. Real floating-point values propagate NaN values
+    /// (preferring `self` when both are NaN-valued), order negative zero below positive zero, and preserve `self` on
+    /// exact ties. Unlike the primitive floating-point `min` functions, a single NaN value is never discarded. Complex
+    /// values compare real components first, and then imaginary components when the real components are equal. They
+    /// select `other` on ties or when the deciding comparison is unordered because of a NaN.
     fn min(&self, other: &Self) -> Self;
 
-    /// Returns the larger of `self` and `other`, preserving the selected operand's exact encoding. Uses the same
+    /// Returns the larger of `self` and `other`, preserving the selected value's exact encoding. Uses the same
     /// ordering, NaN value propagation, and tie-breaking rules as [`min`](Self::min), including the distinct rules
     /// for complex values.
     fn max(&self, other: &Self) -> Self;
@@ -202,7 +202,7 @@ pub trait NumericArrayElement: ArrayElement {
     /// Divides this element by `rhs`. Integer division truncates toward zero, returns all-one bits for a zero divisor,
     /// and wraps signed overflow. Real floating-point division uses IEEE arithmetic followed by the destination
     /// format's rounding and representability rules. Complex division uses a ratio-based formula to avoid squaring the
-    /// denominator, with explicit recovery for zero divisors and infinite operands when both result components would
+    /// denominator, with explicit recovery for zero divisors and infinite inputs when both result components would
     /// otherwise be NaN. Intermediate overflow can still produce NaN components.
     fn div(self, rhs: Self) -> Result<Self, ProgramError>;
 
@@ -270,7 +270,7 @@ pub trait FloatingPointArrayElement: NumericArrayElement {
     ///
     /// # Parameters
     ///
-    ///   - `x`: Horizontal coordinate for real inputs, or the second operand of the complex continuation.
+    ///   - `x`: Horizontal coordinate for real inputs, or the second argument of the complex continuation.
     fn atan2(self, x: Self) -> Result<Self, ProgramError>;
 
     /// Computes the natural exponential. Real overflow and underflow follow the destination format's conversion
@@ -2202,7 +2202,7 @@ macro_rules! impl_floating_point_array_element_for_complex_floating_point_types 
             }
 
             fn log_add_exp(self, other: Self) -> Result<Self, ProgramError> {
-                // Factor out the operand `p` with the larger real component, so that `log_add_exp(p, q)` is
+                // Factor out the argument `p` with the larger real component, so that `log_add_exp(p, q)` is
                 // `p + ln_1p(exp(q - p))` and keeps `ln_1p`'s accuracy for small corrections. The ratio `exp(q - p)`
                 // is formed as `exp(q - re(p)) · exp(-i im(p))`, which rotates by `p`'s phase instead of subtracting
                 // the imaginary components from each other, since that subtraction loses phase when their magnitudes
@@ -3243,7 +3243,7 @@ mod tests {
         );
         assert_eq!(ArrayElement::min(&f8e8m0fnu::MIN, &f8e8m0fnu::MAX).to_bits(), 0x00);
 
-        // Floating-point selection preserves NaN payloads and distinguishes signed zeros in either operand order.
+        // Floating-point selection preserves NaN payloads and distinguishes signed zeros in either argument order.
         let nan = f32::from_bits(0x7fc0_1234);
         let other_nan = f32::from_bits(0x7fc0_5678);
         assert_eq!(ArrayElement::min(&nan, &1.0).to_bits(), nan.to_bits());
@@ -3253,7 +3253,7 @@ mod tests {
         assert_eq!(ArrayElement::min(&0.0f32, &-0.0).to_bits(), (-0.0f32).to_bits());
         assert_eq!(ArrayElement::min(&f16::from_f32(-0.0), &f16::ZERO).to_bits(), f16::from_f32(-0.0).to_bits());
 
-        // Complex selection is lexicographic, and ties or unordered deciding comparisons select the other operand.
+        // Complex selection is lexicographic, and ties or unordered deciding comparisons select `other`.
         assert_eq!(ArrayElement::min(&Complex::new(1.0f32, 1.0), &Complex::new(1.0, 2.0)), Complex::new(1.0, 1.0));
         assert_eq!(ArrayElement::min(&Complex::new(nan, 1.0), &Complex::new(2.0, 3.0)), Complex::new(2.0, 3.0));
         assert_eq!(
@@ -3273,7 +3273,7 @@ mod tests {
         );
         assert_eq!(ArrayElement::max(&f8e8m0fnu::MIN, &f8e8m0fnu::MAX).to_bits(), 0xfe);
 
-        // Floating-point selection preserves NaN payloads and distinguishes signed zeros in either operand order.
+        // Floating-point selection preserves NaN payloads and distinguishes signed zeros in either argument order.
         let nan = f32::from_bits(0x7fc0_1234);
         let other_nan = f32::from_bits(0x7fc0_5678);
         assert_eq!(ArrayElement::max(&nan, &1.0).to_bits(), nan.to_bits());
@@ -3283,7 +3283,7 @@ mod tests {
         assert_eq!(ArrayElement::max(&0.0f32, &-0.0).to_bits(), (0.0f32).to_bits());
         assert_eq!(ArrayElement::max(&f16::from_f32(-0.0), &f16::ZERO).to_bits(), f16::from_f32(0.0).to_bits());
 
-        // Complex selection is lexicographic, and ties or unordered deciding comparisons select the other operand.
+        // Complex selection is lexicographic, and ties or unordered deciding comparisons select `other`.
         assert_eq!(ArrayElement::max(&Complex::new(1.0f32, 1.0), &Complex::new(1.0, 2.0)), Complex::new(1.0, 2.0));
         assert_eq!(ArrayElement::max(&Complex::new(nan, 1.0), &Complex::new(2.0, 3.0)), Complex::new(2.0, 3.0));
         assert_eq!(
@@ -3804,7 +3804,7 @@ mod tests {
 
         // The shift is real, so neither phase is rounded against the other: `exp(1e16 i)` and `exp(i)` keep their exact
         // phases, where the lexicographic `max + ln_1p(exp(min - max))` form would subtract `1e16 - 1`, which rounds
-        // to a multiple of two and so shifts the smaller operand's phase by a full radian.
+        // to a multiple of two and so shifts the smaller argument's phase by a full radian.
         let (first, second) = (Complex::new(0.0f64, 1e16), Complex::new(-1.0f64, 1.0));
         let output = FloatingPointArrayElement::log_add_exp(first, second).unwrap();
         let expected = (first.exp() + second.exp()).ln();

@@ -41,11 +41,11 @@ pub enum KernelInitializationError {
     #[error(transparent)]
     Program(#[from] ProgramError),
 
-    /// A mapping could not produce a valid operand window.
+    /// A mapping could not produce a valid full array window.
     #[error(transparent)]
     Mapping(#[from] BlockMappingError),
 
-    /// A completion operand does not name a pending copy token from this region.
+    /// A completion input does not name a pending copy token from this region.
     #[error("reference {value:?} is not a pending async copy token from this region")]
     InvalidCopyToken { value: ValueId },
 
@@ -133,7 +133,7 @@ pub enum KernelInitializationError {
         maximum: usize,
     },
 
-    /// Two mutable windows may execute on the same operand coordinates.
+    /// Two mutable windows may execute on the same full array coordinates.
     #[error("kernel parameter {parameter} has overlapping mutable windows")]
     OverlappingWindows {
         /// Mutable parameter position.
@@ -151,17 +151,17 @@ pub enum KernelInitializationError {
 /// Validates definite body writes and complete, disjoint static output windows before memory allocation or execution.
 ///
 /// The supplied region is validated against this exact call. Read-write inputs begin initialized; write-only outputs
-/// begin empty. Masked windows preserve fixed logical tile types, with raw reads checked against actual valid
-/// lanes and output publication clipped to the operand. Unresolved selections never establish complete writes. Static
-/// separable tiling uses the canonical mapping program to check the maximal coordinate and proves coverage from
-/// its axis geometry. Other mappings use bounded enumeration through the same interpreter.
-/// Overlapping mutable windows require grid ordering or exclusively atomic accumulation. Atomic/non-atomic conflicts
-/// remain races; deterministic host traversal does not provide ordering absent from the grid contract.
+/// begin empty. Masked windows preserve fixed logical tile types, with raw reads checked against actual valid lanes and
+/// output publication clipped to the full array. Unresolved selections never establish complete writes. Static
+/// separable tiling uses the canonical mapping program to check the maximal coordinate and proves coverage from its
+/// axis geometry. Other mappings use bounded enumeration through the same interpreter. Overlapping mutable windows
+/// require grid ordering or exclusively atomic accumulation. Atomic/non-atomic conflicts remain races; deterministic
+/// host traversal does not provide ordering absent from the grid contract.
 ///
 /// # Parameters
 ///
 ///   - `region`: actual attached body being qualified.
-///   - `call`: its canonical grid, operand types, accesses, and mappings.
+///   - `call`: its canonical grid, full array types, accesses, and mappings.
 ///   - `maximum_programs`: maximum grid size to enumerate when a mapping lacks a separable tiling proof. Such larger
 ///     launches are rejected before body traversal. This resource limit does not participate in kernel semantic
 ///     identity; interpreters separately enforce their execution limits even when no enumeration is needed here.
@@ -247,7 +247,7 @@ where
         let r#type = declaration.r#type();
         let shape = r#type
             .static_shape()
-            .ok_or(KernelInitializationError::UnsupportedLaunch { boundary: "operand shapes" })?;
+            .ok_or(KernelInitializationError::UnsupportedLaunch { boundary: "full array shapes" })?;
         let addressing = ArrayAddressing::new(r#type.into_owned())?;
         if let Some(axes) = &tiling_axes[parameter] {
             if points.len() == 0 {
@@ -1178,7 +1178,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Selects one repeated scalar operand, optionally retaining pure mapping work to exercise bounded enumeration.
+    /// Selects one repeated scalar parameter, optionally retaining pure mapping work to exercise bounded enumeration.
     fn repeated_call(executions: &[GridExecution], separable: bool) -> KernelCallOperation {
         let mut mapping = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         for _ in executions {

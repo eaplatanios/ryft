@@ -60,7 +60,7 @@ pub use contexts::{
     Context, Domain, DomainProjection, EagerContext, ProjectedContext, StagingContext, ValueResolution,
 };
 pub use differentiation::{
-    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentAccumulator, CotangentBatchingPolicy,
+    BinaryElementwiseJvpInputs, BroadcastDerivativeAlignment, CotangentAccumulator, CotangentBatchingPolicy,
     CotangentDestination, CotangentDestinationKind, CotangentDestinations, CotangentReferenceAccumulator,
     CotangentSeed, DOTS_SAVEABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVEABLE_POLICY_NAME,
     DenseDifferentiableType, DerivativeTransform, DifferentiableOperation, DifferentiableType, Differentiate,
@@ -78,7 +78,7 @@ pub use differentiation::{
     SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME, SAVE_FROM_BOTH_POLICIES_POLICY_NAME,
     SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
     SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual, TransposableOperation,
-    TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliaryOutput, WithCapture,
+    TranspositionContext, TranspositionDriver, UnaryElementwiseJvpInputs, WithAuxiliaryOutput, WithCapture,
     WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp, differentiate_at,
     jvp_for_transpose_projected_operation, jvp_projected_operation, rematerialize, saved_residuals,
     transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
@@ -824,7 +824,7 @@ pub(crate) mod tests {
         /// region's output types, which pins that region interfaces are derived and delivered during inference.
         WithRegions(&'static [RegionSlot]),
 
-        /// Pure call whose body input types must match its operands, used by builder identity-instantiation tests.
+        /// Pure call whose body input types must match its input types, used by builder identity-instantiation tests.
         Call,
     }
 
@@ -883,7 +883,7 @@ pub(crate) mod tests {
                     };
                     if region_interface.input_types() != input_types {
                         return Err(TypeError::invalid(
-                            "array identity region input types do not match its operand types",
+                            "array identity region input types do not match the instruction input types",
                         ));
                     }
                     Ok(region_interface.output_types().to_vec())

@@ -32,7 +32,7 @@ define_dimension_arithmetic_operation!(
             checked_power(left_lower, right_lower).ok_or_else(|| DimensionError::ArithmeticOverflow {
                 message: format!(
                     "dimension arithmetic overflow while deriving `{DIMENSION_POW_OPERATION_NAME}` output bounds \
-                     with operands `{left}` and `{right}`",
+                     with inputs `{left}` and `{right}`",
                 ),
             })?
         };
@@ -98,7 +98,7 @@ impl DimensionPow for DimensionValue {
         let extent =
             checked_power(self.extent(), right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
                 message: format!(
-                    "dimension arithmetic overflow while raising a dimension to a dimension power with operands \
+                    "dimension arithmetic overflow while raising a dimension to a dimension power with inputs \
                      {}={}, {}={}",
                     self.r#type().variable(),
                     self.extent(),

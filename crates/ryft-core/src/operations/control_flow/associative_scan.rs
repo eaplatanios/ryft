@@ -46,9 +46,9 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Typed, Value};
 ///
 /// The recursion combines adjacent pairs along `axis`, scans the halved sequence recursively, combines the scanned
 /// halves back against the elements the pairing skipped, and interleaves the two halves into the result. `combine`
-/// always receives its operands in scan order (the accumulated prefix first), so the construction stays correct for
+/// always receives its inputs in scan order (the accumulated prefix first), so the construction stays correct for
 /// associative operators that are not commutative. A `reverse` scan mirrors the same recursion around the end of the
-/// axis (the pairing simply starts one element in when the extent is odd) instead of reversing the operands before and
+/// axis (the pairing simply starts one element in when the extent is odd) instead of reversing the arrays before and
 /// after a forward scan, which saves two array reversals per array and scan. Boolean arrays are interleaved with a
 /// disjunction rather than an addition, because Booleans have no addition.
 ///
@@ -112,13 +112,13 @@ where
     let extent = extents[0];
     if let Some(other) = extents.iter().find(|other| **other != extent) {
         return Err(TypeError::invalid(format!(
-            "`associative_scan` requires operands with equal extents along axis {axis} but got {extent} and {other}",
+            "`associative_scan` requires inputs with equal extents along axis {axis} but got {extent} and {other}",
         ))
         .into());
     }
 
-    // The recursion runs over the flat arrays, so the combining operator is wrapped to rebuild its structured operands
-    // on the way in and to flatten its structured result on the way out.
+    // The recursion runs over the flat arrays, so the combining operator is wrapped to rebuild its structured inputs on
+    // the way in and to flatten its structured result on the way out.
     let array_count = arrays.len();
     let flat_combine = |left: &[V], right: &[V]| -> Result<Vec<V>, ProgramError> {
         let left = Values::from_parameters(structure.clone(), left.iter().cloned())?;
@@ -183,7 +183,7 @@ where
     let aligned = associative_scan_recursively(&reduced, half, axis, reverse, combine)?;
 
     // Each complementary position extends the aligned result before it by the one element that separates them, except
-    // for the position at the scan's own start, which is just the operand element there. An even extent has one fewer
+    // for the position at the scan's own start, which is just the input element there. An even extent has one fewer
     // complementary combination than there are aligned results, so the aligned side is trimmed; an extent of exactly
     // two has none at all, and its complementary half is that lone start element.
     let complement_count = match extent % 2 {
@@ -201,8 +201,8 @@ where
                         _ => aligned.clone(),
                     };
                     let start = (pair_offset + 1) % 2;
-                    let operands = scan_slice(values, axis, start, start + 2 * complement_count, 2)?;
-                    combine(&trimmed, &operands)?
+                    let inputs = scan_slice(values, axis, start, start + 2 * complement_count, 2)?;
+                    combine(&trimmed, &inputs)?
                         .iter()
                         .zip(&last)
                         .map(|(combined, last)| V::concatenate([combined, last], axis))
@@ -220,10 +220,10 @@ where
                         0 => scan_slice(&aligned, axis, 0, half - 1, 1)?,
                         _ => aligned.clone(),
                     };
-                    let operands = scan_slice(values, axis, 2, (2 + 2 * complement_count).min(extent), 2)?;
+                    let inputs = scan_slice(values, axis, 2, (2 + 2 * complement_count).min(extent), 2)?;
                     first
                         .iter()
-                        .zip(&combine(&trimmed, &operands)?)
+                        .zip(&combine(&trimmed, &inputs)?)
                         .map(|(first, combined)| V::concatenate([first, combined], axis))
                         .collect::<Result<Vec<_>, _>>()?
                 }
@@ -254,10 +254,10 @@ fn scan_slice<V: Slice + Typed<Type = ArrayType>>(
 /// `left` one. Each `left` array must hold either as many elements along `axis` as its `right` counterpart or exactly
 /// one more.
 ///
-/// Both operands are dilated into the output extent with interior padding (writing zeros into the positions that the
-/// other operand occupies) and then combined with an addition, or with a disjunction for Boolean operands, which have
-/// no addition. The combination is exact because the two dilated operands have disjoint support and zero (i.e.,
-/// `false`) is the identity of both combiners.
+/// Both arrays are dilated into the output extent with interior padding (writing zeros into the positions that the
+/// other array occupies) and then combined with an addition, or with a disjunction for Boolean arrays, which have no
+/// addition. The combination is exact because the two dilated arrays have disjoint support and zero (i.e., `false`)
+/// is the identity of both combiners.
 fn scan_interleave<V>(
     left: &[V],
     right: &[V],
@@ -317,7 +317,7 @@ mod tests {
     fn test_associative_scan() {
         // The decomposition is checked against the sequential scan of the same combiner, over both parities of the
         // scanned extent and in both directions. Summation pins the positions each output accumulates over, and the
-        // left projection (which is associative but not commutative) additionally pins the operand order that the
+        // left projection (which is associative but not commutative) additionally pins the input order that the
         // construction passes to the combiner: its forward scan is the first element repeated and its reverse scan the
         // last.
         let add = |left: &Array, right: &Array| left.add(right);
@@ -340,7 +340,7 @@ mod tests {
             }
         }
 
-        // Boolean operands are interleaved with a disjunction, because Booleans have no addition.
+        // Boolean inputs are interleaved with a disjunction, because Booleans have no addition.
         let or = |left: &Array, right: &Array| left.or(right);
         let booleans = Array::vector(vec![false, false, true, false, false]).unwrap();
         assert_eq!(
@@ -352,7 +352,7 @@ mod tests {
             Ok(Array::vector(vec![true, true, true, false, false]).unwrap()),
         );
 
-        // The construction scans one axis of a higher-rank operand independently per row.
+        // The construction scans one axis of a higher-rank input independently per row.
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
             associative_scan(&matrix, 1, false, &add),
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(
             associative_scan(&mismatched, 0, false, &add_all),
             Err(ProgramError::Type(TypeError::invalid(
-                "`associative_scan` requires operands with equal extents along axis 0 but got 3 and 2",
+                "`associative_scan` requires inputs with equal extents along axis 0 but got 3 and 2",
             ))),
         );
         let pair = vec![Array::vector(vec![1.0; 3]).unwrap(), Array::vector(vec![2.0; 3]).unwrap()];

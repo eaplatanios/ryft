@@ -133,7 +133,7 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
     ///     analysis creates a clone with instruction-local ordering state; ordinary replay uses this context directly.
     ///   - `region`: Source region containing the instruction and its reference identities.
     ///   - `instruction_index`: Instruction index within the source region.
-    ///   - `inputs`: Partially evaluated operands in source operand order.
+    ///   - `inputs`: Partially evaluated instruction inputs in source input order.
     ///   - `deferred_instructions`: Source instructions explicitly required to remain residual, including allocations
     ///     that must be created afresh for each residual call.
     ///   - `deferred_effect_ordering`: Accumulated ordering constraints of earlier deferred source work. Updated only

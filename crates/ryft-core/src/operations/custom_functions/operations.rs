@@ -27,7 +27,7 @@ use crate::operations::constants::zero::Zero;
 use crate::operations::custom_functions::rules::{
     CustomRuleBackwardSpecializationKey, CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingRuleKey,
     CustomRuleDerivationKey, CustomRuleDerivationKind, CustomRuleReference, CustomRuleSource,
-    CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer, CustomVjpBackward, boundary_operand_count,
+    CustomRuleSpecializationKey, CustomRuleSpecializer, CustomRuleTracer, CustomVjpBackward, boundary_input_count,
     validate_rule_output_types,
 };
 use crate::parameters::{Parameter, Placeholder};
@@ -167,7 +167,7 @@ enum CustomFunctionRules<T, S> {
 /// unbatched types, sharing that specialization with unbatched calls, and batches the traced program once per recorded
 /// level (refer to [`CustomRuleDefinition::with_batching`](crate::CustomRuleDefinition::with_batching)). A derivative
 /// whose natural layout is incompatible with the declared layout is therefore rejected when it is first requested, not
-/// when the call is batched. In both representations, any boundary operands of the batching policy (e.g., a first-class
+/// when the call is batched. In both representations, any boundary inputs of the batching policy (e.g., a first-class
 /// batch extent) become leading non-differentiated inputs.
 ///
 /// A custom batching rule also stays on the path of forward-mode derivatives that are batched after they are taken.
@@ -183,8 +183,8 @@ enum CustomFunctionRules<T, S> {
 /// Equality and hashing of calls with retained rules use the identity of the shared definition (i.e.,
 /// [`Arc::ptr_eq`](std::sync::Arc::ptr_eq)), while rendering prints its human-readable name.
 pub struct CustomFunctionOperation<V: Typed + Parameter, O, S = CustomRuleReference<V, O>> {
-    /// Number of leading inputs that parameterize the call without being differentiated, including the boundary
-    /// operands that the batching levels of a call with retained rules prepended to its inputs.
+    /// Number of leading inputs that parameterize the call without being differentiated, including the boundary inputs
+    /// that the batching levels of a call with retained rules prepended to its inputs.
     non_differentiated_count: usize,
 
     /// Derivative rules of the call.
@@ -257,19 +257,19 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     /// Returns this call with the provided number of leading non-differentiated inputs. Refer to the documentation of
     /// [`CustomFunctionOperation`] for the impact of this property on the rule interfaces. For a batched call with
-    /// retained rules, this count includes the boundary operands that its batching levels prepended to its inputs.
+    /// retained rules, this count includes the boundary inputs that its batching levels prepended to its inputs.
     ///
     /// # Errors
     ///
     /// Returns a [`TypeError`] when the call is a batched call with retained rules and `non_differentiated_count` is
-    /// smaller than the number of those boundary operands, which are always non-differentiated.
+    /// smaller than the number of those boundary inputs, which are always non-differentiated.
     pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Result<Self, TypeError> {
         if let CustomFunctionRules::Retained { rules, batching: Some(batching), .. } = &self.rules {
-            let boundary_operand_count = batching.boundary_operand_count();
-            if non_differentiated_count < boundary_operand_count {
+            let boundary_input_count = batching.boundary_input_count();
+            if non_differentiated_count < boundary_input_count {
                 return Err(TypeError::invalid(format!(
-                    "batched `{CUSTOM_FUNCTION_OPERATION_NAME}` `{}` must have at least {boundary_operand_count} \
-                     non-differentiated inputs, which are the boundary operands that its batching levels prepended to \
+                    "batched `{CUSTOM_FUNCTION_OPERATION_NAME}` `{}` must have at least {boundary_input_count} \
+                     non-differentiated inputs, which are the boundary inputs that its batching levels prepended to \
                      its inputs, but got {non_differentiated_count}",
                     rules.name(),
                 )));
@@ -488,7 +488,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when a batched call has fewer non-differentiated inputs than its batching levels
-    /// recorded boundary operands, which type inference rejects before the call is staged.
+    /// recorded boundary inputs, which type inference rejects before the call is staged.
     fn specialization_key(
         &self,
         rules: &S,
@@ -511,11 +511,11 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 output_types: batching.output_types.clone(),
                 non_differentiated_count: self
                     .non_differentiated_count
-                    .checked_sub(batching.boundary_operand_count())
+                    .checked_sub(batching.boundary_input_count())
                     .ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
                             "batched `{CUSTOM_FUNCTION_OPERATION_NAME}` `{}` has fewer non-differentiated inputs \
-                             than boundary operands",
+                             than boundary inputs",
                             rules.name(),
                         ))
                     })?,
@@ -685,18 +685,18 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                     input_types.len(),
                 )?;
 
-                // A batched call's inputs start with the boundary operands of its batching levels, followed by the
-                // inputs of the unbatched call (and `with_non_differentiated_count` keeps those boundary operands
+                // A batched call's inputs start with the boundary inputs of its batching levels, followed by the inputs
+                // of the unbatched call (and `with_non_differentiated_count` keeps those boundary inputs
                 // non-differentiated).
                 if let Some(batching) = batching {
-                    let boundary_operand_count = batching.boundary_operand_count();
-                    if input_types.len() != boundary_operand_count + batching.input_types.len() {
+                    let boundary_input_count = batching.boundary_input_count();
+                    if input_types.len() != boundary_input_count + batching.input_types.len() {
                         return Err(TypeError::invalid(format!(
                             "batched `{CUSTOM_FUNCTION_OPERATION_NAME}` `{}` has {} inputs but its batching levels \
-                             record {} boundary operands and {} unbatched inputs",
+                             record {} boundary inputs and {} unbatched inputs",
                             rules.name(),
                             input_types.len(),
-                            boundary_operand_count,
+                            boundary_input_count,
                             batching.input_types.len(),
                         )));
                     }
@@ -869,7 +869,7 @@ where
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let primal_region = driver.region(0)?;
-        let boundary_operands = P::boundary_operands(context.axis_extent());
+        let boundary_inputs = P::boundary_operands(context.axis_extent());
         let (operation, regions, output_axes) = match &self.rules {
             CustomFunctionRules::Attached { .. } => {
                 // Batch every attached region contract while retaining the call and its rules:
@@ -1020,7 +1020,7 @@ where
                     regions.push(backward);
                 }
                 let operation = Self {
-                    non_differentiated_count: self.non_differentiated_count + boundary_operands.len(),
+                    non_differentiated_count: self.non_differentiated_count + boundary_inputs.len(),
                     ..self.clone()
                 };
                 (operation, regions, output_axes)
@@ -1029,16 +1029,13 @@ where
                 // Batch the primal now and record the level, so that the derivative rules are batched only when they
                 // are first traced. A custom batching rule takes precedence over structurally batching the primal
                 // region, and it declares the batch axes of the outputs. Otherwise, the declared layout is required
-                // exactly, so an incompatible primal is rejected here. Boundary operands reach the primal and every
+                // exactly, so an incompatible primal is rejected here. Boundary inputs reach the primal and every
                 // batched rule program as leading non-differentiated inputs.
                 let level = driver.batching_level(context)?;
                 let (primal, output_axes) = if rules.has_batching_rule() {
                     let key = CustomRuleBatchingRuleKey {
                         level: level.clone(),
-                        boundary_operand_types: boundary_operands
-                            .iter()
-                            .map(|value| value.r#type().into_owned())
-                            .collect(),
+                        boundary_input_types: boundary_inputs.iter().map(|value| value.r#type().into_owned()).collect(),
                         input_types: inputs.iter().map(|input| P::value(input).r#type().into_owned()).collect(),
                         unbatched_input_types: primal_region.input_types(),
                         input_axes: input_axes.clone(),
@@ -1075,12 +1072,12 @@ where
                 });
                 batching.levels.push(CustomRuleBatchingLevel {
                     level,
-                    boundary_operand_count: boundary_operands.len(),
+                    boundary_input_count: boundary_inputs.len(),
                     input_axes,
                     output_axes: output_axes.clone(),
                 });
                 let operation = Self {
-                    non_differentiated_count: self.non_differentiated_count + boundary_operands.len(),
+                    non_differentiated_count: self.non_differentiated_count + boundary_inputs.len(),
                     rules: CustomFunctionRules::Retained {
                         rules: rules.clone(),
                         batching: Some(batching),
@@ -1091,7 +1088,7 @@ where
                 (operation, vec![primal], output_axes)
             }
         };
-        let mut packed_inputs = boundary_operands;
+        let mut packed_inputs = boundary_inputs;
         packed_inputs.extend(inputs.iter().map(P::value).cloned());
         let outputs = context.parent().bind(operation, regions, packed_inputs.as_slice())?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
@@ -1343,7 +1340,7 @@ where
                             };
                             let level_specialization = rules.forward_specialization(level_key)?;
                             let leading_input_count =
-                                non_differentiated_count + boundary_operand_count(&batching.levels[..index]);
+                                non_differentiated_count + boundary_input_count(&batching.levels[..index]);
                             let mut input_axes = level.input_axes[..leading_input_count].to_vec();
                             input_axes.extend_from_slice(&level_specialization.output_axes[output_count..]);
                             input_axes.extend(std::iter::repeat_n(BatchAxis::replicated(), seed_geometry_count));
@@ -1469,7 +1466,7 @@ enum CustomFunctionTransposeRules<T, S> {
 /// call without reverse-mode rules stages no carrier, because reverse mode transposes the linearization of its
 /// forward-mode rule instead.
 ///
-/// Its inputs are the known leading inputs (i.e., any batching boundary operands, the non-differentiated inputs, the
+/// Its inputs are the known leading inputs (i.e., any batching boundary inputs, the non-differentiated inputs, the
 /// residuals, and the seed geometry) followed by the differentiated inputs' tangents. The seed geometry names the
 /// runtime quantities of the output tangent types (e.g., the extents of dynamically shaped outputs) that
 /// structural-zero seeds need when no other leading input names them, and the backward rule never receives it.
@@ -1507,8 +1504,7 @@ enum CustomFunctionTransposeRules<T, S> {
 /// specialization and batches it once per level. Seeds, caller buffers, and leading inputs keep their recorded batch
 /// axes, and each returned cotangent is aligned to its input, summing the per-item cotangents of a replicated input.
 pub struct CustomFunctionTransposeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V, O>> {
-    /// Number of leading known inputs (i.e., boundary operands, non-differentiated inputs, residuals, and seed
-    /// geometry).
+    /// Number of leading known inputs (i.e., boundary inputs, non-differentiated inputs, residuals, and seed geometry).
     leading_input_count: usize,
 
     /// Number of trailing leading inputs that carry the runtime geometry of the output tangent types (e.g., the
@@ -2046,9 +2042,9 @@ where
                 // A completely replicated carrier at an unnamed batching level needs no structural region rewrite, and
                 // keeping it avoids manufacturing a batch axis that its backward region does not observe. What makes
                 // this shortcut sound is the level being unnamed: a region's value can vary per batch item with no
-                // mapped operand only by addressing the level by name (e.g., an `axis_index` or a collective over the
-                // level's axis). Any other carrier is rejected, because no forward program determines the batch axes
-                // of its outputs.
+                // mapped input only by addressing the level by name (e.g., an `axis_index` or a collective over the
+                // level's axis). Any other carrier is rejected, because no forward program determines the batch axes of
+                // its outputs.
                 if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
                     let outputs = context.parent().bind(
                         self.clone(),
@@ -2103,7 +2099,7 @@ where
             output_axes.as_slice(),
         )?;
 
-        let boundary_operands = P::boundary_operands(context.axis_extent());
+        let boundary_inputs = P::boundary_operands(context.axis_extent());
         let mut batching = batching.clone().unwrap_or_else(|| CustomRuleBatching {
             input_types: inputs.iter().map(|input| P::unbatched_type(input).into_owned()).collect(),
             output_types: self.output_tangent_types.clone(),
@@ -2111,12 +2107,12 @@ where
         });
         batching.levels.push(CustomRuleBatchingLevel {
             level: driver.batching_level(context)?,
-            boundary_operand_count: boundary_operands.len(),
+            boundary_input_count: boundary_inputs.len(),
             input_axes,
             output_axes: output_axes.clone(),
         });
         let carrier = Self {
-            leading_input_count: self.leading_input_count + boundary_operands.len(),
+            leading_input_count: self.leading_input_count + boundary_inputs.len(),
             seed_geometry_count: self.seed_geometry_count,
             input_tangent_types: inputs[self.leading_input_count..]
                 .iter()
@@ -2131,7 +2127,7 @@ where
             },
             marker: PhantomData,
         };
-        let mut packed_inputs = boundary_operands;
+        let mut packed_inputs = boundary_inputs;
         packed_inputs.extend(inputs.iter().map(P::value).cloned());
         let outputs = context.parent().bind(carrier, Vec::new(), packed_inputs.as_slice())?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
@@ -2228,7 +2224,7 @@ where
                     })
                     .collect::<Vec<_>>();
 
-                // A dead output's structural-zero seed still becomes a real operand of the backward region. Its type
+                // A dead output's structural-zero seed still becomes a real input of the backward region. Its type
                 // alone cannot construct it when it references runtime identities, but the live seeds and the leading
                 // inputs, whose seed geometry names every runtime quantity of the output tangent types, do, so the zero
                 // is assembled from them one identity at a time before falling back to the nullary zero that every
@@ -2366,7 +2362,7 @@ where
                 }
             }
         }
-        let (key, boundary_operand_count) = match batching {
+        let (key, boundary_input_count) = match batching {
             None => (
                 CustomRuleBackwardSpecializationKey {
                     leading_input_types: leading_values.iter().map(|value| value.r#type().into_owned()).collect(),
@@ -2401,17 +2397,17 @@ where
                         levels: batching.levels.clone(),
                         discharged,
                     },
-                    batching.boundary_operand_count(),
+                    batching.boundary_input_count(),
                 )
             }
         };
         let specialization = rules.backward_specialization(key)?;
 
-        // The specialized program consumes the boundary operands, then the live seeds, then the caller buffers, then
-        // the remaining known leading inputs, and returns the cotangents of the differentiated inputs with returned
+        // The specialized program consumes the boundary inputs, then the live seeds, then the caller buffers, then the
+        // remaining known leading inputs, and returns the cotangents of the differentiated inputs with returned
         // destinations.
         let mut leading_values = leading_values.into_iter();
-        let mut arguments = leading_values.by_ref().take(boundary_operand_count).collect::<Vec<_>>();
+        let mut arguments = leading_values.by_ref().take(boundary_input_count).collect::<Vec<_>>();
         arguments.extend(outputs.iter().filter_map(MaybeZero::as_value).cloned());
         arguments.extend(references);
         arguments.extend(leading_values);
@@ -4759,7 +4755,7 @@ mod tests {
             Err(TypeError::invalid("`custom_function` non-differentiated input count 2 exceeds input count 1")),
         );
 
-        // A batched call's leading inputs are the boundary operands of its batching levels, which a call that is
+        // A batched call's leading inputs are the boundary inputs of its batching levels, which a call that is
         // reconfigured after it was batched must still declare as non-differentiated.
         let definition = CustomRuleRegistration::new(
             IrDefinition::new("identity")
@@ -4801,11 +4797,11 @@ mod tests {
             }),
             Err(ProgramError::Type(error)) if error == TypeError::invalid(
                 "batched `custom_function` `identity` must have at least 1 non-differentiated inputs, which are the \
-                 boundary operands that its batching levels prepended to its inputs, but got 0",
+                 boundary inputs that its batching levels prepended to its inputs, but got 0",
             ),
         ));
 
-        // The batched call cannot be staged without the boundary operand of its batching level.
+        // The batched call cannot be staged without the boundary input of its batching level.
         let batched_type: ArrayIrType = batched.input_types()[1].clone();
         let batched_region =
             RegionInterface::new(vec![batched_type.clone()], vec![batched_type.clone()], EffectClasses::NONE);
@@ -4813,7 +4809,7 @@ mod tests {
             batched_operation.infer_output_types(&[batched_type], std::slice::from_ref(&batched_region)),
             Err(TypeError::invalid(
                 "batched `custom_function` `identity` has 1 inputs but its batching levels record 1 boundary \
-                 operands and 1 unbatched inputs",
+                 inputs and 1 unbatched inputs",
             )),
         );
     }
@@ -5760,7 +5756,7 @@ mod tests {
     fn test_custom_function_batching_retained_rules_custom_batching_rule() {
         // A custom batching rule takes precedence over structurally batching the primal region. This rule computes
         // `x · (x · x)` rather than the primal's `(x · x) · x`, which shows that it batched the call, and it declares
-        // the batch axes of its outputs. It is traced once per level and operand signature.
+        // the batch axes of its outputs. It is traced once per level and input signature.
         let invocations = Arc::new(AtomicUsize::new(0));
         let counters = Arc::new(RuleCounters::default());
         let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false).with_batching_rule({
@@ -8698,8 +8694,8 @@ mod tests {
         let driver = TestTranspositionDriver { region: backward.entry_region_ref() };
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
 
-        // Transposition validates the carrier's operand split independently of type inference, because a pullback may
-        // be built from an imported carrier whose operands were pruned after inference ran.
+        // Transposition validates the carrier's input split independently of type inference, because a pullback may be
+        // built from an imported carrier whose inputs were pruned after inference ran.
         let carrier = ArrayCustomFunctionTranspose::from_backward_region(1, vec![r#type.clone()], vec![r#type.clone()]);
         assert_eq!(
             carrier.transpose(&mut TranspositionContext::new(context.clone()), &driver, &[], &[], &[]),
@@ -8721,11 +8717,11 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_transpose_transposition_known_operand_cotangents() {
-        // The backward region of a carrier returns one cotangent per differentiated input, in operand order after the
-        // leading inputs. Leading operands are fixed primal parameters rather than linear inputs, and a *known*
-        // differentiated operand is not being differentiated, so both receive structural zeros while the replayed
-        // region's cotangents are assigned only to the unknown linear operands.
+    fn test_custom_function_transpose_transposition_known_input_cotangents() {
+        // The backward region of a carrier returns one cotangent per differentiated input, in input order after the
+        // leading inputs. Leading inputs are fixed primal parameters rather than linear inputs, and a *known*
+        // differentiated input is not being differentiated, so both receive structural zeros while the replayed
+        // region's cotangents are assigned only to the unknown linear inputs.
         let r#type = ArrayType::scalar(DataType::F64);
         let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let residual = transpose_builder.add_input(r#type.clone());

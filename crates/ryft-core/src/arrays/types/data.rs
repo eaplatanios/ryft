@@ -57,10 +57,10 @@ pub enum DataTypeError {
 /// The special `f*/c*` node does not correspond to a real [`DataType`] variant. Instead, it represents some standard
 /// floating-point or complex type that is already present in the expression involving the type that is being promoted.
 /// Dashed edges from `i64` and `u64` into that node indicate that these wide integer types do not move onto the
-/// floating-point or complex side of the lattice on their own, but they may do so when they are combined with an
-/// operand that is already on that side. Once that happens, the final result is determined by following the solid
-/// arrows on that branch starting at the type of that operand. When only `i64` and `u64` are involved, the result
-/// defaults to [`DataType::F64`] because no wider integer type exists.
+/// floating-point or complex side of the lattice on their own, but they may do so when they are combined with an input
+/// that is already on that side. Once that happens, the final result is determined by following the solid arrows on
+/// that branch starting at the type of that input. When only `i64` and `u64` are involved, the result defaults to
+/// [`DataType::F64`] because no wider integer type exists.
 ///
 /// The diagram intentionally omits [`DataType::Token`], [`DataType::Zero`], and the 4-bit, 6-bit, and 8-bit
 /// floating-point types because they have no promotion edges to other types. The specialized floating-point types can
@@ -680,7 +680,7 @@ pub enum DataTypeError {
 /// </div>
 ///
 /// Mixing any integer type with a standard floating-point or complex type yields the smallest result type on that
-/// branch that can represent both operands. For example, `i2 + f16 -> f16`, `u4 + f32 -> f32`, and `i64 + u64 -> f64`.
+/// branch that can represent both inputs. For example, `i2 + f16 -> f16`, `u4 + f32 -> f32`, and `i64 + u64 -> f64`.
 /// Low-precision custom floating-point types remain disconnected from the standard floating-point and complex part of
 /// the lattice. However, one of them may still become the final result when it is already present in the expression
 /// alongside another compatible custom floating-point type from the same disconnected group.
@@ -1169,8 +1169,8 @@ impl DataType {
     }
 
     /// Returns the number of bits that encode one value of this [`DataType`]. This is the element bit width that
-    /// [StableHLO's `bitcast_convert`](https://openxla.org/stablehlo/spec#bitcast_convert) uses to relate the shapes
-    /// of its operand and result, and it matches XLA's `primitive_util::BitWidth`. Sub-byte types report their exact
+    /// [StableHLO's `bitcast_convert`](https://openxla.org/stablehlo/spec#bitcast_convert) uses to relate the shapes of
+    /// its `operand` and `result`, and it matches XLA's `primitive_util::BitWidth`. Sub-byte types report their exact
     /// encoding width (e.g., `4` for [`DataType::I4`] and `6` for [`DataType::F6E2M3FN`]), [`DataType::Boolean`]
     /// reports `8` even though only `0` and `1` are valid values, complex types count both of their components (e.g.,
     /// `64` for [`DataType::C64`]), and [`DataType::Token`] and [`DataType::Zero`] report `0`.

@@ -308,11 +308,11 @@ pub const CLAMP_OPERATION_NAME: &str = "clamp";
 
 /// [`Operation`] that clamps its input elementwise into the interval delimited by a lower and an upper bound
 /// (i.e., `(lower, x, upper) ↦ min(max(x, lower), upper)`, same as for StableHLO's
-/// [`clamp`](https://openxla.org/stablehlo/spec#clamp)). The inputs are ordered as `[lower, input, upper]`, like the
-/// operands of StableHLO's `clamp`, and may have any Boolean or numeric element types, which are promoted to a common
-/// element type while their shapes are broadcast together. Crossed bounds (i.e., `lower > upper`) produce `upper`,
-/// and the NaN, signed-zero, and complex ordering semantics are those of [`MinOperation`] and [`MaxOperation`].
-/// Array inputs that still carry partial sums are rejected, and their reduced-axis markers must agree.
+/// [`clamp`](https://openxla.org/stablehlo/spec#clamp)). The inputs are ordered as `[lower, input, upper]`, like those
+/// of StableHLO's `clamp`, and may have any Boolean or numeric element types, which are promoted to a common element
+/// type while their shapes are broadcast together. Crossed bounds (i.e., `lower > upper`) produce `upper`, and the NaN,
+/// signed-zero, and complex ordering semantics are those of [`MinOperation`] and [`MaxOperation`]. Array inputs that
+/// still carry partial sums are rejected, and their reduced-axis markers must agree.
 ///
 /// For real inputs, the tangent follows JAX's [`clamp`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.clamp.html)
 /// using the input tangent where `lower < x < upper`, the lower-bound tangent where `x < lower < upper`, the
@@ -1487,15 +1487,15 @@ mod tests {
             cases = [
                 {
                     input_types = [reduced.clone(), plain.clone(), plain.clone()],
-                    error = "`clamp` operands must be reduced over the same axes",
+                    error = "`clamp` inputs must be reduced over the same axes",
                 },
                 {
                     input_types = [plain.clone(), plain.clone(), reduced.clone()],
-                    error = "`clamp` operands must be reduced over the same axes",
+                    error = "`clamp` inputs must be reduced over the same axes",
                 },
                 {
                     input_types = [reduced.clone(), plain, reduced],
-                    error = "`clamp` operands must be reduced over the same axes",
+                    error = "`clamp` inputs must be reduced over the same axes",
                 },
             ],
         );

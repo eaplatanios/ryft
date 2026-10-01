@@ -124,7 +124,7 @@ where
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Interpretation replays an already-built instruction, so the operand is borrowed from the environment rather
+        // Interpretation replays an already-built instruction, so the input is borrowed from the environment rather
         // than owned, and cloning it is the faithful replay as a clone names the same allocation, and so consuming it
         // invalidates the whole alias family exactly as the source program asked. The linearity the value-level
         // capability enforces is not weakened by the clone, because it was never this layer's to enforce (a staged
@@ -174,7 +174,7 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // Freezing a reference freezes its tangent reference alongside, so the final value pairs with the final tangent
         // contents. A plumbing reference carries no tangent reference, so its final value has a symbolic zero tangent.
-        // The operands are cloned before consumption for the same reason the interpretation rule clones them (the rule
+        // The inputs are cloned before consumption for the same reason the interpretation rule clones them (the rule
         // replays an already-built application over borrowed duals, and a clone names the same allocation).
         check_count!("input", inputs, 1, ProgramError);
         let primal = context.primal().bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
@@ -548,7 +548,7 @@ mod tests {
         let live = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         let reference = PartialEvaluationValue::known(TestIrValue::Reference(live.clone()));
 
-        // Under the `Stage` placement the freeze stays residual regardless of operand knowledge, so eager
+        // Under the `Stage` placement the freeze stays residual regardless of input knowledge, so eager
         // specialization never consumes live reference state.
         let staging =
             PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
@@ -695,7 +695,7 @@ mod tests {
             Ok(vec![TestIrValue::Array(Array::scalar(2.0_f32).unwrap())]),
         );
 
-        // The rule accumulates through the cotangent reference of its operand's root, which only a transposition
+        // The rule accumulates through the cotangent reference of its input's root, which only a transposition
         // context scoped to the freeze instruction can resolve, so a detached context rejects a live result cotangent.
         let inputs = [PartialValue::Unknown(reference_type)];
         let tracing = TracingContext::<TestIrValue, TestIrOperation>::new();

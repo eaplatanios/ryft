@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn test_transpose_partial_evaluation() {
-        // Check standard partial evaluation with known and residual operands.
+        // Check standard partial evaluation with known and residual inputs.
         let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let expected = Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]).unwrap();
         check_operation_partial_evaluation!(

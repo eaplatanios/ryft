@@ -21,9 +21,9 @@ enum InputRegionProvenance {
     /// No input origin is declared.
     None,
 
-    /// The region input corresponds to an operation operand.
+    /// The region input corresponds to an instruction input.
     Input {
-        /// Position of the supplying operation operand.
+        /// Position of the supplying instruction input.
         index: usize,
     },
 
@@ -1725,7 +1725,7 @@ fn test_operation_default_crate_path_is_ryft() {
 /// real `ryft` member vocabulary instead of stand-ins, because the mixed contracts the derive emits against
 /// ([`MemberOperation`](ryft::MemberOperation), the member zero constructor selected per output universe, and
 /// [`transpose_mixed_operation`](ryft::transpose_mixed_operation)) are defined over real member universes, and a
-/// stand-in could not pin how the real machinery classifies an interleaved operand list.
+/// stand-in could not pin how the real machinery classifies an interleaved input list.
 mod mixed_members {
     use ryft::arrays::Array;
     use ryft::{
@@ -1739,9 +1739,9 @@ mod mixed_members {
         Value, ZeroOperation, check_count,
     };
 
-    /// Member payload whose parent instruction interleaves its two array data operands with two first-class dimension
-    /// operands. No production payload arranges its operands this way, so this fixture is what pins that the generated
-    /// mixed dispatchers classify operands individually instead of splitting on the first dimension operand.
+    /// Member payload whose parent instruction interleaves its two array data inputs with two first-class dimension
+    /// inputs. No production payload arranges its inputs this way, so this fixture is what pins that the generated
+    /// mixed dispatchers classify inputs individually instead of splitting on the first dimension input.
     #[derive(Clone, Debug)]
     struct InterleavedOperation;
 
@@ -1758,7 +1758,7 @@ mod mixed_members {
             _region_interfaces: &[RegionInterface<ArrayType>],
         ) -> Result<Vec<ArrayType>, TypeError> {
             if input_types.len() != 2 {
-                return Err(TypeError::invalid("interleaved expects two array operands"));
+                return Err(TypeError::invalid("interleaved expects two array inputs"));
             }
             Ok(vec![input_types[0].clone()])
         }
@@ -1779,7 +1779,7 @@ mod mixed_members {
             _region_interfaces: &[RegionInterface<ArrayIrType>],
         ) -> Result<Vec<ArrayIrType>, TypeError> {
             // The parent boundary is `(array, dimension, array, dimension) -> array`, so the payload's own homogeneous
-            // rule sees the two array operands and the dimension operands only select the result geometry.
+            // rule sees the two array inputs and the dimension inputs only select the result geometry.
             let arrays = input_types
                 .iter()
                 .filter_map(|r#type| <&ArrayType>::try_from(r#type).ok())
@@ -1817,8 +1817,8 @@ mod mixed_members {
             inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, ryft::DifferentiationError> {
             let context = context.primal();
-            // A linear payload pushes its tangents through the same mixed instruction, keeping the geometry operands
-            // as primals.
+            // A linear payload pushes its tangents through the same mixed instruction, keeping the geometry inputs as
+            // primals.
             let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
             let primal = context.bind(self.clone(), Vec::new(), primals.as_slice())?.remove(0);
             Ok(vec![DifferentiationDual::new(primal, inputs[0].tangent().clone())?])
@@ -1848,7 +1848,7 @@ mod mixed_members {
             check_count!("input", inputs, 2, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 2, DifferentiationError);
-            // The homogeneous rule sees only array operands and submits each requested linear contribution.
+            // The homogeneous rule sees only array inputs and submits each requested linear contribution.
             for (input, accumulator) in inputs.iter().zip(accumulators) {
                 if matches!(input, PartialValue::Unknown(_)) {
                     accumulator.accumulate(context, outputs[0].clone())?;
@@ -1990,7 +1990,7 @@ mod mixed_members {
     #[ryft(members(ArrayType, structural(DimensionType)))]
     #[ryft(dispatch(differentiation, transposition))]
     enum MixedProgramOperation<A: Value<Type = ArrayType>> {
-        /// Computational mixed payload whose parent instruction interleaves array and dimension operands.
+        /// Computational mixed payload whose parent instruction interleaves array and dimension inputs.
         #[ryft(mixed)]
         Interleaved(InterleavedOperation),
 
@@ -2093,7 +2093,7 @@ mod mixed_members {
         type Operation = MixedProgramOperation<Array>;
 
         // A bare `mixed` marker declares the same computational data universe the family declares, so base inference
-        // still runs through the payload's parent boundary and accepts the interleaved operand arrangement.
+        // still runs through the payload's parent boundary and accepts the interleaved input arrangement.
         let (array_type, dimension_type) = fixture_types();
         let operation = Operation::from(InterleavedOperation);
         assert_eq!(operation.name(), "interleaved");
@@ -2110,8 +2110,8 @@ mod mixed_members {
             Ok(vec![array_type.clone().into()]),
         );
 
-        // Transposing that interleaved instruction delegates the array operands, in operand order, to the payload's
-        // homogeneous rule and gives each interleaved dimension operand a structural zero cotangent.
+        // Transposing that interleaved instruction delegates the array inputs, in input order, to the payload's
+        // homogeneous rule and gives each interleaved dimension input a structural zero cotangent.
         let context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
         let output_cotangent = context.input(array_type.clone().into());
         let inputs = [
@@ -2139,7 +2139,7 @@ mod mixed_members {
             MaybeZero::Zero(fourth_cotangent_type),
         ] = cotangents.as_slice()
         else {
-            panic!("interleaved mixed transposition must classify each operand: {cotangents:?}");
+            panic!("interleaved mixed transposition must classify each input: {cotangents:?}");
         };
         assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
         assert_eq!(third_cotangent.atom_id(), output_cotangent.atom_id());

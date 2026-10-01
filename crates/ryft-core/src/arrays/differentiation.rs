@@ -27,9 +27,9 @@ use crate::tracing::{Tracer, TracingContext};
 impl<O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>>> ResidualZeroProvider<ArrayType> for O {}
 
 // Array-IR operation families share declaration, capture, and assembly regardless of their backend representation.
-// Static zeros use the family's `OperationProvider`. Dynamic zeros consume one extent operand per dynamic axis.
+// Static zeros use the family's `OperationProvider`. Dynamic zeros consume one extent input per dynamic axis.
 // Captured residuals contain one extent per distinct dimension identity, in first-occurrence order. Assembly expands
-// repeated identities back into the constructor's per-axis operand order. Builder-level capture reads each identity's
+// repeated identities back into the constructor's per-axis input order. Builder-level capture reads each identity's
 // first axis from the ordinary primal array. Value-level capture also accepts first-class dimensions and references
 // (i.e., a dimension with the requested identity is reused, an array supplies a `DimensionSizeOperation` read, and a
 // reference is read before obtaining its referent's extent). A source is inspected before staging anything, so a
@@ -134,7 +134,7 @@ where
         residuals: &[R],
     ) -> Result<(O, Vec<R>), ProgramError> {
         // Capture stores one residual per distinct dimension identity, even when that identity occurs on
-        // several axes. Validate that compact list before expanding it into constructor operands.
+        // several axes. Validate that compact list before expanding it into constructor inputs.
         let array_type = <&ArrayType>::try_from(&r#type)?;
         let (shape, first_axes) = ExactShape::for_residual_zero(array_type.shape());
         let expected_residual_count = first_axes.len();
@@ -148,14 +148,14 @@ where
         }
 
         if expected_residual_count == 0 {
-            // Static zeros need no extent operands. Preserve the family's provider choice and reuse the owned type.
+            // Static zeros need no extent inputs. Preserve the family's provider choice and reuse the owned type.
             return Ok((Self::provide(ZeroOperation::new(r#type), &[])?, Vec::new()));
         }
 
-        // Dynamic constructors take one operand per dynamic axis: a shape [n, n, m] expands residuals [n, m]
-        // into operands [n, n, m]. Static axes stay in the stored type and consume no operand.
-        let operands = shape.dynamic_dimensions(residuals);
-        Ok((O::from(ZeroOperation::new(array_type.clone())), operands))
+        // Dynamic constructors take one input per dynamic axis: a shape [n, n, m] expands residuals [n, m]
+        // into inputs [n, n, m]. Static axes stay in the stored type and consume no input.
+        let zero_inputs = shape.dynamic_dimensions(residuals);
+        Ok((O::from(ZeroOperation::new(array_type.clone())), zero_inputs))
     }
 }
 
@@ -208,7 +208,7 @@ impl ExactShape {
     /// Materializes one first-class dimension value per axis of this shape in `context` (typically an attached region
     /// body). Static axes stage a [`DimensionValue`] [`ConstantOperation`], while dynamic axes clone the residual
     /// value their slot refers to. The result has exactly one value per axis, in axis order, ready to be consumed by
-    /// operations that take one dimension operand per output axis.
+    /// operations that take one dimension input per output axis.
     ///
     /// # Parameters
     ///
@@ -232,17 +232,17 @@ impl ExactShape {
     }
 
     /// Returns the residual values required by mixed dynamic array constructors, in dynamic-axis order. Constructors
-    /// such as the dynamic zero consume one dimension operand per _dynamic_ axis, in axis order, while this plan stores
-    /// deduplicated residual slots. This method expands the plan back into that operand convention: static axes
-    /// contribute nothing, and repeated identities intentionally produce repeated operands referring to the one
+    /// such as the dynamic zero consume one dimension input per _dynamic_ axis, in axis order, while this plan stores
+    /// deduplicated residual slots. This method expands the plan back into that input convention: static axes
+    /// contribute nothing, and repeated identities intentionally produce repeated inputs referring to the one
     /// shared residual value.
     ///
     /// # Parameters
     ///
     ///   - `residuals`: Residual values indexed by this plan's residual slots.
     pub fn dynamic_dimensions<V: Clone>(&self, residuals: &[V]) -> Vec<V> {
-        // Mixed array constructors consume one operand per dynamic axis. Expand deduplicated residual slots back into
-        // axis order here, so repeated identities intentionally produce repeated operands.
+        // Mixed array constructors consume one input per dynamic axis. Expand deduplicated residual slots back into
+        // axis order here, so repeated identities intentionally produce repeated inputs.
         self.0
             .iter()
             .filter_map(|dimension| match dimension {
@@ -280,12 +280,12 @@ pub enum ExactShapeDimension {
 ///
 /// A linear call's attached forward and transpose [`Region`](crate::Region)s later run without access to the primal
 /// trace, so everything they need from it must cross the call boundary as ordinary trailing Single Static Assignment
-/// (SSA) operands, called _residuals_. A rule retains values one by one while building its regions, remembers the
-/// returned indices, and finally passes [`Self::into_values`] as the staged linear call's residual operand list.
+/// (SSA) instruction inputs, called _residuals_. A rule retains values one by one while building its regions, remembers
+/// the returned indices, and finally passes [`Self::into_values`] as the staged linear call's residual input list.
 /// Inside a region, the same indices address the region's residual inputs.
 ///
 /// The most important residuals in the array universe are exact runtime extents. A transpose region typically has to
-/// construct values with the exact shape of a primal _operand_ (e.g., the zero-padded cotangent of a slice), and that
+/// construct values with the exact shape of a primal _input_ (e.g., the zero-padded cotangent of a slice), and that
 /// shape is neither recoverable from the region's cotangent inputs nor from any ambient side channel, because runtime
 /// dimensions are ordinary Single Static Assignment (SSA) values. [`Self::retain_shape`] reads such extents from primal
 /// arrays with [`DimensionSizeOperation`] on demand, and [`ExactShape`] is the compile-time plan that lets a region
@@ -294,7 +294,7 @@ pub enum ExactShapeDimension {
 /// Dynamic dimension definitions are deduplicated by identity. Retaining a dimension-typed value whose
 /// [`DimensionType`] carries no concrete extent reuses the slot of any previously retained residual with the same
 /// [`DimensionVariable`], because a variable that appears several times (across axes, or as both an axis and an
-/// explicit dimension operand) denotes one runtime extent. This keeps operand lists minimal and, more importantly,
+/// explicit dimension input) denotes one runtime extent. This keeps input lists minimal and, more importantly,
 /// preserves the type-level equality between axes when shapes are reconstructed inside the attached regions. All other
 /// valid differential residuals (i.e., ordinary arrays and dimensions whose types already pin a concrete extent) are
 /// purely positional: every retention appends a new slot, and the values themselves are never inspected. References
@@ -302,7 +302,7 @@ pub enum ExactShapeDimension {
 /// [`DifferentiableType`](crate::DifferentiableType)) before a valid linearization can retain them.
 #[derive(Clone, Debug)]
 pub struct LinearResiduals<V: Value<Type = ArrayIrType>> {
-    /// Retained residual [`Value`]s, in the trailing-operand order of the staged linear call. Indices returned by the
+    /// Retained residual [`Value`]s, in the trailing-input order of the staged linear call. Indices returned by the
     /// retention methods point into this list and stay valid because the list is append-only.
     values: Vec<V>,
 }
@@ -321,7 +321,7 @@ impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
     }
 
     /// Consumes this residual list and returns its values, in residual-slot order. The result is what a rule passes
-    /// as the residual operand list when staging its [`LinearCallOperation`](crate::LinearCallOperation).
+    /// as the residual input list when staging its [`LinearCallOperation`](crate::LinearCallOperation).
     #[inline]
     pub fn into_values(self) -> Vec<V> {
         self.values
@@ -468,8 +468,8 @@ fn sum_mapped_array_cotangents<V: Typed<Type = ArrayType> + Reduce>(
     Ok(cotangent.reduce(&[normalized_axis], ReductionKind::Sum)?)
 }
 
-/// Materializes one array operand's forward-mode tangent as a concrete projected array value, reading whatever runtime
-/// geometry the tangent type omits from the operand's primal. A mixed array rule that has to hand a concrete tangent to
+/// Materializes one array input's forward-mode tangent as a concrete projected array value, reading whatever runtime
+/// geometry the tangent type omits from the input's primal. A mixed array rule that has to hand a concrete tangent to
 /// a staged operation cannot always materialize a structural zero from its type (an [`ArrayType`] with symbolic extents
 /// names its dynamic extents by [`DimensionVariable`] rather than pinning them, so the type-only nullary
 /// [`ZeroOperation`] is unconstructible for it). The primal names every one of those extents, because the tangent type
@@ -477,7 +477,7 @@ fn sum_mapped_array_cotangents<V: Typed<Type = ArrayType> + Reduce>(
 ///
 /// The zero is therefore staged through the *mixed* parent family's residual protocol rather than the projected array
 /// view, and the result is projected back. That is deliberate: the mixed family owns the dynamic zero constructor that
-/// consumes one first-class dimension operand per dynamic axis, while the projected homogeneous family has only the
+/// consumes one first-class dimension input per dynamic axis, while the projected homogeneous family has only the
 /// nullary form. Routing through the parent is also what makes widened tangent representations (e.g., the `f32` tangent
 /// of an `f8e8m0fnu` primal) work at a dynamic shape, which naming the primal's whole type as an exemplar could not.
 /// Identity-free tangent types declare no residuals and keep the canonical nullary zero, whose zero-producing marker
@@ -684,22 +684,22 @@ mod tests {
         let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), rows.into(), columns.into()]));
         let residuals = [AtomId::new(5), AtomId::new(8)];
-        let (operation, operands) =
+        let (operation, zero_inputs) =
             ArrayIrOperation::<Array>::zero_operation_with_residuals(r#type.clone().into(), &residuals).unwrap();
         assert!(matches!(operation, ArrayIrOperation::Zero(operation) if operation.r#type() == &r#type));
-        assert_eq!(operands, vec![residuals[0], residuals[0], residuals[1]]);
+        assert_eq!(zero_inputs, vec![residuals[0], residuals[0], residuals[1]]);
         assert_eq!(
             ArrayIrOperation::<Array>::zero_operation_with_residuals(r#type.into(), &residuals[..1],).map(|_| ()),
             Err(ProgramError::InvalidArgument { message: "dynamic zero expected 2 extent residuals but got 1".into() }),
         );
         let static_type = ArrayType::scalar(DataType::F32);
-        let (operation, operands) =
+        let (operation, zero_inputs) =
             ArrayIrOperation::<Array>::zero_operation_with_residuals(static_type.clone().into(), &[] as &[AtomId])
                 .unwrap();
         assert!(
             matches!(operation, ArrayIrOperation::Array(ArrayOperation::Zero(operation)) if operation.r#type() == &static_type)
         );
-        assert_eq!(operands, Vec::<AtomId>::new());
+        assert_eq!(zero_inputs, Vec::<AtomId>::new());
     }
 
     #[test]
@@ -958,7 +958,7 @@ mod tests {
         );
         assert_eq!(first_axes, vec![(1, n.variable().clone()), (4, m.variable().clone())]);
 
-        // Dynamic-constructor operand expansion is in axis order and intentionally repeats shared slots.
+        // Dynamic-constructor input expansion is in axis order and intentionally repeats shared slots.
         assert_eq!(plan.dynamic_dimensions(&["n", "m"]), vec!["n", "n", "m"]);
 
         // Transposing copies output axis `i` from source axis `permutation[i]`, preserving residual slot indices.

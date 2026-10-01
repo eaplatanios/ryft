@@ -107,11 +107,11 @@ pub enum ReductionKind {
     /// Numeric product reduction. The identity is `1` and the combiner is multiplication. Floating-point inputs
     /// narrower than `f32` accumulate in `f32` before conversion back to the input data type. Integer products wrap
     /// in their input type. Note that, complex multiplication by `1 + 0i` is not exact for infinite components (its
-    /// zero imaginary component meets them as `0 · ∞ = NaN`), so a complex operand that is exactly `1 + 0i` returns
-    /// the other operand instead, which keeps the identity inert and complex infinities intact on every backend.
-    /// Structural zeros are unsupported because their type cannot represent the empty product. Differentiation requires
-    /// a static input shape and replicates reduced dimensions partitioned over explicit mesh axes before constructing
-    /// the pairwise product rule.
+    /// zero imaginary component meets them as `0 · ∞ = NaN`), so a complex factor that is exactly `1 + 0i` yields the
+    /// other factor instead, which keeps the identity inert and complex infinities intact on every backend. Structural
+    /// zeros are unsupported because their type cannot represent the empty product. Differentiation requires a static
+    /// input shape and replicates reduced dimensions partitioned over explicit mesh axes before constructing the
+    /// pairwise product rule.
     Product,
 
     /// Numeric mean reduction defined as a [`Sum`](Self::Sum) divided by the product of reduced extents. Narrow
@@ -1497,7 +1497,7 @@ impl Array {
     }
 }
 
-/// Multiplies two elements of a product reduction or product scan, returning the other operand when a complex operand
+/// Multiplies two elements of a product reduction or product scan, returning the other factor when a complex factor
 /// is exactly `1 + 0i`. Complex multiplication by that identity is not exact for infinite components (its zero
 /// imaginary component meets them as `0 · ∞ = NaN`), and the XLA lowering of the same products applies the same rule,
 /// so the two backends agree on every input, including inputs whose elements are themselves exactly `1 + 0i`. Real

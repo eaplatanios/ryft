@@ -1378,12 +1378,11 @@ impl OperationEnum {
 
     /// Generates the [`ReferenceDischargeableOperation`](ryft_core::ReferenceDischargeableOperation) dispatcher. The
     /// reference universe policy stays fully generic for every family, because a policy names the reference universe
-    /// being threaded rather than the element universe the family's values belong to. Composite-native variants
-    /// and bare generic extension variants delegate to their payload's own discharge rule, while member variants
-    /// replay the complete enum through
-    /// [`discharge_reference_free_operation`](ryft_core::discharge_reference_free_operation), which copies any
-    /// attached regions across unchanged and rejects a reference operand or a region closure that reaches a
-    /// reference.
+    /// being threaded rather than the element universe the family's values belong to. Composite-native variants and
+    /// bare generic extension variants delegate to their payload's own discharge rule, while member variants replay the
+    /// complete enum through [`discharge_reference_free_operation`](ryft_core::discharge_reference_free_operation),
+    /// which copies any attached regions across unchanged and rejects a reference instruction input or a region closure
+    /// that reaches a reference.
     fn generate_reference_dischargeable_operation(&self) -> TokenStream {
         let variants = &self.variants;
         let ryft = &self.ryft_crate;
@@ -1555,7 +1554,7 @@ impl OperationEnum {
                     });
                 }
                 // A structural mixed payload stages its own primal and a matching zero tangent over the same
-                // parent-universe operands, so the dispatcher needs the member zero constructor and the member view of
+                // parent-universe inputs, so the dispatcher needs the member zero constructor and the member view of
                 // the payload's declared parent output types.
                 OperationVariantClass::MixedMember { member_type, structural: true } => {
                     where_clause.predicates.push(syn::parse_quote! {
@@ -1623,11 +1622,12 @@ impl OperationEnum {
                                     #member_method(#receiver, context, driver, inputs)
                             },
                         },
-                        // A structural mixed payload is constant with respect to its parent-universe operands, but its zero
-                        // tangent still needs the runtime geometry those operands carry. Stage the primal and the member zero
-                        // over the same operands so the geometry stays available to both. Each output's zero tangent is staged
-                        // in the computational member universe that output belongs to, and an output outside every such
-                        // universe (e.g., a structural member output) has a zero differential space and needs no instruction.
+                        // A structural mixed payload is constant with respect to its parent-universe inputs, but its
+                        // zero tangent still needs the runtime geometry those inputs carry. Stage the primal and the
+                        // member zero over the same inputs so the geometry stays available to both. Each output's zero
+                        // tangent is staged in the computational member universe that output belongs to, and an output
+                        // outside every such universe (e.g., a structural member output) has a zero differential space
+                        // and needs no instruction.
                         OperationVariantClass::MixedMember { member_type, structural: true } => {
                             let tangent_universe_arms = self.tangent_universes(member_type).into_iter().map(|member_type| {
                                 quote! {
@@ -3200,7 +3200,7 @@ mod tests {
 
         // The structural mixed role keeps the shared mixed base, interpretation, batching, and transposition dispatch
         // while replacing only the forward-mode arm with a generated primal plus member zero tangent over the same
-        // parent-universe operands.
+        // parent-universe inputs.
         assert!(generated.contains("ryft::ZeroOperation<ArrayType>,>>::from(ryft::ZeroOperation::new(tangent_type))"));
         assert!(generated.contains("Self::DynamicZero(operation)=>{letprimal_inputs"));
 

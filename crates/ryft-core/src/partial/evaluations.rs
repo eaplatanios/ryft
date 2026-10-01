@@ -64,7 +64,7 @@ impl<C: Context> PartialEvaluation<C> {
     /// A known reference input carries a live handle and not a snapshot of its mutable contents. Under an eager known
     /// side it is the handle itself. Under a staging known side it is the tracer naming the outer program's reference
     /// atom. The residual program therefore observes the state when it runs. Such an input is needed when an access
-    /// must stage (e.g., because of an unknown operand, an earlier deferred ordered effect, or
+    /// must stage (e.g., because of an unknown instruction input, an earlier deferred ordered effect, or
     /// [`Stage`](ReferencePlacement::Stage) placement) or when the residual program forwards the handle.
     ///
     /// Reference-typed program constants are excluded too: replay lifts them inline, so the residual program reaches

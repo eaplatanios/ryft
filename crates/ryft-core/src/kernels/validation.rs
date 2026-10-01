@@ -1,25 +1,25 @@
 //! Backend-independent validation of preserved-reference kernel bodies.
 //!
-//! A kernel's array operands enter as reference-typed region inputs. Its body reads and mutates them through ordinary
-//! reference operations and transforms, then publishes updated arrays at its outer, array-typed boundary. This module
-//! validates those reference accesses using the [`ArrayReferenceAnalysis`] retained on the body region through
+//! A kernel's array inputs enter its body as reference-typed region inputs. Its body reads and mutates them through
+//! ordinary reference operations and transforms, then publishes updated arrays at its outer, array-typed boundary. This
+//! module validates those reference accesses using the [`ArrayReferenceAnalysis`] retained on the body region through
 //! [`RegionRef::reference_view_analysis`]. A [`KernelBoundaryContract`] declares one [`KernelParameterAccess`] per
 //! reference-typed input. These analyses run explicitly for kernel validation; neither is a standing lint on ordinary
 //! programs.
 //!
-//! Read-only operands contain their entering values and publish nothing; read-write operands contain their entering
+//! Read-only inputs contain their entering values and publish nothing; read-write inputs contain their entering
 //! values and publish an updated result. Write-only results start uninitialized, so this boundary admits stores and
 //! rejects reads. A swap whose old-value result is provably dead is admitted as a plain store, while a live old-value
 //! result requires read-write access. [`KernelReferenceSummary::swap_lowering`] records this classification for each
 //! swap so that lowering does not re-derive it. This access check does not prove that every output element has been
 //! initialized; complete initialization and publication require the kernel's separate coverage analysis.
 //!
-//! Kernel bodies publish no references, capture no references, and never consume their operands. Generic reference
+//! Kernel bodies publish no references, capture no references, and never consume their inputs. Generic reference
 //! analysis rejects reference-typed constants and consumption of entering roots. Its region access policies and
 //! root-only boundaries also cover nested control flow; a nested swap is classified by its own region's liveness.
 //!
-//! Scratch bindings are deliberately unsupported: a scratch operand starts uninitialized, so admitting it requires the
-//! definite-initialization analysis that lands with uninitialized allocation semantics.
+//! Scratch bindings are deliberately unsupported: a scratch reference starts uninitialized, so admitting it requires
+//! the definite-initialization analysis that lands with uninitialized allocation semantics.
 //!
 //! The validator is attached to a standalone body region today.
 // TODO(eaplatanios): Phase 7 attaches this validator to the real kernel operation.
@@ -44,7 +44,7 @@ use crate::programs::{
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum KernelValidationError {
     /// The array view overlay or the generic reference analysis rejected the body. This covers reference-typed
-    /// constants (kernel bodies capture no references) and consumption of an entering operand, both of which the
+    /// constants (kernel bodies capture no references) and consumption of an entering kernel input, both of which the
     /// generic lifetime and capture rules reject before any kernel-specific rule runs.
     #[error(transparent)]
     Analysis(#[from] ReferenceViewAnalysisError),
@@ -87,7 +87,7 @@ pub enum KernelValidationError {
         output_index: usize,
     },
 
-    /// An access performed on a kernel operand, directly or inside a nested region, is not admitted by the operand's
+    /// An access performed on a kernel input, directly or inside a nested region, is not admitted by the input's
     /// declared access.
     #[error(
         "operation `{operation}` at {instruction} performs a `{mode}` access on kernel input {input_index}, which the \
@@ -112,7 +112,7 @@ pub enum KernelValidationError {
 }
 
 /// Operation-local reference semantics used by kernel boundary validation. Implementations identify an old-value
-/// result only for a swap whose first reference operand is read and replaced; the result index must exist and denote
+/// result only for a swap whose first reference input is read and replaced; the result index must exist and denote
 /// exactly that previous value. Ordinary read-write operations and unrecognized extensions return `None`.
 pub trait KernelReferenceOperation:
     ReferenceAccessOperation<Type = ArrayIrType, Transform = ArrayReferenceTransform>
@@ -129,17 +129,17 @@ impl<A: Value<Type = ArrayType>> KernelReferenceOperation for ArrayIrOperation<A
     }
 }
 
-/// Access that a kernel declares for one reference-typed operand of its body.
+/// Access that a kernel declares for one reference-typed input of its body.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum KernelParameterAccess {
-    /// The operand contains its entering value and publishes nothing; the body may only read it.
+    /// The input contains its entering value and publishes nothing; the body may only read it.
     ReadOnly,
 
-    /// The operand starts uninitialized and publishes its final value; the body may only write it, including through
+    /// The input starts uninitialized and publishes its final value; the body may only write it, including through
     /// swaps whose old-value result is provably dead.
     WriteOnly,
 
-    /// The operand contains its entering value and publishes its final value; the body may perform every
+    /// The input contains its entering value and publishes its final value; the body may perform every
     /// non-consuming access on it.
     ReadWrite,
 }
@@ -156,7 +156,7 @@ impl Display for KernelParameterAccess {
 }
 
 /// Declared accesses of one kernel body, with exactly one entry per body input: [`Some`] for every reference-typed
-/// operand and [`None`] for every ordinary array or scalar input. [`validate_kernel_body`] checks the declaration
+/// input and [`None`] for every ordinary array or scalar input. [`validate_kernel_body`] checks the declaration
 /// against the body.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KernelBoundaryContract {
@@ -174,7 +174,7 @@ impl KernelBoundaryContract {
 
     /// Creates a new [`KernelBoundaryContract`] that additionally binds program-local scratch allocations with the
     /// provided referent types. Scratch is currently rejected with [`KernelValidationError::ScratchUnsupported`]
-    /// whenever `scratch` is non-empty, because a scratch operand starts uninitialized and admitting it requires the
+    /// whenever `scratch` is non-empty, because a scratch reference starts uninitialized and admitting it requires the
     /// definite-initialization analysis that lands together with uninitialized allocation semantics.
     // TODO(eaplatanios): Phase 9 supplies uninitialized allocation semantics and turns this into a real scratch
     // binding.
@@ -198,58 +198,58 @@ impl KernelBoundaryContract {
 /// Lowering of one `reference_swap` inside a kernel body, chosen by the liveness of its old-value result.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum KernelSwapLowering {
-    /// The old-value result is provably dead, so the swap is a plain store that never reads the operand.
+    /// The old-value result is provably dead, so the swap is a plain store that never reads the reference.
     Store,
 
-    /// The old-value result is live, so the swap reads the operand before replacing it.
+    /// The old-value result is live, so the swap reads the reference before replacing it.
     Exchange,
 }
 
-/// Validated facts about one reference-typed kernel operand.
+/// Validated facts about one reference-typed kernel input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelParameterSummary {
-    /// Root of the operand in the body region.
+    /// Root of the input in the body region.
     root: ReferenceRoot,
 
-    /// Declared access of the operand.
+    /// Declared access of the input.
     access: KernelParameterAccess,
 
-    /// Every access mode observed on the operand, directly or inside nested regions.
+    /// Every access mode observed on the input, directly or inside nested regions.
     modes: BTreeSet<ReferenceAccessMode>,
 
-    /// Whether any observed access mutates the operand.
+    /// Whether any observed access mutates the input.
     mutated: bool,
 }
 
 impl KernelParameterSummary {
-    /// Returns the root of the operand in the body region.
+    /// Returns the root of the input in the body region.
     #[inline]
     pub fn root(&self) -> ReferenceRoot {
         self.root
     }
 
-    /// Returns the declared access of the operand.
+    /// Returns the declared access of the input.
     #[inline]
     pub fn access(&self) -> KernelParameterAccess {
         self.access
     }
 
-    /// Returns every access mode observed on the operand, directly or inside nested regions, in
-    /// [`ReferenceAccessMode`] declaration order.
+    /// Returns every access mode observed on the input, directly or inside nested regions, in [`ReferenceAccessMode`]
+    /// declaration order.
     #[inline]
     pub fn modes(&self) -> &BTreeSet<ReferenceAccessMode> {
         &self.modes
     }
 
-    /// Returns whether any observed access writes, swaps, or accumulates into the operand.
+    /// Returns whether any observed access writes, swaps, or accumulates into the input.
     #[inline]
     pub fn is_mutated(&self) -> bool {
         self.mutated
     }
 }
 
-/// Result of [`validate_kernel_body`]: the array view overlay of the body together with the per-operand summaries and
-/// the lowering of every swap in the body.
+/// Result of [`validate_kernel_body`]: the array view overlay of the body together with the per-input summaries and the
+/// lowering of every swap in the body.
 #[derive(Clone, Debug)]
 pub struct KernelReferenceSummary {
     /// Array view overlay of the body, shared with the region's transform cache.
@@ -269,8 +269,8 @@ impl KernelReferenceSummary {
         &self.analysis
     }
 
-    /// Returns the summary of the operand at `input_index`, or [`None`] when that input is not a reference or is out
-    /// of range.
+    /// Returns the summary of the input at `input_index`, or [`None`] when that input is not a reference or is out of
+    /// range.
     #[inline]
     pub fn parameter(&self, input_index: usize) -> Option<&KernelParameterSummary> {
         self.parameters.get(input_index).and_then(Option::as_ref)
@@ -301,16 +301,16 @@ impl KernelReferenceSummary {
 
 /// Validates the kernel body `region` against `contract` and returns its [`KernelReferenceSummary`].
 ///
-/// The body's [`ArrayReferenceAnalysis`] is obtained through the cached [`RegionRef::reference_view_analysis`]
-/// accessor under an empty capture scope, so every reference-typed constant is rejected and a body validated twice is
-/// analyzed once. The contract must declare exactly one entry per body input, [`Some`] for every reference-typed input
-/// and [`None`] for every other input. The body may publish no reference and may not consume an operand. Every access
-/// observed on an operand, directly or inside nested regions, must be admitted by its declared
-/// access: a read-only operand admits reads only; a write-only operand admits writes and swaps whose old-value result
-/// is provably dead (not used by any instruction of its region and not a region output), which lower as
-/// [`KernelSwapLowering::Store`]; a read-write operand admits every non-consuming access. Every swap in the body is
+/// The body's [`ArrayReferenceAnalysis`] is obtained through the cached [`RegionRef::reference_view_analysis`] accessor
+/// under an empty capture scope, so every reference-typed constant is rejected and a body validated twice is analyzed
+/// once. The contract must declare exactly one entry per body input, [`Some`] for every reference-typed input and
+/// [`None`] for every other input. The body may publish no reference and may not consume an input. Every access
+/// observed on a reference input, directly or inside nested regions, must be admitted by its declared access: a
+/// read-only input admits reads only; a write-only input admits writes and swaps whose old-value result is provably
+/// dead (not used by any instruction of its region and not a region output), which lower as
+/// [`KernelSwapLowering::Store`]; a read-write input admits every non-consuming access. Every swap in the body is
 /// classified as [`KernelSwapLowering::Store`] or [`KernelSwapLowering::Exchange`] by the same liveness rule,
-/// regardless of the operand it targets.
+/// regardless of the reference it targets.
 ///
 /// # Errors
 ///
@@ -360,9 +360,9 @@ where
         return Err(KernelValidationError::ReferenceOutput { output_index });
     }
 
-    // Direct accesses inside nested regions are recorded against the nested region's own inputs, which the bindings
-    // map back to the roots they denote in the attaching region; following the bindings up to the body region yields
-    // the operands an access reaches. A shared region attached under different operands reaches all of them.
+    // Direct accesses inside nested regions are recorded against the nested region's own inputs, which the bindings map
+    // back to the roots they denote in the attaching region; following the bindings up to the body region yields the
+    // kernel inputs an access reaches. A shared region attached with different reference inputs reaches all of them.
     let mut bindings = BTreeMap::<ReferenceRoot, BTreeSet<ReferenceRoot>>::new();
     for binding in generic.region_input_bindings() {
         // Bound inputs are reference-typed inputs of the attached region, which the analysis resolved before recording
@@ -389,10 +389,10 @@ where
         } else {
             None
         };
-        let mut operands = BTreeSet::new();
-        entry_roots(access.root(), entry, &bindings, &mut operands);
-        for root in operands {
-            // Every root of the body region is a reference-typed input and therefore a declared operand.
+        let mut kernel_roots = BTreeSet::new();
+        entry_roots(access.root(), entry, &bindings, &mut kernel_roots);
+        for root in kernel_roots {
+            // Every root of the body region is a reference-typed input and therefore has a declared access.
             let (input_index, declared) = accesses_by_root[&root];
             let admitted = match declared {
                 KernelParameterAccess::ReadOnly => mode == ReferenceAccessMode::Read,
@@ -423,21 +423,21 @@ fn is_dead<V: Value, O: Operation<Type = V::Type>>(region: RegionRef<'_, V, O>, 
         && !region.instructions().iter().any(|instruction| instruction.inputs().contains(&atom))
 }
 
-/// Collects into `operands` the roots of the body region `entry` that `root` denotes, following nested region input
-/// bindings upward. Allocations local to the body or to a nested region denote no operand.
+/// Collects into `kernel_roots` the roots of the body region `entry` that `root` denotes, following nested region
+/// input bindings upward. Allocations local to the body or to a nested region denote no kernel input.
 fn entry_roots(
     root: ReferenceRoot,
     entry: RegionId,
     bindings: &BTreeMap<ReferenceRoot, BTreeSet<ReferenceRoot>>,
-    operands: &mut BTreeSet<ReferenceRoot>,
+    kernel_roots: &mut BTreeSet<ReferenceRoot>,
 ) {
     match root {
         ReferenceRoot::RegionInput { region, .. } if region == entry => {
-            operands.insert(root);
+            kernel_roots.insert(root);
         }
         ReferenceRoot::RegionInput { .. } => {
             for caller in bindings.get(&root).into_iter().flatten() {
-                entry_roots(*caller, entry, bindings, operands);
+                entry_roots(*caller, entry, bindings, kernel_roots);
             }
         }
         ReferenceRoot::Allocation { .. } => {}
@@ -545,8 +545,8 @@ mod tests {
         (program, contract)
     }
 
-    /// Builds a body with one write-only vector operand, one scalar input, and one swap of the operand whose old-value
-    /// result is used as described by `use_old_value`: not at all, by a later write, or as a region output.
+    /// Builds a body with one write-only vector reference input, one scalar input, and one swap of that reference whose
+    /// old-value result is used as described by `use_old_value`: not at all, by a later write, or as a region output.
     fn swapping_body(use_old_value: Option<bool>) -> TestProgram {
         let mut builder = TestBuilder::new();
         let reference = builder.add_input(reference_type([]));
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn test_validate_kernel_body() {
-        // Read-only, write-only, and read-write operands each admit exactly the accesses the accepted body performs
+        // Read-only, write-only, and read-write inputs each admit exactly the accesses the accepted body performs
         // on them, the ordinary scalar input carries no summary, and no reference reaches the boundary.
         let (program, contract) = accepted_body();
         let summary = validate_kernel_body(program.entry_region_ref(), &contract).unwrap();
@@ -824,15 +824,15 @@ mod tests {
 
     #[test]
     fn test_validate_kernel_body_lowers_swaps_by_result_liveness() {
-        // A swap whose old value is dead is a store and is admitted on a write-only operand.
+        // A swap whose old value is dead is a store and is admitted on a write-only input.
         let program = swapping_body(None);
         let write_only = KernelBoundaryContract::new(vec![Some(KernelParameterAccess::WriteOnly), None]);
         let summary = validate_kernel_body(program.entry_region_ref(), &write_only).unwrap();
         assert_eq!(summary.swap_lowering(id(0, 0)), Some(KernelSwapLowering::Store));
         assert_eq!(summary.parameter(0).unwrap().modes(), &BTreeSet::from([ReferenceAccessMode::ReadWrite]),);
 
-        // A swap whose old value feeds a later instruction is an exchange: rejected on a write-only operand and
-        // classified as an exchange on a read-write operand.
+        // A swap whose old value feeds a later instruction is an exchange: rejected on a write-only input and
+        // classified as an exchange on a read-write input.
         let program = swapping_body(Some(false));
         assert_eq!(
             validate_kernel_body(program.entry_region_ref(), &write_only).err(),
@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn test_validate_kernel_body_rejects_reference_outputs() {
-        // Publishing either an operand or a body-local allocation is rejected; the local allocation stays legal
+        // Publishing either a reference input or a body-local allocation is rejected; the local allocation stays legal
         // otherwise because the kernel rule concerns the boundary, not local state.
         let mut builder = TestBuilder::new();
         let reference = builder.add_input(reference_type([]));
@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn test_validate_kernel_body_rejects_consumed_parameters() {
-        // Consuming an operand violates the generic lifetime rule for external roots before any kernel rule applies.
+        // Consuming an input violates the generic lifetime rule for external roots before any kernel rule applies.
         let mut builder = TestBuilder::new();
         let reference = builder.add_input(reference_type([]));
         let frozen =
@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_validate_kernel_body_rejects_disallowed_accesses() {
-        // Writing a read-only operand and reading a write-only operand are both rejected, naming the instruction.
+        // Writing a read-only input and reading a write-only input are both rejected, naming the instruction.
         let mut builder = TestBuilder::new();
         let reference = builder.add_input(reference_type([]));
         let scalar = builder.add_input(array_type([]));
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_validate_kernel_body_validates_nested_conditions() {
-        // Both branches write the write-only operand through the condition's root-only boundary, and the swap inside
+        // Both branches write the write-only input through the condition's root-only boundary, and the swap inside
         // the false branch is classified by that branch's own liveness.
         let make_branch = |swap: bool| {
             let mut branch = TestBuilder::new();
@@ -1063,7 +1063,7 @@ mod tests {
         assert_eq!(summary.path(id(0, 0), 0), Some(&ArrayReferenceTransformPath::root()));
         assert_eq!(summary.path(id(1, 0), 0), Some(&ArrayReferenceTransformPath::root()));
 
-        // The nested writes are attributed to the operand, so a read-only declaration is rejected at the branch
+        // The nested writes are attributed to the input, so a read-only declaration is rejected at the branch
         // instruction that performs the first write.
         let read_only = KernelBoundaryContract::new(vec![None, Some(KernelParameterAccess::ReadOnly), None]);
         assert_eq!(

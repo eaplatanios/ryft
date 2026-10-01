@@ -78,7 +78,7 @@ pub trait KernelExtension: ReferenceAccessOperation<Type = ArrayIrType, Transfor
     ///
     /// The encoding must include an unambiguous owner namespace and schema version, every instruction mode and
     /// semantic option, and exact floating-point bits. It must not depend on diagnostic formatting or addresses.
-    /// Operands, results, regions, and their types are encoded by the enclosing kernel. Type identities in the
+    /// Inputs, results, regions, and their types are encoded by the enclosing kernel. Type identities in the
     /// payload must participate in ordinary operation identity renaming before this function is called.
     /// Unsupported payloads fail explicitly; implementing this function does not enable source deserialization.
     fn semantic_key(&self) -> Result<Vec<u8>, TypeError> {
@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn test_kernel_operation_extension_rejection() {
-        /// An adapter operation whose required operand is deliberately absent.
+        /// An adapter operation whose required input is deliberately absent.
         #[derive(Clone, Debug)]
         struct UnavailableExtension;
 
@@ -919,7 +919,7 @@ mod tests {
                 _input_types: &[ArrayIrType],
                 _region_interfaces: &[RegionInterface<ArrayIrType>],
             ) -> Result<Vec<ArrayIrType>, TypeError> {
-                Err(TypeError::invalid("extension requires a reference operand"))
+                Err(TypeError::invalid("extension requires a reference input"))
             }
         }
 
@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(operation.to_string(), "unavailable_extension");
         assert_eq!(
             operation.infer_output_types(&[], &[]),
-            Err(TypeError::invalid("extension requires a reference operand")),
+            Err(TypeError::invalid("extension requires a reference input")),
         );
         assert_eq!(
             operation.interpret(&EagerContext::<ArrayIrValue<Array>, KernelOperation>::new(), &EmptyRegionDriver, &[],),

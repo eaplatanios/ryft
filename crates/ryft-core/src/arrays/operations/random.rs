@@ -61,7 +61,7 @@ where
                     return Err(ProgramError::InvalidArgument {
                         message: format!(
                             "`{RNG_BIT_GENERATOR_OPERATION_NAME}` bits output axis {axis} has extent {actual_extent}, \
-                             but its explicit extent operand is {expected_extent}",
+                             but its explicit extent input is {expected_extent}",
                         ),
                     });
                 }

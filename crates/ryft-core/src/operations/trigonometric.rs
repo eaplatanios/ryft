@@ -380,12 +380,12 @@ impl_differentiable_elementwise_operation! {
         C::Value: OneLike + Sub + Mul + Logistic,
         <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
     {
-        |operation, operands| {
-            let input_tangent = operands.input_tangent()?;
+        |operation, inputs| {
+            let input_tangent = inputs.input_tangent()?;
             if operation.accuracy() == Accuracy::Highest {
                 // The highest-accuracy rule follows JAX and evaluates `4 · logistic(2x) · logistic(-2x)`, which
                 // stays accurate where `tanh(x)` saturates and `1 - tanh(x)²` cancels catastrophically.
-                let input = operands.input_primal()?;
+                let input = inputs.input_primal()?;
                 let input_type = input.r#type().into_owned();
                 let domain = input.dispatch_domain();
                 let positive = domain.fill(&input_type, 2.0)?.mul(&input)?.logistic_with_accuracy(Accuracy::Highest)?;
@@ -397,7 +397,7 @@ impl_differentiable_elementwise_operation! {
                 // stable `-2 · output` higher derivative near zero without the dedicated primitive that JAX uses for
                 // `one_minus_square`, whose `(1 + output) · (1 - output)` value is not uniformly more accurate once
                 // the primal output has already rounded.
-                let output = operands.output_primal_at_tangent_type()?;
+                let output = inputs.output_primal_at_tangent_type()?;
                 output.one_like()?.sub(&output.mul(&output)?)?.mul(&input_tangent)?
             }
         }

@@ -1251,7 +1251,7 @@ mod tests {
         let context = EagerContext::<Array>::new();
         let operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, false);
 
-        // Validate arity before accessing operands or attempting element conversion.
+        // Validate arity before accessing inputs or attempting element conversion.
         assert!(matches!(
             operation.interpret(&context, &EmptyRegionDriver, &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),

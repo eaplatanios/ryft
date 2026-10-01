@@ -712,13 +712,13 @@ mod tests {
         ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::non_negative(None).unwrap()))
     }
 
-    /// Returns a dot product that contracts the leading dimensions of its operands and has no batching dimensions.
+    /// Returns a dot product that contracts the leading dimensions of its inputs and has no batching dimensions.
     fn dot() -> TestOperation {
         ArrayOperation::<Array>::from(DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![])))
             .into()
     }
 
-    /// Returns a dot product that contracts the trailing dimensions of its operands and batches their leading ones.
+    /// Returns a dot product that contracts the trailing dimensions of its inputs and batches their leading ones.
     fn batched_dot() -> TestOperation {
         ArrayOperation::<Array>::from(DotOperation::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0])))
             .into()

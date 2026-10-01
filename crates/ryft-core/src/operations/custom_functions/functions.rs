@@ -691,18 +691,18 @@ where
     ) -> CustomRuleDefinition<V, O> {
         let (rule, name) = (self.rule.clone(), name.clone());
         let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-        definition.with_batching_rule(move |level, boundary_operands, inputs, input_axes| {
-            // A dynamic extent reaches the rule as the level's only boundary operand. The inputs of a call that was
-            // batched at earlier levels start with those levels' boundary operands, which the rule does not receive.
-            let extent = match (level.extent(), boundary_operands) {
+        definition.with_batching_rule(move |level, boundary_inputs, inputs, input_axes| {
+            // A dynamic extent reaches the rule as the level's only boundary input. The inputs of a call that was
+            // batched at earlier levels start with those levels' boundary inputs, which the rule does not receive.
+            let extent = match (level.extent(), boundary_inputs) {
                 (BatchingLevelExtent::Static(extent), _) => BatchingLevelExtent::Static(*extent),
                 (BatchingLevelExtent::Dynamic(_), [extent]) => BatchingLevelExtent::Dynamic(extent.clone()),
                 (BatchingLevelExtent::Dynamic(_), _) => {
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
-                            "`{name}` batching rule requires a dynamic batch extent to be the only boundary operand of \
-                             its batching level, but the level has {} boundary operands",
-                            boundary_operands.len(),
+                            "`{name}` batching rule requires a dynamic batch extent to be the only boundary input of \
+                             its batching level, but the level has {} boundary inputs",
+                            boundary_inputs.len(),
                         ),
                     });
                 }
@@ -1726,10 +1726,10 @@ impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp,
     /// replicated input axis means that the input is the same for every batch item. Its closure parameters must
     /// usually be annotated.
     ///
-    /// The rule is traced when a call is batched, once per batching level and operand signature, and its program
-    /// becomes the batched call's primal, so the rule takes precedence over structurally batching the primal (e.g.,
-    /// over the batching strategy of a foreign kernel called by [`Self::from_custom_call`]). Batching preserves the
-    /// call and its derivative rules, and the rule must compute the batched primal consistently with them.
+    /// The rule is traced when a call is batched, once per batching level and input signature, and its program becomes
+    /// the batched call's primal, so the rule takes precedence over structurally batching the primal (e.g., over the
+    /// batching strategy of a foreign kernel called by [`Self::from_custom_call`]). Batching preserves the call and its
+    /// derivative rules, and the rule must compute the batched primal consistently with them.
     ///
     /// # Derivatives
     ///
@@ -3631,7 +3631,7 @@ mod tests {
     fn test_custom_function_with_batching() {
         // The rule of `(x, y) ↦ x · y` computes `y · x`, which shows that it takes precedence over structurally
         // batching the primal, and declares that the output follows the mapped input. It is traced once per batching
-        // level and operand signature, which the extents that it records show.
+        // level and input signature, which the extents that it records show.
         type Tracer = DomainTracer<ArrayContext>;
         let extents = Arc::new(Mutex::new(Vec::new()));
         let function = custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y))
@@ -3661,7 +3661,7 @@ mod tests {
         );
         assert_eq!(*extents.lock().unwrap(), vec![3]);
 
-        // The staged batched call shares that trace, because it has the same level and operand signature.
+        // The staged batched call shares that trace, because it has the same level and input signature.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let (_, program) =
             ArrayContext::trace(|inputs| function.call(inputs), (scalar_type.clone(), scalar_type)).unwrap();
@@ -4522,8 +4522,8 @@ mod tests {
 
     #[test]
     fn test_custom_function_with_batching_differentiate_then_batch_dynamic_extent() {
-        // A first-class batch extent reaches the derived batching rule as the level's boundary operand, which the
-        // source rule and the batched derivative both consume.
+        // A first-class batch extent reaches the derived batching rule as the level's boundary input, which the source
+        // rule and the batched derivative both consume.
         type Tracer = DomainTracer<EagerArrayIrContext>;
         let sine = |x: Tracer| ValueProjection::<ArrayType>::into_projected(x)?.sin();
         let function = custom_function(move |x: Tracer| Ok(sine(x)?.into_value())).with_name("sine").with_batching(

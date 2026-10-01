@@ -85,18 +85,18 @@ pub const RNG_BIT_GENERATOR_OPERATION_NAME: &str = "rng_bit_generator";
 /// The output element type must be an unsigned-integer type (`ui8`, `ui16`, `ui32`, or `ui64`); distributions over
 /// floating-point values are compositions on top of the raw bits (see [`Random::uniform`]).
 /// The declared output must not be sharded (each shard would otherwise see the same bits; derive per-shard states
-/// inside `shard_map` instead). The homogeneous array contract requires a static output shape. In an
-/// [`ArrayIrType`] graph, a bounded dynamic bits axis instead has one trailing first-class dimension operand;
-/// eager execution resolves those operands before generating bits. XLA lowering rejects dynamic bits outputs:
-/// generating the physical upper-bound buffer would advance the functional generator state by the physical rather
-/// than logical element count, which is observably incorrect.
+/// inside `shard_map` instead). The homogeneous array contract requires a static output shape. In an [`ArrayIrType`]
+/// graph, a bounded dynamic bits axis instead has one trailing first-class dimension input; eager execution resolves
+/// those inputs before generating bits. XLA lowering rejects dynamic bits outputs: generating the physical upper-bound
+/// buffer would advance the functional generator state by the physical rather than logical element count, which is
+/// observably incorrect.
 ///
 /// Both outputs are discrete, so differentiation assigns structural-zero tangents and transposition is rejected.
 /// Homogeneous array batching of a *mapped* state (one state per batch item, e.g. derived with [`Random::split_key`])
 /// stages one carry-free [`ScanOperation`] over the per-item states, so each batch item draws its own bits from its
 /// own state.
-/// Composite array IR batching remains unsupported because the scan must retain first-class extent operands across
-/// its region boundary. Batching a *replicated* state is rejected in either contract because every batch item would see
+/// Composite array IR batching remains unsupported because the scan must retain first-class extent inputs across its
+/// region boundary. Batching a *replicated* state is rejected in either contract because every batch item would see
 /// the same state and draw identical bits. The reference array backend implements both
 /// [`ThreeFry`](RandomAlgorithm::ThreeFry) and [`Philox`](RandomAlgorithm::Philox)
 /// bit-exactly with XLA's implementation.
@@ -220,7 +220,7 @@ impl Operation for RngBitGeneratorOperation<ArrayType> {
     }
 }
 
-// Composite bit-generation contract: the generator state is followed by one explicit first-class extent operand per
+// Composite bit-generation contract: the generator state is followed by one explicit first-class extent input per
 // dynamic bits axis, each of which must define the dimension variable that the declared bits axis refers to.
 impl Operation for RngBitGeneratorOperation<ArrayIrType> {
     type Type = ArrayIrType;
@@ -246,7 +246,7 @@ impl Operation for RngBitGeneratorOperation<ArrayIrType> {
             let actual_variable = <&DimensionType>::try_from(input_type)?.variable();
             if actual_variable != expected_variable {
                 return Err(TypeError::invalid(format!(
-                    "`{RNG_BIT_GENERATOR_OPERATION_NAME}` output-extent operand defines dimension variable \
+                    "`{RNG_BIT_GENERATOR_OPERATION_NAME}` output-extent input defines dimension variable \
                      `{actual_variable}`, but the corresponding declared bits axis refers to `{expected_variable}`",
                 )));
             }
@@ -1140,7 +1140,7 @@ mod tests {
         assert_eq!(imported_builder.region_ref(imported)?.to_program().to_string(), rendered);
 
         // A second vmap structurally replays the already scan-decomposed RNG program. The inner runtime scan length
-        // remains an explicit replicated dimension operand while the new mapped extent becomes its leading carry.
+        // remains an explicit replicated dimension input while the new mapped extent becomes its leading carry.
         let nested_trace = Context::new();
         let outer = DimensionVariable::new("outer", DimensionBounds::new(1, Some(5))?);
         let outer_extent = nested_trace.input(DimensionType::from(outer.clone()).into());

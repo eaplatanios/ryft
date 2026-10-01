@@ -212,7 +212,7 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 ) -> Result<(), TypeError> {
     match r#type.identities().find(|(position, _)| *position == TypeIdentityPosition::Reference) {
         Some((_, reference)) => Err(TypeError::invalid(format!(
-            "`{}` cannot construct type {} without operands because it references identity {}",
+            "`{}` cannot construct type {} without inputs because it references identity {}",
             name, r#type, reference,
         ))),
         None => Ok(()),
@@ -244,7 +244,7 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
     let variables = r#type.shape().dimensions().iter().filter_map(Dimension::variable).collect::<Vec<_>>();
     if input_types.len() != variables.len() {
         return Err(TypeError::invalid(format!(
-            "`{}` expects one dimension operand per dynamic output dimension ({}) but got {} operands",
+            "`{}` expects one dimension input per dynamic output dimension ({}) but got {} inputs",
             name,
             variables.len(),
             input_types.len(),
@@ -252,7 +252,7 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
     }
     for (index, (input_type, variable)) in input_types.iter().zip(variables).enumerate() {
         let dimension_type = <&DimensionType>::try_from(input_type).map_err(|_| {
-            TypeError::invalid(format!("`{name}` operand {index} must be a dimension but has type {input_type}"))
+            TypeError::invalid(format!("`{name}` input {index} must be a dimension but has type {input_type}"))
         })?;
         if dimension_type.variable() != variable {
             // Repeated reads may give one concrete extent separate nominal definitions after specialization.
@@ -268,7 +268,7 @@ pub(crate) fn infer_array_ir_constant_constructor_output_types(
                 continue;
             }
             return Err(TypeError::invalid(format!(
-                "`{name}` operand {index} has type {dimension_type} but the output shape requires {required_type}",
+                "`{name}` input {index} has type {dimension_type} but the output shape requires {required_type}",
             )));
         }
     }
@@ -385,7 +385,7 @@ mod tests {
         let dynamic_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]));
 
-        // One identity-validated dimension operand per dynamic axis, in axis order; static axes consume no operands.
+        // One identity-validated dimension input per dynamic axis, in axis order; static axes consume no inputs.
         assert_eq!(
             infer_array_ir_constant_constructor_output_types(
                 "zero",
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(
             infer_array_ir_constant_constructor_output_types("zero", &dynamic_type, &[], &[]),
             Err(TypeError::invalid(
-                "`zero` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+                "`zero` expects one dimension input per dynamic output dimension (1) but got 0 inputs",
             )),
         );
         let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
@@ -410,7 +410,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "`zero` operand 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
+                "`zero` input 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
                  dimension<rows ∈ [0, 8)>",
             )),
         );
@@ -421,10 +421,10 @@ mod tests {
                 &[ArrayIrType::Array(ArrayType::scalar(DataType::I64))],
                 &[],
             ),
-            Err(TypeError::invalid("`zero` operand 0 must be a dimension but has type i64[]")),
+            Err(TypeError::invalid("`zero` input 0 must be a dimension but has type i64[]")),
         );
 
-        // Static mixed construction is valid with no operands, while unexpected operands remain invalid.
+        // Static mixed construction is valid with no inputs, while unexpected inputs remain invalid.
         let static_type = ArrayType::scalar(DataType::F32);
         assert_eq!(
             infer_array_ir_constant_constructor_output_types("zero", &static_type, &[], &[]),
@@ -438,7 +438,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "`zero` expects one dimension operand per dynamic output dimension (0) but got 1 operands",
+                "`zero` expects one dimension input per dynamic output dimension (0) but got 1 inputs",
             )),
         );
     }
@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(
             infer_array_ir_constant_constructor_output_types("zero", &r#type, &[], &[]),
             Err(TypeError::invalid(
-                "`zero` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+                "`zero` expects one dimension input per dynamic output dimension (1) but got 0 inputs",
             )),
         );
     }
@@ -472,7 +472,7 @@ mod tests {
         let column_extent =
             ArrayIrValue::<Array>::Dimension(DimensionValue::new(DimensionType::from(columns), 4).unwrap());
 
-        // Operands correspond only to dynamic axes and must follow their order in the stored shape.
+        // Inputs correspond only to dynamic axes and must follow their order in the stored shape.
         assert_eq!(
             validate_dynamic_constant_dimensions("fill", &output_type, &[row_extent.clone(), column_extent.clone()]),
             Ok(()),
@@ -480,13 +480,13 @@ mod tests {
         assert_eq!(
             validate_dynamic_constant_dimensions("fill", &output_type, std::slice::from_ref(&row_extent)),
             Err(ProgramError::Type(TypeError::invalid(
-                "`fill` expects one dimension operand per dynamic output dimension (2) but got 1 operands",
+                "`fill` expects one dimension input per dynamic output dimension (2) but got 1 inputs",
             ))),
         );
         assert_eq!(
             validate_dynamic_constant_dimensions("fill", &output_type, &[column_extent.clone(), row_extent.clone()]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`fill` operand 0 has type dimension<columns ∈ [0, 8)> but the output shape requires \
+                "`fill` input 0 has type dimension<columns ∈ [0, 8)> but the output shape requires \
                  dimension<rows ∈ [0, 8)>",
             ))),
         );
@@ -496,10 +496,10 @@ mod tests {
                 &output_type,
                 &[ArrayIrValue::Array(Array::scalar(3i64).unwrap()), column_extent],
             ),
-            Err(ProgramError::Type(TypeError::invalid("`fill` operand 0 must be a dimension but has type i64[]"))),
+            Err(ProgramError::Type(TypeError::invalid("`fill` input 0 must be a dimension but has type i64[]"))),
         );
 
-        // Repeated dynamic axes consume repeated operands; fully static shapes consume none.
+        // Repeated dynamic axes consume repeated inputs; fully static shapes consume none.
         let repeated_type = ArrayType::new(DataType::F32, Shape::new(vec![rows.clone().into(), rows.into()]));
         assert_eq!(
             validate_dynamic_constant_dimensions("fill", &repeated_type, &[row_extent.clone(), row_extent.clone()]),
@@ -514,10 +514,8 @@ mod tests {
         assert_eq!(validate_dynamic_constant_dimensions("fill", &exact_type, &[first.clone(), second.clone()]), Ok(()));
         assert_eq!(
             validate_dynamic_constant_dimensions("fill", &exact_type, &[second.clone(), second]),
-            Err(TypeError::invalid(
-                "`fill` operand 0 has type dimension<2> but the output shape requires dimension<2>",
-            )
-            .into()),
+            Err(TypeError::invalid("`fill` input 0 has type dimension<2> but the output shape requires dimension<2>")
+                .into()),
         );
         let wider = ArrayIrValue::<Array>::Dimension(
             DimensionValue::new(DimensionType::new("wider", DimensionBounds::non_negative(Some(8)).unwrap()), 2)
@@ -526,7 +524,7 @@ mod tests {
         assert_eq!(
             validate_dynamic_constant_dimensions("fill", &exact_type, &[first.clone(), wider]),
             Err(TypeError::invalid(
-                "`fill` operand 1 has type dimension<wider ∈ [0, 8)> but the output shape requires dimension<2>",
+                "`fill` input 1 has type dimension<wider ∈ [0, 8)> but the output shape requires dimension<2>",
             )
             .into()),
         );
@@ -536,10 +534,8 @@ mod tests {
                 &exact_type,
                 &[first, ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())],
             ),
-            Err(TypeError::invalid(
-                "`fill` operand 1 has type dimension<3> but the output shape requires dimension<2>",
-            )
-            .into()),
+            Err(TypeError::invalid("`fill` input 1 has type dimension<3> but the output shape requires dimension<2>")
+                .into()),
         );
 
         let static_type = ArrayType::new_static(DataType::F32, [3, 2]);
@@ -547,7 +543,7 @@ mod tests {
         assert_eq!(
             validate_dynamic_constant_dimensions("fill", &static_type, &[row_extent]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`fill` expects one dimension operand per dynamic output dimension (0) but got 1 operands",
+                "`fill` expects one dimension input per dynamic output dimension (0) but got 1 inputs",
             ))),
         );
     }

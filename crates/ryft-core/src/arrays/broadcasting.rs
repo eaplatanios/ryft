@@ -28,7 +28,7 @@ pub enum BroadcastingError {
 
     #[error(
         "failed to broadcast memory space `{lhs}` to memory space `{rhs}`; broadcasting never moves values, so \
-        operands must reside in the same memory space and combining them requires staging an explicit transfer first"
+        inputs must reside in the same memory space and combining them requires staging an explicit transfer first"
     )]
     IncompatibleMemories { lhs: Memory, rhs: Memory },
 
@@ -67,11 +67,11 @@ pub enum BroadcastingError {
 ///
 ///   - Dimensions are compared from right to left.
 ///   - Two aligned dimensions are compatible when they are equal or when one of them is `1`.
-///   - If the operands have different ranks, missing leading dimensions are treated as if they had size `1`.
+///   - If the inputs have different ranks, missing leading dimensions are treated as if they had size `1`.
 ///
-/// Conceptually, dimensions of size `1` are stretched to match the other operand. As NumPy notes, that stretching is
-/// a semantic model for compatibility and result-shape inference; it does not imply that an implementation must
-/// materialize expanded copies of the underlying data.
+/// Conceptually, dimensions of size `1` are stretched to match the other input. As NumPy notes, that stretching
+/// is a semantic model for compatibility and result-shape inference; it does not imply that an implementation
+/// must materialize expanded copies of the underlying data.
 ///
 /// These rules imply that, for example:
 ///
@@ -80,7 +80,7 @@ pub enum BroadcastingError {
 ///   - `(4,)` does not broadcast with `(4, 3)` because the trailing dimensions `4` and `3` are incompatible, and
 ///   - `(4, 1)` broadcasts with `(3,)` to `(4, 3)`.
 ///
-/// The [`Broadcastable::broadcast`] operation is symmetric and returns the least common result that both operands can
+/// The [`Broadcastable::broadcast`] operation is symmetric and returns the least common result that both inputs can
 /// broadcast to. The [`Broadcastable::broadcast_to`] operation is directional and requires the left-hand side to
 /// broadcast exactly to the right-hand side's target. The default [`Broadcastable::broadcasted`] helper folds the
 /// symmetric operation over multiple values from left to right.
@@ -128,18 +128,18 @@ pub enum BroadcastingError {
 pub trait Broadcastable: Sized {
     /// Broadcasts this value with `other` and returns the least common result that both values can broadcast to.
     /// This operation is _symmetric_. For example, with [`Shape`] values this returns the smallest shape that both
-    /// operands can broadcast to, and with [`ArrayType`] values it combines [`DataType`] promotion with [`Shape`]
+    /// inputs can broadcast to, and with [`ArrayType`] values it combines [`DataType`] promotion with [`Shape`]
     /// broadcasting. Shapes may expand on either side, and element types are promoted to a common type. Incompatible
     /// dimensions, types, parameter structures, memory spaces, or shardings return the corresponding
-    /// [`BroadcastingError`]. Neither operand is modified.
+    /// [`BroadcastingError`]. Neither input is modified.
     fn broadcast(&self, other: &Self) -> Result<Self, BroadcastingError>;
 
     /// Broadcasts this value to the provided `other` value. Unlike [`Broadcastable::broadcast`], this operation
     /// is _not symmetric_ (i.e., `x.broadcast_to(y)` and `y.broadcast_to(x)` may differ and one of them may even fail).
     /// The source cannot lose axes, shrink non-singleton dimensions, or require a data-type promotion beyond the target
-    /// type. For array types, the target layout is adopted and compatible sharding information from both operands is
+    /// type. For array types, the target layout is adopted and compatible sharding information from both inputs is
     /// combined, so the result may carry more sharding information than `other`. Incompatibility returns the
-    /// corresponding [`BroadcastingError`]. Neither operand is modified.
+    /// corresponding [`BroadcastingError`]. Neither input is modified.
     fn broadcast_to(&self, other: &Self) -> Result<Self, BroadcastingError>;
 
     /// Broadcasts the provided values into a single value by folding over [`Broadcastable::broadcast`]
@@ -335,33 +335,33 @@ impl<T: Parameterized<ArrayType>> Broadcastable for T {
 /// Broadcasts an optional [`Sharding`] paired with a [`Shape`] to another optional [`Sharding`] paired with a [`Shape`]
 /// and returns the resulting [`Sharding`], using the following broadcasting rules:
 ///
-///   - If neither operand carries sharding information, then this function returns no sharding information.
+///   - If neither input carries sharding information, then this function returns no sharding information.
 ///   - Any provided [`Sharding`] must already have the same rank as its source [`Shape`], as guaranteed by the
 ///     containing [`ArrayType`].
-///   - When the operands have different ranks, the lower-rank sharding is left-padded with replicated dimensions so
+///   - When the inputs have different ranks, the lower-rank sharding is left-padded with replicated dimensions so
 ///     that sharding alignment follows the same leading-rank promotion rules as [`Shape`] broadcasting.
 ///   - On an aligned axis, a singleton dimension is only treated as broadcast-trivial when its [`ShardingDimension`] is
 ///     already [`ShardingDimension::Replicated`]. Non-replicated singleton-axis shardings are preserved and must still
-///     be compatible with the other operand.
+///     be compatible with the other input.
 ///   - If neither aligned axis is a singleton, identical sharding dimensions remain unchanged. A replicated dimension
-///     is neutral and yields to the other operand's [`Sharding`].
-///   - If both aligned non-singleton axes carry different non-replicated shardings, the operands are considered
+///     is neutral and yields to the other input's [`Sharding`].
+///   - If both aligned non-singleton axes carry different non-replicated shardings, the inputs are considered
 ///     incompatible and this function will return a [`BroadcastingError`].
-///   - Rank promotion and outer-product style broadcasts preserve the contributing operand's [`Sharding`] on axes that
-///     only one operand meaningfully contributes to.
-///   - Both operands must use the same [`LogicalMesh`](crate::LogicalMesh) when they are both sharded. After the
+///   - Rank promotion and outer-product style broadcasts preserve the contributing input's [`Sharding`] on axes that
+///     only one input meaningfully contributes to.
+///   - Both inputs must use the same [`LogicalMesh`](crate::LogicalMesh) when they are both sharded. After the
 ///     per-axis dimensions are combined, reusing the same mesh axis across multiple result dimensions is treated as an
 ///     incompatible broadcast, and for those cases, this function will return a [`BroadcastingError`].
 ///   - The [`Sharding::unreduced_axes`], [`Sharding::reduced_axes`], and [`Sharding::varying_manual_axes`] sets are
-///     only preserved when both inputs already agree on them, or when only one operand carries sharding information.
+///     only preserved when both inputs already agree on them, or when only one input carries sharding information.
 ///     Generic [`ArrayType`] broadcasting does not attempt primitive-specific manual-axis merges.
 ///
 /// # Parameters
 ///
-///   - `lhs_shape`: [`Shape`] of the left-hand operand before broadcasting.
-///   - `lhs_sharding`: Optional [`Sharding`] for the left-hand operand.
-///   - `rhs_shape`: [`Shape`] of the right-hand operand before broadcasting.
-///   - `rhs_sharding`: Optional [`Sharding`] for the right-hand operand.
+///   - `lhs_shape`: [`Shape`] of the left-hand input before broadcasting.
+///   - `lhs_sharding`: Optional [`Sharding`] for the left-hand input.
+///   - `rhs_shape`: [`Shape`] of the right-hand input before broadcasting.
+///   - `rhs_sharding`: Optional [`Sharding`] for the right-hand input.
 ///   - `broadcasted_shape`: Already validated result shape of the symmetric or directional broadcast.
 fn broadcast_sharding(
     lhs_shape: &Shape,
@@ -762,7 +762,7 @@ mod tests {
         let pinned_host = device.clone().with_memory(Memory::Host { pinned: true });
         let pinned_host_scalar = ArrayType::scalar(F32).with_memory(Memory::Host { pinned: true });
 
-        // Broadcasting preserves placement; its reversed retry determines the error operand order.
+        // Broadcasting preserves placement; its reversed retry determines the order of the inputs in the error.
         assert_eq!(pinned_host.broadcast(&pinned_host_scalar), Ok(pinned_host.clone()));
         assert_eq!(
             device.broadcast(&pinned_host),
@@ -839,7 +839,7 @@ mod tests {
             ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(conflicting_vector_sharding).unwrap();
         let unsharded_vector = ArrayType::new(F32, Shape::new(vec![8.into()]));
 
-        // Manual-axis variation must agree when both operands carry sharding.
+        // Manual-axis variation must agree when both inputs carry sharding.
         assert_eq!(
             manual_vector.broadcast(&same_manual_vector).map(|output| output
                 .sharding()

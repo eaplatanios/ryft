@@ -12,9 +12,9 @@
 //!
 //! [`RegionInterface`] is the type-and-effect summary passed to [`Operation::infer_output_types`]. It deliberately
 //! exposes a region boundary without exposing the region body. [`Operation::input_region_provenance`] returns an
-//! [`InputRegionProvenance`] describing operand correspondence, local creation, or unspecified provenance for a region
-//! input. [`OutputRegionProvenance`] identifies both the attached region and its output when an operation output
-//! originates there rather than directly from that [`Instruction`].
+//! [`InputRegionProvenance`] describing instruction input correspondence, local creation, or unspecified provenance
+//! for a region input. [`OutputRegionProvenance`] identifies both the attached region and its output when an operation
+//! output originates there rather than directly from that [`Instruction`].
 //!
 //! Operation rules receive application-scoped structural access to attached [`Region`]s through [`RegionDriver`]s.
 //! Binding applications obtain their complete ordered region sequence from [`BindingRegionDriver`], which can provide
@@ -194,9 +194,9 @@ impl<V: Typed + Parameter, O> Region<V, O> {
 
     /// Derives this [`Region`]'s closed [`TypeIdentitySignature`]. A definition-position constant establishes one
     /// immutable internal identity. A result definition whose [`TypeIdentity`](crate::TypeIdentity) occurs on an
-    /// input/operand forwards that available identity, while any other result definition establishes one fresh internal
-    /// identity. Every result reference must either forward an operand identity or refer to a definition-position
-    /// occurrence on a sibling result.
+    /// instruction input forwards that available identity, while any other result definition establishes one fresh
+    /// internal identity. Every result reference must either forward an instruction input identity or refer to a
+    /// definition-position occurrence on a sibling result.
     pub(crate) fn type_identity_signature(
         &self,
     ) -> Result<TypeIdentitySignature<<V::Type as Type>::Identity>, TypeError>
@@ -256,11 +256,11 @@ impl<V: Typed + Parameter, O> Region<V, O> {
         })?;
 
         // Instructions are already in evaluation order, so processing them sequentially turns availability into a
-        // simple dominance check: operands may use only identities established by the boundary or an earlier result.
+        // simple dominance check: inputs may use only identities established by the boundary or an earlier result.
         self.instructions.iter().try_for_each(|instruction| {
-            // Collect the identities consumed by this instruction while rejecting any operand reference that appears
+            // Collect the identities consumed by this instruction while rejecting any input reference that appears
             // before its definition. Result occurrences matching these identities are forwarders, not new definitions.
-            let mut operand_identities = Vec::new();
+            let mut input_identities = Vec::new();
             instruction.inputs().iter().try_for_each(|input| {
                 let r#type = self.atoms[input.index()].r#type();
                 r#type.identities().try_for_each(|(_, identity)| {
@@ -271,21 +271,21 @@ impl<V: Typed + Parameter, O> Region<V, O> {
                             identity,
                         )));
                     }
-                    if !operand_identities.contains(identity) {
-                        operand_identities.push(identity.clone());
+                    if !input_identities.contains(identity) {
+                        input_identities.push(identity.clone());
                     }
                     Ok(())
                 })
             })?;
 
-            // Process explicit definition-position occurrences first. A definition also present on an operand forwards
+            // Process explicit definition-position occurrences first. A definition also present on an input forwards
             // that identity. Every other definition establishes one fresh internal identity, which must not have been
             // established earlier or repeated by another result of the same instruction.
             let mut defined_identities = Vec::new();
             instruction.outputs().iter().try_for_each(|output| {
                 let r#type = self.atoms[output.index()].r#type();
                 r#type.identities().try_for_each(|(position, identity)| {
-                    if position != TypeIdentityPosition::Definition || operand_identities.contains(identity) {
+                    if position != TypeIdentityPosition::Definition || input_identities.contains(identity) {
                         return Ok(());
                     }
                     if identities.contains(identity) || defined_identities.contains(identity) {
@@ -302,14 +302,14 @@ impl<V: Typed + Parameter, O> Region<V, O> {
             })?;
 
             // Validate reference-position result occurrences after all sibling definitions are known. A reference must
-            // either be forwarded from an operand or refer to an identity defined by this instruction.
+            // either be forwarded from an input or refer to an identity defined by this instruction.
             instruction.outputs().iter().try_for_each(|output| {
                 let r#type = self.atoms[output.index()].r#type();
                 r#type.identities().try_for_each(|(position, identity)| {
                     if position != TypeIdentityPosition::Reference {
                         return Ok(());
                     }
-                    if !operand_identities.contains(identity) && !defined_identities.contains(identity) {
+                    if !input_identities.contains(identity) && !defined_identities.contains(identity) {
                         return Err(TypeError::invalid(format!(
                             "operation `{}` output type references identity {} without consuming or defining it",
                             instruction.operation().name(),
@@ -1780,18 +1780,19 @@ struct InstantiatedRegionMapping<T: Type> {
 }
 
 /// Describes how an [`Operation`] supplies an attached [`Region`] input. The region and its input are selected by
-/// [`Operation::input_region_provenance`]. Operand indices refer to the attaching instruction's inputs.
-/// This describes semantic dataflow, independently of diagnostic [`Provenance`](crate::Provenance).
+/// [`Operation::input_region_provenance`]. Input indices in [`InputRegionProvenance::Input`] refer to the attaching
+/// instruction's inputs. This describes semantic dataflow, independently of diagnostic
+/// [`Provenance`](crate::Provenance).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum InputRegionProvenance {
     /// No provenance is declared. This does not imply local creation and is invalid for an executed reference input.
     #[default]
     None,
 
-    /// The input corresponds to an operation operand. Ordinary values may be sliced or evolve across iterations;
-    /// references forward the complete caller handle and construct any views inside the region.
+    /// The region input corresponds to an instruction input. Ordinary values may be sliced or evolve across iterations
+    /// while references forward the complete caller handle and construct any views inside the region.
     Input {
-        /// Position of the supplying operand in the attaching instruction.
+        /// Position of the supplying input in the attaching instruction.
         index: usize,
     },
 
@@ -2249,7 +2250,7 @@ mod tests {
         assert_eq!(signature.input_identities(), &[boundary.clone()]);
         assert_eq!(signature.internal_identities(), &[]);
 
-        // A result definition absent from the operands establishes one fresh internal identity.
+        // A result definition absent from the inputs establishes one fresh internal identity.
         let arithmetic = structural_region(
             vec![StructuralType::reference(boundary.clone())],
             Vec::new(),

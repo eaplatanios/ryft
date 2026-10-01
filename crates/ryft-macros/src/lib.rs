@@ -37,7 +37,7 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 /// #[ryft(dispatch(batching, differentiation, transposition))]
 ///
 /// // Variant level:
-/// #[ryft(projected(U [, structural]))]       // Every operand and result of the instruction belongs to `U`.
+/// #[ryft(projected(U [, structural]))]       // Every input and output of the instruction belongs to `U`.
 /// #[ryft(mixed(U [, structural]))]           // The instruction crosses member universes; `U` may be defaulted.
 /// #[ryft(skip_from)]                         // Suppresses only this variant's owned `From<Payload>` conversion.
 /// ```

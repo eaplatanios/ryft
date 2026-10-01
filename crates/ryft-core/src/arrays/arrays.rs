@@ -43,7 +43,7 @@ use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 /// dynamically shaped array value cannot be built. Reference kernels may therefore assume static geometry and read
 /// extents directly off the stored type instead of resolving first-class dimension extent. [`Program`](crate::Program)s
 /// that genuinely need dynamic shapes stage over [`ArrayIrOperation`](crate::ArrayIrOperation) instead, where
-/// each dynamic axis is carried by an explicit dimension operand.
+/// each dynamic axis is carried by an explicit dimension input.
 ///
 /// Host concretization through [`Concretizable`] requires rank zero. Integer scalars can be extracted into any Rust
 /// integer or Ryft sub-byte integer type when the value fits; [`Concretizable<i128>`] preserves every supported integer
@@ -175,7 +175,7 @@ impl Array {
 
     /// Returns the complete physical storage for in-place mutation, copying the payload first when it is shared with
     /// another array. Kernels that build a result by mutating a buffer they own (or one they just cloned from an
-    /// operand) use this to avoid a second allocation.
+    /// input) use this to avoid a second allocation.
     pub(crate) fn storage_bytes_mut(&mut self) -> &mut [u8] {
         Arc::make_mut(&mut self.bytes).as_mut_slice()
     }
@@ -188,11 +188,11 @@ impl Array {
     /// Decodes this integer array as host indices or sizes in logical row-major order, rejecting negative entries and
     /// entries that do not fit in `usize`. Every signed and unsigned integer element type, including the sub-byte ones,
     /// is widened losslessly before the range check, so large unsigned values are never misreported as negative. This
-    /// is used by reference kernels that consume integer metadata operands (e.g., offsets and group sizes).
+    /// is used by reference kernels that consume integer metadata inputs (e.g., offsets and group sizes).
     ///
     /// # Parameters
     ///
-    ///   - `name`: Name of this array (e.g., the metadata operand it is passed as), used in error messages.
+    ///   - `name`: Name of this array (e.g., the metadata input it is passed as), used in error messages.
     pub(crate) fn non_negative_integer_elements(&self, name: &str) -> Result<Vec<usize>, ProgramError> {
         let data_type = self.r#type.data_type();
         dispatch_on_array_element_type!(@integer data_type, |Element| {
@@ -359,7 +359,7 @@ impl Array {
     /// memory space. Tiled layouts are preserved; byte-stride layouts are cleared when element storage width changes.
     /// This is the foundational cast of the reference backend: the
     /// [`ConvertElementType`](crate::operations::ConvertElementType) capability delegates to it, and so does every
-    /// kernel that promotes mixed-type operands through [`Array::promoted_to`].
+    /// kernel that promotes mixed-type inputs through [`Array::promoted_to`].
     ///
     /// Conversion of an individual element is exactly [`ArrayElement::convert_to`], so the per-element semantics
     /// (including rounding, truncation, saturation, and exceptional-value handling) are documented on that trait.
@@ -400,9 +400,9 @@ impl Array {
     }
 
     /// Converts this array to the provided element data type, borrowing it unchanged when it already has that data
-    /// type so that already-promoted operands keep their exact physical storage and layout. Kernels that promote
-    /// mixed-type operands to a common element data type (which each kernel computes from its own type-inference
-    /// contract) use this to convert only the mismatched operands.
+    /// type so that already-promoted inputs keep their exact physical storage and layout. Kernels that promote
+    /// mixed-type inputs to a common element data type (which each kernel computes from its own type-inference
+    /// contract) use this to convert only the mismatched inputs.
     pub fn promoted_to(&self, data_type: DataType) -> Result<Cow<'_, Self>, ProgramError> {
         if self.r#type.data_type() == data_type {
             Ok(Cow::Borrowed(self))
@@ -413,17 +413,17 @@ impl Array {
 
     /// Broadcasts the types of the provided arrays together (including element data type promotion) and promotes
     /// every array to the broadcast element data type, borrowing the ones that already have it. This is the shared
-    /// entry step of broadcasting elementwise kernels: the returned operands all have the broadcast element data
-    /// type, while their shapes may still differ from the returned broadcast type, which the shared elementwise
-    /// loops bridge by indexing the operands with NumPy-style broadcasting.
+    /// entry step of broadcasting elementwise kernels: the returned arrays all have the broadcast element data type,
+    /// while their shapes may still differ from the returned broadcast type, which the shared elementwise loops bridge
+    /// by indexing the arrays with NumPy-style broadcasting.
     pub fn broadcast_promoted<'a>(arrays: &[&'a Self]) -> Result<(ArrayType, Vec<Cow<'a, Self>>), ProgramError> {
         let types = arrays.iter().map(|array| &array.r#type).collect::<Vec<_>>();
         let output_type = ArrayType::broadcasted(&types).map_err(|error| TypeError::invalid(error.to_string()))?;
-        let operands = arrays
+        let promoted = arrays
             .iter()
             .map(|array| array.promoted_to(output_type.data_type()))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((output_type, operands))
+        Ok((output_type, promoted))
     }
 
     /// Creates an array of `type` by evaluating a typed function at every flat logical row-major element index. This

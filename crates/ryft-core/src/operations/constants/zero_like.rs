@@ -263,7 +263,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh, 1))
             .unwrap();
         let input = Array::from_elements(r#type.clone(), &[Complex::new(2.0f32, 3.0); 2]).unwrap();
-        assert_eq!(input.zero_like(), Ok(Array::from_elements(r#type, &[Complex::new(0.0f32, 0.0); 2]).unwrap()),);
+        assert_eq!(input.zero_like(), Ok(Array::from_elements(r#type, &[Complex::new(0.0f32, 0.0); 2]).unwrap()));
         let empty = Array::from_elements::<Complex<f32>>(ArrayType::new_static(DataType::C64, [0]), &[]).unwrap();
         assert_eq!(empty.zero_like(), Ok(empty.clone()));
 
@@ -337,7 +337,7 @@ mod tests {
         );
         let output = input.zero_like().unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::new(1));
-        assert_eq!(output.batch().value(), &Array::from_elements(r#type, &[Complex::new(0.0f32, 0.0); 6]).unwrap(),);
+        assert_eq!(output.batch().value(), &Array::from_elements(r#type, &[Complex::new(0.0f32, 0.0); 6]).unwrap());
     }
 
     #[test]

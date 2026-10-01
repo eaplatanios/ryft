@@ -126,9 +126,9 @@ impl_member_interpretable_operation_for_array_ir_constant_operation!(
 impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: OneOperation<ArrayType>) -> Self {
-        // Prefer the homogeneous member encoding for identity-free static ones and the mixed dimension-operand
-        // encoding for dynamic output types. Explicit mixed static constructors remain valid, but canonical lifts
-        // normalize them to the homogeneous form.
+        // Prefer the homogeneous member encoding for identity-free static ones and the mixed dimension-input encoding
+        // for dynamic output types. Explicit mixed static constructors remain valid, but canonical lifts normalize them
+        // to the homogeneous form.
         if operation
             .r#type()
             .shape()
@@ -400,11 +400,11 @@ mod tests {
         assert_eq!(
             OneOperation::new(dynamic_type).infer_output_types(&[], &[]),
             Err(TypeError::invalid(
-                "`one` cannot construct type f32[rows, 3] without operands because it references identity rows",
+                "`one` cannot construct type f32[rows, 3] without inputs because it references identity rows",
             )),
         );
         let dimension_type = DimensionType::from(rows);
-        assert_eq!(OneOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
+        assert_eq!(OneOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]));
     }
 
     #[test]
@@ -490,7 +490,7 @@ mod tests {
         for data_type in [DataType::Token, DataType::Zero] {
             assert_eq!(
                 context.one(&ArrayType::scalar(data_type)),
-                Err(ProgramError::Type(TypeError::invalid(format!("data type `{data_type}` cannot represent one",)))),
+                Err(ProgramError::Type(TypeError::invalid(format!("data type `{data_type}` cannot represent one")))),
             );
         }
         let dynamic_type = ArrayType::new(
@@ -711,8 +711,8 @@ mod tests {
 
     #[test]
     fn test_one_transposition_dynamic() {
-        // Dynamic constructors depend on their extent operands only as non-differentiable shape inputs, so every
-        // extent receives a structural-zero cotangent regardless of the output cotangent being live.
+        // Dynamic constructors use their extent inputs only as non-differentiable shape information, so every extent
+        // receives a structural-zero cotangent regardless of the output cotangent being live.
         let extent_type = DimensionType::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let output_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
@@ -744,7 +744,7 @@ mod tests {
         };
         assert_eq!(operation.r#type(), &static_type);
 
-        // Output types belong to the request; nullary construction rejects any operand types.
+        // Output types belong to the request; nullary construction rejects any input types.
         assert_eq!(
             ArrayOperation::<Array>::provide(OneOperation::new(static_type.clone()), &[&static_type]).unwrap_err(),
             ProgramError::InvalidInputCount { expected: 0, actual: 1 },
@@ -756,7 +756,7 @@ mod tests {
             ProgramError::InvalidInputCount { expected: 0, actual: 1 },
         );
 
-        // The composite provider projects a valid operand-free array one into the homogeneous member family.
+        // The composite provider projects a valid input-free array one into the homogeneous member family.
         let ArrayIrOperation::<Array>::Array(ArrayOperation::One(operation)) =
             ArrayIrOperation::<Array>::provide(OneOperation::new(ArrayIrType::Array(static_type.clone())), &[])
                 .unwrap()
@@ -765,14 +765,14 @@ mod tests {
         };
         assert_eq!(operation.r#type(), &static_type);
 
-        // Operand-free construction cannot resolve a dynamic identity. Dynamic mixed ones must instead receive their
-        // concrete extents as dimension operands.
+        // Input-free construction cannot resolve a dynamic identity. Dynamic mixed ones must instead receive their
+        // concrete extents as dimension inputs.
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
         assert_eq!(
             ArrayIrOperation::<Array>::provide(OneOperation::new(ArrayIrType::Array(dynamic_type)), &[]).unwrap_err(),
             ProgramError::Type(TypeError::invalid(
-                "`one` cannot construct type f32[size] without operands because it references identity size",
+                "`one` cannot construct type f32[size] without inputs because it references identity size",
             )),
         );
 
@@ -859,7 +859,7 @@ mod tests {
             Shape::new(vec![Dimension::Dynamic(size.clone()), Dimension::Static(3), Dimension::Dynamic(size)]),
         );
 
-        // Static axes consume no operands; each occurrence of a dynamic identity consumes its own operand.
+        // Static axes consume no inputs; each occurrence of a dynamic identity consumes its own input.
         assert_eq!(
             context.dynamic_one(&output_type, &[dimension.clone(), dimension]),
             Ok(ArrayIrValue::Array(
@@ -892,19 +892,19 @@ mod tests {
         assert_eq!(
             context.dynamic_one(&output_type, &[]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`one` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+                "`one` expects one dimension input per dynamic output dimension (1) but got 0 inputs",
             ))),
         );
         assert_eq!(
             context.dynamic_one(&output_type, &[ArrayIrValue::Array(Array::scalar(2.0f32).unwrap())]),
-            Err(ProgramError::Type(TypeError::invalid("`one` operand 0 must be a dimension but has type f32[]"))),
+            Err(ProgramError::Type(TypeError::invalid("`one` input 0 must be a dimension but has type f32[]"))),
         );
         let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
         let dimension = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(other), 2).unwrap());
         assert_eq!(
             context.dynamic_one(&output_type, &[dimension]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`one` operand 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
+                "`one` input 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
                  dimension<size ∈ [0, 8)>",
             ))),
         );
@@ -915,7 +915,7 @@ mod tests {
         assert_eq!(
             context.dynamic_one(&output_type, &[dimension]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`one` operand 0 has type dimension<size ∈ [0, 8)> but the output shape requires dimension<size ∈ [0, 8)>",
+                "`one` input 0 has type dimension<size ∈ [0, 8)> but the output shape requires dimension<size ∈ [0, 8)>",
             ))),
         );
     }

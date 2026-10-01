@@ -32,11 +32,11 @@
 ///   - `@float_or_complex`: Every real floating-point and complex element type (i.e., the transcendental family).
 ///   - `@boolean_or_integer`: Boolean and every integer element type (i.e., the bitwise and logical family).
 ///
-/// Kernels dispatch after type inference has already validated the operand element class,
-/// so a [`DataType`](crate::arrays::DataType) outside the selected class (including the payload-free
-/// [`Token`](crate::arrays::DataType::Token) and [`Zero`](crate::arrays::DataType::Zero) types, which no selector
-/// includes) is an internal invariant violation and panics with a descriptive message rather than forcing every body
-/// to return a [`Result`].
+/// Kernels dispatch after type inference has already validated the input element class,
+/// so a [`DataType`](crate::DataType) outside the selected class (including the payload-free
+/// [`Token`](crate::DataType::Token) and [`Zero`](crate::DataType::Zero) types, which no selector
+/// includes) is an internal invariant violation and panics with a descriptive message rather than
+/// forcing every body to return a [`Result`].
 #[macro_export]
 macro_rules! dispatch_on_array_element_type {
     ($data_type:expr, |$element:ident| $body:expr $(,)?) => {
@@ -304,11 +304,10 @@ macro_rules! dispatch_on_array_element_type {
 /// concrete Rust element type selected by [`dispatch_on_array_element_type!`]. Its result has that same element type,
 /// inferred from the generated traversal; no caller-visible type binding is needed.
 ///
-/// Empty results undergo all input and metadata checks, but skip operand conversion and scalar
-/// evaluation. The result buffer follows the inferred layout, including zero-initialized padding.
-/// Non-empty results use [`Array::map_elements`](crate::Array::map_elements) or
-/// [`Array::map_element_pairs`](crate::Array::map_element_pairs) to traverse operands directly
-/// through their storage layouts. Scalar errors are propagated without modification.
+/// Empty results undergo all input and metadata checks, but skip input conversion and scalar evaluation.
+/// The result buffer follows the inferred layout, including zero-initialized padding. Non-empty results use
+/// [`Array::map_elements`](crate::Array::map_elements) or [`Array::map_element_pairs`](crate::Array::map_element_pairs)
+/// to traverse inputs directly through their storage layouts. Scalar errors are propagated without modification.
 ///
 /// Unsupported input types and metadata, incompatible broadcast shapes, failed conversions, and scalar errors
 /// are returned as [`ProgramError`](crate::ProgramError). Validation precedes broadcasting, even for empty results.
@@ -317,9 +316,9 @@ macro_rules! dispatch_on_array_element_type {
 ///
 /// # Examples
 ///
-/// A local capability can implement complex-aware minimum selection using the element contract. The scalar right
-/// operand broadcasts across the left vector. Downstream crates must use a locally defined capability trait because
-/// Rust's orphan rules prevent implementing another crate's trait for [`Array`](crate::Array).
+/// A local capability can implement complex-aware minimum selection using the element contract. The scalar right input
+/// broadcasts across the left vector. Downstream crates must use a locally defined capability trait because Rust's
+/// orphan rules prevent implementing another crate's trait for [`Array`](crate::Array).
 ///
 /// ```rust
 /// # use ryft_core::{Array, ArrayElement, ProgramError};
@@ -368,7 +367,7 @@ macro_rules! dispatch_on_array_element_type {
 ///
 /// # Parameters
 ///
-///   - `@unary` or `@binary`: Number of operands accepted by the generated function.
+///   - `@unary` or `@binary`: Number of inputs accepted by the generated function.
 ///   - `$capability`: Capability trait path.
 ///   - `$method`: Name of its function to implement. A unary capability whose operation carries a result
 ///     [`Accuracy`](crate::Accuracy) names that function's accuracy parameter in parentheses (e.g.,
@@ -382,8 +381,8 @@ macro_rules! dispatch_on_array_element_type {
 ///     selector is `@boolean_or_numeric`, which extends it with Booleans.
 ///   - `checks = $checks`: Ordered list of array metadata checks from [`check_types!`](crate::check_types), typically
 ///     `@no_unreduced`, `@same_unreduced_axes`, or `@same_reduced_axes`. An empty list applies no additional checks.
-///   - `|input| body` or `|lhs, rhs| body`: Names for decoded scalar operands, followed by an expression returning
-///     their element type wrapped in `Result<_, ProgramError>`. The body must compile for every type in `inputs`.
+///   - `|input| body` or `|lhs, rhs| body`: Names for decoded scalar inputs, followed by an expression returning their
+///     element type wrapped in `Result<_, ProgramError>`. The body must compile for every type in `inputs`.
 #[macro_export]
 macro_rules! impl_array_elementwise_operation {
     // Validate the Boolean-extended universe on its own, since intersecting it with the numeric base would drop
@@ -531,8 +530,8 @@ macro_rules! impl_array_elementwise_operation {
                 let output_type = lhs_type.as_ref().broadcast(rhs_type.as_ref())
                     .map_err(|error| $crate::programs::TypeError::invalid(error.to_string()))?;
 
-                // Empty results need only layout-sized, zero-initialized storage. Skip operand conversions
-                // and scalar evaluation, since neither contributes any result elements.
+                // Empty results need only layout-sized, zero-initialized storage. Skip input conversions and scalar
+                // evaluation, since neither contributes any result elements.
                 if Self::element_count(&output_type) == 0 {
                     let addressing = $crate::arrays::addressing::ArrayAddressing::new(output_type.clone())?;
                     return Self::new(output_type, vec![0; addressing.storage_byte_len()]);
@@ -587,7 +586,7 @@ mod tests {
 
     /// Numeric minimum used to test generated array implementations.
     trait TestMinimum: Sized {
-        /// Computes the elementwise minimum of the operands.
+        /// Computes the elementwise minimum of the inputs.
         fn minimum(&self, rhs: &Self) -> Result<Self, ProgramError>;
     }
 
@@ -813,7 +812,7 @@ mod tests {
                 if message == "`real_float_identity` does not support input data type `c64`",
         ));
 
-        // Empty operands cannot bypass validation of the declared input class.
+        // Empty inputs cannot bypass validation of the declared input class.
         let input = Array::from_elements(ArrayType::new_static(DataType::Boolean, [0]), &[] as &[bool])?;
         assert!(matches!(
             input.real_float_identity(),
@@ -843,7 +842,7 @@ mod tests {
         assert!(matches!(
             input.identity(),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`identity` does not support unreduced operands",
+                if message == "`identity` does not support unreduced inputs",
         ));
         Ok(())
     }
@@ -882,7 +881,7 @@ mod tests {
 
     #[test]
     fn test_impl_array_elementwise_operation_binary() -> Result<(), ProgramError> {
-        // Promotion and broadcasting happen before the scalar kernel receives its operands.
+        // Promotion and broadcasting happen before the scalar kernel receives its inputs.
         let lhs = Array::from_elements(ArrayType::new_static(DataType::I16, [2, 1]), &[2i16, 5])?;
         let rhs = Array::from_elements(ArrayType::new_static(DataType::I32, [1, 3]), &[1i32, 3, 6])?;
         let output = lhs.minimum(&rhs)?;
@@ -895,7 +894,7 @@ mod tests {
     fn test_impl_array_elementwise_operation_binary_empty_invalid_data_type() -> Result<(), ProgramError> {
         /// Real minimum used to verify input-class validation.
         trait TestRealMinimum: Sized {
-            /// Computes the elementwise minimum of real operands.
+            /// Computes the elementwise minimum of real inputs.
             fn real_minimum(&self, rhs: &Self) -> Result<Self, ProgramError>;
         }
 
@@ -950,7 +949,7 @@ mod tests {
         assert!(matches!(
             output,
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`min` does not support unreduced operands",
+                if message == "`min` does not support unreduced inputs",
         ));
         Ok(())
     }

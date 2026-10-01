@@ -339,7 +339,7 @@ pub enum BatchingLevelExtent<T> {
     Static(usize),
 
     /// First-class extent value of the provided type. Its runtime value is not part of the level and is instead
-    /// supplied as a leading boundary operand. Refer to the documentation of [`BatchingPolicy::boundary_operands`]
+    /// supplied as a leading boundary input. Refer to the documentation of [`BatchingPolicy::boundary_operands`]
     /// for more information on dynamic batching extents.
     Dynamic(T),
 }
@@ -349,7 +349,7 @@ pub enum BatchingLevelExtent<T> {
 /// only after the operation itself was batched records the level through [`BatchingDriver::batching_level`] and later
 /// batches those programs with [`RecursiveBatchingPolicy::batch_program_at_level`]. A level never contains a runtime
 /// value: first-class extents contribute only their type, and their value reaches batched programs as the leading
-/// boundary operand that [`BatchingPolicy::boundary_operands`] supplies to every consumer of that policy's batched
+/// boundary input that [`BatchingPolicy::boundary_operands`] supplies to every consumer of that policy's batched
 /// programs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BatchingLevel<T> {
@@ -592,8 +592,8 @@ pub trait BatchableType: Type {
 ///     reject mapped non-array members.
 ///   - **The Mapped-Axis Extent (i.e., [`Self::Extent`]):** Homogeneous array batching uses a static `usize`, while a
 ///     composite universe may carry an ordinary parent-owned first-class dimension value so that a dynamic batch extent
-///     remains a Single Static Assignment (SSA) value flowing through operand edges rather than being treated as static
-///     transform metadata.
+///     remains a Single Static Assignment (SSA) value flowing through instruction inputs rather than being treated as
+///     static transform metadata.
 ///   - **The Structurally Batched Program (i.e., [`Self::BatchedProgram`]):** Programs over homogeneous arrays preserve
 ///     source region's boundary exactly and produce [`BoundaryPreservingBatchedProgram`]s, while a composite universe
 ///     may thread bookkeeping values such as its first-class mapped extent through standalone nested programs. Every
@@ -684,15 +684,15 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
         Ok(())
     }
 
-    /// Returns the parent-owned bookkeeping operand values that this policy's structurally batched programs require
-    /// prepended to their source operands when they are rebound as ordinary [`Region`](crate::Region)s of an operation
-    /// that does not thread this policy's batching state itself.
+    /// Returns the parent-owned bookkeeping values that this policy's structurally batched programs require
+    /// prepended to the instruction inputs that feed their source region inputs when they are rebound as ordinary
+    /// [`Region`](crate::Region)s of an operation that does not thread this policy's batching state itself.
     ///
     /// A structurally batched program's boundary is not always the source region's boundary. A batched nested program
     /// is sealed and cannot reference values owned by the parent program, so a policy whose batching state is itself a
     /// parent-owned value must widen the batched boundary with leading inputs that reintroduce that state. This
     /// function supplies the parent-owned value for each such input, in boundary order, so consumers can complete
-    /// an adapted program's operands without knowing which policy produced it:
+    /// an adapted program's inputs without knowing which policy produced it:
     ///
     ///   - Homogeneous array policies return no values (the default), because their mapped-axis extent
     ///     is static transform metadata and their batched programs carry exactly the source boundary.
@@ -1341,7 +1341,7 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation {
 /// If this operation has native type `T` while the enclosing operation family uses type `U`, an ordinary
 /// [`BatchableOperation`] implementation can describe only the homogeneous `T -> T` contract because its
 /// [`batch`](BatchableOperation::batch) method requires `Self::Type = C::Type`. This trait instead receives the parent
-/// [`BatchingContext`] and its `U`-typed batches, allowing the rule to account for operands or results belonging to
+/// [`BatchingContext`] and its `U`-typed batches, allowing the rule to account for inputs or results belonging to
 /// other members of `U`.
 ///
 /// Shape-changing collectives are the motivating example. Their native array operation consumes one array, whereas
@@ -1355,7 +1355,7 @@ pub trait MemberBatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation 
     ///
     ///   - `context`: Active parent [`BatchingContext`] through which the rule stages mixed operations.
     ///   - `driver`: Instruction-scoped [`BatchingDriver`] exposing any attached regions.
-    ///   - `inputs`: Parent-universe batches in the mixed instruction's operand order.
+    ///   - `inputs`: Parent-universe batches in the mixed instruction's input order.
     fn batch_in_parent<D: BatchingDriver<C, P>>(
         &self,
         context: &BatchingContext<C, P>,
@@ -1639,7 +1639,7 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
     /// Alignment happens before adaptation because the reconciled `target_output_axes` describe the source region's
     /// outputs, which is exactly the axis vector both steps are stated over (a policy's bookkeeping outputs never
     /// appear in [`BatchedProgram::output_axes`]). Callers must reintroduce the shed inputs by prepending
-    /// [`BatchingPolicy::boundary_operands`] to the operands of the operation they attach the result to.
+    /// [`BatchingPolicy::boundary_operands`] to the inputs of the operation they attach the result to.
     ///
     /// Like [`Self::align_batched_program_outputs`], this performs no mapped-to-replicated collapse. Alignment resolves
     /// every structurally movable mismatch, and collapsing a genuinely mapped output requires [`Operation`]-specific
@@ -2048,7 +2048,7 @@ pub fn batch<
 
 /// Applies a member [`Operation`]'s batching rule through a projected view of a composite [`BatchingContext`]. Use
 /// this function from a composite operation dispatcher when the operation is [`Region`](crate::Region)-free and every
-/// operand and result belongs to the same projectable member type `T`. It converts the packed input values to the
+/// input and result belongs to the same projectable member type `T`. It converts the packed input values to the
 /// member value family, preserves the outer batch axes and mapped extent, runs the member's existing batching rule,
 /// and converts the results back to the composite value family, relaying the member rule's validation evidence
 /// unchanged. [`BatchingPolicyProjection`] selects the member policy that represents that same extent and evidence for
@@ -2064,7 +2064,7 @@ pub fn batch<
 ///   - `context`: Active composite [`BatchingContext`] whose mapped extent, axis metadata, and parent context are
 ///     preserved while the member rule runs.
 ///   - `operation`: Region-free operation expressed in the projected member operation family.
-///   - `inputs`: Packed composite batches corresponding to the operation's operands.
+///   - `inputs`: Packed composite batches corresponding to the operation's inputs.
 pub fn batch_projected_operation<
     T: Type,
     O: Operation<Type = T> + BatchableOperation<ProjectedContext<C, T>, P::Projected>,

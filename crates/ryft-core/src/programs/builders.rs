@@ -214,7 +214,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             )?;
             let resolved = match analysis.output_roots().get(output.output_index).copied().flatten() {
                 Some(ReferenceRoot::RegionInput { region: owner, input_index }) if owner == region.id() => {
-                    // Map a forwarded handle to its caller operand; an operation-owned root cannot escape.
+                    // Map a forwarded handle to its instruction input; an operation-owned root cannot escape.
                     let input_index = match operation.input_region_provenance(output.region_index, input_index) {
                         InputRegionProvenance::Input { index } => index,
                         InputRegionProvenance::Local => {
@@ -736,7 +736,8 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                 continue;
             }
 
-            // References require an explicit operand or local origin; ordinary values carry no allocation ownership.
+            // References require an explicit instruction input or local origin, while ordinary values
+            // carry no allocation ownership.
             for (input_index, input_type) in region_input_types.iter().enumerate() {
                 if input_type.is_reference()
                     && operation.input_region_provenance(region_index, input_index) == InputRegionProvenance::None
@@ -789,7 +790,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
 
         // The accepted application is read back off the instruction just appended, which borrows a different field of
         // this builder than the lifetime state does, so recording needs neither a clone of the operation nor of its
-        // operand list. It runs for an application that declares reference effects or aliases and for one that merely
+        // input list. It runs for an application that declares reference effects or aliases and for one that merely
         // names a reference-typed value, because a region-carrying operation carrying a reference through its boundary
         // declares nothing and is recognized only by its identity-forwarding hook.
         let instruction = self.instructions.last().unwrap();
@@ -971,7 +972,7 @@ mod tests {
     /// Call and read operations for the builder's reference provenance queries.
     #[derive(Clone, Debug)]
     enum ReferenceIdentityOperation {
-        /// Reads the first reference operand.
+        /// Reads the first reference input.
         Read,
 
         /// Calls one region, optionally rebinding its capture scope to a leading input prefix.
@@ -2151,8 +2152,8 @@ mod tests {
             )),
         );
 
-        // A declared endpoint must be reference-typed: an access to an array operand, an allocation classifying
-        // an array result, and an alias of an array operand are all rejected.
+        // A declared endpoint must be reference-typed: an access to an array input, an allocation classifying an
+        // array result, and an alias of an array input are all rejected.
         assert_eq!(
             builder.add_instruction(InvalidReferenceOperation(read(0)), Vec::new(), vec![array], None),
             Err(ProgramError::MalformedProgram(
@@ -2223,7 +2224,7 @@ mod tests {
             }
         }
 
-        /// `ForwardingRegion` forwards complete operand values to their corresponding region inputs.
+        /// `ForwardingRegion` forwards complete instruction input values to their corresponding region inputs.
         #[derive(Clone, Debug)]
         enum HookOperation {
             Allocate,
@@ -2480,7 +2481,7 @@ mod tests {
             Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_freeze", "consumes"),
         ));
 
-        // Structured identity forwarding joins the output to its operand's family without declaring reference
+        // Structured identity forwarding joins the output to its input's family without declaring reference
         // effects. Independent roots remain live, and out-of-range access indices remain the arity owner's concern.
         let mut lifetimes = ReferenceLifetimes::default();
         let carry = AtomId::new(6);
