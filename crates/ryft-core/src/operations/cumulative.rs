@@ -57,7 +57,7 @@ use num_complex::Complex;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayType, DataType, Dimension, FloatingPointArrayElement,
-    NumericArrayElement, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity, ShardingDimension, StaticShape,
+    NumericArrayElement, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -591,12 +591,10 @@ impl Cumulative for Array {
             return Self::new(output_type, Vec::new());
         }
 
-        let shape = output_type.static_shape().unwrap();
         match kind {
             CumulativeKind::Sum | CumulativeKind::Product => {
                 dispatch_on_array_element_type!(@numeric data_type, |Element| {
-                    let elements = self.elements::<Element>()?;
-                    let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
+                    let scanned = self.cumulative_elements::<Element, _>(axis, reverse, |left, right| {
                         match kind {
                             CumulativeKind::Sum => NumericArrayElement::add(left, right),
                             _ => multiply_product_elements(left, right),
@@ -609,8 +607,7 @@ impl Cumulative for Array {
                 dispatch_on_array_element_type!(@float_or_complex data_type, |Element| {
                     // Converting an element into `f64` keeps only its real component, which is all that decides whether
                     // its exponential is zero. The guard never changes a real combination.
-                    let elements = self.elements::<Element>()?;
-                    let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
+                    let scanned = self.cumulative_elements::<Element, _>(axis, reverse, |left, right| {
                         if right.convert_to::<f64>()? == f64::NEG_INFINITY {
                             Ok(left)
                         } else if left.convert_to::<f64>()? == f64::NEG_INFINITY {
@@ -645,8 +642,7 @@ impl Cumulative for Array {
             }
             CumulativeKind::Max | CumulativeKind::Min => {
                 dispatch_on_array_element_type!(@numeric data_type, |Element| {
-                    let elements = self.elements::<Element>()?;
-                    let scanned = cumulative_evaluate(elements.as_slice(), &shape, axis, reverse, |left, right| {
+                    let scanned = self.cumulative_elements::<Element, _>(axis, reverse, |left, right| {
                         Ok(match kind {
                             CumulativeKind::Max => ArrayElement::max(&left, &right),
                             _ => ArrayElement::min(&left, &right),
@@ -681,26 +677,24 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ArrayType {
-    /// Returns the output [`ArrayType`] produced by scanning `self` along `axis` with `kind`. The result *is* `self`: a
-    /// prefix scan changes neither the element data type nor the shape, layout, memory placement, or sharding.
+    /// Returns the output [`ArrayType`] produced by scanning `self` along `axis` with `kind`. The result _is_ `self` as
+    /// a prefix scan changes neither the element data type nor the shape, layout, memory placement, or sharding. Also,
+    /// this function validates that:
     ///
-    /// Validates that:
-    ///   - `kind` supports the element data type of `self`, as documented on [`CumulativeKind`];
-    ///   - `axis` is within `0..self.rank()`;
+    ///   - `kind` supports the element data type of `self`, as documented on [`CumulativeKind`],
+    ///   - `axis` is within `0..self.rank()`,
     ///   - the scanned dimension is [`Dimension::Static`], because a prefix scan is defined by the exact number of
-    ///     elements that it accumulates over;
+    ///     elements that it accumulates over,
     ///   - the scanned dimension is unsharded, because a prefix crosses shard boundaries and a cumulative operation
-    ///     carries no cross-shard communication of its own; and
+    ///     carries no cross-shard communication of its own, and
     ///   - `self` has no unreduced mesh axes unless `kind` is [`CumulativeKind::Sum`], because only a prefix sum
     ///     commutes with the pending cross-device sum of an unreduced value.
     ///
     /// A dynamically sized scanned axis could be supported in the future by physicalizing the scan at the dimension's
     /// declared upper bound and masking the elements past each runtime extent with the kind's identity, which is the
-    /// same discipline that the ragged batching rule already uses. That extension is deliberately not implemented here:
-    /// it would silently change the operation's cost model, and so it belongs to an explicit dynamic-scan surface.
+    /// same discipline that the ragged batching rule already uses. That extension is deliberately not implemented here
+    /// as it would silently change the operation's cost model, and so it belongs to an explicit dynamic-scan surface.
     fn cumulative(&self, axis: usize, kind: CumulativeKind) -> Result<Self, TypeError> {
         // The element data type is validated before the scan geometry, and the diagnostic names the kind, because the
         // supported data types differ across kinds (e.g., summation accepts the structural zero while extrema do not).
@@ -709,11 +703,11 @@ impl ArrayType {
             CumulativeKind::Sum | CumulativeKind::Product if !data_type.is_numeric() && data_type != DataType::Zero => {
                 Some(Cow::Borrowed("numeric inputs"))
             }
-            CumulativeKind::Max | CumulativeKind::Min if !data_type.is_numeric() => {
-                Some(Cow::Borrowed("numeric inputs"))
-            }
             CumulativeKind::LogSumExp if !data_type.is_floating_point() && !data_type.is_complex() => {
                 Some(Cow::Borrowed("floating-point or complex inputs"))
+            }
+            CumulativeKind::Max | CumulativeKind::Min if !data_type.is_numeric() => {
+                Some(Cow::Borrowed("numeric inputs"))
             }
             CumulativeKind::LogSumExp if matches!(data_type, DataType::F8E8M0FNU | DataType::F6E2M3FN) => {
                 Some(Cow::Owned(format!(
@@ -734,12 +728,14 @@ impl ArrayType {
                 "`{CUMULATIVE_OPERATION_NAME}` axis {axis} is out of bounds for rank {rank}",
             )));
         }
+
         if !matches!(self.dimension(axis), Dimension::Static(_)) {
             return Err(TypeError::invalid(format!(
                 "`{CUMULATIVE_OPERATION_NAME}` requires a static scanned dimension but axis {axis} of `{self}` is \
                  dynamic",
             )));
         }
+
         if let Some(sharding) = self.sharding()
             && matches!(sharding.dimensions()[axis], ShardingDimension::Sharded(_))
         {
@@ -748,15 +744,19 @@ impl ArrayType {
                  sharded",
             )));
         }
+
         if kind != CumulativeKind::Sum && self.sharding().is_some_and(|sharding| !sharding.unreduced_axes().is_empty())
         {
             return Err(TypeError::invalid(format!(
                 "`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` cannot scan inputs with unreduced axes",
             )));
         }
+
         Ok(self.clone())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Value that the nested trace staging an [`associative_scan`] decomposition flows.
 type DecompositionTracer<C> = Tracer<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>;
@@ -852,59 +852,60 @@ where
     DifferentiationDual::new(primal_outputs.remove(0), MaybeZero::Value(tangent_outputs.remove(0)))
 }
 
-/// Sequential prefix scan over a flat row-major payload with the provided `shape`, which the eager [`Array`] kernel
-/// runs with the element-level combining operator of each [`CumulativeKind`].
-///
-/// Returns the scanned payload, which has the same length and shape as `values`. Output element `i` along `axis` holds
-/// the accumulation of input elements `0..=i`, or of elements `i..` when `reverse` is set. A scanned axis shorter than
-/// two elements (including a zero-length one) leaves the payload unchanged. The combiner is fallible because the
-/// element-level arithmetic contracts of the reference backend are (e.g., a conversion into a low-precision encoding
-/// can fail).
-///
-/// # Parameters
-///
-///   - `values`: Row-major input payload.
-///   - `shape`: Input shape.
-///   - `axis`: Scanned axis.
-///   - `reverse`: Whether to accumulate from the end of the scanned axis toward its start.
-///   - `combiner`: Binary associative operator, receiving the accumulated prefix and the next element.
-pub(crate) fn cumulative_evaluate<T: Clone>(
-    values: &[T],
-    shape: &StaticShape,
-    axis: usize,
-    reverse: bool,
-    combiner: impl Fn(T, T) -> Result<T, ProgramError>,
-) -> Result<Vec<T>, ProgramError> {
-    let mut output = values.to_vec();
-    let extent = shape[axis];
-    if extent < 2 {
-        return Ok(output);
-    }
+impl Array {
+    /// Scans this array's logical elements sequentially along `axis`, returning a row-major payload of the same shape.
+    /// Output element `i` along `axis` accumulates input elements `0..=i`, or elements `i..` when `reverse` is set.
+    /// An axis shorter than two elements, including an empty axis, leaves the payload unchanged. Callers validate
+    /// the static shape, axis, and element type before invoking this helper.
+    ///
+    /// `combine_fn` is fallible because reference-backend element arithmetic can fail (e.g., conversion into a
+    /// low-precision encoding). Returning elements lets complex log-sum-exp normalize phases before encoding them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Validated nonnegative scanned axis.
+    ///   - `reverse`: Whether to accumulate from the end of the scanned axis toward its start.
+    ///   - `combine_fn`: Binary associative operator, receiving the accumulated prefix and the next element.
+    fn cumulative_elements<T: ArrayElement, F: Fn(T, T) -> Result<T, ProgramError>>(
+        &self,
+        axis: usize,
+        reverse: bool,
+        combine_fn: F,
+    ) -> Result<Vec<T>, ProgramError> {
+        let shape = self.r#type().static_shape().unwrap();
+        let values = self.elements::<T>()?;
+        let mut output = values.clone();
+        let extent = shape[axis];
+        if extent < 2 {
+            return Ok(output);
+        }
 
-    // Row-major storage splits into `outer` independent blocks of `extent` slices, each holding `inner` elements, so
-    // one scan step moves by `inner` elements and the scan visits every `(outer, inner)` pair once. Both bounds are
-    // computed as direct dimension products rather than from the payload length and the scanned axis stride, because a
-    // zero-extent axis anywhere to the right of `axis` makes that stride zero.
-    let inner = shape.dimensions()[axis + 1..].iter().product::<usize>();
-    let outer = shape.dimensions()[..axis].iter().product::<usize>();
-    for block in 0..outer {
-        let base = block * extent * inner;
-        for offset in 0..inner {
-            let index = |position: usize| base + position * inner + offset;
-            if reverse {
-                for position in (0..extent - 1).rev() {
-                    output[index(position)] =
-                        combiner(output[index(position + 1)].clone(), values[index(position)].clone())?;
-                }
-            } else {
-                for position in 1..extent {
-                    output[index(position)] =
-                        combiner(output[index(position - 1)].clone(), values[index(position)].clone())?;
+        // Row-major storage splits into `outer` independent blocks of `extent` slices, each holding `inner` elements,
+        // so one scan step moves by `inner` elements and the scan visits every `(outer, inner)` pair once. Both bounds
+        // are computed as direct dimension products rather than from the payload length and the scanned axis stride,
+        // because a zero-extent axis anywhere to the right of `axis` makes that stride zero.
+        let inner = shape.dimensions()[axis + 1..].iter().product::<usize>();
+        let outer = shape.dimensions()[..axis].iter().product::<usize>();
+        for block in 0..outer {
+            let base = block * extent * inner;
+            for offset in 0..inner {
+                let index = |position: usize| base + position * inner + offset;
+                if reverse {
+                    for position in (0..extent - 1).rev() {
+                        output[index(position)] =
+                            combine_fn(output[index(position + 1)].clone(), values[index(position)].clone())?;
+                    }
+                } else {
+                    for position in 1..extent {
+                        output[index(position)] =
+                            combine_fn(output[index(position - 1)].clone(), values[index(position)].clone())?;
+                    }
                 }
             }
         }
+
+        Ok(output)
     }
-    Ok(output)
 }
 
 #[cfg(test)]
@@ -2261,34 +2262,25 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_evaluate() {
+    fn test_array_cumulative_elements() {
         let values = (1..=6).map(|value| value as f64).collect::<Vec<_>>();
-        let shape = StaticShape::new(vec![2, 3]);
+        let input = Array::matrix(2, 3, values.clone()).unwrap();
         let add = |left: f64, right: f64| Ok(left + right);
 
-        // Forward scans accumulate prefixes and reverse scans accumulate suffixes, per row of the scanned axis, and
-        // scanning the outer axis accumulates across the row stride instead.
-        assert_eq!(
-            cumulative_evaluate(values.as_slice(), &shape, 1, false, add),
-            Ok(vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0])
-        );
-        assert_eq!(
-            cumulative_evaluate(values.as_slice(), &shape, 1, true, add),
-            Ok(vec![6.0, 5.0, 3.0, 15.0, 11.0, 6.0])
-        );
-        assert_eq!(
-            cumulative_evaluate(values.as_slice(), &shape, 0, false, add),
-            Ok(vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0])
-        );
+        // Scan independent rows and the outer axis in both directions.
+        assert_eq!(input.cumulative_elements(1, false, add), Ok(vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]));
+        assert_eq!(input.cumulative_elements(1, true, add), Ok(vec![6.0, 5.0, 3.0, 15.0, 11.0, 6.0]));
+        assert_eq!(input.cumulative_elements(0, false, add), Ok(vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]));
+        assert_eq!(input.cumulative_elements(0, true, add), Ok(vec![5.0, 7.0, 9.0, 4.0, 5.0, 6.0]));
 
-        // A scanned axis with fewer than two elements has nothing to accumulate.
-        assert_eq!(cumulative_evaluate(values.as_slice(), &StaticShape::new(vec![6, 1]), 1, false, add), Ok(values));
-        assert_eq!(cumulative_evaluate(&[], &StaticShape::new(vec![0, 3]), 0, false, add), Ok(Vec::<f64>::new()));
+        // A scanned axis with fewer than two elements leaves the payload unchanged.
+        let singleton = Array::matrix(6, 1, values.clone()).unwrap();
+        assert_eq!(singleton.cumulative_elements(1, false, add), Ok(values));
 
-        // A zero-extent axis to the *right* of the scanned one leaves the payload empty while the scanned extent itself
-        // is still at least two, so the block bounds are derived from dimension products rather than from the payload
-        // length and the scanned axis stride, which is zero here.
-        assert_eq!(cumulative_evaluate(&[], &StaticShape::new(vec![2, 0]), 0, false, add), Ok(Vec::<f64>::new()));
-        assert_eq!(cumulative_evaluate(&[], &StaticShape::new(vec![3, 0, 2]), 0, true, add), Ok(Vec::<f64>::new()));
+        // An empty scanned axis or an empty trailing axis must not divide by a zero row stride.
+        for (shape, reverse) in [(vec![0, 3], false), (vec![2, 0], false), (vec![3, 0, 2], true)] {
+            let empty = Array::new(ArrayType::new_static(DataType::F64, shape), Vec::new()).unwrap();
+            assert_eq!(empty.cumulative_elements(0, reverse, add), Ok(Vec::<f64>::new()));
+        }
     }
 }
