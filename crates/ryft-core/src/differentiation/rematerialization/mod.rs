@@ -15,11 +15,12 @@
 //! # use ryft_core::differentiation::rematerialization::{DotsSaveable, rematerialize};
 //! # use ryft_core::{Array, ArrayOperation, DomainTracer, EagerContext, ProgramError, Sin};
 //! # fn main() -> Result<(), ProgramError> {
-//! type Tracer = DomainTracer<EagerContext<Array, ArrayOperation<Array>>>;
+//! type Context = EagerContext<Array, ArrayOperation<Array>>;
+//! type Tracer = DomainTracer<Context>;
 //!
 //! // The closure annotates its tracer input, which determines the context that the function is traced in.
 //! let function = rematerialize(|x: Tracer| Ok(x.sin()?)).with_policy(DotsSaveable);
-//! assert_eq!(function.call(Array::scalar(0.0f64)?)?, Array::scalar(0.0f64)?);
+//! assert_eq!(function.call_in_context(&Context::new(), Array::scalar(0.5f64)?)?, Array::scalar(0.5f64.sin())?);
 //! # Ok(())
 //! # }
 //! ```
@@ -42,9 +43,13 @@ use crate::programs::{ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext};
 
 pub use policies::{
-    DotsSaveable, DotsWithNoBatchDimensionsSaveable, EverythingSaveable, MemoryTransferStorage, NothingSaveable,
-    OffloadDotsWithNoBatchDimensions, PolicyFn, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
-    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
+    DOTS_SAVEABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVEABLE_POLICY_NAME, DotsSaveable,
+    DotsWithNoBatchDimensionsSaveable, EVERYTHING_SAVEABLE_POLICY_NAME, EverythingSaveable, MemoryTransferStorage,
+    NOTHING_SAVEABLE_POLICY_NAME, NothingSaveable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
+    OffloadDotsWithNoBatchDimensions, POLICY_FN_POLICY_NAME, PolicyFn, SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME,
+    SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME, SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME,
+    SAVE_FROM_BOTH_POLICIES_POLICY_NAME, SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames,
+    SaveAnyNamesButThese, SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
 };
 
 /// [`PolicyReferences`] of the default [`NothingSaveable`] policy, which every [`Rematerialize`] that does not select
@@ -279,4 +284,146 @@ pub fn rematerialize<Input, Output, Body: Fn(Input) -> Result<Output, ProgramErr
     body: Body,
 ) -> Rematerialize<Input, Output, Body> {
     Rematerialize { body, policy: DEFAULT_POLICY_REFERENCES.clone(), optimization_barrier: true, marker: PhantomData }
+}
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::contexts::EagerContext;
+    use crate::operations::Sin;
+    use crate::programs::Program;
+    use crate::tracing::{Tracer, TracingContext};
+
+    use super::*;
+
+    type TestTracer = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+
+    /// Traces `function` into a program over one `f64[]` scalar input.
+    fn trace<F: Fn(TestTracer) -> Result<TestTracer, ProgramError>>(
+        function: F,
+    ) -> Program<Array, ArrayOperation<Array>, Array, Array> {
+        TracingContext::<Array, ArrayOperation<Array>>::trace(function, ArrayType::scalar(DataType::F64))
+            .unwrap()
+            .1
+    }
+
+    /// Returns the [`RematerializeOperation`] of the instruction at `index` in `program`.
+    fn operation(
+        program: &Program<Array, ArrayOperation<Array>, Array, Array>,
+        index: usize,
+    ) -> RematerializeOperation<ArrayType> {
+        match program.instructions()[index].operation() {
+            ArrayOperation::Rematerialize(operation) => operation.clone(),
+            operation => panic!("expected a `rematerialize` operation but got `{operation}`"),
+        }
+    }
+
+    #[test]
+    fn test_rematerialize_with_policy() {
+        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSaveable);
+        let program = trace(|x| function.call(x));
+        assert_eq!(operation(&program, 0).policy().name(), "dots_saveable");
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = rematerialize [policy=\"dots_saveable\"] %0 [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_with_optimization_barrier() {
+        let function = rematerialize(|x: TestTracer| Ok(x.sin()?));
+        assert!(operation(&trace(|x| function.call(x)), 0).optimization_barrier());
+        let function = function.with_optimization_barrier(false);
+        assert!(!operation(&trace(|x| function.call(x)), 0).optimization_barrier());
+    }
+
+    #[test]
+    fn test_rematerialize_call() {
+        // Each call stages one `rematerialize` operation, whose body is the traced closure, into the dispatch domain of
+        // its inputs. Repeated calls of one function stage equal operations because they share the reference to its
+        // policy.
+        let function = rematerialize(|x: TestTracer| Ok(x.sin()?));
+        let program = trace(|x| function.call(function.call(x)?));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+            PLACEHOLDER"},
+        );
+        assert_eq!(operation(&program, 0), operation(&program, 1));
+        assert_eq!(program.interpret(Array::scalar(0.5f64).unwrap()), Ok(Array::scalar(0.5f64.sin().sin()).unwrap()),);
+    }
+
+    #[test]
+    fn test_rematerialize_call_without_inputs() {
+        let function = rematerialize(|inputs: Vec<TestTracer>| Ok(inputs));
+        assert_eq!(
+            function.call(Vec::<TestTracer>::new()),
+            Err(ProgramError::from(TypeError::invalid(
+                "`rematerialize` requires at least one input to recover its context from; use \
+                 `Rematerialize::call_in_context` for functions without inputs",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_call_in_context() {
+        // Eager arrays dispatch to a context whose operation family cannot represent `rematerialize`, so eager calls
+        // name a context that can.
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let function = rematerialize(|inputs: Vec<TestTracer>| -> Result<Vec<TestTracer>, ProgramError> {
+            inputs.into_iter().map(|x| Ok(x.sin()?)).collect()
+        });
+        assert_eq!(
+            function.call_in_context(&context, vec![Array::scalar(0.5f64).unwrap()]),
+            Ok(vec![Array::scalar(0.5f64.sin()).unwrap()]),
+        );
+
+        // Unlike `call`, `call_in_context` supports functions without inputs.
+        assert_eq!(function.call_in_context(&context, Vec::<Array>::new()), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn test_rematerialize_clone() {
+        // Clones share the reference to the policy of the function, so their calls stage equal operations.
+        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSaveable);
+        let clone = function.clone();
+        let program = trace(|x| clone.call(function.call(x)?));
+        assert_eq!(operation(&program, 0), operation(&program, 1));
+
+        // Selecting the same policy again defines a new policy, whose calls stage different operations.
+        let other = function.clone().with_policy(DotsSaveable);
+        let program = trace(|x| other.call(function.call(x)?));
+        assert_ne!(operation(&program, 0), operation(&program, 1));
+    }
+
+    #[test]
+    fn test_rematerialize_debug() {
+        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_optimization_barrier(false);
+        assert_eq!(
+            format!("{function:?}"),
+            "Rematerialize { policy: NothingSaveable, optimization_barrier: false, .. }"
+        );
+    }
+
+    #[test]
+    fn test_rematerialize() {
+        // Functions that use the default policy share its reference, so their calls stage equal operations.
+        let sine = rematerialize(|x: TestTracer| Ok(x.sin()?));
+        let identity = rematerialize(|x: TestTracer| Ok(x));
+        let program = trace(|x| identity.call(sine.call(x)?));
+        assert_eq!(operation(&program, 0), operation(&program, 1));
+        assert_eq!(operation(&program, 0).policy().name(), "nothing_saveable");
+    }
 }

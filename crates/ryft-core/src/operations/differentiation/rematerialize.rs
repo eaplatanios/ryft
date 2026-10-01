@@ -1,16 +1,16 @@
 use std::fmt::Display;
 
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
-    ProgramBatchingOutputAxesPolicy,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    BatchingPolicy, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy,
+    DifferentiationError, DifferentiationPolicy, NOTHING_SAVEABLE_POLICY_NAME,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types};
+use crate::macros::{check_count, check_types, impl_non_transposable_operation};
 use crate::partial::{PartiallyEvaluatableOperation, ResidualPolicyReference};
 use crate::programs::{
     InputRegionProvenance, Operation, OperationBoundaryPruning, OperationFormatter, OutputRegionProvenance,
@@ -19,27 +19,21 @@ use crate::programs::{
     TypeError, Typed, discharge_positional_region_operation,
 };
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`RematerializeOperation`].
 pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
-
-/// Name of the residual policy that [`RematerializeOperation`]s omit from their rendering, because it is the default
-/// policy of [`rematerialize`](crate::differentiation::rematerialization::rematerialize).
-const DEFAULT_POLICY_NAME: &str = "nothing_saveable";
 
 /// [`Operation`] that represents a rematerialized (i.e., checkpointed) call of its attached `body` region, which is the
 /// analogue of JAX's [`jax.checkpoint`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html) primitive.
 /// Outside of differentiation, the call computes exactly what its body computes, and its outputs are the body's
 /// outputs. Under differentiation, the residual policy of the call decides which of the values that the body computes
-/// are saved for the derivative computation and which are recomputed from the saved values instead (refer to
-/// [`ResidualPolicy`](crate::ResidualPolicy)), which trades computation for the memory that the saved values occupy.
+/// are saved for the derivative computation and which are recomputed from the saved values instead (based on a
+/// [`ResidualPolicy`]), which trades computation for the memory that the saved values occupy.
 ///
 /// The operands of the call map positionally onto the inputs of its body, and its outputs map positionally onto the
 /// outputs of its body. The call carries no stored derivative regions: the transforms derive the body's derivatives
 /// when they need them, so rematerialization composes with every transform that applies to its body.
 ///
-/// The call also records whether it is the residual side of a differentiated computation (refer to
+/// The call also records whether it is the residual side of a differentiated computation (via
 /// [`differentiated`](Self::differentiated)), in which case backends place an optimization barrier on its inputs when
 /// [`optimization_barrier`](Self::optimization_barrier) is set, so that the recomputation is neither merged with the
 /// original computation nor scheduled before its inputs are available.
@@ -58,8 +52,8 @@ const DEFAULT_POLICY_NAME: &str = "nothing_saveable";
 /// ]
 /// ```
 ///
-/// It renders only the fields that differ from their defaults, e.g.,
-/// `rematerialize [policy="dots_saveable", optimization_barrier=false, differentiated=true]`.
+/// It renders only the fields that differ from their defaults (e.g.,
+/// `rematerialize [policy="dots_saveable", optimization_barrier=false, differentiated=true]`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RematerializeOperation<T: Type> {
     /// Residual policy that decides which values the call saves under differentiation.
@@ -79,6 +73,22 @@ impl<T: Type> RematerializeOperation<T> {
     #[inline]
     pub fn new(policy: ResidualPolicyReference<T>) -> Self {
         Self { policy, optimization_barrier: true, differentiated: false }
+    }
+
+    /// Returns this [`RematerializeOperation`] with the provided optimization-barrier flag.
+    /// Refer to [`optimization_barrier`](Self::optimization_barrier) for more information.
+    #[inline]
+    pub fn with_optimization_barrier(mut self, optimization_barrier: bool) -> Self {
+        self.optimization_barrier = optimization_barrier;
+        self
+    }
+
+    /// Returns this [`RematerializeOperation`] with the provided differentiated flag.
+    /// Refer to [`differentiated`](Self::differentiated) for more information.
+    #[inline]
+    pub fn with_differentiated(mut self, differentiated: bool) -> Self {
+        self.differentiated = differentiated;
+        self
     }
 
     /// Returns the residual policy that decides which values this call saves under differentiation.
@@ -103,24 +113,8 @@ impl<T: Type> RematerializeOperation<T> {
         self.differentiated
     }
 
-    /// Returns this [`RematerializeOperation`] with the provided optimization-barrier flag (refer to
-    /// [`optimization_barrier`](Self::optimization_barrier)).
-    #[inline]
-    pub fn with_optimization_barrier(mut self, optimization_barrier: bool) -> Self {
-        self.optimization_barrier = optimization_barrier;
-        self
-    }
-
-    /// Returns this [`RematerializeOperation`] with the provided differentiated flag (refer to
-    /// [`differentiated`](Self::differentiated)).
-    #[inline]
-    pub fn with_differentiated(mut self, differentiated: bool) -> Self {
-        self.differentiated = differentiated;
-        self
-    }
-
-    /// Returns this [`RematerializeOperation`] lifted into a type universe `U` whose types project into `T` (e.g., from
-    /// [`ArrayType`](crate::ArrayType) into [`ArrayIrType`](crate::ArrayIrType)), with its policy lifted through
+    /// Returns this [`RematerializeOperation`] lifted into a type universe `U` whose types project into `T` (e.g.,
+    /// from [`ArrayType`](crate::ArrayType) into [`ArrayIrType`](crate::ArrayIrType)), with its policy lifted through
     /// [`ResidualPolicyReference::lift`], which keeps the identity of the policy, and with its flags unchanged.
     #[inline]
     pub fn lift<U: 'static + Type>(&self) -> RematerializeOperation<U>
@@ -169,7 +163,11 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
         Ok(vec![Some(input_types.to_vec())])
     }
 
-    fn infer_output_types(&self, input_types: &[T], region_interfaces: &[RegionInterface<T>]) -> Result<Vec<T>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         check_count!("region", region_interfaces, 1, TypeError);
         let body = &region_interfaces[0];
         check_types!(@same, format!("`{REMATERIALIZE_OPERATION_NAME}` body input"), [
@@ -181,7 +179,11 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
 
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
-        if region_index == 0 { InputRegionProvenance::Input { index: input_index } } else { InputRegionProvenance::None }
+        if region_index == 0 {
+            InputRegionProvenance::Input { index: input_index }
+        } else {
+            InputRegionProvenance::None
+        }
     }
 
     #[inline]
@@ -195,8 +197,8 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
         used_outputs: &[bool],
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
-        // Operands map onto the body inputs one for one, so the operands that the body does not use are dropped together
-        // with its unused outputs (as in JAX's `remat_dce`).
+        // Operands map onto the body inputs one for one, so the operands that the body does not use are dropped
+        // together with its unused outputs.
         let kept_inputs = regions.used_region_inputs(0, used_outputs)?;
         check_count!("input", kept_inputs, input_count, ProgramError);
         Ok(Some(OperationBoundaryPruning { operation: self.clone(), kept_inputs, kept_outputs: used_outputs.to_vec() }))
@@ -204,7 +206,7 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let operation = OperationFormatter::new(formatter, indentation, REMATERIALIZE_OPERATION_NAME)?;
-        let renders_policy = self.policy.name() != DEFAULT_POLICY_NAME;
+        let renders_policy = self.policy.name() != NOTHING_SAVEABLE_POLICY_NAME;
         if !renders_policy && self.optimization_barrier && !self.differentiated {
             return Ok(());
         }
@@ -223,21 +225,22 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
     }
 }
 
-// A rematerialized call forwards its operands onto its body's inputs one for one and reports the body's outputs as its
-// own, which is the positionally forwarding shape that the shared structured rewrite serves with no leading operands.
-impl<T, C, P> ReferenceDischargeableOperation<C, P> for RematerializeOperation<T>
-where
-    T: 'static + Type,
+impl<
+    T: 'static + Type + From<P::Referent>,
     C: Context<Type = T, Operation: From<RematerializeOperation<T>>>,
     P: ReferenceDischargePolicy<C>,
-    C::Type: From<P::Referent>,
+> ReferenceDischargeableOperation<C, P> for RematerializeOperation<T>
 {
+    #[inline]
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
         context: &ReferenceDischargeContext<C, P>,
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        // A rematerialized call forwards its operands onto its body's inputs one for one and reports the body's outputs
+        // as its own, which is the positionally forwarding shape that the shared structured rewrite serves with no
+        // leading operands.
         discharge_positional_region_operation(self, context, driver, inputs, 0)
     }
 }
@@ -253,6 +256,8 @@ impl<C: Domain<Type: 'static>> InterpretableOperation<C> for RematerializeOperat
         driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // TODO(eaplatanios): Phase B2 of `.tasks/plan_rematerialization_redesign.md` replaces this default, which folds calls
 //  whose inputs are all known and otherwise residualizes them unchanged, with a rule that partitions the body according
@@ -316,8 +321,8 @@ impl<T: 'static + Type, C: Context<Type = T, Operation: From<RematerializeOperat
 
 // TODO(eaplatanios): Phase B2 of `.tasks/plan_rematerialization_redesign.md` replaces this rejection with the
 //  policy-driven `jvp` and `jvp_for_transpose` rules.
-impl<C: Context<Type: 'static + DifferentiableType, Operation: From<RematerializeOperation<C::Type>>>> DifferentiableOperation<C>
-    for RematerializeOperation<C::Type>
+impl<C: Context<Type: 'static + DifferentiableType, Operation: From<RematerializeOperation<C::Type>>>>
+    DifferentiableOperation<C> for RematerializeOperation<C::Type>
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -334,7 +339,7 @@ impl<C: Context<Type: 'static + DifferentiableType, Operation: From<Rematerializ
 
 // TODO(eaplatanios): Phase B2 of `.tasks/plan_rematerialization_redesign.md` replaces this rejection with the
 //  transposition rule that re-binds the call over its transposed body.
-crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: 'static + Type);
+impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: 'static + Type);
 
 #[cfg(test)]
 mod tests {
@@ -346,7 +351,7 @@ mod tests {
         DimensionBounds, DimensionType, DimensionValue, ShardingDimension,
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
-    use crate::contexts::{EagerContext, StagingContext};
+    use crate::contexts::EagerContext;
     use crate::differentiation::rematerialization::{DotsSaveable, NothingSaveable};
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::dimensions::DimensionAddOperation;
@@ -372,7 +377,9 @@ mod tests {
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
         let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x], None).unwrap()[0];
-        builder.build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder], vec![Placeholder]).unwrap()
+        builder
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder], vec![Placeholder])
+            .unwrap()
     }
 
     #[test]
@@ -427,7 +434,8 @@ mod tests {
     fn test_rematerialize_operation_type_inference() {
         let scalar = ArrayType::scalar(DataType::F64);
         let operation = rematerialize_operation();
-        let body = RegionInterface::new(vec![scalar.clone()], vec![scalar.clone(), scalar.clone()], EffectClasses::NONE);
+        let body =
+            RegionInterface::new(vec![scalar.clone()], vec![scalar.clone(), scalar.clone()], EffectClasses::NONE);
 
         // The outputs are the outputs of the body, whose inputs must match the operands.
         assert_eq!(
@@ -446,8 +454,8 @@ mod tests {
         );
 
         // The body is requested at the operand types, which staging instantiates when their type identities differ
-        // from the declared ones. The output of the body below is a computed dimension, which the instantiation renames
-        // to the operand's dimension.
+        // from the declared ones. The output of the body below is a computed dimension, whose identity the
+        // instantiation derives from the operand's dimension while keeping its diagnostic label.
         assert_eq!(
             operation.infer_region_input_types(std::slice::from_ref(&scalar), std::slice::from_ref(&body)),
             Ok(vec![Some(vec![scalar.clone()])]),
@@ -497,14 +505,18 @@ mod tests {
         let x = body.add_input(scalar.clone());
         let y = body.add_input(scalar.clone());
         let sine = body.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
-        let body = body.build::<Vec<Array>, Vec<Array>>(vec![sine, y], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(vec![sine, y], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let body = builder.import_program(body);
         let x = builder.add_input(scalar.clone());
         let y = builder.add_input(scalar);
-        let outputs = builder.add_instruction(rematerialize_operation(), vec![body], vec![x, y], None).unwrap().to_vec();
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let outputs =
+            builder.add_instruction(rematerialize_operation(), vec![body], vec![x, y], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
         assert_eq!(
             program.into_pruned().unwrap().to_string(),
             indoc! {"
@@ -529,7 +541,8 @@ mod tests {
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let reference = body.add_input(reference_type.clone().into());
         let x = body.add_input(scalar_type.clone().into());
-        body.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, x], None).unwrap();
+        body.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, x], None)
+            .unwrap();
         let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
@@ -566,8 +579,9 @@ mod tests {
     fn test_rematerialize_operation_interpretation() {
         // Outside of differentiation, the call computes what its body computes.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let outputs =
-            context.bind(rematerialize_operation(), vec![sine_product_body()], &[Array::scalar(0.5f64).unwrap()]).unwrap();
+        let outputs = context
+            .bind(rematerialize_operation(), vec![sine_product_body()], &[Array::scalar(0.5f64).unwrap()])
+            .unwrap();
         assert_eq!(outputs, vec![Array::scalar(0.5f64.sin() * 0.5).unwrap()]);
     }
 
@@ -578,7 +592,8 @@ mod tests {
         let body = builder.import_program(sine_product_body());
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(rematerialize_operation(), vec![body], vec![x], None).unwrap()[0];
-        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let (batched, output_axes) = program
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
@@ -610,7 +625,8 @@ mod tests {
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let reference = body.add_input(reference_type.clone().into());
         let x = body.add_input(scalar_type.clone().into());
-        body.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, x], None).unwrap();
+        body.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, x], None)
+            .unwrap();
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference, x], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
@@ -635,26 +651,19 @@ mod tests {
             )
             .unwrap()
             .into_parts();
-        assert_eq!(output_axes, vec![BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::new(0)]);
+        assert_eq!(output_axes, vec![BatchAxis::new(0), BatchAxis::new(0)]);
         assert_eq!(
             batched.to_string(),
             indoc! {"
-                [
-                    BatchAxis(
-                        Some(
-                            Axis(
-                                0,
-                            ),
-                        ),
-                    ),
-                    BatchAxis(
-                        Some(
-                            Axis(
-                                0,
-                            ),
-                        ),
-                    ),
-                ]"},
+                lambda %0:dimension<3>, %1:ref<f32[3]>, %2:f32[3] .
+                let %3:ref<f32[3]>, %4:f32[3] = rematerialize %0 %1 %2 [
+                    body={
+                        lambda %0:dimension<3>, %1:ref<f32[3]>, %2:f32[3] .
+                        let () = reference_add_update %1 %2
+                        in (%1, %2)
+                    },
+                ]
+                in (%0, %3, %4)"},
         );
         let counter = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap());
         let outputs = batched
@@ -675,7 +684,8 @@ mod tests {
         let body = builder.import_program(sine_product_body());
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(rematerialize_operation(), vec![body], vec![x], None).unwrap()[0];
-        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(program.jvp().unwrap_err().to_string(), "operation `rematerialize` is not differentiable yet");
     }
 }
