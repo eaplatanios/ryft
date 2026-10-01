@@ -169,19 +169,17 @@ pub struct PartialEvaluationContext<C: Context> {
     /// Specialization retains these operations so they observe state when the specialized program is called.
     reference_placement: ReferencePlacement,
 
-    // TODO(eaplatanios): Should this become private with an accessor function?
     /// Specifies whether effectful operations with known inputs may run in the parent context. Deferred sibling
     /// contexts disable this so that every residual call performs its own effects, including allocations with known
     /// initial values. Pure known work can still fold; reference placement and previously deferred ordered effects
     /// can further restrict folding.
-    pub(super) allow_effect_folding: bool,
+    allow_effect_folding: bool,
 
-    // TODO(eaplatanios): Should this become private with an accessor function?
     /// Specifies whether ordered effects must remain residual to preserve execution order. Clones share this flag so
     /// that nested operations cannot move effects ahead of already deferred work. During replay with per-reference
     /// ordering, each instruction receives a separate flag initialized from its conflicts with earlier deferred work;
     /// the reference sets themselves remain local to that replay.
-    pub(super) defer_ordered_effects: Rc<Cell<bool>>,
+    defer_ordered_effects: Rc<Cell<bool>>,
 
     /// Residual placement with which the partitions that split rules construct through
     /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program) place their
@@ -223,10 +221,10 @@ impl<C: Context> PartialEvaluationContext<C> {
         }
     }
 
-    /// Returns a copy of this context with the provided [`ReferencePlacement`] for known reference operations under an
-    /// eager parent. For example, use [`Stage`](ReferencePlacement::Stage) for specialization so reference operations
-    /// run when the residual program is called rather than while it is constructed. Under a staging parent, both
-    /// placements record known work in the parent program, subject to effect-ordering constraints.
+    /// Returns this context with the provided [`ReferencePlacement`] for known reference operations under an eager
+    /// parent. For example, use [`Stage`](ReferencePlacement::Stage) for specialization so reference operations run
+    /// when the residual program is called rather than while it is constructed. Under a staging parent, both placements
+    /// record known work in the parent program, subject to effect-ordering constraints.
     ///
     /// Note that this function changes the configuration of the returned context without creating a new residual
     /// program or changing previously emitted work. Existing clones retain their own placement setting.
@@ -236,9 +234,9 @@ impl<C: Context> PartialEvaluationContext<C> {
         self
     }
 
-    /// Returns a copy of this context with the provided permission to fold effectful operations with known inputs into
-    /// the parent context. When `false`, effectful operations remain in the residual program while pure known work can
-    /// still fold. When `true`, reference placement and effect-ordering constraints can still prevent folding.
+    /// Returns this context with the provided permission to fold effectful operations with known inputs into the parent
+    /// context. When `false`, effectful operations remain in the residual program while pure known work can still fold.
+    /// When `true`, reference placement and effect-ordering constraints can still prevent folding.
     ///
     /// This function changes only the returned context's configuration, without creating a new residual program or
     /// changing previously emitted work. Existing clones retain their own effect-folding setting.
@@ -248,16 +246,19 @@ impl<C: Context> PartialEvaluationContext<C> {
         self
     }
 
-    /// Returns a copy of this context whose nested partitions place their residuals according to `policy`.
+    /// Returns this context configured to place the residuals of its nested partitions according to `policy`.
     /// The split rules of region-carrying operations (e.g., `scan` and `condition`) partition their bodies through
     /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program), which then
     /// places the residuals of each such partition according to `policy` (which can be set using
     /// [`PartitionedProgram::with_residual_policy`]) and carries `policy` into the partitions nested within it. This
     /// has implications for various region-carrying operation types. For example, it means that decisions apply per
-    /// iteration of a `scan` operation and per branch of a `condition` operation. A region-carrying operation whose
-    /// body was split this way is never replayed as a whole when the residuals of an enclosing partition are placed,
-    /// because its split rule already placed the residuals of its body. For example, a `while` loop saves nothing as
-    /// its residual loop re-runs every iteration, so its split rule partitions its regions without the policy.
+    /// iteration of a `scan` operation and per branch of a `condition` operation. When the residuals of an enclosing
+    /// partition are placed, a region-carrying operation in its known program is replayed as a whole only if the policy
+    /// would recompute every value that its regions compute, so that the decisions of a split rule that already placed
+    /// the residuals of its body are never undone, while an operation whose inputs are all known (and which was
+    /// therefore not split) is recomputed whenever the policy recomputes everything that it computes. A `while` loop
+    /// is an exception that saves nothing, because its residual loop re-runs every iteration, and so its split rule
+    /// partitions its regions without the policy.
     ///
     /// This function changes only the returned context's configuration, without creating a new residual program
     /// or changing previously emitted work. Existing clones retain their own residual policy.
@@ -270,7 +271,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         self.with_residual_placement(Some(Rc::new(policy.clone())))
     }
 
-    /// Returns a copy of this context without a residual policy, for split rules whose residual programs do not consume
+    /// Returns this context without a residual policy, for split rules whose residual programs do not consume
     /// saved values (e.g., a `while` loop, whose residual loop re-runs every iteration). Refer to
     /// [`with_residual_policy`](Self::with_residual_policy) for the inverse operation.
     #[inline]
@@ -278,7 +279,19 @@ impl<C: Context> PartialEvaluationContext<C> {
         self.with_residual_placement(None)
     }
 
-    /// Returns a copy of this context with the provided residual placement, which nested contexts inherit
+    /// Sets whether ordered effects must remain residual, using a new flag that is independent
+    /// of existing context clones. Future clones of the returned context share the new flag.
+    /// Refer to [`defer_ordered_effects`](Self::defer_ordered_effects) for more information.
+    ///
+    /// Per-reference replay uses this to initialize each instruction's deferral flag according to whether its effects
+    /// conflict with earlier deferred work.
+    #[inline]
+    pub(super) fn with_defer_ordered_effects(mut self, defer_ordered_effects: bool) -> Self {
+        self.defer_ordered_effects = Rc::new(Cell::new(defer_ordered_effects));
+        self
+    }
+
+    /// Returns this context with the provided residual placement, which nested contexts inherit
     /// from their parents.
     #[inline]
     pub(super) fn with_residual_placement(
@@ -319,11 +332,35 @@ impl<C: Context> PartialEvaluationContext<C> {
         self.reference_placement
     }
 
+    /// Returns whether effectful operations with known inputs may run in the parent [`Context`] of this
+    /// [`PartialEvaluationContext`]. Refer to [`with_allow_effect_folding`](Self::with_allow_effect_folding)
+    /// for more information.
+    #[inline]
+    pub fn allow_effect_folding(&self) -> bool {
+        self.allow_effect_folding
+    }
+
+    /// Returns whether ordered effects must currently remain residual to preserve execution order, which is the case
+    /// once an ordered operation has been staged (or has failed) in this context or in a clone that shares its flag.
+    #[inline]
+    pub(super) fn defer_ordered_effects(&self) -> bool {
+        self.defer_ordered_effects.get()
+    }
+
     /// Returns the residual placement of this [`PartialEvaluationContext`], if a residual policy was set (refer to
     /// [`with_residual_policy`](Self::with_residual_policy)).
     #[inline]
     pub(super) fn residual_placement(&self) -> Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>> {
         self.residual_placement.clone()
+    }
+
+    /// Returns the first binding error that this [`PartialEvaluationContext`] retained for finalization, if any (refer
+    /// to [`fold_or_residualize`](Self::fold_or_residualize) for more information). Rules that perform work outside of
+    /// the context (e.g., by interpreting a program in its [`parent`](Self::parent)) report this error before doing so,
+    /// as binding through the context does.
+    #[inline]
+    pub(crate) fn error(&self) -> Option<ProgramError> {
+        self.error.borrow().clone()
     }
 
     /// Imports a known value from another [`PartialEvaluationContext`] sharing this context's parent. The first import
@@ -450,7 +487,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        if let Some(error) = self.error.borrow().clone() {
+        if let Some(error) = self.error() {
             return Err(error);
         }
 
@@ -548,22 +585,22 @@ impl<C: Context> PartialEvaluationContext<C> {
             self.parent.bind(operation, regions, &known)?
         };
 
-        let outputs = outputs
-            .into_iter()
-            .map(|value| {
-                // A folded value that owns a type identity must remain a producer when it crosses into residual
-                // work. Embedding its cheap constant payload does that structurally. Symbolic known values remain
-                // residual inputs because their parent-context producer stays live.
-                let defines_identity =
-                    value.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
-                if defines_identity && self.parent.resolve(&value).is_constant() {
-                    PartialEvaluationValue::known_constant(value)
-                } else {
-                    PartialEvaluationValue::known(value)
-                }
-            })
-            .collect::<Vec<_>>();
-        Ok(outputs)
+        Ok(outputs.into_iter().map(|value| self.folded_value(value)).collect())
+    }
+
+    // TODO(eaplatanios): Should this be renamed to `lift`, moved to above `fold_or_residualize`, and made public?
+    /// Returns the provided value, which work folded into the known-side [`Context`] produced, as a known
+    /// [`PartialEvaluationValue`]. A folded value that owns a type identity must remain a producer when it crosses
+    /// into residual work, which embedding its cheap constant payload does structurally. Symbolic known values remain
+    /// residual inputs because their known-side producer stays live.
+    pub(crate) fn folded_value(&self, value: C::Value) -> PartialEvaluationValue<C::Value> {
+        let defines_identity =
+            value.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
+        if defines_identity && self.parent.resolve(&value).is_constant() {
+            PartialEvaluationValue::known_constant(value)
+        } else {
+            PartialEvaluationValue::known(value)
+        }
     }
 
     /// _Residualizes_ the provided [`Operation`] into the residual [`Program`], materializing each known input into
@@ -603,7 +640,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        if let Some(error) = self.error.borrow().clone() {
+        if let Some(error) = self.error() {
             return Err(error);
         }
 
@@ -989,7 +1026,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         self,
         outputs: Vec<PartialEvaluationValue<C::Value>>,
     ) -> Result<PartialEvaluation<C>, ProgramError> {
-        if let Some(error) = self.error.borrow().clone() {
+        if let Some(error) = self.error() {
             return Err(error);
         }
 
@@ -1439,7 +1476,8 @@ mod tests {
     };
     use crate::programs::{
         AtomId, Concretizable, EffectClass, EffectClasses, Effects, InstructionId, Operation, ProgramBuilder,
-        ProgramError, Provenance, ProvenanceScope, ReferenceIdentity, ReferenceType, RegionInterface, TypeError, Typed,
+        ProgramError, Provenance, ProvenanceScope, ReferenceError, ReferenceIdentity, ReferenceType, RegionInterface,
+        TypeError, Typed,
     };
     use crate::tests::{
         TestArrayContext, TestArrayIrContext, TestArrayIrOperation, TestArrayOperation, TestArrayTracingContext,
@@ -1475,7 +1513,7 @@ mod tests {
     fn test_partial_evaluation_context_new() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         assert_eq!(context.reference_placement(), ReferencePlacement::Execute);
-        assert!(context.allow_effect_folding);
+        assert!(context.allow_effect_folding());
         assert!(context.builder.borrow().instructions().is_empty());
         assert!(context.inputs.borrow().is_empty());
     }
@@ -1509,11 +1547,11 @@ mod tests {
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
         let input = context.unknown_input(ArrayType::scalar(DataType::F32).into(), 0);
         let configured = context.clone().with_allow_effect_folding(false);
-        assert!(context.allow_effect_folding);
-        assert!(!configured.allow_effect_folding);
+        assert!(context.allow_effect_folding());
+        assert!(!configured.allow_effect_folding());
         let restored = configured.clone().with_allow_effect_folding(true);
-        assert!(restored.allow_effect_folding);
-        assert!(!configured.allow_effect_folding);
+        assert!(restored.allow_effect_folding());
+        assert!(!configured.allow_effect_folding());
         // Enabling folding again must restore behavior, while preserving the previously created residual input.
         let initial = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32).unwrap()));
         let allocated =
@@ -1587,6 +1625,20 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_with_defer_ordered_effects() {
+        // Clones share their ordered-effect deferral, while a context with its own deferral no longer does.
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let detached = context.clone().with_defer_ordered_effects(true);
+        assert!(!context.defer_ordered_effects());
+        assert!(detached.defer_ordered_effects());
+        context.clone().defer_ordered_effects.set(true);
+        assert!(context.defer_ordered_effects());
+        let detached = context.clone().with_defer_ordered_effects(false);
+        assert!(!detached.defer_ordered_effects());
+        assert!(context.defer_ordered_effects());
+    }
+
+    #[test]
     fn test_partial_evaluation_context_deferred_sibling() {
         let parent = TracingContext::<TestValue, TestOperation>::new();
         let source = PartialEvaluationContext::new(parent.clone());
@@ -1641,6 +1693,19 @@ mod tests {
             ),
             Ok(vec![Array::scalar(3.0).unwrap()]),
         );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_error() {
+        // The first binding failure is retained, and clones share it.
+        let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
+        assert_eq!(frozen.freeze(), Ok(Array::scalar(1.0_f32).unwrap()));
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        assert_eq!(context.error(), None);
+        let reference = context.lift(TestValue::Reference(frozen)).unwrap();
+        drop(context.clone().bind(ReferenceReadOperation::new(), Vec::new(), &[reference]).unwrap());
+        let error = context.error().unwrap();
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
 
     #[test]
