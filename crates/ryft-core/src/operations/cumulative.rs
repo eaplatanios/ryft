@@ -109,18 +109,6 @@ pub enum CumulativeKind {
     /// exact for infinite components.
     Product,
 
-    /// Running maximum. The identity is the element data type's lowest value (i.e., negative infinity for the
-    /// floating-point formats that have infinities). Real and complex numeric inputs are supported, with the ordering
-    /// and exceptional-value semantics of the elementwise [`Max`] operation: complex inputs compare their real parts
-    /// first and their imaginary parts second, NaNs propagate, and `-0.0` orders below `+0.0`.
-    Max,
-
-    /// Running minimum. The identity is the element data type's highest value (i.e., positive infinity for the
-    /// floating-point formats that have infinities). Real and complex numeric inputs are supported, with the ordering
-    /// and exceptional-value semantics of the elementwise [`Min`] operation: complex inputs compare their real parts
-    /// first and their imaginary parts second, NaNs propagate, and `-0.0` orders below `+0.0`.
-    Min,
-
     /// Running numerically stable `log(sum(exp(x)))`. Each prefix is accumulated by folding the pairwise [`LogAddExp`]
     /// operation, which is stable over the whole real range but is a different expression from the max-shifted
     /// reduction that [`ReductionKind::LogSumExp`](crate::ReductionKind::LogSumExp) evaluates, so the two can round
@@ -148,6 +136,18 @@ pub enum CumulativeKind {
     /// of the log-sum-exp reduction, whose padding must remain neutral after subtracting an arbitrary maximum and which
     /// therefore requires a format that represents negative infinity.
     LogSumExp,
+
+    /// Running maximum. The identity is the element data type's lowest value (i.e., negative infinity for the
+    /// floating-point formats that have infinities). Real and complex numeric inputs are supported, with the ordering
+    /// and exceptional-value semantics of the elementwise [`Max`] operation: complex inputs compare their real parts
+    /// first and their imaginary parts second, NaNs propagate, and `-0.0` orders below `+0.0`.
+    Max,
+
+    /// Running minimum. The identity is the element data type's highest value (i.e., positive infinity for the
+    /// floating-point formats that have infinities). Real and complex numeric inputs are supported, with the ordering
+    /// and exceptional-value semantics of the elementwise [`Min`] operation: complex inputs compare their real parts
+    /// first and their imaginary parts second, NaNs propagate, and `-0.0` orders below `+0.0`.
+    Min,
 }
 
 impl CumulativeKind {
@@ -158,9 +158,9 @@ impl CumulativeKind {
         match self {
             Self::Sum => "sum",
             Self::Product => "product",
+            Self::LogSumExp => "log_sum_exp",
             Self::Max => "max",
             Self::Min => "min",
-            Self::LogSumExp => "log_sum_exp",
         }
     }
 }
@@ -284,8 +284,6 @@ impl<C: Context<Type = ArrayType, Operation: From<CumulativeOperation>>> Partial
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for CumulativeOperation
 where
@@ -310,7 +308,7 @@ where
             None => (self.axis, BatchAxis::replicated()),
         };
 
-        // Padding along a *scanned* ragged axis is neutralized with the identity of the combining operator first, so
+        // Padding along a _scanned_ ragged axis is neutralized with the identity of the combining operator first, so
         // that padded positions cannot contribute to any live prefix. A payload-free structural zero needs no masking,
         // because every element of it (padding included) is the same zero, whose every prefix sum or product is zero.
         let scans_ragged_axis = inputs[0].ragged_axes().iter().any(|ragged_axis| ragged_axis.axis() == lifted_axis);
@@ -319,8 +317,8 @@ where
                 let identity = match self.kind {
                     CumulativeKind::Sum => RaggedMaskIdentity::Zero,
                     CumulativeKind::Product => RaggedMaskIdentity::One,
-                    CumulativeKind::Max => RaggedMaskIdentity::Lowest,
                     CumulativeKind::LogSumExp => RaggedMaskIdentity::LowestReal,
+                    CumulativeKind::Max => RaggedMaskIdentity::Lowest,
                     CumulativeKind::Min => RaggedMaskIdentity::Highest,
                 };
                 P::mask_identity_input(context, &inputs[0], &[lifted_axis], identity)?
@@ -335,8 +333,8 @@ where
         )?;
         check_count!("output", outputs, 1, ProgramError);
 
-        // Interpretation carries values rather than batch metadata, so the input's ragged axes are restored here. A
-        // scan consumes none of them, and so the rule reports no consumption evidence.
+        // Interpretation carries values rather than batch metadata, so the input's ragged axes are restored here.
+        // A scan consumes none of them, and so the rule reports no consumption evidence.
         let output = ArrayBatch::new(outputs.remove(0).into_value(), output_batch_axis)?
             .with_ragged_axes(input.ragged_axes().to_vec())?;
         Ok(BatchedOutputs::new(vec![output], Vec::new()))
@@ -348,39 +346,40 @@ impl_differentiable_operation! {
     jvp<C>
     where
         C: Context<Type = ArrayType>,
-        C::Operation: From<CumulativeOperation>
-            + From<AddOperation<ArrayType>>
-            + From<BroadcastOperation>
-            + From<ConcatenateOperation<ArrayType>>
-            + From<LogAddExpOperation<ArrayType>>
-            + From<MaxOperation<ArrayType>>
-            + From<MinOperation<ArrayType>>
+        C::Value: Cumulative,
+        C::Operation: From<AddOperation<ArrayType>>
             + From<MulOperation<ArrayType>>
             + From<OrOperation<ArrayType>>
+            + From<MaxOperation<ArrayType>>
+            + From<MinOperation<ArrayType>>
+            + From<LogAddExpOperation<ArrayType>>
+            + From<CumulativeOperation>
+            + From<BroadcastOperation>
+            + From<ConcatenateOperation<ArrayType>>
             + From<PadOperation<ArrayType>>
             + From<SliceOperation>
             + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>
-            + OperationProvider<ArrayType, ParallelVaryOperation, Operation = C::Operation>
-            + OperationProvider<ArrayType, BroadcastOperation, Operation = C::Operation>,
-        C::Value: Cumulative,
+            + OperationProvider<ArrayType, BroadcastOperation, Operation = C::Operation>
+            + OperationProvider<ArrayType, ParallelVaryOperation, Operation = C::Operation>,
     {
         |operation, context, driver, inputs| {
             // A cumulative sum is linear in its input, so its tangent is the same prefix sum of the input tangent.
-            // Every other kind is nonlinear, so its rule differentiates through the associative-scan decomposition with
-            // the kind's own combining operator, and every primitive that construction stages contributes its own
-            // forward-mode rule. The composite array universe reaches this rule through the default projected
+            // Every other kind is nonlinear, so its rule differentiates through the associative-scan decomposition
+            // with the kind's own combining operator, and every primitive that construction stages contributes its
+            // own forward-mode rule. The composite array universe reaches this rule through the default projected
             // fall-through of `MemberDifferentiableOperation`, because the operation is shape-preserving and its
             // input never needs the replication that a broadcasting elementwise member does.
             check_count!("input", inputs, 1, ProgramError);
             let (axis, kind, reverse) = (operation.axis, operation.kind, operation.reverse);
             let primal_input = inputs[0].primal();
             let MaybeZero::Value(tangent_input) = inputs[0].tangent() else {
-                // Every JVP is linear in its tangent, so a structural zero tangent stays a structural zero one, and the
-                // primal is cheaper to obtain from the primitive itself than from the decomposition.
+                // Every JVP is linear in its tangent, so a structural zero tangent stays a structural zero one,
+                // and the primal is cheaper to obtain from the primitive itself than from the decomposition.
                 let primal = primal_input.cumulative(axis, kind, reverse)?;
                 let tangent = MaybeZero::Zero(primal.r#type().tangent()?);
                 return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
             };
+
             // The primal output of a nonlinear kind comes from the decomposition, which interleaves its halves by
             // zero-padding and adding them. That addition turns a `-0.0` result into `+0.0`, so under differentiation
             // the primal output of an extremum scan over signed zeros can differ from the undifferentiated one in the
@@ -403,6 +402,15 @@ impl_differentiable_operation! {
                     reverse,
                     |left, right| left.mul(right),
                 )?,
+                CumulativeKind::LogSumExp => jvp_through_associative_scan(
+                    context,
+                    driver,
+                    primal_input,
+                    tangent_input,
+                    axis,
+                    reverse,
+                    |left, right| left.log_add_exp(right),
+                )?,
                 CumulativeKind::Max => jvp_through_associative_scan(
                     context,
                     driver,
@@ -421,16 +429,8 @@ impl_differentiable_operation! {
                     reverse,
                     |left, right| left.min(right),
                 )?,
-                CumulativeKind::LogSumExp => jvp_through_associative_scan(
-                    context,
-                    driver,
-                    primal_input,
-                    tangent_input,
-                    axis,
-                    reverse,
-                    |left, right| left.log_add_exp(right),
-                )?,
             };
+
             Ok(vec![dual])
         }
     },
@@ -441,11 +441,11 @@ impl_differentiable_operation! {
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // A forward prefix sum sends input element `i` into every output element `j >= i`, so the cotangent of
-            // input `i` is the sum of the output cotangents `j >= i` (i.e., a reverse prefix sum). The adjoint of a
-            // reverse prefix sum is symmetrically a forward one, which is why a cumulative sum is closed under
+            // input `i` is the sum of the output cotangents `j >= i` (i.e., a reverse prefix sum). The adjoint of
+            // a reverse prefix sum is symmetrically a forward one, which is why a cumulative sum is closed under
             // transposition and needs no companion primitive. Every other kind is nonlinear and is instead
-            // differentiated through the linear operations staged by its JVP, so it is rejected here regardless of its
-            // cotangent.
+            // differentiated through the linear operations staged by its JVP, so it is rejected here regardless
+            // of its cotangent.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -470,16 +470,15 @@ impl_differentiable_operation! {
     },
 }
 
-/// Value-level cumulative capability that accumulates the elements of an array along one axis using a
-/// [`CumulativeKind`].
-///
-/// [`Cumulative`] fills the same role for [`CumulativeOperation`] that
-/// [`Reduce`](crate::operations::reductions::Reduce) fills for
-/// [`ReduceOperation`](crate::operations::reductions::ReduceOperation). Concrete [`Array`]s scan immediately, while
-/// context-carrying values bind a [`CumulativeOperation`] through their own context. The output has the input's type,
-/// and element `i` along the scanned axis holds the combination of the input elements `0..=i`, or of the input elements
-/// `i..` for the reverse direction. Refer to [`CumulativeKind`] for the identity, supported data types, and exceptional
-/// values of each kind.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Value-level cumulative capability that accumulates the elements of an array along one axis based on a chosen
+/// [`CumulativeKind`]. [`Cumulative`] fills the same role for [`CumulativeOperation`] that [`Reduce`](crate::Reduce)
+/// fills for [`ReduceOperation`](crate::ReduceOperation). Concrete [`Array`]s scan immediately, while context-carrying
+/// values bind a [`CumulativeOperation`] through their own context. The output has the input's type, and element `i`
+/// along the scanned axis holds the combination of the input elements `0..=i`, or of the input elements `i..` for the
+/// reverse direction. Refer to [`CumulativeKind`] for the identity, supported data types, and exceptional values of
+/// each kind.
 ///
 /// Besides the general [`Self::cumulative`] function, this trait provides one forward and one reverse shortcut function
 /// per kind, which all share the axis, direction, and error contract of [`Self::cumulative`].
