@@ -170,6 +170,13 @@ impl<'o, T: Type> ResidualProducer<'o, T> {
         self.name
     }
 
+    /// Returns the operation that produced the output, viewed through its [`OperationPayloadProjection`]
+    /// (e.g., to read the key of a producing tag with [`TagOperation::key_of`](crate::TagOperation::key_of)).
+    #[inline]
+    pub fn operation(&self) -> &'o dyn OperationPayloadProjection {
+        self.operation
+    }
+
     /// Returns the index of the output among the outputs of the producer.
     #[inline]
     pub fn output_index(&self) -> usize {
@@ -304,8 +311,31 @@ pub trait ResidualStorage<T: Type>: 'static + Send + Sync + Debug {
     -> Result<Vec<ErasedOperation>, ResidualPolicyError>;
 }
 
-/// Type-erased [`ResidualStorage`], which [`ResidualPolicyReference::classify`] returns.
+/// Type-erased [`ResidualStorage`], which [`ResidualPolicyReference::classify`] returns. It is a [`ResidualStorage`]
+/// itself, so that policies whose decisions may use different storages (e.g., a policy that combines two other
+/// policies) can return erased storage.
 pub type ErasedResidualStorage<T> = Arc<dyn ResidualStorage<T>>;
+
+impl<T: 'static + Type> ResidualStorage<T> for ErasedResidualStorage<T> {
+    #[inline]
+    fn name(&self) -> String {
+        self.as_ref().name()
+    }
+
+    #[inline]
+    fn store_payloads(&self, residual_type: &T) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
+        self.as_ref().store_payloads(residual_type)
+    }
+
+    #[inline]
+    fn restore_payloads(
+        &self,
+        stored_type: &T,
+        residual_type: &T,
+    ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
+        self.as_ref().restore_payloads(stored_type, residual_type)
+    }
+}
 
 /// Uninhabited [`ResidualStorage`] of policies that never return [`ResidualDecision::SaveWith`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

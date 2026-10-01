@@ -73,8 +73,8 @@ pub use custom_functions::{
 };
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::{
-    LINEAR_CALL_OPERATION_NAME, LinearCallOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation,
-    StopGradients,
+    LINEAR_CALL_OPERATION_NAME, LinearCallOperation, REMATERIALIZE_OPERATION_NAME, RematerializeOperation,
+    STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients,
 };
 pub use dimensions::{
     ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DATA_TYPE, DIMENSION_DIV_OPERATION_NAME,
@@ -112,12 +112,13 @@ pub use manipulation::{
     DynamicScatter, DynamicSlice, DynamicSliceBounds, DynamicSliceOperation, DynamicSliceWithDimensions,
     DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather,
     GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector,
-    IndexSlice, Indexed, Indexing, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, RESHAPE_OPERATION_NAME,
-    REVERSE_OPERATION_NAME, Reshape, ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME,
-    SLICE_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
-    ScatterReductionKind, Slice, SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME,
-    TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME,
-    UpdateSlice, UpdateSliceOperation,
+    IndexSlice, Indexed, Indexing, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, REDUCE_PRECISION_OPERATION_NAME,
+    RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME, ReducePrecision, ReducePrecisionOperation, Reshape,
+    ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
+    ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Slice,
+    SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, TransferToMemory,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
+    UpdateSliceOperation,
 };
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use reductions::{REDUCE_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind};

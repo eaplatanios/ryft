@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 use crate::contexts::Domain;
 use crate::macros::check_count;
@@ -11,8 +12,10 @@ use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::effects::EffectsSummary;
 use crate::programs::identities::{TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
-use crate::programs::operations::Operation;
-use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, reachable_region_mask};
+use crate::programs::operations::{Operation, OperationBoundaryPruning};
+use crate::programs::regions::{
+    Region, RegionArena, RegionId, RegionInterface, RegionLiveness, RegionRef, reachable_region_mask,
+};
 use crate::programs::transforms::RegionTransformCache;
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId, ValueProjection};
@@ -917,6 +920,72 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         // topology, so re-sealing keeps whatever the adoption pass above decided each region may retain.
         let (regions, entry) = compact_regions(regions, entry);
         Self::new_preserving_transform_caches(input_structure, output_structure, regions, entry)
+    }
+
+    /// Consumes this [`Program`] and returns it with the unused boundaries of its region-carrying [`Instruction`]s
+    /// pruned, which extends dead code elimination into the regions of those instructions like JAX's
+    /// [`dce_jaxpr`](https://github.com/jax-ml/jax/blob/main/jax/_src/interpreters/partial_eval.py).
+    ///
+    /// Starting from the entry region, whose boundary is the signature of the program and is kept, the pass determines
+    /// in reverse program order which values each region uses and asks each region-carrying instruction to prune its
+    /// boundary given its used outputs (i.e., [`Operation::prune_boundary`]). The instruction inputs and outputs that
+    /// the resulting [`OperationBoundaryPruning`] drops are removed, and the instruction attaches pruned copies of its
+    /// regions, which the pass prunes in turn. Regions are never pruned in place, because other instructions may attach
+    /// them with different uses, but instructions whose regions and kept boundaries agree share one pruned copy.
+    ///
+    /// Instructions that nothing uses are removed as in [`Self::into_simplified`], including in the pruned regions,
+    /// while instructions with effects that remain observable when unused or that carry deferred work are kept. When
+    /// no instruction prunes its boundary, this returns the program unchanged, retaining its transform caches.
+    /// Otherwise, the rebuilt regions start over with no derived transforms.
+    ///
+    /// Pruning is separate from [`Self::into_simplified`] because it changes the interfaces of region-carrying
+    /// instructions and unshares their regions, which most transforms rely on staying as traced (e.g., a shared
+    /// callee that is linearized once for every program that calls it). Consumers opt in where unused work matters,
+    /// such as the placement of residuals by
+    /// [`PartitionedProgram::with_residual_policy`](crate::PartitionedProgram::with_residual_policy).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when a [`OperationBoundaryPruning`] has the wrong shape, drops a
+    /// used output or a live region input, or produces an instruction whose inferred output types differ from its kept
+    /// output types.
+    pub fn into_pruned(self) -> Result<Self, ProgramError>
+    where
+        O: Clone,
+    {
+        let entry = self.entry_region_ref();
+        let kept_inputs = vec![true; entry.input_ids().len()];
+        let kept_outputs = vec![true; entry.output_ids().len()];
+        let mut pruner = BoundaryPruner::new(&self.regions);
+        let entry = pruner.emit_pruned_region(self.entry, &kept_inputs, &kept_outputs)?;
+        let BoundaryPruner { regions, pruned_instructions, .. } = pruner;
+        if pruned_instructions.is_empty() {
+            return Ok(self);
+        }
+        let program = Self::new(self.input_structure.clone(), self.output_structure.clone(), regions, entry)?;
+
+        // Sealing validates the atoms and attached regions of the rebuilt instructions but not their types,
+        // so every pruned instruction is validated against the types of its kept outputs here.
+        for id in pruned_instructions {
+            let region = program.region_ref(id.region())?;
+            let instruction = &region.instructions()[id.index()];
+            let atom_type = |atom: &AtomId| region.atoms()[atom.index()].r#type().into_owned();
+            let input_types = instruction.inputs().iter().map(atom_type).collect::<Vec<_>>();
+            let output_types = instruction.outputs().iter().map(atom_type).collect::<Vec<_>>();
+            let region_interfaces = instruction
+                .regions()
+                .iter()
+                .map(|region| Ok(program.region_ref(*region)?.interface()))
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            if instruction.operation().infer_output_types(&input_types, &region_interfaces)? != output_types {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pruning the boundary of operation `{}` changes the types of its kept outputs",
+                    instruction.operation().name(),
+                )));
+            }
+        }
+
+        Ok(program)
     }
 
     /// Rebuilds this [`Program`] as a flat subprogram over a chosen input/output boundary. The rebuilt program
@@ -2040,6 +2109,283 @@ fn compact_regions<V: Typed + Parameter, O>(
     (compacted, remapping[entry.index()].unwrap())
 }
 
+/// State of [`Program::into_pruned`], which determines the pruning of regions under sets of used outputs and emits
+/// pruned copies of regions for kept boundaries.
+struct BoundaryPruner<'p, V: Value, O: Operation<Type = V::Type>> {
+    /// Arena of the program that is pruned.
+    arena: &'p RegionArena<V, O>,
+
+    /// Pruning of each region under each set of used outputs that was queried so far.
+    prunings: HashMap<(RegionId, Vec<bool>), Rc<RegionPruning<O>>>,
+
+    /// Pruned copy of each region for each kept boundary that was emitted so far, keyed by the source region, its kept
+    /// inputs, and its kept outputs.
+    copies: HashMap<(RegionId, Vec<bool>, Vec<bool>), RegionId>,
+
+    /// Emitted regions, in sealing order (i.e., attached regions before the regions that attach them).
+    regions: Vec<Region<V, O>>,
+
+    /// Positions of the emitted instructions whose boundaries were pruned.
+    pruned_instructions: Vec<InstructionId>,
+}
+
+impl<'p, V: Value, O: Operation<Type = V::Type> + Clone> BoundaryPruner<'p, V, O> {
+    /// Creates a new [`BoundaryPruner`] for the program whose arena is `arena`.
+    fn new(arena: &'p RegionArena<V, O>) -> Self {
+        Self {
+            arena,
+            prunings: HashMap::new(),
+            copies: HashMap::new(),
+            regions: Vec::new(),
+            pruned_instructions: Vec::new(),
+        }
+    }
+
+    /// Returns the pruning of `region` when only the outputs of it that `used_outputs` marks are used.
+    fn region_pruning(
+        &mut self,
+        region: RegionId,
+        used_outputs: &[bool],
+    ) -> Result<Rc<RegionPruning<O>>, ProgramError> {
+        let key = (region, used_outputs.to_vec());
+        if let Some(region_pruning) = self.prunings.get(&key) {
+            return Ok(region_pruning.clone());
+        }
+        let arena = self.arena;
+        let source = RegionRef::new(arena, region)?;
+        check_count!("output", used_outputs, source.output_ids().len(), ProgramError);
+
+        // Liveness flows backwards from the used outputs, so instructions are visited in reverse program order, and the
+        // inputs of an instruction become live once the instruction is known to be kept.
+        let mut live = vec![false; source.atoms().len()];
+        for (output, used) in source.output_ids().iter().zip(used_outputs) {
+            live[output.index()] |= *used;
+        }
+        let mut instructions = Vec::with_capacity(source.instructions().len());
+        for (index, instruction) in source.instructions().iter().enumerate().rev() {
+            // Instructions with effects that remain observable when unused, or that carry deferred work, are kept even
+            // when no used value depends on them, exactly as in simplification.
+            let used_outputs = instruction.outputs().iter().map(|output| live[output.index()]).collect::<Vec<_>>();
+            if !used_outputs.contains(&true) && !source.instruction_effects(index)?.is_retained_when_unused() {
+                instructions.push(InstructionPruning::Removed);
+                continue;
+            }
+
+            // Region-carrying instructions may prune their boundaries. A pruning that keeps everything is treated like
+            // no pruning, so that the instruction and its regions are not needlessly rebuilt.
+            let pruning = if instruction.regions().is_empty() {
+                None
+            } else {
+                let mut liveness = AttachedRegionLiveness { pruner: self, regions: instruction.regions() };
+                instruction.operation().prune_boundary(instruction.inputs().len(), &used_outputs, &mut liveness)?
+            };
+
+            let instruction_pruning = match pruning {
+                None => InstructionPruning::Kept,
+                Some(pruning) => {
+                    pruning.validate(instruction, &used_outputs)?;
+                    let (kept_region_inputs, kept_region_outputs) =
+                        pruning.kept_region_boundaries(instruction, arena)?;
+                    let prunes = pruning.kept_inputs.contains(&false)
+                        || pruning.kept_outputs.contains(&false)
+                        || kept_region_inputs.iter().chain(&kept_region_outputs).any(|kept| kept.contains(&false));
+                    if prunes {
+                        InstructionPruning::Pruned { pruning, kept_region_inputs, kept_region_outputs }
+                    } else {
+                        InstructionPruning::Kept
+                    }
+                }
+            };
+            for (position, input) in instruction.inputs().iter().enumerate() {
+                if !matches!(
+                    &instruction_pruning,
+                    InstructionPruning::Pruned { pruning, .. } if !pruning.kept_inputs[position]
+                ) {
+                    live[input.index()] = true;
+                }
+            }
+
+            instructions.push(instruction_pruning);
+        }
+        instructions.reverse();
+
+        let used_inputs = source.input_ids().iter().map(|input| live[input.index()]).collect();
+        let region_pruning = Rc::new(RegionPruning { used_inputs, instructions });
+        self.prunings.insert(key, region_pruning.clone());
+        Ok(region_pruning)
+    }
+
+    /// Emits the pruned copy of `region` whose boundary keeps the inputs and outputs that `kept_inputs` and
+    /// `kept_outputs` mark, and returns its identifier among the emitted regions.
+    fn emit_pruned_region(
+        &mut self,
+        region: RegionId,
+        kept_inputs: &[bool],
+        kept_outputs: &[bool],
+    ) -> Result<RegionId, ProgramError> {
+        let key = (region, kept_inputs.to_vec(), kept_outputs.to_vec());
+        if let Some(copy) = self.copies.get(&key) {
+            return Ok(*copy);
+        }
+
+        let arena = self.arena;
+        let source = RegionRef::new(arena, region)?;
+        check_count!("input", kept_inputs, source.input_ids().len(), ProgramError);
+
+        // The instructions of the copy are those that the kept outputs use, and a pruned boundary may keep region
+        // inputs that are not live but must keep every live one.
+        let region_pruning = self.region_pruning(region, kept_outputs)?;
+        if region_pruning.used_inputs.iter().zip(kept_inputs).any(|(used, kept)| *used && !*kept) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "boundary pruning drops a live input of region {region}",
+            )));
+        }
+
+        // Atoms of the copy are created as they are defined or first used, so that the atoms of removed instructions,
+        // dropped inputs, and dropped outputs disappear, and constants are copied only when something uses them.
+        let source_atoms = source.atoms();
+        let mut atoms = Vec::new();
+        let mut mapping = vec![None; source_atoms.len()];
+        let define = |atom: AtomId, atoms: &mut Vec<Atom<V>>, mapping: &mut [Option<AtomId>]| {
+            let copy = AtomId::new(atoms.len());
+            atoms.push(source_atoms[atom.index()].clone());
+            mapping[atom.index()] = Some(copy);
+            copy
+        };
+        let resolve =
+            |atom: AtomId, atoms: &mut Vec<Atom<V>>, mapping: &mut [Option<AtomId>]| match mapping[atom.index()] {
+                Some(copy) => Ok(copy),
+                None if source_atoms[atom.index()].as_constant().is_some() => Ok(define(atom, atoms, mapping)),
+                None => Err(ProgramError::UnboundAtomId { id: atom }),
+            };
+        let input_ids = source
+            .input_ids()
+            .iter()
+            .zip(kept_inputs)
+            .filter(|(_, kept)| **kept)
+            .map(|(input, _)| define(*input, &mut atoms, &mut mapping))
+            .collect::<Vec<_>>();
+
+        // Kept instructions are copied in program order. Whole instructions attach copies of their regions with
+        // complete boundaries, which may still prune the instructions nested in them, while pruned instructions
+        // attach the copies that their pruning keeps and consume and produce only their kept inputs and outputs.
+        let mut instructions = Vec::new();
+        let mut pruned_positions = Vec::new();
+        for (instruction, instruction_pruning) in source.instructions().iter().zip(&region_pruning.instructions) {
+            let (operation, kept_inputs, kept_outputs, regions) = match instruction_pruning {
+                InstructionPruning::Removed => continue,
+                InstructionPruning::Kept => {
+                    let regions = instruction
+                        .regions()
+                        .iter()
+                        .map(|attached| {
+                            let attached_region = RegionRef::new(arena, *attached)?;
+                            let kept_inputs = vec![true; attached_region.input_ids().len()];
+                            let kept_outputs = vec![true; attached_region.output_ids().len()];
+                            self.emit_pruned_region(*attached, &kept_inputs, &kept_outputs)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (instruction.operation().clone(), None, None, regions)
+                }
+                InstructionPruning::Pruned { pruning, kept_region_inputs, kept_region_outputs } => {
+                    let regions = instruction
+                        .regions()
+                        .iter()
+                        .zip(kept_region_inputs.iter().zip(kept_region_outputs))
+                        .map(|(attached, (kept_inputs, kept_outputs))| {
+                            self.emit_pruned_region(*attached, kept_inputs, kept_outputs)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    pruned_positions.push(instructions.len());
+                    (pruning.operation.clone(), Some(&pruning.kept_inputs), Some(&pruning.kept_outputs), regions)
+                }
+            };
+            let inputs = instruction
+                .inputs()
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| kept_inputs.is_none_or(|kept_inputs| kept_inputs[*position]))
+                .map(|(_, input)| resolve(*input, &mut atoms, &mut mapping))
+                .collect::<Result<Vec<_>, _>>()?;
+            let outputs = instruction
+                .outputs()
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| kept_outputs.is_none_or(|kept_outputs| kept_outputs[*position]))
+                .map(|(_, output)| define(*output, &mut atoms, &mut mapping))
+                .collect::<Vec<_>>();
+            instructions.push(
+                Instruction::new(operation, inputs, outputs, regions).with_provenance(instruction.provenance().clone()),
+            );
+        }
+
+        let output_ids = source
+            .output_ids()
+            .iter()
+            .zip(kept_outputs)
+            .filter(|(_, kept)| **kept)
+            .map(|(output, _)| resolve(*output, &mut atoms, &mut mapping))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.regions.push(Region::new(atoms, input_ids, output_ids, instructions));
+        let copy = RegionId::new(self.regions.len() - 1);
+        self.pruned_instructions
+            .extend(pruned_positions.into_iter().map(|index| InstructionId::new(copy, index)));
+        self.copies.insert(key, copy);
+        Ok(copy)
+    }
+}
+
+/// Pruning of one [`Region`] under one set of used outputs, as determined by [`Program::into_pruned`],
+/// which specifies which of its inputs are live and what happens to each of its instructions.
+struct RegionPruning<O> {
+    /// Whether each input of the region is live.
+    used_inputs: Vec<bool>,
+
+    /// Pruning of each instruction of the region, in instruction order.
+    instructions: Vec<InstructionPruning<O>>,
+}
+
+/// What [`Program::into_pruned`] does to one [`Instruction`] of a [`Region`] under one set of used region outputs.
+enum InstructionPruning<O> {
+    /// The instruction is removed, because no used value and no retained work depends on it.
+    Removed,
+
+    /// The instruction is kept whole.
+    Kept,
+
+    /// The instruction is kept with a pruned boundary.
+    Pruned {
+        /// Pruned boundary of the instruction.
+        pruning: OperationBoundaryPruning<O>,
+
+        /// Whether each input of each attached region is kept, in attachment order, as derived from `pruning`.
+        kept_region_inputs: Vec<Vec<bool>>,
+
+        /// Whether each output of each attached region is kept, in attachment order, as derived from `pruning`.
+        kept_region_outputs: Vec<Vec<bool>>,
+    },
+}
+
+/// [`RegionLiveness`] of the regions attached to one [`Instruction`] during [`Program::into_pruned`].
+struct AttachedRegionLiveness<'s, 'p, V: Value, O: Operation<Type = V::Type>> {
+    /// Pruner that determines the liveness of the attached regions.
+    pruner: &'s mut BoundaryPruner<'p, V, O>,
+
+    /// Regions attached to the instruction, in [`Instruction::regions`] order.
+    regions: &'p [RegionId],
+}
+
+impl<V: Value, O: Operation<Type = V::Type> + Clone> RegionLiveness for AttachedRegionLiveness<'_, '_, V, O> {
+    #[inline]
+    fn used_region_inputs(&mut self, region_index: usize, used_outputs: &[bool]) -> Result<Vec<bool>, ProgramError> {
+        let region = *self.regions.get(region_index).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!("the instruction has no attached region {region_index}"))
+        })?;
+        Ok(self.pruner.region_pruning(region, used_outputs)?.used_inputs.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -2067,10 +2413,10 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceEffect};
-    use crate::programs::operations::OperationFormatter;
+    use crate::programs::operations::{OperationBoundaryPruning, OperationFormatter};
     use crate::programs::provenance::{Provenance, ProvenanceScope};
     use crate::programs::references::ReferenceType;
-    use crate::programs::regions::{RegionInterface, RegionSlot};
+    use crate::programs::regions::{InputRegionProvenance, RegionInterface, RegionLiveness, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::tests::{TestArrayOperation, TestOrderedStateOperation, TestRegionOperation};
 
@@ -2223,6 +2569,21 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
         (program, input, shifted)
+    }
+
+    /// Builds a branch region over `(x, y)` that returns `(neg(x), mul(y, y))`, printing `y` too
+    /// when `print` is `true`.
+    fn pruning_branch(print: bool) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let x = builder.add_input(scalar.clone());
+        let y = builder.add_input(scalar);
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![y, y], None).unwrap()[0];
+        if print {
+            builder.add_instruction(PrintOperation::new("y"), Vec::new(), vec![y], None).unwrap();
+        }
+        builder.build(vec![negated, squared], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
     }
 
     #[test]
@@ -3545,6 +3906,293 @@ mod tests {
         let shape = RegionSimplificationShape::of(&region);
         assert!(!shape.atoms_pin_every_instruction);
         assert!(!shape.is_identity_rebuild(&identity_mapping, &region));
+    }
+
+    #[test]
+    fn test_program_into_pruned() {
+        // `f(p, x, y)` returns only the first output of a condition over `pruning_branch`, so the condition drops its
+        // second output together with the operand `y`, which only that output uses.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let p = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let y = builder.add_input(ArrayType::scalar(DataType::F64));
+        let branch = builder.import_program(pruning_branch(false));
+        let outputs = builder
+            .add_instruction(ConditionOperation::<Array>::new(), vec![branch, branch], vec![p, x, y], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[0]], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let pruned = program.clone().into_pruned().unwrap();
+        assert_eq!(
+            pruned.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[] .
+                let %3:f64[] = condition %0 %1 [
+                    true=^0={
+                        lambda %0:f64[] .
+                        let %1:f64[] = neg %0
+                        in (%1)
+                    },
+                    false=^0,
+                ]
+                in (%3)"},
+        );
+
+        // Pruning keeps the signature and the semantics of the program.
+        let inputs = vec![Array::scalar(true).unwrap(), Array::scalar(2.0f64).unwrap(), Array::scalar(3.0f64).unwrap()];
+        assert_eq!(pruned.interpret(inputs.clone()).unwrap(), program.interpret(inputs).unwrap());
+    }
+
+    #[test]
+    fn test_program_into_pruned_returns_programs_without_unused_boundaries_unchanged() {
+        // Both outputs of the condition are used, so nothing is pruned and the program keeps its transform caches.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let p = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let y = builder.add_input(ArrayType::scalar(DataType::F64));
+        let branch = builder.import_program(pruning_branch(false));
+        let outputs = builder
+            .add_instruction(ConditionOperation::<Array>::new(), vec![branch, branch], vec![p, x, y], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let rendering = program.to_string();
+        let before = program.entry_region_ref().linearize_shared(&[0, 1, 2]).unwrap();
+        let pruned = program.into_pruned().unwrap();
+        assert_eq!(pruned.to_string(), rendering);
+        let after = pruned.entry_region_ref().linearize_shared(&[0, 1, 2]).unwrap();
+        assert!(Arc::ptr_eq(after.primal(), before.primal()));
+        assert!(Arc::ptr_eq(after.tangent(), before.tangent()));
+    }
+
+    #[test]
+    fn test_program_into_pruned_shares_pruned_regions() {
+        // Three conditions attach the same branch region. The first two use only their first outputs and share one
+        // pruned copy of the region, while the third uses both of its outputs and keeps the region whole.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let p = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let y = builder.add_input(ArrayType::scalar(DataType::F64));
+        let branch = builder.import_program(pruning_branch(false));
+        let mut condition = |inputs: Vec<AtomId>| {
+            builder
+                .add_instruction(ConditionOperation::<Array>::new(), vec![branch, branch], inputs, None)
+                .unwrap()
+                .to_vec()
+        };
+        let first = condition(vec![p, x, y]);
+        let second = condition(vec![p, y, x]);
+        let third = condition(vec![p, x, y]);
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![first[0], second[0], third[0], third[1]],
+                vec![Placeholder; 3],
+                vec![Placeholder; 4],
+            )
+            .unwrap();
+        assert_eq!(
+            program.into_pruned().unwrap().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[] .
+                let %3:f64[] = condition %0 %1 [
+                    true=^0={
+                        lambda %0:f64[] .
+                        let %1:f64[] = neg %0
+                        in (%1)
+                    },
+                    false=^0,
+                ]
+                    %4:f64[] = condition %0 %2 [
+                        true=^0,
+                        false=^0,
+                    ]
+                    %5:f64[], %6:f64[] = condition %0 %1 %2 [
+                        true=^1={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = neg %0
+                                %3:f64[] = mul %1 %1
+                            in (%2, %3)
+                        },
+                        false=^1,
+                    ]
+                in (%3, %4, %5, %6)"},
+        );
+    }
+
+    #[test]
+    fn test_program_into_pruned_keeps_retained_work() {
+        // The second output of the condition is unused, but the branch prints `y`, so the condition drops the output
+        // and keeps the operand `y` for the print, which stays in the branch.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let p = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let y = builder.add_input(ArrayType::scalar(DataType::F64));
+        let branch = builder.import_program(pruning_branch(true));
+        let outputs = builder
+            .add_instruction(ConditionOperation::<Array>::new(), vec![branch, branch], vec![p, x, y], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![outputs[0]], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.into_pruned().unwrap().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[] .
+                let %3:f64[] = condition %0 %1 %2 [
+                    true=^0={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = neg %0
+                            %3:f64[] = print [label=y] %1
+                        in (%2)
+                    },
+                    false=^0,
+                ]
+                in (%3)"},
+        );
+    }
+
+    #[test]
+    fn test_program_into_pruned_prunes_nested_regions() {
+        // The outer condition uses both outputs of its branch, so it keeps its boundary, but its branch returns only the
+        // first output of an inner condition, which is pruned inside the copy of the outer branch.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let mut outer_branch = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let p = outer_branch.add_input(ArrayType::scalar(DataType::Boolean));
+        let x = outer_branch.add_input(scalar.clone());
+        let y = outer_branch.add_input(scalar.clone());
+        let inner_branch = outer_branch.import_program(pruning_branch(false));
+        let inner = outer_branch
+            .add_instruction(ConditionOperation::<Array>::new(), vec![inner_branch, inner_branch], vec![p, x, y], None)
+            .unwrap()
+            .to_vec();
+        let outer_branch = outer_branch
+            .build::<Vec<Array>, Vec<Array>>(vec![inner[0], y], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let p = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let x = builder.add_input(scalar.clone());
+        let y = builder.add_input(scalar);
+        let outer_branch = builder.import_program(outer_branch);
+        let outputs = builder
+            .add_instruction(
+                ConditionOperation::<Array>::new(),
+                vec![outer_branch, outer_branch],
+                vec![p, p, x, y],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.into_pruned().unwrap().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[], %2:f64[] .
+                let %3:f64[], %4:f64[] = condition %0 %0 %1 %2 [
+                    true=^1={
+                        lambda %0:bool[], %1:f64[], %2:f64[] .
+                        let %3:f64[] = condition %0 %1 [
+                            true=^0={
+                                lambda %0:f64[] .
+                                let %1:f64[] = neg %0
+                                in (%1)
+                            },
+                            false=^0,
+                        ]
+                        in (%3, %2)
+                    },
+                    false=^1,
+                ]
+                in (%3, %4)"},
+        );
+    }
+
+    #[test]
+    fn test_program_into_pruned_rejects_invalid_prunings() {
+        // Operations over a `neg` body, which they supply with their operand, whose prunings drop the output that is
+        // used or the operand that supplies the body input that it needs.
+        #[derive(Clone, Debug)]
+        enum InvalidPruningOperation {
+            Neg,
+            DropsUsedOutput,
+            DropsLiveInput,
+        }
+
+        impl Operation for InvalidPruningOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Neg => "neg",
+                    Self::DropsUsedOutput | Self::DropsLiveInput => "invalid_pruning",
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Neg => &[],
+                    Self::DropsUsedOutput | Self::DropsLiveInput => const { &[RegionSlot::computation("body")] },
+                }
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                match self {
+                    Self::Neg => Ok(input_types.to_vec()),
+                    Self::DropsUsedOutput | Self::DropsLiveInput => Ok(region_interfaces[0].output_types().to_vec()),
+                }
+            }
+
+            fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
+                InputRegionProvenance::Input { index: input_index }
+            }
+
+            fn prune_boundary(
+                &self,
+                input_count: usize,
+                used_outputs: &[bool],
+                _regions: &mut dyn RegionLiveness,
+            ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+                let (kept_inputs, kept_outputs) = match self {
+                    Self::Neg => return Ok(None),
+                    Self::DropsUsedOutput => (vec![true; input_count], vec![false; used_outputs.len()]),
+                    Self::DropsLiveInput => (vec![false; input_count], used_outputs.to_vec()),
+                };
+                Ok(Some(OperationBoundaryPruning { operation: self.clone(), kept_inputs, kept_outputs }))
+            }
+        }
+
+        let program = |operation: InvalidPruningOperation| {
+            let mut body = ProgramBuilder::<Array, InvalidPruningOperation>::new();
+            let x = body.add_input(ArrayType::scalar(DataType::F64));
+            let negated = body.add_instruction(InvalidPruningOperation::Neg, Vec::new(), vec![x], None).unwrap()[0];
+            let body =
+                body.build::<Vec<Array>, Vec<Array>>(vec![negated], vec![Placeholder], vec![Placeholder]).unwrap();
+            let mut builder = ProgramBuilder::<Array, InvalidPruningOperation>::new();
+            let x = builder.add_input(ArrayType::scalar(DataType::F64));
+            let body = builder.import_program(body);
+            let output = builder.add_instruction(operation, vec![body], vec![x], None).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        assert!(matches!(
+            program(InvalidPruningOperation::DropsUsedOutput).into_pruned(),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "the boundary pruning of operation `invalid_pruning` drops its used output 0",
+        ));
+        assert!(matches!(
+            program(InvalidPruningOperation::DropsLiveInput).into_pruned(),
+            Err(ProgramError::MalformedProgram(message)) if message == "boundary pruning drops a live input of region ^0",
+        ));
     }
 
     #[test]

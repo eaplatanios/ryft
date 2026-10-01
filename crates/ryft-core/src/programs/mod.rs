@@ -122,9 +122,9 @@ pub use effects::{
 pub use identities::{NoIdentity, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 pub use instructions::{Instruction, InstructionId};
 pub use operations::{
-    ErasedOperation, MemberOperation, Operation, OperationFoldOutput, OperationFoldReplacement, OperationFormatter,
-    OperationPayloadProjection, OperationProjection, OperationProvider, fold_projected_operation,
-    infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    ErasedOperation, MemberOperation, Operation, OperationBoundaryPruning, OperationFoldOutput,
+    OperationFoldReplacement, OperationFormatter, OperationPayloadProjection, OperationProjection, OperationProvider,
+    fold_projected_operation, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 pub use programs::{FlatProgram, Program, ProgramLiveSets, ProgramRenderingMode};
 pub use provenance::{Provenance, ProvenanceScope, ProvenanceState};
@@ -150,8 +150,8 @@ pub use references::{
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region,
-    RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
-    RegionRole, RegionSlot, ReplayRegionDriver,
+    RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionLiveness, RegionRef,
+    RegionReplayMappings, RegionRole, RegionSlot, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};

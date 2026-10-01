@@ -181,6 +181,7 @@ pub mod elementwise;
 pub mod forward;
 pub mod hessian;
 pub mod jacobian;
+pub mod rematerialization;
 pub mod reverse;
 pub mod types;
 pub mod zeros;
@@ -198,6 +199,11 @@ pub use forward::{
 };
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
+pub use rematerialization::{
+    DotsSaveable, DotsWithNoBatchDimensionsSaveable, EverythingSaveable, MemoryTransferStorage, NothingSaveable,
+    OffloadDotsWithNoBatchDimensions, PolicyFn, Rematerialize, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
+    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, rematerialize,
+};
 pub use reverse::{
     CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentDestinations,
     CotangentReferenceAccumulator, CotangentSeed, MemberTransposableOperation, Pullback, ReverseModeDifferentiate,

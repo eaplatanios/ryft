@@ -19,7 +19,6 @@ pub mod partial;
 pub mod programs;
 pub mod specialization;
 pub mod tracing;
-pub mod tracing_v2;
 pub mod utilities;
 
 pub use arrays::{
@@ -67,13 +66,16 @@ pub use differentiation::{
     Differentiate, DifferentiationBoundaryPosition, DifferentiationBuilder, DifferentiationBuilderContext,
     DifferentiationBuilderLinearityMode, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationParameterRole, DifferentiationPolicy, DifferentiationRule,
-    DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate, FusedDifferentiationPolicy,
-    Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, Linearization, LinearizationContext,
-    LinearizationTracer, MemberDifferentiableOperation, MemberTransposableOperation, PartitionedDifferentiationPolicy,
-    Pullback, Pushforward, RealLinearity, ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation,
+    DifferentiationTracer, DotsSaveable, DotsWithNoBatchDimensionsSaveable, ElementwiseDerivativeAlignment,
+    EverythingSaveable, ForwardModeDifferentiate, FusedDifferentiationPolicy, Hessian, HessianBlock,
+    HolomorphicLinearity, Jacobian, JacobianBlock, Linearization, LinearizationContext, LinearizationTracer,
+    MemberDifferentiableOperation, MemberTransposableOperation, MemoryTransferStorage, NothingSaveable,
+    OffloadDotsWithNoBatchDimensions, PartitionedDifferentiationPolicy, PolicyFn, Pullback, Pushforward, RealLinearity,
+    Rematerialize, ResidualZeroProvider, ReverseModeDifferentiate, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
+    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, TransposableOperation,
     TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliaryOutput, WithCapture,
     WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp, differentiate_at,
-    jvp_for_transpose_projected_operation, jvp_projected_operation, transpose_mixed_operation,
+    jvp_for_transpose_projected_operation, jvp_projected_operation, rematerialize, transpose_mixed_operation,
     transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
@@ -120,27 +122,29 @@ pub use operations::{
     PAD_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation,
     ParallelReduce, ParallelReduceOperation, ParallelReductionKind, ParallelVary, ParallelVaryOperation, Permutation,
     Pow, PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME, REDUCE_OPERATION_NAME,
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
-    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME,
-    RESHAPE_OPERATION_NAME, RESHARD_OPERATION_NAME, REVERSE_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME,
-    RaggedDot, RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReduceOperation, ReductionKind,
-    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate, ReferenceAtomicAddUpdateOperation,
-    ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Rem,
-    RemOperation, Reshape, ReshapeOperation, Reshard, ReshardOperation, Reverse, ReverseOperation, Round,
-    RoundOperation, Rsqrt, RsqrtOperation, SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME,
-    SELECT_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SLICE_OPERATION_NAME, SQRT_OPERATION_NAME,
-    STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME, ScaledDot, ScaledDotOperation, ScanOperation,
-    ScanReferenceDischarge, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
-    ScatterReductionKind, Select, SelectOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt,
-    SqrtOperation, StopGradient, StopGradientOperation, StopGradients, Sub, SubOperation, TAG_OPERATION_NAME,
-    TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tanh,
-    TanhOperation, Tolerance, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
-    UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules, UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME,
-    WeakCustomRuleRegistration, WhileOperation, WhilePredicate, WhileTypeSemantics, WithAccumulatingVjp, WithBatching,
-    WithJvp, WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, XOR_OPERATION_NAME, Xor, XorOperation,
-    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
-    custom_function, forward_collective_to_parent, transpose_primal_condition, transpose_primal_scan,
+    REDUCE_PRECISION_OPERATION_NAME, REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
+    REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
+    REFERENCE_WRITE_OPERATION_NAME, REM_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RESHAPE_OPERATION_NAME,
+    RESHARD_OPERATION_NAME, REVERSE_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, RaggedDot,
+    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation, Reduce, ReduceOperation, ReducePrecision,
+    ReducePrecisionOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdate,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+    ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, Reshape, ReshapeOperation, Reshard,
+    ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation,
+    SCALED_DOT_OPERATION_NAME, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, SELECT_OPERATION_NAME, SIGN_OPERATION_NAME,
+    SIN_OPERATION_NAME, SLICE_OPERATION_NAME, SQRT_OPERATION_NAME, STOP_GRADIENT_OPERATION_NAME, SUB_OPERATION_NAME,
+    ScaledDot, ScaledDotOperation, ScanOperation, ScanReferenceDischarge, Scatter, ScatterDimensionNumbers,
+    ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Select, SelectOperation, Sign, SignOperation,
+    Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, StopGradients,
+    Sub, SubOperation, TAG_OPERATION_NAME, TANH_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME,
+    TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tanh, TanhOperation, Tolerance, TransferToMemory,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UnavailableCustomRules,
+    UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WeakCustomRuleRegistration, WhileOperation,
+    WhilePredicate, WhileTypeSemantics, WithAccumulatingVjp, WithBatching, WithJvp, WithSymbolicZeroJvp,
+    WithSymbolicZeroVjp, WithVjp, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME,
+    Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan, custom_function, forward_collective_to_parent,
+    transpose_primal_condition, transpose_primal_scan,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -148,18 +152,18 @@ pub use parameters::{
     PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, VecParameterizedFamily,
 };
 pub use partial::{
-    EitherStorage, ErasedResidualStorage, NativeResidualPolicies, NoStorage, PartialEvaluation,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput,
-    PartialEvaluationValue, PartialTracer, PartialValue, PartialValueMaterialization, PartiallyEvaluatableOperation,
-    PartitionMetadata, PartitionedProgram, ProjectionFallbackCandidate, ResidualCandidate, ResidualDecision,
-    ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualProducer, ResidualRejection, ResidualStorage,
+    ErasedResidualStorage, NativeResidualPolicies, NoStorage, PartialEvaluation, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
+    PartialValue, PartialValueMaterialization, PartiallyEvaluatableOperation, PartitionMetadata, PartitionedProgram,
+    ProjectionFallbackCandidate, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyError,
+    ResidualPolicyReference, ResidualProducer, ResidualRejection, ResidualStorage,
 };
 pub use programs::{
     Atom, AtomId, AttachedRegionStatistics, BatchableReferenceTransform, BindingRegionDriver, BoundReferenceTransform,
     CalleeRegionDriver, Concretizable, EffectClass, EffectClassOccurrence, EffectClasses, Effects, EffectsSummary,
     EmptyRegionDriver, ErasedOperation, ExternalReferenceBinding, FlatProgram, InputRegionProvenance, Instruction,
     InstructionId, MaybeZero, MemberOperation, NoIdentity, NoReferenceTransform, NoReferenceTransformBinding,
-    NoReferent, Operation, OperationFoldOutput, OperationFoldReplacement, OperationFormatter,
+    NoReferent, Operation, OperationBoundaryPruning, OperationFoldOutput, OperationFoldReplacement, OperationFormatter,
     OperationPayloadProjection, OperationProjection, OperationProvider, OutputRegionProvenance, ParameterProjection,
     PartialReferenceDischargeResult, PreparedReferenceReplacement, Program, ProgramBuilder, ProgramBuilderId,
     ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics, ProjectedValue, Provenance,
@@ -177,9 +181,9 @@ pub use programs::{
     ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceTransform, ReferenceTransformPath,
     ReferenceTransitiveAccess, ReferenceType, ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis,
     ReferenceViewAnalysisError, ReferenceViewOverlap, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId,
-    RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, ReplayRegionDriver,
-    TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity,
-    TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
+    RegionInterface, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics,
+    ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type, TypeError,
+    TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
     ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection, batch_reference_transforms,
     discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
     fold_projected_operation, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
@@ -193,10 +197,6 @@ pub use specialization::{
 pub use tracing::{
     DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,
     infer_output_type, trace,
-};
-pub use tracing_v2::rematerialization::{
-    REMATERIALIZE_OPERATION_NAME, RematerializeOperation, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
-    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, rematerialize,
 };
 
 #[cfg(test)]
