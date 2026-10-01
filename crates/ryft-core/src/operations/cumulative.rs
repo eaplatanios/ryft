@@ -65,10 +65,7 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationPolicy,
-};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
 use crate::operations::arithmetic::{AddOperation, Mul, MulOperation};
@@ -381,58 +378,86 @@ impl_differentiable_operation! {
                 return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
             };
 
-            // The primal output of a nonlinear kind comes from the decomposition, which interleaves its halves by
-            // zero-padding and adding them. That addition turns a `-0.0` result into `+0.0`, so under differentiation
-            // the primal output of an extremum scan over signed zeros can differ from the undifferentiated one in the
-            // sign of a zero. Similarly, the decomposition combines log-sum-exp prefixes with the unguarded elementwise
-            // `log_add_exp`, so a complex prefix that combines two arguments with negative-infinite real components is
-            // NaN there, while the primitive returns the other argument, and its first complex prefix is the raw first
-            // input, while the primitive wraps it onto the principal branch.
-            let dual = match kind {
+            let combine_fn: fn(
+                &Tracer<TracingContext<C::Constant, C::Operation>>,
+                &Tracer<TracingContext<C::Constant, C::Operation>>,
+            ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, ProgramError> = match kind {
                 CumulativeKind::Sum => {
                     let primal = primal_input.cumulative(axis, kind, reverse)?;
                     let tangent = tangent_input.cumulative(axis, kind, reverse)?;
-                    DifferentiationDual::new(primal, MaybeZero::Value(tangent))?
+                    return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?]);
                 }
-                CumulativeKind::Product => jvp_through_associative_scan(
-                    context,
-                    driver,
-                    primal_input,
-                    tangent_input,
-                    axis,
-                    reverse,
-                    |left, right| left.mul(right),
-                )?,
-                CumulativeKind::LogSumExp => jvp_through_associative_scan(
-                    context,
-                    driver,
-                    primal_input,
-                    tangent_input,
-                    axis,
-                    reverse,
-                    |left, right| left.log_add_exp(right),
-                )?,
-                CumulativeKind::Max => jvp_through_associative_scan(
-                    context,
-                    driver,
-                    primal_input,
-                    tangent_input,
-                    axis,
-                    reverse,
-                    |left, right| left.max(right),
-                )?,
-                CumulativeKind::Min => jvp_through_associative_scan(
-                    context,
-                    driver,
-                    primal_input,
-                    tangent_input,
-                    axis,
-                    reverse,
-                    |left, right| left.min(right),
-                )?,
+                CumulativeKind::Product => |left, right| left.mul(right),
+                CumulativeKind::LogSumExp => |left, right| left.log_add_exp(right),
+                CumulativeKind::Max => |left, right| left.max(right),
+                CumulativeKind::Min => |left, right| left.min(right),
             };
 
-            Ok(vec![dual])
+            // Only non-linear kinds with a live tangent reach this decomposition. Each staged primitive contributes
+            // its own JVP through the instruction-scoped driver; the shortcuts above avoid unnecessary tracing. The
+            // primal output of a non-linear kind comes from the decomposition, which reassociates combinations and can
+            // change the last bits of floating-point results. It interleaves its halves by zero-padding and adding
+            // them. That addition turns a `-0.0` result into `+0.0`, so under differentiation the primal output of
+            // an extremum scan over signed zeros can differ from the undifferentiated one in the sign of a zero.
+            // Similarly, the decomposition combines log-sum-exp prefixes with the unguarded elementwise `log_add_exp`,
+            // so a complex prefix that combines two arguments with negative-infinite real components is NaN there,
+            // while the primitive returns the other argument, and its first complex prefix is the raw first input,
+            // while the primitive wraps it onto the principal branch.
+
+            // Attribute the decomposition to this differentiation rule using provenance scopes. Its  manipulation
+            // primitives do not preserve rank-specific layouts, so an identity broadcast restores the input layout
+            // and makes the outputs have the cumulative primitive's type. Backends lower that broadcast as a layout
+            // constraint (e.g., XLA's `LayoutConstraint`).
+            let input_type = primal_input.r#type().into_owned();
+            let (_, decomposition) = TracingContext::<C::Constant, C::Operation>::trace::<_, ArrayType, _>(
+                |value: Tracer<TracingContext<C::Constant, C::Operation>>| {
+                    let domain = value.dispatch_domain();
+                    domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
+                        domain.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
+                            let output = associative_scan(&value, axis, reverse, &combine_fn)?;
+                            match input_type.layout() {
+                                Some(_) => output.broadcast(
+                                    input_type.clone(),
+                                    &(0..input_type.rank()).collect::<Vec<_>>(),
+                                ),
+                                None => Ok(output),
+                            }
+                        })
+                    })
+                },
+                input_type.clone(),
+            )?;
+
+            // A shared context can replay the fused program and obtain both primal and tangent in one pass.
+            if std::ptr::eq(context.primal(), context.tangent()) {
+                let fused = driver.jvp_program(decomposition.entry_region_ref(), &[0])?;
+                let mut outputs = fused.interpret_in_context(
+                    context.primal(),
+                    vec![primal_input.clone(), tangent_input.clone()],
+                )?;
+                check_count!("output", outputs, 2, ProgramError);
+                let output_tangent = outputs.remove(1);
+                return Ok(vec![DifferentiationDual::new(outputs.remove(0), MaybeZero::Value(output_tangent))?]);
+            }
+
+            // Separate contexts replay the primal first, then transfer its saved residuals into the tangent context.
+            // Linearizing through the driver preserves the active differentiation rules and policy.
+            let linearization = driver.linearize_program(decomposition.entry_region_ref(), &[0])?;
+            let mut primal_outputs =
+                linearization.primal().interpret_in_context(context.primal(), vec![primal_input.clone()])?;
+            check_count!("output", primal_outputs, 1 + linearization.residual_count(), ProgramError);
+            let residuals = primal_outputs.split_off(1);
+            let mut tangent_inputs = vec![tangent_input.clone()];
+            tangent_inputs.extend(
+                residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?,
+            );
+            let mut tangent_outputs =
+                linearization.tangent().interpret_in_context(context.tangent(), tangent_inputs)?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            Ok(vec![DifferentiationDual::new(
+                primal_outputs.remove(0),
+                MaybeZero::Value(tangent_outputs.remove(0)),
+            )?])
         }
     },
     transpose<V, O>
@@ -754,102 +779,6 @@ impl ArrayType {
 
         Ok(self.clone())
     }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Value that the nested trace staging an [`associative_scan`] decomposition flows.
-type DecompositionTracer<C> = Tracer<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>;
-
-/// Applies the forward-mode rule of a nonlinear [`CumulativeKind`] by differentiating through the associative-scan
-/// decomposition of [`associative_scan`], and returns the resulting primal/tangent pair.
-///
-/// The decomposition is traced once into its own program over the caller's operation family, that program is
-/// differentiated through the instruction-scoped `driver` (which re-enters the active differentiation machinery, so
-/// every primitive the construction stages contributes its *own* forward-mode rule), and the resulting fused program is
-/// replayed in `context` over the input's primal and tangent. The primal output comes back from the decomposition too,
-/// rather than from the cumulative primitive, because the fused program computes it on the way to the tangent. The two
-/// agree mathematically but not always bit for bit: the decomposition associates its combinations differently (so
-/// floating-point results can differ in their last bits), turns `-0.0` results into `+0.0` when it interleaves, and
-/// combines complex log-sum-exp prefixes without the primitive's `-∞` guard and without wrapping the first prefix onto
-/// the principal branch. JAX's `_cumulative_jvp_rule` has the same properties. When the primal and tangent contexts
-/// differ, the decomposition is linearized instead, its primal half is replayed in the primal context, and its tangent
-/// half is replayed in the tangent context over the transferred residuals.
-///
-/// The caller is responsible for the structural-zero tangent shortcut; this function requires a live tangent because
-/// the decomposition is pure overhead when there is nothing to propagate.
-///
-/// # Parameters
-///
-///   - `context`: [`DifferentiationContext`] that the forward-mode program is replayed in.
-///   - `driver`: Instruction-scoped [`DifferentiationDriver`] serving the nested differentiation request.
-///   - `primal`: Input primal.
-///   - `tangent`: Input tangent.
-///   - `axis`: Scanned axis.
-///   - `reverse`: Whether the scan accumulates from the end of the scanned axis toward its start.
-///   - `combine`: Associative combining operator of the kind, staged over the nested trace's values.
-fn jvp_through_associative_scan<C, D, F, P: DifferentiationPolicy<C>>(
-    context: &DifferentiationContext<C, P>,
-    driver: &D,
-    primal: &C::Value,
-    tangent: &C::Value,
-    axis: usize,
-    reverse: bool,
-    combine: F,
-) -> Result<DifferentiationDual<C::Value>, DifferentiationError>
-where
-    C: Context<Type = ArrayType>,
-    D: DifferentiationDriver<C>,
-    C::Operation: From<AddOperation<ArrayType>>
-        + From<BroadcastOperation>
-        + From<ConcatenateOperation<ArrayType>>
-        + From<OrOperation<ArrayType>>
-        + From<PadOperation<ArrayType>>
-        + From<SliceOperation>
-        + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>
-        + OperationProvider<ArrayType, ParallelVaryOperation, Operation = C::Operation>
-        + OperationProvider<ArrayType, BroadcastOperation, Operation = C::Operation>,
-    F: Fn(&DecompositionTracer<C>, &DecompositionTracer<C>) -> Result<DecompositionTracer<C>, ProgramError>,
-{
-    // The decomposition is staged under the framework's differentiation scope, so that its instructions are attributed
-    // to this rule rather than only to the `associative_scan` function that stages them. Its manipulation primitives
-    // do not carry an explicit input layout through (layouts are rank-specific), so the output is constrained back onto
-    // the input's layout with an identity broadcast, which is what backends lower as a layout constraint (e.g., XLA's
-    // `LayoutConstraint` custom call, which JAX's `with_layout_constraint` also emits). The primal and tangent outputs
-    // then have exactly the type of the primitive's output.
-    let input_type = primal.r#type().into_owned();
-    let (_, decomposition) = TracingContext::<C::Constant, C::Operation>::trace::<_, ArrayType, _>(
-        |value: DecompositionTracer<C>| {
-            let domain = value.dispatch_domain();
-            domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
-                domain.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
-                    let output = associative_scan(&value, axis, reverse, &combine)?;
-                    match input_type.layout() {
-                        Some(_) => output.broadcast(input_type.clone(), &(0..input_type.rank()).collect::<Vec<_>>()),
-                        None => Ok(output),
-                    }
-                })
-            })
-        },
-        input_type.clone(),
-    )?;
-    if std::ptr::eq(context.primal(), context.tangent()) {
-        let fused = driver.jvp_program(decomposition.entry_region_ref(), &[0])?;
-        let mut outputs = fused.interpret_in_context(context.primal(), vec![primal.clone(), tangent.clone()])?;
-        check_count!("output", outputs, 2, ProgramError);
-        let output_tangent = outputs.remove(1);
-        return DifferentiationDual::new(outputs.remove(0), MaybeZero::Value(output_tangent));
-    }
-    let linearization = driver.linearize_program(decomposition.entry_region_ref(), &[0])?;
-    let mut primal_outputs = linearization.primal().interpret_in_context(context.primal(), vec![primal.clone()])?;
-    check_count!("output", primal_outputs, 1 + linearization.residual_count(), ProgramError);
-    let residuals = primal_outputs.split_off(1);
-    let mut tangent_inputs = vec![tangent.clone()];
-    tangent_inputs
-        .extend(residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?);
-    let mut tangent_outputs = linearization.tangent().interpret_in_context(context.tangent(), tangent_inputs)?;
-    check_count!("output", tangent_outputs, 1, ProgramError);
-    DifferentiationDual::new(primal_outputs.remove(0), MaybeZero::Value(tangent_outputs.remove(0)))
 }
 
 impl Array {
