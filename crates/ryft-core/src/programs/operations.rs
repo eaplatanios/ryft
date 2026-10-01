@@ -8,7 +8,7 @@ use crate::programs::effects::{Effects, ReferenceAccessMode};
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::{Program, ProgramRenderingMode};
 use crate::programs::regions::{
-    InputRegionProvenance, OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot,
+    InputRegionProvenance, OutputRegionProvenance, RegionInterface, RegionLiveness, RegionRole, RegionSlot,
 };
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
@@ -689,6 +689,37 @@ pub trait Operation: Clone {
         Vec::new()
     }
 
+    /// Prunes the boundary of an [`Instruction`](crate::Instruction) that applies this operation, given which of its
+    /// outputs are used, returning the pruned boundary or [`None`] to keep the instruction whole. A pruning drops the
+    /// instruction inputs and outputs, and the attached-region inputs and outputs, that nothing needs, like the
+    /// [dead code elimination rules](https://github.com/jax-ml/jax/blob/main/jax/_src/interpreters/partial_eval.py)
+    /// of JAX's higher-order primitives (e.g., `pe.dce_rules[scan_p]`). [`Program::into_pruned`] applies the pruning,
+    /// and [`OperationBoundaryPruning`] describes its contract.
+    ///
+    /// The default keeps every instruction whole, which is always correct. Operations whose attached regions forward
+    /// operands and outputs positionally override it: a `condition` drops the operands that neither branch uses, and a
+    /// `scan` drops unused stacked operands and outputs together with the carries that nothing depends on. Operations
+    /// whose attached regions have coupled boundaries (e.g., the rule regions of a custom function, which mirror its
+    /// primal region) keep the default.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_count`: Number of inputs of the instruction.
+    ///   - `used_outputs`: Whether each output of the instruction is used. It may mark no output as used when the
+    ///     instruction is retained for its effects.
+    ///   - `regions`: Liveness of the attached regions, which reports the inputs of an attached region that a given
+    ///     set of its used outputs needs.
+    #[inline]
+    fn prune_boundary(
+        &self,
+        input_count: usize,
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        let _ = (input_count, used_outputs, regions);
+        Ok(None)
+    }
+
     /// Returns `true` if the `output_index`-th output is structurally known to be zero independently
     /// of this [`Operation`]'s inputs. The default implementation returns `false`. Operations such as
     /// [`ZeroOperation`](crate::ZeroOperation) and [`ZeroLikeOperation`](crate::ZeroLikeOperation) override
@@ -949,6 +980,19 @@ impl<O: Operation> Operation for Box<O> {
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         self.as_ref().output_region_provenance(output_index)
+    }
+
+    #[inline]
+    fn prune_boundary(
+        &self,
+        input_count: usize,
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        Ok(self
+            .as_ref()
+            .prune_boundary(input_count, used_outputs, regions)?
+            .map(|pruning| pruning.map_operation(Box::new)))
     }
 
     #[inline]
@@ -1253,6 +1297,47 @@ pub enum OperationFoldReplacement<V> {
 
     /// The output is this materialized constant, whose type is the inferred output type.
     Constant(V),
+}
+
+/// Pruned boundary of one region-carrying [`Instruction`](crate::Instruction), as returned by
+/// [`Operation::prune_boundary`]. [`Program::into_pruned`] applies it by dropping the instruction inputs and outputs
+/// that are not kept and by attaching pruned copies of the regions, so that regions attached elsewhere are never
+/// modified.
+///
+/// The kept boundary of each attached region follows from the region provenance that the operation declares (i.e.,
+/// [`Operation::input_region_provenance`] and [`Operation::output_region_provenance`]). A region input is kept unless
+/// it is supplied by an operand that is dropped, and a region output is kept unless every instruction output that it
+/// supplies is dropped. Region inputs that the operation creates itself or that have no declared provenance, and region
+/// outputs that supply no instruction output, are therefore always kept.
+///
+/// A pruning must keep every output of the instruction that is used, and every operand that supplies a region input
+/// that is live once only the kept outputs of that region are used (i.e., [`RegionLiveness::used_region_inputs`]).
+/// Operands whose region inputs are not live may still be kept, which is how operations keep region boundaries that
+/// must agree (e.g., the two branches of a `condition` operation). [`Program::into_pruned`] checks both requirements
+/// and validates the pruned instruction with [`Operation::infer_output_types`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OperationBoundaryPruning<O> {
+    /// Operation that applies to the kept inputs and produces the kept outputs (e.g., a `scan` with fewer carries).
+    pub operation: O,
+
+    /// Whether each input of the [`Instruction`](crate::Instruction) is kept.
+    pub kept_inputs: Vec<bool>,
+
+    /// Whether each output of the [`Instruction`](crate::Instruction) is kept.
+    pub kept_outputs: Vec<bool>,
+}
+
+impl<O> OperationBoundaryPruning<O> {
+    /// Returns this [`OperationBoundaryPruning`] with its operation mapped by `function` (e.g., wrapped into the
+    /// variant of the operation family that holds it).
+    #[inline]
+    pub fn map_operation<P, F: FnOnce(O) -> P>(self, function: F) -> OperationBoundaryPruning<P> {
+        OperationBoundaryPruning {
+            operation: function(self.operation),
+            kept_inputs: self.kept_inputs,
+            kept_outputs: self.kept_outputs,
+        }
+    }
 }
 
 /// Infers the region input types of a member [`Operation`] through a composite type boundary. Every composite input

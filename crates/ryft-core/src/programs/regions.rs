@@ -1817,6 +1817,17 @@ pub struct OutputRegionProvenance {
     pub output_index: usize,
 }
 
+/// Liveness of the [`Region`]s attached to one [`Instruction`], which [`Program::into_pruned`]
+/// provides to [`Operation::prune_boundary`].
+pub trait RegionLiveness {
+    /// Returns whether each input of the attached [`Region`] at `region_index` is live when only the outputs of that
+    /// region that `used_outputs` marks are used. Inputs that the region needs for work that is retained even when
+    /// unused (e.g., observable effects) are always live, and the liveness accounts for the pruning of the
+    /// region-carrying instructions nested in the region. Answers are memoized, so repeated queries (e.g.,
+    /// while a `scan` operation computes the fixed point of its carries) are cheap.
+    fn used_region_inputs(&mut self, region_index: usize, used_outputs: &[bool]) -> Result<Vec<bool>, ProgramError>;
+}
+
 /// One cached source view for a complete replay [`TypeIdentityRenaming`]. The replay cache and its instruction drivers
 /// share this immutable entry through [`Rc`]. Renaming the whole [`RegionArena`] preserves its local [`RegionId`]s and
 /// shared descendants. These are source identifiers, not destination imports; the same entry can therefore supply views
