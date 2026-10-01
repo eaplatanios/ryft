@@ -429,6 +429,26 @@ impl<C: Context> PartialEvaluationContext<C> {
         PartialEvaluationValue::variable(r#type, atom)
     }
 
+    /// Wraps a value from the known-side parent [`Context`] as a known [`PartialEvaluationValue`]. Custom partial
+    /// evaluation rules use this after computing a value in [`parent`](Self::parent).
+    ///
+    /// A constant value that defines a type identity is embedded as a residual-program constant when consumed by
+    /// residual work, preserving its role as the identity's producer. Symbolic known values remain residual inputs
+    /// because their known-side producer stays live.
+    ///
+    /// # Parameters
+    ///
+    ///   - `value`: Value belonging to this context's known-side parent. Its context membership is not checked.
+    pub fn known_value(&self, value: C::Value) -> PartialEvaluationValue<C::Value> {
+        let defines_identity =
+            value.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
+        if defines_identity && self.parent.resolve(&value).is_constant() {
+            PartialEvaluationValue::known_constant(value)
+        } else {
+            PartialEvaluationValue::known(value)
+        }
+    }
+
     /// Returns whether the provided effects may execute in the known-side context at this point. Reference placement
     /// and input knowledge impose additional constraints in [`Self::fold_or_residualize`].
     #[inline]
@@ -585,22 +605,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             self.parent.bind(operation, regions, &known)?
         };
 
-        Ok(outputs.into_iter().map(|value| self.folded_value(value)).collect())
-    }
-
-    // TODO(eaplatanios): Should this be renamed to `lift`, moved to above `fold_or_residualize`, and made public?
-    /// Returns the provided value, which work folded into the known-side [`Context`] produced, as a known
-    /// [`PartialEvaluationValue`]. A folded value that owns a type identity must remain a producer when it crosses
-    /// into residual work, which embedding its cheap constant payload does structurally. Symbolic known values remain
-    /// residual inputs because their known-side producer stays live.
-    pub(crate) fn folded_value(&self, value: C::Value) -> PartialEvaluationValue<C::Value> {
-        let defines_identity =
-            value.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
-        if defines_identity && self.parent.resolve(&value).is_constant() {
-            PartialEvaluationValue::known_constant(value)
-        } else {
-            PartialEvaluationValue::known(value)
-        }
+        Ok(outputs.into_iter().map(|value| self.known_value(value)).collect())
     }
 
     /// _Residualizes_ the provided [`Operation`] into the residual [`Program`], materializing each known input into

@@ -765,6 +765,7 @@ mod tests {
         Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayType, DataType,
     };
     use crate::captures::CaptureReference;
+    use crate::differentiation::NothingSaveable;
     use crate::operations::{
         AddOperation, ConditionOperation, CosOperation, DotDimensionNumbers, DotOperation, MulOperation, NegOperation,
         PrintOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation,
@@ -1592,5 +1593,112 @@ mod tests {
         let known_outputs = planned.known_program().interpret(vec![xs.clone()]).unwrap();
         let residual_outputs = planned.residual_program().interpret(vec![c.clone(), known_outputs[0].clone()]).unwrap();
         assert_eq!(residual_outputs, program.interpret(vec![c, xs]).unwrap());
+    }
+
+    #[test]
+    fn test_program_partition_with_residual_policy_recomputes_known_region_operations() {
+        // `f(c, xs, y)` scans `c * cos(dot(x, x))` over the two rows `x` of `xs` and multiplies the result by `y`, with
+        // `c` and `xs` known and `y` unknown. No split rule runs for the scan, because all of its inputs are known, so
+        // the known program computes it whole. Saving nothing recomputes it whole in the residual program, while saving
+        // dot products saves its output, because recomputing the scan whole would also recompute its dot products.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let _index = builder.add_input(ArrayType::scalar(DataType::I64));
+        let c = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::new_static(DataType::F64, [3]));
+        let dot = DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]));
+        let product = builder.add_instruction(dot, Vec::new(), vec![x, x], None).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![product], None).unwrap()[0];
+        let next = builder.add_instruction(MulOperation::new(), Vec::new(), vec![c, cosine], None).unwrap()[0];
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let c = builder.add_input(ArrayType::scalar(DataType::F64));
+        let xs = builder.add_input(ArrayType::new_static(DataType::F64, [2, 3]));
+        let y = builder.add_input(ArrayType::scalar(DataType::F64));
+        let scan = ArrayOperation::Scan(ScanOperation::new(1, 2));
+        let scanned = builder.add_instruction(scan, vec![body], vec![c, xs], None).unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scanned, y], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        let save_nothing = ResidualPolicyReference::<ArrayType>::new(NothingSaveable);
+        let planned = program.partition_with_residual_policy(&[true, true, false], &save_nothing).unwrap();
+        assert_eq!(
+            planned.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0), Known(1)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[], %1:f64[2, 3] .
+                    in (%0, %1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[], %2:f64[2, 3] .
+                    let %3:f64[] = scan [carry_count=1, length=2, reverse=false] %1 %2 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[3] .
+                            let %3:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %2 %2
+                                %4:f64[] = cos %3
+                                %5:f64[] = mul %1 %4
+                            in (%5)
+                        },
+                    ]
+                        %4:f64[] = mul %3 %0
+                    in (%4)
+                }"},
+        );
+        let c = Array::scalar(2.0f64).unwrap();
+        let xs = Array::new(
+            ArrayType::new_static(DataType::F64, [2, 3]),
+            [1.0f64, 2.0, 3.0, 0.5, 0.25, 0.125].into_iter().flat_map(f64::to_ne_bytes).collect(),
+        )
+        .unwrap();
+        let y = Array::scalar(3.0f64).unwrap();
+        let known_outputs = planned.known_program().interpret(vec![c.clone(), xs.clone()]).unwrap();
+        let mut residual_inputs = vec![y.clone()];
+        residual_inputs.extend(known_outputs);
+        assert_eq!(
+            planned.residual_program().interpret(residual_inputs),
+            program.interpret(vec![c.clone(), xs.clone(), y.clone()]),
+        );
+
+        let planned = program.partition_with_residual_policy(&[true, true, false], &save_dots()).unwrap();
+        assert_eq!(
+            planned.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[Unknown(2), Known(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[], %1:f64[2, 3] .
+                    let %2:f64[] = scan [carry_count=1, length=2, reverse=false] %0 %1 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[3] .
+                            let %3:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %2 %2
+                                %4:f64[] = cos %3
+                                %5:f64[] = mul %1 %4
+                            in (%5)
+                        },
+                    ]
+                    in (%2)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = mul %1 %0
+                    in (%2)
+                }"},
+        );
     }
 }

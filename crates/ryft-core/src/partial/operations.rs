@@ -1,6 +1,5 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashSet;
-use std::rc::Rc;
 
 use crate::contexts::Context;
 use crate::partial::contexts::{PartialEvaluationContext, ReferencePlacement};
@@ -190,10 +189,7 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
         };
 
         let instruction_context = effect_ordering.as_ref().map(|ordering| {
-            let mut instruction_context = context.clone();
-            instruction_context.defer_ordered_effects =
-                Rc::new(Cell::new(deferred_effect_ordering.borrow().conflicts(ordering)));
-            instruction_context
+            context.clone().with_defer_ordered_effects(deferred_effect_ordering.borrow().conflicts(ordering))
         });
 
         let context = instruction_context.as_ref().unwrap_or(context);
@@ -210,7 +206,7 @@ impl<D> RecursivePartialEvaluationDriver<'_, D> {
         }?;
 
         if let Some(ordering) = effect_ordering
-            && context.defer_ordered_effects.get()
+            && context.defer_ordered_effects()
         {
             deferred_effect_ordering.borrow_mut().extend(&ordering);
         }
@@ -277,7 +273,7 @@ where
         // Unlike inlining a region, constructing a separate residual program needs fresh builder and ordering
         // state. Ordinary specialization still inherits the caller's permission to fold effectful work.
         if !self.repeated_residual {
-            return region.partially_evaluate_in_context(context.parent(), knowledge, context.allow_effect_folding);
+            return region.partially_evaluate_in_context(context.parent(), knowledge, context.allow_effect_folding());
         }
 
         // Give the nested evaluation its own residual program while folding through the same known-side parent.
@@ -340,7 +336,7 @@ where
             region
                 .partition_with_configuration(
                     input_known,
-                    context.allow_effect_folding,
+                    context.allow_effect_folding(),
                     false,
                     None,
                     residual_placement,
@@ -455,18 +451,18 @@ mod tests {
             .unwrap();
         let regions = vec![program];
         let driver = RecursivePartialEvaluationDriver { driver: &regions, repeated_residual: false };
-        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
-        context.defer_ordered_effects.set(true);
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+            .with_defer_ordered_effects(true);
 
         // A fresh partition inherits configuration, but not the active context's recorded ordering constraints.
         let partition = driver.partition_program(&context, regions[0].entry_region_ref(), &[true, true, true]).unwrap();
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
-        assert!(context.defer_ordered_effects.get());
+        assert!(context.defer_ordered_effects());
 
         // The same driver uses the effect placement passed to each call.
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new()).deferred_sibling();
         let partition = driver.partition_program(&context, regions[0].entry_region_ref(), &[true, true, true]).unwrap();
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
-        assert!(!context.defer_ordered_effects.get());
+        assert!(!context.defer_ordered_effects());
     }
 }
