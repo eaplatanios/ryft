@@ -730,7 +730,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             }
 
             // The reference-typed inputs of a dormant rule region are bound by the transform that instantiates the
-            // rule (e.g., the forward tail and cotangent destinations of a rematerialized call) rather than by this
+            // rule (e.g., the residuals and cotangent destinations of a custom backward rule) rather than by this
             // application's inputs, so, exactly as the reference analysis does, the check skips rule regions.
             if matches!(operation.region_role(region_index), Some(RegionRole::Rule | RegionRole::DeferredRule)) {
                 continue;

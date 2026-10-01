@@ -1106,9 +1106,9 @@ pub enum RegionRole {
     /// operation.
     Computation,
 
-    /// The [`Region`] represents a dormant transformation rule, such as a custom derivative or rematerialization rule.
-    /// It is consumed by a transform rather than ordinary interpretation and so its [`EffectClasses`] do not belong to
-    /// the owning computation.
+    /// The [`Region`] represents a dormant transformation rule, such as a custom derivative rule. It is consumed
+    /// by a transform rather than ordinary interpretation and so its [`EffectClasses`] do not belong to the owning
+    /// computation.
     Rule,
 
     /// The [`Region`] represents a dormant transformation rule that a later transform of the owning operation executes

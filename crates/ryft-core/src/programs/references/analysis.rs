@@ -29,11 +29,11 @@
 //! [`ReferenceRegionInputBinding`] per forwarded reference input, mapping that formal input to its caller root. An
 //! explicitly local input instead borrows a distinct root owned by the attaching operation and has no caller binding.
 //! The attaching instruction's [`ReferenceTransitiveAccess`] summary substitutes forwarded bindings and drops both
-//! operation-owned local inputs and the nested region's local allocations. Only [`RegionRole::Computation`] regions are
-//! entered as a dormant [`RegionRole::Rule`] region (e.g., a derived rematerialization or custom derivative rule) is an
-//! input to a later transform rather than an executed child of the attaching instruction, its reference-typed inputs
-//! are bound by that transform rather than by the instruction's operands, and the transform validates it separately,
-//! so the analysis neither enters it nor attributes its accesses to the instruction (i.e., the same rule by which
+//! operation-owned local inputs and the nested region's local allocations. Only [`RegionRole::Computation`] regions
+//! are entered, because a dormant [`RegionRole::Rule`] region (e.g., a custom derivative rule) is an input to a later
+//! transform rather than an executed child of the attaching instruction, its reference-typed inputs are bound by that
+//! transform rather than by the instruction's operands, and the transform validates it separately, so the analysis
+//! neither enters it nor attributes its accesses to the instruction (i.e., the same rule by which
 //! [`Effects`](crate::Effects) exclude [`RegionRole::Rule`] regions).
 //!
 //! # Capture Scopes
