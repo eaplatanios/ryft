@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::ThreadId;
 
+use crate::axes::NamedAxis;
 use crate::batching::{
     BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingLevelExtent, BatchingPolicy,
     ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
@@ -718,6 +719,9 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Human-readable label used for rendering and diagnostics.
     name: Cow<'static, str>,
 
+    /// Named axes with which every rule is traced (refer to [`Self::with_named_axes`]).
+    named_axes: Vec<(String, NamedAxis)>,
+
     /// Optional forward-mode rule.
     jvp: Option<CustomRuleJvp<V, O>>,
 
@@ -763,6 +767,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         Self {
             id: NEXT_CUSTOM_RULE_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
+            named_axes: Vec::new(),
             jvp: None,
             forward: None,
             backward: None,
@@ -775,6 +780,15 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             discharger: None,
             uncached_in_flight: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Returns this [`CustomRuleDefinition`] with the provided named axes, with which every rule is traced, so that
+    /// the rules resolve the names bound where the calls that apply them are made (e.g., an `axis_index` over the axis
+    /// of an enclosing batching level). The rules are traced lazily and in fresh traces, which see no enclosing
+    /// bindings otherwise. The definitions that are derived from this definition trace their rules with the same axes.
+    pub fn with_named_axes(mut self, named_axes: Vec<(String, NamedAxis)>) -> Self {
+        self.named_axes = named_axes;
+        self
     }
 
     /// Returns this [`CustomRuleDefinition`] with the provided forward-mode rule, replacing any previously configured
@@ -1111,6 +1125,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     #[inline]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the named axes with which the rules of this [`CustomRuleDefinition`] are traced.
+    #[inline]
+    pub fn named_axes(&self) -> &[(String, NamedAxis)] {
+        &self.named_axes
     }
 
     /// Returns `true` if this [`CustomRuleDefinition`] has a forward-mode rule or reverse-mode rules.
@@ -1685,7 +1705,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 // The rule's two result partitions are validated separately before they are flattened, because
                 // the flattened types alone cannot tell a missing output from a misplaced tangent.
                 let output_count = key.output_types.len();
-                let (rule_output_types, program) = TracingContext::<V, O>::trace(
+                let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
                     |values: Vec<CustomRuleTracer<V, O>>| {
                         let (primals, active_tangents) = values.split_at(key.input_types.len());
                         let mut active_tangents = active_tangents.iter().cloned();
@@ -1728,12 +1748,14 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         Ok(outputs)
                     },
                     rule_input_types,
+                    self.definition.named_axes.clone(),
                 )?;
                 let mut expected_output_types = key.output_types.clone();
                 for r#type in &key.output_types {
                     expected_output_types.push(r#type.tangent()?);
                 }
-                validate_rule_output_types(self.definition.name(), "JVP", &expected_output_types, &rule_output_types)?;
+                let program =
+                    conform_rule_output_types(self.definition.name(), "JVP", program, &expected_output_types)?;
                 let program = self.definition.discharge_if(key.discharged, program)?;
                 return Ok(Arc::new(CustomRuleSpecialization { program, output_axes: Vec::new() }));
             };
@@ -1795,7 +1817,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             let Some((inner, level)) = inner else {
                 // The primal outputs are validated as their own partition before the residuals are appended,
                 // because a residual whose type matches a missing output would otherwise pass as that output.
-                let (rule_output_types, program) = TracingContext::<V, O>::trace(
+                let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
                     |values: Vec<CustomRuleTracer<V, O>>| {
                         let (mut outputs, residuals) = forward.apply(&values)?;
                         if outputs.len() != output_count {
@@ -1811,13 +1833,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         Ok(outputs)
                     },
                     key.input_types.clone(),
+                    self.definition.named_axes.clone(),
                 )?;
-                validate_rule_output_types(
-                    self.definition.name(),
-                    "forward",
-                    &key.output_types,
-                    &rule_output_types[..output_count],
-                )?;
+                let program = conform_rule_output_types(self.definition.name(), "forward", program, &key.output_types)?;
                 // Reference residuals preserve handles, not snapshots, so each one must forward a distinct leading
                 // non-differentiated input by identity, which the backward rule then receives as plumbing.
                 let leading_inputs = &program.input_ids()[..key.non_differentiated_count];
@@ -1988,7 +2006,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         self.specialize(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
             let boundary_operand_count = key.boundary_operand_types.len();
             let mut output_axes = Vec::new();
-            let (_, program) = TracingContext::<V, O>::trace(
+            let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
                 |values: Vec<CustomRuleTracer<V, O>>| {
                     let (boundary_operands, inputs) = values.split_at(boundary_operand_count);
                     let (outputs, axes) = rule.apply(&key.level, boundary_operands, inputs, &key.input_axes)?;
@@ -2006,6 +2024,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     Ok(outputs)
                 },
                 key.boundary_operand_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
+                self.definition.named_axes.clone(),
             )?;
             Ok(Arc::new(CustomRuleSpecialization { program, output_axes }))
         })
@@ -2028,6 +2047,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             };
             CustomRuleDefinition {
                 name: Cow::Owned(format!("{prefix}({})", self.definition.name())),
+                named_axes: self.definition.named_axes.clone(),
                 jvp: Some(CustomRuleJvp::Primal),
                 batcher: self.definition.batcher.clone(),
                 differentiator: self.definition.differentiator.clone(),
@@ -2548,7 +2568,7 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
                 .map_err(ProgramError::from)?;
 
                 // The batched program consumes the level's boundary operands before the JVP program's own copy of them.
-                let (_, program) = TracingContext::<V, O>::trace(
+                let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
                     |values: Vec<CustomRuleTracer<V, O>>| {
                         let context = values[0].context().clone();
                         let mut inputs = values[..boundary_operand_count].to_vec();
@@ -2556,6 +2576,7 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
                         Ok(batched.interpret_in_context(&context, inputs)?)
                     },
                     program_types,
+                    self.source.definition.named_axes.clone(),
                 )?;
                 return Ok(Arc::new(CustomRuleSpecialization { program, output_axes }));
             }
@@ -2619,7 +2640,7 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
             CustomRuleDerivationKind::Jvp => rule.output_axes.iter().copied().chain(tangent_output_axes).collect(),
             CustomRuleDerivationKind::Pushforward => tangent_output_axes.collect(),
         };
-        let (_, program) = TracingContext::<V, O>::trace(
+        let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
             |values: Vec<CustomRuleTracer<V, O>>| {
                 let context = values[0].context().clone();
                 let (boundary_operands, inputs) = values.split_at(boundary_operand_count);
@@ -2637,6 +2658,7 @@ impl<V: Value<Type: DifferentiableType + Eq + Hash>, O: Operation<Type = V::Type
                 Ok(jvp.interpret_in_context(&context, jvp_inputs)?)
             },
             program_types,
+            self.source.definition.named_axes.clone(),
         )?;
         Ok(Arc::new(CustomRuleSpecialization { program, output_axes }))
     }
@@ -2726,6 +2748,62 @@ pub(super) fn validate_rule_output_types<T: Type>(
     Ok(())
 }
 
+/// Validates that `program`, a retained rule of the custom rule set named `name` traced in its own trace, returns the
+/// `expected` types as its leading outputs, and returns it with its type identities renamed onto those of `expected`.
+/// The trace establishes fresh identities for the extents that the rule computes (e.g., a recomputed `n · n` extent of
+/// the primal outputs), so its outputs can agree with `expected` only up to a renaming of those identities. The
+/// renaming is derived across the complete boundary, so that the identities of the program inputs map to themselves,
+/// and it must be bijective, so that it preserves which outputs share an identity. It is applied to the whole program,
+/// including any trailing outputs (e.g., residuals) that name the renamed identities.
+fn conform_rule_output_types<V: Value, O: Operation<Type = V::Type>>(
+    name: &str,
+    rule: &str,
+    program: Program<V, O, Vec<V>, Vec<V>>,
+    expected: &[V::Type],
+) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+    let input_types = program.input_types();
+    let output_types = program.output_types();
+    let actual = output_types.get(..expected.len()).unwrap_or(&output_types);
+    let boundary = |outputs: &[V::Type]| input_types.iter().chain(outputs).cloned().collect::<Vec<_>>();
+    let Some(renaming) = derive_bijective_identity_renaming(&boundary(actual), &boundary(expected)) else {
+        // Signatures that render equally differ only in their identities (e.g., when the rule computes two extents
+        // separately that the expected outputs share), which the rendering alone would not show.
+        let render = |types: &[V::Type]| types.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+        let (expected, actual) = (render(expected), render(actual));
+        let reason = if expected == actual { " with different type identities" } else { "" };
+        return Err(TypeError::invalid(format!(
+            "`{CUSTOM_FUNCTION_OPERATION_NAME}` `{name}` {rule} rule output type signature mismatch: expected \
+             [{expected}] but got [{actual}]{reason}",
+        ))
+        .into());
+    };
+    if renaming.is_identity() {
+        return Ok(program);
+    }
+    program.rename_type_identities(&renaming)
+}
+
+/// Returns the renaming of the type identities of `source` onto those of `target` when the two type signatures are
+/// equal up to a bijective renaming of their identities, which holds exactly when each renames into the other.
+pub(super) fn derive_bijective_identity_renaming<T: Type>(
+    source: &[T],
+    target: &[T],
+) -> Option<TypeIdentityRenaming<T::Identity>> {
+    let renames_into = |declared: &[T], actual: &[T]| {
+        let renaming = T::derive_identity_renaming(declared, actual).ok()?;
+        declared
+            .iter()
+            .zip(actual)
+            .all(|(declared, actual)| declared.rename_identities(&renaming).is_ok_and(|renamed| &renamed == actual))
+            .then_some(renaming)
+    };
+    if source.len() != target.len() {
+        return None;
+    }
+    renames_into(target, source)?;
+    renames_into(source, target)
+}
+
 /// Converts a failed or reentrant specialization of a retained custom rule into a [`DifferentiationError`], keeping
 /// the rule's own error when it produced one.
 fn specialization_error<E: Debug + Display + Into<DifferentiationError>>(
@@ -2741,6 +2819,7 @@ fn specialization_error<E: Debug + Display + Into<DifferentiationError>>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use indoc::indoc;
@@ -2752,59 +2831,14 @@ mod tests {
     };
     use crate::contexts::Context;
     use crate::operations::arithmetic::MulOperation;
+    use crate::operations::custom_functions::operations::CustomFunctionOperation;
+    use crate::operations::custom_functions::tests::{
+        MemberDefinition, RuleCounters, TestDefinition, call_jvp, cube_definition, cube_program, custom_rule_program,
+        member_cube_definition,
+    };
     use crate::programs::ReferenceType;
 
     use super::*;
-
-    /// Retained-rule definition over the production [`ArrayOperation`] member family.
-    type MemberDefinition = CustomRuleDefinition<Array, ArrayOperation<Array>>;
-
-    /// Invocation counters of the retained rules of a [`member_cube_definition`].
-    #[derive(Default)]
-    struct RuleCounters {
-        /// Number of JVP rule invocations.
-        jvp: AtomicUsize,
-
-        /// Number of VJP forward rule invocations.
-        forward: AtomicUsize,
-
-        /// Number of VJP backward rule invocations.
-        backward: AtomicUsize,
-    }
-
-    impl RuleCounters {
-        /// Returns the JVP, forward, and backward invocation counts.
-        fn counts(&self) -> (usize, usize, usize) {
-            (self.jvp.load(Ordering::SeqCst), self.forward.load(Ordering::SeqCst), self.backward.load(Ordering::SeqCst))
-        }
-    }
-
-    /// Returns a definition of `f(x) = x³` in the production [`ArrayOperation`] member family, whose deliberately wrong
-    /// rules distinguish the selected rule: the JVP rule computes `ẏ = x² ẋ` and the VJP rule computes `x̄ = 2 x² ȳ`,
-    /// while the true derivative is `3 x²`. Each rule counts its invocations in `counters`.
-    fn member_cube_definition(counters: &Arc<RuleCounters>) -> MemberDefinition {
-        let (jvp_counters, forward_counters, backward_counters) =
-            (counters.clone(), counters.clone(), counters.clone());
-        MemberDefinition::new("cube")
-            .with_jvp(move |primals, tangents| {
-                jvp_counters.jvp.fetch_add(1, Ordering::SeqCst);
-                let square = primals[0].clone() * primals[0].clone();
-                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
-            })
-            .with_vjp(
-                move |primals| {
-                    forward_counters.forward.fetch_add(1, Ordering::SeqCst);
-                    let square = primals[0].clone() * primals[0].clone();
-                    Ok((vec![square.clone() * primals[0].clone()], vec![square]))
-                },
-                move |leading_inputs, seeds| {
-                    backward_counters.backward.fetch_add(1, Ordering::SeqCst);
-                    let contribution = leading_inputs[0].clone() * seeds[0].clone();
-                    Ok(vec![contribution.clone() + contribution])
-                },
-            )
-            .with_batching()
-    }
 
     #[test]
     fn test_lifted_custom_rules() {
@@ -2960,6 +2994,300 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_custom_rule_registration_ownership() {
+        // The outer JVP rule calls the inner definition through a reference, so the outer rule's cached specialization
+        // retains the inner definition but not its caches, which only the inner handle owns.
+        let counters = Arc::new(RuleCounters::default());
+        let inner = CustomRuleRegistration::new(cube_definition(&counters, true, true));
+        let (retained_inner, retained_inner_caches) =
+            (Arc::downgrade(&inner.definition()), Arc::downgrade(&inner.caches()));
+        let inner_reference = inner.reference();
+        let outer = CustomRuleRegistration::new(TestDefinition::new("outer").with_jvp(move |primals, tangents| {
+            let r#type = primals[0].r#type().into_owned();
+            let operation = CustomFunctionOperation::new(inner_reference.clone());
+            let outputs = primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
+            Ok((outputs, vec![tangents[0].clone()]))
+        }));
+        let (retained_outer, retained_outer_caches) =
+            (Arc::downgrade(&outer.definition()), Arc::downgrade(&outer.caches()));
+        let program = custom_rule_program(&outer, ArrayType::scalar(DataType::F64));
+        let linearization = program.linearize().unwrap();
+        assert_eq!(counters.counts(), (0, 0, 0));
+        assert_eq!(outer.caches().jvp_specializations.len(), 1);
+
+        // Dropping the handles frees their caches, including the outer specialization that called the inner definition,
+        // while the staged programs keep both definitions alive until they are dropped as well.
+        drop((inner, outer));
+        assert!(retained_outer_caches.upgrade().is_none());
+        assert!(retained_inner_caches.upgrade().is_none());
+        assert!(retained_outer.upgrade().is_some());
+        drop((program, linearization));
+        assert!(retained_outer.upgrade().is_none());
+        assert!(retained_inner.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_custom_rule_registration_ownership_self_recursive() {
+        // The JVP rule calls its own definition through the weak handle of `new_cyclic`, so its cached specialization
+        // retains the definition. Only the handle owns the caches, so dropping it frees that specialization, and the
+        // definition itself lives exactly as long as the staged programs that call it.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new_cyclic(|this| {
+            let (this, counters) = (this.clone(), counters.clone());
+            TestDefinition::new("recursive").with_jvp(move |primals, tangents| {
+                counters.jvp.fetch_add(1, Ordering::SeqCst);
+                let r#type = primals[0].r#type().into_owned();
+                let operation = CustomFunctionOperation::new(this.reference()?);
+                let outputs =
+                    primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
+                Ok((outputs, vec![primals[0].clone() * primals[0].clone() * tangents[0].clone()]))
+            })
+        });
+        let (retained_definition, retained_caches) =
+            (Arc::downgrade(&definition.definition()), Arc::downgrade(&definition.caches()));
+        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
+        let linearization = program.linearize().unwrap();
+        assert_eq!(counters.counts(), (1, 0, 0));
+        assert_eq!(definition.caches().jvp_specializations.len(), 1);
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = custom_function [name=\"recursive\"] %0 [
+                    primal={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                            %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                    %2:f64[] = mul %0 %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+        drop(definition);
+        assert!(retained_caches.upgrade().is_none());
+        assert!(retained_definition.upgrade().is_some());
+        drop((program, linearization));
+        assert!(retained_definition.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_custom_rule_registration_ownership_mutually_recursive() {
+        // The rules of `a` call `b` through a reference and the rules of `b` call `a` through its weak handle, which is
+        // how mutually recursive definitions are registered without a cycle: `b` is registered inside the `new_cyclic`
+        // closure of `a`. Filling both caches (the second-order linearization traces the rule of `b`) and then
+        // dropping both handles and every program must free every definition and cache.
+        let mut b = None;
+        let a = CustomRuleRegistration::new_cyclic(|a| {
+            let a = a.clone();
+            let registration =
+                CustomRuleRegistration::new(TestDefinition::new("b").with_jvp(move |primals, tangents| {
+                    let r#type = primals[0].r#type().into_owned();
+                    let operation = CustomFunctionOperation::new(a.reference()?);
+                    let outputs =
+                        primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
+                    Ok((outputs, vec![tangents[0].clone()]))
+                }));
+            let reference = registration.reference();
+            b = Some(registration);
+            TestDefinition::new("a").with_jvp(move |primals, tangents| {
+                let r#type = primals[0].r#type().into_owned();
+                let operation = CustomFunctionOperation::new(reference.clone());
+                let outputs =
+                    primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
+                Ok((outputs, vec![tangents[0].clone()]))
+            })
+        });
+        let b = b.unwrap();
+        let probes = [
+            (Arc::downgrade(&a.definition()), Arc::downgrade(&a.caches())),
+            (Arc::downgrade(&b.definition()), Arc::downgrade(&b.caches())),
+        ];
+        let program = custom_rule_program(&a, ArrayType::scalar(DataType::F64));
+        let first = program.linearize().unwrap();
+        let second = first.primal().linearize().unwrap();
+        assert_eq!(a.caches().jvp_specializations.len(), 1);
+        assert_eq!(b.caches().jvp_specializations.len(), 1);
+        drop((a, b));
+        assert!(probes.iter().all(|(_, caches)| caches.upgrade().is_none()));
+        drop((program, first, second));
+        assert!(probes.iter().all(|(definition, _)| definition.upgrade().is_none()));
+    }
+
+    #[test]
+    fn test_custom_rule_registration_drop() {
+        // Once the handle is dropped, the remaining calls trace their rules again on every derivative request, with
+        // results identical to the cached ones.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
+        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
+        let cached = program.linearize().unwrap().tangent().to_string();
+        drop(definition);
+        for expected_invocations in [2, 3] {
+            assert_eq!(program.linearize().unwrap().tangent().to_string(), cached);
+            assert_eq!(counters.counts(), (expected_invocations, 0, 0));
+        }
+
+        // A rule that requests its own specialization while it is being traced is rejected, with and without a live
+        // handle, and a rejected request leaves nothing in flight.
+        let definition = CustomRuleRegistration::new_cyclic(|this| {
+            let this = this.clone();
+            TestDefinition::new("reentrant").with_jvp(move |primals, tangents| {
+                let r#type = primals[0].r#type().into_owned();
+                let key = CustomRuleSpecializationKey {
+                    input_types: vec![r#type.clone()],
+                    output_types: vec![r#type],
+                    non_differentiated_count: 0,
+                    tangent_activity: vec![true],
+                    levels: Vec::new(),
+                    discharged: false,
+                };
+                this.reference()?
+                    .jvp_specialization(key)
+                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                Ok((primals.to_vec(), tangents.to_vec()))
+            })
+        });
+        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
+        let reentrant = "recursive request for a specialization that is already being produced on this thread";
+        assert_eq!(program.jvp().unwrap_err().to_string(), reentrant);
+        let retained = Arc::downgrade(&definition.definition());
+        drop(definition);
+        for _ in 0..2 {
+            assert_eq!(program.jvp().unwrap_err().to_string(), reentrant);
+            assert!(!retained.upgrade().unwrap().has_uncached_in_flight());
+        }
+    }
+
+    #[test]
+    fn test_custom_rule_reference_specialization_eviction() {
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
+        let jvp = |extent: usize| {
+            let x = Array::vector(vec![2f64; extent]).unwrap();
+            let tangent = Array::vector(vec![1f64; extent]).unwrap();
+            assert_eq!(
+                call_jvp(&definition, x, tangent),
+                Ok((
+                    vec![Array::vector(vec![8f64; extent]).unwrap()],
+                    vec![Array::vector(vec![4f64; extent]).unwrap()]
+                )),
+            );
+        };
+        let specialization = |extent: usize| {
+            let r#type = ArrayType::new_static(DataType::F64, [extent]);
+            let key = CustomRuleSpecializationKey {
+                input_types: vec![r#type.clone()],
+                output_types: vec![r#type],
+                non_differentiated_count: 0,
+                tangent_activity: vec![true],
+                levels: Vec::new(),
+                discharged: false,
+            };
+            Arc::downgrade(&definition.reference().jvp_specialization(key).unwrap())
+        };
+        let baseline = Arc::strong_count(&definition.definition());
+        let mut probes = Vec::new();
+        for extent in 1..=CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1 {
+            jvp(extent);
+            probes.push(specialization(extent));
+        }
+        assert_eq!(definition.caches().jvp_specializations.len(), CUSTOM_RULE_SPECIALIZATION_CAPACITY);
+        assert_eq!(counters.counts(), (CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1, 0, 0));
+
+        // Bounded caches bound the retained memory: the evicted specialization is freed, and no cached program retains
+        // the definition.
+        assert!(probes[0].upgrade().is_none());
+        assert!(probes[1..].iter().all(|probe| probe.upgrade().is_some()));
+        assert_eq!(Arc::strong_count(&definition.definition()), baseline);
+
+        // The evicted oldest specialization is traced again, while a resident one is reused.
+        jvp(1);
+        jvp(CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1);
+        assert_eq!(counters.counts(), (CUSTOM_RULE_SPECIALIZATION_CAPACITY + 2, 0, 0));
+    }
+
+    #[test]
+    fn test_custom_rule_reference_specialization_retry_after_failure() {
+        // A failed specialization is not retained, so the next request invokes the rule again.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let definition = CustomRuleRegistration::new(TestDefinition::new("flaky").with_jvp({
+            let attempts = attempts.clone();
+            move |primals, tangents| {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(ProgramError::InvalidArgument { message: "transient failure".to_string() });
+                }
+                let square = primals[0].clone() * primals[0].clone();
+                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
+            }
+        }));
+        let x = Array::scalar(2f64).unwrap();
+        let one = Array::scalar(1f64).unwrap();
+        assert_eq!(call_jvp(&definition, x.clone(), one.clone()).unwrap_err().to_string(), "transient failure");
+        assert!(definition.caches().jvp_specializations.is_empty());
+        for _ in 0..2 {
+            assert_eq!(
+                call_jvp(&definition, x.clone(), one.clone()),
+                Ok((vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(4f64).unwrap()])),
+            );
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_custom_rule_reference_specialization_concurrent_cold_requests() {
+        // Both threads enter the rule before either finishes, so both derive the same cold specialization. The
+        // duplicate derivations produce one resident result, which later requests reuse.
+        let barrier = Arc::new(Barrier::new(2));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let definition = CustomRuleRegistration::new(TestDefinition::new("concurrent").with_jvp({
+            let barrier = barrier.clone();
+            let invocations = invocations.clone();
+            move |primals, tangents| {
+                if invocations.fetch_add(1, Ordering::SeqCst) < 2 {
+                    barrier.wait();
+                }
+                let square = primals[0].clone() * primals[0].clone();
+                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
+            }
+        }));
+        let x = Array::scalar(2f64).unwrap();
+        let one = Array::scalar(1f64).unwrap();
+        let expected = (vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(4f64).unwrap()]);
+        std::thread::scope(|scope| {
+            let threads = (0..2)
+                .map(|_| {
+                    let (definition, x, one) = (definition.clone(), x.clone(), one.clone());
+                    scope.spawn(move || call_jvp(&definition, x, one))
+                })
+                .collect::<Vec<_>>();
+            for thread in threads {
+                assert_eq!(thread.join().unwrap(), Ok(expected.clone()));
+            }
+        });
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        assert_eq!(definition.caches().jvp_specializations.len(), 1);
+        assert_eq!(call_jvp(&definition, x, one), Ok(expected));
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_custom_rule_reference_specialization_debug_recheck() {
+        // A region-transform cache hit re-derives the linearization in debug builds and compares renderings. The
+        // re-derivation reuses the retained specialization, so it neither invokes the rule nor changes the rendering.
+        let counters = Arc::new(RuleCounters::default());
+        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, true));
+        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
+        let first = program.linearize().unwrap();
+        let second = program.linearize().unwrap();
+        assert_eq!(second.tangent().to_string(), first.tangent().to_string());
+        assert_eq!(counters.counts(), (1, 0, 0));
     }
 
     #[test]

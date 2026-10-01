@@ -13,6 +13,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchableType, BatchingLevelExtent, RecursiveBatchingPolicy};
 use crate::contexts::{Context, EagerContext};
 use crate::differentiation::{
@@ -27,6 +28,7 @@ use crate::operations::custom_functions::operations::{
 };
 use crate::operations::custom_functions::rules::{
     CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer,
+    derive_bijective_identity_renaming,
 };
 use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
@@ -35,7 +37,7 @@ use crate::programs::{
     MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceAccessOperation, ReferenceMemberType,
     ReferenceTransform, Type, TypeError, Typed, Value,
 };
-use crate::tracing::{DomainTracer, Trace, TracingContext};
+use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
 /// Forward-mode configuration of a [`CustomFunction`] without a configured forward-mode rule. A function without
 /// reverse-mode rules then derives its forward-mode rule from its primal (as [`JvpFromPrimal`] does), while a function
@@ -53,14 +55,14 @@ pub struct WithJvp<Jvp>(Arc<Jvp>);
 pub struct JvpFromPrimal;
 
 /// Forward-mode configuration of a [`CustomFunction`] with a user-supplied Jacobian-Vector Product (JVP) rule closure
-/// implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` as a `Tangents` value whose structurally zero leaves are
+/// implementing `(x, ẋ) ↦ (y, ẏ)` that receives `ẋ` with [`MaybeZero`] leaves, of which the structurally zero ones are
 /// [`MaybeZero::Zero`]s (refer to [`CustomFunction::with_symbolic_zero_jvp`]).
-pub struct WithSymbolicZeroJvp<Tangents, Jvp> {
+pub struct WithSymbolicZeroJvp<Tracer, Jvp> {
     /// Closure computing `(outputs, output_tangents)` from the primal input value and the input tangent value.
     jvp: Arc<Jvp>,
 
-    /// Phantom marker pinning the tangent value type named by the closure signature.
-    marker: PhantomData<fn() -> Tangents>,
+    /// Phantom marker pinning the tracer type of the closure's input leaves, which the leaves of its tangents wrap.
+    marker: PhantomData<fn() -> Tracer>,
 }
 
 /// Reverse-mode configuration of a [`CustomFunction`] without reverse-mode rules. Reverse mode then transposes the
@@ -82,24 +84,25 @@ pub struct WithVjp<Residual, Forward, Backward> {
 }
 
 /// Reverse-mode configuration of a [`CustomFunction`] with user-supplied forward and backward (i.e., Vector-Jacobian
-/// Product or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, whose backward rule receives `ȳ` as a
-/// `Seeds` value whose structurally zero leaves are [`MaybeZero::Zero`]s (refer to
+/// Product or VJP) rule closures implementing `x ↦ (y, r)` and `(r, ȳ) ↦ x̄`, whose backward rule receives `ȳ` with
+/// [`MaybeZero`] leaves, of which the structurally zero ones are [`MaybeZero::Zero`]s (refer to
 /// [`CustomFunction::with_symbolic_zero_vjp`]).
-pub struct WithSymbolicZeroVjp<Residual, Seeds, Forward, Backward> {
+pub struct WithSymbolicZeroVjp<Residual, Tracer, Forward, Backward> {
     /// Closure computing `(outputs, residuals)` from the primal input value.
     forward: Arc<Forward>,
 
     /// Closure computing the input cotangent value from `(residuals, output_cotangent_seeds)`.
     backward: Arc<Backward>,
 
-    /// Phantom marker pinning the residual and seed value types named by the closure signatures.
-    marker: PhantomData<fn() -> (Residual, Seeds)>,
+    /// Phantom marker pinning the residual type and the tracer type of the closures' output leaves, which the leaves
+    /// of the seeds wrap.
+    marker: PhantomData<fn() -> (Residual, Tracer)>,
 }
 
 /// Reverse-mode configuration of a [`CustomFunction`] with a user-supplied forward rule closure implementing
 /// `x ↦ (y, r)` and an accumulating backward rule closure, which submits the input cotangents to their accumulators
 /// (refer to [`CustomFunction::with_accumulating_vjp`]).
-pub struct WithAccumulatingVjp<Residual, Seeds, Accumulators, Transposition, Forward, Backward> {
+pub struct WithAccumulatingVjp<Residual, Tracer, Transposition, Forward, Backward> {
     /// Closure computing `(outputs, residuals)` from the primal input value.
     forward: Arc<Forward>,
 
@@ -107,9 +110,9 @@ pub struct WithAccumulatingVjp<Residual, Seeds, Accumulators, Transposition, For
     /// accumulators.
     backward: Arc<Backward>,
 
-    /// Phantom marker pinning the residual, seed, accumulator, and transposition context types named by the closure
-    /// signatures.
-    marker: PhantomData<fn() -> (Residual, Seeds, Accumulators, Transposition)>,
+    /// Phantom marker pinning the residual type, the tracer type of the closures' leaves, which the leaves of the seeds
+    /// wrap, and the transposition context type named by the closure signatures.
+    marker: PhantomData<fn() -> (Residual, Tracer, Transposition)>,
 }
 
 /// Forward-mode configuration of a [`CustomFunction`] (i.e., [`DefaultJvp`], [`WithJvp`], [`WithSymbolicZeroJvp`], or
@@ -197,7 +200,7 @@ where
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
     ) -> CustomRuleDefinition<V, O> {
-        let (jvp, name) = (self.0.clone(), name.clone());
+        let (jvp, name, named_axes) = (self.0.clone(), name.clone(), definition.named_axes().to_vec());
         let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
         definition.with_jvp(move |primals, tangents| {
             let input_types = Input::To::<V::Type>::from_parameters(
@@ -210,6 +213,7 @@ where
                 input_types,
                 &output_structure,
                 non_differentiated_count,
+                named_axes.clone(),
             )?;
             let mut values = primals.to_vec();
             values.extend_from_slice(tangents);
@@ -220,18 +224,21 @@ where
     }
 }
 
-impl<V, O, Input, Output, Tangents, Jvp> CustomFunctionJvp<V, O, Input, Output> for WithSymbolicZeroJvp<Tangents, Jvp>
+impl<V, O, Input, Output, Jvp> CustomFunctionJvp<V, O, Input, Output>
+    for WithSymbolicZeroJvp<CustomRuleTracer<V, O>, Jvp>
 where
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
     O: 'static + Clone + Operation<Type = V::Type>,
     Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Send + Sync>,
-    Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Input::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
     Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
     Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Tangents:
-        'static + Parameterized<MaybeZero<CustomRuleTracer<V, O>>, ParameterStructure = Input::ParameterStructure>,
-    Jvp: 'static + Fn(Input, Tangents) -> Result<(Output, Output), ProgramError> + Send + Sync,
+    Jvp: 'static
+        + Fn(Input, Input::To<MaybeZero<CustomRuleTracer<V, O>>>) -> Result<(Output, Output), ProgramError>
+        + Send
+        + Sync,
 {
     fn configure(
         &self,
@@ -241,7 +248,7 @@ where
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
     ) -> CustomRuleDefinition<V, O> {
-        let jvp = self.jvp.clone();
+        let (jvp, named_axes) = (self.jvp.clone(), definition.named_axes().to_vec());
         let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
         definition.with_symbolic_zero_jvp(move |primals, tangents| {
             let input_types = Input::To::<V::Type>::from_parameters(
@@ -249,12 +256,13 @@ where
                 primals.iter().map(|primal| primal.r#type().into_owned()),
             )?;
             let tangent_activity = tangents.iter().map(|tangent| !tangent.is_zero()).collect::<Vec<_>>();
-            let program = trace_symbolic_zero_custom_jvp_rule::<V, O, Input, Output, Tangents, Jvp>(
+            let program = trace_symbolic_zero_custom_jvp_rule::<V, O, Input, Output, Jvp>(
                 jvp.as_ref(),
                 input_types,
                 &tangent_activity,
                 &output_structure,
                 non_differentiated_count,
+                named_axes.clone(),
             )?;
             let mut values = primals.to_vec();
             values.extend(tangents.iter().filter_map(MaybeZero::as_value).cloned());
@@ -357,9 +365,10 @@ where
             input_structure,
             output_structure,
             &residual_structures,
+            definition.named_axes(),
         );
         let backward = {
-            let (backward, name) = (self.backward.clone(), name.clone());
+            let (backward, name, named_axes) = (self.backward.clone(), name.clone(), definition.named_axes().to_vec());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
             move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[CustomRuleTracer<V, O>]| {
                 let types = |values: &[CustomRuleTracer<V, O>]| {
@@ -381,6 +390,7 @@ where
                     residual_types,
                     output_structure.clone(),
                     types(seeds),
+                    named_axes.clone(),
                 )?;
                 let mut values = leading_inputs.to_vec();
                 values.extend_from_slice(seeds);
@@ -391,8 +401,8 @@ where
     }
 }
 
-impl<V, O, Input, Output, Residual, Seeds, Forward, Backward> CustomFunctionVjp<V, O, Input, Output>
-    for WithSymbolicZeroVjp<Residual, Seeds, Forward, Backward>
+impl<V, O, Input, Output, Residual, Forward, Backward> CustomFunctionVjp<V, O, Input, Output>
+    for WithSymbolicZeroVjp<Residual, CustomRuleTracer<V, O>, Forward, Backward>
 where
     V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
     O: 'static
@@ -418,104 +428,15 @@ where
     Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
     Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
-    Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Output::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
     Residual: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send>,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
     Forward: 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
-    Seeds: 'static + Parameterized<MaybeZero<CustomRuleTracer<V, O>>, ParameterStructure = Output::ParameterStructure>,
-    Backward: 'static + Fn(Residual, Seeds) -> Result<Input, ProgramError> + Send + Sync,
-{
-    fn configure(
-        &self,
-        definition: CustomRuleDefinition<V, O>,
-        name: &Cow<'static, str>,
-        input_structure: &Input::ParameterStructure,
-        output_structure: &Output::ParameterStructure,
-        non_differentiated_count: usize,
-    ) -> CustomRuleDefinition<V, O> {
-        let residual_structures = CustomFunctionResidualStructures::<V::Type, Residual::ParameterStructure>::default();
-        let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, Forward>(
-            self.forward.clone(),
-            name,
-            input_structure,
-            output_structure,
-            &residual_structures,
-        );
-        let backward = {
-            let (backward, name) = (self.backward.clone(), name.clone());
-            let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-            move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[MaybeZero<CustomRuleTracer<V, O>>]| {
-                let types = |values: &[CustomRuleTracer<V, O>]| {
-                    values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>()
-                };
-                let residual_types = types(&leading_inputs[non_differentiated_count..]);
-                let structure = residual_structures.get(&name, &residual_types)?;
-                let live_seeds = seeds.iter().filter_map(MaybeZero::as_value).cloned().collect::<Vec<_>>();
-                let Some(context) =
-                    leading_inputs.iter().chain(&live_seeds).next().map(|value| value.context().clone())
-                else {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "`{name}` backward rule has neither leading inputs nor non-zero seeds",
-                    )));
-                };
-                let program =
-                    trace_symbolic_zero_custom_vjp_backward_rule::<V, O, Input, Output, Residual, Seeds, Backward>(
-                        backward.as_ref(),
-                        &input_structure,
-                        types(&leading_inputs[..non_differentiated_count]),
-                        structure,
-                        residual_types,
-                        output_structure.clone(),
-                        seeds,
-                    )?;
-                let mut values = leading_inputs.to_vec();
-                values.extend(live_seeds);
-                program.interpret_in_context(&context, values)
-            }
-        };
-        definition.with_symbolic_zero_vjp(forward, backward)
-    }
-}
-
-impl<V, O, Input, Output, Residual, Seeds, Accumulators, Forward, Backward> CustomFunctionVjp<V, O, Input, Output>
-    for WithAccumulatingVjp<Residual, Seeds, Accumulators, TranspositionContext<V, O>, Forward, Backward>
-where
-    V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
-    O: 'static
-        + TransposableOperation<V, O>
-        + ResidualZeroProvider<V::Type, Operation = O>
-        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>>
-        + OperationProvider<
-            V::Type,
-            ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
-            Operation = O,
-        >
-        + OperationProvider<
-            V::Type,
-            ReferenceAddUpdateOperation<
-                <V::Type as ReferenceMemberType>::Referent,
-                V::Type,
-                <O as ReferenceAccessOperation>::Transform,
-            >,
-            Operation = O,
-        >
-        + From<AddOperation<V::Type>>,
-    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
-    Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
-    Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
-    Residual: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send>,
-    Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
-    Forward: 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
-    Seeds: 'static + Parameterized<MaybeZero<CustomRuleTracer<V, O>>, ParameterStructure = Output::ParameterStructure>,
-    Accumulators: 'static + Parameterized<CotangentAccumulator, ParameterStructure = Input::ParameterStructure>,
     Backward: 'static
-        + Fn(&mut TranspositionContext<V, O>, Residual, Seeds, Accumulators) -> Result<(), DifferentiationError>
+        + Fn(Residual, Output::To<MaybeZero<CustomRuleTracer<V, O>>>) -> Result<Input, ProgramError>
         + Send
         + Sync,
 {
@@ -534,6 +455,104 @@ where
             input_structure,
             output_structure,
             &residual_structures,
+            definition.named_axes(),
+        );
+        let backward = {
+            let (backward, name, named_axes) = (self.backward.clone(), name.clone(), definition.named_axes().to_vec());
+            let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
+            move |leading_inputs: &[CustomRuleTracer<V, O>], seeds: &[MaybeZero<CustomRuleTracer<V, O>>]| {
+                let types = |values: &[CustomRuleTracer<V, O>]| {
+                    values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>()
+                };
+                let residual_types = types(&leading_inputs[non_differentiated_count..]);
+                let structure = residual_structures.get(&name, &residual_types)?;
+                let live_seeds = seeds.iter().filter_map(MaybeZero::as_value).cloned().collect::<Vec<_>>();
+                let Some(context) =
+                    leading_inputs.iter().chain(&live_seeds).next().map(|value| value.context().clone())
+                else {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "`{name}` backward rule has neither leading inputs nor non-zero seeds",
+                    )));
+                };
+                let program = trace_symbolic_zero_custom_vjp_backward_rule::<V, O, Input, Output, Residual, Backward>(
+                    backward.as_ref(),
+                    &input_structure,
+                    types(&leading_inputs[..non_differentiated_count]),
+                    structure,
+                    residual_types,
+                    output_structure.clone(),
+                    seeds,
+                    named_axes.clone(),
+                )?;
+                let mut values = leading_inputs.to_vec();
+                values.extend(live_seeds);
+                program.interpret_in_context(&context, values)
+            }
+        };
+        definition.with_symbolic_zero_vjp(forward, backward)
+    }
+}
+
+impl<V, O, Input, Output, Residual, Forward, Backward> CustomFunctionVjp<V, O, Input, Output>
+    for WithAccumulatingVjp<Residual, CustomRuleTracer<V, O>, TranspositionContext<V, O>, Forward, Backward>
+where
+    V: 'static + Value<Type: DifferentiableType + ReferenceMemberType + Eq + Hash + Send>,
+    O: 'static
+        + TransposableOperation<V, O>
+        + ResidualZeroProvider<V::Type, Operation = O>
+        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = <V::Type as ReferenceMemberType>::Referent>>
+        + OperationProvider<
+            V::Type,
+            ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
+            Operation = O,
+        >
+        + OperationProvider<
+            V::Type,
+            ReferenceAddUpdateOperation<
+                <V::Type as ReferenceMemberType>::Referent,
+                V::Type,
+                <O as ReferenceAccessOperation>::Transform,
+            >,
+            Operation = O,
+        >
+        + From<AddOperation<V::Type>>,
+    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<CotangentAccumulator>,
+    Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
+    Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
+    Output::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
+    Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
+    Residual: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send>,
+    Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
+    Forward: 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
+    Backward: 'static
+        + Fn(
+            &mut TranspositionContext<V, O>,
+            Residual,
+            Output::To<MaybeZero<CustomRuleTracer<V, O>>>,
+            Input::To<CotangentAccumulator>,
+        ) -> Result<(), DifferentiationError>
+        + Send
+        + Sync,
+{
+    fn configure(
+        &self,
+        definition: CustomRuleDefinition<V, O>,
+        name: &Cow<'static, str>,
+        input_structure: &Input::ParameterStructure,
+        output_structure: &Output::ParameterStructure,
+        non_differentiated_count: usize,
+    ) -> CustomRuleDefinition<V, O> {
+        let residual_structures = CustomFunctionResidualStructures::<V::Type, Residual::ParameterStructure>::default();
+        let forward = retained_custom_vjp_forward_rule::<V, O, Input, Output, Residual, Forward>(
+            self.forward.clone(),
+            name,
+            input_structure,
+            output_structure,
+            &residual_structures,
+            definition.named_axes(),
         );
 
         // The rule is invoked directly while its carrier is transposed, with the carrier's inputs (i.e., the
@@ -561,8 +580,11 @@ where
                     .collect::<Result<Vec<_>, _>>()?;
                 let residual_types = residuals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
                 let residuals = Residual::from_parameters(residual_structures.get(&name, &residual_types)?, residuals)?;
-                let seeds = Seeds::from_parameters(output_structure.clone(), seeds.iter().cloned())?;
-                let accumulators = Accumulators::from_parameters(
+                let seeds = Output::To::<MaybeZero<CustomRuleTracer<V, O>>>::from_parameters(
+                    output_structure.clone(),
+                    seeds.iter().cloned(),
+                )?;
+                let accumulators = Input::To::<CotangentAccumulator>::from_parameters(
                     input_structure.clone(),
                     accumulators[..non_differentiated_count]
                         .iter()
@@ -583,12 +605,12 @@ pub struct DefaultBatching;
 
 /// Batching configuration of a [`CustomFunction`] with a user-supplied custom batching rule closure implementing
 /// `(extent, x, x_axes) ↦ (y, y_axes)` (refer to [`CustomFunction::with_batching`]).
-pub struct WithBatching<InputAxes, OutputAxes, Extent, Rule> {
+pub struct WithBatching<Tracer, Rule> {
     /// Closure computing the batched outputs and their batch axes from the batched inputs and their batch axes.
     rule: Arc<Rule>,
 
-    /// Phantom marker pinning the batch axis value and extent types named by the closure signature.
-    marker: PhantomData<fn() -> (InputAxes, OutputAxes, Extent)>,
+    /// Phantom marker pinning the tracer type of the closure's leaves, which is also the type of dynamic extents.
+    marker: PhantomData<fn() -> Tracer>,
 }
 
 /// Batching configuration of a [`CustomFunction`] (i.e., [`DefaultBatching`] or [`WithBatching`]), which installs its
@@ -633,8 +655,8 @@ where
     }
 }
 
-impl<V, O, Input, Output, InputAxes, OutputAxes, Rule> CustomFunctionBatching<V, O, Input, Output>
-    for WithBatching<InputAxes, OutputAxes, CustomRuleTracer<V, O>, Rule>
+impl<V, O, Input, Output, Rule> CustomFunctionBatching<V, O, Input, Output>
+    for WithBatching<CustomRuleTracer<V, O>, Rule>
 where
     V: 'static + Value<Type: DifferentiableType + Eq + Hash>,
     O: 'static
@@ -643,12 +665,20 @@ where
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
         + ResidualZeroProvider<V::Type, Operation = O>,
-    Input: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Send + Sync>,
-    Output: 'static + Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq + Send + Sync>,
-    InputAxes: 'static + Parameterized<BatchAxis, ParameterStructure = Input::ParameterStructure>,
-    OutputAxes: 'static + Parameterized<BatchAxis, ParameterStructure = Output::ParameterStructure>,
+    Input: 'static
+        + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
+    Output: 'static
+        + Parameterized<
+            CustomRuleTracer<V, O>,
+            Family: ParameterizedFamily<BatchAxis>,
+            ParameterStructure: Debug + PartialEq + Send + Sync,
+        >,
     Rule: 'static
-        + Fn(BatchingLevelExtent<CustomRuleTracer<V, O>>, Input, InputAxes) -> Result<(Output, OutputAxes), ProgramError>
+        + Fn(
+            BatchingLevelExtent<CustomRuleTracer<V, O>>,
+            Input,
+            Input::To<BatchAxis>,
+        ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
         + Send
         + Sync,
 {
@@ -683,7 +713,10 @@ where
             let (outputs, output_axes) = rule(
                 extent,
                 Input::from_parameters(input_structure.clone(), inputs[leading_input_count..].iter().cloned())?,
-                InputAxes::from_parameters(input_structure.clone(), input_axes[leading_input_count..].iter().copied())?,
+                Input::To::<BatchAxis>::from_parameters(
+                    input_structure.clone(),
+                    input_axes[leading_input_count..].iter().copied(),
+                )?,
             )?;
             for structure in [outputs.parameter_structure(), output_axes.parameter_structure()] {
                 if structure != output_structure {
@@ -723,7 +756,9 @@ impl<T: Type, Structure: Clone + Debug + PartialEq> CustomFunctionResidualStruct
     /// Returns a [`ParameterError`] when residuals of equivalent flat types were recorded with a different structure.
     fn record(&self, residual_types: Vec<T>, structure: Structure) -> Result<(), ParameterError> {
         let mut structures = self.structures.lock().expect("custom function residual mutex is poisoned");
-        let recorded = structures.iter().find(|(types, _)| Self::equivalent(types, &residual_types));
+        let recorded = structures
+            .iter()
+            .find(|(types, _)| derive_bijective_identity_renaming(types, &residual_types).is_some());
         match recorded {
             Some((_, recorded)) if recorded != &structure => Err(ParameterError::MismatchedParameterStructures {
                 left_structure: format!("{recorded:?}"),
@@ -749,26 +784,13 @@ impl<T: Type, Structure: Clone + Debug + PartialEq> CustomFunctionResidualStruct
             .lock()
             .expect("custom function residual mutex is poisoned")
             .iter()
-            .find(|(types, _)| Self::equivalent(types, residual_types))
+            .find(|(types, _)| derive_bijective_identity_renaming(types, residual_types).is_some())
             .map(|(_, structure)| structure.clone())
             .ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
                     "`{name}` backward rule was traced before the forward rule that produces its residuals",
                 ))
             })
-    }
-
-    /// Returns whether `left` and `right` are equal up to a bijective renaming of their type identities, which holds
-    /// exactly when each renames into the other.
-    fn equivalent(left: &[T], right: &[T]) -> bool {
-        let renames_into = |declared: &[T], actual: &[T]| {
-            T::derive_identity_renaming(declared, actual).is_ok_and(|renaming| {
-                declared.iter().zip(actual).all(|(declared, actual)| {
-                    declared.rename_identities(&renaming).is_ok_and(|renamed| &renamed == actual)
-                })
-            })
-        };
-        left.len() == right.len() && renames_into(left, right) && renames_into(right, left)
     }
 }
 
@@ -795,12 +817,15 @@ impl<T, Structure> Default for CustomFunctionResidualStructures<T, Structure> {
 ///   - `input_structure`: Structure of the call's inputs.
 ///   - `output_structure`: Structure of the call's primal outputs.
 ///   - `residual_structures`: Residual structures shared with the backward rule of the same registration.
+///   - `named_axes`: Named axes with which the closure is traced (refer to
+///     [`CustomRuleDefinition::with_named_axes`]).
 fn retained_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
     forward: Arc<Forward>,
     name: &Cow<'static, str>,
     input_structure: &Input::ParameterStructure,
     output_structure: &Output::ParameterStructure,
     residual_structures: &CustomFunctionResidualStructures<V::Type, Residual::ParameterStructure>,
+    named_axes: &[(String, NamedAxis)],
 ) -> impl 'static
 + Fn(&[CustomRuleTracer<V, O>]) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
 + Send
@@ -818,7 +843,7 @@ where
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
     Forward: 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
 {
-    let (name, residual_structures) = (name.clone(), residual_structures.clone());
+    let (name, residual_structures, named_axes) = (name.clone(), residual_structures.clone(), named_axes.to_vec());
     let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
     move |primals: &[CustomRuleTracer<V, O>]| {
         let input_types = Input::To::<V::Type>::from_parameters(
@@ -831,6 +856,7 @@ where
                 forward.as_ref(),
                 input_types,
                 &output_structure,
+                named_axes.clone(),
             )?;
         residual_structures.record(residual_types, structure)?;
         let mut outputs = program.interpret_in_context(primals[0].context(), primals.to_vec())?;
@@ -853,11 +879,14 @@ where
 ///   - `forward`: Closure implementing `x ↦ (y, r)`.
 ///   - `input_types`: Types of the call's inputs, with the call's input structure.
 ///   - `output_structure`: Structure of the call's primal outputs.
+///   - `named_axes`: Named axes with which the closure is traced (refer to
+///     [`CustomRuleDefinition::with_named_axes`]).
 fn trace_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
     name: &str,
     forward: &Forward,
     input_types: Input::To<V::Type>,
     output_structure: &Output::ParameterStructure,
+    named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<(Residual::ParameterStructure, Vec<V::Type>, Program<V, O, Vec<V>, Vec<V>>), ProgramError>
 where
     V: Value<Type: DifferentiableType>,
@@ -872,14 +901,16 @@ where
     Forward: Fn(Input) -> Result<(Output, Residual), ProgramError>,
 {
     let mut residual_structure = None;
-    let ((forward_output_types, residual_types), program) = EagerContext::<V, O>::trace(
-        |input| {
-            let (outputs, residuals) = forward(input)?;
-            residual_structure = Some(residuals.parameter_structure());
-            Ok((outputs, residuals))
-        },
-        input_types,
-    )?;
+    let ((forward_output_types, residual_types), program) =
+        DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes(
+            |input| {
+                let (outputs, residuals) = forward(input)?;
+                residual_structure = Some(residuals.parameter_structure());
+                Ok((outputs, residuals))
+            },
+            input_types,
+            named_axes,
+        )?;
     let forward_output_structure = forward_output_types.parameter_structure();
     if &forward_output_structure != output_structure {
         return Err(ParameterError::MismatchedParameterStructures {
@@ -935,6 +966,8 @@ where
 ///   - `residual_types`: Flat types of those residuals.
 ///   - `output_structure`: Structure of the call's outputs.
 ///   - `output_cotangent_types`: Flat cotangent types of the call's outputs.
+///   - `named_axes`: Named axes with which the closure is traced (refer to
+///     [`CustomRuleDefinition::with_named_axes`]).
 fn trace_custom_vjp_backward_rule<V, O, Input, Output, Residual, Backward>(
     backward: &Backward,
     input_structure: &Input::ParameterStructure,
@@ -943,6 +976,7 @@ fn trace_custom_vjp_backward_rule<V, O, Input, Output, Residual, Backward>(
     residual_types: Vec<V::Type>,
     output_structure: Output::ParameterStructure,
     output_cotangent_types: Vec<V::Type>,
+    named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value<Type: DifferentiableType>,
@@ -959,7 +993,7 @@ where
     let non_differentiated_count = non_differentiated_types.len();
     let residual_types = Residual::To::<V::Type>::from_parameters(residual_structure, residual_types)?;
     let output_cotangent_types = Output::To::<V::Type>::from_parameters(output_structure, output_cotangent_types)?;
-    let (_, program) = EagerContext::<V, O>::trace(
+    let (_, program) = DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes(
         |(_, residuals, cotangents): (Vec<CustomRuleTracer<V, O>>, Residual, Output)| {
             let cotangents = backward(residuals, cotangents)?;
 
@@ -976,6 +1010,7 @@ where
             Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
         },
         (non_differentiated_types, residual_types, output_cotangent_types),
+        named_axes,
     )?;
     Ok(program.into_flat_program())
 }
@@ -996,7 +1031,9 @@ where
 ///   - `residual_types`: Flat types of those residuals.
 ///   - `output_structure`: Structure of the call's outputs.
 ///   - `seeds`: Output cotangent seeds, of which only the types and the structural zeros are used.
-fn trace_symbolic_zero_custom_vjp_backward_rule<V, O, Input, Output, Residual, Seeds, Backward>(
+///   - `named_axes`: Named axes with which the closure is traced (refer to
+///     [`CustomRuleDefinition::with_named_axes`]).
+fn trace_symbolic_zero_custom_vjp_backward_rule<V, O, Input, Output, Residual, Backward>(
     backward: &Backward,
     input_structure: &Input::ParameterStructure,
     non_differentiated_types: Vec<V::Type>,
@@ -1004,17 +1041,17 @@ fn trace_symbolic_zero_custom_vjp_backward_rule<V, O, Input, Output, Residual, S
     residual_types: Vec<V::Type>,
     output_structure: Output::ParameterStructure,
     seeds: &[MaybeZero<CustomRuleTracer<V, O>>],
+    named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>,
     Input: Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<CustomRuleTracer<V, O>>,
+    Output: Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>>,
     Residual: Parameterized<CustomRuleTracer<V, O>>,
     Residual::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
     Residual::To<V::Type>: Parameterized<V::Type, Family = Residual::Family, To<CustomRuleTracer<V, O>> = Residual>,
-    Seeds: Parameterized<MaybeZero<CustomRuleTracer<V, O>>, ParameterStructure = Output::ParameterStructure>,
-    Backward: Fn(Residual, Seeds) -> Result<Input, ProgramError>,
+    Backward: Fn(Residual, Output::To<MaybeZero<CustomRuleTracer<V, O>>>) -> Result<Input, ProgramError>,
 {
     let non_differentiated_count = non_differentiated_types.len();
     let residual_types = Residual::To::<V::Type>::from_parameters(residual_structure, residual_types)?;
@@ -1023,14 +1060,16 @@ where
         .filter_map(MaybeZero::as_value)
         .map(|seed| seed.r#type().into_owned())
         .collect::<Vec<_>>();
-    let (_, program) = EagerContext::<V, O>::trace(
+    let (_, program) = DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes(
         |(_, residuals, live_seeds): (Vec<CustomRuleTracer<V, O>>, Residual, Vec<CustomRuleTracer<V, O>>)| {
             let mut live_seeds = live_seeds.into_iter();
             let leaves = seeds.iter().map(|seed| match seed {
                 MaybeZero::Value(_) => MaybeZero::Value(live_seeds.next().unwrap()),
                 MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
             });
-            let cotangents = backward(residuals, Seeds::from_parameters(output_structure.clone(), leaves)?)?;
+            let seeds =
+                Output::To::<MaybeZero<CustomRuleTracer<V, O>>>::from_parameters(output_structure.clone(), leaves)?;
+            let cotangents = backward(residuals, seeds)?;
 
             // Check the full input structure before dropping the non-differentiated prefix, as for materialized seeds.
             let cotangent_structure = cotangents.parameter_structure();
@@ -1044,6 +1083,7 @@ where
             Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
         },
         (non_differentiated_types, residual_types, live_seed_types),
+        named_axes,
     )?;
     Ok(program.into_flat_program())
 }
@@ -1063,12 +1103,15 @@ where
 ///   - `input_types`: Types of the call's inputs, with the call's input structure.
 ///   - `output_structure`: Structure of the call's primal outputs.
 ///   - `non_differentiated_count`: Number of leading non-differentiated input leaves.
+///   - `named_axes`: Named axes with which the closure is traced (refer to
+///     [`CustomRuleDefinition::with_named_axes`]).
 fn trace_custom_jvp_rule<V, O, Input, Output, Jvp>(
     name: &str,
     jvp: &Jvp,
     input_types: Input::To<V::Type>,
     output_structure: &Output::ParameterStructure,
     non_differentiated_count: usize,
+    named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value<Type: DifferentiableType>,
@@ -1082,8 +1125,11 @@ where
 {
     let input_count = input_types.parameter_count();
     let input_tangent_types = input_types.clone().try_map_parameters(|r#type| r#type.tangent())?;
-    let ((output_types, tangent_types), program) =
-        EagerContext::<V, O>::trace(|(x, t)| jvp(x, t), (input_types, input_tangent_types))?;
+    let ((output_types, tangent_types), program) = DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes(
+        |(x, t)| jvp(x, t),
+        (input_types, input_tangent_types),
+        named_axes,
+    )?;
     for rule_structure in [output_types.parameter_structure(), tangent_types.parameter_structure()] {
         if &rule_structure != output_structure {
             return Err(ParameterError::MismatchedParameterStructures {
@@ -1110,23 +1156,26 @@ where
 ///   - `tangent_activity`: Whether the tangent of each differentiated input is active.
 ///   - `output_structure`: Structure of the call's primal outputs.
 ///   - `non_differentiated_count`: Number of leading non-differentiated input leaves.
-fn trace_symbolic_zero_custom_jvp_rule<V, O, Input, Output, Tangents, Jvp>(
+///   - `named_axes`: Named axes with which the closure is traced (refer to
+///     [`CustomRuleDefinition::with_named_axes`]).
+fn trace_symbolic_zero_custom_jvp_rule<V, O, Input, Output, Jvp>(
     jvp: &Jvp,
     input_types: Input::To<V::Type>,
     tangent_activity: &[bool],
     output_structure: &Output::ParameterStructure,
     non_differentiated_count: usize,
+    named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value<Type: DifferentiableType>,
     O: Clone + Operation<Type = V::Type>,
     Input: Parameterized<CustomRuleTracer<V, O>>,
-    Input::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
+    Input::Family:
+        ParameterizedFamily<V::Type> + ParameterizedFamily<V> + ParameterizedFamily<MaybeZero<CustomRuleTracer<V, O>>>,
     Input::To<V::Type>: Clone + Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
     Output: Parameterized<CustomRuleTracer<V, O>, ParameterStructure: Debug + PartialEq>,
     Output::Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>,
-    Tangents: Parameterized<MaybeZero<CustomRuleTracer<V, O>>, ParameterStructure = Input::ParameterStructure>,
-    Jvp: Fn(Input, Tangents) -> Result<(Output, Output), ProgramError>,
+    Jvp: Fn(Input, Input::To<MaybeZero<CustomRuleTracer<V, O>>>) -> Result<(Output, Output), ProgramError>,
 {
     let input_structure = input_types.parameter_structure();
     let tangent_types = input_types.parameters().map(|r#type| r#type.tangent()).collect::<Result<Vec<_>, _>>()?;
@@ -1135,20 +1184,26 @@ where
         .zip(tangent_activity)
         .filter_map(|(r#type, active)| active.then(|| r#type.clone()))
         .collect::<Vec<_>>();
-    let ((output_types, output_tangent_types), program) = EagerContext::<V, O>::trace(
-        |(inputs, active_tangents): (Input, Vec<CustomRuleTracer<V, O>>)| {
-            let mut active_tangents = active_tangents.into_iter();
-            let leaves = tangent_types.iter().enumerate().map(|(index, r#type)| {
-                let active = index.checked_sub(non_differentiated_count).is_some_and(|index| tangent_activity[index]);
-                match active {
-                    true => MaybeZero::Value(active_tangents.next().unwrap()),
-                    false => MaybeZero::Zero(r#type.clone()),
-                }
-            });
-            jvp(inputs, Tangents::from_parameters(input_structure.clone(), leaves)?)
-        },
-        (input_types, active_tangent_types),
-    )?;
+    let ((output_types, output_tangent_types), program) =
+        DomainTracingContext::<EagerContext<V, O>>::trace_with_named_axes(
+            |(inputs, active_tangents): (Input, Vec<CustomRuleTracer<V, O>>)| {
+                let mut active_tangents = active_tangents.into_iter();
+                let leaves = tangent_types.iter().enumerate().map(|(index, r#type)| {
+                    let active =
+                        index.checked_sub(non_differentiated_count).is_some_and(|index| tangent_activity[index]);
+                    match active {
+                        true => MaybeZero::Value(active_tangents.next().unwrap()),
+                        false => MaybeZero::Zero(r#type.clone()),
+                    }
+                });
+                jvp(
+                    inputs,
+                    Input::To::<MaybeZero<CustomRuleTracer<V, O>>>::from_parameters(input_structure.clone(), leaves)?,
+                )
+            },
+            (input_types, active_tangent_types),
+            named_axes,
+        )?;
     for rule_structure in [output_types.parameter_structure(), output_tangent_types.parameter_structure()] {
         if &rule_structure != output_structure {
             return Err(ParameterError::MismatchedParameterStructures {
@@ -1210,9 +1265,10 @@ fn without_non_differentiated_tangent_inputs<V: Value, O: Clone + Operation<Type
     Ok(pruned)
 }
 
-/// Retained definitions that one [`CustomFunction`] function registered, one per operation family and call structure
-/// (i.e., input and output parameter structure). The registration handles live as long as the function, so every call
-/// staged by the function shares the specialization caches of its structure until the function is dropped.
+/// Retained definitions that one [`CustomFunction`] function registered, one per operation family, call structure
+/// (i.e., input and output parameter structure), and visible named axes. The registration handles live as long as the
+/// function, so every call staged by the function shares the specialization caches of its structure and named axes
+/// until the function is dropped.
 #[derive(Default)]
 struct CustomFunctionRegistrations {
     /// Registrations, each a [`CustomFunctionRegistration`] of some family and structure types.
@@ -1227,17 +1283,21 @@ struct CustomFunctionRegistration<V: Typed + Parameter, O, InputStructure, Outpu
     /// Structure of the calls' outputs.
     output_structure: OutputStructure,
 
+    /// Named axes visible where the calls are made, with which the definition traces its rules.
+    named_axes: Vec<(String, NamedAxis)>,
+
     /// Registration handle, which owns the definition's specialization caches.
     registration: CustomRuleRegistration<V, O>,
 }
 
 impl CustomFunctionRegistrations {
-    /// Returns a reference to the definition registered for the family `(V, O)` and the provided call structure,
-    /// registering the definition returned by `register_fn` if there is none yet.
+    /// Returns a reference to the definition registered for the family `(V, O)`, the provided call structure, and the
+    /// provided named axes, registering the definition returned by `register_fn` if there is none yet.
     fn get_or_register<V, O, InputStructure, OutputStructure, F>(
         &self,
         input_structure: &InputStructure,
         output_structure: &OutputStructure,
+        named_axes: &[(String, NamedAxis)],
         register_fn: F,
     ) -> CustomRuleReference<V, O>
     where
@@ -1253,7 +1313,9 @@ impl CustomFunctionRegistrations {
             entry
                 .downcast_ref::<CustomFunctionRegistration<V, O, InputStructure, OutputStructure>>()
                 .filter(|entry| {
-                    &entry.input_structure == input_structure && &entry.output_structure == output_structure
+                    &entry.input_structure == input_structure
+                        && &entry.output_structure == output_structure
+                        && entry.named_axes == named_axes
                 })
                 .map(|entry| entry.registration.reference())
         });
@@ -1263,6 +1325,7 @@ impl CustomFunctionRegistrations {
             entries.push(Box::new(CustomFunctionRegistration {
                 input_structure: input_structure.clone(),
                 output_structure: output_structure.clone(),
+                named_axes: named_axes.to_vec(),
                 registration,
             }));
             reference
@@ -1456,20 +1519,22 @@ impl<Input, Output, Primal, Vjp, Batching> CustomFunction<Input, Output, Primal,
     }
 
     /// Returns this function with the provided Jacobian-Vector Product (JVP) rule `(x, ẋ) ↦ (y, ẏ)`, which is used as
-    /// the rule of [`Self::with_jvp`] except that it receives `ẋ` as a `Tangents` value whose leaves are
-    /// [`MaybeZero`]s: the leaves of structurally zero input tangents (e.g., those of inputs that are not being
-    /// differentiated, and those of every non-differentiated input) are [`MaybeZero::Zero`]s, which lets the rule skip
-    /// the work that they would otherwise require. `Tangents` has the parameter structure of `Input` (e.g., it is
-    /// `(MaybeZero<DomainTracer<C>>, MaybeZero<DomainTracer<C>>)` for an input `(DomainTracer<C>, DomainTracer<C>)`),
-    /// and its closure parameter must usually be annotated. Each pattern of structurally zero input tangents is a
-    /// separate specialization of the rule. This is the analogue of JAX's `defjvp(..., symbolic_zeros=True)`.
+    /// the rule of [`Self::with_jvp`] except that it receives `ẋ` with [`MaybeZero`] leaves (i.e., as an
+    /// `Input::To<MaybeZero<Tracer>>` value, such as `(MaybeZero<DomainTracer<C>>, MaybeZero<DomainTracer<C>>)` for an
+    /// input `(DomainTracer<C>, DomainTracer<C>)`): the leaves of structurally zero input tangents (e.g., those of
+    /// inputs that are not being differentiated, and those of every non-differentiated input) are
+    /// [`MaybeZero::Zero`]s, which lets the rule skip the work that they would otherwise require. Its closure
+    /// parameters must usually be annotated. Each pattern of structurally zero input tangents is a separate
+    /// specialization of the rule. This is the analogue of JAX's `defjvp(..., symbolic_zeros=True)`.
     #[inline]
-    pub fn with_symbolic_zero_jvp<Tangents, Jvp>(
+    pub fn with_symbolic_zero_jvp<Tracer, Jvp>(
         self,
         jvp: Jvp,
-    ) -> CustomFunction<Input, Output, Primal, WithSymbolicZeroJvp<Tangents, Jvp>, Vjp, Batching>
+    ) -> CustomFunction<Input, Output, Primal, WithSymbolicZeroJvp<Tracer, Jvp>, Vjp, Batching>
     where
-        Jvp: 'static + Fn(Input, Tangents) -> Result<(Output, Output), ProgramError> + Send + Sync,
+        Tracer: Typed + Parameter,
+        Input: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
+        Jvp: 'static + Fn(Input, Input::To<MaybeZero<Tracer>>) -> Result<(Output, Output), ProgramError> + Send + Sync,
     {
         let Self { primal, vjp, batching, non_differentiated_count, name, .. } = self;
         let jvp = WithSymbolicZeroJvp { jvp: Arc::new(jvp), marker: PhantomData };
@@ -1580,20 +1645,22 @@ impl<Input, Output, Primal, Jvp, Batching> CustomFunction<Input, Output, Primal,
     }
 
     /// Returns this function with the provided reverse-mode forward rule `x ↦ (y, r)` and backward rule `(r, ȳ) ↦ x̄`,
-    /// which are used as the rules of [`Self::with_vjp`] except that the backward rule receives `ȳ` as a `Seeds` value
-    /// whose leaves are [`MaybeZero`]s: the leaves of structural-zero cotangent seeds (e.g., those of unused outputs)
-    /// are [`MaybeZero::Zero`]s. `Seeds` has the parameter structure of `Output`, and its closure parameter must
-    /// usually be annotated. This is the analogue of JAX's `defvjp(..., symbolic_zeros=True)`, except that the forward
-    /// rule receives no per-input differentiation flags.
+    /// which are used as the rules of [`Self::with_vjp`] except that the backward rule receives `ȳ` with [`MaybeZero`]
+    /// leaves (i.e., as an `Output::To<MaybeZero<Tracer>>` value): the leaves of structural-zero cotangent seeds (e.g.,
+    /// those of unused outputs) are [`MaybeZero::Zero`]s. Its closure parameters must usually be annotated. This is the
+    /// analogue of JAX's `defvjp(..., symbolic_zeros=True)`, except that the forward rule receives no per-input
+    /// differentiation flags.
     #[inline]
-    pub fn with_symbolic_zero_vjp<Residual, Seeds, Forward, Backward>(
+    pub fn with_symbolic_zero_vjp<Residual, Tracer, Forward, Backward>(
         self,
         forward: Forward,
         backward: Backward,
-    ) -> CustomFunction<Input, Output, Primal, Jvp, WithSymbolicZeroVjp<Residual, Seeds, Forward, Backward>, Batching>
+    ) -> CustomFunction<Input, Output, Primal, Jvp, WithSymbolicZeroVjp<Residual, Tracer, Forward, Backward>, Batching>
     where
+        Tracer: Typed + Parameter,
+        Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
         Forward: 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
-        Backward: 'static + Fn(Residual, Seeds) -> Result<Input, ProgramError> + Send + Sync,
+        Backward: 'static + Fn(Residual, Output::To<MaybeZero<Tracer>>) -> Result<Input, ProgramError> + Send + Sync,
     {
         let Self { primal, jvp, batching, non_differentiated_count, name, .. } = self;
         let vjp = WithSymbolicZeroVjp { forward: Arc::new(forward), backward: Arc::new(backward), marker: PhantomData };
@@ -1610,12 +1677,12 @@ impl<Input, Output, Primal, Jvp, Batching> CustomFunction<Input, Output, Primal,
     /// specialization.
     ///
     /// The backward rule is invoked while the call's carrier is transposed, with the [`TranspositionContext`], the
-    /// residuals `r` (with the structure that the forward rule returned), the output cotangent seeds as a `Seeds` value
-    /// whose leaves are [`MaybeZero`]s (with the structure of `Output`), and the accumulators as an `Accumulators`
-    /// value whose leaves are [`CotangentAccumulator`]s (with the structure of `Input`; the accumulators of
+    /// residuals `r` (with the structure that the forward rule returned), the output cotangent seeds with
+    /// [`MaybeZero`] leaves (i.e., as an `Output::To<MaybeZero<Tracer>>` value), and the accumulators with
+    /// [`CotangentAccumulator`] leaves (i.e., as an `Input::To<CotangentAccumulator>` value; the accumulators of
     /// non-differentiated inputs are never needed). Its closure parameters must usually be annotated.
     #[inline]
-    pub fn with_accumulating_vjp<Residual, Seeds, Accumulators, Transposition, Forward, Backward>(
+    pub fn with_accumulating_vjp<Residual, Tracer, Transposition, Forward, Backward>(
         self,
         forward: Forward,
         backward: Backward,
@@ -1624,13 +1691,21 @@ impl<Input, Output, Primal, Jvp, Batching> CustomFunction<Input, Output, Primal,
         Output,
         Primal,
         Jvp,
-        WithAccumulatingVjp<Residual, Seeds, Accumulators, Transposition, Forward, Backward>,
+        WithAccumulatingVjp<Residual, Tracer, Transposition, Forward, Backward>,
         Batching,
     >
     where
+        Tracer: Typed + Parameter,
+        Input: Parameterized<Tracer, Family: ParameterizedFamily<CotangentAccumulator>>,
+        Output: Parameterized<Tracer, Family: ParameterizedFamily<MaybeZero<Tracer>>>,
         Forward: 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
         Backward: 'static
-            + Fn(&mut Transposition, Residual, Seeds, Accumulators) -> Result<(), DifferentiationError>
+            + Fn(
+                &mut Transposition,
+                Residual,
+                Output::To<MaybeZero<Tracer>>,
+                Input::To<CotangentAccumulator>,
+            ) -> Result<(), DifferentiationError>
             + Send
             + Sync,
     {
@@ -1646,10 +1721,10 @@ impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp,
     /// [`custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html)). The rule
     /// receives the extent of the batch axis (i.e., [`BatchingLevelExtent::Static`] for a host extent, or
     /// [`BatchingLevelExtent::Dynamic`] with a first-class extent value), the batched inputs (as values of the context
-    /// in which the call is batched), and an `InputAxes` value of their [`BatchAxis`]es (with the structure of
-    /// `Input`), and it returns the batched outputs together with an `OutputAxes` value of their batch axes (with the
-    /// structure of `Output`). A replicated input axis means that the input is the same for every batch item. Its
-    /// closure parameters must usually be annotated.
+    /// in which the call is batched), and their [`BatchAxis`]es (i.e., an `Input::To<BatchAxis>` value), and it
+    /// returns the batched outputs together with their batch axes (i.e., an `Output::To<BatchAxis>` value). A
+    /// replicated input axis means that the input is the same for every batch item. Its closure parameters must
+    /// usually be annotated.
     ///
     /// The rule is traced when a call is batched, once per batching level and operand signature, and its program
     /// becomes the batched call's primal, so the rule takes precedence over structurally batching the primal (e.g.,
@@ -1667,25 +1742,40 @@ impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp,
     ///     differentiating an unbatched call stages a derived call whose batching applies the derivative of the rule,
     ///     including when a forward-mode Jacobian batches it or when a linearized pushforward is batched. The derived
     ///     rule applies the rule with the inputs that are mapped on both their primal and tangent side mapped
-    ///     (broadcasting the replicated side of a pair with one mapped side). When no input is mapped on both sides
+    ///     (broadcasting the replicated side of a pair with one mapped side), so the batched derivative has the batch
+    ///     axes of the batched call. This deliberately differs from JAX when an input is mapped on only one of its two
+    ///     sides while another input is mapped on both: JAX then applies the rule with the primal-side axes and batches
+    ///     the tangents separately, which yields the outer product of the two batches, of which only the diagonal
+    ///     holds the per-item tangents. For a rule whose result depends on its input axes, the broadcast inputs also
+    ///     change the rule's result (e.g., the primal outputs of the batched derivative can differ from those of the
+    ///     batched call), whereas JAX's diagonal reflects the primal-side axes. When no input is mapped on both sides
     ///     (e.g., in a forward-mode Jacobian, whose primals are replicated), it applies the rule with every input
     ///     replicated and batches the rule's derivative structurally, so the rule must also accept calls without mapped
     ///     inputs. Linearization computes the outputs with the call itself and recomputes the primal inside the staged
-    ///     pushforward, because the call is opaque to partial evaluation. Reverse mode inlines the derivative of the
-    ///     primal instead, because derived calls are not transposable.
+    ///     pushforward, because the call is opaque to partial evaluation, which is only valid for a primal without
+    ///     effects: a primal with effects (e.g., one that updates or reads references) is linearized inline, so that
+    ///     its effects run once, and batching that linearization's pushforward batches it structurally. Reverse mode
+    ///     inlines the derivative of the primal instead, because derived calls are not transposable.
     ///   - **Explicit** (i.e., [`Self::with_jvp`] or reverse-mode rules): differentiating a batched call traces the
     ///     derivative rules at the unbatched types and batches them structurally, aligned to the batch axes that the
     ///     rule declared, and batching a derivative batches the explicit rule structurally, which is JAX's
     ///     `custom_jvp(custom_vmap(f))` nesting order. The other order nests two functions: an outer function with the
     ///     batching rule, whose primal calls an inner function with the derivative rule.
     #[inline]
-    pub fn with_batching<InputAxes, OutputAxes, Extent, Rule>(
+    pub fn with_batching<Tracer, Rule>(
         self,
         rule: Rule,
-    ) -> CustomFunction<Input, Output, Primal, Jvp, Vjp, WithBatching<InputAxes, OutputAxes, Extent, Rule>>
+    ) -> CustomFunction<Input, Output, Primal, Jvp, Vjp, WithBatching<Tracer, Rule>>
     where
+        Tracer: Parameter,
+        Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+        Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
         Rule: 'static
-            + Fn(BatchingLevelExtent<Extent>, Input, InputAxes) -> Result<(Output, OutputAxes), ProgramError>
+            + Fn(
+                BatchingLevelExtent<Tracer>,
+                Input,
+                Input::To<BatchAxis>,
+            ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
             + Send
             + Sync,
     {
@@ -1706,6 +1796,12 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
     /// of the values in `input`, which is exactly the context the call is staged into. It is therefore never named at
     /// a construction or call site, while the stored closures still pin the tracers that this universe must produce.
     ///
+    /// The primal and the rules are traced in fresh traces rather than in `C` itself, so each trace is seeded with the
+    /// named axes in scope in `C` (refer to [`NamedAxes::named_axes`]). Code in the closures therefore resolves the
+    /// axes of enclosing transforms (e.g., an `axis_index` or a collective over the axis of an enclosing `batch`) as it
+    /// would if it were inlined. Rules traced under different bindings may differ, so calls under different named axes
+    /// register separate rule definitions.
+    ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when `input` has no leaves, when the non-differentiated count exceeds the number of
@@ -1714,7 +1810,7 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
     /// traced, so their errors are reported by the derivative requests that trace them.
     pub fn call<
         V: Value<Type = C::Type, DispatchDomain = C>,
-        C: Context<Type: DifferentiableType + BatchableType + Eq + Hash, Value = V>,
+        C: Context<Type: DifferentiableType + BatchableType + Eq + Hash, Value = V> + NamedAxes,
         InputValues: Parameterized<V, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
     >(
         &self,
@@ -1749,12 +1845,19 @@ impl<Input, Output, Primal: Fn(Input) -> Result<Output, ProgramError>, Jvp, Vjp,
         };
         validate_non_differentiated_count(&self.name, self.non_differentiated_count, input_values.len())?;
 
-        // Only the primal is traced now. The rules are registered with the call structure and traced lazily.
-        let (output_types, primal) = C::trace(&self.primal, input_types.clone())?;
+        // Only the primal is traced now. The rules are registered with the call structure and traced lazily. The
+        // primal and the rules are traced in fresh traces, which are seeded with the named axes that are visible where
+        // the function is called (e.g., the axis of an enclosing batching level), so that they resolve the same names
+        // as the function would if it were inlined. Rules traced under different bindings may differ, so the named
+        // axes are part of the registration key.
+        let named_axes = first.dispatch_domain().named_axes();
+        let (output_types, primal) =
+            DomainTracingContext::<C>::trace_with_named_axes(&self.primal, input_types.clone(), named_axes.clone())?;
         let input_structure = input_types.parameter_structure();
         let output_structure = output_types.parameter_structure();
-        let rules = self.registrations.get_or_register(&input_structure, &output_structure, || {
-            let definition = CustomRuleDefinition::new(self.name.clone()).with_batching();
+        let rules = self.registrations.get_or_register(&input_structure, &output_structure, &named_axes, || {
+            let definition =
+                CustomRuleDefinition::new(self.name.clone()).with_named_axes(named_axes.clone()).with_batching();
             let definition = self.jvp.configure(
                 definition,
                 &self.name,
@@ -1957,19 +2060,25 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
-        ArraySliceAxis, ArrayType, DataType, DimensionType, DimensionValue, ShardingDimension,
+        ArraySliceAxis, ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue, ShardingDimension,
     };
-    use crate::batching::{BatchAxis, BatchedProgram, BatchingError, ProgramBatchingOutputAxesPolicy, batch};
+    use crate::axes::{AxisError, AxisIndex};
+    use crate::batching::{
+        BatchAxis, BatchAxisSpecification, BatchedProgram, BatchingError, ProgramBatchingOutputAxesPolicy, batch,
+    };
     use crate::contexts::{Context, EagerContext, ProjectedContext};
     use crate::differentiation::{
         CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, differentiate_at,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
+    use crate::operations::collectives::parallel_reduce::{ParallelReduce, ParallelReductionKind};
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;
     use crate::operations::custom_functions::rules::CustomRuleSource;
     use crate::operations::dimensions::dimension_size::DimensionSize;
     use crate::operations::dot::{Dot, DotDimensionNumbers};
+    use crate::operations::manipulation::broadcasting::DynamicBroadcast;
+    use crate::operations::manipulation::conversions::ConvertElementType;
     use crate::operations::manipulation::padding::PadOperation;
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::reductions::{Reduce, ReductionKind};
@@ -2490,6 +2599,81 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_function_with_jvp_computed_dimension_outputs() {
+        // The primal broadcasts `x` to the computed extent `n · n`, and the JVP rule recomputes that extent in its own
+        // trace, which mints a fresh identity for it. The rule outputs therefore agree with the primal outputs only up
+        // to a renaming of that identity, which is applied to the rule program.
+        let broadcast = |dimension: &ArrayIrTracer, x: ArrayIrTracer| -> Result<_, ProgramError> {
+            let dimension = ValueProjection::<DimensionType>::into_projected(dimension.clone())?;
+            let extent = (dimension.clone() * dimension).into_value();
+            Ok((extent.clone(), x.dynamic_broadcast(&[extent], &[])?))
+        };
+        let function = |shares_extent: bool| {
+            custom_function(move |(dimension, x): (ArrayIrTracer, ArrayIrTracer)| broadcast(&dimension, x))
+                .with_non_differentiated_count(1)
+                .with_jvp(
+                    move |(dimension, x): (ArrayIrTracer, ArrayIrTracer),
+                          (_, tangent): (ArrayIrTracer, ArrayIrTracer)| {
+                        let (extent, output) = broadcast(&dimension, x)?;
+                        let extent_tangent = extent.context().zero(&extent.r#type().tangent()?)?;
+                        let output_tangent = match shares_extent {
+                            true => tangent.dynamic_broadcast(&[extent.clone()], &[])?,
+                            false => broadcast(&dimension, tangent)?.1,
+                        };
+                        Ok(((extent, output), (extent_tangent, output_tangent)))
+                    },
+                )
+        };
+        let dimension = DimensionType::new("n", DimensionBounds::new(2, Some(5)).unwrap());
+        let input_types = (ArrayIrType::from(dimension.clone()), ArrayIrType::from(ArrayType::scalar(DataType::F64)));
+        let jvp = |shares_extent: bool| {
+            let function = function(shares_extent);
+            let (_, program) = EagerArrayIrContext::trace(|inputs| function.call(inputs), input_types.clone())?;
+            program.into_flat_program().jvp_with_respect_to(&[1]).map_err(ProgramError::from)
+        };
+        let program = jvp(true).unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<n ∈ [2, 5)>, %1:f64[], %2:f64[] .
+                let %3:dimension<n * n ∈ [4, 17)> = dimension_mul %0 %0
+                    %4:f64[n * n] = broadcast [output_axes=[]] %1 %3
+                    %5:zero[] = zero [type=zero[]]
+                    %6:f64[n * n] = broadcast [output_axes=[]] %2 %3
+                in (%3, %4, %6)
+            "}
+            .trim_end(),
+        );
+        let outputs = program
+            .interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::new(dimension, 2).unwrap()),
+                ArrayIrValue::Array(Array::scalar(3.0f64).unwrap()),
+                ArrayIrValue::Array(Array::scalar(1.0f64).unwrap()),
+            ])
+            .unwrap();
+        assert!(matches!(&outputs[0], ArrayIrValue::Dimension(extent) if extent.extent() == 4));
+        assert_eq!(
+            outputs[1..],
+            [
+                ArrayIrValue::Array(Array::vector(vec![3.0f64; 4]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1.0f64; 4]).unwrap()),
+            ],
+        );
+
+        // A rule that computes the extent of its output tangent separately establishes a second identity for it,
+        // which the primal output and its tangent share, so its outputs are rejected.
+        assert_eq!(
+            jvp(false).map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`custom_function` `custom_function` JVP rule output type signature mismatch: expected \
+                 [dimension<n * n ∈ [4, 17)>, f64[n * n], zero[], f64[n * n]] but got [dimension<n * n ∈ [4, 17)>, \
+                 f64[n * n], zero[], f64[n * n]] with different type identities"
+                    .to_string(),
+            ))),
+        );
+    }
+
+    #[test]
     fn test_custom_function_with_jvp_zero_space_boundaries() {
         // Token primals and zero-space tangents carry no payload, so the wrapper must pass them through the traced
         // rule unchanged instead of demanding a dense tangent space.
@@ -2684,6 +2868,68 @@ mod tests {
         let seed = ArrayIrValue::Array(Array::vector(vec![3.0f64, 4.0]).unwrap());
         let (_, pullback) = differentiate_at(input).vjp(|x| function.call(x)).unwrap();
         assert_eq!(pullback.apply(seed.clone()), Ok(seed));
+    }
+
+    #[test]
+    fn test_custom_function_with_vjp_computed_dimension_outputs() {
+        // The primal broadcasts `x` to the computed extent `n · n`, and the forward rule recomputes that extent in its
+        // own trace, which mints a fresh identity for it. The rule outputs therefore agree with the primal outputs
+        // only up to a renaming of that identity, which is applied to the rule program, including its residuals.
+        let broadcast = |dimension: &ArrayIrTracer, x: ArrayIrTracer| -> Result<_, ProgramError> {
+            let dimension = ValueProjection::<DimensionType>::into_projected(dimension.clone())?;
+            let extent = (dimension.clone() * dimension).into_value();
+            Ok((extent.clone(), x.dynamic_broadcast(&[extent], &[])?))
+        };
+        let function = custom_function(move |(dimension, x): (ArrayIrTracer, ArrayIrTracer)| broadcast(&dimension, x))
+            .with_vjp(
+                move |(dimension, x): (ArrayIrTracer, ArrayIrTracer)| {
+                    let (extent, output) = broadcast(&dimension, x)?;
+                    Ok(((extent.clone(), output), (dimension, extent)))
+                },
+                |(dimension, _): (ArrayIrTracer, ArrayIrTracer), (_, cotangent): (ArrayIrTracer, ArrayIrTracer)| {
+                    let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
+                    Ok((dimension, cotangent.reduce(&[0], ReductionKind::Sum)?.into_value()))
+                },
+            )
+            .with_non_differentiated_count(1);
+        let dimension = DimensionType::new("n", DimensionBounds::new(2, Some(5)).unwrap());
+        let input_types = (ArrayIrType::from(dimension.clone()), ArrayIrType::from(ArrayType::scalar(DataType::F64)));
+        let (_, program) = EagerArrayIrContext::trace(|inputs| function.call(inputs), input_types).unwrap();
+        let linearization = program
+            .into_flat_program()
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[1], DifferentiationRule::JvpForTranspose)
+            .unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:dimension<n ∈ [2, 5)>, %1:f64[] .
+                let %2:dimension<n * n ∈ [4, 17)> = dimension_mul %0 %0
+                    %3:f64[n * n] = broadcast [output_axes=[]] %1 %2
+                    %4:dimension<n * n ∈ [4, 17)> = dimension_size [axis=0] %3
+                in (%2, %3, %0, %2, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:dimension<n ∈ [2, 5)>, %2:dimension<n * n ∈ [4, 17)>, %3:dimension<n * n ∈ [4, 17)> .
+                let %4:zero[], %5:f64[n * n] = custom_function_transpose [name=\"custom_function\", leading_input_count=4, seed_geometry_count=1] %1 %1 %2 %3 %0
+                in (%5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[n * n], %1:dimension<n ∈ [2, 5)>, %2:dimension<n * n ∈ [4, 17)>, %3:dimension<n * n ∈ [4, 17)> .
+                let %4:zero[] = zero [type=zero[]]
+                    %5:f64[] = reduce [kind=sum, axes=[0]] %0
+                in (%5)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -3493,6 +3739,85 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_function_named_axes() {
+        // The primal and the rules are traced in fresh traces that are seeded with the named axes visible where the
+        // function is called, so a function called under `batch` resolves the batch axis `items` in its primal
+        // (`x ↦ x · i` at batch item `i`), its JVP rule (`(x, ẋ) ↦ (x · i, ẋ · i)`), its VJP rules (which save `i`
+        // and pull back `ȳ ↦ ȳ · i`), and its named collectives (`x ↦ Σᵢ xᵢ`).
+        type Tracer = DomainTracer<ArrayContext>;
+        let index = |x: &Tracer| -> Result<Tracer, ProgramError> {
+            x.context().axis_index("items")?.convert_element_type(DataType::F64)
+        };
+        let scaled = move |x: Tracer| -> Result<Tracer, ProgramError> { Ok(x.clone() * index(&x)?) };
+        let inputs = Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap();
+        let ones = Array::vector(vec![1.0f64; 3]).unwrap();
+        let items = || BatchAxisSpecification::named("items");
+
+        // Outside of `batch`, nothing binds `items`.
+        let function = custom_function(scaled);
+        assert_eq!(
+            ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
+            Err(BatchingError::Axis(AxisError::UnboundAxisName { name: "items".to_string() }).into()),
+        );
+        assert_eq!(
+            batch(|x| function.call(x), inputs.clone(), BatchAxis::new(0), BatchAxis::new(0), items()),
+            Ok(Array::vector(vec![0.0f64, 2.0, 6.0]).unwrap()),
+        );
+        let (_, program) = ArrayContext::trace(
+            |x| Ok(batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), items())?),
+            ArrayType::new_static(DataType::F64, [3]),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[3] = custom_function [
+                    name=\"custom_function\",
+                    batching=[(extent=3, axis_name=\"items\", input_axes=[axis 0], output_axes=[axis 0])],
+                ] %0 [
+                    primal={
+                        lambda %0:f64[3] .
+                        let %1:u64[3] = iota [type=u64[3], dimension=0]
+                            %2:f64[3] = convert_element_type [data_type=f64] %1
+                            %3:f64[3] = mul %0 %2
+                        in (%3)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        let function = custom_function(scaled)
+            .with_jvp(move |x: Tracer, tangent: Tracer| Ok((scaled(x.clone())?, tangent * index(&x)?)));
+        assert_eq!(
+            differentiate_at(inputs.clone()).jvp(ones.clone(), |x| {
+                Ok(batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), items())?)
+            }),
+            Ok((Array::vector(vec![0.0f64, 2.0, 6.0]).unwrap(), Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap())),
+        );
+
+        let function = custom_function(scaled).with_vjp(
+            move |x: Tracer| Ok((scaled(x.clone())?, index(&x)?)),
+            |index: Tracer, cotangent: Tracer| Ok(cotangent * index),
+        );
+        assert_eq!(
+            differentiate_at(inputs.clone()).gradient(|x| {
+                batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), items())?
+                    .reduce(&[0], ReductionKind::Sum)
+            }),
+            Ok(Array::vector(vec![0.0f64, 1.0, 2.0]).unwrap()),
+        );
+
+        let function = custom_function(|x: Tracer| x.parallel_reduce("items", ParallelReductionKind::Sum));
+        assert_eq!(
+            batch(|x| function.call(x), inputs, BatchAxis::new(0), BatchAxis::new(0), items()),
+            Ok(Array::vector(vec![6.0f64; 3]).unwrap()),
+        );
+    }
+
+    #[test]
     fn test_custom_function_with_batching_references() {
         // The primal `(counter, x) ↦ x` adds `x` into its plumbing counter. Structurally batching it with a replicated
         // counter and a mapped `x` is rejected, because a replicated reference cannot receive a batched value, while
@@ -3594,8 +3919,6 @@ mod tests {
         DefaultJvp,
         DefaultVjp,
         WithBatching<
-            BatchAxis,
-            BatchAxis,
             DomainTracer<ArrayContext>,
             impl 'static
             + Fn(
@@ -3624,8 +3947,6 @@ mod tests {
         DefaultJvp,
         DefaultVjp,
         WithBatching<
-            (BatchAxis, BatchAxis),
-            BatchAxis,
             DomainTracer<ArrayContext>,
             impl 'static
             + Fn(
@@ -3924,6 +4245,69 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_function_with_batching_differentiate_then_batch_flag_sensitive_rule() {
+        // The rule computes `2xy` when both inputs are mapped and `3xy` otherwise. For a mapped `x` and a replicated
+        // `y` whose tangent is mapped, the derived rule broadcasts `y` and applies the rule with both inputs mapped, so
+        // the batched derivative returns `2xy` and `2(ẋy + xẏ)`, while batching the call alone returns `3xy`. JAX
+        // returns `3xy` and the outer product of the flags' two input sets, whose diagonal is `3(ẋy + xẏ)` (i.e.,
+        // `[18, 24, 39]` here). The two coincide for rules that do not depend on the flags (e.g., in
+        // `test_custom_function_with_batching_differentiate_then_batch_mixed_axes`).
+        type Tracer = DomainTracer<ArrayContext>;
+        let function = custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_batching(
+            |_: BatchingLevelExtent<Tracer>, (x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis)| {
+                let product = x * y;
+                let scale = if x_axis.is_replicated() || y_axis.is_replicated() { 3.0 } else { 2.0 };
+                let scale = product.context().lift(Array::scalar(scale)?)?;
+                Ok((product * scale, if x_axis.is_replicated() { y_axis } else { x_axis }))
+            },
+        );
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let (_, program) =
+            ArrayContext::trace(|inputs| function.call(inputs), (scalar_type.clone(), scalar_type)).unwrap();
+        let program = program.into_flat_program();
+        let x = Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap();
+        let y = Array::scalar(4.0f64).unwrap();
+        assert_eq!(
+            program
+                .batched(
+                    3,
+                    ShardingDimension::Replicated,
+                    &[BatchAxis::new(0), BatchAxis::replicated()],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0
+                .interpret(vec![x.clone(), y.clone()]),
+            Ok(vec![Array::vector(vec![12.0f64, 24.0, 36.0]).unwrap()]),
+        );
+        let (batched, output_axes) = program
+            .jvp()
+            .unwrap()
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0); 2]);
+        assert_eq!(
+            batched.interpret(vec![
+                x,
+                y,
+                Array::vector(vec![1.0f64, 0.5, 0.25]).unwrap(),
+                Array::vector(vec![2.0f64, 3.0, 4.0]).unwrap(),
+            ]),
+            Ok(vec![
+                Array::vector(vec![8.0f64, 16.0, 24.0]).unwrap(),
+                Array::vector(vec![12.0f64, 16.0, 26.0]).unwrap(),
+            ]),
+        );
+    }
+
+    #[test]
     fn test_custom_function_with_batching_differentiate_then_batch_non_differentiated_inputs() {
         // A derived call receives no tangents for non-differentiated inputs, which keep their batch axes when the rule
         // is applied.
@@ -4188,6 +4572,35 @@ mod tests {
         )
         .unwrap();
         let jvp = program.into_flat_program().jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[2], %2:f64[], %3:f64[2] .
+                let %4:f64[], %5:f64[] = custom_function [name=\"jvp(sine)\"] %0 %2 [
+                    primal={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = sin %0
+                            %3:f64[] = cos %0
+                            %4:f64[] = mul %3 %1
+                        in (%2, %4)
+                    },
+                ]
+                    %6:f64[2], %7:f64[2] = custom_function [name=\"jvp(sine)\"] %1 %3 [
+                        primal={
+                            lambda %0:f64[2], %1:f64[2] .
+                            let %2:f64[2] = sin %0
+                                %3:f64[2] = cos %0
+                                %4:f64[2] = mul %3 %1
+                            in (%2, %4)
+                        },
+                    ]
+                in (%4, %6, %5, %7)
+            "}
+            .trim_end(),
+        );
+
+        // The rendering names the rules of both calls but cannot show that they share one derived definition, which
+        // only their rule references record.
         let derived_rules = jvp
             .instructions()
             .iter()
@@ -4230,6 +4643,68 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_function_with_batching_differentiate_then_batch_effectful_primal() {
+        // A pushforward that recomputed this primal would repeat its reference update and read the updated counter, so
+        // linearization inlines the derivative of an effectful primal instead: the effect runs once, when the known
+        // side runs, and every pushforward sees the coefficient that the known side observed.
+        type Tracer = DomainTracer<EagerArrayIrContext>;
+        let scaled_by_incremented_counter = |(counter, x): (Tracer, Tracer)| {
+            let one = counter.context().lift(ArrayIrValue::Array(Array::scalar(1.0)?))?;
+            counter.add_update(&one)?;
+            let scale = ValueProjection::<ArrayType>::into_projected(counter.read()?)?;
+            Ok::<_, ProgramError>((scale * ValueProjection::<ArrayType>::into_projected(x)?).into_value())
+        };
+        let function = custom_function(scaled_by_incremented_counter).with_non_differentiated_count(1).with_batching(
+            move |_: BatchingLevelExtent<Tracer>, inputs: (Tracer, Tracer), (_, axis): (BatchAxis, BatchAxis)| {
+                Ok((scaled_by_incremented_counter(inputs)?, axis))
+            },
+        );
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
+        let (_, program) = EagerArrayIrContext::trace(
+            |inputs| function.call(inputs),
+            (reference_type, ArrayIrType::Array(ArrayType::scalar(DataType::F64))),
+        )
+        .unwrap();
+        let linearization = program.into_flat_program().linearize_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:ref<f64[]>, %1:f64[] .
+                let %2:f64[] = const 1.0
+                    () = reference_add_update %0 %2
+                    %3:f64[] = reference_read %0
+                    %4:f64[] = mul %3 %1
+                in (%4, %3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let counter = ArrayReference::new(Array::scalar(0.0).unwrap());
+        let outputs = linearization
+            .primal()
+            .interpret(vec![ArrayIrValue::Reference(counter.clone()), ArrayIrValue::Array(Array::scalar(2.0).unwrap())])
+            .unwrap();
+        assert_eq!(counter.read(), Ok(Array::scalar(1.0).unwrap()));
+        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::scalar(1.0).unwrap())];
+        tangent_inputs.extend(outputs.into_iter().skip(1));
+        for _ in 0..2 {
+            assert_eq!(
+                linearization.tangent().interpret(tangent_inputs.clone()),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(1.0).unwrap())]),
+            );
+        }
+        assert_eq!(counter.read(), Ok(Array::scalar(1.0).unwrap()));
+    }
+
+    #[test]
     fn test_custom_function_with_batching_differentiate_then_batch_higher_order() {
         // A derived call is differentiated like its source, so higher-order derivatives keep the rule on their batching
         // path. Nested batching applies the derived rule at every level, where the source rule batches the source
@@ -4238,12 +4713,29 @@ mod tests {
         let (_, program) = ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).unwrap();
         let second_order = program.into_flat_program().jvp().unwrap().jvp().unwrap();
         assert_eq!(
-            second_order
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().to_string())
-                .collect::<Vec<_>>(),
-            vec!["custom_function [name=\"jvp(jvp(sine))\"]"],
+            second_order.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                let %4:f64[], %5:f64[], %6:f64[], %7:f64[] = custom_function [name=\"jvp(jvp(sine))\"] %0 %1 %2 %3 [
+                    primal={
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[] = sin %0
+                            %5:f64[] = cos %0
+                            %6:f64[] = mul %5 %2
+                            %7:f64[] = cos %0
+                            %8:f64[] = sin %0
+                            %9:f64[] = mul %8 %2
+                            %10:f64[] = neg %9
+                            %11:f64[] = mul %7 %1
+                            %12:f64[] = mul %1 %10
+                            %13:f64[] = mul %7 %3
+                            %14:f64[] = add %12 %13
+                        in (%4, %11, %6, %14)
+                    },
+                ]
+                in (%4, %5, %6, %7)
+            "}
+            .trim_end(),
         );
         let batched = second_order
             .batched(
@@ -4371,6 +4863,9 @@ mod tests {
         let (_, program) =
             ArrayContext::trace(|x| function.call(function.call(x)?), ArrayType::scalar(DataType::F64)).unwrap();
         let program = program.into_flat_program();
+
+        // Renderings name the rules of calls but not the definitions that they share, which only their rule
+        // references record.
         let rule_ids = program
             .instructions()
             .iter()
@@ -4414,6 +4909,9 @@ mod tests {
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
+
+        // Renderings name the rules of calls but not the definitions that they share, which only their rule
+        // references record.
         let rule_ids = program
             .instructions()
             .iter()

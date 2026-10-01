@@ -33,11 +33,11 @@ use crate::operations::custom_functions::rules::{
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Effects, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramBuilder,
-    ProgramError, ReferenceBoundary, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, RegionInterface, RegionRef, RegionSlot, Type, TypeError,
-    TypeIdentityRenaming, TypeRefinements, Typed, Value, discharge_local_reference_operation,
-    discharge_reference_free_operation,
+    Effects, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance,
+    ProgramBuilder, ProgramError, ReferenceBoundary, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionInterface, RegionRef,
+    RegionSlot, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, Value,
+    discharge_local_reference_operation, discharge_reference_free_operation,
 };
 
 /// Canonical operation name for [`CustomFunctionOperation`].
@@ -176,8 +176,9 @@ enum CustomFunctionRules<T, S> {
 /// [`CustomRuleSpecializer::derived`] derives) instead of inlining the derivative
 /// of the primal region, and batching that call applies the derivative of the batching rule. The derived call's primal
 /// region is that derivative: in fused contexts, it computes the outputs and their tangents, while partitioned contexts
-/// compute the outputs with the call itself and stage a pushforward that computes only the tangents. Reverse mode
-/// inlines the derivative, because derived calls are not transposable.
+/// compute the outputs with the call itself and stage a pushforward that computes only the tangents (for a pure primal
+/// region, since the pushforward recomputes the primal; other primals are linearized inline, so that their effects run
+/// once). Reverse mode inlines the derivative, because derived calls are not transposable.
 ///
 /// Equality and hashing of calls with retained rules use the identity of the shared definition (i.e.,
 /// [`Arc::ptr_eq`](std::sync::Arc::ptr_eq)), while rendering prints its human-readable name.
@@ -219,30 +220,6 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         }
     }
 
-    /// Returns this call with the provided number of leading non-differentiated inputs. Refer to the documentation of
-    /// [`CustomFunctionOperation`] for the impact of this property on the rule interfaces. For a batched call with
-    /// retained rules, this count includes the boundary operands that its batching levels prepended to its inputs.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] when the call is a batched call with retained rules and `non_differentiated_count` is
-    /// smaller than the number of those boundary operands, which are always non-differentiated.
-    pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Result<Self, TypeError> {
-        if let CustomFunctionRules::Retained { rules, batching: Some(batching), .. } = &self.rules {
-            let boundary_operand_count = batching.boundary_operand_count();
-            if non_differentiated_count < boundary_operand_count {
-                return Err(TypeError::invalid(format!(
-                    "batched `{CUSTOM_FUNCTION_OPERATION_NAME}` `{}` must have at least {boundary_operand_count} \
-                     non-differentiated inputs, which are the boundary operands that its batching levels prepended to \
-                     its inputs, but got {non_differentiated_count}",
-                    rules.name(),
-                )));
-            }
-        }
-        self.non_differentiated_count = non_differentiated_count;
-        Ok(self)
-    }
-
     /// Returns the number of leading inputs that parameterize this call without being differentiated.
     #[inline]
     pub fn non_differentiated_count(&self) -> usize {
@@ -276,6 +253,30 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             CustomFunctionRules::Attached { has_vjp_rule, .. } => *has_vjp_rule,
             CustomFunctionRules::Retained { rules, .. } => rules.has_vjp(),
         }
+    }
+
+    /// Returns this call with the provided number of leading non-differentiated inputs. Refer to the documentation of
+    /// [`CustomFunctionOperation`] for the impact of this property on the rule interfaces. For a batched call with
+    /// retained rules, this count includes the boundary operands that its batching levels prepended to its inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] when the call is a batched call with retained rules and `non_differentiated_count` is
+    /// smaller than the number of those boundary operands, which are always non-differentiated.
+    pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Result<Self, TypeError> {
+        if let CustomFunctionRules::Retained { rules, batching: Some(batching), .. } = &self.rules {
+            let boundary_operand_count = batching.boundary_operand_count();
+            if non_differentiated_count < boundary_operand_count {
+                return Err(TypeError::invalid(format!(
+                    "batched `{CUSTOM_FUNCTION_OPERATION_NAME}` `{}` must have at least {boundary_operand_count} \
+                     non-differentiated inputs, which are the boundary operands that its batching levels prepended to \
+                     its inputs, but got {non_differentiated_count}",
+                    rules.name(),
+                )));
+            }
+        }
+        self.non_differentiated_count = non_differentiated_count;
+        Ok(self)
     }
 
     /// Converts this call into the family `(V2, O2)` with the rule source that `rules_fn` derives from its current
@@ -1242,7 +1243,36 @@ where
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let mut leading_values =
             non_differentiated_inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let (outputs, carrier_rules, carrier_regions) = match &self.rules {
+
+        // Structural-zero seeds are materialized from the known leading inputs, which need not carry the runtime
+        // geometry of the output tangent types (e.g., the extents of a dynamically shaped output that the residuals do
+        // not mention), so that geometry is read from the primal outputs and appended to the leading inputs as hidden
+        // seed geometry, which the backward rule never receives. Equal geometry types name the same runtime quantity,
+        // so each one is passed once.
+        let capture_seed_geometry = |outputs: &[C::Value],
+                                     geometry_types: &[C::Type],
+                                     leading_values: &mut Vec<C::Value>|
+         -> Result<Vec<C::Type>, ProgramError> {
+            let mut seed_geometry_types = Vec::new();
+            for (output, r#type) in outputs.iter().zip(geometry_types) {
+                for geometry_type in C::Operation::zero_residual_types(r#type) {
+                    if seed_geometry_types.contains(&geometry_type) {
+                        continue;
+                    }
+                    let value = C::Operation::capture_zero_residual_value(context.primal(), output, &geometry_type)?
+                        .ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "seed geometry of type `{geometry_type}` cannot be captured from output of type `{}`",
+                                output.r#type().as_ref(),
+                            ))
+                        })?;
+                    leading_values.push(value);
+                    seed_geometry_types.push(geometry_type);
+                }
+            }
+            Ok(seed_geometry_types)
+        };
+        let (outputs, seed_geometry_count, carrier_rules, carrier_regions) = match &self.rules {
             CustomFunctionRules::Attached { .. } => {
                 // Replay the forward region on the dual primals, recovering the primal outputs followed by the
                 // residuals. The carrier transposes by replaying the backward region, whose own inputs are exactly the
@@ -1260,8 +1290,12 @@ where
                     .into());
                 }
                 leading_values.extend(outputs.split_off(output_count));
+                let geometry_types =
+                    outputs.iter().map(|output| output.r#type().tangent()).collect::<Result<Vec<_>, _>>()?;
+                let seed_geometry_types = capture_seed_geometry(&outputs, &geometry_types, &mut leading_values)?;
                 (
                     outputs,
+                    seed_geometry_types.len(),
                     CustomFunctionTransposeRules::Attached,
                     vec![driver.region(backward_region_index)?.to_program()],
                 )
@@ -1275,41 +1309,15 @@ where
                 let mut outputs = specialization.program.interpret_in_context(context.primal(), primal_inputs)?;
                 leading_values.extend(outputs.split_off(output_count));
 
-                // Structural-zero seeds are materialized from the known leading inputs, which need not carry the
-                // runtime geometry of the output tangent types (e.g., the extents of dynamically shaped outputs when
-                // the rule saves no residuals), so that geometry is read from the primal outputs and passed as hidden
-                // seed-geometry inputs. The geometry of a batched call is that of its unbatched output tangent types,
-                // read by identity from its outputs.
+                // The seed geometry of a batched call is that of its unbatched output tangent types, read by identity
+                // from its outputs.
                 let geometry_types = match batching {
                     None => outputs.iter().map(|output| output.r#type().tangent()).collect::<Result<Vec<_>, _>>()?,
                     Some(batching) => {
                         batching.output_types.iter().map(DifferentiableType::tangent).collect::<Result<Vec<_>, _>>()?
                     }
                 };
-
-                // Equal geometry types name the same runtime quantity, so each one is passed once.
-                let mut seed_geometry_types = Vec::new();
-                for (output, r#type) in outputs.iter().zip(&geometry_types) {
-                    for geometry_type in C::Operation::zero_residual_types(r#type) {
-                        if seed_geometry_types.contains(&geometry_type) {
-                            continue;
-                        }
-                        let value = C::Operation::capture_zero_residual_value(
-                            context.primal(),
-                            output,
-                            &geometry_type,
-                        )?
-                        .ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
-                                "seed geometry of type `{geometry_type}` cannot be captured from output of type \
-                                     `{}`",
-                                output.r#type().as_ref(),
-                            ))
-                        })?;
-                        leading_values.push(value);
-                        seed_geometry_types.push(geometry_type);
-                    }
-                }
+                let seed_geometry_types = capture_seed_geometry(&outputs, &geometry_types, &mut leading_values)?;
                 let seed_geometry_count = seed_geometry_types.len();
 
                 // A batched call stages a batched carrier. At each level, the carrier's inputs have the batch axes of
@@ -1355,9 +1363,9 @@ where
                 };
                 (
                     outputs,
+                    seed_geometry_count,
                     CustomFunctionTransposeRules::Retained {
                         rules: rules.clone(),
-                        seed_geometry_count,
                         batching: carrier_batching,
                         invokes_rule_directly: false,
                         discharged: *discharged,
@@ -1387,6 +1395,7 @@ where
         }
         let carrier = CustomFunctionTransposeOperation {
             leading_input_count,
+            seed_geometry_count,
             input_tangent_types,
             output_tangent_types: outputs
                 .iter()
@@ -1435,11 +1444,6 @@ enum CustomFunctionTransposeRules<T, S> {
         /// Source of the backward rule.
         rules: S,
 
-        /// Number of trailing leading inputs that carry the runtime geometry of the output tangent types (e.g., the
-        /// extents of dynamically shaped outputs), from which structural-zero seeds are materialized when no other
-        /// leading input carries it. The backward rule never receives them.
-        seed_geometry_count: usize,
-
         /// Batching applied to the carrier (or to the call from which it was staged), or [`None`] when it is
         /// unbatched.
         batching: Option<CustomRuleBatching<T>>,
@@ -1466,7 +1470,9 @@ enum CustomFunctionTransposeRules<T, S> {
 /// forward-mode rule instead.
 ///
 /// Its inputs are the known leading inputs (i.e., any batching boundary operands, the non-differentiated inputs, the
-/// residuals, and, for a retained backward rule, seed geometry) followed by the differentiated inputs' tangents.
+/// residuals, and the seed geometry) followed by the differentiated inputs' tangents. The seed geometry names the
+/// runtime quantities of the output tangent types (e.g., the extents of dynamically shaped outputs) that
+/// structural-zero seeds need when no other leading input names them, and the backward rule never receives it.
 ///
 /// A [`LinearCallOperation`](crate::LinearCallOperation), by contrast, carries both an executable forward map and its
 /// transpose: it executes, lowers, differentiates, and batches through its forward region, and it transposes by
@@ -1477,9 +1483,13 @@ enum CustomFunctionTransposeRules<T, S> {
 /// The backward rule has the representation of the call that staged the carrier:
 ///
 ///   - **Attached** ([`Self::from_backward_region`]): the backward program is the carrier's `"backward"` rule region,
-///     `(leading, ȳ) → x̄`, which transposition replays inline into the pullback, since a user-supplied backward
-///     program has no linearity contract of its own that would let it be transposed again. The region's own effects
-///     decide whether transposition must run it when no cotangent is requested.
+///     `(leading, ȳ) → x̄` over the leading inputs other than the seed geometry, which transposition replays inline
+///     into the pullback, since a user-supplied backward program has no linearity contract of its own that would let it
+///     be transposed again. The region's own effects decide whether transposition must run it when no cotangent is
+///     requested. It is a deferred rule region (refer to
+///     [`RegionRole::DeferredRule`](crate::RegionRole::DeferredRule)), so a backward region with effects or deferred
+///     work makes the carrier carry deferred work, which keeps simplification from removing an unused carrier before
+///     transposition runs those effects.
 ///   - **Retained** ([`Self::new`]): the backward rule is specialized per [`CustomRuleBackwardSpecializationKey`] by
 ///     transposing a source program that invokes the rule directly, cached in the definition, and replayed with the
 ///     actual known inputs, seeds, and caller-buffer destinations. The runtime buffer identities are invocation inputs
@@ -1497,9 +1507,14 @@ enum CustomFunctionTransposeRules<T, S> {
 /// specialization and batches it once per level. Seeds, caller buffers, and leading inputs keep their recorded batch
 /// axes, and each returned cotangent is aligned to its input, summing the per-item cotangents of a replicated input.
 pub struct CustomFunctionTransposeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V, O>> {
-    /// Number of leading known inputs (i.e., boundary operands, non-differentiated inputs, residuals, and, for
-    /// retained backward rules, seed geometry).
+    /// Number of leading known inputs (i.e., boundary operands, non-differentiated inputs, residuals, and seed
+    /// geometry).
     leading_input_count: usize,
+
+    /// Number of trailing leading inputs that carry the runtime geometry of the output tangent types (e.g., the
+    /// extents of dynamically shaped outputs), from which structural-zero seeds are materialized when no other leading
+    /// input carries it. The backward rule never receives them.
+    seed_geometry_count: usize,
 
     /// Tangent types of the differentiated inputs.
     input_tangent_types: Vec<V::Type>,
@@ -1536,11 +1551,11 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     ) -> Self {
         Self {
             leading_input_count,
+            seed_geometry_count: 0,
             input_tangent_types,
             output_tangent_types,
             rules: CustomFunctionTransposeRules::Retained {
                 rules,
-                seed_geometry_count: 0,
                 batching: None,
                 invokes_rule_directly: false,
                 discharged: false,
@@ -1551,8 +1566,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     /// Creates a new [`CustomFunctionTransposeOperation`] whose backward rule is its attached `"backward"` rule
     /// region, exactly as the [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rule of a
-    /// [`CustomFunctionOperation`] with attached rules stages it. The region maps the leading inputs followed by one
-    /// cotangent per output to one cotangent per differentiated input.
+    /// [`CustomFunctionOperation`] with attached rules stages it, except that it has no seed geometry. The region
+    /// maps the leading inputs followed by one cotangent per output to one cotangent per differentiated input. When
+    /// the zero seeds of dead outputs need runtime quantities (e.g., dynamic extents) that no leading input names,
+    /// the region can receive them as additional leading inputs.
     ///
     /// # Parameters
     ///
@@ -1567,6 +1584,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     ) -> Self {
         Self {
             leading_input_count,
+            seed_geometry_count: 0,
             input_tangent_types,
             output_tangent_types,
             rules: CustomFunctionTransposeRules::Attached,
@@ -1586,11 +1604,11 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     ) -> Self {
         Self {
             leading_input_count,
+            seed_geometry_count,
             input_tangent_types,
             output_tangent_types,
             rules: CustomFunctionTransposeRules::Retained {
                 rules,
-                seed_geometry_count,
                 batching: None,
                 invokes_rule_directly: true,
                 discharged,
@@ -1637,23 +1655,19 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         let map_types = |types: Vec<V::Type>| types.into_iter().map(V2::Type::from).collect::<Vec<_>>();
         CustomFunctionTransposeOperation {
             leading_input_count: self.leading_input_count,
+            seed_geometry_count: self.seed_geometry_count,
             input_tangent_types: map_types(self.input_tangent_types),
             output_tangent_types: map_types(self.output_tangent_types),
             rules: match self.rules {
                 CustomFunctionTransposeRules::Attached => CustomFunctionTransposeRules::Attached,
-                CustomFunctionTransposeRules::Retained {
-                    rules,
-                    seed_geometry_count,
-                    batching,
-                    invokes_rule_directly,
-                    discharged,
-                } => CustomFunctionTransposeRules::Retained {
-                    rules: rules_fn(rules),
-                    seed_geometry_count,
-                    batching: batching.map(CustomRuleBatching::map_types),
-                    invokes_rule_directly,
-                    discharged,
-                },
+                CustomFunctionTransposeRules::Retained { rules, batching, invokes_rule_directly, discharged } => {
+                    CustomFunctionTransposeRules::Retained {
+                        rules: rules_fn(rules),
+                        batching: batching.map(CustomRuleBatching::map_types),
+                        invokes_rule_directly,
+                        discharged,
+                    }
+                }
             },
             marker: PhantomData,
         }
@@ -1671,6 +1685,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 let map_types = |types: Vec<V::Type>| types.into_iter().map(V2::Type::from).collect::<Vec<_>>();
                 Ok(CustomFunctionTransposeOperation {
                     leading_input_count: self.leading_input_count,
+                    seed_geometry_count: self.seed_geometry_count,
                     input_tangent_types: map_types(self.input_tangent_types),
                     output_tangent_types: map_types(self.output_tangent_types),
                     rules: CustomFunctionTransposeRules::Attached,
@@ -1698,6 +1713,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Clone
     fn clone(&self) -> Self {
         Self {
             leading_input_count: self.leading_input_count,
+            seed_geometry_count: self.seed_geometry_count,
             input_tangent_types: self.input_tangent_types.clone(),
             output_tangent_types: self.output_tangent_types.clone(),
             rules: self.rules.clone(),
@@ -1718,18 +1734,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Debug
         }
         debug
             .field("leading_input_count", &self.leading_input_count)
+            .field("seed_geometry_count", &self.seed_geometry_count)
             .field("input_tangent_types", &self.input_tangent_types)
             .field("output_tangent_types", &self.output_tangent_types);
-        if let CustomFunctionTransposeRules::Retained {
-            seed_geometry_count,
-            batching,
-            invokes_rule_directly,
-            discharged,
-            ..
-        } = &self.rules
+        if let CustomFunctionTransposeRules::Retained { batching, invokes_rule_directly, discharged, .. } = &self.rules
         {
             debug
-                .field("seed_geometry_count", seed_geometry_count)
                 .field("batching", batching)
                 .field("invokes_rule_directly", invokes_rule_directly)
                 .field("discharged", discharged);
@@ -1743,6 +1753,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Partia
 {
     fn eq(&self, other: &Self) -> bool {
         self.leading_input_count == other.leading_input_count
+            && self.seed_geometry_count == other.seed_geometry_count
             && self.input_tangent_types == other.input_tangent_types
             && self.output_tangent_types == other.output_tangent_types
             && self.rules == other.rules
@@ -1759,6 +1770,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Hash
 {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.leading_input_count.hash(state);
+        self.seed_geometry_count.hash(state);
         self.input_tangent_types.hash(state);
         self.output_tangent_types.hash(state);
         self.rules.hash(state);
@@ -1787,7 +1799,7 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
         match self.rules {
-            CustomFunctionTransposeRules::Attached => const { &[RegionSlot::rule("backward")] },
+            CustomFunctionTransposeRules::Attached => const { &[RegionSlot::deferred_rule("backward")] },
             CustomFunctionTransposeRules::Retained { .. } => &[],
         }
     }
@@ -1851,8 +1863,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
-        // Only a retained backward rule is an unresolved obligation of the carrier itself. An attached backward region
-        // declares its own effects, which transposition inspects when no cotangent is requested.
+        // A retained backward rule is an unresolved obligation of the carrier itself. An attached backward region is a
+        // deferred rule region instead (refer to `region_slots`), which makes the carrier carry deferred work exactly
+        // when the region has effects or deferred work of its own.
         match self.rules {
             CustomFunctionTransposeRules::Attached => Cow::Borrowed(Effects::empty()),
             CustomFunctionTransposeRules::Retained { .. } => Cow::Borrowed(&CUSTOM_FUNCTION_TRANSPOSE_EFFECTS),
@@ -1868,22 +1881,18 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         };
         let rules = match &self.rules {
             CustomFunctionTransposeRules::Attached => CustomFunctionTransposeRules::Attached,
-            CustomFunctionTransposeRules::Retained {
-                rules,
-                seed_geometry_count,
-                batching,
-                invokes_rule_directly,
-                discharged,
-            } => CustomFunctionTransposeRules::Retained {
-                rules: rules.clone(),
-                seed_geometry_count: *seed_geometry_count,
-                batching: batching.as_ref().map(|batching| batching.rename_identities(renaming)).transpose()?,
-                invokes_rule_directly: *invokes_rule_directly,
-                discharged: *discharged,
-            },
+            CustomFunctionTransposeRules::Retained { rules, batching, invokes_rule_directly, discharged } => {
+                CustomFunctionTransposeRules::Retained {
+                    rules: rules.clone(),
+                    batching: batching.as_ref().map(|batching| batching.rename_identities(renaming)).transpose()?,
+                    invokes_rule_directly: *invokes_rule_directly,
+                    discharged: *discharged,
+                }
+            }
         };
         Ok(Self {
             leading_input_count: self.leading_input_count,
+            seed_geometry_count: self.seed_geometry_count,
             input_tangent_types: rename(&self.input_tangent_types)?,
             output_tangent_types: rename(&self.output_tangent_types)?,
             rules,
@@ -1895,33 +1904,28 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         // The tangent types coincide with the types of the carrier's tangent inputs and outputs, so they are not
         // rendered.
         let operation = OperationFormatter::new(formatter, indentation, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME)?;
-        operation.bracketed(|operation| match &self.rules {
-            CustomFunctionTransposeRules::Attached => {
-                operation.field("leading_input_count", self.leading_input_count)?;
-                Ok(())
-            }
-            CustomFunctionTransposeRules::Retained {
-                rules,
-                seed_geometry_count,
-                batching,
-                invokes_rule_directly,
-                discharged,
-            } => {
+        operation.bracketed(|operation| {
+            if let CustomFunctionTransposeRules::Retained { rules, .. } = &self.rules {
                 operation.field("name", format_args!("{:?}", rules.name()))?;
-                operation.field("leading_input_count", self.leading_input_count)?;
-                if *seed_geometry_count != 0 {
-                    operation.field("seed_geometry_count", seed_geometry_count)?;
+            }
+            operation.field("leading_input_count", self.leading_input_count)?;
+            if self.seed_geometry_count != 0 {
+                operation.field("seed_geometry_count", self.seed_geometry_count)?;
+            }
+            match &self.rules {
+                CustomFunctionTransposeRules::Attached => Ok(()),
+                CustomFunctionTransposeRules::Retained { batching, invokes_rule_directly, discharged, .. } => {
+                    if let Some(batching) = batching {
+                        operation.field("batching", batching)?;
+                    }
+                    if *invokes_rule_directly {
+                        operation.field("direct", true)?;
+                    }
+                    if *discharged {
+                        operation.field("discharged", true)?;
+                    }
+                    Ok(())
                 }
-                if let Some(batching) = batching {
-                    operation.field("batching", batching)?;
-                }
-                if *invokes_rule_directly {
-                    operation.field("direct", true)?;
-                }
-                if *discharged {
-                    operation.field("discharged", true)?;
-                }
-                Ok(())
             }
         })
     }
@@ -1930,8 +1934,8 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>
     CustomFunctionTransposeOperation<V, O, S>
 {
-    /// Returns the input types of an attached backward region: the types of the leading inputs among `input_types`
-    /// followed by the cotangent types of the outputs.
+    /// Returns the input types of an attached backward region: the types of the leading inputs among `input_types`,
+    /// except for the seed geometry, followed by the cotangent types of the outputs.
     fn backward_input_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
         if self.leading_input_count > input_types.len() {
             return Err(TypeError::invalid(format!(
@@ -1941,7 +1945,13 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 input_types.len(),
             )));
         }
-        let mut backward_input_types = input_types[..self.leading_input_count].to_vec();
+        let Some(rule_leading_input_count) = self.leading_input_count.checked_sub(self.seed_geometry_count) else {
+            return Err(TypeError::invalid(format!(
+                "`{}` seed geometry count {} exceeds leading input count {}",
+                CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, self.seed_geometry_count, self.leading_input_count,
+            )));
+        };
+        let mut backward_input_types = input_types[..rule_leading_input_count].to_vec();
         backward_input_types.extend(
             self.output_tangent_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?,
         );
@@ -1970,17 +1980,10 @@ where
             CustomFunctionTransposeRules::Attached => {
                 discharge_local_reference_operation(self, context, driver, inputs)
             }
-            CustomFunctionTransposeRules::Retained {
-                rules,
-                seed_geometry_count,
-                batching,
-                invokes_rule_directly,
-                ..
-            } => {
+            CustomFunctionTransposeRules::Retained { rules, batching, invokes_rule_directly, .. } => {
                 let discharged = Self {
                     rules: CustomFunctionTransposeRules::Retained {
                         rules: rules.clone(),
-                        seed_geometry_count: *seed_geometry_count,
                         batching: batching.clone(),
                         invokes_rule_directly: *invokes_rule_directly,
                         discharged: true,
@@ -2038,7 +2041,7 @@ where
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         check_count!("input", inputs, self.leading_input_count + self.input_tangent_types.len(), ProgramError);
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
-        let (rules, seed_geometry_count, batching, discharged) = match &self.rules {
+        let (rules, batching, discharged) = match &self.rules {
             CustomFunctionTransposeRules::Attached => {
                 // A completely replicated carrier at an unnamed batching level needs no structural region rewrite, and
                 // keeping it avoids manufacturing a batch axis that its backward region does not observe. What makes
@@ -2070,8 +2073,8 @@ where
                 ))
                 .into());
             }
-            CustomFunctionTransposeRules::Retained { rules, seed_geometry_count, batching, discharged, .. } => {
-                (rules, *seed_geometry_count, batching, *discharged)
+            CustomFunctionTransposeRules::Retained { rules, batching, discharged, .. } => {
+                (rules, batching, *discharged)
             }
         };
 
@@ -2114,6 +2117,7 @@ where
         });
         let carrier = Self {
             leading_input_count: self.leading_input_count + boundary_operands.len(),
+            seed_geometry_count: self.seed_geometry_count,
             input_tangent_types: inputs[self.leading_input_count..]
                 .iter()
                 .map(|input| P::value(input).r#type().into_owned())
@@ -2121,7 +2125,6 @@ where
             output_tangent_types: batched_identity.output_types(),
             rules: CustomFunctionTransposeRules::Retained {
                 rules: rules.clone(),
-                seed_geometry_count,
                 batching: Some(batching),
                 invokes_rule_directly: false,
                 discharged,
@@ -2189,7 +2192,8 @@ where
                 ))
             })?);
         }
-        let (rules, seed_geometry_count, batching, invokes_rule_directly, discharged) = match &self.rules {
+        let seed_geometry_count = self.seed_geometry_count;
+        let (rules, batching, invokes_rule_directly, discharged) = match &self.rules {
             CustomFunctionTransposeRules::Attached => {
                 // Unrequested gradients can omit a pure backward program, but its observable effects must still
                 // execute and its deferred work must still be staged even when all seeds are structural zeros or none
@@ -2225,10 +2229,10 @@ where
                     .collect::<Vec<_>>();
 
                 // A dead output's structural-zero seed still becomes a real operand of the backward region. Its type
-                // alone cannot construct it when it references runtime identities, but the boundary collectively names
-                // every such quantity: at least one peer seed is live here (the all-zero case returned above) and the
-                // leading inputs are live too, so the zero is assembled from them one identity at a time before falling
-                // back to the nullary zero that every identity-free type keeps.
+                // alone cannot construct it when it references runtime identities, but the live seeds and the leading
+                // inputs, whose seed geometry names every runtime quantity of the output tangent types, do, so the zero
+                // is assembled from them one identity at a time before falling back to the nullary zero that every
+                // identity-free type keeps. The backward region never receives the seed geometry.
                 let seeds = outputs
                     .iter()
                     .cloned()
@@ -2241,6 +2245,7 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut backward_inputs = leading_values;
+                backward_inputs.truncate(self.leading_input_count - seed_geometry_count);
                 backward_inputs.extend(seeds);
 
                 // A user-supplied backward program has no linearity contract of its own, so it cannot be transposed
@@ -2265,13 +2270,9 @@ where
                         accumulator.accumulate(context, MaybeZero::Value(cotangent))
                     });
             }
-            CustomFunctionTransposeRules::Retained {
-                rules,
-                seed_geometry_count,
-                batching,
-                invokes_rule_directly,
-                discharged,
-            } => (rules, *seed_geometry_count, batching, *invokes_rule_directly, *discharged),
+            CustomFunctionTransposeRules::Retained { rules, batching, invokes_rule_directly, discharged } => {
+                (rules, batching, *invokes_rule_directly, *discharged)
+            }
         };
         if invokes_rule_directly {
             let Some(backward) = rules.native_definition().and_then(|definition| definition.backward.as_ref()) else {
@@ -2636,9 +2637,11 @@ where
         };
         let output_tangents = outputs.split_off(output_count);
         (outputs, output_tangents)
-    } else if let Some(call) = call {
+    } else if let Some(call) = call.filter(|_| primal_region.effects() == EffectsSummary::PURE) {
         // The known side computes the outputs with the call itself, and the tangent side stages a pushforward call
-        // that recomputes the primal internally, because the call is opaque to partial evaluation.
+        // that recomputes the primal internally, because the call is opaque to partial evaluation. Recomputing is only
+        // valid for a pure primal: the effects of any other primal (e.g., reference updates, or reference reads that
+        // later effects would change) must run once, when the known side runs, so it is linearized inline instead.
         let program = driver.jvp_program(primal_region, &input_indices)?;
         let program_inputs = program.input_ids().to_vec();
         let (pushforward, _) =
@@ -2832,7 +2835,7 @@ pub(super) fn replay_custom_jvp_rule<
 mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Mutex};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -2862,11 +2865,11 @@ mod tests {
     use crate::operations::control_flow::condition::{ConditionOperation, transpose_primal_condition};
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::custom_functions::functions::custom_function;
-    use crate::operations::custom_functions::rules::{
-        CUSTOM_RULE_SPECIALIZATION_CAPACITY, CustomRuleDefinition, CustomRuleRegistration, CustomRuleSource,
-    };
+    use crate::operations::custom_functions::rules::{CustomRuleDefinition, CustomRuleRegistration, CustomRuleSource};
     use crate::operations::custom_functions::tests::{
-        ReferenceRuleDifferentiationDriver, custom_function_call_program,
+        MemberDefinition, ReferenceRuleDifferentiationDriver, RuleCounters, TestContext, TestDefinition,
+        TestRegistration, call_jvp, cube_definition, cube_program, custom_function_call_program, custom_rule_program,
+        member_cube_definition,
     };
     use crate::operations::differentiation::linear_call::LinearCallOperation;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
@@ -3096,7 +3099,31 @@ mod tests {
         // Local rule state is discharged inside the rule region, while the declared JVP rule remains attached and
         // active. Its tangent is deliberately doubled, so differentiating the primal instead cannot pass.
         let discharged = program.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
-        assert_eq!(discharged.instructions()[0].regions().len(), 2);
+        assert_eq!(
+            discharged.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = custom_function %0 [
+                    primal={
+                        lambda %0:f32[] .
+                        let %1:f32[] = mul %0 %0
+                        in (%1)
+                    },
+                    jvp={
+                        lambda %0:f32[], %1:f32[] .
+                        let %2:f32[] = const 0.0
+                            %3:f32[] = add %0 %0
+                            %4:f32[] = mul %3 %1
+                            %5:f32[] = add %2 %4
+                            %6:f32[] = mul %0 %0
+                            %7:f32[] = add %5 %5
+                        in (%6, %7)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
         assert!(!discharged.entry_region_ref().contains_references_in_closure());
         assert_eq!(
             discharged.interpret(vec![ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())]),
@@ -3139,22 +3166,28 @@ mod tests {
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 1);
         assert_eq!(
-            linearization
-                .primal()
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec!["mul", "add"],
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = mul %0 %0
+                    %2:f32[] = add %0 %0
+                in (%1, %2)
+            "}
+            .trim_end(),
         );
         assert_eq!(
-            linearization
-                .tangent()
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec!["reference_new", "mul", "reference_add_update", endpoint],
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[] = const 0.0
+                    %3:ref<f32[]> = reference_new %2
+                    %4:f32[] = mul %1 %0
+                    () = reference_add_update %3 %4
+                    %5:f32[] = reference_read %3
+                in (%5)
+            "}
+            .trim_end()
+            .replace("reference_read", endpoint),
         );
         let primals =
             linearization.primal().interpret(vec![ArrayIrValue::Array(Array::scalar(3.0f32).unwrap())]).unwrap();
@@ -3475,18 +3508,6 @@ mod tests {
 
     // Fixtures of the tests of calls and carriers with retained rules.
 
-    /// Eager context whose operation family registers the retained-rule operations.
-    type TestContext = EagerContext<Array, TestArrayOperation>;
-
-    /// Retained-rule definition over [`TestContext`].
-    type TestDefinition = CustomRuleDefinition<Array, TestArrayOperation>;
-
-    /// Registration of a [`TestDefinition`].
-    type TestRegistration = CustomRuleRegistration<Array, TestArrayOperation>;
-
-    /// Retained-rule definition over the production [`ArrayOperation`] member family.
-    type MemberDefinition = CustomRuleDefinition<Array, ArrayOperation<Array>>;
-
     /// Array IR program family into which member programs are converted.
     type ConvertedProgram = FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>;
 
@@ -3544,92 +3565,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Invocation counters of the retained rules of a [`cube_definition`].
-    #[derive(Default)]
-    struct RuleCounters {
-        /// Number of JVP rule invocations.
-        jvp: AtomicUsize,
-
-        /// Number of VJP forward rule invocations.
-        forward: AtomicUsize,
-
-        /// Number of VJP backward rule invocations.
-        backward: AtomicUsize,
-    }
-
-    impl RuleCounters {
-        /// Returns the JVP, forward, and backward invocation counts.
-        fn counts(&self) -> (usize, usize, usize) {
-            (self.jvp.load(Ordering::SeqCst), self.forward.load(Ordering::SeqCst), self.backward.load(Ordering::SeqCst))
-        }
-    }
-
-    /// Builds the primal `f(x) = x³`.
-    fn cube_program(r#type: &ArrayType) -> FlatProgram<TestContext> {
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(r#type.clone());
-        let square = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
-        let cube = builder.add_instruction(MulOperation::new(), Vec::new(), vec![square, input], None).unwrap()[0];
-        builder.build(vec![cube], vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
-    /// Returns a definition of `f(x) = x³` whose deliberately wrong rules distinguish the selected rule: the JVP rule
-    /// computes `ẏ = x² ẋ` and the VJP rule computes `x̄ = 2 x² ȳ`, while the true derivative is `3 x²`. Each rule
-    /// counts its invocations in `counters`.
-    fn cube_definition(counters: &Arc<RuleCounters>, jvp: bool, vjp: bool) -> TestDefinition {
-        let mut definition = TestDefinition::new("cube").with_batching();
-        if jvp {
-            let counters = counters.clone();
-            definition = definition.with_jvp(move |primals, tangents| {
-                counters.jvp.fetch_add(1, Ordering::SeqCst);
-                let square = primals[0].clone() * primals[0].clone();
-                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
-            });
-        }
-        if vjp {
-            let forward_counters = counters.clone();
-            let backward_counters = counters.clone();
-            definition = definition.with_vjp(
-                move |primals| {
-                    forward_counters.forward.fetch_add(1, Ordering::SeqCst);
-                    let square = primals[0].clone() * primals[0].clone();
-                    Ok((vec![square.clone() * primals[0].clone()], vec![square]))
-                },
-                move |leading_inputs, seeds| {
-                    backward_counters.backward.fetch_add(1, Ordering::SeqCst);
-                    let contribution = leading_inputs[0].clone() * seeds[0].clone();
-                    Ok(vec![contribution.clone() + contribution])
-                },
-            );
-        }
-        definition
-    }
-
-    /// Returns the member-family counterpart of [`cube_definition`], whose rules are written against member tracers.
-    fn member_cube_definition(counters: &Arc<RuleCounters>) -> MemberDefinition {
-        let (jvp_counters, forward_counters, backward_counters) =
-            (counters.clone(), counters.clone(), counters.clone());
-        MemberDefinition::new("cube")
-            .with_jvp(move |primals, tangents| {
-                jvp_counters.jvp.fetch_add(1, Ordering::SeqCst);
-                let square = primals[0].clone() * primals[0].clone();
-                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
-            })
-            .with_vjp(
-                move |primals| {
-                    forward_counters.forward.fetch_add(1, Ordering::SeqCst);
-                    let square = primals[0].clone() * primals[0].clone();
-                    Ok((vec![square.clone() * primals[0].clone()], vec![square]))
-                },
-                move |leading_inputs, seeds| {
-                    backward_counters.backward.fetch_add(1, Ordering::SeqCst);
-                    let contribution = leading_inputs[0].clone() * seeds[0].clone();
-                    Ok(vec![contribution.clone() + contribution])
-                },
-            )
-            .with_batching()
-    }
-
     /// Builds the member-family program `f(x) = x³` over one input of the provided type.
     fn member_cube_program(r#type: &ArrayType) -> FlatProgram<EagerContext<Array, ArrayOperation<Array>>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -3654,36 +3589,6 @@ mod tests {
         let operation = ArrayOperation::CustomFunction(CustomFunctionOperation::new(definition.reference()));
         let output = builder.add_instruction(operation, vec![primal], vec![input], None).unwrap()[0];
         builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
-    /// Stages one call of `definition` over an input of type `r#type`.
-    fn custom_rule_program(definition: &TestRegistration, r#type: ArrayType) -> FlatProgram<TestContext> {
-        let mut builder = ProgramBuilder::<Array, TestArrayOperation>::new();
-        let primal = builder.import_program(cube_program(&r#type));
-        let input = builder.add_input(r#type);
-        let output = builder
-            .add_instruction(CustomFunctionOperation::new(definition.reference()), vec![primal], vec![input], None)
-            .unwrap()[0];
-        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
-    /// Returns the outputs and tangents of the forward-mode differentiation of one call of `definition` at `x` with
-    /// tangent `tangent`.
-    fn call_jvp(
-        definition: &TestRegistration,
-        x: Array,
-        tangent: Array,
-    ) -> Result<(Vec<Array>, Vec<Array>), DifferentiationError> {
-        let r#type = x.r#type().into_owned();
-        TestContext::new().jvp(
-            |x, ()| {
-                let operation = CustomFunctionOperation::new(definition.reference());
-                x.context().bind(operation, vec![cube_program(&r#type)], &[x.clone()])
-            },
-            x,
-            tangent,
-            (),
-        )
     }
 
     /// Returns the outputs of one call of `definition` at `x` and the input cotangent for the output seed `seed`.
@@ -4828,11 +4733,11 @@ mod tests {
         let region = RegionInterface::new(vec![scalar_type.clone()], vec![scalar_type.clone()], EffectClasses::NONE);
         let operation = CustomFunctionOperation::new(definition.reference());
         assert_eq!(
-            Operation::infer_output_types(&operation, &[scalar_type.clone()], std::slice::from_ref(&region)),
+            operation.infer_output_types(&[scalar_type.clone()], std::slice::from_ref(&region)),
             Ok(vec![scalar_type.clone()]),
         );
         assert_eq!(
-            Operation::infer_output_types(&operation, &[scalar_type.clone()], &[]),
+            operation.infer_output_types(&[scalar_type.clone()], &[]),
             Err(TypeError::invalid("expected 1 region but got 0")),
         );
         assert_eq!(
@@ -4905,7 +4810,7 @@ mod tests {
         let batched_region =
             RegionInterface::new(vec![batched_type.clone()], vec![batched_type.clone()], EffectClasses::NONE);
         assert_eq!(
-            Operation::infer_output_types(&batched_operation, &[batched_type], std::slice::from_ref(&batched_region)),
+            batched_operation.infer_output_types(&[batched_type], std::slice::from_ref(&batched_region)),
             Err(TypeError::invalid(
                 "batched `custom_function` `identity` has 1 inputs but its batching levels record 1 boundary \
                  operands and 1 unbatched inputs",
@@ -4936,7 +4841,21 @@ mod tests {
              of type `ref<f32[]>` before the differentiated inputs",
         );
         let staged = ir_custom_rule_program(&definition, 1, program);
-        assert_eq!(staged.instructions().len(), 1);
+        assert_eq!(
+            staged.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[]>, %1:f32[] .
+                let %2:f32[] = custom_function [name=\"counter\", non_differentiated_count=1] %0 %1 [
+                    primal={
+                        lambda %0:ref<f32[]>, %1:f32[] .
+                        let %2:f32[] = mul %1 %1
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -4989,7 +4908,30 @@ mod tests {
         .unwrap()
         .into_program_without_external_references()
         .unwrap();
-        assert_eq!(program.instructions()[0].regions().len(), 3);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = custom_function %0 [
+                    primal={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                    forward={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                    backward={
+                        lambda %0:f32[] .
+                        let %1:f32[] = const 3.0
+                            %2:f32[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
         assert!(!program.entry_region_ref().contains_references_in_closure());
         let input = ArrayIrValue::Array(Array::scalar(5.0f32).unwrap());
         assert_eq!(program.interpret(vec![input.clone()]), Ok(vec![input.clone()]));
@@ -5222,8 +5164,30 @@ mod tests {
         // custom rule attached to the residual program.
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar_type)]).unwrap();
         assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::CustomFunction(_)));
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = custom_function %0 [
+                    primal={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                    jvp={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = sin %0
+                            %3:f64[] = const 2.0
+                            %4:f64[] = cos %0
+                            %5:f64[] = mul %3 %4
+                            %6:f64[] = mul %5 %1
+                        in (%2, %6)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             evaluation
                 .program
@@ -5259,8 +5223,34 @@ mod tests {
         // custom rules attached to the residual program.
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar_type)]).unwrap();
         assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::CustomFunction(_)));
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = custom_function %0 [
+                    primal={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                    forward={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = cos %0
+                        in (%1, %2)
+                    },
+                    backward={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = const 3.0
+                            %3:f64[] = mul %2 %0
+                            %4:f64[] = mul %3 %1
+                        in (%4)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
         let linearization = evaluation
             .program
             .entry_region_ref()
@@ -5370,7 +5360,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        let program = custom_function_call_program(
+        let program: FlatProgram<ArrayContext> = custom_function_call_program(
             ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
                 CustomFunctionJvpRule::Explicit,
                 false,
@@ -5387,17 +5377,31 @@ mod tests {
             .unwrap()
             .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(1), BatchAxis::replicated(), BatchAxis::new(1)]);
-        assert_eq!(batched.instructions().len(), 1);
-        let instruction = &batched.instructions()[0];
-        assert!(matches!(instruction.operation(), ArrayOperation::CustomFunction(_)));
-        assert!(instruction.regions().iter().all(|region| {
-            batched
-                .region_ref(*region)
-                .unwrap()
-                .instructions()
-                .iter()
-                .all(|instruction| !matches!(instruction.operation(), ArrayOperation::Transpose(_)))
-        }));
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[3, 2] .
+                let %1:f64[3, 2], %2:f64[3], %3:f64[3, 2] = custom_function %0 [
+                    primal={
+                        lambda %0:f64[3, 2] .
+                        let %1:f64[3] = const [4.0, 5.0, 6.0]
+                            %2:f64[3] = const [7.0, 8.0, 9.0]
+                            %3:f64[3, 2] = broadcast [output_type=f64[3, 2], output_axes=[0]] %2
+                        in (%0, %1, %3)
+                    },
+                    jvp={
+                        lambda %0:f64[3, 2], %1:f64[3, 2] .
+                        let %2:f64[3] = const [4.0, 5.0, 6.0]
+                            %3:f64[3] = const [7.0, 8.0, 9.0]
+                            %4:f64[3, 2] = broadcast [output_type=f64[3, 2], output_axes=[0]] %3
+                            %5:f64[3] = const [0.0, 0.0, 0.0]
+                        in (%0, %2, %4, %1, %5, %1)
+                    },
+                ]
+                in (%1, %2, %3)
+            "}
+            .trim_end(),
+        );
 
         let input = Array::matrix(3, 2, vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0]).unwrap();
         assert_eq!(
@@ -5591,7 +5595,6 @@ mod tests {
     #[test]
     fn test_custom_function_batching_vjp_rule_residual_axes_and_replicated_cotangents() {
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let vector_type = ArrayType::new_static(DataType::F64, [2]);
         let primal = {
             let mut builder = ProgramBuilder::new();
             let x = builder.add_input(scalar_type.clone());
@@ -5617,7 +5620,7 @@ mod tests {
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, cotangent], None).unwrap()[0];
             builder.build(vec![x_cotangent, y_cotangent], vec![Placeholder; 3], vec![Placeholder; 2]).unwrap()
         };
-        let program = custom_function_call_program(
+        let program: FlatProgram<ArrayContext> = custom_function_call_program(
             ArrayOperation::CustomFunction(CustomFunctionOperation::from_rule_regions(
                 CustomFunctionJvpRule::Absent,
                 true,
@@ -5639,17 +5642,35 @@ mod tests {
             .unwrap()
             .into_parts();
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
-        let instruction = &batched.instructions()[0];
-        assert!(matches!(instruction.operation(), ArrayOperation::CustomFunction(_)));
-        let forward = batched.region_ref(instruction.regions()[1]).unwrap();
-        assert_eq!(forward.output_types(), &[vector_type.clone(), vector_type.clone(), scalar_type.clone()]);
-        let backward = batched.region_ref(instruction.regions()[2]).unwrap();
-        assert_eq!(backward.output_types(), &[vector_type, scalar_type]);
-        assert!(
-            backward
-                .instructions()
-                .iter()
-                .any(|instruction| matches!(instruction.operation(), ArrayOperation::Reduce(_))),
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:f64[] .
+                let %2:f64[2] = custom_function %0 %1 [
+                    primal={
+                        lambda %0:f64[2], %1:f64[] .
+                        let %2:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %1
+                            %3:f64[2] = mul %0 %2
+                        in (%3)
+                    },
+                    forward={
+                        lambda %0:f64[2], %1:f64[] .
+                        let %2:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %1
+                            %3:f64[2] = mul %0 %2
+                        in (%3, %0, %1)
+                    },
+                    backward={
+                        lambda %0:f64[2], %1:f64[], %2:f64[2] .
+                        let %3:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %1
+                            %4:f64[2] = mul %3 %2
+                            %5:f64[2] = mul %0 %2
+                            %6:f64[] = reduce [kind=sum, axes=[0]] %5
+                        in (%4, %6)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
         );
         assert_eq!(
             batched.interpret(vec![Array::vector(vec![2.0, 3.0]).unwrap(), Array::scalar(5.0).unwrap()]),
@@ -6668,12 +6689,15 @@ mod tests {
         let differentiated = program.jvp().unwrap();
         assert_eq!(differentiated.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
-            differentiated
-                .instructions()
-                .iter()
-                .filter(|instruction| instruction.operation().name() == "assert")
-                .count(),
-            1,
+            differentiated.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[] = const 0.0
+                    %3:bool[] = compare [direction=GreaterThan] %0 %2
+                    () = assert [message=\"custom derivative requires positive input\", labels=[\"input\"]] %3 %0
+                in (%0, %1)
+            "}
+            .trim_end(),
         );
         assert_eq!(
             differentiated.interpret(vec![Array::scalar(1.0f32).unwrap(), Array::scalar(2.0f32).unwrap()]),
@@ -6735,20 +6759,41 @@ mod tests {
         // tangent scan keeps the accumulator lifecycle.
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 1);
-        let primal_operations = linearization
-            .primal()
-            .entry_region_ref()
-            .computation_regions()
-            .flat_map(|region| region.instructions().iter().map(|instruction| instruction.operation().name()))
-            .collect::<Vec<_>>();
-        let tangent_operations = linearization
-            .tangent()
-            .entry_region_ref()
-            .computation_regions()
-            .flat_map(|region| region.instructions().iter().map(|instruction| instruction.operation().name()))
-            .collect::<Vec<_>>();
-        assert_eq!(primal_operations, vec!["scan", "mul", "add"]);
-        assert_eq!(tangent_operations, vec!["scan", "reference_new", "mul", "reference_add_update", "reference_read"]);
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[3] .
+                let %1:f32[3], %2:f32[3] = scan [carry_count=0, length=3, reverse=false] %0 [
+                    body={
+                        lambda %0:i64[], %1:f32[] .
+                        let %2:f32[] = mul %1 %1
+                            %3:f32[] = add %1 %1
+                        in (%2, %3)
+                    },
+                ]
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[3], %1:f32[3] .
+                let %2:f32[3] = scan [carry_count=0, length=3, reverse=false] %0 %1 [
+                    body={
+                        lambda %0:i64[], %1:f32[], %2:f32[] .
+                        let %3:f32[] = const 0.0
+                            %4:ref<f32[]> = reference_new %3
+                            %5:f32[] = mul %2 %1
+                            () = reference_add_update %4 %5
+                            %6:f32[] = reference_read %4
+                        in (%6)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
         let primals = linearization
             .primal()
             .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap())])
@@ -6945,6 +6990,128 @@ mod tests {
             .unwrap();
         assert_eq!(gradient, Array::scalar(3.0 * 0.7f64.cos()).unwrap());
         assert_eq!(second_derivative, Array::scalar(-3.0 * 0.7f64.sin()).unwrap());
+    }
+
+    #[test]
+    fn test_custom_function_differentiation_vjp_rule_dead_output_geometry() {
+        // The attached identity rules of `(x: f32[n], y: f32[m]) ↦ (x, y)` save no residuals, so when the call's
+        // output `x` is dead, only the seed geometry that the carrier captures from the primal outputs names the
+        // extent `n` of its zero seed. The backward rule never receives that geometry.
+        type Builder = ProgramBuilder<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let types = ["n", "m"].map(|name| {
+            let dimension = DimensionVariable::new(name, DimensionBounds::new(1, Some(8)).unwrap());
+            ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension)])))
+        });
+
+        // The identity rule optionally asserts that `1` is a valid extent, which gives it an effect.
+        let identity = |effectful: bool| {
+            let mut builder = Builder::new();
+            let inputs = types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+            if effectful {
+                let extent = builder.add_constant(Array::scalar(1i32).unwrap().into());
+                let variable = DimensionVariable::new("extent", DimensionBounds::new(0, None).unwrap());
+                builder
+                    .add_instruction(DimensionFromScalarOperation::new(variable), Vec::new(), vec![extent], None)
+                    .unwrap();
+            }
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    inputs,
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+
+        // The program returns the call's output `y`, or its own input `x` when every output of the call is dead.
+        let program = |uses_call: bool| {
+            let mut builder = Builder::new();
+            let primal = builder.import_program(identity(false));
+            let forward = builder.import_program(identity(false));
+            let backward = builder.import_program(identity(!uses_call));
+            let inputs = types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+            let outputs = builder
+                .add_instruction(
+                    ArrayIrCustomFunction::from_rule_regions(CustomFunctionJvpRule::Absent, true),
+                    vec![primal, forward, backward],
+                    inputs.clone(),
+                    None,
+                )
+                .unwrap()
+                .to_vec();
+            let output = if uses_call { outputs[1] } else { inputs[0] };
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let linearize = |uses_call: bool| {
+            let linearization = program(uses_call)
+                .entry_region_ref()
+                .linearize_shared_for_rule(&[0, 1], DifferentiationRule::JvpForTranspose)
+                .unwrap();
+            let pullback = linearization.tangent().transpose_with_respect_to(&[0, 1], &[]).unwrap();
+            (linearization.tangent().to_string(), pullback)
+        };
+        let extent = |name: &str, extent: usize| {
+            let variable = DimensionVariable::new(name, DimensionBounds::new(1, Some(8)).unwrap());
+            ArrayIrValue::Dimension(DimensionValue::new(DimensionType::from(variable), extent).unwrap())
+        };
+
+        let (tangent, used) = linearize(true);
+        assert_eq!(
+            tangent,
+            indoc! {"
+                lambda %0:f32[n], %1:f32[m], %2:dimension<n ∈ [1, 8)>, %3:dimension<m ∈ [1, 8)> .
+                let %4:f32[n], %5:f32[m] = custom_function_transpose [leading_input_count=2, seed_geometry_count=2] %2 %3 %0 %1 [
+                    backward={
+                        lambda %0:f32[n], %1:f32[m] .
+                        in (%0, %1)
+                    },
+                ]
+                in (%5)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            used.to_string(),
+            indoc! {"
+                lambda %0:f32[m], %1:dimension<n ∈ [1, 8)>, %2:dimension<m ∈ [1, 8)> .
+                let %3:f32[n] = zero [type=f32[n]] %1
+                in (%3, %0)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            used.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()),
+                extent("n", 2),
+                extent("m", 3),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![0.0f32; 2]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap()),
+            ]),
+        );
+
+        // An effectful backward rule runs even when every seed is dead, so both zero seeds need the seed geometry.
+        let (_, dead) = linearize(false);
+        assert_eq!(
+            dead.to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:dimension<n ∈ [1, 8)>, %2:dimension<m ∈ [1, 8)>, %3:dimension<m ∈ [1, 8)> .
+                let %4:f32[n] = zero [type=f32[n]] %1
+                    %5:f32[m] = zero [type=f32[m]] %2
+                    %6:i32[] = const 1
+                    %7:dimension<extent ∈ [0, ∞)> = dimension_from_scalar [bounds=[0, ∞)] %6
+                    %8:f32[n] = add %0 %4
+                in (%8, %5)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -7874,300 +8041,6 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_function_differentiation_retained_rules_specialization_ownership() {
-        // The outer JVP rule calls the inner definition through a reference, so the outer rule's cached specialization
-        // retains the inner definition but not its caches, which only the inner handle owns.
-        let counters = Arc::new(RuleCounters::default());
-        let inner = CustomRuleRegistration::new(cube_definition(&counters, true, true));
-        let (retained_inner, retained_inner_caches) =
-            (Arc::downgrade(&inner.definition()), Arc::downgrade(&inner.caches()));
-        let inner_reference = inner.reference();
-        let outer = CustomRuleRegistration::new(TestDefinition::new("outer").with_jvp(move |primals, tangents| {
-            let r#type = primals[0].r#type().into_owned();
-            let operation = CustomFunctionOperation::new(inner_reference.clone());
-            let outputs = primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
-            Ok((outputs, vec![tangents[0].clone()]))
-        }));
-        let (retained_outer, retained_outer_caches) =
-            (Arc::downgrade(&outer.definition()), Arc::downgrade(&outer.caches()));
-        let program = custom_rule_program(&outer, ArrayType::scalar(DataType::F64));
-        let linearization = program.linearize().unwrap();
-        assert_eq!(counters.counts(), (0, 0, 0));
-        assert_eq!(outer.caches().jvp_specializations.len(), 1);
-
-        // Dropping the handles frees their caches, including the outer specialization that called the inner definition,
-        // while the staged programs keep both definitions alive until they are dropped as well.
-        drop((inner, outer));
-        assert!(retained_outer_caches.upgrade().is_none());
-        assert!(retained_inner_caches.upgrade().is_none());
-        assert!(retained_outer.upgrade().is_some());
-        drop((program, linearization));
-        assert!(retained_outer.upgrade().is_none());
-        assert!(retained_inner.upgrade().is_none());
-    }
-
-    #[test]
-    fn test_custom_function_differentiation_retained_rules_specialization_ownership_self_recursive() {
-        // The JVP rule calls its own definition through the weak handle of `new_cyclic`, so its cached specialization
-        // retains the definition. Only the handle owns the caches, so dropping it frees that specialization, and the
-        // definition itself lives exactly as long as the staged programs that call it.
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new_cyclic(|this| {
-            let (this, counters) = (this.clone(), counters.clone());
-            TestDefinition::new("recursive").with_jvp(move |primals, tangents| {
-                counters.jvp.fetch_add(1, Ordering::SeqCst);
-                let r#type = primals[0].r#type().into_owned();
-                let operation = CustomFunctionOperation::new(this.reference()?);
-                let outputs =
-                    primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
-                Ok((outputs, vec![primals[0].clone() * primals[0].clone() * tangents[0].clone()]))
-            })
-        });
-        let (retained_definition, retained_caches) =
-            (Arc::downgrade(&definition.definition()), Arc::downgrade(&definition.caches()));
-        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let linearization = program.linearize().unwrap();
-        assert_eq!(counters.counts(), (1, 0, 0));
-        assert_eq!(definition.caches().jvp_specializations.len(), 1);
-        assert_eq!(
-            linearization.primal().to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = custom_function [name=\"recursive\"] %0 [
-                    primal={
-                        lambda %0:f64[] .
-                        let %1:f64[] = mul %0 %0
-                            %2:f64[] = mul %1 %0
-                        in (%2)
-                    },
-                ]
-                    %2:f64[] = mul %0 %0
-                in (%1, %2)
-            "}
-            .trim_end(),
-        );
-        drop(definition);
-        assert!(retained_caches.upgrade().is_none());
-        assert!(retained_definition.upgrade().is_some());
-        drop((program, linearization));
-        assert!(retained_definition.upgrade().is_none());
-    }
-
-    #[test]
-    fn test_custom_function_differentiation_retained_rules_specialization_ownership_mutually_recursive() {
-        // The rules of `a` call `b` through a reference and the rules of `b` call `a` through its weak handle, which is
-        // how mutually recursive definitions are registered without a cycle: `b` is registered inside the `new_cyclic`
-        // closure of `a`. Filling both caches (the second-order linearization traces the rule of `b`) and then
-        // dropping both handles and every program must free every definition and cache.
-        let mut b = None;
-        let a = CustomRuleRegistration::new_cyclic(|a| {
-            let a = a.clone();
-            let registration =
-                CustomRuleRegistration::new(TestDefinition::new("b").with_jvp(move |primals, tangents| {
-                    let r#type = primals[0].r#type().into_owned();
-                    let operation = CustomFunctionOperation::new(a.reference()?);
-                    let outputs =
-                        primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
-                    Ok((outputs, vec![tangents[0].clone()]))
-                }));
-            let reference = registration.reference();
-            b = Some(registration);
-            TestDefinition::new("a").with_jvp(move |primals, tangents| {
-                let r#type = primals[0].r#type().into_owned();
-                let operation = CustomFunctionOperation::new(reference.clone());
-                let outputs =
-                    primals[0].context().bind(operation, vec![cube_program(&r#type)], &[primals[0].clone()])?;
-                Ok((outputs, vec![tangents[0].clone()]))
-            })
-        });
-        let b = b.unwrap();
-        let probes = [
-            (Arc::downgrade(&a.definition()), Arc::downgrade(&a.caches())),
-            (Arc::downgrade(&b.definition()), Arc::downgrade(&b.caches())),
-        ];
-        let program = custom_rule_program(&a, ArrayType::scalar(DataType::F64));
-        let first = program.linearize().unwrap();
-        let second = first.primal().linearize().unwrap();
-        assert_eq!(a.caches().jvp_specializations.len(), 1);
-        assert_eq!(b.caches().jvp_specializations.len(), 1);
-        drop((a, b));
-        assert!(probes.iter().all(|(_, caches)| caches.upgrade().is_none()));
-        drop((program, first, second));
-        assert!(probes.iter().all(|(definition, _)| definition.upgrade().is_none()));
-    }
-
-    #[test]
-    fn test_custom_function_differentiation_retained_rules_specialization_after_registration_drop() {
-        // Once the handle is dropped, the remaining calls trace their rules again on every derivative request, with
-        // results identical to the cached ones.
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
-        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let cached = program.linearize().unwrap().tangent().to_string();
-        drop(definition);
-        for expected_invocations in [2, 3] {
-            assert_eq!(program.linearize().unwrap().tangent().to_string(), cached);
-            assert_eq!(counters.counts(), (expected_invocations, 0, 0));
-        }
-
-        // A rule that requests its own specialization while it is being traced is rejected, with and without a live
-        // handle, and a rejected request leaves nothing in flight.
-        let definition = CustomRuleRegistration::new_cyclic(|this| {
-            let this = this.clone();
-            TestDefinition::new("reentrant").with_jvp(move |primals, tangents| {
-                let r#type = primals[0].r#type().into_owned();
-                let key = CustomRuleSpecializationKey {
-                    input_types: vec![r#type.clone()],
-                    output_types: vec![r#type],
-                    non_differentiated_count: 0,
-                    tangent_activity: vec![true],
-                    levels: Vec::new(),
-                    discharged: false,
-                };
-                this.reference()?
-                    .jvp_specialization(key)
-                    .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-                Ok((primals.to_vec(), tangents.to_vec()))
-            })
-        });
-        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let reentrant = "recursive request for a specialization that is already being produced on this thread";
-        assert_eq!(program.jvp().unwrap_err().to_string(), reentrant);
-        let retained = Arc::downgrade(&definition.definition());
-        drop(definition);
-        for _ in 0..2 {
-            assert_eq!(program.jvp().unwrap_err().to_string(), reentrant);
-            assert!(!retained.upgrade().unwrap().has_uncached_in_flight());
-        }
-    }
-
-    #[test]
-    fn test_custom_function_differentiation_retained_rules_specialization_eviction() {
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, false));
-        let jvp = |extent: usize| {
-            let x = Array::vector(vec![2f64; extent]).unwrap();
-            let tangent = Array::vector(vec![1f64; extent]).unwrap();
-            assert_eq!(
-                call_jvp(&definition, x, tangent),
-                Ok((
-                    vec![Array::vector(vec![8f64; extent]).unwrap()],
-                    vec![Array::vector(vec![4f64; extent]).unwrap()]
-                )),
-            );
-        };
-        let specialization = |extent: usize| {
-            let r#type = ArrayType::new_static(DataType::F64, [extent]);
-            let key = CustomRuleSpecializationKey {
-                input_types: vec![r#type.clone()],
-                output_types: vec![r#type],
-                non_differentiated_count: 0,
-                tangent_activity: vec![true],
-                levels: Vec::new(),
-                discharged: false,
-            };
-            Arc::downgrade(&definition.reference().jvp_specialization(key).unwrap())
-        };
-        let baseline = Arc::strong_count(&definition.definition());
-        let mut probes = Vec::new();
-        for extent in 1..=CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1 {
-            jvp(extent);
-            probes.push(specialization(extent));
-        }
-        assert_eq!(definition.caches().jvp_specializations.len(), CUSTOM_RULE_SPECIALIZATION_CAPACITY);
-        assert_eq!(counters.counts(), (CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1, 0, 0));
-
-        // Bounded caches bound the retained memory: the evicted specialization is freed, and no cached program retains
-        // the definition.
-        assert!(probes[0].upgrade().is_none());
-        assert!(probes[1..].iter().all(|probe| probe.upgrade().is_some()));
-        assert_eq!(Arc::strong_count(&definition.definition()), baseline);
-
-        // The evicted oldest specialization is traced again, while a resident one is reused.
-        jvp(1);
-        jvp(CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1);
-        assert_eq!(counters.counts(), (CUSTOM_RULE_SPECIALIZATION_CAPACITY + 2, 0, 0));
-    }
-
-    #[test]
-    fn test_custom_function_differentiation_retained_rules_specialization_retry_after_failure() {
-        // A failed specialization is not retained, so the next request invokes the rule again.
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let definition = CustomRuleRegistration::new(TestDefinition::new("flaky").with_jvp({
-            let attempts = attempts.clone();
-            move |primals, tangents| {
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return Err(ProgramError::InvalidArgument { message: "transient failure".to_string() });
-                }
-                let square = primals[0].clone() * primals[0].clone();
-                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
-            }
-        }));
-        let x = Array::scalar(2f64).unwrap();
-        let one = Array::scalar(1f64).unwrap();
-        assert_eq!(call_jvp(&definition, x.clone(), one.clone()).unwrap_err().to_string(), "transient failure");
-        assert!(definition.caches().jvp_specializations.is_empty());
-        for _ in 0..2 {
-            assert_eq!(
-                call_jvp(&definition, x.clone(), one.clone()),
-                Ok((vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(4f64).unwrap()])),
-            );
-        }
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn test_custom_function_differentiation_retained_rules_specialization_concurrent_cold_requests() {
-        // Both threads enter the rule before either finishes, so both derive the same cold specialization. The
-        // duplicate derivations produce one resident result, which later requests reuse.
-        let barrier = Arc::new(Barrier::new(2));
-        let invocations = Arc::new(AtomicUsize::new(0));
-        let definition = CustomRuleRegistration::new(TestDefinition::new("concurrent").with_jvp({
-            let barrier = barrier.clone();
-            let invocations = invocations.clone();
-            move |primals, tangents| {
-                if invocations.fetch_add(1, Ordering::SeqCst) < 2 {
-                    barrier.wait();
-                }
-                let square = primals[0].clone() * primals[0].clone();
-                Ok((vec![square.clone() * primals[0].clone()], vec![square * tangents[0].clone()]))
-            }
-        }));
-        let x = Array::scalar(2f64).unwrap();
-        let one = Array::scalar(1f64).unwrap();
-        let expected = (vec![Array::scalar(8f64).unwrap()], vec![Array::scalar(4f64).unwrap()]);
-        std::thread::scope(|scope| {
-            let threads = (0..2)
-                .map(|_| {
-                    let (definition, x, one) = (definition.clone(), x.clone(), one.clone());
-                    scope.spawn(move || call_jvp(&definition, x, one))
-                })
-                .collect::<Vec<_>>();
-            for thread in threads {
-                assert_eq!(thread.join().unwrap(), Ok(expected.clone()));
-            }
-        });
-        assert_eq!(invocations.load(Ordering::SeqCst), 2);
-        assert_eq!(definition.caches().jvp_specializations.len(), 1);
-        assert_eq!(call_jvp(&definition, x, one), Ok(expected));
-        assert_eq!(invocations.load(Ordering::SeqCst), 2);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn test_custom_function_differentiation_retained_rules_specialization_debug_recheck() {
-        // A region-transform cache hit re-derives the linearization in debug builds and compares renderings. The
-        // re-derivation reuses the retained specialization, so it neither invokes the rule nor changes the rendering.
-        let counters = Arc::new(RuleCounters::default());
-        let definition = CustomRuleRegistration::new(cube_definition(&counters, true, true));
-        let program = custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
-        let first = program.linearize().unwrap();
-        let second = program.linearize().unwrap();
-        assert_eq!(second.tangent().to_string(), first.tangent().to_string());
-        assert_eq!(counters.counts(), (1, 0, 0));
-    }
-
-    #[test]
     fn test_custom_function_transposition_jvp_rule() {
         // Differentiation replaces the call with its replayed rule before transposition, so only a direct transpose of
         // an un-linearized call reaches the operation, which rejects it.
@@ -8216,6 +8089,24 @@ mod tests {
         let definition = CustomRuleRegistration::new(member_cube_definition(&counters));
         let member = member_custom_rule_program(&definition, ArrayType::scalar(DataType::F64));
         let converted: ConvertedProgram = member.clone().into_unprojected().unwrap();
+        assert_eq!(
+            converted.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = custom_function [name=\"cube\"] %0 [
+                    primal={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                            %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // The rendering does not show that the call is lifted, which only its operation variant records.
         assert!(matches!(converted.instructions()[0].operation(), ArrayIrOperation::LiftedCustomFunction(_)));
         assert_eq!(counters.counts(), (0, 0, 0));
 
@@ -8300,8 +8191,9 @@ mod tests {
     fn test_custom_function_transpose() {
         let scalar_type = ArrayType::scalar(DataType::F64);
 
-        // A carrier with an attached backward rule attaches that rule as its only, dormant region, whose own effects
-        // decide whether transposition must run it.
+        // A carrier with an attached backward rule attaches that rule as its only, deferred rule region, whose own
+        // effects decide whether transposition must run it (and whether the carrier's application carries deferred
+        // work).
         let carrier =
             ArrayCustomFunctionTranspose::from_backward_region(1, vec![scalar_type.clone()], vec![scalar_type.clone()]);
         assert_eq!(carrier.name(), CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME);
@@ -8309,7 +8201,7 @@ mod tests {
         assert_eq!(carrier.input_tangent_types(), std::slice::from_ref(&scalar_type));
         assert_eq!(carrier.output_tangent_types(), std::slice::from_ref(&scalar_type));
         assert_eq!(carrier.rules(), None);
-        assert_eq!(carrier.region_slots(), &[RegionSlot::rule("backward")]);
+        assert_eq!(carrier.region_slots(), &[RegionSlot::deferred_rule("backward")]);
         assert!(!carrier.effects().summary().has_deferred_work());
         assert_eq!(carrier.to_string(), "custom_function_transpose [leading_input_count=1]");
 
@@ -8460,22 +8352,22 @@ mod tests {
             vec![scalar_type.clone()],
         );
         assert_eq!(
-            Operation::infer_output_types(&carrier, &[scalar_type.clone(), scalar_type.clone()], &[]),
+            carrier.infer_output_types(&[scalar_type.clone(), scalar_type.clone()], &[]),
             Ok(vec![scalar_type.clone()]),
         );
         assert_eq!(
-            Operation::infer_output_types(&carrier, &[scalar_type.clone()], &[]),
+            carrier.infer_output_types(&[scalar_type.clone()], &[]),
             Err(TypeError::invalid("expected 2 inputs but got 1")),
         );
         assert_eq!(
-            Operation::infer_output_types(&carrier, &[scalar_type.clone(), ArrayType::scalar(DataType::F32)], &[]),
+            carrier.infer_output_types(&[scalar_type.clone(), ArrayType::scalar(DataType::F32)], &[]),
             Err(TypeError::invalid(
                 "`custom_function_transpose` tangent input type signature mismatch: expected [f64[]] but got [f32[]]",
             )),
         );
         let region = RegionInterface::new(vec![scalar_type.clone()], vec![scalar_type.clone()], EffectClasses::NONE);
         assert_eq!(
-            Operation::infer_output_types(&carrier, &[scalar_type.clone(), scalar_type], std::slice::from_ref(&region)),
+            carrier.infer_output_types(&[scalar_type.clone(), scalar_type], std::slice::from_ref(&region)),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
         assert_eq!(counters.counts(), (0, 0, 0));
@@ -8957,7 +8849,7 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut backward = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let seed = backward.add_input(scalar_type.clone());
-        let invalid_extent = backward.add_constant(Array::scalar(-1_i32).unwrap().into());
+        let invalid_extent = backward.add_constant(Array::scalar(-1i32).unwrap().into());
         backward
             .add_instruction(
                 DimensionFromScalarOperation::new(DimensionVariable::new(
@@ -8990,11 +8882,14 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
-        let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
-        assert!(transposed.input_ids().is_empty());
-        assert!(transposed.output_ids().is_empty());
-        assert!(matches!(transposed.interpret(Vec::new()), Err(ProgramError::Concretization { message })
-            if message == "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range"));
+        // The unused carrier declares deferred work, so simplification keeps it and its backward effects still run.
+        for program in [program.clone(), program.simplified().unwrap()] {
+            let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
+            assert!(transposed.input_ids().is_empty());
+            assert!(transposed.output_ids().is_empty());
+            assert!(matches!(transposed.interpret(Vec::new()), Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range"));
+        }
     }
 
     #[test]
@@ -9307,11 +9202,12 @@ mod tests {
                     .unwrap()
             };
 
-        // The backward program is a dormant rule of the forward call, so the forward program carries no obligation.
-        // Transposition selects it, and its deferred work must be staged even though the ignored destination makes
-        // every accumulator unneeded, which would otherwise let the attached carrier skip its backward program.
+        // The backward program is a deferred rule of the carrier, so its deferred work makes the forward program carry
+        // an obligation. Transposition selects it, and its deferred work must be staged even though the ignored
+        // destination makes every accumulator unneeded, which would otherwise let the attached carrier skip its
+        // backward program.
         let program = attached_carrier_program(backward(&deferred_work));
-        assert!(!program.entry_region_ref().effects().has_deferred_work());
+        assert!(program.entry_region_ref().effects().has_deferred_work());
         let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
         assert_eq!(
             transposed.to_string(),
@@ -9323,14 +9219,40 @@ mod tests {
             .trim_end(),
         );
 
-        // Deferred work that exists only in a dormant alternative of the selected backward program (i.e., the rule
-        // region of a nested attached carrier) creates no obligation, so the backward program is still skipped.
+        // A nested attached carrier whose backward program has deferred work is itself an obligation, so the selected
+        // backward program is replayed and stages that carrier into the pullback, where it remains an obligation of any
+        // later transposition (rather than disappearing with the unneeded accumulators).
         let program = attached_carrier_program(backward(&|builder, reference, seed| {
             let nested = builder.import_program(backward(&deferred_work));
             builder
                 .add_instruction(attached_carrier.clone(), vec![nested], vec![reference, seed], None)
                 .unwrap();
         }));
+        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:ref<f64[]> .
+                let %2:f64[] = custom_function_transpose [leading_input_count=1] %1 %0 [
+                    backward={
+                        lambda %0:ref<f64[]>, %1:f64[] .
+                        let %2:f64[] = custom_function_transpose [name=\"ignored_zero_effect\", leading_input_count=1] %0 %1
+                        in (%1)
+                    },
+                ]
+                in ()
+            "}
+            .trim_end(),
+        );
+
+        // A nested attached carrier with a pure backward program is no obligation, so the backward program is skipped.
+        let program = attached_carrier_program(backward(&|builder, reference, seed| {
+            let nested = builder.import_program(backward(&|_, _, _| {}));
+            builder
+                .add_instruction(attached_carrier.clone(), vec![nested], vec![reference, seed], None)
+                .unwrap();
+        }));
+        assert!(!program.entry_region_ref().effects().has_deferred_work());
         let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Ignore]).unwrap();
         assert_eq!(
             transposed.to_string(),
