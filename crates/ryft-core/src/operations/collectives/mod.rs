@@ -204,7 +204,10 @@ pub(super) fn effective_collective_axis_size(
     axis_size: usize,
     groups: Option<&[Vec<usize>]>,
 ) -> Result<usize, TypeError> {
-    validate_collective_axis_size(operation_name, axis_size)?;
+    if axis_size == 0 {
+        return Err(TypeError::invalid(format!("`{operation_name}` axis size must be greater than zero")));
+    }
+
     let Some(groups) = groups else {
         return Ok(axis_size);
     };
@@ -256,17 +259,16 @@ pub(super) fn effective_collective_axis_size(
     Ok(group_size)
 }
 
-// TODO(eaplatanios): Review form here onwards.
-
 /// Resolves the static, non-zero size of the named axis bound by the active [`NamedAxes`] environment, failing fast
-/// with [`AxisError::UnboundAxisName`] when no enclosing binder binds `axis_name`. The collective capabilities bake the
-/// resolved size into their operation payloads at staging time, because their output shapes and payload validation
+/// with [`AxisError::UnboundAxisName`] when no enclosing binder binds `axis_name`. The collective capabilities bake
+/// the resolved size into their operation payloads at staging time, because their output shapes and payload validation
 /// depend on it while [`Operation::infer_output_types`] only sees input types.
 pub(super) fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str) -> Result<usize, ProgramError> {
-    let named_axis = context
+    match context
         .named_axis(axis_name)
-        .ok_or_else(|| AxisError::UnboundAxisName { name: axis_name.to_string() })?;
-    match named_axis.size() {
+        .ok_or_else(|| AxisError::UnboundAxisName { name: axis_name.to_string() })?
+        .size()
+    {
         Some(0) => {
             Err(TypeError::invalid(format!("collective axis `{axis_name}` must contain at least one participant"))
                 .into())
@@ -279,16 +281,7 @@ pub(super) fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str
     }
 }
 
-/// Rejects an invalid zero-participant collective before any multiplication, division, or remainder operation.
-pub(crate) fn validate_collective_axis_size(operation_name: &str, axis_size: usize) -> Result<(), TypeError> {
-    if axis_size == 0 {
-        Err(TypeError::invalid(format!("`{operation_name}` axis size must be greater than zero")))
-    } else {
-        Ok(())
-    }
-}
-
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review form here onwards.
 
 /// Validates the shared input contract of the linear collectives (exactly one statically shaped input, which may
 /// carry unreduced axes only when the collective accepts them) and returns the input's static dimensions.
@@ -424,7 +417,10 @@ macro_rules! linear_collective {
                 region_interfaces: &[RegionInterface<ArrayType>],
             ) -> Result<Vec<ArrayType>, TypeError> {
                 check_count!("region", region_interfaces, 0, TypeError);
-                validate_collective_axis_size($name_literal, self.axis_size)?;
+                // A zero-participant collective is rejected before any extent arithmetic divides by its size.
+                if self.axis_size == 0 {
+                    return Err(TypeError::invalid(format!("`{}` axis size must be greater than zero", $name_literal)));
+                }
                 let $dimensions = linear_collective_dimensions($name_literal, $accepts_unreduced, input_types)?;
                 let $infer_self = self;
                 let $input_type = &input_types[0];

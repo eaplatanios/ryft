@@ -53,7 +53,7 @@ use super::{
     infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
     jvp_shape_changing_collective_with_adjoint, linear_collective, linear_collective_dimensions,
     linear_collective_output_type, multiplied_collective_extent, resolve_named_axis_size, transpose_linear_collective,
-    validate_collective_axis_size, validate_explicit_collective_output_extents,
+    validate_explicit_collective_output_extents,
 };
 
 /// Named-axis variance carried by an all-gather result.

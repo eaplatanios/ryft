@@ -50,7 +50,7 @@ use super::{
     infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
     jvp_shape_changing_collective_with_adjoint, linear_collective, linear_collective_dimensions,
     linear_collective_output_type, require_collective_axis_extent, resolve_named_axis_size,
-    transpose_linear_collective, validate_collective_axis_size, validate_explicit_collective_output_extents,
+    transpose_linear_collective, validate_explicit_collective_output_extents,
 };
 
 /// Applies sum-scatter's reduction-state transition. Ordinary inputs preserve their variance metadata. An input that is

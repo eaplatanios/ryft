@@ -49,7 +49,7 @@ use super::{
     jvp_shape_changing_collective_with_adjoint, linear_collective, linear_collective_dimensions,
     linear_collective_output_type, multiplied_collective_extent, require_collective_axis_divisible,
     require_collective_axis_extent, resolve_named_axis_size, transpose_linear_collective,
-    validate_collective_axis_size, validate_explicit_collective_output_extents,
+    validate_explicit_collective_output_extents,
 };
 
 /// Infers the composite all-to-all contract.

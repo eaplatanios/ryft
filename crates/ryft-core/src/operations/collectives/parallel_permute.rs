@@ -33,7 +33,7 @@ use crate::tracing::{Tracer, TracingContext};
 
 use super::{
     interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,
-    resolve_named_axis_size, transpose_linear_collective, validate_collective_axis_size,
+    resolve_named_axis_size, transpose_linear_collective,
 };
 
 linear_collective! {
