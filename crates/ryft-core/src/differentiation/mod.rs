@@ -203,12 +203,12 @@ pub use rematerialization::{
     DOTS_SAVABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME, DotsSavable,
     DotsWithNoBatchDimensionsSavable, EVERYTHING_SAVABLE_POLICY_NAME, EverythingSavable, MemoryTransferStorage,
     NOTHING_SAVABLE_POLICY_NAME, NothingSavable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
-    OffloadDotsWithNoBatchDimensions, POLICY_FN_POLICY_NAME, PolicyFn, RematerializedFunction, ResidualSource,
-    SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME, SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME,
-    SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME, SAVE_FROM_BOTH_POLICIES_POLICY_NAME,
-    SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
-    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual, rematerialize,
-    saved_residuals,
+    OffloadDotsWithNoBatchDimensions, REMATERIALIZATION_POLICY_FN_POLICY_NAME, RematerializationPolicyFn,
+    RematerializedFunction, ResidualSource, SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME,
+    SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME, SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME,
+    SAVE_FROM_BOTH_POLICIES_POLICY_NAME, SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames,
+    SaveAnyNamesButThese, SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, SavedResidual,
+    rematerialize, saved_residuals,
 };
 pub use reverse::{
     CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentDestinations,

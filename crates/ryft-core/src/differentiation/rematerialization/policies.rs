@@ -1,7 +1,7 @@
 //! Built-in [`ResidualPolicy`]s of [`rematerialize`](super::rematerialize), which are the analogues of the
 //! [JAX checkpoint policies](https://docs.jax.dev/en/latest/gradient-checkpointing.html#list-of-policies) with
-//! full-word names, together with [`PolicyFn`] for policies defined by closures and [`MemoryTransferStorage`] for
-//! policies that offload the residuals that they save.
+//! full-word names, together with [`RematerializationPolicyFn`] for policies defined by closures and
+//! [`MemoryTransferStorage`] for policies that offload the residuals that they save.
 //!
 //! Every built-in policy recognizes the producers of a residual by their payload operations (refer to
 //! [`ResidualProducer::payload`]) rather than by their operation family, so the same policy works for every family,
@@ -492,8 +492,8 @@ pub const SAVE_FROM_BOTH_POLICIES_POLICY_NAME: &str = "save_from_both_policies";
 /// [`save_from_both_policies`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.save_from_both_policies.html).
 ///
 /// Unlike the other built-in policies, this policy declares no instantiations in other type universes, because its two
-/// policies may be defined for one universe only (e.g., [`PolicyFn`]s). Promoting a staged rematerialization that uses
-/// it to another universe therefore projects the types of its candidates (refer to
+/// policies may be defined for one universe only (e.g., [`RematerializationPolicyFn`]s). Promoting a staged
+/// rematerialization that uses it to another universe therefore projects the types of its candidates (refer to
 /// [`ResidualPolicyReference::lift`](crate::ResidualPolicyReference::lift)).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SaveFromBothPolicies<P1, P2> {
@@ -545,28 +545,29 @@ impl<T: 'static + Type, P1: ResidualPolicy<T>, P2: ResidualPolicy<T>> ResidualPo
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Default name for [`PolicyFn`].
-pub const POLICY_FN_POLICY_NAME: &str = "policy_fn";
+/// Default name for [`RematerializationPolicyFn`].
+pub const REMATERIALIZATION_POLICY_FN_POLICY_NAME: &str = "rematerialization_policy_fn";
 
 /// [`ResidualPolicy`] whose classifier is the provided closure, for policies that the built-in ones cannot express.
 /// The closure receives each candidate residual and returns its decision, possibly with a [`ResidualStorage`] of type
 /// `S`, or a rejection that forbids every placement of the residual. Policies that need different storages for
 /// different residuals can return [`ErasedResidualStorage`]s.
 ///
-/// A [`PolicyFn`] is defined for the type universe of the candidates that its closure accepts and declares no
-/// instantiations in other universes. Promoting a staged rematerialization that uses it to another universe therefore
-/// projects the types of its candidates (refer to
+/// Use this adapter for closure-defined policies, including closures that capture runtime configuration. Implement
+/// [`ResidualPolicy`] directly for a named, reusable policy type or for a policy that needs native instantiations in
+/// multiple type universes.
+///
+/// A [`RematerializationPolicyFn`] is defined for the type universe of the candidates that its closure accepts and
+/// declares no instantiations in other universes. Promoting a staged rematerialization that uses it to another universe
+/// therefore projects the types of its candidates (refer to
 /// [`ResidualPolicyReference::lift`](crate::ResidualPolicyReference::lift)).
 ///
 /// # Examples
 ///
 /// ```rust
-/// # use ryft_core::differentiation::rematerialization::PolicyFn;
-/// # use ryft_core::{ArrayType, NoStorage, ResidualDecision, ResidualRejection};
+/// # use ryft_core::{ArrayType, NoStorage, RematerializationPolicyFn, ResidualDecision, ResidualRejection};
 /// // Saves the residuals that have one producer and recomputes the ones that several producers may produce.
-/// let policy = PolicyFn::new::<ArrayType>(|candidate| {
+/// let policy = RematerializationPolicyFn::new::<ArrayType>(|candidate| {
 ///     Ok::<_, ResidualRejection>(match candidate.producers().len() {
 ///         1 => ResidualDecision::<NoStorage>::Save,
 ///         _ => ResidualDecision::Recompute,
@@ -575,8 +576,8 @@ pub const POLICY_FN_POLICY_NAME: &str = "policy_fn";
 /// .with_name("save_unique_producers");
 /// # let _ = policy;
 /// ```
-pub struct PolicyFn<F, S = NoStorage> {
-    /// Name of the policy.
+pub struct RematerializationPolicyFn<F, S = NoStorage> {
+    /// Name of this policy.
     name: Cow<'static, str>,
 
     /// Closure that classifies each candidate residual.
@@ -586,19 +587,19 @@ pub struct PolicyFn<F, S = NoStorage> {
     marker: PhantomData<fn() -> S>,
 }
 
-impl<F, S> PolicyFn<F, S> {
-    /// Creates a new [`PolicyFn`] named `policy_fn` whose classifier is `function`, which classifies candidates of the
-    /// type universe `T`.
+impl<F, S> RematerializationPolicyFn<F, S> {
+    /// Creates a new [`RematerializationPolicyFn`] named `rematerialization_policy_fn` whose classifier is `function`,
+    /// which classifies candidates of the type universe `T`.
     #[inline]
     pub fn new<T: 'static + Type>(function: F) -> Self
     where
         F: Fn(&ResidualCandidate<'_, T>) -> Result<ResidualDecision<S>, ResidualRejection>,
     {
-        Self { name: Cow::Borrowed(POLICY_FN_POLICY_NAME), function, marker: PhantomData }
+        Self { name: Cow::Borrowed(REMATERIALIZATION_POLICY_FN_POLICY_NAME), function, marker: PhantomData }
     }
 
-    /// Returns this [`PolicyFn`] with the provided name, which is used in diagnostics and in the rendering of the
-    /// operations that carry the policy.
+    /// Returns this [`RematerializationPolicyFn`] with the provided name, which is used in diagnostics and in the
+    /// rendering of the operations that carry the policy.
     #[inline]
     pub fn with_name<N: Into<Cow<'static, str>>>(mut self, name: N) -> Self {
         self.name = name.into();
@@ -606,22 +607,27 @@ impl<F, S> PolicyFn<F, S> {
     }
 }
 
-impl<F: Clone, S> Clone for PolicyFn<F, S> {
+impl<F: Clone, S> Clone for RematerializationPolicyFn<F, S> {
     #[inline]
     fn clone(&self) -> Self {
         Self { name: self.name.clone(), function: self.function.clone(), marker: PhantomData }
     }
 }
 
-impl<F, S> Debug for PolicyFn<F, S> {
+impl<F, S> Debug for RematerializationPolicyFn<F, S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("PolicyFn").field("name", &self.name).finish_non_exhaustive()
+        formatter
+            .debug_struct("RematerializationPolicyFn")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
     }
 }
 
-impl<T: 'static + Type, S: ResidualStorage<T>, F> ResidualPolicy<T> for PolicyFn<F, S>
-where
+impl<
+    T: 'static + Type,
+    S: ResidualStorage<T>,
     F: 'static + Send + Sync + Fn(&ResidualCandidate<'_, T>) -> Result<ResidualDecision<S>, ResidualRejection>,
+> ResidualPolicy<T> for RematerializationPolicyFn<F, S>
 {
     type Storage = S;
 
@@ -910,8 +916,9 @@ mod tests {
         assert!(matches!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Recompute)));
 
         // Rejections of either policy are returned as they are.
-        let rejecting =
-            PolicyFn::new::<ArrayIrType>(|_| Err::<ResidualDecision<NoStorage>, _>(ResidualRejection::new("rejected")));
+        let rejecting = RematerializationPolicyFn::new::<ArrayIrType>(|_| {
+            Err::<ResidualDecision<NoStorage>, _>(ResidualRejection::new("rejected"))
+        });
         let policy = SaveFromBothPolicies::new(NothingSavable, rejecting);
         assert_eq!(policy.classify(&candidate(&[sine()])).map(|_| ()), Err(ResidualRejection::new("rejected")));
         let policy = SaveFromBothPolicies::new(EverythingSavable, policy.second().clone());
@@ -936,26 +943,26 @@ mod tests {
     }
 
     #[test]
-    fn test_policy_fn() {
+    fn test_rematerialization_policy_fn() {
         // Saves the residuals that have one producer and recomputes the ones that several producers may produce.
-        let policy = PolicyFn::new::<ArrayIrType>(|candidate| {
+        let policy = RematerializationPolicyFn::new::<ArrayIrType>(|candidate| {
             Ok::<_, ResidualRejection>(match candidate.producers().len() {
                 1 => ResidualDecision::<NoStorage>::Save,
                 _ => ResidualDecision::Recompute,
             })
         });
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "policy_fn");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "rematerialization_policy_fn");
         assert_eq!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Save));
         assert_eq!(policy.classify(&candidate(&[sine(), dot()])), Ok(ResidualDecision::Recompute));
 
         // Names apply to clones too, and the closure does not render.
         let policy = policy.with_name("save_unique_producers");
         assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy.clone()), "save_unique_producers");
-        assert_eq!(format!("{policy:?}"), "PolicyFn { name: \"save_unique_producers\", .. }");
+        assert_eq!(format!("{policy:?}"), "RematerializationPolicyFn { name: \"save_unique_producers\", .. }");
 
         // Closures may return storages too.
         let host = Memory::Host { pinned: true };
-        let policy = PolicyFn::new::<ArrayIrType>(move |_| {
+        let policy = RematerializationPolicyFn::new::<ArrayIrType>(move |_| {
             Ok::<_, ResidualRejection>(ResidualDecision::SaveWith(MemoryTransferStorage::new(host)))
         });
         assert_eq!(

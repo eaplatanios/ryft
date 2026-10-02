@@ -2321,7 +2321,7 @@ mod tests {
     fn test_jit_call_residual_candidates_classify_through_callee_provenance() {
         use std::sync::{Arc, Mutex};
 
-        use ryft_core::PolicyFn;
+        use ryft_core::RematerializationPolicyFn;
 
         // `jit_call` reports positional output-region provenance, so a residual produced by a computed callee output
         // is classified through the callee to that output's own producer instead of to the opaque `jit_call`. The
@@ -2350,7 +2350,7 @@ mod tests {
             .unwrap();
         let names = Arc::new(Mutex::new(Vec::new()));
         let recorded = names.clone();
-        let policy = PolicyFn::new::<ArrayIrType>(move |candidate| {
+        let policy = RematerializationPolicyFn::new::<ArrayIrType>(move |candidate| {
             let names = candidate.producers().iter().map(|producer| producer.name().to_string());
             recorded.lock().unwrap().extend(names);
             Ok::<_, ResidualRejection>(ResidualDecision::<NoStorage>::Save)

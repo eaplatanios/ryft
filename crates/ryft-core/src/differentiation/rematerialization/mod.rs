@@ -74,20 +74,21 @@
 //!
 //! ## Custom Policies
 //!
-//! [`PolicyFn`] defines a policy through a closure that classifies each candidate residual (e.g., by the payloads of
-//! the operations that may produce it; refer to [`ResidualProducer::payload`](crate::ResidualProducer::payload)):
+//! [`RematerializationPolicyFn`] defines a policy through a closure that classifies each candidate residual (e.g., by
+//! the payloads of the operations that may produce it; refer to
+//! [`ResidualProducer::payload`](crate::ResidualProducer::payload)):
 //!
 //! ```rust
 //! # use ryft_core::{
-//! #     Array, ArrayOperation, ArrayType, DataType, NoStorage, PolicyFn, ProgramError, ResidualDecision,
-//! #     ResidualSource, ResidualRejection, SavedResidual, Sin, SinOperation, TracingContext, rematerialize,
-//! #     saved_residuals,
+//! #     Array, ArrayOperation, ArrayType, DataType, NoStorage, ProgramError, RematerializationPolicyFn,
+//! #     ResidualDecision, ResidualRejection, ResidualSource, SavedResidual, Sin, SinOperation, TracingContext,
+//! #     rematerialize, saved_residuals,
 //! # };
 //! # fn main() -> Result<(), ProgramError> {
 //! # type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 //!
 //! // Saves the sines and recomputes everything else.
-//! let policy = PolicyFn::new::<ArrayType>(|candidate| {
+//! let policy = RematerializationPolicyFn::new::<ArrayType>(|candidate| {
 //!     let producers = candidate.producers();
 //!     let saved = producers.iter().any(|producer| producer.payload::<SinOperation<ArrayType>>().is_some());
 //!     let decision = if saved { ResidualDecision::<NoStorage>::Save } else { ResidualDecision::Recompute };
@@ -208,10 +209,11 @@ pub use policies::{
     DOTS_SAVABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME, DotsSavable,
     DotsWithNoBatchDimensionsSavable, EVERYTHING_SAVABLE_POLICY_NAME, EverythingSavable, MemoryTransferStorage,
     NOTHING_SAVABLE_POLICY_NAME, NothingSavable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
-    OffloadDotsWithNoBatchDimensions, POLICY_FN_POLICY_NAME, PolicyFn, SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME,
-    SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME, SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME,
-    SAVE_FROM_BOTH_POLICIES_POLICY_NAME, SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames,
-    SaveAnyNamesButThese, SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
+    OffloadDotsWithNoBatchDimensions, REMATERIALIZATION_POLICY_FN_POLICY_NAME, RematerializationPolicyFn,
+    SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME, SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME,
+    SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME, SAVE_FROM_BOTH_POLICIES_POLICY_NAME,
+    SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
+    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
 };
 
 /// Rematerialized function, which [`rematerialize`] creates from a closure over [`DomainTracer`]s.
@@ -397,7 +399,7 @@ impl<Input, Output, Body, Policy: Debug> Debug for RematerializedFunction<Input,
 pub fn rematerialize<Input, Output, Body: Fn(Input) -> Result<Output, ProgramError>>(
     body: Body,
 ) -> RematerializedFunction<Input, Output, Body> {
-    // `PolicyReferences` of the default `NothingSaveable` policy, which every `RematerializedFunction` that does not
+    // `PolicyReferences` of the default `NothingSavable` policy, which every `RematerializedFunction` that does not
     // select a policy shares, so that all of their calls stage operations whose policies compare equal.
     static DEFAULT_POLICY_REFERENCES: LazyLock<Arc<PolicyReferences<NothingSavable>>> =
         LazyLock::new(|| Arc::new(PolicyReferences::new(NothingSavable)));
@@ -628,11 +630,18 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
         DimensionBounds, DimensionType, Memory, ShardingDimension,
     };
-    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
+    use std::collections::HashSet;
+
+    use crate::axes::{AxisError, AxisIndex};
+    use crate::batching::{
+        BatchAxis, BatchAxisSpecification, BatchedProgram, BatchingError, ProgramBatchingOutputAxesPolicy, batch,
+    };
     use crate::differentiation::differentiate_at;
-    use crate::operations::custom_function;
-    use crate::operations::{Cos, Dot, DotDimensionNumbers, Exp, MulOperation, ReferenceRead, Sin, SinOperation, Tag};
+    use crate::operations::{
+        Constant, ConvertElementType, Cos, Dot, DotDimensionNumbers, Exp, MulOperation, ReducePrecision, ReferenceRead,
+        Sin, SinOperation, Tag, custom_function,
+    };
     use crate::programs::{Program, ReferenceType};
     use crate::tracing::{Tracer, TracingContext};
 
@@ -667,12 +676,12 @@ mod tests {
     fn test_rematerialized_function_with_policy() {
         let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSavable);
         let program = trace(|x| function.call(x));
-        assert_eq!(operation(&program, 0).policy().name(), "dots_saveable");
+        assert_eq!(operation(&program, 0).policy().name(), DOTS_SAVABLE_POLICY_NAME);
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = rematerialize [policy=\"dots_saveable\"] %0 [
+                let %1:f64[] = rematerialize [policy=\"dots_savable\"] %0 [
                     body={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
@@ -685,15 +694,17 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_with_optimization_barrier() {
+        // Calls place an optimization barrier on all of their inputs by default, and the selection carries over to
+        // every staged call.
         let function = rematerialize(|x: TestTracer| Ok(x.sin()?));
         assert_eq!(
             operation(&trace(|x| function.call(x)), 0).optimization_barrier(),
-            &RematerializationOptimizationBarrier::All
+            &RematerializationOptimizationBarrier::All,
         );
         let function = function.with_optimization_barrier(RematerializationOptimizationBarrier::None);
         assert_eq!(
             operation(&trace(|x| function.call(x)), 0).optimization_barrier(),
-            &RematerializationOptimizationBarrier::None
+            &RematerializationOptimizationBarrier::None,
         );
         let function = function.with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![false]));
         assert_eq!(
@@ -730,13 +741,12 @@ mod tests {
                 in (%2)"},
         );
         assert_eq!(operation(&program, 0), operation(&program, 1));
-        assert_eq!(program.interpret(Array::scalar(0.5f64).unwrap()), Ok(Array::scalar(0.5f64.sin().sin()).unwrap()),);
+        assert_eq!(program.interpret(Array::scalar(0.5f64).unwrap()), Ok(Array::scalar(0.5f64.sin().sin()).unwrap()));
     }
 
     #[test]
     fn test_rematerialized_function_call_distinguishes_input_structures() {
-        // Regression test for review finding R1: calls whose inputs have the same flattened types but different
-        // structures trace separate bodies.
+        // Calls whose inputs have the same flattened types but different structures trace separate bodies.
         let function = rematerialize(|groups: Vec<Vec<TestTracer>>| {
             Ok(groups.into_iter().map(|group| group[0].clone()).collect::<Vec<_>>())
         });
@@ -759,9 +769,8 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_call_saves_the_values_that_its_policy_selects() {
-        // Regression test for review finding R3: saving dot products saves the dot product inside the recomputed
-        // computation of `x ↦ sin(x · x)`, rather than only choosing among the values that ordinary linearization
-        // would save.
+        // Saving dot products saves the dot product inside the recomputed computation of `x ↦ sin(x · x)`, rather than
+        // only choosing among the values that ordinary linearization would save.
         let x = Array::vector(vec![0.1f64, 0.2]).unwrap();
         let sine_of_dot = |x: TestTracer| -> Result<TestTracer, ProgramError> {
             Ok(x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.sin()?)
@@ -776,9 +785,8 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_call_saves_only_the_values_that_differentiation_needs() {
-        // Regression test for review findings R6 and R8: saving everything for `x ↦ exp(x)` saves only `exp(x)`, as
-        // differentiating `exp` directly does, and linearization saves the same values as reverse-mode
-        // differentiation, according to the policy.
+        // Saving everything for `x ↦ exp(x)` saves only `exp(x)`, as differentiating `exp` directly does, and
+        // linearization saves the same values as reverse-mode differentiation, according to the policy.
         let x = Array::scalar(0.7f64).unwrap();
         let (_, direct) = differentiate_at(x.clone()).vjp(|x| Ok(x.exp()?)).unwrap();
         let function = rematerialize(|x: TestTracer| Ok(x.exp()?)).with_policy(EverythingSavable);
@@ -794,7 +802,7 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_call_with_reference_inputs() {
-        // Regression test for review finding R5: batching a rematerialized call that reads a reference input succeeds.
+        // A rematerialized call that reads a reference input batches, with the reference mapped like the value.
         let function = rematerialize(|(reference, x): (TestIrTracer, TestIrTracer)| {
             let value = reference.read()?;
             let context = x.context().clone();
@@ -808,16 +816,36 @@ mod tests {
         )
         .unwrap();
         let extent = DimensionType::new("batch", DimensionBounds::new(2, Some(3)).unwrap());
-        let batched = program.into_flat_program().batched_with_threaded_extent(
-            extent,
-            ShardingDimension::Replicated,
-            &[BatchAxis::new(0), BatchAxis::new(0)],
-            ProgramBatchingOutputAxesPolicy::Natural,
+        let (batched, _) = program
+            .into_flat_program()
+            .batched_with_threaded_extent(
+                extent,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:dimension<2>, %1:ref<f32[2]>, %2:f32[2] .
+                let %3:f32[2] = rematerialize %0 %1 %2 [
+                    body={
+                        lambda %0:dimension<2>, %1:ref<f32[2]>, %2:f32[2] .
+                        let %3:f32[2] = reference_read %1
+                            %4:f32[2] = mul %3 %2
+                        in (%4)
+                    },
+                ]
+                in (%0, %3)"},
         );
-        assert!(batched.is_ok());
+    }
 
-        // Regression test for review finding R7: an unused reference input does not make reverse-mode differentiation
-        // save the values that the call recomputes.
+    #[test]
+    fn test_rematerialized_function_call_with_an_unused_reference_input() {
+        // An unused reference input does not make reverse-mode differentiation save the values that the call
+        // recomputes.
         let sine_of_square = |x: TestIrTracer| -> Result<TestIrTracer, ProgramError> {
             let context = x.context().clone();
             let square = ArrayIrOperation::Array(ArrayOperation::<Array>::Mul(MulOperation::new()));
@@ -833,6 +861,61 @@ mod tests {
         let (_, with_reference) = differentiate_at((reference, x.clone())).vjp(|inputs| function.call(inputs)).unwrap();
         assert_eq!(without_reference.residuals(), &[x.clone()]);
         assert_eq!(with_reference.residuals(), &[x]);
+    }
+
+    #[test]
+    fn test_rematerialized_function_call_named_axes() {
+        // The body is traced in a fresh trace that is seeded with the named axes in scope where the function is
+        // called, so a call under `batch` resolves the batch axis `items` (`x ↦ x · i` at batch item `i`), while a call
+        // outside of it cannot.
+        let function = rematerialize(|x: TestTracer| {
+            let index = x.context().axis_index("items")?.convert_element_type(DataType::F64)?;
+            Ok(x * index)
+        });
+        let traced = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |x| function.call(x),
+            ArrayType::scalar(DataType::F64),
+        );
+        assert_eq!(
+            traced.map(|_| ()),
+            Err(BatchingError::Axis(AxisError::UnboundAxisName { name: "items".to_string() }).into()),
+        );
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |x| {
+                let items = BatchAxisSpecification::named("items");
+                Ok(batch(|x| function.call(x), x, BatchAxis::new(0), BatchAxis::new(0), items)?)
+            },
+            ArrayType::new_static(DataType::F64, [3]),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[3] = rematerialize %0 [
+                    body={
+                        lambda %0:f64[3] .
+                        let %1:u64[3] = iota [type=u64[3], dimension=0]
+                            %2:f64[3] = convert_element_type [data_type=f64] %1
+                            %3:f64[3] = mul %0 %2
+                        in (%3)
+                    },
+                ]
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_rematerialized_function_call_body_error() {
+        // An error that the body returns while it is traced is the error of the call.
+        let function = rematerialize(|_: TestTracer| -> Result<TestTracer, ProgramError> {
+            Err(ProgramError::InvalidArgument { message: "the body failed".to_string() })
+        });
+        let traced = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |x| function.call(x),
+            ArrayType::scalar(DataType::F64),
+        );
+        assert_eq!(traced.map(|_| ()), Err(ProgramError::InvalidArgument { message: "the body failed".to_string() }));
     }
 
     #[test]
@@ -865,6 +948,45 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialized_function_call_in_context_type_universes() {
+        // A function without inputs can be called in several type universes. Each universe gets its own reference to
+        // the policy of the function, which its later calls reuse, so that repeated calls in one universe stage equal
+        // operations.
+        let function = rematerialize(|(): ()| Ok(()));
+        let array_context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        function.call_in_context(&array_context, ()).unwrap();
+        function.call_in_context(&array_context, ()).unwrap();
+        let array_operations = array_context
+            .builder()
+            .borrow()
+            .instructions()
+            .iter()
+            .map(|instruction| match instruction.operation() {
+                ArrayOperation::Rematerialize(operation) => operation.clone(),
+                operation => panic!("expected a `rematerialize` operation but got `{operation}`"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(array_operations.len(), 2);
+        assert_eq!(array_operations[0], array_operations[1]);
+        let ir_context = TracingContext::<TestIrValue, TestIrOperation>::new();
+        function.call_in_context(&ir_context, ()).unwrap();
+        function.call_in_context(&ir_context, ()).unwrap();
+        let ir_operations = ir_context
+            .builder()
+            .borrow()
+            .instructions()
+            .iter()
+            .map(|instruction| match instruction.operation() {
+                ArrayIrOperation::Rematerialize(operation) => operation.clone(),
+                operation => panic!("expected a `rematerialize` operation but got `{operation}`"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ir_operations.len(), 2);
+        assert_eq!(ir_operations[0], ir_operations[1]);
+        assert_ne!(ir_operations[0].policy().id(), array_operations[0].policy().id());
+    }
+
+    #[test]
     fn test_rematerialized_function_clone() {
         // Clones share the reference to the policy of the function, so their calls stage equal operations.
         let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSavable);
@@ -884,7 +1006,7 @@ mod tests {
             .with_optimization_barrier(RematerializationOptimizationBarrier::None);
         assert_eq!(
             format!("{function:?}"),
-            "RematerializedFunction { policy: NothingSaveable, optimization_barrier: None, .. }",
+            "RematerializedFunction { policy: NothingSavable, optimization_barrier: None, .. }",
         );
     }
 
@@ -895,7 +1017,22 @@ mod tests {
         let identity = rematerialize(|x: TestTracer| Ok(x));
         let program = trace(|x| identity.call(sine.call(x)?));
         assert_eq!(operation(&program, 0), operation(&program, 1));
-        assert_eq!(operation(&program, 0).policy().name(), "nothing_saveable");
+        assert_eq!(operation(&program, 0).policy().name(), NOTHING_SAVABLE_POLICY_NAME);
+    }
+
+    #[test]
+    fn test_residual_source() {
+        let sources = HashSet::from([
+            ResidualSource::Input { index: 0 },
+            ResidualSource::Constant,
+            ResidualSource::Tag { key: "dot".to_owned() },
+            ResidualSource::Operation { name: "cos" },
+        ]);
+        assert_eq!(sources.len(), 4);
+        assert!(sources.contains(&ResidualSource::Tag { key: "dot".to_owned() }));
+        assert!(!sources.contains(&ResidualSource::Input { index: 1 }));
+        assert!(!sources.contains(&ResidualSource::Tag { key: "sin".to_owned() }));
+        assert!(!sources.contains(&ResidualSource::Operation { name: "sin" }));
     }
 
     #[test]
@@ -904,10 +1041,26 @@ mod tests {
         let residual = SavedResidual::new(scalar_type.clone(), ResidualSource::Input { index: 1 });
         assert_eq!(residual.r#type().as_ref(), &scalar_type);
         assert_eq!(residual.source(), &ResidualSource::Input { index: 1 });
-        assert_eq!(residual.to_string(), "f32[] from the input 1");
+
+        // Saved residuals compare and hash by their type and their source.
+        let residuals = HashSet::from([residual.clone()]);
+        assert!(residuals.contains(&residual));
+        let other_source = SavedResidual::new(scalar_type.clone(), ResidualSource::Input { index: 0 });
+        let other_type = SavedResidual::new(ArrayType::scalar(DataType::F64), ResidualSource::Input { index: 1 });
+        assert!(!residuals.contains(&other_source));
+        assert!(!residuals.contains(&other_type));
+    }
+
+    #[test]
+    fn test_saved_residual_display() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        assert_eq!(
+            SavedResidual::new(scalar_type.clone(), ResidualSource::Input { index: 1 }).to_string(),
+            "f32[] from the input 1",
+        );
         assert_eq!(
             SavedResidual::new(scalar_type.clone(), ResidualSource::Constant).to_string(),
-            "f32[] from a constant"
+            "f32[] from a constant",
         );
         assert_eq!(
             SavedResidual::new(scalar_type.clone(), ResidualSource::Tag { key: "dot".to_owned() }).to_string(),
@@ -954,7 +1107,7 @@ mod tests {
                 input,
                 SavedResidual::new(
                     scalar_type.clone().with_memory(host),
-                    ResidualSource::Tag { key: "dot".to_owned() }
+                    ResidualSource::Tag { key: "dot".to_owned() },
                 ),
             ]),
         );
@@ -981,6 +1134,42 @@ mod tests {
                 SavedResidual::new(bf16_type.clone(), ResidualSource::Operation { name: "cos" }),
                 SavedResidual::new(bf16_type, ResidualSource::Operation { name: "sin" }),
             ]),
+        );
+
+        // Inputs are reported at their positions among the flattened inputs of the function (`x · y` saves `y` for the
+        // tangent of `x` before `x` for the tangent of `y`). Constants are re-created rather than saved, so a value is
+        // reported as a constant only when it is computed from one by an operation that is looked through, such as the
+        // rounding of `3` to `bf16` precision below.
+        assert_eq!(
+            saved_residuals(|(x, y): (TestTracer, TestTracer)| Ok(x * y), (scalar_type.clone(), scalar_type.clone())),
+            Ok(vec![
+                SavedResidual::new(scalar_type.clone(), ResidualSource::Input { index: 1 }),
+                SavedResidual::new(scalar_type.clone(), ResidualSource::Input { index: 0 }),
+            ]),
+        );
+        assert_eq!(
+            saved_residuals(
+                |x: TestTracer| {
+                    let constant = x.context().constant(Array::scalar(3.0f64).unwrap())?.reduce_precision(8, 7)?;
+                    Ok(x.sin()? * constant)
+                },
+                scalar_type.clone(),
+            ),
+            Ok(vec![
+                SavedResidual::new(scalar_type.clone(), ResidualSource::Operation { name: "cos" }),
+                SavedResidual::new(scalar_type.clone(), ResidualSource::Constant),
+            ]),
+        );
+
+        // Errors that tracing the function raises are reported as they are.
+        assert_eq!(
+            saved_residuals(
+                |_: TestTracer| -> Result<TestTracer, ProgramError> {
+                    Err(ProgramError::InvalidArgument { message: "the function failed".to_string() })
+                },
+                scalar_type,
+            ),
+            Err(ProgramError::InvalidArgument { message: "the function failed".to_string() }),
         );
     }
 }
