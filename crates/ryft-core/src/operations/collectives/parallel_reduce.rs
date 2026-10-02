@@ -12,6 +12,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::arithmetic::DivOperation;
 use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, ParallelVary, ParallelVaryOperation};
+use crate::operations::collectives::{effective_collective_axis_size, resolve_named_axis_size};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::memory::TransferToMemory;
@@ -20,11 +21,6 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Value};
 
 // TODO(eaplatanios): Review from here onwards.
-
-use super::{effective_collective_axis_size, resolve_named_axis_size};
-
-/// Name of [`ParallelReduceOperation`]. The operation's [`ParallelReductionKind`] is rendered as its `kind` attribute.
-pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
 
 /// Combining operator of a [`ParallelReduceOperation`], which also determines the operation's name. Every kind combines
 /// the values that the participants of a named axis hold into one result that each participant holds in full, and every
@@ -78,6 +74,9 @@ impl Display for ParallelReductionKind {
         write!(formatter, "{}", self.name())
     }
 }
+
+/// Name of [`ParallelReduceOperation`]. The operation's [`ParallelReductionKind`] is rendered as its `kind` attribute.
+pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
 
 /// [`Operation`] that reduces a value across the participants of a named axis using a [`ParallelReductionKind`],
 /// leaving every participant with the full result. Refer to the documentation of [`ParallelReduce`] for more
