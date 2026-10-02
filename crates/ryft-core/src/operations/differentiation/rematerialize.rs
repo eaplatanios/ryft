@@ -481,14 +481,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Batching batches the body with its natural output axes and binds the same call over the batched body. Any
-// `BatchingPolicy::boundary_inputs` (e.g., the first-class mapped extent of a composite program) become additional
-// leading instruction inputs, and therefore leading body inputs, of the batched call, whose tangents are zero-space. As
-// for `linear_call`, a completely replicated call at an unnamed batching level is bound unchanged, and the body is
-// specialized to the packed input types, so that type views that agree only for dense batches (e.g., ragged inputs
-// packed at their declared bounds) reconcile with the exact interface that inference requires.
 impl<T: 'static + Type, C: Context<Type = T, Operation: From<RematerializeOperation<T>>>, P: BatchingPolicy<C>>
     BatchableOperation<C, P> for RematerializeOperation<T>
 {
@@ -498,6 +490,13 @@ impl<T: 'static + Type, C: Context<Type = T, Operation: From<RematerializeOperat
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // Batching batches the body with its natural output axes and binds the same call over the batched body.
+        // Any aBatchingPolicy::boundary_inputs` (e.g., the first-class mapped extent of a composite program) become
+        // additional leading instruction inputs, and therefore leading body inputs, of the batched call, whose tangents
+        // are zero-space. As for `linear_call`, a completely replicated call at an unnamed batching level is bound
+        // unchanged, and the body is specialized to the packed input types, so that type views that agree only for
+        // dense batches (e.g., ragged inputs packed at their declared bounds) reconcile with the exact interface that
+        // inference requires.
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
         if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
@@ -505,7 +504,6 @@ impl<T: 'static + Type, C: Context<Type = T, Operation: From<RematerializeOperat
             let outputs = context.parent().bind(self.clone(), regions, input_values.as_slice())?;
             return Ok(outputs.into_iter().map(P::replicated).collect::<Vec<_>>().into());
         }
-
         let body = driver.region(0)?;
         let batched_body =
             driver.batch_program(context, body, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
@@ -539,23 +537,15 @@ impl<T: 'static + Type, C: Context<Type = T, Operation: From<RematerializeOperat
     }
 }
 
-// Differentiation follows JAX's `remat_jvp`. The body is differentiated with respect to the inputs that have live
-// tangents (structural zeros get no tangent slot, as JAX drops symbolic-zero tangents), and the driver decides whether
-// that uses the `jvp` or the `jvp_for_transpose` rules of the body, so the default `jvp_for_transpose` of this
-// operation delegates here. When the primal and tangent contexts are shared, the call is bound over the fused
-// derivative program with its incoming flags, which interprets it in eager contexts and keeps the rematerialization
-// boundary in staged ones, for later transforms. Otherwise (e.g., for linearization and reverse-mode differentiation),
-// the fused program is partitioned with this call's residual policy: its known program computes the primal outputs
-// together with the values that the policy saves in the primal context, and its residual program recomputes everything
-// else in the tangent context as a differentiated call.
-impl<C> DifferentiableOperation<C> for RematerializeOperation<C::Type>
-where
+impl<
     C: Context<
             Type: 'static + DifferentiableType,
             Operation: From<RematerializeOperation<C::Type>>
                            + OperationPayloadProjection
                            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
         >,
+> DifferentiableOperation<C> for RematerializeOperation<C::Type>
+where
     for<'t> &'t ArrayType: TryFrom<&'t C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -564,6 +554,16 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // Differentiation follows JAX's `remat_jvp`. The body is differentiated with respect to the inputs that have
+        // live tangents (structural zeros get no tangent slot, as JAX drops symbolic-zero tangents), and the driver
+        // decides whether that uses the `jvp` or the `jvp_for_transpose` rules of the body, so the default
+        // `jvp_for_transpose` of this operation delegates here. When the primal and tangent contexts are shared, the
+        // call is bound over the fused derivative program with its incoming flags, which interprets it in eager
+        // contexts and keeps the rematerialization boundary in staged ones, for later transforms. Otherwise (e.g., for
+        // linearization and reverse-mode differentiation), the fused program is partitioned with this call's residual
+        // policy: its known program computes the primal outputs together with the values that the policy saves in the
+        // primal context, and its residual program recomputes everything else in the tangent context as a
+        // differentiated call.
         let body = driver.region(0)?;
         let output_count = body.output_types().len();
         check_count!("input", inputs, body.input_types().len(), ProgramError);
@@ -592,6 +592,7 @@ where
         let fused_operation = self.with_remapped_optimization_barrier(|selected| {
             selected.iter().copied().chain(std::iter::repeat_n(true, active_input_indices.len())).collect()
         });
+
         let mut outputs = if std::ptr::eq(context.primal(), context.tangent()) {
             context.primal().bind(fused_operation, vec![(*fused).clone()], fused_inputs.as_slice())?
         } else {
@@ -614,6 +615,7 @@ where
                 Ok(context.tangent().bind(residual_operation, vec![program.clone()], inputs.as_slice())?)
             })?
         };
+
         check_count!(
             "output",
             outputs,
@@ -632,15 +634,7 @@ where
     }
 }
 
-// Transposition follows JAX's `remat_transpose`. The body is transposed with respect to the unknown (i.e., linear)
-// inputs, and the call is bound with its incoming flags and policy over the transposed body, so that the backward
-// computation keeps its rematerialization boundary and higher-order derivatives keep rematerializing. Any work over the
-// known inputs of the body (e.g., values that the residual program recomputes from the saved ones) is replayed inside
-// the transposed body. The transposed call consumes the cotangents of the non-reference outputs, the cotangent
-// references of the reference inputs whose state cotangents are live, and the known inputs, in that order, and it
-// produces the cotangents of the linear inputs that return one.
-impl<V, O> TransposableOperation<V, O> for RematerializeOperation<V::Type>
-where
+impl<
     V: Value<Type: 'static + DifferentiableType + ReferenceMemberType>,
     O: Operation<Type = V::Type>
         + From<AddOperation<V::Type>>
@@ -651,6 +645,7 @@ where
             ReferenceNewOperation<<V::Type as ReferenceMemberType>::Referent, V::Type>,
             Operation = O,
         >,
+> TransposableOperation<V, O> for RematerializeOperation<V::Type>
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -660,6 +655,14 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
+        // Transposition follows JAX's `remat_transpose`. The body is transposed with respect to the unknown (i.e.,
+        // linear) inputs, and the call is bound with its incoming flags and policy over the transposed body,
+        // so that the backward computation keeps its rematerialization boundary and higher-order derivatives keep
+        // rematerializing. Any work over the known inputs of the body (e.g., values that the residual program
+        // recomputes from the saved ones) is replayed inside the transposed body. The transposed call consumes the
+        // cotangents of the non-reference outputs, the cotangent references of the reference inputs whose state
+        // cotangents are live, and the known inputs, in that order, and it produces the cotangents of the linear
+        // inputs that return one.
         let body = driver.region(0)?;
         check_count!("input", inputs, body.input_types().len(), ProgramError);
         check_count!("output", outputs, body.output_types().len(), ProgramError);
@@ -701,8 +704,8 @@ where
         let cotangent_input_count = call_inputs.len();
         call_inputs.extend(known_inputs);
 
-        // The optimization barrier of the transposed call selects every cotangent input, followed by the selection of
-        // the known inputs.
+        // The optimization barrier of the transposed call selects every cotangent input, followed by the selection
+        // of the known inputs.
         let operation = self.with_remapped_optimization_barrier(|selected| {
             std::iter::repeat_n(true, cotangent_input_count)
                 .chain(
