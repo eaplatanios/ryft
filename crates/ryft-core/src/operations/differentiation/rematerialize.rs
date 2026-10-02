@@ -390,20 +390,9 @@ impl<C: Domain<Type: 'static>> InterpretableOperation<C> for RematerializeOperat
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Partial evaluation follows JAX's `remat_partial_eval`. A call whose inputs are all known folds whole, which keeps the
-// rematerialization boundary in the known-side context. Otherwise, the body is partitioned by input knownness with this
-// call's residual policy, which decides which known values the residual side receives and which ones it recomputes. The
-// known program is then replayed in the known-side context (i.e., hoisted out of the call), and the residual program
-// becomes a differentiated call. Partitioning a call that is already differentiated (e.g., the residual side of a
-// linearization, whose known inputs are the saved values) therefore re-plans its body with the same policy rather
-// than hoisting its recomputation. A body with effects, deferred work, or references stays whole instead, because
-// replaying its known side outside of the call would bypass the effect ordering and the reference placement of the
-// active partial evaluation, as for `jit_call`.
-impl<C> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::Type>
+impl<C: Context<Type: 'static, Operation: From<RematerializeOperation<C::Type>> + OperationPayloadProjection>>
+    PartiallyEvaluatableOperation<C> for RematerializeOperation<C::Type>
 where
-    C: Context<Type: 'static, Operation: From<RematerializeOperation<C::Type>> + OperationPayloadProjection>,
     for<'t> &'t ArrayType: TryFrom<&'t C::Type>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
@@ -412,6 +401,15 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // Partial evaluation follows JAX's `remat_partial_eval`. A call whose inputs are all known folds whole, which
+        // keeps the rematerialization boundary in the known-side context. Otherwise, the body is partitioned by input
+        // knownness with this call's residual policy, which decides which known values the residual side receives and
+        // which ones it recomputes. The known program is then replayed in the known-side context (i.e., hoisted out of
+        // the call), and the residual program becomes a differentiated call. Partitioning a call that is already
+        // differentiated (e.g., the residual side of a linearization, whose known inputs are the saved values)
+        // therefore re-plans its body with the same policy rather than hoisting its recomputation. A body with effects,
+        // deferred work, or references stays whole instead, because replaying its known side outside of the call would
+        // bypass the effect ordering and the reference placement of the active partial evaluation, as for `jit_call`.
         let body = driver.region(0)?;
         check_count!("input", inputs, body.input_types().len(), ProgramError);
         let effects = body.effects();
@@ -432,6 +430,7 @@ where
         }
 
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
+
         // Look through memory transfers so offloaded residuals are rounded before they are offloaded.
         let partition = driver
             .partition_program(&context.clone().with_residual_policy(&self.policy), body, &input_known)?
@@ -481,6 +480,8 @@ where
             .collect())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // Batching batches the body with its natural output axes and binds the same call over the batched body. Any
 // `BatchingPolicy::boundary_inputs` (e.g., the first-class mapped extent of a composite program) become additional
