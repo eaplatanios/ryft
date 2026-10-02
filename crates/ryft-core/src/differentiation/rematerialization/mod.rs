@@ -179,6 +179,7 @@
 //! ```
 
 use std::any::{Any, TypeId};
+use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -379,7 +380,6 @@ impl<Input, Output, Body: Clone, Policy> Clone for RematerializedFunction<Input,
 }
 
 impl<Input, Output, Body, Policy: Debug> Debug for RematerializedFunction<Input, Output, Body, Policy> {
-    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RematerializedFunction")
@@ -409,10 +409,7 @@ pub fn rematerialize<Input, Output, Body: Fn(Input) -> Result<Output, ProgramErr
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Source of a value that differentiation saves for the backward computation of a function (refer to
-/// [`saved_residuals`]).
+/// Source of a value that differentiation saves for the backward computation of a function.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ResidualSource {
     /// Input of the function at the provided index among its flattened inputs.
@@ -421,10 +418,10 @@ pub enum ResidualSource {
         index: usize,
     },
 
-    /// Constant of the function.
+    /// Constant defined in the function's body.
     Constant,
 
-    /// Value tagged with the provided key (refer to [`Tag`](crate::Tag)).
+    /// Value tagged with the provided key. Refer to [`Tag`](crate::Tag) for more information on tagging.
     Tag {
         /// Key of the tag.
         key: String,
@@ -437,33 +434,25 @@ pub enum ResidualSource {
     },
 }
 
-/// Value that differentiation saves for the backward computation of a function, together with its
-/// [`ResidualSource`], which [`saved_residuals`] reports. It renders like the entries that JAX's
-/// [`print_saved_residuals`](https://docs.jax.dev/en/latest/gradient-checkpointing.html#inspecting-residuals-with-jax-ad-checkpoint-print-saved-residuals)
-/// prints (e.g., `f32[3] from the input 0` or ``f32[] tagged `dot` ``).
+/// Value that differentiation saves for the backward computation of a function, together with its [`ResidualSource`],
+/// which [`saved_residuals`] reports.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SavedResidual<T: Type> {
     /// Type of the saved value.
-    residual_type: T,
+    r#type: T,
 
     /// Source of the saved value.
     source: ResidualSource,
 }
 
 impl<T: Type> SavedResidual<T> {
-    /// Creates a new [`SavedResidual`] of type `residual_type` with the provided source.
+    /// Creates a new [`SavedResidual`] of the provided type with the provided source.
     #[inline]
-    pub fn new(residual_type: T, source: ResidualSource) -> Self {
-        Self { residual_type, source }
+    pub fn new(r#type: T, source: ResidualSource) -> Self {
+        Self { r#type, source }
     }
 
-    /// Returns the type of the saved value.
-    #[inline]
-    pub fn residual_type(&self) -> &T {
-        &self.residual_type
-    }
-
-    /// Returns the source of the saved value.
+    /// Returns the [`ResidualSource`] of the saved value.
     #[inline]
     pub fn source(&self) -> &ResidualSource {
         &self.source
@@ -473,20 +462,29 @@ impl<T: Type> SavedResidual<T> {
 impl<T: Type> Display for SavedResidual<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.source {
-            ResidualSource::Input { index } => write!(formatter, "{} from the input {index}", self.residual_type),
-            ResidualSource::Constant => write!(formatter, "{} from a constant", self.residual_type),
-            ResidualSource::Tag { key } => write!(formatter, "{} tagged `{key}`", self.residual_type),
-            ResidualSource::Operation { name } => write!(formatter, "{} output of `{name}`", self.residual_type),
+            ResidualSource::Input { index } => write!(formatter, "{} from the input {index}", self.r#type),
+            ResidualSource::Constant => write!(formatter, "{} from a constant", self.r#type),
+            ResidualSource::Tag { key } => write!(formatter, "{} tagged `{key}`", self.r#type),
+            ResidualSource::Operation { name } => write!(formatter, "{} output of `{name}`", self.r#type),
         }
     }
 }
 
-/// Returns the values that reverse-mode differentiation of `function` at `input_types` saves for its backward
+impl<T: Type> Typed for SavedResidual<T> {
+    type Type = T;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, T> {
+        Cow::Borrowed(&self.r#type)
+    }
+}
+
+/// Returns the values that reverse mode differentiation of `function` at `input_types` saves for its backward
 /// computation, in the order in which the backward computation receives them, which is the analogue of JAX's
 /// [`jax.ad_checkpoint.saved_residuals`](https://docs.jax.dev/en/latest/gradient-checkpointing.html#inspecting-residuals-with-jax-ad-checkpoint-print-saved-residuals).
 /// Use it to check what a [`rematerialize`]d function and its residual policy save. The function is traced into a
 /// [`Program`](crate::Program) like [`TracingContext::trace`] and the program is linearized, and each residual of the
-/// linearization is reported with its [`ResidualSource`]. The program is linearized for reverse-mode differentiation
+/// linearization is reported with its [`ResidualSource`]. The program is linearized for reverse mode differentiation
 /// (i.e., with the [`jvp_for_transpose`](DifferentiableOperation::jvp_for_transpose) rules of its operations). The
 /// source of a saved value looks through the operations that residual placement stages on it (i.e., the rounding of
 /// narrow floating-point values and the store operations of [`MemoryTransferStorage`]), so that an offloaded value is
@@ -496,20 +494,19 @@ impl<T: Type> Display for SavedResidual<T> {
 /// # Examples
 ///
 /// ```rust
-/// # use ryft_core::differentiation::rematerialization::{
-/// #     DotsSaveable, ResidualSource, SavedResidual, rematerialize, saved_residuals,
+/// # use ryft_core::{
+/// #     Array, ArrayOperation, ArrayType, DataType, Dot, DotsSaveable, DotDimensionNumbers, ProgramError,
+/// #     ResidualSource, SavedResidual, Sin, rematerialize, saved_residuals,
 /// # };
-/// # use ryft_core::{Array, ArrayOperation, ArrayType, DataType, Dot, DotDimensionNumbers, ProgramError, Sin};
 /// # use ryft_core::TracingContext;
 /// # fn main() -> Result<(), ProgramError> {
-/// type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+/// # type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 ///
-/// // `x ↦ sin(x · x)` saves its input and, because the policy saves dot products, the dot product as well, from
-/// // which the backward computation recomputes the cosine.
+/// // `x ↦ sin(x · x)` saves its input and, because the policy saves dot products, the dot product as well,
+/// // from which the backward computation recomputes the cosine.
 /// let function = rematerialize(|x: Tracer| {
 ///     Ok(x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.sin()?)
-/// })
-/// .with_policy(DotsSaveable);
+/// }).with_policy(DotsSaveable);
 /// let residuals = saved_residuals(|x: Tracer| function.call(x), ArrayType::new_static(DataType::F64, [3]))?;
 /// assert_eq!(
 ///     residuals,
@@ -526,11 +523,7 @@ impl<T: Type> Display for SavedResidual<T> {
 /// # Errors
 ///
 /// Returns a [`ProgramError`] when tracing or linearizing the function fails.
-pub fn saved_residuals<V, O, Input, Output, F>(
-    function: F,
-    input_types: Input,
-) -> Result<Vec<SavedResidual<V::Type>>, ProgramError>
-where
+pub fn saved_residuals<
     V: Value<Type: 'static + DifferentiableType>,
     O: Operation<Type = V::Type>
         + OperationPayloadProjection
@@ -538,12 +531,15 @@ where
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
         + ResidualZeroProvider<V::Type, Operation = O>,
-    F: FnOnce(Input::To<Tracer<TracingContext<V, O>>>) -> Result<Output, ProgramError>,
     Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<TracingContext<V, O>>>>,
     Output: Parameterized<Tracer<TracingContext<V, O>>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
-{
-    // The program is linearized with the `jvp_for_transpose` rules that reverse-mode differentiation uses, which can
-    // save different values than the `jvp` rules (e.g., for custom functions with distinct rules).
+    F: FnOnce(Input::To<Tracer<TracingContext<V, O>>>) -> Result<Output, ProgramError>,
+>(
+    function: F,
+    input_types: Input,
+) -> Result<Vec<SavedResidual<V::Type>>, ProgramError> {
+    // The program is linearized with the `jvp_for_transpose` rules that reverse mode differentiation uses,
+    // which can save different values than the `jvp` rules (e.g., for custom functions with distinct rules).
     let (_, program) = TracingContext::<V, O>::trace(function, input_types)?;
     let program = program.into_flat_program();
     let input_indices = (0..program.input_ids().len()).collect::<Vec<_>>();
@@ -591,8 +587,8 @@ struct PolicyReferences<Policy> {
     /// Residual policy.
     policy: Policy,
 
-    /// [`ResidualPolicyReference`] to `policy` in each type universe that was used so far, keyed by the [`TypeId`] of
-    /// the universe.
+    /// [`ResidualPolicyReference`] to `policy` in each type universe that was used so far, keyed by the [`TypeId`]
+    /// of the universe.
     references: Mutex<Vec<(TypeId, Box<dyn Any + Send + Sync>)>>,
 }
 
@@ -603,8 +599,8 @@ impl<Policy> PolicyReferences<Policy> {
         Self { policy, references: Mutex::new(Vec::new()) }
     }
 
-    /// Returns the [`ResidualPolicyReference`] to the policy in the type universe `T`, which is registered on first
-    /// use.
+    /// Returns the [`ResidualPolicyReference`] to the policy in the type universe `T`, which is registered
+    /// on first use.
     fn reference<T: 'static + Type>(&self) -> ResidualPolicyReference<T>
     where
         Policy: Clone + ResidualPolicy<T>,
@@ -906,7 +902,7 @@ mod tests {
     fn test_saved_residual() {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let residual = SavedResidual::new(scalar_type.clone(), ResidualSource::Input { index: 1 });
-        assert_eq!(residual.residual_type(), &scalar_type);
+        assert_eq!(residual.r#type().as_ref(), &scalar_type);
         assert_eq!(residual.source(), &ResidualSource::Input { index: 1 });
         assert_eq!(residual.to_string(), "f32[] from the input 1");
         assert_eq!(
