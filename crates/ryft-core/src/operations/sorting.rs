@@ -1,32 +1,73 @@
-//! Sorting and ranking operations over arrays. [`SortOperation`] is the only primitive in this module: it stably sorts
-//! one or more same-shaped arrays along one axis by the lexicographic order of its leading key inputs, co-permuting
-//! every other input. The [`Sort`] capability applies it to eager [`Array`]s and traced values alike, so the same code
-//! executes immediately or records into a program depending on the value it runs on.
+//! Operations that order array elements along one axis. Sorting is defined by the [`SortOperation`] type together with
+//! the [`Sort`] value capability trait, whose functions apply it to eager [`Array`]s and traced values alike, so the
+//! same code executes immediately or records into a program depending on the value it runs on. The capabilities fall
+//! into two groups:
 //!
-//! The ranking capabilities [`TopK`], [`ArgMax`], and [`ArgMin`] are compositions rather than primitives: each one
-//! sorts the ranked value together with an `i32` index [`iota`](IotaOperation) and slices the leading entries, so
-//! every program transform supports them through the rules of [`SortOperation`], [`Slice`], and [`Reshape`].
+//!   - **Sorting:** [`Sort`] stably sorts one or more same-shaped arrays along one axis in a [`SortDirection`], by the
+//!     lexicographic order of their leading key inputs, and co-permutes every other input as a passenger.
+//!   - **Ranking:** [`TopK`] selects the `k` largest elements along one axis together with their indices, while
+//!     [`ArgMax`] and [`ArgMin`] compute the index of the largest and smallest element. These are compositions rather
+//!     than primitives: each one sorts the ranked value together with an `i32` index [`iota`](IotaOperation) passenger
+//!     and slices the leading entries, so every program transform supports them through the rules of
+//!     [`SortOperation`], [`Slice`], and [`Reshape`], and their indices are always `i32`.
 //!
-//! [`SortOrdering`] selects how floating-point keys compare. The default [`SortOrdering::Canonical`] ordering is the
-//! one of [JAX's `lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html) and NumPy, under which
-//! `-0.0` and `+0.0` are equal and every NaN sorts after `+∞`. [`SortOrdering::Total`] is the IEEE 754 total order of
-//! [StableHLO's `TOTALORDER` comparison](https://openxla.org/stablehlo/spec#compare), which [`TopK`] uses to rank values
-//! like [JAX's `lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html).
+//! A [`SortOrdering`] selects how floating-point keys, including the real and imaginary parts of complex keys, compare.
+//! Under the default [`SortOrdering::Canonical`] ordering, `-0.0` and `+0.0` compare equal, every NaN compares equal to
+//! every other NaN and greater than `+∞`, and complex keys order lexicographically by their real part and then their
+//! imaginary part. These are the semantics of
+//! [JAX's `lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html). Under [`SortOrdering::Total`],
+//! keys order by the IEEE 754 total order of
+//! [StableHLO's `TOTALORDER` comparison](https://openxla.org/stablehlo/spec#compare) (i.e.,
+//! `-NaN < -∞ < … < -0.0 < +0.0 < … < +∞ < +NaN`), and complex keys are rejected. [`TopK`] ranks under the total
+//! ordering, following [JAX's `lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html), while
+//! [`ArgMax`] and [`ArgMin`] rank under the canonical ordering, so that an axis that contains a NaN of either sign
+//! reports its first NaN, following
+//! [`jnp.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.argmax.html). Every sort is stable, so
+//! elements that tie on every key keep their original relative order and ranking ties select the lowest index.
 //!
-//! # Example
+//! # Batching
+//!
+//! Every mapped input moves its batch axis to the leading position and every replicated input is broadcast to the
+//! batched shape, because all inputs of a sort must agree on shape. The sorted axis then lifts past the leading batch
+//! axis. Bounded ragged batches are rejected, because sorting an axis that carries padding would move that padding into
+//! valid data.
+//!
+//! # Differentiation
+//!
+//! The permutation that a sort applies is piecewise constant in its keys, so every input, including each key,
+//! differentiates as a passenger of that permutation: tangents ride a sort of the primal keys, and the transpose of the
+//! resulting linear map sorts the output cotangents by the forward permutation itself, which applies its inverse.
+//! Reverse-mode differentiation therefore works through every sorting and ranking capability, while the integer
+//! indices returned by the ranking capabilities have zero derivatives.
+//!
+//! # Examples
+//!
+//! Sorting co-permutes passengers by the order of the keys, and the ordering decides how signed zeros and NaNs tie:
 //!
 //! ```rust
-//! # use ryft_core::{Array, ArgMax, ProgramError, Sort, SortDirection, TopK};
+//! # use ryft_core::{Array, ProgramError, Sort, SortDirection, SortOrdering};
 //! # fn main() -> Result<(), ProgramError> {
-//! let keys = Array::vector(vec![3.0, 1.0, 2.0])?;
-//! let values = Array::vector(vec![30i32, 10, 20])?;
-//! let sorted = Array::sort(&[keys.clone(), values], 0, SortDirection::Ascending)?;
-//! assert_eq!(sorted[0], Array::vector(vec![1.0, 2.0, 3.0])?);
-//! assert_eq!(sorted[1], Array::vector(vec![10i32, 20, 30])?);
-//! let (top_values, top_indices) = keys.top_k(2, 0)?;
-//! assert_eq!(top_values, Array::vector(vec![3.0, 2.0])?);
-//! assert_eq!(top_indices, Array::vector(vec![0i32, 2])?);
-//! assert_eq!(keys.argmax(0)?, Array::scalar(0i32)?);
+//! let keys = Array::vector(vec![0.0, -0.0, f64::NAN, -f64::NAN])?;
+//! let positions = Array::vector(vec![0i32, 1, 2, 3])?;
+//! let canonical = Array::sort(&[keys.clone(), positions.clone()], 0, SortDirection::Ascending)?;
+//! assert_eq!(canonical[1], Array::vector(vec![0i32, 1, 2, 3])?);
+//! let total = Array::sort_with_ordering(&[keys, positions], 0, SortDirection::Ascending, 1, SortOrdering::Total)?;
+//! assert_eq!(total[1], Array::vector(vec![3i32, 1, 0, 2])?);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Ranking selects the leading entries of a stable sort, so ties select the lowest index:
+//!
+//! ```rust
+//! # use ryft_core::{Array, ArgMax, ArgMin, ProgramError, TopK};
+//! # fn main() -> Result<(), ProgramError> {
+//! let scores = Array::vector(vec![1.0, 3.0, 2.0, 3.0])?;
+//! let (values, indices) = scores.top_k(2, 0)?;
+//! assert_eq!(values, Array::vector(vec![3.0, 3.0])?);
+//! assert_eq!(indices, Array::vector(vec![1i32, 3])?);
+//! assert_eq!(scores.argmax(0)?, Array::scalar(1i32)?);
+//! assert_eq!(scores.argmin(0)?, Array::scalar(0i32)?);
 //! # Ok(())
 //! # }
 //! ```
@@ -132,9 +173,9 @@ pub const SORT_OPERATION_NAME: &str = "sort";
 /// ([`TopK`], [`ArgMax`], and [`ArgMin`]) and multi-key sorts without carrying a comparator region through every
 /// program transform.
 ///
-/// Sorting is differentiable with respect to its passengers (keys only select the permutation, so they receive zero
-/// cotangents): tangents ride the sort of their primal keys as passengers, and the transpose of that permutation sorts
-/// the output cotangents by the permutation itself, which applies its inverse.
+/// The permutation is piecewise constant in the keys, so every input, including each key, differentiates as a
+/// passenger: tangents ride a sort of their primal keys, and the transpose of that permutation sorts the output
+/// cotangents by the permutation itself, which applies its inverse.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SortOperation {
     /// Axis along which the inputs are sorted.

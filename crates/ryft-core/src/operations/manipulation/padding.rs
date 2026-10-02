@@ -1754,7 +1754,7 @@ pub trait DynamicPad: Value<Type = ArrayIrType> + Sized {
         let no_padding = vec![0; input_type.rank()];
         validate_pad_inputs(input_type, padding_type, &no_padding, &no_padding, &vec![0; input_type.rank()])?;
         let extent_dimension = <&DimensionType>::try_from(extent.r#type().as_ref())?.to_dimension();
-        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let axis = axis.into().normalize(input_type.rank())?;
         let mut output_shape = input_type.shape().dimensions().to_vec();
         output_shape[axis] = extent_dimension;
 
@@ -2195,6 +2195,7 @@ mod tests {
         DataType, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, Layout,
         LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout,
     };
+    use crate::axes::AxisError;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiableOperation, DifferentiationContext, TranspositionContext};
@@ -5824,6 +5825,10 @@ mod tests {
         let padding_value = context.input(ArrayType::scalar(DataType::F32).into());
         let low_value = context.input(DimensionType::from(low).into());
         let extent = context.input(DimensionType::from(target.clone()).into());
+        assert!(matches!(
+            input.dynamic_pad_to_extent(&padding_value, 2, &low_value, &extent),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis, rank: 2 })) if axis == Axis::from(2),
+        ));
         let output = input.dynamic_pad_to_extent(&padding_value, 1, &low_value, &extent).unwrap();
         assert_eq!(
             output.r#type().as_ref(),

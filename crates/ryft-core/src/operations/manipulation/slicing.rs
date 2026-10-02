@@ -641,7 +641,7 @@ pub trait Slice: Sized {
         Self: Typed<Type = ArrayType>,
     {
         let input_type = self.r#type();
-        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let axis = axis.into().normalize(input_type.rank())?;
         let mut starts = vec![0; input_type.rank()];
         let mut limits = input_type.shape().dimensions().to_vec();
         let mut strides = vec![1; input_type.rank()];
@@ -664,8 +664,7 @@ pub trait Slice: Sized {
     where
         Self: Typed<Type = ArrayType> + Reshape,
     {
-        let axis =
-            axis.into().normalize(self.r#type().rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let axis = axis.into().normalize(self.r#type().rank())?;
         let limit = index.checked_add(1).ok_or_else(|| TypeError::invalid("`index_axis` index overflows `usize`"))?;
         let output = self.slice_axis(axis, index, limit, 1)?;
         if keep_axis { Ok(output) } else { output.squeeze([axis]) }
@@ -729,10 +728,14 @@ impl Slice for ArrayType {
                 Dimension::Dynamic(variable) => {
                     if self.dimension(axis) != *limit || start != 0 || stride != 1 {
                         return Err(TypeError::invalid(format!(
-                            "`{SLICE_OPERATION_NAME}` dynamic limit `{variable}` on axis {axis} must be the input's \
-                             own extent with start 0 and stride 1, but the input extent is `{}` with start {start} \
-                             and stride {stride}",
+                            "`{}` dynamic limit `{}` on axis {} must be the input's own extent with start 0 and \
+                             stride 1, but the input extent is `{}` with start {} and stride {}",
+                            SLICE_OPERATION_NAME,
+                            variable,
+                            axis,
                             self.dimension(axis),
+                            start,
+                            stride,
                         ))
                         .into());
                     }
@@ -2574,7 +2577,7 @@ pub trait DynamicSlice: Sized {
         Self: Clone + Typed<Type = ArrayType> + ZeroLike,
     {
         let input_type = self.r#type();
-        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let axis = axis.into().normalize(input_type.rank())?;
         let starts = (0..input_type.rank())
             .map(|input_axis| if input_axis == axis { Ok(start.clone()) } else { start.zero_like() })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2632,8 +2635,7 @@ pub trait DynamicSlice: Sized {
     where
         Self: Clone + Typed<Type = ArrayType> + ZeroLike + Reshape,
     {
-        let axis =
-            axis.into().normalize(self.r#type().rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let axis = axis.into().normalize(self.r#type().rank())?;
         let output = self.dynamic_slice_in_axis(index, 1, axis)?;
         if keep_axis {
             return Ok(output);
@@ -2965,7 +2967,7 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
     {
         let input_type = self.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
-        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let axis = axis.into().normalize(input_type.rank())?;
         if stride == 0 || start > limit {
             return Err(TypeError::invalid(
                 "`dynamic_slice_axis` requires a positive stride and start no greater than limit",
@@ -3059,7 +3061,7 @@ pub trait DynamicSliceWithDimensions: DynamicSlice + Value<Type = ArrayIrType> {
     {
         let input_type = self.r#type();
         let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
-        let axis = axis.into().normalize(input_type.rank()).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let axis = axis.into().normalize(input_type.rank())?;
         let limit = index
             .checked_add(1)
             .ok_or_else(|| TypeError::invalid("`dynamic_index_axis` index overflows `usize`"))?;
@@ -3854,7 +3856,7 @@ pub trait DynamicUpdateSlice: Sized {
         Self: Clone + Typed<Type = ArrayType> + ZeroLike,
     {
         let rank = self.r#type().rank();
-        let axis = axis.into().normalize(rank).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let axis = axis.into().normalize(rank)?;
         let starts = (0..rank)
             .map(|input_axis| if input_axis == axis { Ok(start.clone()) } else { start.zero_like() })
             .collect::<Result<Vec<_>, _>>()?;
@@ -3898,7 +3900,7 @@ pub trait DynamicUpdateSlice: Sized {
         Self: Clone + Typed<Type = ArrayType> + ZeroLike + Reshape,
     {
         let rank = self.r#type().rank();
-        let axis = axis.into().normalize(rank).map_err(|error| TypeError::invalid(error.to_string()))?;
+        let axis = axis.into().normalize(rank)?;
         let update_type = update.r#type();
         if update_type.rank() + 1 == rank {
             let mut dimensions = update_type.shape().dimensions().to_vec();
@@ -4441,7 +4443,7 @@ mod tests {
         DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Sharding,
         ShardingDimension, StridedLayout, f8e8m0fnu, i4,
     };
-    use crate::axes::NamedAxis;
+    use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
@@ -5393,6 +5395,10 @@ mod tests {
         if error == TypeError::invalid(format!(
             "`{SLICE_OPERATION_NAME}` strides must be at least 1 but axis 1 has stride 0",
         ))));
+        assert_eq!(
+            input.slice_axis(2, 0, 1, 1),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(2), rank: 2 })),
+        );
 
         // Every other axis is kept whole, including a dynamic one, which keeps its dynamic extent.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
@@ -9712,6 +9718,10 @@ mod tests {
         // update's extent on the other axis need not match the input's.
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let update = Array::matrix(1, 2, vec![8.0, 9.0]).unwrap();
+        assert_eq!(
+            matrix.dynamic_update_slice_in_axis(&update, &Array::scalar(0i32).unwrap(), -3),
+            Err(ProgramError::Axis(AxisError::OutOfBounds { axis: Axis::from(-3), rank: 2 })),
+        );
         assert_eq!(
             matrix.dynamic_update_slice_in_axis(&update, &Array::scalar(-1_i32).unwrap(), 1).unwrap(),
             Array::matrix(2, 3, vec![1.0, 8.0, 9.0, 4.0, 5.0, 6.0]).unwrap(),

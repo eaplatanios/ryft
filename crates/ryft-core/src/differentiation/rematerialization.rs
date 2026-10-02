@@ -1302,9 +1302,7 @@ mod tests {
         DimensionBounds, DimensionType, Memory, ShardingDimension,
     };
     use crate::axes::{AxisError, AxisIndex};
-    use crate::batching::{
-        BatchAxis, BatchAxisSpecification, BatchedProgram, BatchingError, ProgramBatchingOutputAxesPolicy, batch,
-    };
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::operations::{

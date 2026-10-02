@@ -5816,7 +5816,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_collective_over_unbound_axis_is_rejected_at_trace_time() {
-        use ryft_core::{AxisError, BatchingError, ParallelReduce, ParallelReductionKind};
+        use ryft_core::{AxisError, ParallelReduce, ParallelReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
