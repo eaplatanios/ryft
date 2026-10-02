@@ -216,9 +216,10 @@ impl_differentiable_operation! {
         O: Operation<Type = ArrayType> + From<ParallelReduceOperation>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
-            // Treating one shared value as `n` per-device copies is the linear map `x ↦ (x, …, x)`, whose adjoint sums
-            // the `n` cotangent contributions back into one: a `parallel_sum` over the same axis of the cotangent's
-            // mesh, which type inference validated to contain the axis when the forward operation was staged.
+            // Treating one shared value as `n` per-device copies is the linear map `x ↦ (x, …, x)`, whose adjoint
+            // sums the `n` cotangent contributions back into one: a sum `parallel_reduce` over the same axis of the
+            // cotangent's mesh, which type inference validated to contain the axis when the forward operation was
+            // staged.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -274,8 +275,8 @@ impl<A: Value<Type = ArrayType>> From<ParallelVaryOperation> for ArrayIrOperatio
 ///
 /// The reason this transition is an explicit operation rather than a silent widening of the type is differentiation.
 /// Treating one shared value as `n` per-device copies is the linear map `x ↦ (x, …, x)`, whose adjoint sums the `n`
-/// cotangent contributions back into one. Transposing a [`ParallelVaryOperation`] therefore stages a `parallel_sum`
-/// over the axis (a mesh-form [`ParallelReduceOperation`]), and that sum is exactly the cross-device reduction that
+/// cotangent contributions back into one. Transposing a [`ParallelVaryOperation`] therefore stages a sum over the axis
+/// (a mesh-form [`ParallelReduceOperation`] of kind `sum`), and that sum is exactly the cross-device reduction that
 /// the gradient of a replicated parameter needs. Without the explicit transition, each device would report only its
 /// own contribution. The other transforms keep the transition intact: forward-mode differentiation repeats it on the
 /// tangent (a structural-zero tangent still receives the varying output type), partial evaluation retains it for the
@@ -522,6 +523,7 @@ mod tests {
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::macros::check_operation_type_inference;
     use crate::operations::arithmetic::Add;
+    use crate::operations::collectives::parallel_reduce::PARALLEL_REDUCE_OPERATION_NAME;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed, ValueProjection};
@@ -764,7 +766,7 @@ mod tests {
             zero_tangent
                 .instructions()
                 .iter()
-                .filter(|instruction| instruction.operation().name() == "parallel_sum")
+                .filter(|instruction| instruction.operation().name() == PARALLEL_REDUCE_OPERATION_NAME)
                 .count(),
             0
         );
@@ -796,7 +798,7 @@ mod tests {
                 .iter()
                 .map(|instruction| instruction.operation().name())
                 .collect::<Vec<_>>(),
-            vec!["parallel_sum"]
+            vec![PARALLEL_REDUCE_OPERATION_NAME],
         );
         assert!(matches!(transposed.instructions()[0].operation(), ArrayOperation::ParallelReduce(operation)
             if operation.mesh() == Some(varying.sharding().unwrap().mesh())));

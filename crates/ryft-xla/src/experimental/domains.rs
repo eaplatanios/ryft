@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use prost::Message;
 use ryft_core::macros::check_count;
-use ryft_core::operations::sort::SortDirection;
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, BatchingError,
     BindingRegionDriver, CallRequest, CompilationCacheDomain, CompilationContext, CompilationDomain, CompileRequest,
@@ -23,7 +22,7 @@ use ryft_core::{
     ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance,
     ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
     ReferenceDischargeResult, ReferenceExecution, ReferenceId, ReferenceReplacementPreparation, ReferenceSource,
-    ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction,
+    ScatterMode, ScatterReductionKind, Shape, Sharding, ShardingDimension, SortDirection, StageRequest, StagedFunction,
     StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
     TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
 };
@@ -6262,7 +6261,6 @@ mod tests {
     use ryft_core::operations::custom_call::CustomCallOperation;
     use ryft_core::operations::manipulation::indexing::index;
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
-    use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
         AddOperation, AndOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayOperation,
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, Assert, AssertOperation, Atan2Operation,
@@ -6281,8 +6279,8 @@ mod tests {
         ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
         ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation,
         ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
-        SelectOperation, Sharding, ShardingDimension, SliceOperation, StagingContext, StaticShape, SubOperation,
-        TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
+        SelectOperation, Sharding, ShardingDimension, SliceOperation, SortDirection, SortOperation, StagingContext,
+        StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]

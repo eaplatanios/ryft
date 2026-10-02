@@ -29,7 +29,7 @@ pub mod reductions;
 pub mod references;
 pub mod rounding;
 pub mod sharding;
-pub mod sort;
+pub mod sorting;
 pub mod special;
 pub mod tagging;
 pub mod trigonometric;
@@ -45,8 +45,8 @@ pub use assertions::{
     ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionError, AssertionFailure, AssertionValue,
 };
 pub use collectives::{
-    ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelReduce, ParallelReduceOperation,
-    ParallelReductionKind, ParallelVary, ParallelVaryOperation, forward_collective_to_parent,
+    ManualVariationAlignment, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelReduce,
+    ParallelReduceOperation, ParallelReductionKind, ParallelVary, ParallelVaryOperation, forward_collective_to_parent,
 };
 pub use comparisons::{
     COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonTypeSemantics,
@@ -139,6 +139,7 @@ pub use sharding::{
     CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingOperation, RESHARD_OPERATION_NAME, Reshard,
     ReshardOperation,
 };
+pub use sorting::{ArgMax, ArgMin, SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};
 pub use special::{ERF_OPERATION_NAME, Erf, ErfOperation};
 pub use tagging::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use trigonometric::{

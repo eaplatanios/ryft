@@ -25,7 +25,7 @@ use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
-use crate::operations::sort::ArgMax;
+use crate::operations::sorting::ArgMax;
 use crate::operations::trigonometric::Cos;
 use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;

@@ -1480,9 +1480,9 @@ mod tests {
 
     #[test]
     fn test_rematerialize_partial_evaluation_unsupported_known_operation() {
-        // The body `(x, y) ↦ parallel_sum(x) · y` reduces `x` over a manual mesh axis, which an eager known side cannot
-        // execute. Saving everything would hoist that reduction out of the call, so the call stays whole and
-        // undifferentiated on the residual side instead, for an execution backend that owns the mesh.
+        // The body `(x, y) ↦ parallel_reduce(x, sum) · y` reduces `x` over a manual mesh axis, which an eager known
+        // side cannot execute. Saving everything would hoist that reduction out of the call, so the call stays whole
+        // and undifferentiated on the residual side instead, for an execution backend that owns the mesh.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh.clone(), 0);
         let invariant_type = ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap();
@@ -1520,7 +1520,7 @@ mod tests {
                 let %2:f32[][sharding={mesh<['m'=4:manual]>, []}] = rematerialize [policy=\"everything_savable\"] %1 %0 [
                     body={
                         lambda %0:f32[][sharding={mesh<['m'=4:manual]>, [], varying_manual={'m'}}], %1:f32[][sharding={mesh<['m'=4:manual]>, []}] .
-                        let %2:f32[][sharding={mesh<['m'=4:manual]>, []}] = parallel_sum [axis_name=\"m\", mesh=['m'=4:manual]] %0
+                        let %2:f32[][sharding={mesh<['m'=4:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual]] %0
                             %3:f32[][sharding={mesh<['m'=4:manual]>, []}] = mul %2 %1
                         in (%3)
                     },

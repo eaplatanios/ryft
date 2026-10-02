@@ -65,7 +65,7 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
 use crate::operations::arithmetic::{AddOperation, Mul, MulOperation};
@@ -854,7 +854,8 @@ mod tests {
     };
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableOperation, DifferentiationContext, TransposableOperation, TranspositionContext, differentiate_at,
+        DifferentiableOperation, DifferentiationContext, DifferentiationError, TransposableOperation,
+        TranspositionContext, differentiate_at,
     };
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,

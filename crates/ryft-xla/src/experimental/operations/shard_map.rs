@@ -1550,7 +1550,7 @@ fn transpose_shard_map_body<
     // Replicated primal references are read-only. Each device accumulates its contribution into fresh local state,
     // and only the enclosing map updates the caller's destination once. Existing destination contents are neither
     // duplicated nor used as a per-device seed. The body's variation adjoints already aggregate the contributions:
-    // an invariant primal read passed through `parallel_vary` transposes to the mesh-form `parallel_sum`, so the
+    // an invariant primal read passed through `parallel_vary` transposes to the mesh-form sum `parallel_reduce`, so the
     // boundary performs no reduction and no output-seed normalization of its own.
     let seed_count = operation.output_types.iter().filter(|r#type| !r#type.is_reference()).count();
     if replicated_destinations.iter().any(|replicated| *replicated) {

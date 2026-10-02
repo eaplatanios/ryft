@@ -77,7 +77,9 @@ pub use all_to_all::{ALL_TO_ALL_OPERATION_NAME, AllToAll, AllToAllOperation, Par
 pub use parallel_permute::{
     PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation, ParallelShuffle,
 };
-pub use parallel_reduce::{ParallelReduce, ParallelReduceOperation, ParallelReductionKind};
+pub use parallel_reduce::{
+    PARALLEL_REDUCE_OPERATION_NAME, ParallelReduce, ParallelReduceOperation, ParallelReductionKind,
+};
 pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation};
 pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
 pub use ragged_all_to_all::{RAGGED_ALL_TO_ALL_OPERATION_NAME, RaggedAllToAll, RaggedAllToAllOperation};
@@ -230,7 +232,7 @@ pub(super) fn reject_ragged_collective_inputs<V: Value<Type = ArrayType>>(
 /// Re-stages a collective that targets a different (outer) named axis into the batching context's parent.
 ///
 /// Under nested `batch` levels, a collective is consumed by the level whose
-/// [`axis_name`](crate::batching::BatchingContext::axis_name) matches its axis name and must pass through every inner
+/// [`axis_name`](BatchingContext::axis_name) matches its axis name and must pass through every inner
 /// level untouched: each inner batch item participates in the outer collective independently, so the inputs' mapped
 /// axes are preserved as-is on the forwarded outputs. The parent may itself be another [`BatchingContext`] — whose own
 /// rule dispatch repeats this name resolution at the next level — or an ordinary tracing context. Batching rules for

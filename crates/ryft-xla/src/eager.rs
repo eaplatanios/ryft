@@ -2498,12 +2498,12 @@ mod tests {
         assert!(close(&value, &doubled(&sine)) && close(&derivative, &doubled(&cosine)));
     }
 
-    /// Sorting, top-k, and argmax agree between the XLA-backed eager array backend and the reference array backend,
-    /// including stable-tie routing (equal keys keep their original order, so ranking ties select the lowest
-    /// index) and NaN placement (NaNs order above `+∞` in the total order, so `argmax` reports a NaN's index).
+    /// Sorting, top-k, argmax, and argmin agree between the XLA-backed eager array backend and the reference array
+    /// backend under both sort orderings, including stable-tie routing (equal keys keep their original order, so
+    /// ranking ties select the lowest index), signed zeros, and NaNs of either sign.
     #[test]
     fn test_eager_sort_and_ranking_parity_with_reference_backend() {
-        use ryft_core::operations::sort::{ArgMax, ArgMin, Sort, SortDirection, TopK};
+        use ryft_core::{ArgMax, ArgMin, Sort, SortDirection, SortOrdering, TopK};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2511,42 +2511,89 @@ mod tests {
             .unwrap();
         let mesh = cpu_mesh(&client);
 
-        let key_values = [3.0f32, 1.0, 3.0, -0.0, 0.0, 2.0];
-        let payload_values = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
+        // The canonical ordering ties signed zeros and all NaNs, while the total ordering separates them, so both
+        // the sorted keys (compared bit for bit) and the payloads expose any disagreement in tie handling.
+        let key_values = [3.0f32, f32::NAN, 1.0, 3.0, -f32::NAN, -0.0, 0.0, 2.0];
+        let payload_values = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
         let keys = f32_vector(&client, &mesh, &key_values);
         let payloads = f32_vector(&client, &mesh, &payload_values);
         let reference_keys = CpuArray::vector(key_values.to_vec()).unwrap();
         let reference_payloads = CpuArray::vector(payload_values.to_vec()).unwrap();
-
-        for direction in [SortDirection::Ascending, SortDirection::Descending] {
-            let sorted = Sort::sort(&[keys.clone(), payloads.clone()], 0, direction).unwrap();
-            let reference_sorted =
-                Sort::sort(&[reference_keys.clone(), reference_payloads.clone()], 0, direction).unwrap();
-            for (device, reference) in sorted.iter().zip(reference_sorted.iter()) {
-                // Bit-level comparison keeps the `-0.0` versus `+0.0` total-order placement observable.
-                let device_bits = read_f32s(device).into_iter().map(f32::to_bits).collect::<Vec<_>>();
-                let reference_bits =
-                    reference.to_f64s().into_iter().map(|value| (value as f32).to_bits()).collect::<Vec<_>>();
-                assert_eq!(device_bits, reference_bits);
+        for ordering in [SortOrdering::Canonical, SortOrdering::Total] {
+            for direction in [SortDirection::Ascending, SortDirection::Descending] {
+                let sorted =
+                    Sort::sort_with_ordering(&[keys.clone(), payloads.clone()], 0, direction, 1, ordering).unwrap();
+                let reference_sorted = Sort::sort_with_ordering(
+                    &[reference_keys.clone(), reference_payloads.clone()],
+                    0,
+                    direction,
+                    1,
+                    ordering,
+                )
+                .unwrap();
+                for (device, reference) in sorted.iter().zip(reference_sorted.iter()) {
+                    assert_eq!(
+                        read_f32s(device).into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                        reference.elements::<f32>().unwrap().into_iter().map(f32::to_bits).collect::<Vec<_>>(),
+                        "{ordering} {direction}",
+                    );
+                }
             }
         }
 
-        let (device_values, device_indices) = keys.top_k(3, 0).unwrap();
-        let (reference_values, reference_indices) = reference_keys.top_k(3, 0).unwrap();
-        let device_value_f64s = read_f32s(&device_values).iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
-        assert_eq!(device_value_f64s, reference_values.to_f64s());
-        let device_index_f64s = read_i32s(&device_indices).iter().map(|index| f64::from(*index)).collect::<Vec<_>>();
-        assert_eq!(device_index_f64s, reference_indices.to_f64s());
+        // Canonical complex keys order lexicographically by their canonicalized real and imaginary parts, so that
+        // signed-zero real parts tie and NaN parts order last, as in JAX's `lax.sort`.
+        let complex_values = [
+            num_complex::Complex::new(1.0f32, f32::NAN),
+            num_complex::Complex::new(f32::NAN, 0.0),
+            num_complex::Complex::new(1.0, 2.0),
+            num_complex::Complex::new(1.0, 1.0),
+            num_complex::Complex::new(-0.0, 1.0),
+            num_complex::Complex::new(0.0, 1.0),
+        ];
+        let complex_type = replicated_type(&mesh, DataType::C64, &[complex_values.len()]);
+        let complex_keys =
+            Array::from_host_buffer(&client, complex_type, mesh.clone(), values_to_bytes(&complex_values).as_slice())
+                .unwrap();
+        let positions = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let sorted =
+            Sort::sort(&[complex_keys, f32_vector(&client, &mesh, &positions)], 0, SortDirection::Ascending).unwrap();
+        let reference_sorted = Sort::sort(
+            &[CpuArray::vector(complex_values.to_vec()).unwrap(), CpuArray::vector(positions.to_vec()).unwrap()],
+            0,
+            SortDirection::Ascending,
+        )
+        .unwrap();
+        assert_eq!(read_f32s(&sorted[1]), vec![4.0, 5.0, 3.0, 2.0, 0.0, 1.0]);
+        assert_eq!(reference_sorted[1].elements::<f32>().unwrap(), vec![4.0, 5.0, 3.0, 2.0, 0.0, 1.0]);
+
         // Ties select the lowest index: both threes appear before the two, and index 0 precedes index 2.
+        let top_k_values = [3.0f32, 1.0, 3.0, -0.0, 0.0, 2.0];
+        let (device_values, device_indices) = f32_vector(&client, &mesh, &top_k_values).top_k(3, 0).unwrap();
+        let (reference_values, reference_indices) =
+            CpuArray::vector(top_k_values.to_vec()).unwrap().top_k(3, 0).unwrap();
+        assert_eq!(read_f32s(&device_values), reference_values.elements::<f32>().unwrap());
+        assert_eq!(read_i32s(&device_indices), reference_indices.elements::<i32>().unwrap());
         assert_eq!(read_i32s(&device_indices), vec![0, 2, 5]);
 
-        let nan_values = [1.0f32, f32::NAN, 3.0];
-        let nan_keys = f32_vector(&client, &mesh, &nan_values);
-        let reference_nan_keys = CpuArray::vector(nan_values.to_vec()).unwrap();
-        assert_eq!(read_i32s(&nan_keys.argmax(0).unwrap()), vec![1]);
-        assert_eq!(reference_nan_keys.argmax(0).unwrap().to_f64s(), vec![1.0]);
-        assert_eq!(read_i32s(&nan_keys.argmin(0).unwrap()), vec![0]);
-        assert_eq!(reference_nan_keys.argmin(0).unwrap().to_f64s(), vec![0.0]);
+        // An axis that contains a NaN of either sign reports its first NaN, and ties between signed zeros select the
+        // lowest index, which are the indices that `jnp.argmax` and `jnp.argmin` return.
+        for (values, expected_argmax, expected_argmin) in [
+            ([1.0f32, f32::NAN, 3.0], 1, 1),
+            ([1.0f32, -f32::NAN, f32::NAN], 1, 1),
+            ([-0.0f32, 0.0, 5.0], 2, 0),
+            ([0.0f32, -0.0, -5.0], 0, 2),
+        ] {
+            let device = f32_vector(&client, &mesh, &values);
+            let reference = CpuArray::vector(values.to_vec()).unwrap();
+            assert_eq!(read_i32s(&device.argmax(0).unwrap()), vec![expected_argmax]);
+            assert_eq!(reference.argmax(0).unwrap().elements::<i32>().unwrap(), vec![expected_argmax]);
+            assert_eq!(read_i32s(&device.argmin(0).unwrap()), vec![expected_argmin]);
+            assert_eq!(reference.argmin(0).unwrap().elements::<i32>().unwrap(), vec![expected_argmin]);
+        }
+        let device = f32_vector(&client, &mesh, &[-0.0, 0.0]);
+        assert_eq!(read_i32s(&device.argmax(0).unwrap()), vec![0]);
+        assert_eq!(read_i32s(&device.argmin(0).unwrap()), vec![0]);
     }
 
     /// A two-key lexicographic sort agrees between the XLA-backed eager array backend and the reference array
@@ -2555,7 +2602,7 @@ mod tests {
     /// co-permutes.
     #[test]
     fn test_eager_multi_key_sort_parity_with_reference_backend() {
-        use ryft_core::operations::sort::{Sort, SortDirection};
+        use ryft_core::{Sort, SortDirection};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

@@ -37,7 +37,6 @@ use crate::operations::complex::{
 };
 use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::random::RngBitGeneratorOperation;
-use crate::operations::sort::{Sort, SortOperation};
 use crate::operations::{
     Abs, AbsOperation, Add, AddOperation, And, AndOperation, Assert, AssertOperation, Atan2, Atan2Operation, Broadcast,
     BroadcastOperation, Ceil, CeilOperation, Clamp, ClampOperation, Compare, CompareOperation, Concatenate,
@@ -60,9 +59,10 @@ use crate::operations::{
     ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, Reshape, ReshapeOperation,
     ReshardOperation, Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot,
     ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign, SignOperation, Sin,
-    SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation,
-    TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice,
-    UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    SinOperation, Slice, SliceOperation, Sort, SortOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
+    Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation,
+    UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation,
+    ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -74,7 +74,6 @@ use crate::tracing::{Tracer, TracingContext};
 
 mod control_flow;
 mod random;
-mod sort;
 
 // The element-level extrema of the reference kernels are the canonical least and greatest values of each element data
 // type, so the ragged identity masking of `arrays::batching` reads them through this facade instead of restating them.
@@ -226,8 +225,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///     and the operation-family `From` bounds that transforms require of a domain.
 ///
 /// Derived conveniences that a member already implies are also left out, because bounding them would only duplicate
-/// solver work: [`TopK`](crate::operations::sort::TopK), [`ArgMax`](crate::operations::sort::ArgMax), and
-/// [`ArgMin`](crate::operations::sort::ArgMin) all follow from [`Sort`], [`Slice`], and [`Reshape`], and
+/// solver work: [`TopK`](crate::operations::TopK), [`ArgMax`](crate::operations::ArgMax), and
+/// [`ArgMin`](crate::operations::ArgMin) all follow from [`Sort`], [`Slice`], and [`Reshape`], and
 /// [`DotOps`](crate::operations::dot::DotOps) follows from [`Dot`] and [`Transpose`].
 ///
 /// # Tracers

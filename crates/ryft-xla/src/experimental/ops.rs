@@ -13,7 +13,6 @@ use ryft_core::operations::collectives::{
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::CustomCallOperation;
 use ryft_core::operations::random::RngBitGeneratorOperation;
-use ryft_core::operations::sort::SortOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
     ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceTransform, ArrayType,
@@ -42,10 +41,10 @@ use ryft_core::{
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionLiveness,
     RegionSlot, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation, RoundOperation,
     RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, SignOperation, SinOperation,
-    SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
-    Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext,
-    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UnavailableCustomRules, UpdateSliceOperation,
-    Value, ValueProjection, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    SliceOperation, SortOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
+    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
+    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UnavailableCustomRules,
+    UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
     discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;

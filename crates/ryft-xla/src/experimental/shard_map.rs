@@ -4034,8 +4034,8 @@ mod tests {
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
-        // `parallel_sum` over the manual mesh axis `"x"` resolves against the seeded body trace and lowers to a
-        // `stablehlo.all_reduce` whose replica group spans the four devices along `"x"`, so every shard receives the
+        // A sum `parallel_reduce` over the manual mesh axis `"x"` resolves against the seeded body trace and lowers to
+        // a `stablehlo.all_reduce` whose replica group spans the four devices along `"x"`, so every shard receives the
         // elementwise sum of all four local shards.
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
@@ -4049,7 +4049,7 @@ mod tests {
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with parallel_sum should trace")
+                    .expect("shard_map with a sum parallel_reduce should trace")
                 }
             },
             global_input_type,
@@ -4625,7 +4625,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_sort_varying_keys_jvp_executes_on_cpu() {
-        use ryft_core::operations::sort::{Sort, SortDirection};
+        use ryft_core::{Sort, SortDirection};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -5337,7 +5337,7 @@ mod tests {
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with parallel_mean should trace")
+                    .expect("shard_map with a mean parallel_reduce should trace")
                 }
             },
             global_input_type,
@@ -5413,10 +5413,10 @@ mod tests {
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
-        // A named `batch` level inside the shard_map body binds `"b"`, while `parallel_sum` names the *mesh* axis
+        // A named `batch` level inside the shard_map body binds `"b"`, while the sum `parallel_reduce` names the *mesh* axis
         // `"x"`: the batching rule forwards the collective through the batch level to the seeded base trace (which
         // binds `"x"`), so it lands in the body program on the batched physical value and lowers to the same
-        // `all_reduce` as a direct `parallel_sum` — resolution composes across binder kinds.
+        // `all_reduce` as a direct sum `parallel_reduce` — resolution composes across binder kinds.
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
@@ -5441,14 +5441,14 @@ mod tests {
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with vmapped parallel_sum should trace")
+                    .expect("shard_map with a vmapped sum parallel_reduce should trace")
                 }
             },
             global_input_type,
         )
         .unwrap();
 
-        // The module is identical to the direct `parallel_sum` module: the batch level forwarded the mesh collective
+        // The module is identical to the direct sum `parallel_reduce` module: the batch level forwarded the mesh collective
         // untouched.
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
@@ -5479,9 +5479,9 @@ mod tests {
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
-        // The `parallel_sum` sits inside a `condition` branch inside the shard_map body, so it lowers through the
+        // The sum `parallel_reduce` sits inside a `condition` branch inside the shard_map body, so it lowers through the
         // nested control-flow path: the threaded collective lowering state resolves the manual mesh axis inside the
-        // `stablehlo.if` region and emits the same `all_reduce` as a body-level `parallel_sum` would.
+        // `stablehlo.if` region and emits the same `all_reduce` as a body-level sum `parallel_reduce` would.
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
@@ -5525,7 +5525,7 @@ mod tests {
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with parallel_sum inside a condition should trace")
+                    .expect("shard_map with a sum parallel_reduce inside a condition should trace")
                 }
             },
             global_input_type,

@@ -1853,9 +1853,8 @@ mod tests {
 
     use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
     use ryft_core::operations::random::Random;
-    use ryft_core::operations::sort::{ArgMax, TopK};
     use ryft_core::{
-        Add, AddOperation, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
+        Add, AddOperation, ArgMax, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver,
         CaptureReference, Compare, ComparisonDirection, Context, ConvertElementType, Cos, CotangentDestinationKind,
         Cumulative, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
@@ -1866,7 +1865,7 @@ mod tests {
         ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
         ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
         ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
-        StopGradientOperation, Sub, Tanh, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
+        StopGradientOperation, Sub, Tanh, TopK, Trace, TransferToMemory, Typed, Value, ValueProjection, WhileOperation,
         ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
