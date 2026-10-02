@@ -1093,8 +1093,8 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableType, DotsSavable, ForwardModeDifferentiate, LinearizationTracer, NothingSavable,
-        ReverseModeDifferentiate,
+        DOTS_SAVABLE_POLICY_NAME, DifferentiableType, DotsSavable, ForwardModeDifferentiate, LinearizationTracer,
+        NothingSavable, ReverseModeDifferentiate,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
@@ -2531,7 +2531,7 @@ mod tests {
             )),
             ArrayIrOperation::Rematerialize(operation)
                 if operation.policy().id() == policy.id()
-                    && operation.policy().name() == "dots_saveable"
+                    && operation.policy().name() == DOTS_SAVABLE_POLICY_NAME
                     && operation.optimization_barrier() == &RematerializationOptimizationBarrier::None
                     && operation.differentiated(),
         ));

@@ -4,10 +4,10 @@
 //! [`MemoryTransferStorage`] for policies that offload the residuals that they save.
 //!
 //! Every built-in policy recognizes the producers of a residual by their payload operations (refer to
-//! [`ResidualProducer::payload`]) rather than by their operation family, so the same policy works for every family,
-//! including composite and backend families that hold array operations through projected members. A residual that
-//! several producers may produce (e.g., the corresponding outputs of the two branches of a `condition`) matches a
-//! policy when any of its producers does.
+//! [`ResidualProducer::payload`](crate::partial::ResidualProducer::payload)) rather than by their operation family, so
+//! the same policy works for every family, including composite and backend families that hold array operations through
+//! projected members. A residual that several producers may produce (e.g., the corresponding outputs of the two
+//! branches of a `condition`) matches a policy when any of its producers does.
 //!
 //! The built-in policies are generic over the type universe and declare their instantiations for the array universes
 //! [`ArrayType`] and [`ArrayIrType`] (refer to [`ResidualPolicy::native_instantiations`]), so that promoting a staged
@@ -22,7 +22,7 @@ use crate::arrays::{ArrayIrType, ArrayType, Memory};
 use crate::operations::{DotOperation, TagOperation, TransferToMemoryOperation};
 use crate::partial::{
     ErasedResidualStorage, NativeResidualPolicies, NoStorage, ResidualCandidate, ResidualDecision, ResidualPolicy,
-    ResidualPolicyError, ResidualProducer, ResidualRejection, ResidualStorage,
+    ResidualPolicyError, ResidualRejection, ResidualStorage,
 };
 use crate::programs::{ErasedOperation, ProgramError, Type};
 
@@ -701,11 +701,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayIrOperation, ArrayOperation, DataType, DimensionBounds, DimensionType};
     use crate::operations::{DimensionSizeOperation, DotDimensionNumbers, SinOperation};
-    use crate::partial::ResidualPolicyReference;
+    use crate::partial::{ResidualPolicyReference, ResidualProducer};
 
     use super::*;
 
@@ -721,10 +723,15 @@ mod tests {
         ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::non_negative(None).unwrap()))
     }
 
+    /// Returns the dimension numbers of a dot product that contracts the leading dimensions of its inputs and has no
+    /// batching dimensions.
+    fn contracting_dimensions() -> DotDimensionNumbers {
+        DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![])
+    }
+
     /// Returns a dot product that contracts the leading dimensions of its inputs and has no batching dimensions.
     fn dot() -> TestOperation {
-        ArrayOperation::<Array>::from(DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![])))
-            .into()
+        ArrayOperation::<Array>::from(DotOperation::new(contracting_dimensions())).into()
     }
 
     /// Returns a dot product that contracts the trailing dimensions of its inputs and batches their leading ones.
@@ -753,23 +760,45 @@ mod tests {
         ResidualCandidate::new(producers, scalar_type())
     }
 
+    /// Classifies a dimension candidate, whose type does not project into [`ArrayType`], with a reference to `policy`
+    /// that is lifted from [`ArrayType`] into [`ArrayIrType`]. A policy that declares a native [`ArrayIrType`]
+    /// instantiation classifies the candidate with it, while any other policy projects the types of the candidate and
+    /// cannot classify it.
+    fn classify_lifted_dimension<P: ResidualPolicy<ArrayType>>(
+        policy: P,
+    ) -> Result<ResidualDecision<ErasedResidualStorage<ArrayIrType>>, ResidualPolicyError> {
+        let dimension_size = TestOperation::DimensionSize(
+            DimensionSizeOperation::new(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap(),
+        );
+        let producer = ResidualProducer::new(&dimension_size, 0, Vec::new(), vec![dimension_type()]);
+        ResidualPolicyReference::<ArrayType>::new(policy)
+            .lift::<ArrayIrType>()
+            .classify(&ResidualCandidate::new(vec![producer], dimension_type()))
+    }
+
     #[test]
     fn test_nothing_savable() {
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&NothingSavable), "nothing_savable");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&NothingSavable), NOTHING_SAVABLE_POLICY_NAME);
         assert_eq!(NothingSavable.classify(&candidate(&[dot()])), Ok(ResidualDecision::Recompute));
         assert_eq!(NothingSavable.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Recompute));
+
+        // Lifting a reference to the policy into `ArrayIrType` uses its native instantiation.
+        assert!(matches!(classify_lifted_dimension(NothingSavable), Ok(ResidualDecision::Recompute)));
     }
 
     #[test]
     fn test_everything_savable() {
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&EverythingSavable), "everything_savable");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&EverythingSavable), EVERYTHING_SAVABLE_POLICY_NAME);
         assert_eq!(EverythingSavable.classify(&candidate(&[sine()])), Ok(ResidualDecision::Save));
         assert_eq!(EverythingSavable.classify(&candidate(&[dot()])), Ok(ResidualDecision::Save));
+
+        // Lifting a reference to the policy into `ArrayIrType` uses its native instantiation.
+        assert!(matches!(classify_lifted_dimension(EverythingSavable), Ok(ResidualDecision::Save)));
     }
 
     #[test]
     fn test_dots_savable() {
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&DotsSavable), "dots_savable");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&DotsSavable), DOTS_SAVABLE_POLICY_NAME);
         assert_eq!(DotsSavable.classify(&candidate(&[dot()])), Ok(ResidualDecision::Save));
         assert_eq!(DotsSavable.classify(&candidate(&[batched_dot()])), Ok(ResidualDecision::Save));
         assert_eq!(DotsSavable.classify(&candidate(&[sine()])), Ok(ResidualDecision::Recompute));
@@ -778,12 +807,7 @@ mod tests {
         assert_eq!(DotsSavable.classify(&candidate(&[sine(), dot()])), Ok(ResidualDecision::Save));
 
         // Dot products are recognized in the array operation family itself too.
-        let dot = ArrayOperation::<Array>::from(DotOperation::new(DotDimensionNumbers::new(
-            vec![0],
-            vec![0],
-            vec![],
-            vec![],
-        )));
+        let dot = ArrayOperation::<Array>::from(DotOperation::new(contracting_dimensions()));
         let scalar_type = ArrayType::scalar(DataType::F64);
         let producer = ResidualProducer::new(&dot, 0, Vec::new(), vec![scalar_type.clone()]);
         assert_eq!(
@@ -793,25 +817,23 @@ mod tests {
 
         // Lifting a reference to the policy from `ArrayType` into `ArrayIrType` uses its native instantiation, which
         // classifies candidates whose types do not project into `ArrayType` instead of rejecting them.
-        let lifted = ResidualPolicyReference::<ArrayType>::new(DotsSavable).lift::<ArrayIrType>();
-        let dimension_size = TestOperation::DimensionSize(
-            DimensionSizeOperation::new(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap(),
-        );
-        let producer = ResidualProducer::new(&dimension_size, 0, Vec::new(), vec![dimension_type()]);
-        assert!(matches!(
-            lifted.classify(&ResidualCandidate::new(vec![producer], dimension_type())),
-            Ok(ResidualDecision::Recompute),
-        ));
+        assert!(matches!(classify_lifted_dimension(DotsSavable), Ok(ResidualDecision::Recompute)));
     }
 
     #[test]
     fn test_dots_with_no_batch_dimensions_savable() {
         let policy = DotsWithNoBatchDimensionsSavable;
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "dots_with_no_batch_dimensions_savable");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME);
         assert_eq!(policy.classify(&candidate(&[dot()])), Ok(ResidualDecision::Save));
         assert_eq!(policy.classify(&candidate(&[batched_dot()])), Ok(ResidualDecision::Recompute));
         assert_eq!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Recompute));
+
+        // A residual that several producers may produce is saved when any of them is a dot product without batching
+        // dimensions.
         assert_eq!(policy.classify(&candidate(&[batched_dot(), dot()])), Ok(ResidualDecision::Save));
+
+        // Lifting a reference to the policy into `ArrayIrType` uses its native instantiation.
+        assert!(matches!(classify_lifted_dimension(policy), Ok(ResidualDecision::Recompute)));
     }
 
     #[test]
@@ -819,44 +841,80 @@ mod tests {
         let host = Memory::Host { pinned: true };
         let policy = OffloadDotsWithNoBatchDimensions::new(host);
         assert_eq!(policy.destination(), host);
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "offload_dots_with_no_batch_dimensions");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME);
         assert_eq!(
             policy.classify(&candidate(&[dot()])),
             Ok(ResidualDecision::SaveWith(MemoryTransferStorage::new(host))),
         );
         assert_eq!(policy.classify(&candidate(&[batched_dot()])), Ok(ResidualDecision::Recompute));
         assert_eq!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Recompute));
+
+        // A residual that several producers may produce is offloaded when any of them is a dot product without
+        // batching dimensions.
+        assert_eq!(
+            policy.classify(&candidate(&[batched_dot(), dot()])),
+            Ok(ResidualDecision::SaveWith(MemoryTransferStorage::new(host))),
+        );
+
+        // Policies compare and hash by their destination.
+        let policies = HashSet::from([policy]);
+        assert!(policies.contains(&OffloadDotsWithNoBatchDimensions::new(host)));
+        assert!(!policies.contains(&OffloadDotsWithNoBatchDimensions::new(Memory::Host { pinned: false })));
+
+        // Lifting a reference to the policy into `ArrayIrType` uses its native instantiation.
+        assert!(matches!(classify_lifted_dimension(policy), Ok(ResidualDecision::Recompute)));
     }
 
     #[test]
     fn test_save_only_these_names() {
         let policy = SaveOnlyTheseNames::new(["a", "b"]);
         assert_eq!(policy.names(), &["a".to_owned(), "b".to_owned()]);
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "save_only_these_names");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), SAVE_ONLY_THESE_NAMES_POLICY_NAME);
         assert_eq!(policy.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Save));
         assert_eq!(policy.classify(&candidate(&[tag("c")])), Ok(ResidualDecision::Recompute));
         assert_eq!(policy.classify(&candidate(&[dot()])), Ok(ResidualDecision::Recompute));
+
+        // A residual that several producers may produce is saved when any of them is tagged with a saved name.
         assert_eq!(policy.classify(&candidate(&[tag("c"), tag("b")])), Ok(ResidualDecision::Save));
+
+        // Policies compare and hash by their names.
+        let policies = HashSet::from([policy.clone()]);
+        assert!(policies.contains(&SaveOnlyTheseNames::new(["a", "b"])));
+        assert!(!policies.contains(&SaveOnlyTheseNames::new(["a"])));
+
+        // Lifting a reference to the policy into `ArrayIrType` uses its native instantiation.
+        assert!(matches!(classify_lifted_dimension(policy), Ok(ResidualDecision::Recompute)));
     }
 
     #[test]
     fn test_save_any_names_but_these() {
         let policy = SaveAnyNamesButThese::new(["a"]);
         assert_eq!(policy.names(), &["a".to_owned()]);
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "save_any_names_but_these");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME);
         assert_eq!(policy.classify(&candidate(&[tag("b")])), Ok(ResidualDecision::Save));
         assert_eq!(policy.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Recompute));
 
         // Untagged residuals are recomputed.
         assert_eq!(policy.classify(&candidate(&[dot()])), Ok(ResidualDecision::Recompute));
+
+        // A residual that several producers may produce is saved when any of them is tagged with a name that is not
+        // excluded.
         assert_eq!(policy.classify(&candidate(&[tag("a"), tag("b")])), Ok(ResidualDecision::Save));
+
+        // Policies compare and hash by their names.
+        let policies = HashSet::from([policy.clone()]);
+        assert!(policies.contains(&SaveAnyNamesButThese::new(["a"])));
+        assert!(!policies.contains(&SaveAnyNamesButThese::new(["b"])));
+
+        // Lifting a reference to the policy into `ArrayIrType` uses its native instantiation.
+        assert!(matches!(classify_lifted_dimension(policy), Ok(ResidualDecision::Recompute)));
     }
 
     #[test]
     fn test_save_anything_except_these_names() {
         let policy = SaveAnythingExceptTheseNames::new(["a"]);
         assert_eq!(policy.names(), &["a".to_owned()]);
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "save_anything_except_these_names");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME);
         assert_eq!(policy.classify(&candidate(&[tag("b")])), Ok(ResidualDecision::Save));
         assert_eq!(policy.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Recompute));
 
@@ -864,6 +922,14 @@ mod tests {
         // produce.
         assert_eq!(policy.classify(&candidate(&[dot()])), Ok(ResidualDecision::Save));
         assert_eq!(policy.classify(&candidate(&[tag("a"), sine()])), Ok(ResidualDecision::Save));
+
+        // Policies compare and hash by their names.
+        let policies = HashSet::from([policy.clone()]);
+        assert!(policies.contains(&SaveAnythingExceptTheseNames::new(["a"])));
+        assert!(!policies.contains(&SaveAnythingExceptTheseNames::new(["b"])));
+
+        // Lifting a reference to the policy into `ArrayIrType` uses its native instantiation.
+        assert!(matches!(classify_lifted_dimension(policy), Ok(ResidualDecision::Save)));
     }
 
     #[test]
@@ -873,7 +939,7 @@ mod tests {
         assert_eq!(policy.savable_names(), &["a".to_owned()]);
         assert_eq!(policy.offloadable_names(), &["b".to_owned()]);
         assert_eq!(policy.destination(), host);
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "save_and_offload_only_these_names");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME);
         assert_eq!(policy.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Save));
         assert_eq!(
             policy.classify(&candidate(&[tag("b")])),
@@ -884,6 +950,15 @@ mod tests {
 
         // Saving takes precedence over offloading for residuals that both kinds of tags may produce.
         assert_eq!(policy.classify(&candidate(&[tag("b"), tag("a")])), Ok(ResidualDecision::Save));
+
+        // Policies compare and hash by their names and their destination.
+        let policies = HashSet::from([policy.clone()]);
+        assert!(policies.contains(&SaveAndOffloadOnlyTheseNames::new(["a"], ["b"], host).unwrap()));
+        assert!(!policies.contains(&SaveAndOffloadOnlyTheseNames::new(["b"], ["a"], host).unwrap()));
+        assert!(!policies.contains(&SaveAndOffloadOnlyTheseNames::new(["a"], ["b"], Memory::Device).unwrap()));
+
+        // Lifting a reference to the policy into `ArrayIrType` uses its native instantiation.
+        assert!(matches!(classify_lifted_dimension(policy), Ok(ResidualDecision::Recompute)));
     }
 
     #[test]
@@ -905,37 +980,38 @@ mod tests {
             SaveFromBothPolicies::new(OffloadDotsWithNoBatchDimensions::new(host), SaveOnlyTheseNames::new(["a"]));
         assert_eq!(policy.first(), &OffloadDotsWithNoBatchDimensions::new(host));
         assert_eq!(policy.second(), &SaveOnlyTheseNames::new(["a"]));
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "save_from_both_policies");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), SAVE_FROM_BOTH_POLICIES_POLICY_NAME);
 
-        // The first policy decides first, keeping its storage, and the second one decides what the first recomputes.
+        // The first policy decides first, keeping its storage (which still offloads to `host`), and the second one
+        // decides what the first recomputes.
         let Ok(ResidualDecision::SaveWith(storage)) = policy.classify(&candidate(&[dot()])) else {
             panic!("expected an offloaded residual");
         };
         assert_eq!(storage.name(), "memory_transfer");
+        let mut store = storage.store_payloads(&scalar_type()).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.remove(0).downcast::<TransferToMemoryOperation>().unwrap().destination(), host);
         assert!(matches!(policy.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Save)));
         assert!(matches!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Recompute)));
 
-        // Rejections of either policy are returned as they are.
+        // Rejections of either policy are returned as they are. A rejection of the first policy is returned without
+        // consulting the second one, and a residual that the first policy saves never reaches a rejecting second one.
         let rejecting = RematerializationPolicyFn::new::<ArrayIrType>(|_| {
             Err::<ResidualDecision<NoStorage>, _>(ResidualRejection::new("rejected"))
         });
-        let policy = SaveFromBothPolicies::new(NothingSavable, rejecting);
+        let policy = SaveFromBothPolicies::new(rejecting.clone(), EverythingSavable);
         assert_eq!(policy.classify(&candidate(&[sine()])).map(|_| ()), Err(ResidualRejection::new("rejected")));
-        let policy = SaveFromBothPolicies::new(EverythingSavable, policy.second().clone());
+        let policy = SaveFromBothPolicies::new(NothingSavable, rejecting.clone());
+        assert_eq!(policy.classify(&candidate(&[sine()])).map(|_| ()), Err(ResidualRejection::new("rejected")));
+        let policy = SaveFromBothPolicies::new(EverythingSavable, rejecting);
         assert!(matches!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Save)));
 
         // The policy declares no native instantiations, so lifting a reference to it projects the types of each
         // candidate and cannot classify the ones that do not project.
-        let lifted = ResidualPolicyReference::<ArrayType>::new(SaveFromBothPolicies::new(DotsSavable, NothingSavable))
-            .lift::<ArrayIrType>();
-        let dimension_size = TestOperation::DimensionSize(
-            DimensionSizeOperation::new(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap(),
-        );
-        let producer = ResidualProducer::new(&dimension_size, 0, Vec::new(), vec![dimension_type()]);
         assert_eq!(
-            lifted.classify(&ResidualCandidate::new(vec![producer], dimension_type())).map(|_| ()),
+            classify_lifted_dimension(SaveFromBothPolicies::new(DotsSavable, NothingSavable)).map(|_| ()),
             Err(ResidualPolicyError::UnsupportedProjection {
-                policy: "save_from_both_policies".to_owned(),
+                policy: SAVE_FROM_BOTH_POLICIES_POLICY_NAME.to_owned(),
                 position: "the output 0 of producer `dimension_size`".to_owned(),
                 residual_type: dimension_type().to_string(),
             }),
@@ -951,14 +1027,16 @@ mod tests {
                 _ => ResidualDecision::Recompute,
             })
         });
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "rematerialization_policy_fn");
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), REMATERIALIZATION_POLICY_FN_POLICY_NAME);
         assert_eq!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Save));
         assert_eq!(policy.classify(&candidate(&[sine(), dot()])), Ok(ResidualDecision::Recompute));
 
-        // Names apply to clones too, and the closure does not render.
+        // Names, either static or owned, apply to clones too, and the closure does not render.
         let policy = policy.with_name("save_unique_producers");
         assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy.clone()), "save_unique_producers");
         assert_eq!(format!("{policy:?}"), "RematerializationPolicyFn { name: \"save_unique_producers\", .. }");
+        let policy = policy.with_name(format!("save_{}_producers", "single"));
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy.clone()), "save_single_producers");
 
         // Closures may return storages too.
         let host = Memory::Host { pinned: true };
@@ -995,5 +1073,10 @@ mod tests {
         };
         assert_eq!(storage.store_payloads(&dimension_type()).map(|_| ()), Err(error.clone()));
         assert_eq!(storage.restore_payloads(&dimension_type(), &dimension_type()).map(|_| ()), Err(error));
+
+        // Storages compare and hash by their destination.
+        let storages = HashSet::from([storage]);
+        assert!(storages.contains(&MemoryTransferStorage::new(host)));
+        assert!(!storages.contains(&MemoryTransferStorage::new(Memory::Device)));
     }
 }

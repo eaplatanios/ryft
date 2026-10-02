@@ -2,8 +2,6 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
-// TODO(eaplatanios): Review this module.
-
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
     ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis,
@@ -33,6 +31,9 @@ use crate::programs::{
     ProgramBuilder, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value,
     ValueProjection,
 };
+
+// TODO(eaplatanios): Add a module docstring, adhering to our conventions (e.g., look at the `materialization` docstring).
+// TODO(eaplatanios): Review this module.
 
 /// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the foreign kernel.
 /// The variants distinguish UTF-8 strings, arbitrary binary data, Booleans, signed integers, and floating-point

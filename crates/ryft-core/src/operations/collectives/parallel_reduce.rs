@@ -19,6 +19,7 @@ use crate::differentiation::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::arithmetic::{DivOperation, Mul};
+use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, ParallelVary, ParallelVaryOperation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::manipulation::conversions::ConvertElementType;
@@ -29,7 +30,6 @@ use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
 };
 
-use super::parallel_vary::{ManualVariationAlignment, ParallelVary, ParallelVaryOperation};
 use super::{effective_collective_axis_size, forward_collective_to_parent, resolve_named_axis_size};
 
 /// Kind of collective performed by a [`ParallelReduceOperation`].

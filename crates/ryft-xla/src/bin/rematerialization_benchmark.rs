@@ -47,10 +47,10 @@ enum Checkpointing {
     None,
 
     /// The layer is rematerialized and saves nothing.
-    NothingSaveable,
+    NothingSavable,
 
     /// The layer is rematerialized and saves its dot products.
-    DotsSaveable,
+    DotsSavable,
 
     /// The layer is rematerialized and offloads its dot products to pinned host memory.
     OffloadDots,
@@ -61,8 +61,8 @@ impl Checkpointing {
     fn name(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::NothingSaveable => "nothing_saveable",
-            Self::DotsSaveable => "dots_saveable",
+            Self::NothingSavable => "nothing_savable",
+            Self::DotsSavable => "dots_savable",
             Self::OffloadDots => "offload_dots_with_no_batch_dimensions",
         }
     }
@@ -155,8 +155,8 @@ fn checkpointed_layer<'c>(
 ) -> Result<Tracer<'c>, ProgramError> {
     match checkpointing {
         Checkpointing::None => layer(hidden, up, down),
-        Checkpointing::NothingSaveable => rematerialized_layer(NothingSavable, optimization_barrier, hidden, up, down),
-        Checkpointing::DotsSaveable => rematerialized_layer(DotsSavable, optimization_barrier, hidden, up, down),
+        Checkpointing::NothingSavable => rematerialized_layer(NothingSavable, optimization_barrier, hidden, up, down),
+        Checkpointing::DotsSavable => rematerialized_layer(DotsSavable, optimization_barrier, hidden, up, down),
         Checkpointing::OffloadDots => {
             let policy = OffloadDotsWithNoBatchDimensions::new(Memory::Host { pinned: true });
             rematerialized_layer(policy, optimization_barrier, hidden, up, down)
@@ -416,7 +416,7 @@ fn main() {
     print_header(&format!("Scan over layers ({model:?})"));
     let mut reference = None;
     for checkpointing in
-        [Checkpointing::None, Checkpointing::NothingSaveable, Checkpointing::DotsSaveable, Checkpointing::OffloadDots]
+        [Checkpointing::None, Checkpointing::NothingSavable, Checkpointing::DotsSavable, Checkpointing::OffloadDots]
     {
         let start = Instant::now();
         let staged = stage_scanned_gradient(&domain, &mesh, model, checkpointing);
@@ -440,9 +440,9 @@ fn main() {
     let mut reference = None;
     for (checkpointing, optimization_barrier) in [
         (Checkpointing::None, true),
-        (Checkpointing::NothingSaveable, true),
-        (Checkpointing::NothingSaveable, false),
-        (Checkpointing::DotsSaveable, true),
+        (Checkpointing::NothingSavable, true),
+        (Checkpointing::NothingSavable, false),
+        (Checkpointing::DotsSavable, true),
     ] {
         let start = Instant::now();
         let staged = stage_gradient(&domain, &mesh, model, &up_shape, &down_shape, |hidden, up, down| {
