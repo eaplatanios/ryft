@@ -1510,6 +1510,14 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
     /// Each rounding operation is constructed in the operation family of this partition through
     /// [`OperationPayloadProjection::from_payload`].
     ///
+    /// # Parameters
+    ///
+    ///   - `rounding`: Function that returns a type-preserving rounding operation for a residual's type, or `None`
+    ///     when that type needs no rounding under the caller's policy.
+    ///   - `is_storage`: Predicate identifying store operations through which to trace a residual back to its stored
+    ///     value. Only instructions with one input and one output are traversed. Selected operations must preserve
+    ///     that value apart from its storage placement, so rounding the input also rounds the stored residual.
+    ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when the operation family cannot hold a rounding operation

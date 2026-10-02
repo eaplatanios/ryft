@@ -45,26 +45,26 @@ impl Display for InstructionId {
     }
 }
 
-/// [`Instruction`]s represent applications of [`Operation`](crate::Operation)s to input values in
-/// [`Program`](crate::Program)s. Each [`Region`](crate::Region) executes its [`Instruction`]s in sequential order.
-/// Beyond its operation and its input and output [`Atom`](crate::Atom)s, an instruction carries the [`RegionId`]s of
-/// the nested computations attached to the application (e.g., the `true`/`false` branches of a condition, a scan body,
-/// or the shared program of a JIT call), in the operation-defined order. Note that there is one
-/// [`Region`](crate::Region) edge kind, and sharing is expressed directly in the graph. Several [`Instruction`]s may
-/// reference the same [`RegionId`], and a region stays alive for as long as it is reachable from the entry region. What
-/// a slot *means* (i.e., a branch-like computation that lowers inline versus a call-like computation that lowers and
-/// compiles once as a shared function) is defined by the operation and not by the edge. For example,
-/// `if p { f(x) + f(2 * x) } else { x }` with a JIT-compiled `f` is one condition instruction attaching a `true` and a
-/// `false` branch [`Region`](crate::Region), where the `true` branch contains two call instructions that both reference
-/// the single region holding `f`'s body  (i.e., one shared region, three region edges, and the inline-versus-shared
-/// lowering decision carried by the condition and call operations, respectively). Two structurally equal but
-/// independently created computations remain distinct regions, because [`ProgramBuilder`](crate::ProgramBuilder)
-/// imports regions by *identity* (i.e., [`import_region`](crate::ProgramBuilder::import_region) always copies and
+/// [`Instruction`]s represent applications of [`Operation`]s to input values in [`Program`](crate::Program)s. Each
+/// [`Region`](crate::Region) executes its [`Instruction`]s in sequential order. Beyond its operation and its input and
+/// output [`Atom`](crate::Atom)s, an instruction carries the [`RegionId`]s of the nested computations attached to the
+/// application (e.g., the `true`/`false` branches of a condition, a scan body, or the shared program of a JIT call),
+/// in the operation-defined order. Note that there is one [`Region`](crate::Region) edge kind, and sharing is expressed
+/// directly in the graph. Several [`Instruction`]s may reference the same [`RegionId`], and a region stays alive for as
+/// long as it is reachable from the entry region. What a slot _means_ (i.e., a branch-like computation that lowers
+/// inline versus a call-like computation that lowers and compiles once as a shared function) is defined by the
+/// operation and not by the edge. For example, `if p { f(x) + f(2 * x) } else { x }` with a JIT-compiled `f` is one
+/// condition instruction attaching a `true` and a `false` branch [`Region`](crate::Region), where the `true` branch
+/// contains two call instructions that both reference the single region holding `f`'s body  (i.e., one shared region,
+/// three region edges, and the inline-versus-shared lowering decision carried by the condition and call operations,
+/// respectively). Two structurally equal but independently created computations remain distinct regions, because
+/// [`ProgramBuilder`](crate::ProgramBuilder) imports regions by _identity_ (i.e.,
+/// [`import_region`](crate::ProgramBuilder::import_region) always copies and
 /// [`intern_callee`](crate::ProgramBuilder::intern_callee) interns by [`Rc`](std::rc::Rc) identity),
 /// never by structure.
 #[derive(Clone, Debug)]
 pub struct Instruction<O> {
-    /// [`Operation`](crate::Operation) applied by this [`Instruction`].
+    /// [`Operation`] applied by this [`Instruction`].
     pub(crate) operation: O,
 
     /// [`AtomId`]s of the input [`Atom`](crate::Atom)s consumed by this [`Instruction`].
@@ -97,7 +97,7 @@ impl<O> Instruction<O> {
         self
     }
 
-    /// Returns the [`Operation`](crate::Operation) applied by this [`Instruction`].
+    /// Returns the [`Operation`] applied by this [`Instruction`].
     #[inline]
     pub fn operation(&self) -> &O {
         &self.operation
@@ -130,10 +130,9 @@ impl<O> Instruction<O> {
         &self.provenance
     }
 
-    /// Consumes this [`Instruction`] and returns its [`Operation`](crate::Operation), input [`AtomId`]s,
-    /// output [`AtomId`]s, attached region [`RegionId`]s, and [`Provenance`], in that order. Rebuilds that
-    /// destructure an instruction this way must reattach the returned provenance through [`Self::with_provenance`]
-    /// instead of silently dropping it.
+    /// Consumes this [`Instruction`] and returns its [`Operation`], input [`AtomId`]s, output [`AtomId`]s, attached
+    /// region [`RegionId`]s, and [`Provenance`], in that order. Rebuilds that destructure an instruction this way must
+    /// reattach the returned provenance through [`Self::with_provenance`] instead of silently dropping it.
     #[inline]
     pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>, Vec<RegionId>, Provenance) {
         (self.operation, self.inputs, self.outputs, self.regions, self.provenance)
