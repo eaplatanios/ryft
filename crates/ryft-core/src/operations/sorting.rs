@@ -71,6 +71,7 @@
 //! ```
 
 use std::fmt::Display;
+use std::num::NonZeroUsize;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayType,
@@ -147,8 +148,6 @@ impl Display for SortOrdering {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`SortOperation`].
 pub const SORT_OPERATION_NAME: &str = "sort";
 
@@ -180,8 +179,8 @@ pub struct SortOperation {
     /// Axis along which the inputs are sorted.
     axis: usize,
 
-    /// Number of leading inputs that act as lexicographic sort keys (always at least one).
-    key_count: usize,
+    /// Number of leading inputs that act as lexicographic sort keys.
+    key_count: NonZeroUsize,
 
     /// Direction in which the key inputs are ordered.
     direction: SortDirection,
@@ -190,23 +189,40 @@ pub struct SortOperation {
     ordering: SortOrdering,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl SortOperation {
     /// Creates a new [`SortOperation`] that sorts along `axis` in the provided `direction` with a single key input and
     /// the default [`SortOrdering::Canonical`] ordering.
     #[inline]
     pub fn new(axis: usize, direction: SortDirection) -> Self {
-        Self { axis, key_count: 1, direction, ordering: SortOrdering::default() }
+        Self { axis, key_count: NonZeroUsize::MIN, direction, ordering: SortOrdering::default() }
     }
 
-    /// Returns this [`SortOperation`] with the provided number of leading key inputs compared lexicographically,
-    /// rejecting `key_count == 0` because a sort needs at least one key.
-    pub fn with_key_count(self, key_count: usize) -> Result<Self, ProgramError> {
-        if key_count == 0 {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{SORT_OPERATION_NAME}` `key_count` must be at least 1"),
-            });
-        }
-        Ok(Self { key_count, ..self })
+    /// Creates the [`SortOperation`] that the [`Sort`] capability functions execute or stage for `inputs`, normalizing
+    /// the possibly negative `axis` against the rank of the first input and rejecting a zero `key_count`. Type
+    /// inference validates the remaining input requirements.
+    fn from_sort_arguments<V: Typed<Type = ArrayType>>(
+        inputs: &[V],
+        axis: Axis,
+        key_count: usize,
+        direction: SortDirection,
+        ordering: SortOrdering,
+    ) -> Result<Self, ProgramError> {
+        let Some(first) = inputs.first() else {
+            return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` needs at least one input")).into());
+        };
+        let axis = normalize_axis(SORT_OPERATION_NAME, axis, first.r#type().rank())?;
+        let key_count = NonZeroUsize::new(key_count).ok_or_else(|| ProgramError::InvalidArgument {
+            message: format!("`{SORT_OPERATION_NAME}` `key_count` must be at least 1"),
+        })?;
+        Ok(Self { axis, key_count, direction, ordering })
+    }
+
+    /// Returns this [`SortOperation`] with the provided number of leading key inputs compared lexicographically.
+    #[inline]
+    pub fn with_key_count(self, key_count: NonZeroUsize) -> Self {
+        Self { key_count, ..self }
     }
 
     /// Returns this [`SortOperation`] with the provided floating-point key [`SortOrdering`].
@@ -223,7 +239,7 @@ impl SortOperation {
 
     /// Returns the number of leading inputs that act as lexicographic sort keys.
     #[inline]
-    pub fn key_count(&self) -> usize {
+    pub fn key_count(&self) -> NonZeroUsize {
         self.key_count
     }
 
@@ -263,15 +279,16 @@ impl Operation for SortOperation {
         let Some(key_type) = input_types.first() else {
             return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` needs at least one input")));
         };
-        if self.key_count > input_types.len() {
+        let key_count = self.key_count.get();
+        if key_count > input_types.len() {
             return Err(TypeError::invalid(format!(
                 "`{}` `key_count` {} exceeds input count {}",
                 SORT_OPERATION_NAME,
-                self.key_count,
+                key_count,
                 input_types.len(),
             )));
         }
-        for input_type in &input_types[..self.key_count] {
+        for input_type in &input_types[..key_count] {
             // A reduced key can select a different permutation on its zero-filled replicas, so invariant passengers
             // would need additional variation tracking. Reduced passengers remain valid.
             if !input_type.reduced_axes().is_empty() {
@@ -328,7 +345,7 @@ impl Operation for SortOperation {
         // common renderings stay short.
         OperationFormatter::new(formatter, indentation, SORT_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("axis", self.axis)?;
-            if self.key_count > 1 {
+            if self.key_count > NonZeroUsize::MIN {
                 operation.field("key_count", self.key_count)?;
             }
             operation.field("direction", self.direction)?;
@@ -348,7 +365,7 @@ impl<C: Domain<Type = ArrayType, Value: Sort>> InterpretableOperation<C> for Sor
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        C::Value::sort_with_ordering(inputs, self.axis, self.key_count, self.direction, self.ordering)
+        C::Value::sort_with_ordering(inputs, self.axis, self.key_count.get(), self.direction, self.ordering)
     }
 }
 
@@ -416,7 +433,7 @@ impl_differentiable_operation! {
             // the tangents together. Otherwise, the primal sort runs in the primal context and the tangent sort
             // receives only the transferred keys, because the keys alone determine the permutation. Structural-zero
             // tangents remain symbolic because every permutation of zeros is zero.
-            let key_count = operation.key_count();
+            let key_count = operation.key_count().get();
             let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
             let live_tangents = inputs
                 .iter()
@@ -474,7 +491,7 @@ impl_differentiable_operation! {
             // Keys and known passengers receive no cotangents, and structural-zero cotangents remain symbolic.
             check_count!("output", outputs, inputs.len(), ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-            let mut keys = inputs[..operation.key_count()]
+            let mut keys = inputs[..operation.key_count().get()]
                 .iter()
                 .map(|input| {
                     input.as_known().cloned().ok_or_else(|| ProgramError::InvalidArgument {
@@ -482,7 +499,7 @@ impl_differentiable_operation! {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let cotangents = (operation.key_count()..inputs.len())
+            let cotangents = (operation.key_count().get()..inputs.len())
                 .filter_map(|index| match &outputs[index] {
                     MaybeZero::Value(cotangent) if accumulators[index].is_needed() => Some((index, cotangent.clone())),
                     _ => None,
@@ -499,7 +516,7 @@ impl_differentiable_operation! {
             let permutation = Sort::sort_with_ordering(
                 keys.as_slice(),
                 operation.axis(),
-                operation.key_count(),
+                operation.key_count().get(),
                 operation.direction(),
                 operation.ordering(),
             )?
@@ -582,14 +599,10 @@ impl Sort for Array {
         // encoding of each element and the resulting gather map moves whole element encodings, so non-key inputs of
         // any element data type (including the sub-byte ones without a scalar representation) sort without being
         // decoded.
-        let Some(first) = inputs.first() else {
-            return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` needs at least one input")).into());
-        };
-        let axis = normalize_axis(SORT_OPERATION_NAME, axis.into(), first.r#type().rank())?;
-        let operation = SortOperation::new(axis, direction).with_key_count(key_count)?.with_ordering(ordering);
+        let operation = SortOperation::from_sort_arguments(inputs, axis.into(), key_count, direction, ordering)?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         operation.infer_output_types(input_types.as_slice(), &[])?;
-        let key_ranks = inputs[..key_count]
+        let key_ranks = inputs[..operation.key_count().get()]
             .iter()
             .map(|key| key.sort_key_ranks(ordering))
             .collect::<Result<Vec<_>, _>>()?
@@ -598,7 +611,7 @@ impl Sort for Array {
             .collect::<Vec<_>>();
         let key_ranks = key_ranks.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let shape = input_types[0].static_shape().unwrap();
-        let gather = sort_permutation(key_ranks.as_slice(), shape.dimensions(), axis, direction);
+        let gather = sort_permutation(key_ranks.as_slice(), shape.dimensions(), operation.axis(), direction);
         inputs
             .iter()
             .zip(input_types)
@@ -621,13 +634,9 @@ where
         // Context-carrying values bind a `SortOperation` through the first input's context after aligning the manual
         // variation of the inputs. The `From<SortOperation>` bound keeps this implementation disjoint from the eager
         // reference arrays, whose dispatch domain does not provide a sort operation.
-        let Some(first) = inputs.first() else {
-            return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` needs at least one input")).into());
-        };
-        let axis = normalize_axis(SORT_OPERATION_NAME, axis.into(), first.r#type().rank())?;
-        let operation = SortOperation::new(axis, direction).with_key_count(key_count)?.with_ordering(ordering);
-        let inputs = ManualVariationAlignment::align_manual_variation(inputs)?;
-        first.dispatch_domain().bind(operation, Vec::new(), &inputs)
+        let operation = SortOperation::from_sort_arguments(inputs, axis.into(), key_count, direction, ordering)?;
+        let aligned_inputs = ManualVariationAlignment::align_manual_variation(inputs)?;
+        inputs[0].dispatch_domain().bind(operation, Vec::new(), &aligned_inputs)
     }
 }
 
@@ -885,8 +894,8 @@ fn top_k_with_index_passenger<V: Clone + Sort + Slice>(
 /// ```
 pub trait ArgMax: Sized {
     /// Returns the `i32` indices of the largest elements of this value along `axis`, with that axis dropped from the
-    /// result shape. Negative axes count from the end. Returns an error if the value has dynamic dimensions or complex elements, or if `axis` is out of
-    /// bounds or empty.
+    /// result shape. Negative axes count from the end. Returns an error if the value has dynamic dimensions or complex
+    /// elements, or if `axis` is out of bounds or empty.
     fn argmax<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>;
 }
 
@@ -929,8 +938,8 @@ where
 /// ```
 pub trait ArgMin: Sized {
     /// Returns the `i32` indices of the smallest elements of this value along `axis`, with that axis dropped from the
-    /// result shape. Negative axes count from the end. Returns an error if the value has dynamic dimensions or complex elements, or if `axis` is out of
-    /// bounds or empty.
+    /// result shape. Negative axes count from the end. Returns an error if the value has dynamic dimensions or complex
+    /// elements, or if `axis` is out of bounds or empty.
     fn argmin<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>;
 }
 
@@ -1113,22 +1122,17 @@ mod tests {
         assert_eq!(operation.name(), SORT_OPERATION_NAME);
         assert_eq!(operation.axis(), 0);
         assert_eq!(operation.direction(), SortDirection::Ascending);
-        assert_eq!(operation.key_count(), 1);
+        assert_eq!(operation.key_count(), NonZeroUsize::MIN);
         assert_eq!(operation.ordering(), SortOrdering::Canonical);
         assert_eq!(operation.to_string(), "sort [axis=0, direction=ascending]");
         assert_eq!(SortOperation::new(1, SortDirection::Descending).to_string(), "sort [axis=1, direction=descending]");
 
-        // Non-default key counts and orderings render, while their defaults keep the rendering unchanged. A zero
-        // `key_count` is rejected because a sort needs at least one key.
-        let multi_key = operation.with_key_count(2).unwrap().with_ordering(SortOrdering::Total);
-        assert_eq!(multi_key.key_count(), 2);
+        // Non-default key counts and orderings render, while their defaults keep the rendering unchanged.
+        let multi_key = operation.with_key_count(NonZeroUsize::new(2).unwrap()).with_ordering(SortOrdering::Total);
+        assert_eq!(multi_key.key_count().get(), 2);
         assert_eq!(multi_key.ordering(), SortOrdering::Total);
         assert_eq!(multi_key.to_string(), "sort [axis=0, key_count=2, direction=ascending, ordering=total]");
-        assert_eq!(multi_key.with_key_count(1).unwrap().with_ordering(SortOrdering::Canonical), operation,);
-        assert!(matches!(
-            operation.with_key_count(0),
-            Err(ProgramError::UnsupportedOperation { message }) if message == "`sort` `key_count` must be at least 1",
-        ));
+        assert_eq!(multi_key.with_key_count(NonZeroUsize::MIN).with_ordering(SortOrdering::Canonical), operation);
 
         // A sort stages as one instruction with one output per input.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -1207,7 +1211,7 @@ mod tests {
         // A multi-key sort validates every key: the key count must not exceed the input count, and every key data type
         // must be sortable, while passengers pass through unchanged.
         check_operation_type_inference!(
-            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap(),
+            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(NonZeroUsize::new(2).unwrap()),
             cases = [
                 {
                     type = ArrayType,
@@ -1355,7 +1359,7 @@ mod tests {
         ));
         assert!(matches!(
             Array::sort_with_key_count(&inputs, 0, 0, SortDirection::Ascending),
-            Err(ProgramError::UnsupportedOperation { message }) if message == "`sort` `key_count` must be at least 1",
+            Err(ProgramError::InvalidArgument { message }) if message == "`sort` `key_count` must be at least 1",
         ));
     }
 
@@ -1503,7 +1507,7 @@ mod tests {
         // A multi-key sort folds and residualizes like a single-key sort, resolving key-0 ties through key 1.
         check_operation_partial_evaluation!(
             backend = (Array, ArrayOperation<Array>),
-            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap(),
+            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(NonZeroUsize::new(2).unwrap()),
             cases = [
                 {
                     inputs = [(@known, keys.clone()), (@known, values.clone())],
@@ -1565,8 +1569,7 @@ mod tests {
         check_operation_batching!(
             @exact,
             operation = SortOperation::new(0, SortDirection::Ascending)
-                .with_key_count(2)
-                .unwrap()
+                .with_key_count(NonZeroUsize::new(2).unwrap())
                 .with_ordering(SortOrdering::Total),
             axis_size = 2,
             cases = [{
@@ -1624,7 +1627,7 @@ mod tests {
         // perturbation.
         check_operation_differentiation!(
             @approx(step = 1e-3, epsilon = 1e-6),
-            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap(),
+            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(NonZeroUsize::new(2).unwrap()),
             cases = [{
                 primals = [
                     Array::vector(vec![2.0, 1.0, 2.0]).unwrap(),
@@ -1851,9 +1854,9 @@ mod tests {
             .trim_end(),
         );
 
-        // Along the trailing axis (here given as `-1`) of a batch-size-1 input, the leading size-1 dimension is squeezed
-        // away before the composition, so the index passenger is a rank-1 iota (not the `reshape(iota)` that XLA's
-        // top-k rewriter rejects), and both outputs are reshaped back to the original rank afterward.
+        // Along the trailing axis (here given as `-1`) of a batch-size-1 input, the leading size-1 dimension is
+        // squeezed away before the composition, so the index passenger is a rank-1 iota (not the `reshape(iota)` that
+        // XLA's top-k rewriter rejects), and both outputs are reshaped back to the original rank afterward.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.top_k(2, -1)?.0),
             ArrayType::new_static(DataType::F64, [1, 4]),

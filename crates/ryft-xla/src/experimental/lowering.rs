@@ -4846,8 +4846,8 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
 
     // Each key contributes its comparison components in lexicographic order as left and right scalar values together
     // with their comparison type.
-    let mut components = Vec::with_capacity(operation.key_count());
-    for key_index in 0..operation.key_count() {
+    let mut components = Vec::with_capacity(operation.key_count().get());
+    for key_index in 0..operation.key_count().get() {
         let left_key = comparator_block.argument(2 * key_index)?.as_ref();
         let right_key = comparator_block.argument(2 * key_index + 1)?.as_ref();
         let data_type = output_types[key_index].data_type();
@@ -22252,7 +22252,7 @@ mod tests {
         let primary = builder.add_input(primary_type.clone());
         let secondary = builder.add_input(secondary_type.clone());
         let passenger = builder.add_input(passenger_type.clone());
-        let operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap();
+        let operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(NonZeroUsize::new(2).unwrap());
         let outputs = builder
             .add_instruction(operation, Vec::new(), vec![primary, secondary, passenger], None)
             .unwrap()

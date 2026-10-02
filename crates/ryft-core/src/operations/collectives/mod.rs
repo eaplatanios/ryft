@@ -31,7 +31,7 @@
 //! the binding level, while a name bound to a device mesh axis by a `shard_map` manual region stays in the staged
 //! body and lowers to cross-device collectives over that mesh axis.
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review this module's docstring.
 
 use std::fmt::Debug;
 
@@ -84,6 +84,7 @@ pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumS
 pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
 pub use ragged_all_to_all::{RAGGED_ALL_TO_ALL_OPERATION_NAME, RaggedAllToAll, RaggedAllToAllOperation};
 
+// TODO(eaplatanios): Review this.
 /// Shape semantics used by collectives that can either materialize a named axis or tile an existing array axis.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CollectiveMode {
@@ -95,6 +96,7 @@ pub enum CollectiveMode {
     Tiled,
 }
 
+// TODO(eaplatanios): Review this.
 /// Shared shape and grouping options for all-gather, sum-scatter, and all-to-all.
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct CollectiveOptions {
@@ -105,6 +107,7 @@ pub struct CollectiveOptions {
     axis_index_groups: Option<Vec<Vec<usize>>>,
 }
 
+// TODO(eaplatanios): Review this.
 impl Debug for CollectiveOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.axis_index_groups {
@@ -118,6 +121,7 @@ impl Debug for CollectiveOptions {
     }
 }
 
+// TODO(eaplatanios): Review this.
 impl CollectiveOptions {
     /// Creates collective options for `mode` with no participant subgroups.
     #[inline]
@@ -151,13 +155,50 @@ impl CollectiveOptions {
     }
 
     /// Validates these options against the full named-axis size and returns the effective group size used for shape
-    /// arithmetic.
+    /// arithmetic. Refer to the documentation of [`effective_collective_axis_size`] for more information.
     pub(super) fn effective_axis_size(&self, operation_name: &str, axis_size: usize) -> Result<usize, TypeError> {
         effective_collective_axis_size(operation_name, axis_size, self.axis_index_groups())
     }
 }
 
-/// Validates an optional ordered participant partition and returns its effective group size without copying it.
+/// Validates the participant grouping of a collective over a named axis of size `axis_size` and returns its _effective
+/// axis size_, which is the number of participants that each instance of the collective combines. Without `groups`,
+/// every participant along the axis takes part in one collective, so the effective axis size is `axis_size` itself.
+/// With `groups`, the axis is split into independent collectives, one per group, and the effective axis size is the
+/// common group size. Callers use it wherever shapes or values depend on the participant count (e.g., the gathered
+/// extent of an `all_gather` operation, the chunk extent of a `parallel_sum_scatter` operation, or the divisor of a
+/// mean operation).
+///
+/// For example, an axis of size 4 split into the groups `[[0, 2], [3, 1]]` runs two independent collectives over two
+/// participants each, so its effective axis size is 2:
+///
+/// ```text
+///   participant:   0   1   2   3
+///   group:         A   B   A   B      (A = [0, 2] and B = [3, 1])
+///   collectives:   A combines participants 0 and 2, and B combines participants 3 and 1
+/// ```
+///
+/// The groups must form an equal-sized exact partition of `0..axis_size`:
+///
+///   - `axis_size` must be positive, and there must be at least one group, whose size is at least one.
+///   - Every group must have the same size as the first one.
+///   - Every participant in `0..axis_size` must appear in exactly one group, which rules out out-of-bounds, repeated,
+///     and missing participants.
+///
+/// This function only validates the groups and borrows them without copying. The order of the groups and of the
+/// participants within each group is part of the collective's semantics and is preserved by its owner (e.g., the
+/// XLA backend's lowering emits replica groups in this order), even though this validation does not depend on it.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the collective, used in diagnostics.
+///   - `axis_size`: Full size of the named axis, which every participant index must be smaller than.
+///   - `groups`: Optional ordered participant groups.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] that names `operation_name` and describes the first violated requirement, checking the
+/// requirements above in order and the groups and their participants in order.
 pub(super) fn effective_collective_axis_size(
     operation_name: &str,
     axis_size: usize,
@@ -167,14 +208,17 @@ pub(super) fn effective_collective_axis_size(
     let Some(groups) = groups else {
         return Ok(axis_size);
     };
+
     let Some(first_group) = groups.first() else {
         return Err(TypeError::invalid(format!("`{operation_name}` axis index groups must not be empty")));
     };
+
     if first_group.is_empty() {
         return Err(TypeError::invalid(format!(
             "`{operation_name}` axis index groups must contain at least one participant",
         )));
     }
+
     let group_size = first_group.len();
     let mut seen = vec![false; axis_size];
     for (group_index, group) in groups.iter().enumerate() {
@@ -185,27 +229,34 @@ pub(super) fn effective_collective_axis_size(
                 group.len(),
             )));
         }
+
         for &participant in group {
             let Some(participant_seen) = seen.get_mut(participant) else {
                 return Err(TypeError::invalid(format!(
                     "`{operation_name}` axis index {participant} is out of bounds for axis size {axis_size}",
                 )));
             };
+
             if *participant_seen {
                 return Err(TypeError::invalid(format!(
                     "`{operation_name}` axis index groups contain participant {participant} more than once",
                 )));
             }
+
             *participant_seen = true;
         }
     }
+
     if let Some(missing) = seen.iter().position(|seen| !seen) {
         return Err(TypeError::invalid(format!(
             "`{operation_name}` axis index groups do not contain participant {missing}",
         )));
     }
+
     Ok(group_size)
 }
+
+// TODO(eaplatanios): Review form here onwards.
 
 /// Rejects ragged collective inputs before any parent binding can stage or execute collective work.
 pub(super) fn reject_ragged_collective_inputs<V: Value<Type = ArrayType>>(
