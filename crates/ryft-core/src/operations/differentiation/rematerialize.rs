@@ -218,13 +218,13 @@ impl<T: Type> RematerializeOperation<T> {
     }
 
     /// Returns the operation that rounds a saved residual of type `r#type` to the precision of its type, which
-    /// [`PartitionedProgram::with_rounded_residuals`] stages in the known program of a rematerialized call so that its
-    /// known and residual consumers observe the same value. Only arrays of floating-point types narrower than `f32`
-    /// whose formats are IEEE-style (i.e., `bf16`, `f16`, and the `f8` formats with infinities) are rounded, because
-    /// backends compute those types at a higher precision (e.g., in `f32`), and [`ReducePrecisionOperation`] simulates
-    /// exactly their formats. Wider floating-point types are not computed with excess precision, so rounding them would
-    /// be a no-op. The finite-only formats (e.g., `f8e4m3fn`) are not rounded, because an IEEE-style simulation of
-    /// their bit widths would map their largest finite values to infinities.
+    /// [`PartitionedProgram::with_rounded_residuals`] stages in the known program of a rematerialized call so that
+    /// its known and residual consumers observe the same value. This rounding policy targets arrays of IEEE-style
+    /// floating-point types narrower than `f32` (i.e., `bf16`, `f16`, and the `f8` formats with infinities), which
+    /// backends may compute at a higher precision (e.g., in `f32`). [`ReducePrecisionOperation`] simulates their
+    /// formats without changing the array type. The policy leaves `f32` and wider types unchanged. It also excludes
+    /// finite-only formats (e.g., `f8e4m3fn`), because an IEEE-style simulation of their bit widths would map their
+    /// largest finite values to infinities.
     fn excess_precision_rounding(r#type: &T) -> Option<ErasedOperation>
     where
         for<'t> &'t ArrayType: TryFrom<&'t T>,
@@ -431,7 +431,9 @@ where
 
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
 
-        // Look through memory transfers so offloaded residuals are rounded before they are offloaded.
+        // Look through memory transfers and round before offloading, so known consumers and derivative
+        // consumers use the same rounded value. Rounding after the transfer would leave known consumers
+        // using the value computed with excess precision.
         let partition = driver
             .partition_program(&context.clone().with_residual_policy(&self.policy), body, &input_known)?
             .with_rounded_residuals(Self::excess_precision_rounding, |operation| {
@@ -605,7 +607,10 @@ where
                 required_known_outputs.as_slice(),
                 &self.policy,
             )?;
-            // Look through memory transfers so offloaded residuals are rounded before they are offloaded.
+
+            // Look through memory transfers and round before offloading, so known consumers and derivative consumers
+            // use the same rounded value. Rounding after the transfer would leave known consumers using the value
+            // computed with excess precision.
             let partition = partition.with_rounded_residuals(Self::excess_precision_rounding, |operation| {
                 operation.projected_payload::<TransferToMemoryOperation>().is_some()
             })?;
@@ -746,6 +751,8 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -766,7 +773,8 @@ mod tests {
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::WhileOperation;
     use crate::operations::custom_functions::functions::custom_function;
-    use crate::operations::dimensions::DimensionAddOperation;
+    use crate::operations::debugging::PrintOperation;
+    use crate::operations::dimensions::dimension_add::DimensionAddOperation;
     use crate::operations::dot::{Dot, DotDimensionNumbers, DotOperation};
     use crate::operations::manipulation::memory::TransferToMemory;
     use crate::operations::references::{
@@ -776,13 +784,16 @@ mod tests {
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{NoStorage, ResidualDecision, ResidualPolicy, ResidualRejection};
-    use crate::programs::{EffectClasses, Program, ProgramBuilder, ReferenceType};
+    use crate::programs::{
+        EffectClasses, ExternalReferenceBinding, Program, ProgramBuilder, ReferenceSource, ReferenceType,
+    };
     use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
+    type TestTracer = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 
     /// Returns a [`RematerializeOperation`] over [`ArrayType`] with the default [`NothingSaveable`] policy.
     fn rematerialize_operation() -> RematerializeOperation<ArrayType> {
@@ -799,8 +810,6 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder], vec![Placeholder])
             .unwrap()
     }
-
-    type TestTracer = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 
     /// Returns the dot product dimensions that contract two vectors.
     fn vector_dot_dimensions() -> DotDimensionNumbers {
@@ -850,7 +859,20 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation() {
+    fn test_rematerialization_optimization_barrier_selects() {
+        assert!(RematerializationOptimizationBarrier::All.selects(0));
+        assert!(RematerializationOptimizationBarrier::All.selects(7));
+        assert!(!RematerializationOptimizationBarrier::None.selects(0));
+        let barrier = RematerializationOptimizationBarrier::Inputs(vec![true, false]);
+        assert!(barrier.selects(0));
+        assert!(!barrier.selects(1));
+
+        // Indices beyond the selection are not selected.
+        assert!(!barrier.selects(2));
+    }
+
+    #[test]
+    fn test_rematerialize() {
         let policy = ResidualPolicyReference::<ArrayType>::new(NothingSaveable);
         let operation = RematerializeOperation::new(policy.clone());
         assert_eq!(operation.policy(), &policy);
@@ -885,14 +907,19 @@ mod tests {
             "rematerialize [optimization_barrier=[true, false]]",
         );
 
-        // Operations compare by the identity of their policy definition and by their flags.
+        // Operations compare and hash by the identity of their policy definition and by their flags.
         assert_eq!(operation.clone(), operation);
         assert_ne!(operation.clone().with_differentiated(true), operation);
         assert_ne!(rematerialize_operation(), operation);
+        let operations = HashSet::from([operation.clone(), configured.clone()]);
+        assert!(operations.contains(&operation));
+        assert!(operations.contains(&configured));
+        assert!(!operations.contains(&operation.clone().with_differentiated(true)));
+        assert!(!operations.contains(&rematerialize_operation()));
     }
 
     #[test]
-    fn test_rematerialize_operation_lift() {
+    fn test_rematerialize_lift() {
         // Lifting keeps the identity of the policy and the flags of the operation.
         let operation = RematerializeOperation::new(ResidualPolicyReference::<ArrayType>::new(DotsSaveable))
             .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![false, true]))
@@ -905,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_type_inference() {
+    fn test_rematerialize_type_inference() {
         let scalar = ArrayType::scalar(DataType::F64);
         let operation = rematerialize_operation();
         let body =
@@ -940,6 +967,14 @@ mod tests {
         assert_eq!(
             operation.infer_region_input_types(std::slice::from_ref(&scalar), std::slice::from_ref(&body)),
             Ok(vec![Some(vec![scalar.clone()])]),
+        );
+        assert_eq!(
+            operation.infer_region_input_types(std::slice::from_ref(&scalar), &[]),
+            Err(TypeError::invalid("expected 1 region but got 0")),
+        );
+        assert_eq!(
+            operation.infer_region_input_types(&[scalar.clone(), scalar.clone()], std::slice::from_ref(&body)),
+            Err(TypeError::invalid("PLACEHOLDER")),
         );
         let bounds = DimensionBounds::new(1, Some(5)).unwrap();
         let extent = DimensionType::new("n", bounds);
@@ -978,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_boundary_pruning() {
+    fn test_rematerialize_boundary_pruning() {
         // The body maps `(x, y)` to `(sin(x), y)`, so using only the first output drops the input `y` and the second
         // output, together with the optimization barrier selection entry of `y`.
         let scalar = ArrayType::scalar(DataType::F64);
@@ -1015,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_discharge_references() {
+    fn test_rematerialize_discharge_references() {
         // The body adds `x` into the reference `r` and returns the value that it then holds. Discharging threads the
         // state of the reference through the body positionally and publishes the mutated state.
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -1053,12 +1088,14 @@ mod tests {
                 ]
                 in (%2, %3)"},
         );
-        assert_eq!(discharged.external_reference_bindings().len(), 1);
-        assert!(discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(
+            discharged.external_reference_bindings(),
+            &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
+        );
     }
 
     #[test]
-    fn test_rematerialize_operation_interpretation() {
+    fn test_rematerialize_interpretation() {
         // Outside of differentiation, the call computes what its body computes.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let outputs = context
@@ -1068,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_partial_evaluation() {
+    fn test_rematerialize_partial_evaluation() {
         // With a known `x` and an unknown `y`, the policy decides what the known side computes: saving nothing forwards
         // `x` to a differentiated call that recomputes the dot product, while saving dot products hoists the dot
         // product out of the call and recomputes only the sine.
@@ -1204,7 +1241,8 @@ mod tests {
                 }"},
         );
 
-        // A body with effects stays whole and undifferentiated on the residual side.
+        // A call over a reference input stays whole and undifferentiated on the residual side, because replaying its
+        // known side outside of the call would bypass the reference placement of the active partial evaluation.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -1250,10 +1288,35 @@ mod tests {
                     in (%2)
                 }"},
         );
+
+        // A body with observable effects stays whole and undifferentiated on the residual side as well, because replaying
+        // its known side outside of the call would bypass the effect ordering of the active partial evaluation.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let x = body.add_input(scalar_type.clone());
+        let y = body.add_input(scalar_type.clone());
+        let printed = body.add_instruction(PrintOperation::new("x"), Vec::new(), vec![x], None).unwrap()[0];
+        let product = body.add_instruction(MulOperation::new(), Vec::new(), vec![printed, y], None).unwrap()[0];
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let x = builder.add_input(scalar_type.clone());
+        let y = builder.add_input(scalar_type);
+        let output = builder.add_instruction(rematerialize_operation(), vec![body], vec![x, y], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.partition(&[true, false]).unwrap().to_string(),
+            indoc! {"
+            PLACEHOLDER"},
+        );
     }
 
     #[test]
-    fn test_rematerialize_operation_partial_evaluation_forwarded_known_inputs() {
+    fn test_rematerialize_partial_evaluation_forwarded_known_inputs() {
         // `(a, b) ↦ a · b + rematerialize((a, b) ↦ a · b)` with an eager known side forwards the known `a` into the
         // differentiated call, which receives it as the same residual input that the outer product uses.
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -1297,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_batching() {
+    fn test_rematerialize_batching() {
         // Batching batches the body with its natural output axes and keeps the rematerialization boundary.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let body = builder.import_program(sine_product_body());
@@ -1327,6 +1390,23 @@ mod tests {
         assert_eq!(
             batched.interpret(vec![Array::vector(vec![0.5f64, 1.5]).unwrap()]),
             Ok(vec![Array::vector(vec![0.5f64.sin() * 0.5, 1.5f64.sin() * 1.5]).unwrap()]),
+        );
+
+        // A completely replicated call at an unnamed batching level is bound unchanged.
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+            PLACEHOLDER"},
         );
 
         // A mapped reference input enters the batched body as a reference to the stacked values, and the body may
@@ -1392,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_differentiation() {
+    fn test_rematerialize_differentiation() {
         // Forward mode in a shared staged context binds the same call over the fused derivative program, keeping its
         // policy and flags.
         let operation = RematerializeOperation::new(ResidualPolicyReference::new(DotsSaveable))
@@ -1426,6 +1506,53 @@ mod tests {
                     },
                 ]
                 in (%4, %5)"},
+        );
+
+        // Inputs whose tangents are zero-space (e.g., integer inputs) get no tangent slot in the fused call, and a call
+        // without any live input tangent is bound unchanged over its primal inputs, with structurally zero output
+        // tangents.
+        let body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let x = builder.add_input(ArrayType::scalar(DataType::F64));
+            let n = builder.add_input(ArrayType::scalar(DataType::I64));
+            let square = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, x], None).unwrap()[0];
+            let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![n, n], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![square, product], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let n = builder.add_input(ArrayType::scalar(DataType::I64));
+        let outputs =
+            builder.add_instruction(rematerialize_operation(), vec![body], vec![x, n], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+            PLACEHOLDER"},
+        );
+        let body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let n = builder.add_input(ArrayType::scalar(DataType::I64));
+            let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![n, n], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let n = builder.add_input(ArrayType::scalar(DataType::I64));
+        let output = builder.add_instruction(rematerialize_operation(), vec![body], vec![n], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+            PLACEHOLDER"},
         );
 
         // The optimization barrier of the fused call additionally selects the live input tangents, and that of the
@@ -1599,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_differentiation_policies() {
+    fn test_rematerialize_differentiation_policies() {
         // Every built-in policy computes the same value and gradient, while the residuals that the pullback saves
         // differ (and offloading policies save them in host memory). The gradient of `sin(x · x)` is `2 cos(x · x) x`.
         let x = [0.1f64, 0.2, 0.3];
@@ -1653,7 +1780,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_differentiation_entry_points() {
+    fn test_rematerialize_differentiation_entry_points() {
         // Forward mode, linearization, and reverse mode agree, and linearization saves the residuals that the policy
         // selects: `x` and the dot product.
         let function = rematerialize(tagged_sine_of_dot).with_policy(DotsSaveable);
@@ -1674,7 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_differentiation_custom_function_body() {
+    fn test_rematerialize_differentiation_custom_function_body() {
         // The body calls a custom function whose JVP rule doubles the derivative of `sin` and whose VJP rule triples
         // it. Forward mode through the call uses the JVP rule, while reverse mode uses the VJP rule, because the
         // driver selects the rule with which the body is differentiated.
@@ -1696,11 +1823,11 @@ mod tests {
             differentiate_at(x.clone()).jvp(Array::scalar(1.0f64).unwrap(), |x| function.call(x)).unwrap(),
             (Array::scalar(0.5f64.sin()).unwrap(), Array::scalar(2.0 * 0.5f64.cos()).unwrap()),
         );
-        assert_eq!(differentiate_at(x).gradient(|x| function.call(x)), Ok(Array::scalar(3.0 * 0.5f64.cos()).unwrap()),);
+        assert_eq!(differentiate_at(x).gradient(|x| function.call(x)), Ok(Array::scalar(3.0 * 0.5f64.cos()).unwrap()));
     }
 
     #[test]
-    fn test_rematerialize_operation_differentiation_higher_order() {
+    fn test_rematerialize_differentiation_higher_order() {
         // The staged gradient of `sin(x²)` keeps the differentiated call that recomputes `cos(x²)`, and so does
         // differentiating that gradient in forward mode (i.e., forward-over-reverse Hessian-vector products) and in
         // reverse mode (i.e., the gradient of the gradient), as well as the gradient of its forward-mode derivative.
@@ -1852,12 +1979,12 @@ mod tests {
         let outputs = hessian_vector_product.interpret(vec![Array::scalar(x).unwrap(), Array::scalar(1.0).unwrap()]);
         assert_eq!(
             outputs,
-            Ok(vec![Array::scalar(2.0 * x * (x * x).cos()).unwrap(), Array::scalar(second_derivative).unwrap()])
+            Ok(vec![Array::scalar(2.0 * x * (x * x).cos()).unwrap(), Array::scalar(second_derivative).unwrap()]),
         );
     }
 
     #[test]
-    fn test_rematerialize_operation_differentiation_batching() {
+    fn test_rematerialize_differentiation_batching() {
         // Batching a pullback keeps its differentiated call, and so does differentiating a batched program.
         let linearization = sine_of_dot_program(rematerialize_operation()).linearize().unwrap();
         let (batched_pullback, _) = linearization
@@ -1938,7 +2065,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_differentiation_scan_body() {
+    fn test_rematerialize_differentiation_scan_body() {
         // The body scans `c * cos(dot(x, x))` over the rows `x` of `xs`. Saving dot products applies to every iteration
         // of the scan: the primal scan stacks the dot products, and the differentiated call recomputes their cosines.
         let scan_body = {
@@ -2023,7 +2150,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_differentiation_unbounded_while_body() {
+    fn test_rematerialize_differentiation_unbounded_while_body() {
         // The body `while (x < 16) { x = x * x }` has no reverse-mode derivative, but evaluating it and differentiating
         // it in forward mode derive nothing that only reverse mode needs. At `x = 2`, the loop computes `x⁴` locally.
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -2067,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_differentiation_excess_precision() {
+    fn test_rematerialize_differentiation_excess_precision() {
         // Saving everything for `x ↦ sin(x)²` over `bf16` saves `sin(x)` and `cos(x)`. The primal program also squares
         // `sin(x)`, so it is rounded to `bf16` right after its producer, and both its primal consumer and the tangent
         // program observe the rounded value even when a backend computes `sin(x)` in a wider type. The cosine feeds
@@ -2111,7 +2238,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_differentiation_external_reference_mutation() {
+    fn test_rematerialize_differentiation_external_reference_mutation() {
         // The body `(r, x) ↦ (r += x²; read(r) · x)` mutates an external reference. Its mutation runs once, in the
         // primal computation, and is never recomputed, so the reference holds `r + x²` afterwards, and the derivative
         // of `(r + x²) · x` with respect to `x` is `r + 3x²`, as without rematerialization.
@@ -2158,7 +2285,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_transposition() {
+    fn test_rematerialize_transposition() {
         // Transposing the tangent program binds the same differentiated call over the transposed body, which recomputes
         // the cosine of the dot product from the saved `x` before using it.
         let linearization = sine_of_dot_program(rematerialize_operation()).linearize().unwrap();
@@ -2226,7 +2353,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_operation_transposition_local_reference_lifecycle() {
+    fn test_rematerialize_transposition_local_reference_lifecycle() {
         // The body `x ↦ freeze(new(x) += x²) · x` computes `x² + x³` through a local reference whose lifecycle the
         // pullback recomputes from the saved `x`, afresh for every application.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
