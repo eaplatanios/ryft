@@ -84,30 +84,105 @@ pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumS
 pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation};
 pub use ragged_all_to_all::{RAGGED_ALL_TO_ALL_OPERATION_NAME, RaggedAllToAll, RaggedAllToAllOperation};
 
-// TODO(eaplatanios): Review this.
-/// Shape semantics used by collectives that can either materialize a named axis or tile an existing array axis.
+/// Shape semantics of the collectives that resize an array axis (e.g., [`AllGatherOperation`],
+/// [`ParallelSumScatterOperation`], and [`AllToAllOperation`]), which determine where the `n` participants of the named
+/// axis appear in the shape of the result. In [`Untiled`](Self::Untiled) mode, the participants get an array dimension
+/// of their own with extent `n`, which an all-gather inserts, a sum-scatter consumes, and an all-to-all moves, so the
+/// rank changes. In [`Tiled`](Self::Tiled) mode, the participants are instead folded into an existing array dimension,
+/// whose extent is multiplied or divided by `n`, so the rank is preserved. These are the analogues of the `tiled=False`
+/// (the default) and `tiled=True` settings of JAX's
+/// [`jax.lax.all_gather`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_gather.html),
+/// [`jax.lax.psum_scatter`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.psum_scatter.html),
+/// and [`jax.lax.all_to_all`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.all_to_all.html).
+///
+/// Both modes compute the same values and differ only in where the participant dimension lives: an untiled result keeps
+/// it as a separate dimension, while a tiled result folds it, participant-major, into an existing one. For example,
+/// with `n = 4` participants, an all-gather that concatenates along axis 0, a sum-scatter that scatters along axis 0,
+/// and an all-to-all that splits axis 0 and concatenates along axis 1, the shapes are:
+///
+/// ```text
+///   Collective             Participant Input   Untiled Output   Tiled Output
+///   ------------------------------------------------------------------------
+///   all_gather             f32[3, 5]           f32[4, 3, 5]     f32[12, 5]
+///   parallel_sum_scatter   f32[4, 5]           f32[5]           f32[1, 5]
+///   parallel_sum_scatter   f32[12, 5]          (invalid)        f32[3, 5]
+///   all_to_all             f32[4, 6]           f32[6, 4]        f32[1, 24]
+///   all_to_all             f32[8, 6]           (invalid)        f32[2, 24]
+/// ```
+///
+/// The untiled all-gather output stacks the participants' inputs, so index `i` along its new axis 0 holds the input of
+/// participant `i`, whereas the tiled all-gather output concatenates them along the existing axis 0, so reshaping the
+/// untiled `f32[4, 3, 5]` result to `f32[12, 5]` yields the tiled result exactly. The untiled all-to-all, in contrast,
+/// inserts its sender dimension at the concat axis, after the dimension it concatenates along, so recovering the tiled
+/// `f32[1, 24]` result from the untiled `f32[6, 4]` result also requires moving that sender dimension in front of the
+/// concatenated dimension first. An untiled sum-scatter and an untiled all-to-all require the selected axis to have
+/// extent exactly `n`, while their tiled forms only require it to be divisible by `n`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CollectiveMode {
-    /// Materializes the named axis as a new ranked array dimension, or consumes one ranked dimension when scattering.
+    /// Gives the participants an array dimension of their own with extent `n`: an all-gather inserts it at its concat
+    /// axis, a sum-scatter consumes its scatter axis (whose extent must be exactly `n`), and an all-to-all consumes its
+    /// split axis (whose extent must be exactly `n`) and inserts a sender dimension at its concat axis.
     #[default]
     Untiled,
 
-    /// Preserves array rank by multiplying or dividing an existing ranked array dimension.
+    /// Folds the participants into an existing array dimension, preserving the rank: an all-gather multiplies the
+    /// extent of its concat axis by `n`, a sum-scatter divides the extent of its scatter axis by `n`, and an all-to-all
+    /// divides the extent of its split axis by `n` and multiplies the extent of its concat axis by `n`. Each divided
+    /// extent must be divisible by `n`.
     Tiled,
 }
 
-// TODO(eaplatanios): Review this.
-/// Shared shape and grouping options for all-gather, sum-scatter, and all-to-all.
+/// Shared shape and grouping options for collective operations that resize an array axis (e.g., [`AllGatherOperation`],
+/// [`ParallelSumScatterOperation`], and [`AllToAllOperation`]).
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct CollectiveOptions {
-    /// Rank-changing or rank-preserving shape semantics.
+    /// [`CollectiveMode`] of the collective.
     mode: CollectiveMode,
 
     /// Optional ordered partition of logical participant indices.
     axis_index_groups: Option<Vec<Vec<usize>>>,
 }
 
-// TODO(eaplatanios): Review this.
+impl CollectiveOptions {
+    /// Creates a new [`CollectiveOptions`] instance for `mode` with no participant subgroups.
+    #[inline]
+    pub fn new(mode: CollectiveMode) -> Self {
+        Self { mode, axis_index_groups: None }
+    }
+
+    /// Creates a new rank-preserving tiled [`CollectiveOptions`] instance with no participant subgroups.
+    #[inline]
+    pub fn tiled() -> Self {
+        Self::new(CollectiveMode::Tiled)
+    }
+
+    /// Returns this [`CollectiveOptions`] instance with the provided ordered participant groups.
+    #[inline]
+    pub fn with_axis_index_groups(mut self, axis_index_groups: Vec<Vec<usize>>) -> Self {
+        self.axis_index_groups = Some(axis_index_groups);
+        self
+    }
+
+    /// Returns the [`CollectiveMode`] of this [`CollectiveOptions`] instance.
+    #[inline]
+    pub fn mode(&self) -> CollectiveMode {
+        self.mode
+    }
+
+    /// Returns the ordered participant groups of this [`CollectiveOptions`] instance, if any.
+    #[inline]
+    pub fn axis_index_groups(&self) -> Option<&[Vec<usize>]> {
+        self.axis_index_groups.as_deref()
+    }
+
+    /// Validates these options against the full named-axis size and returns the effective group size used for shape
+    /// arithmetic. Refer to the documentation of [`effective_collective_axis_size`] for more information.
+    #[inline]
+    pub(super) fn effective_axis_size(&self, operation_name: &str, axis_size: usize) -> Result<usize, TypeError> {
+        effective_collective_axis_size(operation_name, axis_size, self.axis_index_groups())
+    }
+}
+
 impl Debug for CollectiveOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.axis_index_groups {
@@ -118,46 +193,6 @@ impl Debug for CollectiveOptions {
                 .field("axis_index_groups", axis_index_groups)
                 .finish(),
         }
-    }
-}
-
-// TODO(eaplatanios): Review this.
-impl CollectiveOptions {
-    /// Creates collective options for `mode` with no participant subgroups.
-    #[inline]
-    pub fn new(mode: CollectiveMode) -> Self {
-        Self { mode, axis_index_groups: None }
-    }
-
-    /// Creates rank-preserving tiled collective options with no participant subgroups.
-    #[inline]
-    pub fn tiled() -> Self {
-        Self::new(CollectiveMode::Tiled)
-    }
-
-    /// Returns these options with the provided ordered participant groups.
-    #[inline]
-    pub fn with_axis_index_groups(mut self, axis_index_groups: Vec<Vec<usize>>) -> Self {
-        self.axis_index_groups = Some(axis_index_groups);
-        self
-    }
-
-    /// Returns the selected shape mode.
-    #[inline]
-    pub fn mode(&self) -> CollectiveMode {
-        self.mode
-    }
-
-    /// Returns the ordered participant groups, if any.
-    #[inline]
-    pub fn axis_index_groups(&self) -> Option<&[Vec<usize>]> {
-        self.axis_index_groups.as_deref()
-    }
-
-    /// Validates these options against the full named-axis size and returns the effective group size used for shape
-    /// arithmetic. Refer to the documentation of [`effective_collective_axis_size`] for more information.
-    pub(super) fn effective_axis_size(&self, operation_name: &str, axis_size: usize) -> Result<usize, TypeError> {
-        effective_collective_axis_size(operation_name, axis_size, self.axis_index_groups())
     }
 }
 
