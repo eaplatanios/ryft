@@ -2522,12 +2522,12 @@ mod tests {
         for ordering in [SortOrdering::Canonical, SortOrdering::Total] {
             for direction in [SortDirection::Ascending, SortDirection::Descending] {
                 let sorted =
-                    Sort::sort_with_ordering(&[keys.clone(), payloads.clone()], 0, direction, 1, ordering).unwrap();
+                    Sort::sort_with_ordering(&[keys.clone(), payloads.clone()], 0, 1, direction, ordering).unwrap();
                 let reference_sorted = Sort::sort_with_ordering(
                     &[reference_keys.clone(), reference_payloads.clone()],
                     0,
-                    direction,
                     1,
+                    direction,
                     ordering,
                 )
                 .unwrap();
@@ -2652,7 +2652,7 @@ mod tests {
         ];
         for (direction, expected_primary, expected_secondary, expected_passenger) in cases {
             let sorted =
-                Sort::sort_with_key_count(&[primary.clone(), secondary.clone(), passenger.clone()], 0, direction, 2)
+                Sort::sort_with_key_count(&[primary.clone(), secondary.clone(), passenger.clone()], 0, 2, direction)
                     .unwrap();
             assert_eq!(read_i32s(&sorted[0]), expected_primary);
             assert_eq!(read_f32s(&sorted[1]), expected_secondary);
@@ -2661,8 +2661,8 @@ mod tests {
             let reference_sorted = Sort::sort_with_key_count(
                 &[reference_primary.clone(), reference_secondary.clone(), reference_passenger.clone()],
                 0,
-                direction,
                 2,
+                direction,
             )
             .unwrap();
             let expected_primary_f64s = expected_primary.iter().map(|value| f64::from(*value)).collect::<Vec<_>>();

@@ -49,7 +49,7 @@
 //! let positions = Array::vector(vec![0i32, 1, 2, 3])?;
 //! let canonical = Array::sort(&[keys.clone(), positions.clone()], 0, SortDirection::Ascending)?;
 //! assert_eq!(canonical[1], Array::vector(vec![0i32, 1, 2, 3])?);
-//! let total = Array::sort_with_ordering(&[keys, positions], 0, SortDirection::Ascending, 1, SortOrdering::Total)?;
+//! let total = Array::sort_with_ordering(&[keys, positions], 0, 1, SortDirection::Ascending, SortOrdering::Total)?;
 //! assert_eq!(total[1], Array::vector(vec![3i32, 1, 0, 2])?);
 //! # Ok(())
 //! # }
@@ -76,6 +76,7 @@ use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayExtentBatchingPolicy, ArrayType,
     Complex, DataType, Dimension, Shape, ShardingDimension, i1, i2, i4, u1, u2, u4,
 };
+use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -179,11 +180,11 @@ pub struct SortOperation {
     /// Axis along which the inputs are sorted.
     axis: usize,
 
-    /// Direction in which the key inputs are ordered.
-    direction: SortDirection,
-
     /// Number of leading inputs that act as lexicographic sort keys (always at least one).
     key_count: usize,
+
+    /// Direction in which the key inputs are ordered.
+    direction: SortDirection,
 
     /// Order in which floating-point keys are compared.
     ordering: SortOrdering,
@@ -194,7 +195,7 @@ impl SortOperation {
     /// the default [`SortOrdering::Canonical`] ordering.
     #[inline]
     pub fn new(axis: usize, direction: SortDirection) -> Self {
-        Self { axis, direction, key_count: 1, ordering: SortOrdering::default() }
+        Self { axis, key_count: 1, direction, ordering: SortOrdering::default() }
     }
 
     /// Returns this [`SortOperation`] with the provided number of leading key inputs compared lexicographically,
@@ -220,16 +221,16 @@ impl SortOperation {
         self.axis
     }
 
-    /// Returns the direction in which the key inputs are ordered.
-    #[inline]
-    pub fn direction(&self) -> SortDirection {
-        self.direction
-    }
-
     /// Returns the number of leading inputs that act as lexicographic sort keys.
     #[inline]
     pub fn key_count(&self) -> usize {
         self.key_count
+    }
+
+    /// Returns the direction in which the key inputs are ordered.
+    #[inline]
+    pub fn direction(&self) -> SortDirection {
+        self.direction
     }
 
     /// Returns the order in which floating-point keys are compared.
@@ -327,10 +328,10 @@ impl Operation for SortOperation {
         // common renderings stay short.
         OperationFormatter::new(formatter, indentation, SORT_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("axis", self.axis)?;
-            operation.field("direction", self.direction)?;
             if self.key_count > 1 {
                 operation.field("key_count", self.key_count)?;
             }
+            operation.field("direction", self.direction)?;
             if self.ordering != SortOrdering::default() {
                 operation.field("ordering", self.ordering)?;
             }
@@ -347,7 +348,7 @@ impl<C: Domain<Type = ArrayType, Value: Sort>> InterpretableOperation<C> for Sor
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        C::Value::sort_with_ordering(inputs, self.axis, self.direction, self.key_count, self.ordering)
+        C::Value::sort_with_ordering(inputs, self.axis, self.key_count, self.direction, self.ordering)
     }
 }
 
@@ -498,8 +499,8 @@ impl_differentiable_operation! {
             let permutation = Sort::sort_with_ordering(
                 keys.as_slice(),
                 operation.axis(),
-                operation.direction(),
                 operation.key_count(),
+                operation.direction(),
                 operation.ordering(),
             )?
             .pop()
@@ -522,41 +523,58 @@ impl_differentiable_operation! {
 /// first input's context.
 pub trait Sort: Sized {
     /// Sorts `inputs` along `axis` by the values of the first input in the provided `direction` under the default
-    /// [`SortOrdering::Canonical`] ordering, co-permuting every other input by the key's order.
-    fn sort(inputs: &[Self], axis: usize, direction: SortDirection) -> Result<Vec<Self>, ProgramError> {
-        Self::sort_with_key_count(inputs, axis, direction, 1)
+    /// [`SortOrdering::Canonical`] ordering, co-permuting every other input by the key's order. Refer to
+    /// [`Self::sort_with_ordering`] for the semantics of `axis` and for the errors that this function may return.
+    fn sort<A: Into<Axis>>(inputs: &[Self], axis: A, direction: SortDirection) -> Result<Vec<Self>, ProgramError> {
+        Self::sort_with_key_count(inputs, axis, 1, direction)
     }
 
     /// Sorts `inputs` along `axis` lexicographically by the values of the first `key_count` inputs in the provided
     /// `direction` under the default [`SortOrdering::Canonical`] ordering (i.e., ties on earlier keys fall through to
-    /// later keys), co-permuting every remaining input by that order.
-    fn sort_with_key_count(
+    /// later keys), co-permuting every remaining input by that order. Refer to [`Self::sort_with_ordering`] for the
+    /// semantics of `axis` and for the errors that this function may return.
+    fn sort_with_key_count<A: Into<Axis>>(
         inputs: &[Self],
-        axis: usize,
-        direction: SortDirection,
+        axis: A,
         key_count: usize,
+        direction: SortDirection,
     ) -> Result<Vec<Self>, ProgramError> {
-        Self::sort_with_ordering(inputs, axis, direction, key_count, SortOrdering::default())
+        Self::sort_with_ordering(inputs, axis, key_count, direction, SortOrdering::default())
     }
 
     /// Sorts `inputs` along `axis` lexicographically by the values of the first `key_count` inputs in the provided
     /// `direction`, comparing floating-point keys under `ordering`, and co-permuting every remaining input by that
     /// order.
-    fn sort_with_ordering(
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: Same-shaped values to sort, starting with the keys.
+    ///   - `axis`: Axis of the inputs to sort along, with negative indices counted from the end. Its dimension must
+    ///     not be sharded.
+    ///   - `key_count`: Number of leading `inputs` that act as lexicographic sort keys, which must be at least 1.
+    ///   - `direction`: [`SortDirection`] in which every key is ordered.
+    ///   - `ordering`: [`SortOrdering`] under which floating-point keys are compared.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if `inputs` is empty, if `axis` is out of bounds, if `key_count` is zero or exceeds
+    /// the number of inputs, if the inputs violate the requirements documented on [`SortOperation`], or if the context
+    /// of the first input fails to bind the sort.
+    fn sort_with_ordering<A: Into<Axis>>(
         inputs: &[Self],
-        axis: usize,
-        direction: SortDirection,
+        axis: A,
         key_count: usize,
+        direction: SortDirection,
         ordering: SortOrdering,
     ) -> Result<Vec<Self>, ProgramError>;
 }
 
 impl Sort for Array {
-    fn sort_with_ordering(
+    fn sort_with_ordering<A: Into<Axis>>(
         inputs: &[Self],
-        axis: usize,
-        direction: SortDirection,
+        axis: A,
         key_count: usize,
+        direction: SortDirection,
         ordering: SortOrdering,
     ) -> Result<Vec<Self>, ProgramError> {
         // Type inference validates the inputs (e.g., their count, key data types, shapes, axis, sharding, and manual
@@ -564,6 +582,10 @@ impl Sort for Array {
         // encoding of each element and the resulting gather map moves whole element encodings, so non-key inputs of
         // any element data type (including the sub-byte ones without a scalar representation) sort without being
         // decoded.
+        let Some(first) = inputs.first() else {
+            return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` needs at least one input")).into());
+        };
+        let axis = normalize_axis(SORT_OPERATION_NAME, axis.into(), first.r#type().rank())?;
         let operation = SortOperation::new(axis, direction).with_key_count(key_count)?.with_ordering(ordering);
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         operation.infer_output_types(input_types.as_slice(), &[])?;
@@ -589,21 +611,20 @@ impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Sort for 
 where
     V::DispatchDomain: Context<Operation: From<SortOperation>>,
 {
-    fn sort_with_ordering(
+    fn sort_with_ordering<A: Into<Axis>>(
         inputs: &[Self],
-        axis: usize,
-        direction: SortDirection,
+        axis: A,
         key_count: usize,
+        direction: SortDirection,
         ordering: SortOrdering,
     ) -> Result<Vec<Self>, ProgramError> {
         // Context-carrying values bind a `SortOperation` through the first input's context after aligning the manual
         // variation of the inputs. The `From<SortOperation>` bound keeps this implementation disjoint from the eager
         // reference arrays, whose dispatch domain does not provide a sort operation.
         let Some(first) = inputs.first() else {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{SORT_OPERATION_NAME}` needs at least one input"),
-            });
+            return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` needs at least one input")).into());
         };
+        let axis = normalize_axis(SORT_OPERATION_NAME, axis.into(), first.r#type().rank())?;
         let operation = SortOperation::new(axis, direction).with_key_count(key_count)?.with_ordering(ordering);
         let inputs = ManualVariationAlignment::align_manual_variation(inputs)?;
         first.dispatch_domain().bind(operation, Vec::new(), &inputs)
@@ -745,14 +766,14 @@ fn sort_permutation(key_ranks: &[&[u64]], dimensions: &[usize], axis: usize, dir
 /// ```
 pub trait TopK: Sized {
     /// Returns the `k` largest elements of this value along `axis` together with their `i32` indices, both with the
-    /// `axis` dimension resized to `k`. Returns an error if `k` exceeds the size of `axis`, if the value has dynamic
-    /// dimensions or complex elements, or if `axis` is out of bounds.
-    fn top_k(&self, k: usize, axis: usize) -> Result<(Self, Self), ProgramError>;
+    /// `axis` dimension resized to `k`. Negative axes count from the end. Returns an error if `k` exceeds the size of
+    /// `axis`, if the value has dynamic dimensions or complex elements, or if `axis` is out of bounds.
+    fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError>;
 }
 
 impl TopK for Array {
-    fn top_k(&self, k: usize, axis: usize) -> Result<(Self, Self), ProgramError> {
-        let dimensions = top_k_dimensions(&self.r#type(), k, axis)?;
+    fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError> {
+        let (axis, dimensions) = top_k_dimensions(&self.r#type(), k, axis.into())?;
         if let Some(outputs) = top_k_via_squeezed_view(self, dimensions.as_slice(), k, axis)? {
             return Ok(outputs);
         }
@@ -764,8 +785,8 @@ impl<V: Value<Type = ArrayType> + Sort + Slice + Reshape> TopK for V
 where
     V::DispatchDomain: Context<Operation: From<IotaOperation<ArrayType>>>,
 {
-    fn top_k(&self, k: usize, axis: usize) -> Result<(Self, Self), ProgramError> {
-        let dimensions = top_k_dimensions(&self.r#type(), k, axis)?;
+    fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError> {
+        let (axis, dimensions) = top_k_dimensions(&self.r#type(), k, axis.into())?;
         if let Some(outputs) = top_k_via_squeezed_view(self, dimensions.as_slice(), k, axis)? {
             return Ok(outputs);
         }
@@ -774,15 +795,15 @@ where
 }
 
 /// Validates a [`top_k`](TopK::top_k) of `k` elements along `axis` of a value of type `value_type` and returns the
-/// static dimensions of that value.
-fn top_k_dimensions(value_type: &ArrayType, k: usize, axis: usize) -> Result<Vec<usize>, ProgramError> {
-    let dimensions = ranking_dimensions("top_k", value_type, axis)?;
+/// normalized axis together with the static dimensions of that value.
+fn top_k_dimensions(value_type: &ArrayType, k: usize, axis: Axis) -> Result<(usize, Vec<usize>), ProgramError> {
+    let (axis, dimensions) = ranking_dimensions("top_k", value_type, axis)?;
     if k > dimensions[axis] {
         return Err(ProgramError::InvalidArgument {
             message: format!("`top_k` `k` {k} exceeds size {} of axis {axis}", dimensions[axis]),
         });
     }
-    Ok(dimensions)
+    Ok((axis, dimensions))
 }
 
 /// Computes [`top_k`](TopK::top_k) through a squeezed view of `value` that strips the leading size-1 dimensions in
@@ -832,7 +853,7 @@ fn top_k_with_index_passenger<V: Clone + Sort + Slice>(
     axis: usize,
 ) -> Result<(V, V), ProgramError> {
     let mut sorted =
-        V::sort_with_ordering(&[value.clone(), indices], axis, SortDirection::Descending, 1, SortOrdering::Total)?;
+        V::sort_with_ordering(&[value.clone(), indices], axis, 1, SortDirection::Descending, SortOrdering::Total)?;
     let sorted_indices = sorted.pop().unwrap();
     let sorted_values = sorted.pop().unwrap();
     let start_indices = vec![0; dimensions.len()];
@@ -864,14 +885,14 @@ fn top_k_with_index_passenger<V: Clone + Sort + Slice>(
 /// ```
 pub trait ArgMax: Sized {
     /// Returns the `i32` indices of the largest elements of this value along `axis`, with that axis dropped from the
-    /// result shape. Returns an error if the value has dynamic dimensions or complex elements, or if `axis` is out of
+    /// result shape. Negative axes count from the end. Returns an error if the value has dynamic dimensions or complex elements, or if `axis` is out of
     /// bounds or empty.
-    fn argmax(&self, axis: usize) -> Result<Self, ProgramError>;
+    fn argmax<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>;
 }
 
 impl ArgMax for Array {
-    fn argmax(&self, axis: usize) -> Result<Self, ProgramError> {
-        let dimensions = extremal_index_dimensions("argmax", &self.r#type(), axis)?;
+    fn argmax<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
+        let (axis, dimensions) = extremal_index_dimensions("argmax", &self.r#type(), axis.into())?;
         let indices = eager_index_passenger(self, axis)?;
         extremal_index(vec![self.clone()], indices, dimensions.as_slice(), axis, SortDirection::Descending)
     }
@@ -881,8 +902,8 @@ impl<V: Value<Type = ArrayType> + Sort + Slice + Reshape> ArgMax for V
 where
     V::DispatchDomain: Context<Operation: From<IotaOperation<ArrayType>>>,
 {
-    fn argmax(&self, axis: usize) -> Result<Self, ProgramError> {
-        let dimensions = extremal_index_dimensions("argmax", &self.r#type(), axis)?;
+    fn argmax<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
+        let (axis, dimensions) = extremal_index_dimensions("argmax", &self.r#type(), axis.into())?;
         let indices = staged_index_passenger(self, axis)?;
         extremal_index(vec![self.clone()], indices, dimensions.as_slice(), axis, SortDirection::Descending)
     }
@@ -908,14 +929,14 @@ where
 /// ```
 pub trait ArgMin: Sized {
     /// Returns the `i32` indices of the smallest elements of this value along `axis`, with that axis dropped from the
-    /// result shape. Returns an error if the value has dynamic dimensions or complex elements, or if `axis` is out of
+    /// result shape. Negative axes count from the end. Returns an error if the value has dynamic dimensions or complex elements, or if `axis` is out of
     /// bounds or empty.
-    fn argmin(&self, axis: usize) -> Result<Self, ProgramError>;
+    fn argmin<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>;
 }
 
 impl ArgMin for Array {
-    fn argmin(&self, axis: usize) -> Result<Self, ProgramError> {
-        let dimensions = extremal_index_dimensions("argmin", &self.r#type(), axis)?;
+    fn argmin<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
+        let (axis, dimensions) = extremal_index_dimensions("argmin", &self.r#type(), axis.into())?;
         let indices = eager_index_passenger(self, axis)?;
         extremal_index(argmin_keys(self)?, indices, dimensions.as_slice(), axis, SortDirection::Ascending)
     }
@@ -925,8 +946,8 @@ impl<V: Value<Type = ArrayType> + Compare + Sort + Slice + Reshape> ArgMin for V
 where
     V::DispatchDomain: Context<Operation: From<IotaOperation<ArrayType>>>,
 {
-    fn argmin(&self, axis: usize) -> Result<Self, ProgramError> {
-        let dimensions = extremal_index_dimensions("argmin", &self.r#type(), axis)?;
+    fn argmin<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError> {
+        let (axis, dimensions) = extremal_index_dimensions("argmin", &self.r#type(), axis.into())?;
         let indices = staged_index_passenger(self, axis)?;
         extremal_index(argmin_keys(self)?, indices, dimensions.as_slice(), axis, SortDirection::Ascending)
     }
@@ -943,13 +964,17 @@ fn argmin_keys<V: Clone + Typed<Type = ArrayType> + Compare>(value: &V) -> Resul
 }
 
 /// Validates an extremal-index ranking named `name` (i.e., `argmax` or `argmin`) along `axis` of a value of type
-/// `value_type` and returns the static dimensions of that value.
-fn extremal_index_dimensions(name: &str, value_type: &ArrayType, axis: usize) -> Result<Vec<usize>, ProgramError> {
-    let dimensions = ranking_dimensions(name, value_type, axis)?;
+/// `value_type` and returns the normalized axis together with the static dimensions of that value.
+fn extremal_index_dimensions(
+    name: &str,
+    value_type: &ArrayType,
+    axis: Axis,
+) -> Result<(usize, Vec<usize>), ProgramError> {
+    let (axis, dimensions) = ranking_dimensions(name, value_type, axis)?;
     if dimensions[axis] == 0 {
         return Err(ProgramError::InvalidArgument { message: format!("`{name}` axis {axis} is empty") });
     }
-    Ok(dimensions)
+    Ok((axis, dimensions))
 }
 
 /// Computes the index of the extremal element along `axis`, which is shared by every [`ArgMax`] and [`ArgMin`]
@@ -964,7 +989,7 @@ fn extremal_index<V: Sort + Slice + Reshape>(
 ) -> Result<V, ProgramError> {
     let key_count = keys.len();
     keys.push(indices);
-    let sorted_indices = V::sort_with_ordering(keys.as_slice(), axis, direction, key_count, SortOrdering::Canonical)?
+    let sorted_indices = V::sort_with_ordering(keys.as_slice(), axis, key_count, direction, SortOrdering::Canonical)?
         .pop()
         .unwrap();
     let start_indices = vec![0; dimensions.len()];
@@ -981,9 +1006,10 @@ fn extremal_index<V: Sort + Slice + Reshape>(
 }
 
 /// Validates a ranking named `name` (i.e., `top_k`, `argmax`, or `argmin`) along `axis` of a value of type
-/// `value_type` and returns the static dimensions of that value. Rankings reject complex values, because complex
-/// numbers are unordered, and dynamic dimensions, because the index passenger and the slices need static extents.
-fn ranking_dimensions(name: &str, value_type: &ArrayType, axis: usize) -> Result<Vec<usize>, ProgramError> {
+/// `value_type` and returns the normalized axis together with the static dimensions of that value. Rankings reject
+/// complex values, because complex numbers are unordered, and dynamic dimensions, because the index passenger and the
+/// slices need static extents.
+fn ranking_dimensions(name: &str, value_type: &ArrayType, axis: Axis) -> Result<(usize, Vec<usize>), ProgramError> {
     let data_type = value_type.data_type();
     if data_type.is_complex() {
         return Err(TypeError::invalid(format!("`{name}` does not support data type `{data_type}`")).into());
@@ -998,13 +1024,14 @@ fn ranking_dimensions(name: &str, value_type: &ArrayType, axis: usize) -> Result
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if axis >= dimensions.len() {
-        return Err(TypeError::invalid(
-            format!("`{name}` axis {axis} is out of bounds for rank {}", dimensions.len(),),
-        )
-        .into());
-    }
-    Ok(dimensions)
+    Ok((normalize_axis(name, axis, dimensions.len())?, dimensions))
+}
+
+/// Normalizes the possibly negative `axis` that the sorting or ranking function named `name` received for values of
+/// rank `rank`, returning its nonnegative position.
+fn normalize_axis(name: &str, axis: Axis, rank: usize) -> Result<usize, ProgramError> {
+    axis.normalize(rank)
+        .map_err(|_| TypeError::invalid(format!("`{name}` axis {axis} is out of bounds for rank {rank}")).into())
 }
 
 /// Returns the `i32` index passenger of a ranking of the eager [`Array`] `value` along `axis`, which holds the index of
@@ -1096,7 +1123,7 @@ mod tests {
         let multi_key = operation.with_key_count(2).unwrap().with_ordering(SortOrdering::Total);
         assert_eq!(multi_key.key_count(), 2);
         assert_eq!(multi_key.ordering(), SortOrdering::Total);
-        assert_eq!(multi_key.to_string(), "sort [axis=0, direction=ascending, key_count=2, ordering=total]");
+        assert_eq!(multi_key.to_string(), "sort [axis=0, key_count=2, direction=ascending, ordering=total]");
         assert_eq!(multi_key.with_key_count(1).unwrap().with_ordering(SortOrdering::Canonical), operation,);
         assert!(matches!(
             operation.with_key_count(0),
@@ -1115,7 +1142,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:i32[4] .
-                let %2:f64[4], %3:i32[4] = sort [axis=0, direction=ascending, key_count=2, ordering=total] %0 %1
+                let %2:f64[4], %3:i32[4] = sort [axis=0, key_count=2, direction=ascending, ordering=total] %0 %1
                 in (%2, %3)
             "}
             .trim_end(),
@@ -1275,7 +1302,7 @@ mod tests {
             Ok(vec![Array::vector(vec![3.0, 3.0, 2.0, 1.0]).unwrap(), Array::vector(vec![10i32, 30, 40, 20]).unwrap()]),
         );
 
-        // Every column sorts independently along axis 0, and every row along axis 1.
+        // Every column sorts independently along axis 0, and every row along axis 1. Negative axes count from the end.
         let matrix = Array::matrix(2, 3, vec![3.0, 1.0, 2.0, 0.0, 5.0, 4.0]).unwrap();
         assert_eq!(
             Array::sort(std::slice::from_ref(&matrix), 0, SortDirection::Ascending),
@@ -1285,6 +1312,15 @@ mod tests {
             Array::sort(std::slice::from_ref(&matrix), 1, SortDirection::Ascending),
             Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 0.0, 4.0, 5.0]).unwrap()]),
         );
+        assert_eq!(
+            Array::sort(std::slice::from_ref(&matrix), -1, SortDirection::Ascending),
+            Array::sort(std::slice::from_ref(&matrix), 1, SortDirection::Ascending),
+        );
+        assert!(matches!(
+            Array::sort(std::slice::from_ref(&matrix), -3, SortDirection::Ascending),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`sort` axis -3 is out of bounds for rank 2",
+        ));
 
         // Two keys compare lexicographically: ties on key 0 fall through to key 1, and the full tie `(1.0, 9.0)` keeps
         // its original order (element 1 before element 3), which the passenger shows. Descending reverses every key
@@ -1295,7 +1331,7 @@ mod tests {
             Array::vector(vec![10i32, 20, 30, 40]).unwrap(),
         ];
         assert_eq!(
-            Array::sort_with_key_count(&inputs, 0, SortDirection::Ascending, 2),
+            Array::sort_with_key_count(&inputs, 0, 2, SortDirection::Ascending),
             Ok(vec![
                 Array::vector(vec![1.0, 1.0, 2.0, 2.0]).unwrap(),
                 Array::vector(vec![9.0, 9.0, 4.0, 5.0]).unwrap(),
@@ -1303,7 +1339,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            Array::sort_with_key_count(&inputs, 0, SortDirection::Descending, 2),
+            Array::sort_with_key_count(&inputs, 0, 2, SortDirection::Descending),
             Ok(vec![
                 Array::vector(vec![2.0, 2.0, 1.0, 1.0]).unwrap(),
                 Array::vector(vec![5.0, 4.0, 9.0, 9.0]).unwrap(),
@@ -1313,12 +1349,12 @@ mod tests {
 
         // The eager implementation validates its inputs through type inference.
         assert!(matches!(
-            Array::sort_with_key_count(&inputs[..1], 0, SortDirection::Ascending, 2),
+            Array::sort_with_key_count(&inputs[..1], 0, 2, SortDirection::Ascending),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
                 if message == "`sort` `key_count` 2 exceeds input count 1",
         ));
         assert!(matches!(
-            Array::sort_with_key_count(&inputs, 0, SortDirection::Ascending, 0),
+            Array::sort_with_key_count(&inputs, 0, 0, SortDirection::Ascending),
             Err(ProgramError::UnsupportedOperation { message }) if message == "`sort` `key_count` must be at least 1",
         ));
     }
@@ -1339,7 +1375,7 @@ mod tests {
             [f64::NEG_INFINITY, 0.0, -0.0, 1.0, f64::NAN, negative_nan].map(f64::to_bits).to_vec(),
         );
         let sorted =
-            Array::sort_with_ordering(&[keys, indices], 0, SortDirection::Descending, 1, SortOrdering::Total).unwrap();
+            Array::sort_with_ordering(&[keys, indices], 0, 1, SortDirection::Descending, SortOrdering::Total).unwrap();
         assert_eq!(sorted[1], Array::vector(vec![0i32, 5, 1, 2, 4, 3]).unwrap());
 
         // Canonical complex keys order lexicographically by their canonicalized real and imaginary parts, so that the
@@ -1612,7 +1648,7 @@ mod tests {
                 ],
                 jvp = indoc! {"
                     lambda %0:f64[3], %1:f64[3], %2:f64[3], %3:f64[3], %4:f64[3], %5:f64[3] .
-                    let %6:f64[3], %7:f64[3], %8:f64[3], %9:f64[3], %10:f64[3], %11:f64[3] = sort [axis=0, direction=ascending, key_count=2] %0 %1 %2 %3 %4 %5
+                    let %6:f64[3], %7:f64[3], %8:f64[3], %9:f64[3], %10:f64[3], %11:f64[3] = sort [axis=0, key_count=2, direction=ascending] %0 %1 %2 %3 %4 %5
                     in (%6, %7, %8, %9, %10, %11)
                 "},
             }],
@@ -1660,8 +1696,8 @@ mod tests {
             |input| Ok(Sort::sort_with_ordering(
                 &[input.clone(), input.clone() * input],
                 1,
-                SortDirection::Descending,
                 1,
+                SortDirection::Descending,
                 SortOrdering::Total,
             )?
             .remove(1)
@@ -1736,12 +1772,14 @@ mod tests {
         let input = Array::vector(vec![f64::NAN, 2.0, -f64::NAN, 0.0, -0.0]).unwrap();
         assert_eq!(input.top_k(5, 0).unwrap().1, Array::vector(vec![0i32, 1, 3, 4, 2]).unwrap());
 
-        // Every row of a matrix ranks independently along a non-trailing axis as well.
+        // Every column of a matrix ranks independently along a non-trailing axis as well, and negative axes count from
+        // the end.
         let matrix = Array::matrix(2, 3, vec![3.0, 1.0, 2.0, 0.0, 5.0, 4.0]).unwrap();
         assert_eq!(
             matrix.top_k(1, 0),
             Ok((Array::matrix(1, 3, vec![3.0, 5.0, 4.0]).unwrap(), Array::matrix(1, 3, vec![0i32, 1, 1]).unwrap())),
         );
+        assert_eq!(matrix.top_k(1, -2), matrix.top_k(1, 0));
 
         // Oversized `k`, complex values, and out-of-bounds axes are rejected.
         assert!(matches!(
@@ -1757,6 +1795,11 @@ mod tests {
             input.top_k(1, 1),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
                 if message == "`top_k` axis 1 is out of bounds for rank 1",
+        ));
+        assert!(matches!(
+            input.top_k(1, -2),
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`top_k` axis -2 is out of bounds for rank 1",
         ));
     }
 
@@ -1808,11 +1851,11 @@ mod tests {
             .trim_end(),
         );
 
-        // Along the trailing axis of a batch-size-1 input, the leading size-1 dimension is squeezed away before the
-        // composition, so the index passenger is a rank-1 iota (not the `reshape(iota)` that XLA's top-k rewriter
-        // rejects), and both outputs are reshaped back to the original rank afterward.
+        // Along the trailing axis (here given as `-1`) of a batch-size-1 input, the leading size-1 dimension is squeezed
+        // away before the composition, so the index passenger is a rank-1 iota (not the `reshape(iota)` that XLA's
+        // top-k rewriter rejects), and both outputs are reshaped back to the original rank afterward.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.top_k(2, 1)?.0),
+            |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(x.top_k(2, -1)?.0),
             ArrayType::new_static(DataType::F64, [1, 4]),
         )
         .unwrap();
@@ -1845,6 +1888,7 @@ mod tests {
         let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]).unwrap();
         assert_eq!(matrix.argmax(0), Ok(Array::vector(vec![1i32, 0, 0]).unwrap()));
         assert_eq!(matrix.argmax(1), Ok(Array::vector(vec![1i32, 0]).unwrap()));
+        assert_eq!(matrix.argmax(-1), matrix.argmax(1));
 
         // Complex values and empty axes are rejected.
         assert!(matches!(
@@ -1889,6 +1933,7 @@ mod tests {
         let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]).unwrap();
         assert_eq!(matrix.argmin(0), Ok(Array::vector(vec![0i32, 1, 1]).unwrap()));
         assert_eq!(matrix.argmin(1), Ok(Array::vector(vec![0i32, 1]).unwrap()));
+        assert_eq!(matrix.argmin(-1), matrix.argmin(1));
 
         // Complex values and empty axes are rejected.
         assert!(matches!(
@@ -1917,7 +1962,7 @@ mod tests {
                 lambda %0:f64[4] .
                 let %1:i32[4] = iota [type=i32[4], dimension=0]
                     %2:bool[4] = compare [direction=Equal] %0 %0
-                    %3:bool[4], %4:f64[4], %5:i32[4] = sort [axis=0, direction=ascending, key_count=2] %2 %0 %1
+                    %3:bool[4], %4:f64[4], %5:i32[4] = sort [axis=0, key_count=2, direction=ascending] %2 %0 %1
                     %6:i32[1] = slice [start_indices=[0], limits=[1]] %5
                     %7:i32[] = reshape [shape=[]] %6
                 in (%7)
