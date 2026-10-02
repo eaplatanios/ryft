@@ -1451,7 +1451,7 @@ mod tests {
         let left = context.lift(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap()).unwrap();
         let right = context.lift(Array::vector(vec![1.0f64, 2.0]).unwrap()).unwrap();
         let error = context.bind(MulOperation::new(), Vec::new(), &[left, right]).err().unwrap();
-        assert_eq!(error, ProgramError::Type(TypeError::invalid("TODO")));
+        assert_eq!(error, ProgramError::Type(TypeError::invalid("`mul` input types are not broadcast-compatible")));
         let program = sine_of_dot_program(RematerializeOperation::new(ResidualPolicyReference::new(DotsSaveable)));
         let inputs = vec![
             PartialEvaluationValue::known(trace.input(ArrayType::new_static(DataType::F64, [3]))),

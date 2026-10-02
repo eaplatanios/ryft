@@ -73,7 +73,7 @@ pub use differentiation::{
     LinearizationTracer, MemberDifferentiableOperation, MemberTransposableOperation, MemoryTransferStorage,
     NOTHING_SAVEABLE_POLICY_NAME, NothingSaveable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
     OffloadDotsWithNoBatchDimensions, POLICY_FN_POLICY_NAME, PartitionedDifferentiationPolicy, PolicyFn, Pullback,
-    Pushforward, RealLinearity, Rematerialize, ResidualSource, ResidualZeroProvider, ReverseModeDifferentiate,
+    Pushforward, RealLinearity, RematerializedFunction, ResidualSource, ResidualZeroProvider, ReverseModeDifferentiate,
     SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME, SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME,
     SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME, SAVE_FROM_BOTH_POLICIES_POLICY_NAME,
     SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,

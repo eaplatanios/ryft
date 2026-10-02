@@ -4,13 +4,13 @@
 //! needs them, instead of keeping every value of the body alive until then. This is the Ryft analogue of JAX's
 //! [`jax.checkpoint`/`jax.remat`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html).
 //!
-//! [`rematerialize`] creates a rematerialized function from a closure, [`Rematerialize::with_policy`] selects which
-//! values it saves, and [`Rematerialize::call`] stages one call of the function as a [`RematerializeOperation`] whose
-//! body is the traced closure. Nothing is derived when the function is called: the transforms derive the derivatives
-//! of the body when they need them. Linearization and reverse mode differentiation split the derivative of the body
-//! into the work that runs up front, which computes the outputs and the values that the policy saves, and a
-//! _differentiated_ call that recomputes everything else from the saved values when the backward computation runs.
-//! [`saved_residuals`] reports which values a function saves.
+//! [`rematerialize`] creates a rematerialized function from a closure, [`RematerializedFunction::with_policy`]
+//! selects which values it saves, and [`RematerializedFunction::call`] stages one call of the function as a
+//! [`RematerializeOperation`] whose body is the traced closure. Nothing is derived when the function is called: the
+//! transforms derive the derivatives of the body when they need them. Linearization and reverse mode differentiation
+//! split the derivative of the body into the work that runs up front, which computes the outputs and the values that
+//! the policy saves, and a _differentiated_ call that recomputes everything else from the saved values when the
+//! backward computation runs. [`saved_residuals`] reports which values a function saves.
 //!
 //! # Examples
 //!
@@ -140,12 +140,12 @@
 //! ## Optimization Barriers
 //!
 //! The differentiated call that recomputes the saved values places an optimization barrier on its inputs (refer to
-//! [`Rematerialize::with_optimization_barrier`]), which keeps compilers from merging the recomputation with the forward
-//! computation and thus from undoing the memory savings. The barrier can also keep compilers from optimizing across it
-//! in other ways (e.g., from fusing operations), so it should be disabled when something else already separates the
-//! recomputation from the forward computation. This is the case for a rematerialized function that is called inside
-//! the body of a loop (e.g., a `scan` over the layers of a model), because the backward loop recomputes each iteration
-//! after the forward loop has finished, which is also why
+//! [`RematerializedFunction::with_optimization_barrier`]), which keeps compilers from merging the recomputation with
+//! the forward computation and thus from undoing the memory savings. The barrier can also keep compilers from
+//! optimizing across it in other ways (e.g., from fusing operations), so it should be disabled when something else
+//! already separates the recomputation from the forward computation. This is the case for a rematerialized function
+//! that is called inside the body of a loop (e.g., a `scan` over the layers of a model), because the backward loop
+//! recomputes each iteration after the forward loop has finished, which is also why
 //! [JAX recommends](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html) `prevent_cse=False` there:
 //!
 //! ```rust
@@ -178,8 +178,6 @@
 //! # let _ = layer;
 //! ```
 
-pub mod policies;
-
 use std::any::{Any, TypeId};
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
@@ -203,6 +201,8 @@ use crate::partial::{
 use crate::programs::{Operation, OperationPayloadProjection, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
 
+pub mod policies;
+
 pub use policies::{
     DOTS_SAVEABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVEABLE_POLICY_NAME, DotsSaveable,
     DotsWithNoBatchDimensionsSaveable, EVERYTHING_SAVEABLE_POLICY_NAME, EverythingSaveable, MemoryTransferStorage,
@@ -213,77 +213,28 @@ pub use policies::{
     SaveAnyNamesButThese, SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
 };
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// [`PolicyReferences`] of the default [`NothingSaveable`] policy, which every [`Rematerialize`] that does not select
-/// a policy shares, so that all of their calls stage operations whose policies compare equal.
-static DEFAULT_POLICY_REFERENCES: LazyLock<Arc<PolicyReferences<NothingSaveable>>> =
-    LazyLock::new(|| Arc::new(PolicyReferences::new(NothingSaveable)));
-
-/// Residual policy of a [`Rematerialize`] together with its [`ResidualPolicyReference`]s in the type universes that
-/// its calls have used so far. [`ResidualPolicyReference`]s compare by the identity of the policy definition that
-/// [`ResidualPolicyReference::new`] registers, so creating one per call would make calls of the same function stage
-/// unequal operations. Clones of a [`Rematerialize`] share one [`PolicyReferences`], and therefore stage equal
-/// operations too.
-struct PolicyReferences<P> {
-    /// Residual policy.
-    policy: P,
-
-    /// [`ResidualPolicyReference`] to `policy` in each type universe that was used so far, keyed by the [`TypeId`] of
-    /// the universe.
-    references: Mutex<Vec<(TypeId, Box<dyn Any + Send + Sync>)>>,
-}
-
-impl<P> PolicyReferences<P> {
-    /// Creates new [`PolicyReferences`] for `policy` that hold no references yet.
-    #[inline]
-    fn new(policy: P) -> Self {
-        Self { policy, references: Mutex::new(Vec::new()) }
-    }
-
-    /// Returns the [`ResidualPolicyReference`] to the policy in the type universe `T`, which is registered on first
-    /// use.
-    fn reference<T: 'static + Type>(&self) -> ResidualPolicyReference<T>
-    where
-        P: Clone + ResidualPolicy<T>,
-    {
-        let mut references = self.references.lock().expect("the residual policy references lock is poisoned");
-        let reference = references
-            .iter()
-            .find(|(universe, _)| *universe == TypeId::of::<T>())
-            .and_then(|(_, reference)| reference.downcast_ref::<ResidualPolicyReference<T>>());
-        if let Some(reference) = reference {
-            return reference.clone();
-        }
-        let reference = ResidualPolicyReference::new(self.policy.clone());
-        references.push((TypeId::of::<T>(), Box::new(reference.clone())));
-        reference
-    }
-}
-
-/// Rematerialized function, which [`rematerialize`] creates from a closure over [`DomainTracer`]s. Refer to the
-/// [module documentation](self) for more information.
-pub struct Rematerialize<Input, Output, Body, P = NothingSaveable> {
+/// Rematerialized function, which [`rematerialize`] creates from a closure over [`DomainTracer`]s.
+pub struct RematerializedFunction<Input, Output, Body, Policy = NothingSaveable> {
     /// Closure that computes the body of the function.
     body: Body,
 
     /// Residual policy of the function together with its references in the type universes that were used so far.
-    policy: Arc<PolicyReferences<P>>,
+    policy: Arc<PolicyReferences<Policy>>,
 
-    /// Inputs of the staged calls on which backends place an optimization barrier when the calls are differentiated
-    /// (refer to [`RematerializeOperation::optimization_barrier`]).
+    /// Specifies the inputs of the staged calls on which backends place an optimization barrier when the calls
+    /// are differentiated.
     optimization_barrier: RematerializationOptimizationBarrier,
 
     /// Input and output types of the closure.
     marker: PhantomData<fn() -> (Input, Output)>,
 }
 
-impl<Input, Output, Body, P> Rematerialize<Input, Output, Body, P> {
-    /// Returns this function with the provided residual policy, which decides which values of the body differentiation
-    /// saves (refer to the [`policies`] module for the built-in policies).
+impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Policy> {
+    /// Returns this [`RematerializedFunction`] with the provided residual policy, which decides which values of the
+    /// body differentiation saves.
     #[inline]
-    pub fn with_policy<Q>(self, policy: Q) -> Rematerialize<Input, Output, Body, Q> {
-        Rematerialize {
+    pub fn with_policy<NewPolicy>(self, policy: NewPolicy) -> RematerializedFunction<Input, Output, Body, NewPolicy> {
+        RematerializedFunction {
             body: self.body,
             policy: Arc::new(PolicyReferences::new(policy)),
             optimization_barrier: self.optimization_barrier,
@@ -291,24 +242,23 @@ impl<Input, Output, Body, P> Rematerialize<Input, Output, Body, P> {
         }
     }
 
-    /// Sets the inputs on which backends place an optimization barrier when the staged calls of this function are
-    /// differentiated, which are [all of them](RematerializationOptimizationBarrier::All) by default (refer to
-    /// [`RematerializeOperation::optimization_barrier`]). A [`RematerializationOptimizationBarrier::Inputs`] selection
-    /// has one entry per leaf of the input of this function, in [`Parameterized::parameters`] order. This is the
-    /// analogue of the `prevent_cse` parameter of
+    /// Sets the inputs on which backends place an optimization barrier when the staged calls of this
+    /// [`RematerializedFunction`] are differentiated, which are [all](RematerializationOptimizationBarrier::All)
+    /// by default. A [`RematerializationOptimizationBarrier::Inputs`] selection has one entry per leaf of the input
+    /// of this function, in [`Parameterized::parameters`] order. This is the analogue of the `prevent_cse` parameter of
     /// [`jax.checkpoint`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html), which can be disabled when
-    /// the function is called in a loop body (e.g., of a `scan`), where the loop already keeps the recomputation from
-    /// being merged with the original computation.
+    /// the function is called in a loop body (e.g., of a `scan` operation), where the loop already keeps the
+    /// recomputation from being merged with the original computation.
     #[inline]
     pub fn with_optimization_barrier(mut self, optimization_barrier: RematerializationOptimizationBarrier) -> Self {
         self.optimization_barrier = optimization_barrier;
         self
     }
 
-    /// Stages one call of this function on the provided `input` value and returns its output value. The [`Context`]
-    /// `C` that the call is staged into is the [`DispatchDomain`](Value::DispatchDomain) of the values in `input`, so
-    /// it is never named at a construction or call site. The body is traced in a fresh trace that is seeded with the
-    /// named axes in scope in `C` (refer to [`NamedAxes::named_axes`]), so that it resolves the axes of enclosing
+    /// Stages one call of this [`RematerializedFunction`] on the provided `input` value and returns its output value.
+    /// The [`Context`] `C` that the call is staged into is the [`DispatchDomain`](Value::DispatchDomain) of the values
+    /// in `input`, so it is never named at a construction or call site. The body is traced in a fresh trace that is
+    /// seeded with the [named axes](NamedAxes::named_axes) in scope in `C`, so that it resolves the axes of enclosing
     /// transforms as it would if it were inlined.
     ///
     /// # Errors
@@ -318,16 +268,15 @@ impl<Input, Output, Body, P> Rematerialize<Input, Output, Body, P> {
     /// call.
     pub fn call<
         V: Value<Type = C::Type, DispatchDomain = C>,
-        C: Context<Type: 'static, Value = V> + NamedAxes,
+        C: Context<Type: 'static, Value = V, Operation: From<RematerializeOperation<C::Type>>> + NamedAxes,
         InputValues: Parameterized<V, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
     >(
         &self,
         input: InputValues,
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<V>, ProgramError>
     where
-        C::Operation: From<RematerializeOperation<C::Type>>,
         Body: Fn(Input) -> Result<Output, ProgramError>,
-        P: Clone + ResidualPolicy<C::Type>,
+        Policy: Clone + ResidualPolicy<C::Type>,
         Input: Parameterized<DomainTracer<C>>,
         Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
         Input::To<C::Type>: Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input>,
@@ -345,12 +294,12 @@ impl<Input, Output, Body, P> Rematerialize<Input, Output, Body, P> {
             .map_err(ProgramError::from)?;
         let Some(first) = input_values.first() else {
             return Err(TypeError::invalid(
-                "`rematerialize` requires at least one input to recover its context from; use \
-                 `Rematerialize::call_in_context` for functions without inputs",
+                "`rematerialize` requires at least one input to recover its context from; \
+                 use `RematerializedFunction::call_in_context` for functions without inputs",
             )
             .into());
         };
-        self.stage(&first.dispatch_domain(), input_types, input_values.as_slice())
+        self.call_impl(&first.dispatch_domain(), input_types, input_values.as_slice())
     }
 
     /// Stages one call of this function on the provided `input` value in the provided `context` and returns its output
@@ -362,7 +311,7 @@ impl<Input, Output, Body, P> Rematerialize<Input, Output, Body, P> {
     /// Returns a [`ProgramError`] when tracing the body fails or when the staged [`RematerializeOperation`] rejects
     /// the call.
     pub fn call_in_context<
-        C: Context<Type: 'static> + NamedAxes,
+        C: Context<Type: 'static, Operation: From<RematerializeOperation<C::Type>>> + NamedAxes,
         InputValues: Parameterized<C::Value, Family = Input::Family, To<C::Type> = Input::To<C::Type>>,
     >(
         &self,
@@ -370,9 +319,8 @@ impl<Input, Output, Body, P> Rematerialize<Input, Output, Body, P> {
         input: InputValues,
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<C::Value>, ProgramError>
     where
-        C::Operation: From<RematerializeOperation<C::Type>>,
         Body: Fn(Input) -> Result<Output, ProgramError>,
-        P: Clone + ResidualPolicy<C::Type>,
+        Policy: Clone + ResidualPolicy<C::Type>,
         Input: Parameterized<DomainTracer<C>>,
         Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
         Input::To<C::Type>: Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input>,
@@ -388,20 +336,19 @@ impl<Input, Output, Body, P> Rematerialize<Input, Output, Body, P> {
                 r#type
             })
             .map_err(ProgramError::from)?;
-        self.stage(context, input_types, input_values.as_slice())
+        self.call_impl(context, input_types, input_values.as_slice())
     }
 
     /// Traces the body at `input_types` and binds one call of it to `input_values` in `context`.
-    fn stage<C: Context<Type: 'static> + NamedAxes>(
+    fn call_impl<C: Context<Type: 'static, Operation: From<RematerializeOperation<C::Type>>> + NamedAxes>(
         &self,
         context: &C,
         input_types: Input::To<C::Type>,
         input_values: &[C::Value],
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<C::Value>, ProgramError>
     where
-        C::Operation: From<RematerializeOperation<C::Type>>,
         Body: Fn(Input) -> Result<Output, ProgramError>,
-        P: Clone + ResidualPolicy<C::Type>,
+        Policy: Clone + ResidualPolicy<C::Type>,
         Input: Parameterized<DomainTracer<C>>,
         Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<C::Constant>,
         Input::To<C::Type>: Parameterized<C::Type, Family = Input::Family, To<DomainTracer<C>> = Input>,
@@ -419,7 +366,7 @@ impl<Input, Output, Body, P> Rematerialize<Input, Output, Body, P> {
     }
 }
 
-impl<Input, Output, Body: Clone, P> Clone for Rematerialize<Input, Output, Body, P> {
+impl<Input, Output, Body: Clone, Policy> Clone for RematerializedFunction<Input, Output, Body, Policy> {
     #[inline]
     fn clone(&self) -> Self {
         Self {
@@ -431,32 +378,38 @@ impl<Input, Output, Body: Clone, P> Clone for Rematerialize<Input, Output, Body,
     }
 }
 
-impl<Input, Output, Body, P: Debug> Debug for Rematerialize<Input, Output, Body, P> {
+impl<Input, Output, Body, Policy: Debug> Debug for RematerializedFunction<Input, Output, Body, Policy> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("Rematerialize")
+            .debug_struct("RematerializedFunction")
             .field("policy", &self.policy.policy)
             .field("optimization_barrier", &self.optimization_barrier)
             .finish_non_exhaustive()
     }
 }
 
-/// Creates a [`Rematerialize`] function from a closure `x ↦ y = f(x)` over [`DomainTracer`]s, which saves nothing under
+/// Creates a [`RematerializedFunction`] from a closure `x ↦ y = f(x)` over [`DomainTracer`]s, which saves nothing under
 /// differentiation (i.e., it uses the [`NothingSaveable`] policy) and places an optimization barrier on its inputs when
 /// it is differentiated. The closure must annotate the type of its tracer input, which determines the context that its
-/// body is traced in, and nothing is traced until the function is called. Refer to the [module documentation](self)
-/// for more information.
+/// body is traced in, and nothing is traced until the function is called.
 #[inline]
 pub fn rematerialize<Input, Output, Body: Fn(Input) -> Result<Output, ProgramError>>(
     body: Body,
-) -> Rematerialize<Input, Output, Body> {
-    Rematerialize {
+) -> RematerializedFunction<Input, Output, Body> {
+    // `PolicyReferences` of the default `NothingSaveable` policy, which every `RematerializedFunction` that does not
+    // select a policy shares, so that all of their calls stage operations whose policies compare equal.
+    static DEFAULT_POLICY_REFERENCES: LazyLock<Arc<PolicyReferences<NothingSaveable>>> =
+        LazyLock::new(|| Arc::new(PolicyReferences::new(NothingSaveable)));
+    RematerializedFunction {
         body,
         policy: DEFAULT_POLICY_REFERENCES.clone(),
         optimization_barrier: RematerializationOptimizationBarrier::All,
         marker: PhantomData,
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Source of a value that differentiation saves for the backward computation of a function (refer to
 /// [`saved_residuals`]).
@@ -629,6 +582,47 @@ where
         .collect()
 }
 
+/// Residual policy of a [`RematerializedFunction`] together with its [`ResidualPolicyReference`]s in the type universes
+/// that its calls have used so far. [`ResidualPolicyReference`]s compare by the identity of the policy definition that
+/// [`ResidualPolicyReference::new`] registers, so creating one per call would make calls of the same function stage
+/// unequal operations. Clones of a [`RematerializedFunction`] share one [`PolicyReferences`], and therefore stage equal
+/// operations too.
+struct PolicyReferences<Policy> {
+    /// Residual policy.
+    policy: Policy,
+
+    /// [`ResidualPolicyReference`] to `policy` in each type universe that was used so far, keyed by the [`TypeId`] of
+    /// the universe.
+    references: Mutex<Vec<(TypeId, Box<dyn Any + Send + Sync>)>>,
+}
+
+impl<Policy> PolicyReferences<Policy> {
+    /// Creates new [`PolicyReferences`] for `policy` that hold no references yet.
+    #[inline]
+    fn new(policy: Policy) -> Self {
+        Self { policy, references: Mutex::new(Vec::new()) }
+    }
+
+    /// Returns the [`ResidualPolicyReference`] to the policy in the type universe `T`, which is registered on first
+    /// use.
+    fn reference<T: 'static + Type>(&self) -> ResidualPolicyReference<T>
+    where
+        Policy: Clone + ResidualPolicy<T>,
+    {
+        let mut references = self.references.lock().expect("the residual policy references lock is poisoned");
+        let reference = references
+            .iter()
+            .find(|(universe, _)| *universe == TypeId::of::<T>())
+            .and_then(|(_, reference)| reference.downcast_ref::<ResidualPolicyReference<T>>());
+        if let Some(reference) = reference {
+            return reference.clone();
+        }
+        let reference = ResidualPolicyReference::new(self.policy.clone());
+        references.push((TypeId::of::<T>(), Box::new(reference.clone())));
+        reference
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -674,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_with_policy() {
+    fn test_rematerialized_function_with_policy() {
         let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSaveable);
         let program = trace(|x| function.call(x));
         assert_eq!(operation(&program, 0).policy().name(), "dots_saveable");
@@ -694,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_with_optimization_barrier() {
+    fn test_rematerialized_function_with_optimization_barrier() {
         let function = rematerialize(|x: TestTracer| Ok(x.sin()?));
         assert_eq!(
             operation(&trace(|x| function.call(x)), 0).optimization_barrier(),
@@ -713,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_call() {
+    fn test_rematerialized_function_call() {
         // Each call stages one `rematerialize` operation, whose body is the traced closure, into the dispatch domain of
         // its inputs. Repeated calls of one function stage equal operations because they share the reference to its
         // policy.
@@ -744,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_call_distinguishes_input_structures() {
+    fn test_rematerialized_function_call_distinguishes_input_structures() {
         // Regression test for review finding R1: calls whose inputs have the same flattened types but different
         // structures trace separate bodies.
         let function = rematerialize(|groups: Vec<Vec<TestTracer>>| {
@@ -768,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_call_saves_the_values_that_its_policy_selects() {
+    fn test_rematerialized_function_call_saves_the_values_that_its_policy_selects() {
         // Regression test for review finding R3: saving dot products saves the dot product inside the recomputed
         // computation of `x ↦ sin(x · x)`, rather than only choosing among the values that ordinary linearization
         // would save.
@@ -785,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_call_saves_only_the_values_that_differentiation_needs() {
+    fn test_rematerialized_function_call_saves_only_the_values_that_differentiation_needs() {
         // Regression test for review findings R6 and R8: saving everything for `x ↦ exp(x)` saves only `exp(x)`, as
         // differentiating `exp` directly does, and linearization saves the same values as reverse-mode
         // differentiation, according to the policy.
@@ -803,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_call_with_reference_inputs() {
+    fn test_rematerialized_function_call_with_reference_inputs() {
         // Regression test for review finding R5: batching a rematerialized call that reads a reference input succeeds.
         let function = rematerialize(|(reference, x): (TestIrTracer, TestIrTracer)| {
             let value = reference.read()?;
@@ -846,19 +840,19 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_call_without_inputs() {
+    fn test_rematerialized_function_call_without_inputs() {
         let function = rematerialize(|inputs: Vec<TestTracer>| Ok(inputs));
         assert_eq!(
             function.call(Vec::<TestTracer>::new()),
             Err(ProgramError::from(TypeError::invalid(
                 "`rematerialize` requires at least one input to recover its context from; use \
-                 `Rematerialize::call_in_context` for functions without inputs",
+                 `RematerializedFunction::call_in_context` for functions without inputs",
             ))),
         );
     }
 
     #[test]
-    fn test_rematerialize_call_in_context() {
+    fn test_rematerialized_function_call_in_context() {
         // Eager arrays dispatch to a context whose operation family cannot represent `rematerialize`, so eager calls
         // name a context that can.
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
@@ -875,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_clone() {
+    fn test_rematerialized_function_clone() {
         // Clones share the reference to the policy of the function, so their calls stage equal operations.
         let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSaveable);
         let clone = function.clone();
@@ -889,12 +883,12 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialize_debug() {
+    fn test_rematerialized_function_debug() {
         let function = rematerialize(|x: TestTracer| Ok(x.sin()?))
             .with_optimization_barrier(RematerializationOptimizationBarrier::None);
         assert_eq!(
             format!("{function:?}"),
-            "Rematerialize { policy: NothingSaveable, optimization_barrier: None, .. }",
+            "RematerializedFunction { policy: NothingSaveable, optimization_barrier: None, .. }",
         );
     }
 
