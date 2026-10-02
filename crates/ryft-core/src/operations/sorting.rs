@@ -3,25 +3,23 @@
 //! same code executes immediately or records into a program depending on the value it runs on. The capabilities fall
 //! into two groups:
 //!
-//!   - **Sorting:** [`Sort`] stably sorts one or more same-shaped arrays along one axis in a [`SortDirection`], by the
-//!     lexicographic order of their leading key inputs, and co-permutes every other input as a passenger.
+//!   - **Sorting:** [`Sort`] stably sorts one or more same-shaped arrays along one axis in a [`SortDirection`],
+//!     by the lexicographic order of their leading key inputs, and co-permutes every other input as a passenger.
 //!   - **Ranking:** [`TopK`] selects the `k` largest elements along one axis together with their indices, while
 //!     [`ArgMax`] and [`ArgMin`] compute the index of the largest and smallest element. These are compositions rather
 //!     than primitives: each one sorts the ranked value together with an `i32` index [`iota`](IotaOperation) passenger
-//!     and slices the leading entries, so every program transform supports them through the rules of
+//!     and slices the leading entries, and so every program transform supports them through the rules of
 //!     [`SortOperation`], [`Slice`], and [`Reshape`], and their indices are always `i32`.
 //!
 //! A [`SortOrdering`] selects how floating-point keys, including the real and imaginary parts of complex keys, compare.
 //! Under the default [`SortOrdering::Canonical`] ordering, `-0.0` and `+0.0` compare equal, every NaN compares equal to
 //! every other NaN and greater than `+∞`, and complex keys order lexicographically by their real part and then their
-//! imaginary part. These are the semantics of
-//! [JAX's `lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html). Under [`SortOrdering::Total`],
-//! keys order by the IEEE 754 total order of
-//! [StableHLO's `TOTALORDER` comparison](https://openxla.org/stablehlo/spec#compare) (i.e.,
-//! `-NaN < -∞ < … < -0.0 < +0.0 < … < +∞ < +NaN`), and complex keys are rejected. [`TopK`] ranks under the total
-//! ordering, following [JAX's `lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html), while
-//! [`ArgMax`] and [`ArgMin`] rank under the canonical ordering, so that an axis that contains a NaN of either sign
-//! reports its first NaN, following
+//! imaginary part, same as JAX's [`lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html). Under
+//! [`SortOrdering::Total`], keys order by the IEEE 754 total order of
+//! [StableHLO's `TOTALORDER` comparison](https://openxla.org/stablehlo/spec#compare) (i.e., `-NaN < -∞ < … < -0.0 <
+//! +0.0 < … < +∞ < +NaN`), and complex keys are rejected. [`TopK`] ranks under the total ordering, following JAX's
+//! [`lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html), while [`ArgMax`] and [`ArgMin`] rank
+//! under the canonical ordering, so that an axis that contains a NaN of either sign reports its first NaN, following
 //! [`jnp.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.argmax.html). Every sort is stable, so
 //! elements that tie on every key keep their original relative order and ranking ties select the lowest index.
 //!
@@ -35,10 +33,10 @@
 //! # Differentiation
 //!
 //! The permutation that a sort applies is piecewise constant in its keys, so every input, including each key,
-//! differentiates as a passenger of that permutation: tangents ride a sort of the primal keys, and the transpose of the
-//! resulting linear map sorts the output cotangents by the forward permutation itself, which applies its inverse.
-//! Reverse-mode differentiation therefore works through every sorting and ranking capability, while the integer
-//! indices returned by the ranking capabilities have zero derivatives.
+//! differentiates as a passenger of that permutation: tangents ride a sort of the primal keys, and the transpose of
+//! the resulting linear map sorts the output cotangents by the forward permutation itself, which applies its inverse.
+//! Reverse mode differentiation therefore works through every sorting and ranking capability, while the integer indices
+//! returned by the ranking capabilities have zero derivatives.
 //!
 //! # Examples
 //!
@@ -72,8 +70,6 @@
 //! # }
 //! ```
 
-// TODO(eaplatanios): Review this module.
-
 use std::fmt::Display;
 
 use crate::arrays::{
@@ -100,6 +96,8 @@ use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
 };
 use crate::tracing::{Tracer, TracingContext};
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Direction in which a [`SortOperation`] orders its key inputs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
