@@ -41,7 +41,7 @@ use crate::arrays::{
     ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
     StaticArrayExtentBatchingPolicy,
 };
-use crate::axes::{AxisError, NamedAxes, NamedAxis};
+use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchAxis, BatchingContext, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
@@ -229,22 +229,24 @@ pub(super) fn reject_ragged_collective_inputs<V: Value<Type = ArrayType>>(
     Ok(())
 }
 
-/// Resolves the size of the named axis bound by the active [`NamedAxes`] environment, failing fast with
-/// [`AxisError::UnboundAxisName`] when no enclosing binder binds `axis_name`. The collective capabilities bake the
+/// Resolves the static, non-zero size of the named axis bound by the active [`NamedAxes`] environment, failing fast
+/// with [`AxisError::UnboundAxisName`] when no enclosing binder binds `axis_name`. The collective capabilities bake the
 /// resolved size into their operation payloads at staging time, because their output shapes and payload validation
 /// depend on it while [`Operation::infer_output_types`] only sees input types.
 pub(super) fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str) -> Result<usize, ProgramError> {
-    match context.named_axis(axis_name) {
-        Some(NamedAxis::Batched { size: Some(size) } | NamedAxis::Mesh { size, .. }) if size > 0 => Ok(size),
-        Some(NamedAxis::Batched { size: Some(_) } | NamedAxis::Mesh { .. }) => {
-            Err(TypeError::invalid(format!("collective axis `{axis_name}` must contain at least one participant",))
+    let named_axis = context
+        .named_axis(axis_name)
+        .ok_or_else(|| AxisError::UnboundAxisName { name: axis_name.to_string() })?;
+    match named_axis.size() {
+        Some(0) => {
+            Err(TypeError::invalid(format!("collective axis `{axis_name}` must contain at least one participant"))
                 .into())
         }
-        Some(NamedAxis::Batched { size: None }) => Err(BatchingError::UnsupportedOperation {
+        Some(size) => Ok(size),
+        None => Err(BatchingError::UnsupportedOperation {
             message: format!("collective axis `{axis_name}` has a dynamic extent that must remain a first-class input"),
         }
         .into()),
-        None => Err(BatchingError::Axis(AxisError::UnboundAxisName { name: axis_name.to_string() }).into()),
     }
 }
 

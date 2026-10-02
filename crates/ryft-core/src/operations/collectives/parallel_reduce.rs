@@ -663,9 +663,9 @@ where
 {
     fn parallel_reduce(&self, axis_name: &str, kind: ParallelReductionKind) -> Result<Self, ProgramError> {
         let context = self.dispatch_domain();
-        let Some(named_axis) = context.named_axis(axis_name) else {
-            return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: axis_name.to_string() }).into());
-        };
+        let named_axis = context
+            .named_axis(axis_name)
+            .ok_or_else(|| AxisError::UnboundAxisName { name: axis_name.to_string() })?;
         let NamedAxis::Mesh { mesh, size, .. } = named_axis else {
             let operation = ParallelReduceOperation::new(axis_name.to_string(), kind);
             let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(self))?;
@@ -1756,7 +1756,7 @@ mod tests {
                 manual_mesh_axes(&mesh),
             )
             .map(|(output, _)| output),
-            Err(BatchingError::Axis(AxisError::UnboundAxisName { name: "x".to_string() }).into()),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "x".to_string() })),
         );
     }
 }

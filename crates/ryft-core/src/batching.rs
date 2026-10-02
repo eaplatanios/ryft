@@ -102,19 +102,20 @@ use crate::tracing::{Tracer, TracingContext};
 
 /// Represents batching-related errors.
 ///
-/// [`BatchingError`] and [`ProgramError`] deliberately form a conversion cycle in which each type can
-/// carry the other. Batching rules get executed by binding operations (i.e., via [`Context::bind`] and
-/// [`StagingContext::stage_operation`]), which can result in [`ProgramError`]s. So, [`BatchingError`]s travel
-/// up a trace, type-erased, inside [`ProgramError::Custom`] payloads. In the other direction, the public batching
-/// transform entry point is typed to [`BatchingError`], and a batching trace can also fail for reasons that are not
-/// batching-related. Those program errors surface through the [`BatchingError::Program`] variant. The paired [`From`]
+/// [`BatchingError`] and [`ProgramError`] deliberately form a conversion cycle in which each type
+/// can carry the other. Batching rules get executed by binding operations (i.e., via [`Context::bind`] and
+/// [`StagingContext::stage_operation`]), which can result in [`ProgramError`]s. So, [`BatchingError`]s travel up a
+/// trace, type-erased, inside [`ProgramError::Custom`] payloads. In the other direction, the public batching transform
+/// entry point is typed to [`BatchingError`], and a batching trace can also fail for reasons that are not related to
+/// batching. Those program errors surface through the [`BatchingError::Program`] variant. The paired [`From`]
 /// implementations keep this cycle normalized instead of letting the two types nest: converting to [`ProgramError`]
-/// unwraps a [`BatchingError::Program`] back into the program error that it carries and wraps every other variant in
-/// [`ProgramError::Custom`], while converting to [`BatchingError`] unwraps a [`ProgramError::Custom`] payload holding
-/// a [`BatchingError`] and wraps every other program error in [`BatchingError::Program`]. Round trips therefore never
-/// nest one error type inside the other, and `?` re-types errors correctly at both boundaries. Outside of these
-/// conversions, a [`BatchingError`] carried by a [`ProgramError`] can be recovered using
-/// [`ProgramError::downcast_custom`].
+/// unwraps a [`BatchingError::Program`] back into the program error that it carries, maps a [`BatchingError::Axis`]
+/// error onto [`ProgramError::Axis`], and wraps every other variant in [`ProgramError::Custom`], while converting to
+/// [`BatchingError`] maps a [`ProgramError::Axis`] error onto [`BatchingError::Axis`], unwraps a
+/// [`ProgramError::Custom`] payload holding a [`BatchingError`], and wraps every other program error in
+/// [`BatchingError::Program`]. Round trips therefore never nest one error type inside the other, and `?` re-types
+/// errors correctly at both boundaries. Outside of these conversions, a [`BatchingError`] carried by a [`ProgramError`]
+/// can be recovered using [`ProgramError::downcast_custom`].
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BatchingError {
     #[error("encountered an empty batch")]
@@ -160,10 +161,12 @@ pub enum BatchingError {
 impl From<ProgramError> for BatchingError {
     #[inline]
     fn from(error: ProgramError) -> Self {
-        if let Some(batching) = error.downcast_custom::<BatchingError>() {
-            batching.clone()
-        } else {
-            BatchingError::Program(error)
+        match error {
+            ProgramError::Axis(error) => BatchingError::Axis(error),
+            error => match error.downcast_custom::<BatchingError>() {
+                Some(batching) => batching.clone(),
+                None => BatchingError::Program(error),
+            },
         }
     }
 }
@@ -173,6 +176,7 @@ impl From<BatchingError> for ProgramError {
     fn from(error: BatchingError) -> Self {
         match error {
             BatchingError::Program(error) => error,
+            BatchingError::Axis(error) => ProgramError::Axis(error),
             error => ProgramError::custom(error),
         }
     }
@@ -2331,6 +2335,11 @@ mod tests {
         let batching = BatchingError::from(program.clone());
         assert_eq!(batching, BatchingError::Program(ProgramError::EscapedProgramBuilder));
         assert_eq!(ProgramError::from(batching), program);
+
+        // Axis errors map between the dedicated variants of the two types in both directions.
+        let axis = AxisError::UnboundAxisName { name: "batch".to_string() };
+        assert_eq!(ProgramError::from(BatchingError::Axis(axis.clone())), ProgramError::Axis(axis.clone()));
+        assert_eq!(BatchingError::from(ProgramError::Axis(axis.clone())), BatchingError::Axis(axis));
     }
 
     #[test]

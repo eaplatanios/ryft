@@ -279,6 +279,18 @@ pub enum NamedAxis {
     },
 }
 
+impl NamedAxis {
+    /// Returns the statically known number of batch items or device shards along this [`NamedAxis`], or [`None`] for a
+    /// batched axis whose extent is dynamic. Mesh axes always have a static size.
+    #[inline]
+    pub fn size(&self) -> Option<usize> {
+        match self {
+            Self::Batched { size } => *size,
+            Self::Mesh { size, .. } => Some(*size),
+        }
+    }
+}
+
 /// Capability for resolving named axes visible at one context-stack level. Named axes are dynamically scoped binders
 /// introduced by transforms and manual sharding regions, then consumed by named-axis operations such as collectives.
 /// Resolution is innermost-first, so a nearer binder shadows a farther one. The returned [`NamedAxis`] carries only
@@ -497,7 +509,7 @@ impl<C: Context<Operation: From<AxisIndexOperation>> + NamedAxes> AxisIndex for 
         let operation = match self.named_axis(name) {
             Some(NamedAxis::Mesh { mesh, .. }) => AxisIndexOperation::new(name.to_string()).with_mesh(mesh),
             Some(NamedAxis::Batched { .. }) => AxisIndexOperation::new(name.to_string()),
-            None => return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: name.to_string() }).into()),
+            None => return Err(AxisError::UnboundAxisName { name: name.to_string() }.into()),
         };
         let mut outputs = self.bind(operation, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
@@ -782,6 +794,14 @@ mod tests {
     }
 
     #[test]
+    fn test_named_axis_size() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        assert_eq!(NamedAxis::Batched { size: Some(3) }.size(), Some(3));
+        assert_eq!(NamedAxis::Batched { size: None }.size(), None);
+        assert_eq!(NamedAxis::Mesh { mesh, axis: 0, size: 2 }.size(), Some(2));
+    }
+
+    #[test]
     fn test_axis_index_operation() {
         let operation = AxisIndexOperation::new("devices".to_string());
         assert_eq!(operation.axis_name(), "devices");
@@ -836,7 +856,7 @@ mod tests {
     #[test]
     fn test_axis_index_rejects_an_unbound_axis() {
         // A name that no enclosing binder binds fails fast at the reader, before any operation is staged, surfacing
-        // `AxisError::UnboundAxisName` through the `BatchingError::Axis` channel riding `ProgramError`.
+        // `AxisError::UnboundAxisName` as a `ProgramError::Axis` error.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let error = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
             |input| input.context().axis_index("missing"),
@@ -844,10 +864,7 @@ mod tests {
             vec![("device".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 4 })],
         )
         .unwrap_err();
-        assert!(matches!(
-            error.downcast_custom::<BatchingError>(),
-            Some(BatchingError::Axis(AxisError::UnboundAxisName { name })) if name == "missing",
-        ));
+        assert_eq!(error, ProgramError::Axis(AxisError::UnboundAxisName { name: "missing".to_string() }));
     }
 
     #[test]

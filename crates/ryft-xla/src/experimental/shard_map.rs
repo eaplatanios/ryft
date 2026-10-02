@@ -5832,10 +5832,10 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
                             let error = local_x.parallel_reduce("y", ParallelReductionKind::Sum).unwrap_err();
-                            assert!(matches!(
-                                error.downcast_custom::<BatchingError>(),
-                                Some(BatchingError::Axis(AxisError::UnboundAxisName { name })) if name == "y",
-                            ));
+                            assert_eq!(
+                                error,
+                                ProgramError::Axis(AxisError::UnboundAxisName { name: "y".to_string() }),
+                            );
                             local_x
                         },
                         x,

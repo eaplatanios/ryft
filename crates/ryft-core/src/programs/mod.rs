@@ -95,6 +95,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::axes::AxisError;
 use crate::errors::CustomError;
 use crate::parameters::ParameterError;
 
@@ -206,6 +207,9 @@ pub enum ProgramError {
 
     #[error(transparent)]
     Reference(#[from] ReferenceError),
+
+    #[error(transparent)]
+    Axis(#[from] AxisError),
 
     #[error("{0}")]
     Custom(Arc<dyn CustomError>),

@@ -1599,7 +1599,7 @@ mod tests {
         );
         assert_eq!(
             traced.map(|_| ()),
-            Err(BatchingError::Axis(AxisError::UnboundAxisName { name: "items".to_string() }).into()),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "items".to_string() })),
         );
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |x| {

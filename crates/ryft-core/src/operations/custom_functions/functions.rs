@@ -3757,7 +3757,7 @@ mod tests {
         let function = custom_function(scaled);
         assert_eq!(
             ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
-            Err(BatchingError::Axis(AxisError::UnboundAxisName { name: "items".to_string() }).into()),
+            Err(ProgramError::Axis(AxisError::UnboundAxisName { name: "items".to_string() })),
         );
         assert_eq!(
             batch(|x| function.call(x), inputs.clone(), BatchAxis::new(0), BatchAxis::new(0), items()),
