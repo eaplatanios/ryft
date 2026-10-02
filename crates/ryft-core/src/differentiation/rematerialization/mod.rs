@@ -23,7 +23,7 @@
 //!
 //! ```rust
 //! # use ryft_core::{
-//! #     Array, ArrayOperation, ArrayType, DataType, Dot, DotsSaveable, DotDimensionNumbers, ProgramError, Sin,
+//! #     Array, ArrayOperation, ArrayType, DataType, Dot, DotsSavable, DotDimensionNumbers, ProgramError, Sin,
 //! #     ResidualSource, SavedResidual, TracingContext, differentiate_at, rematerialize, saved_residuals,
 //! # };
 //! # fn main() -> Result<(), ProgramError> {
@@ -38,7 +38,7 @@
 //! let vector_type = ArrayType::new_static(DataType::F64, [3]);
 //! let input = SavedResidual::new(vector_type.clone(), ResidualSource::Input { index: 0 });
 //! assert_eq!(saved_residuals(|x: Tracer| function.call(x), vector_type.clone())?, vec![input.clone()]);
-//! let function = rematerialize(sine_of_dot).with_policy(DotsSaveable);
+//! let function = rematerialize(sine_of_dot).with_policy(DotsSavable);
 //! let dot = SavedResidual::new(ArrayType::scalar(DataType::F64), ResidualSource::Operation { name: "dot" });
 //! assert_eq!(saved_residuals(|x: Tracer| function.call(x), vector_type)?, vec![input, dot]);
 //! # Ok(())
@@ -205,9 +205,9 @@ use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext}
 pub mod policies;
 
 pub use policies::{
-    DOTS_SAVEABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVEABLE_POLICY_NAME, DotsSaveable,
-    DotsWithNoBatchDimensionsSaveable, EVERYTHING_SAVEABLE_POLICY_NAME, EverythingSaveable, MemoryTransferStorage,
-    NOTHING_SAVEABLE_POLICY_NAME, NothingSaveable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
+    DOTS_SAVABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME, DotsSavable,
+    DotsWithNoBatchDimensionsSavable, EVERYTHING_SAVABLE_POLICY_NAME, EverythingSavable, MemoryTransferStorage,
+    NOTHING_SAVABLE_POLICY_NAME, NothingSavable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
     OffloadDotsWithNoBatchDimensions, POLICY_FN_POLICY_NAME, PolicyFn, SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME,
     SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME, SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME,
     SAVE_FROM_BOTH_POLICIES_POLICY_NAME, SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames,
@@ -215,7 +215,7 @@ pub use policies::{
 };
 
 /// Rematerialized function, which [`rematerialize`] creates from a closure over [`DomainTracer`]s.
-pub struct RematerializedFunction<Input, Output, Body, Policy = NothingSaveable> {
+pub struct RematerializedFunction<Input, Output, Body, Policy = NothingSavable> {
     /// Closure that computes the body of the function.
     body: Body,
 
@@ -390,7 +390,7 @@ impl<Input, Output, Body, Policy: Debug> Debug for RematerializedFunction<Input,
 }
 
 /// Creates a [`RematerializedFunction`] from a closure `x ↦ y = f(x)` over [`DomainTracer`]s, which saves nothing under
-/// differentiation (i.e., it uses the [`NothingSaveable`] policy) and places an optimization barrier on its inputs when
+/// differentiation (i.e., it uses the [`NothingSavable`] policy) and places an optimization barrier on its inputs when
 /// it is differentiated. The closure must annotate the type of its tracer input, which determines the context that its
 /// body is traced in, and nothing is traced until the function is called.
 #[inline]
@@ -399,8 +399,8 @@ pub fn rematerialize<Input, Output, Body: Fn(Input) -> Result<Output, ProgramErr
 ) -> RematerializedFunction<Input, Output, Body> {
     // `PolicyReferences` of the default `NothingSaveable` policy, which every `RematerializedFunction` that does not
     // select a policy shares, so that all of their calls stage operations whose policies compare equal.
-    static DEFAULT_POLICY_REFERENCES: LazyLock<Arc<PolicyReferences<NothingSaveable>>> =
-        LazyLock::new(|| Arc::new(PolicyReferences::new(NothingSaveable)));
+    static DEFAULT_POLICY_REFERENCES: LazyLock<Arc<PolicyReferences<NothingSavable>>> =
+        LazyLock::new(|| Arc::new(PolicyReferences::new(NothingSavable)));
     RematerializedFunction {
         body,
         policy: DEFAULT_POLICY_REFERENCES.clone(),
@@ -495,7 +495,7 @@ impl<T: Type> Typed for SavedResidual<T> {
 ///
 /// ```rust
 /// # use ryft_core::{
-/// #     Array, ArrayOperation, ArrayType, DataType, Dot, DotsSaveable, DotDimensionNumbers, ProgramError,
+/// #     Array, ArrayOperation, ArrayType, DataType, Dot, DotsSavable, DotDimensionNumbers, ProgramError,
 /// #     ResidualSource, SavedResidual, Sin, rematerialize, saved_residuals,
 /// # };
 /// # use ryft_core::TracingContext;
@@ -506,7 +506,7 @@ impl<T: Type> Typed for SavedResidual<T> {
 /// // from which the backward computation recomputes the cosine.
 /// let function = rematerialize(|x: Tracer| {
 ///     Ok(x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.sin()?)
-/// }).with_policy(DotsSaveable);
+/// }).with_policy(DotsSavable);
 /// let residuals = saved_residuals(|x: Tracer| function.call(x), ArrayType::new_static(DataType::F64, [3]))?;
 /// assert_eq!(
 ///     residuals,
@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_with_policy() {
-        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSaveable);
+        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSavable);
         let program = trace(|x| function.call(x));
         assert_eq!(operation(&program, 0).policy().name(), "dots_saveable");
         assert_eq!(
@@ -769,7 +769,7 @@ mod tests {
         let function = rematerialize(sine_of_dot);
         let (_, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
         assert_eq!(pullback.residuals(), &[x.clone()]);
-        let function = rematerialize(sine_of_dot).with_policy(DotsSaveable);
+        let function = rematerialize(sine_of_dot).with_policy(DotsSavable);
         let (_, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
         assert_eq!(pullback.residuals(), &[x, Array::scalar(0.1f64 * 0.1 + 0.2 * 0.2).unwrap()]);
     }
@@ -781,7 +781,7 @@ mod tests {
         // differentiation, according to the policy.
         let x = Array::scalar(0.7f64).unwrap();
         let (_, direct) = differentiate_at(x.clone()).vjp(|x| Ok(x.exp()?)).unwrap();
-        let function = rematerialize(|x: TestTracer| Ok(x.exp()?)).with_policy(EverythingSaveable);
+        let function = rematerialize(|x: TestTracer| Ok(x.exp()?)).with_policy(EverythingSavable);
         let (_, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
         assert_eq!(pullback.residuals(), direct.residuals());
         assert_eq!(pullback.residuals(), &[Array::scalar(0.7f64.exp()).unwrap()]);
@@ -867,13 +867,13 @@ mod tests {
     #[test]
     fn test_rematerialized_function_clone() {
         // Clones share the reference to the policy of the function, so their calls stage equal operations.
-        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSaveable);
+        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_policy(DotsSavable);
         let clone = function.clone();
         let program = trace(|x| clone.call(function.call(x)?));
         assert_eq!(operation(&program, 0), operation(&program, 1));
 
         // Selecting the same policy again defines a new policy, whose calls stage different operations.
-        let other = function.clone().with_policy(DotsSaveable);
+        let other = function.clone().with_policy(DotsSavable);
         let program = trace(|x| other.call(function.call(x)?));
         assert_ne!(operation(&program, 0), operation(&program, 1));
     }
@@ -932,7 +932,7 @@ mod tests {
         };
         let function = rematerialize(sine_of_dot);
         assert_eq!(saved_residuals(|x: TestTracer| function.call(x), vector_type.clone()), Ok(vec![input.clone()]));
-        let function = rematerialize(sine_of_dot).with_policy(DotsSaveable);
+        let function = rematerialize(sine_of_dot).with_policy(DotsSavable);
         assert_eq!(
             saved_residuals(|x: TestTracer| function.call(x), vector_type.clone()),
             Ok(vec![input.clone(), SavedResidual::new(scalar_type.clone(), ResidualSource::Operation { name: "dot" })]),
@@ -962,7 +962,7 @@ mod tests {
         // Reverse-mode rules decide what is saved: a custom function with only a reverse-mode rule saves its residual.
         let sine = custom_function(|x: TestTracer| Ok(x.sin()?))
             .with_vjp(|x: TestTracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent));
-        let function = rematerialize(move |x: TestTracer| sine.call(x)).with_policy(EverythingSaveable);
+        let function = rematerialize(move |x: TestTracer| sine.call(x)).with_policy(EverythingSavable);
         assert_eq!(
             saved_residuals(|x: TestTracer| function.call(x), scalar_type.clone()),
             Ok(vec![SavedResidual::new(scalar_type.clone(), ResidualSource::Operation { name: "cos" })]),
@@ -973,7 +973,7 @@ mod tests {
             let sine = x.sin()?;
             Ok(sine.clone() * sine)
         })
-        .with_policy(EverythingSaveable);
+        .with_policy(EverythingSavable);
         let bf16_type = ArrayType::scalar(DataType::BF16);
         assert_eq!(
             saved_residuals(|x: TestTracer| function.call(x), bf16_type.clone()),

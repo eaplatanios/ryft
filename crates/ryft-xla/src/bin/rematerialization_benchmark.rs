@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use ryft_core::compilation::{AnalyzableCompilationDomain, call_function};
 use ryft_core::{
     ArrayIrType, ArrayIrValue, ArrayType, CompilationDomain, CompiledFunction, Context, DataType, Device, DeviceMesh,
-    Dimension, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSaveable, LogicalMesh, Memory,
-    MeshAxis, MeshAxisType, NothingSaveable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
+    Dimension, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh, Memory,
+    MeshAxis, MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce, ReductionKind,
     RematerializationOptimizationBarrier, ResidualPolicy, ScanOperation, Shape, Sharding, StagedFunction, Tanh, Value,
     ValueProjection, differentiate_at, rematerialize, stage_function,
 };
@@ -155,8 +155,8 @@ fn checkpointed_layer<'c>(
 ) -> Result<Tracer<'c>, ProgramError> {
     match checkpointing {
         Checkpointing::None => layer(hidden, up, down),
-        Checkpointing::NothingSaveable => rematerialized_layer(NothingSaveable, optimization_barrier, hidden, up, down),
-        Checkpointing::DotsSaveable => rematerialized_layer(DotsSaveable, optimization_barrier, hidden, up, down),
+        Checkpointing::NothingSaveable => rematerialized_layer(NothingSavable, optimization_barrier, hidden, up, down),
+        Checkpointing::DotsSaveable => rematerialized_layer(DotsSavable, optimization_barrier, hidden, up, down),
         Checkpointing::OffloadDots => {
             let policy = OffloadDotsWithNoBatchDimensions::new(Memory::Host { pinned: true });
             rematerialized_layer(policy, optimization_barrier, hidden, up, down)

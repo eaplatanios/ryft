@@ -766,7 +766,7 @@ mod tests {
         Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayType, DataType,
     };
     use crate::captures::CaptureReference;
-    use crate::differentiation::NothingSaveable;
+    use crate::differentiation::NothingSavable;
     use crate::operations::{
         AddOperation, ConditionOperation, CosOperation, DotDimensionNumbers, DotOperation, MulOperation, NegOperation,
         PrintOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation,
@@ -1625,7 +1625,7 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
 
-        let save_nothing = ResidualPolicyReference::<ArrayType>::new(NothingSaveable);
+        let save_nothing = ResidualPolicyReference::<ArrayType>::new(NothingSavable);
         let planned = program.partition_with_residual_policy(&[true, true, false], &save_nothing).unwrap();
         assert_eq!(
             planned.to_string(),

@@ -200,9 +200,9 @@ pub use forward::{
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
 pub use rematerialization::{
-    DOTS_SAVEABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVEABLE_POLICY_NAME, DotsSaveable,
-    DotsWithNoBatchDimensionsSaveable, EVERYTHING_SAVEABLE_POLICY_NAME, EverythingSaveable, MemoryTransferStorage,
-    NOTHING_SAVEABLE_POLICY_NAME, NothingSaveable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
+    DOTS_SAVABLE_POLICY_NAME, DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME, DotsSavable,
+    DotsWithNoBatchDimensionsSavable, EVERYTHING_SAVABLE_POLICY_NAME, EverythingSavable, MemoryTransferStorage,
+    NOTHING_SAVABLE_POLICY_NAME, NothingSavable, OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME,
     OffloadDotsWithNoBatchDimensions, POLICY_FN_POLICY_NAME, PolicyFn, RematerializedFunction, ResidualSource,
     SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME, SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME,
     SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME, SAVE_FROM_BOTH_POLICIES_POLICY_NAME,

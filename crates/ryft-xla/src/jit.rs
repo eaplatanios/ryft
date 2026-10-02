@@ -2942,7 +2942,7 @@ mod tests {
 
     #[test]
     fn test_rematerialized_function_differentiates_on_the_xla_domain() {
-        use ryft_core::{DotsSaveable, ResidualPolicy, SaveAndOffloadOnlyTheseNames, Tag, rematerialize};
+        use ryft_core::{DotsSavable, ResidualPolicy, SaveAndOffloadOnlyTheseNames, Tag, rematerialize};
 
         // `x ↦ sin(tag(x · x, "dot"))` executes its value and gradient on the XLA domain under a policy that saves the
         // dot product and under one that offloads it to pinned host memory, and both match `sin(x · x)` and
@@ -2986,7 +2986,7 @@ mod tests {
         };
         let offload = SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["dot"], Memory::Host { pinned: true });
         for (value, gradient) in
-            [value_and_gradient(&domain, input(), DotsSaveable), value_and_gradient(&domain, input(), offload.unwrap())]
+            [value_and_gradient(&domain, input(), DotsSavable), value_and_gradient(&domain, input(), offload.unwrap())]
         {
             // XLA's elementary functions may differ from the host ones in the last bit.
             let assert_close = |actual: ArrayIrValue<Array<'_>>, expected: Vec<f32>| {

@@ -9,7 +9,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    NOTHING_SAVEABLE_POLICY_NAME, ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    NOTHING_SAVABLE_POLICY_NAME, ResidualZeroProvider, TransposableOperation, TranspositionContext,
     TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -101,7 +101,7 @@ pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
 /// ```
 ///
 /// It renders only the fields that differ from their defaults (e.g.,
-/// `rematerialize [policy="dots_saveable", optimization_barrier=false, differentiated=true]`).
+/// `rematerialize [policy="dots_savable", optimization_barrier=false, differentiated=true]`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RematerializeOperation<T: Type> {
     /// Residual policy that decides which values the call saves under differentiation.
@@ -330,7 +330,7 @@ impl<T: 'static + Type> Operation for RematerializeOperation<T> {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let operation = OperationFormatter::new(formatter, indentation, REMATERIALIZE_OPERATION_NAME)?;
-        let renders_policy = self.policy.name() != NOTHING_SAVEABLE_POLICY_NAME;
+        let renders_policy = self.policy.name() != NOTHING_SAVABLE_POLICY_NAME;
         let renders_optimization_barrier = self.optimization_barrier != RematerializationOptimizationBarrier::All;
         if !renders_policy && !renders_optimization_barrier && !self.differentiated {
             return Ok(());
@@ -766,7 +766,7 @@ mod tests {
     use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
-        CotangentDestination, CotangentSeed, DotsSaveable, EverythingSaveable, NothingSaveable,
+        CotangentDestination, CotangentSeed, DotsSavable, EverythingSavable, NothingSavable,
         OffloadDotsWithNoBatchDimensions, SaveOnlyTheseNames, differentiate_at, rematerialize,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
@@ -804,9 +804,9 @@ mod tests {
     // under test over both linearization tracers and concrete arrays, while a rematerialized function fixes the type of
     // its tracer input.
 
-    /// Returns a [`RematerializeOperation`] over [`ArrayType`] with the default [`NothingSaveable`] policy.
+    /// Returns a [`RematerializeOperation`] over [`ArrayType`] with the default [`NothingSavable`] policy.
     fn rematerialize_operation() -> RematerializeOperation<ArrayType> {
-        RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable))
+        RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))
     }
 
     /// Builds the body `x ↦ sin(x) * x` over `f64[]` scalars.
@@ -882,7 +882,7 @@ mod tests {
 
     #[test]
     fn test_rematerialize() {
-        let policy = ResidualPolicyReference::<ArrayType>::new(NothingSaveable);
+        let policy = ResidualPolicyReference::<ArrayType>::new(NothingSavable);
         let operation = RematerializeOperation::new(policy.clone());
         assert_eq!(operation.policy(), &policy);
         assert_eq!(operation.optimization_barrier(), &RematerializationOptimizationBarrier::All);
@@ -898,14 +898,14 @@ mod tests {
 
         // Only the fields that differ from their defaults render, and the default policy is omitted.
         assert_eq!(operation.to_string(), "rematerialize");
-        let configured = RematerializeOperation::new(ResidualPolicyReference::<ArrayType>::new(DotsSaveable))
+        let configured = RematerializeOperation::new(ResidualPolicyReference::<ArrayType>::new(DotsSavable))
             .with_optimization_barrier(RematerializationOptimizationBarrier::None)
             .with_differentiated(true);
         assert_eq!(configured.optimization_barrier(), &RematerializationOptimizationBarrier::None);
         assert!(configured.differentiated());
         assert_eq!(
             configured.to_string(),
-            "rematerialize [policy=\"dots_saveable\", optimization_barrier=false, differentiated=true]",
+            "rematerialize [policy=\"dots_savable\", optimization_barrier=false, differentiated=true]",
         );
         assert_eq!(operation.clone().with_differentiated(true).to_string(), "rematerialize [differentiated=true]");
         assert_eq!(
@@ -930,12 +930,12 @@ mod tests {
     #[test]
     fn test_rematerialize_lift() {
         // Lifting keeps the identity of the policy and the flags of the operation.
-        let operation = RematerializeOperation::new(ResidualPolicyReference::<ArrayType>::new(DotsSaveable))
+        let operation = RematerializeOperation::new(ResidualPolicyReference::<ArrayType>::new(DotsSavable))
             .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![false, true]))
             .with_differentiated(true);
         let lifted = operation.lift::<ArrayIrType>();
         assert_eq!(lifted.policy().id(), operation.policy().id());
-        assert_eq!(lifted.policy().name(), "dots_saveable");
+        assert_eq!(lifted.policy().name(), "dots_savable");
         assert_eq!(lifted.optimization_barrier(), &RematerializationOptimizationBarrier::Inputs(vec![false, true]));
         assert!(lifted.differentiated());
     }
@@ -1201,7 +1201,7 @@ mod tests {
                     in (%2)
                 }"},
         );
-        let program = sine_of_dot_program(RematerializeOperation::new(ResidualPolicyReference::new(DotsSaveable)));
+        let program = sine_of_dot_program(RematerializeOperation::new(ResidualPolicyReference::new(DotsSavable)));
         assert_eq!(
             program.partition(&[true, false]).unwrap().to_string(),
             indoc! {"
@@ -1215,7 +1215,7 @@ mod tests {
                 }
                 residual={
                     lambda %0:f64[], %1:f64[] .
-                    let %2:f64[] = rematerialize [policy=\"dots_saveable\", differentiated=true] %0 %1 [
+                    let %2:f64[] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 [
                         body={
                             lambda %0:f64[], %1:f64[] .
                             let %2:f64[] = sin %1
@@ -1234,7 +1234,7 @@ mod tests {
                 partition [known_inputs=[0, 1], residual_inputs=[], outputs=[Known(0)]]
                 known={
                     lambda %0:f64[3], %1:f64[] .
-                    let %2:f64[] = rematerialize [policy=\"dots_saveable\"] %0 %1 [
+                    let %2:f64[] = rematerialize [policy=\"dots_savable\"] %0 %1 [
                         body={
                             lambda %0:f64[3], %1:f64[] .
                             let %2:f64[] = dot [
@@ -1281,7 +1281,7 @@ mod tests {
                     in (%2)
                 }"},
         );
-        let operation = RematerializeOperation::new(ResidualPolicyReference::new(DotsSaveable))
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(DotsSavable))
             .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![false, false]));
         assert_eq!(
             sine_of_dot_program(operation).partition(&[true, false]).unwrap().to_string(),
@@ -1296,7 +1296,7 @@ mod tests {
                 }
                 residual={
                     lambda %0:f64[], %1:f64[] .
-                    let %2:f64[] = rematerialize [policy=\"dots_saveable\", optimization_barrier=[false, true], differentiated=true] %0 %1 [
+                    let %2:f64[] = rematerialize [policy=\"dots_savable\", optimization_barrier=[false, true], differentiated=true] %0 %1 [
                         body={
                             lambda %0:f64[], %1:f64[] .
                             let %2:f64[] = sin %1
@@ -1452,7 +1452,7 @@ mod tests {
         let right = context.lift(Array::vector(vec![1.0f64, 2.0]).unwrap()).unwrap();
         let error = context.bind(MulOperation::new(), Vec::new(), &[left, right]).err().unwrap();
         assert_eq!(error, ProgramError::Type(TypeError::invalid("`mul` input types are not broadcast-compatible")));
-        let program = sine_of_dot_program(RematerializeOperation::new(ResidualPolicyReference::new(DotsSaveable)));
+        let program = sine_of_dot_program(RematerializeOperation::new(ResidualPolicyReference::new(DotsSavable)));
         let inputs = vec![
             PartialEvaluationValue::known(trace.input(ArrayType::new_static(DataType::F64, [3]))),
             context.unknown_input(ArrayType::scalar(DataType::F64), 1),
@@ -1502,7 +1502,7 @@ mod tests {
         let body = builder.import_program(body);
         let x = builder.add_input(varying_type.clone());
         let y = builder.add_input(invariant_type.clone());
-        let operation = RematerializeOperation::new(ResidualPolicyReference::new(EverythingSaveable));
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(EverythingSavable));
         let output = builder.add_instruction(operation, vec![body], vec![x, y], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -1517,7 +1517,7 @@ mod tests {
             evaluation.program().to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['m'=4:manual]>, []}], %1:f32[][sharding={mesh<['m'=4:manual]>, [], varying_manual={'m'}}] .
-                let %2:f32[][sharding={mesh<['m'=4:manual]>, []}] = rematerialize [policy=\"everything_saveable\"] %1 %0 [
+                let %2:f32[][sharding={mesh<['m'=4:manual]>, []}] = rematerialize [policy=\"everything_savable\"] %1 %0 [
                     body={
                         lambda %0:f32[][sharding={mesh<['m'=4:manual]>, [], varying_manual={'m'}}], %1:f32[][sharding={mesh<['m'=4:manual]>, []}] .
                         let %2:f32[][sharding={mesh<['m'=4:manual]>, []}] = parallel_sum [axis_name=\"m\", mesh=['m'=4:manual]] %0
@@ -1654,14 +1654,14 @@ mod tests {
     fn test_rematerialize_differentiation() {
         // Forward mode in a shared staged context binds the same call over the fused derivative program, keeping its
         // policy and flags.
-        let operation = RematerializeOperation::new(ResidualPolicyReference::new(DotsSaveable))
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(DotsSavable))
             .with_optimization_barrier(RematerializationOptimizationBarrier::None)
             .with_differentiated(true);
         assert_eq!(
             sine_of_dot_program(operation).jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:f64[], %2:f64[3], %3:f64[] .
-                let %4:f64[], %5:f64[] = rematerialize [policy=\"dots_saveable\", optimization_barrier=false, differentiated=true] %0 %1 %2 %3 [
+                let %4:f64[], %5:f64[] = rematerialize [policy=\"dots_savable\", optimization_barrier=false, differentiated=true] %0 %1 %2 %3 [
                     body={
                         lambda %0:f64[3], %1:f64[], %2:f64[3], %3:f64[] .
                         let %4:f64[] = dot [
@@ -1855,7 +1855,7 @@ mod tests {
                 ]
                 in (%4)"},
         );
-        let operation = RematerializeOperation::new(ResidualPolicyReference::new(DotsSaveable));
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(DotsSavable));
         let linearization = sine_of_dot_program(operation).linearize().unwrap();
         assert_eq!(
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
@@ -1868,7 +1868,7 @@ mod tests {
                     %4:f64[] = mul %3 %1
                 in (%4, %0, %1, %2)
                 lambda %0:f64[3], %1:f64[], %2:f64[3], %3:f64[], %4:f64[] .
-                let %5:f64[] = rematerialize [policy=\"dots_saveable\", differentiated=true] %0 %1 %2 %3 %4 [
+                let %5:f64[] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 %2 %3 %4 [
                     body={
                         lambda %0:f64[3], %1:f64[], %2:f64[3], %3:f64[], %4:f64[] .
                         let %5:f64[] = cos %4
@@ -1889,7 +1889,7 @@ mod tests {
                 ]
                 in (%5)"},
         );
-        let operation = RematerializeOperation::new(ResidualPolicyReference::new(EverythingSaveable));
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(EverythingSavable));
         let linearization = sine_of_dot_program(operation).linearize().unwrap();
         assert_eq!(
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
@@ -1903,7 +1903,7 @@ mod tests {
                     %5:f64[] = cos %2
                 in (%4, %0, %5, %1, %3)
                 lambda %0:f64[3], %1:f64[], %2:f64[3], %3:f64[], %4:f64[], %5:f64[] .
-                let %6:f64[] = rematerialize [policy=\"everything_saveable\", differentiated=true] %0 %1 %2 %3 %4 %5 [
+                let %6:f64[] = rematerialize [policy=\"everything_savable\", differentiated=true] %0 %1 %2 %3 %4 %5 [
                     body={
                         lambda %0:f64[3], %1:f64[], %2:f64[3], %3:f64[], %4:f64[], %5:f64[] .
                         let %6:f64[] = dot [
@@ -1939,13 +1939,13 @@ mod tests {
         let dot = Array::scalar(dot).unwrap();
         let cosine = Array::scalar(0.14f64.cos()).unwrap();
         let host = Memory::Host { pinned: true };
-        assert_eq!(tagged_sine_of_dot_vjp(NothingSaveable), (value.clone(), gradient.clone(), vec![vector.clone()]));
+        assert_eq!(tagged_sine_of_dot_vjp(NothingSavable), (value.clone(), gradient.clone(), vec![vector.clone()]));
         assert_eq!(
-            tagged_sine_of_dot_vjp(EverythingSaveable),
+            tagged_sine_of_dot_vjp(EverythingSavable),
             (value.clone(), gradient.clone(), vec![vector.clone(), cosine]),
         );
         assert_eq!(
-            tagged_sine_of_dot_vjp(DotsSaveable),
+            tagged_sine_of_dot_vjp(DotsSavable),
             (value.clone(), gradient.clone(), vec![vector.clone(), dot.clone()]),
         );
         assert_eq!(
@@ -1959,7 +1959,7 @@ mod tests {
     fn test_rematerialize_differentiation_entry_points() {
         // Forward mode, linearization, and reverse mode agree, and linearization saves the residuals that the policy
         // selects: `x` and the dot product.
-        let function = rematerialize(tagged_sine_of_dot).with_policy(DotsSaveable);
+        let function = rematerialize(tagged_sine_of_dot).with_policy(DotsSavable);
         let x = Array::vector(vec![0.1f64, 0.2, 0.3]).unwrap();
         let tangent = Array::vector(vec![1.0f64, 0.0, 0.0]).unwrap();
         let value = Array::scalar(0.14f64.sin()).unwrap();
@@ -2272,7 +2272,7 @@ mod tests {
         let body = builder.import_program(body);
         let c = builder.add_input(ArrayType::scalar(DataType::F64));
         let xs = builder.add_input(ArrayType::new_static(DataType::F64, [2, 3]));
-        let operation = RematerializeOperation::new(ResidualPolicyReference::new(DotsSaveable));
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(DotsSavable));
         let output = builder.add_instruction(operation, vec![body], vec![c, xs], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -2295,7 +2295,7 @@ mod tests {
                 ]
                 in (%2, %1, %3, %4)
                 lambda %0:f64[], %1:f64[2, 3], %2:f64[2, 3], %3:f64[2], %4:f64[2] .
-                let %5:f64[] = rematerialize [policy=\"dots_saveable\", differentiated=true] %0 %1 %2 %3 %4 [
+                let %5:f64[] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 %2 %3 %4 [
                     body={
                         lambda %0:f64[], %1:f64[2, 3], %2:f64[2, 3], %3:f64[2], %4:f64[2] .
                         let %5:f64[] = scan [carry_count=1, length=2, reverse=false] %0 %1 %2 %3 %4 [
@@ -2384,7 +2384,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let body = builder.import_program(body);
         let x = builder.add_input(scalar_type);
-        let operation = RematerializeOperation::new(ResidualPolicyReference::new(EverythingSaveable));
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(EverythingSavable));
         let output = builder.add_instruction(operation, vec![body], vec![x], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -2399,7 +2399,7 @@ mod tests {
                     %4:bf16[] = cos %0
                 in (%3, %4, %2)
                 lambda %0:bf16[], %1:bf16[], %2:bf16[] .
-                let %3:bf16[] = rematerialize [policy=\"everything_saveable\", differentiated=true] %0 %1 %2 [
+                let %3:bf16[] = rematerialize [policy=\"everything_savable\", differentiated=true] %0 %1 %2 [
                     body={
                         lambda %0:bf16[], %1:bf16[], %2:bf16[] .
                         let %3:bf16[] = mul %1 %0

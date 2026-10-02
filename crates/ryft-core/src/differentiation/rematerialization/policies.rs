@@ -28,52 +28,21 @@ use crate::partial::{
 };
 use crate::programs::{ErasedOperation, ProgramError, Type};
 
-/// Returns the instantiations of `policy` in the array universes [`ArrayType`] and [`ArrayIrType`], which the built-in
-/// policies declare as their [native instantiations](ResidualPolicy::native_instantiations).
-fn native_array_instantiations<P: Clone + ResidualPolicy<ArrayType> + ResidualPolicy<ArrayIrType>>(
-    policy: &P,
-) -> NativeResidualPolicies {
-    NativeResidualPolicies::default()
-        .with::<ArrayType, _>(policy.clone())
-        .with::<ArrayIrType, _>(policy.clone())
-}
-
-/// Returns whether some producer of `candidate` is a dot product, which must have no batching dimensions when
-/// `without_batching_dimensions` is `true`.
-fn has_dot_producer<T: Type>(candidate: &ResidualCandidate<'_, T>, without_batching_dimensions: bool) -> bool {
-    candidate.producers().iter().filter_map(|producer| producer.payload::<DotOperation>()).any(|dot| {
-        let dimensions = dot.dimensions();
-        !without_batching_dimensions
-            || (dimensions.lhs_batching_dimensions().is_empty() && dimensions.rhs_batching_dimensions().is_empty())
-    })
-}
-
-/// Returns the key of the tag that `producer` applies, or [`None`] when it is not a tag (refer to
-/// [`TagOperation::key_of`]).
-fn tag_key<'o, T: 'static + Type>(producer: &ResidualProducer<'o, T>) -> Option<&'o str> {
-    TagOperation::<T>::key_of(producer.operation())
-}
-
-/// Collects `names` into owned names.
-fn owned_names<N: Into<String>, I: IntoIterator<Item = N>>(names: I) -> Vec<String> {
-    names.into_iter().map(Into::into).collect()
-}
-
-/// Canonical policy name for [`NothingSaveable`].
-pub const NOTHING_SAVEABLE_POLICY_NAME: &str = "nothing_saveable";
+/// Canonical policy name for [`NothingSavable`].
+pub const NOTHING_SAVABLE_POLICY_NAME: &str = "nothing_savable";
 
 /// [`ResidualPolicy`] that saves nothing, so that differentiation recomputes every residual from the inputs of the
 /// rematerialized function. This is the default policy of [`rematerialize`](super::rematerialize), and the analogue of
-/// JAX's `nothing_saveable`.
+/// JAX's `nothing_savable`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct NothingSaveable;
+pub struct NothingSavable;
 
-impl<T: 'static + Type> ResidualPolicy<T> for NothingSaveable {
+impl<T: 'static + Type> ResidualPolicy<T> for NothingSavable {
     type Storage = NoStorage;
 
     #[inline]
     fn name(&self) -> &str {
-        NOTHING_SAVEABLE_POLICY_NAME
+        NOTHING_SAVABLE_POLICY_NAME
     }
 
     #[inline]
@@ -86,24 +55,26 @@ impl<T: 'static + Type> ResidualPolicy<T> for NothingSaveable {
 
     #[inline]
     fn native_instantiations(&self) -> NativeResidualPolicies {
-        native_array_instantiations(self)
+        NativeResidualPolicies::default()
+            .with::<ArrayType, _>(self.clone())
+            .with::<ArrayIrType, _>(self.clone())
     }
 }
 
-/// Canonical policy name for [`EverythingSaveable`].
-pub const EVERYTHING_SAVEABLE_POLICY_NAME: &str = "everything_saveable";
+/// Canonical policy name for [`EverythingSavable`].
+pub const EVERYTHING_SAVABLE_POLICY_NAME: &str = "everything_savable";
 
 /// [`ResidualPolicy`] that saves every residual, so that differentiation recomputes nothing, which is the analogue of
-/// JAX's `everything_saveable`.
+/// JAX's `everything_savable`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct EverythingSaveable;
+pub struct EverythingSavable;
 
-impl<T: 'static + Type> ResidualPolicy<T> for EverythingSaveable {
+impl<T: 'static + Type> ResidualPolicy<T> for EverythingSavable {
     type Storage = NoStorage;
 
     #[inline]
     fn name(&self) -> &str {
-        EVERYTHING_SAVEABLE_POLICY_NAME
+        EVERYTHING_SAVABLE_POLICY_NAME
     }
 
     #[inline]
@@ -116,28 +87,31 @@ impl<T: 'static + Type> ResidualPolicy<T> for EverythingSaveable {
 
     #[inline]
     fn native_instantiations(&self) -> NativeResidualPolicies {
-        native_array_instantiations(self)
+        NativeResidualPolicies::default()
+            .with::<ArrayType, _>(self.clone())
+            .with::<ArrayIrType, _>(self.clone())
     }
 }
 
-/// Canonical policy name for [`DotsSaveable`].
-pub const DOTS_SAVEABLE_POLICY_NAME: &str = "dots_saveable";
+/// Canonical policy name for [`DotsSavable`].
+pub const DOTS_SAVABLE_POLICY_NAME: &str = "dots_savable";
 
 /// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s produce and recomputes every other residual,
-/// which is the analogue of JAX's `dots_saveable` (also known as `checkpoint_dots`).
+/// which is the analogue of JAX's `dots_savable` (also known as `checkpoint_dots`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct DotsSaveable;
+pub struct DotsSavable;
 
-impl<T: 'static + Type> ResidualPolicy<T> for DotsSaveable {
+impl<T: 'static + Type> ResidualPolicy<T> for DotsSavable {
     type Storage = NoStorage;
 
     #[inline]
     fn name(&self) -> &str {
-        DOTS_SAVEABLE_POLICY_NAME
+        DOTS_SAVABLE_POLICY_NAME
     }
 
     fn classify(&self, candidate: &ResidualCandidate<'_, T>) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
-        Ok(match has_dot_producer(candidate, false) {
+        let saved = candidate.producers().iter().any(|producer| producer.payload::<DotOperation>().is_some());
+        Ok(match saved {
             true => ResidualDecision::Save,
             false => ResidualDecision::Recompute,
         })
@@ -145,29 +119,35 @@ impl<T: 'static + Type> ResidualPolicy<T> for DotsSaveable {
 
     #[inline]
     fn native_instantiations(&self) -> NativeResidualPolicies {
-        native_array_instantiations(self)
+        NativeResidualPolicies::default()
+            .with::<ArrayType, _>(self.clone())
+            .with::<ArrayIrType, _>(self.clone())
     }
 }
 
-/// Canonical policy name for [`DotsWithNoBatchDimensionsSaveable`].
-pub const DOTS_WITH_NO_BATCH_DIMENSIONS_SAVEABLE_POLICY_NAME: &str = "dots_with_no_batch_dimensions_saveable";
+/// Canonical policy name for [`DotsWithNoBatchDimensionsSavable`].
+pub const DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME: &str = "dots_with_no_batch_dimensions_savable";
 
 /// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s without batching dimensions (e.g., matrix
 /// multiplications) produce and recomputes every other residual, which is the analogue of JAX's
-/// `dots_with_no_batch_dims_saveable`.
+/// `dots_with_no_batch_dims_savable`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct DotsWithNoBatchDimensionsSaveable;
+pub struct DotsWithNoBatchDimensionsSavable;
 
-impl<T: 'static + Type> ResidualPolicy<T> for DotsWithNoBatchDimensionsSaveable {
+impl<T: 'static + Type> ResidualPolicy<T> for DotsWithNoBatchDimensionsSavable {
     type Storage = NoStorage;
 
     #[inline]
     fn name(&self) -> &str {
-        DOTS_WITH_NO_BATCH_DIMENSIONS_SAVEABLE_POLICY_NAME
+        DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME
     }
 
     fn classify(&self, candidate: &ResidualCandidate<'_, T>) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
-        Ok(match has_dot_producer(candidate, true) {
+        let saved = candidate.producers().iter().filter_map(|producer| producer.payload::<DotOperation>()).any(|dot| {
+            let dimensions = dot.dimensions();
+            dimensions.lhs_batching_dimensions().is_empty() && dimensions.rhs_batching_dimensions().is_empty()
+        });
+        Ok(match saved {
             true => ResidualDecision::Save,
             false => ResidualDecision::Recompute,
         })
@@ -175,7 +155,9 @@ impl<T: 'static + Type> ResidualPolicy<T> for DotsWithNoBatchDimensionsSaveable 
 
     #[inline]
     fn native_instantiations(&self) -> NativeResidualPolicies {
-        native_array_instantiations(self)
+        NativeResidualPolicies::default()
+            .with::<ArrayType, _>(self.clone())
+            .with::<ArrayIrType, _>(self.clone())
     }
 }
 
@@ -221,7 +203,11 @@ where
         &self,
         candidate: &ResidualCandidate<'_, T>,
     ) -> Result<ResidualDecision<MemoryTransferStorage>, ResidualRejection> {
-        Ok(match has_dot_producer(candidate, true) {
+        let saved = candidate.producers().iter().filter_map(|producer| producer.payload::<DotOperation>()).any(|dot| {
+            let dimensions = dot.dimensions();
+            dimensions.lhs_batching_dimensions().is_empty() && dimensions.rhs_batching_dimensions().is_empty()
+        });
+        Ok(match saved {
             true => ResidualDecision::SaveWith(MemoryTransferStorage::new(self.destination)),
             false => ResidualDecision::Recompute,
         })
@@ -229,7 +215,9 @@ where
 
     #[inline]
     fn native_instantiations(&self) -> NativeResidualPolicies {
-        native_array_instantiations(self)
+        NativeResidualPolicies::default()
+            .with::<ArrayType, _>(self.clone())
+            .with::<ArrayIrType, _>(self.clone())
     }
 }
 
@@ -248,7 +236,7 @@ impl SaveOnlyTheseNames {
     /// Creates a new [`SaveOnlyTheseNames`] policy that saves the values that are tagged with one of `names`.
     #[inline]
     pub fn new<N: Into<String>, I: IntoIterator<Item = N>>(names: I) -> Self {
-        Self { names: owned_names(names) }
+        Self { names: names.into_iter().map(Into::into).collect() }
     }
 
     /// Returns the names of the tags whose values are saved.
@@ -270,14 +258,16 @@ impl<T: 'static + Type> ResidualPolicy<T> for SaveOnlyTheseNames {
         let saved = candidate
             .producers()
             .iter()
-            .filter_map(tag_key)
+            .filter_map(|producer| TagOperation::<T>::key_of(producer.operation()))
             .any(|key| self.names.iter().any(|name| name == key));
         Ok(if saved { ResidualDecision::Save } else { ResidualDecision::Recompute })
     }
 
     #[inline]
     fn native_instantiations(&self) -> NativeResidualPolicies {
-        native_array_instantiations(self)
+        NativeResidualPolicies::default()
+            .with::<ArrayType, _>(self.clone())
+            .with::<ArrayIrType, _>(self.clone())
     }
 }
 
@@ -297,7 +287,7 @@ impl SaveAnyNamesButThese {
     /// Creates a new [`SaveAnyNamesButThese`] policy that saves the tagged values whose tag names are not in `names`.
     #[inline]
     pub fn new<N: Into<String>, I: IntoIterator<Item = N>>(names: I) -> Self {
-        Self { names: owned_names(names) }
+        Self { names: names.into_iter().map(Into::into).collect() }
     }
 
     /// Returns the names of the tags whose values are not saved.
@@ -319,14 +309,16 @@ impl<T: 'static + Type> ResidualPolicy<T> for SaveAnyNamesButThese {
         let saved = candidate
             .producers()
             .iter()
-            .filter_map(tag_key)
+            .filter_map(|producer| TagOperation::<T>::key_of(producer.operation()))
             .any(|key| !self.names.iter().any(|name| name == key));
         Ok(if saved { ResidualDecision::Save } else { ResidualDecision::Recompute })
     }
 
     #[inline]
     fn native_instantiations(&self) -> NativeResidualPolicies {
-        native_array_instantiations(self)
+        NativeResidualPolicies::default()
+            .with::<ArrayType, _>(self.clone())
+            .with::<ArrayIrType, _>(self.clone())
     }
 }
 
@@ -347,7 +339,7 @@ impl SaveAnythingExceptTheseNames {
     /// with one of `names`.
     #[inline]
     pub fn new<N: Into<String>, I: IntoIterator<Item = N>>(names: I) -> Self {
-        Self { names: owned_names(names) }
+        Self { names: names.into_iter().map(Into::into).collect() }
     }
 
     /// Returns the names of the tags whose values are not saved.
@@ -366,16 +358,17 @@ impl<T: 'static + Type> ResidualPolicy<T> for SaveAnythingExceptTheseNames {
     }
 
     fn classify(&self, candidate: &ResidualCandidate<'_, T>) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
-        let saved = candidate
-            .producers()
-            .iter()
-            .any(|producer| tag_key(producer).is_none_or(|key| !self.names.iter().any(|name| name == key)));
+        let saved = candidate.producers().iter().any(|producer| {
+            TagOperation::<T>::key_of(producer.operation()).is_none_or(|key| !self.names.iter().any(|name| name == key))
+        });
         Ok(if saved { ResidualDecision::Save } else { ResidualDecision::Recompute })
     }
 
     #[inline]
     fn native_instantiations(&self) -> NativeResidualPolicies {
-        native_array_instantiations(self)
+        NativeResidualPolicies::default()
+            .with::<ArrayType, _>(self.clone())
+            .with::<ArrayIrType, _>(self.clone())
     }
 }
 
@@ -383,13 +376,13 @@ impl<T: 'static + Type> ResidualPolicy<T> for SaveAnythingExceptTheseNames {
 pub const SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME: &str = "save_and_offload_only_these_names";
 
 /// [`ResidualPolicy`] that saves the residuals that are tagged (refer to [`Tag`](crate::Tag)) with one of the provided
-/// saveable names, offloads the ones that are tagged with one of the provided offloadable names to the provided
+/// savable names, offloads the ones that are tagged with one of the provided offloadable names to the provided
 /// [`Memory`] (refer to [`MemoryTransferStorage`]), and recomputes every other residual, which is the analogue of JAX's
 /// `save_and_offload_only_these_names`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SaveAndOffloadOnlyTheseNames {
     /// Names of the tags whose values are saved.
-    saveable_names: Vec<String>,
+    savable_names: Vec<String>,
 
     /// Names of the tags whose values are offloaded.
     offloadable_names: Vec<String>,
@@ -400,20 +393,20 @@ pub struct SaveAndOffloadOnlyTheseNames {
 
 impl SaveAndOffloadOnlyTheseNames {
     /// Creates a new [`SaveAndOffloadOnlyTheseNames`] policy that saves the values that are tagged with one of
-    /// `saveable_names` and offloads the ones that are tagged with one of `offloadable_names` to `destination`.
+    /// `savable_names` and offloads the ones that are tagged with one of `offloadable_names` to `destination`.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::InvalidArgument`] when a name is both saveable and offloadable, because a value cannot
+    /// Returns [`ProgramError::InvalidArgument`] when a name is both savable and offloadable, because a value cannot
     /// be both kept in place and offloaded.
     pub fn new<S: Into<String>, O: Into<String>>(
-        saveable_names: impl IntoIterator<Item = S>,
+        savable_names: impl IntoIterator<Item = S>,
         offloadable_names: impl IntoIterator<Item = O>,
         destination: Memory,
     ) -> Result<Self, ProgramError> {
-        let saveable_names = owned_names(saveable_names);
-        let offloadable_names = owned_names(offloadable_names);
-        let overlapping_names = saveable_names
+        let savable_names = savable_names.into_iter().map(Into::into).collect::<Vec<String>>();
+        let offloadable_names = offloadable_names.into_iter().map(Into::into).collect::<Vec<String>>();
+        let overlapping_names = savable_names
             .iter()
             .filter(|name| offloadable_names.contains(name))
             .map(|name| format!("`{name}`"))
@@ -421,19 +414,19 @@ impl SaveAndOffloadOnlyTheseNames {
         if !overlapping_names.is_empty() {
             return Err(ProgramError::InvalidArgument {
                 message: format!(
-                    "names {} cannot be both saveable and offloadable by a \
+                    "names {} cannot be both savable and offloadable by a \
                      `{SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME}` policy",
                     overlapping_names.join(", "),
                 ),
             });
         }
-        Ok(Self { saveable_names, offloadable_names, destination })
+        Ok(Self { savable_names, offloadable_names, destination })
     }
 
     /// Returns the names of the tags whose values are saved.
     #[inline]
-    pub fn saveable_names(&self) -> &[String] {
-        self.saveable_names.as_slice()
+    pub fn savable_names(&self) -> &[String] {
+        self.savable_names.as_slice()
     }
 
     /// Returns the names of the tags whose values are offloaded.
@@ -464,9 +457,13 @@ where
         &self,
         candidate: &ResidualCandidate<'_, T>,
     ) -> Result<ResidualDecision<MemoryTransferStorage>, ResidualRejection> {
-        let keys = candidate.producers().iter().filter_map(tag_key).collect::<Vec<_>>();
+        let keys = candidate
+            .producers()
+            .iter()
+            .filter_map(|producer| TagOperation::<T>::key_of(producer.operation()))
+            .collect::<Vec<_>>();
         let tagged_with = |names: &[String]| keys.iter().any(|key| names.iter().any(|name| name == key));
-        Ok(if tagged_with(&self.saveable_names) {
+        Ok(if tagged_with(&self.savable_names) {
             ResidualDecision::Save
         } else if tagged_with(&self.offloadable_names) {
             ResidualDecision::SaveWith(MemoryTransferStorage::new(self.destination))
@@ -477,7 +474,9 @@ where
 
     #[inline]
     fn native_instantiations(&self) -> NativeResidualPolicies {
-        native_array_instantiations(self)
+        NativeResidualPolicies::default()
+            .with::<ArrayType, _>(self.clone())
+            .with::<ArrayIrType, _>(self.clone())
     }
 }
 
@@ -745,28 +744,28 @@ mod tests {
     }
 
     #[test]
-    fn test_nothing_saveable() {
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&NothingSaveable), "nothing_saveable");
-        assert_eq!(NothingSaveable.classify(&candidate(&[dot()])), Ok(ResidualDecision::Recompute));
-        assert_eq!(NothingSaveable.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Recompute));
+    fn test_nothing_savable() {
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&NothingSavable), "nothing_savable");
+        assert_eq!(NothingSavable.classify(&candidate(&[dot()])), Ok(ResidualDecision::Recompute));
+        assert_eq!(NothingSavable.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Recompute));
     }
 
     #[test]
-    fn test_everything_saveable() {
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&EverythingSaveable), "everything_saveable");
-        assert_eq!(EverythingSaveable.classify(&candidate(&[sine()])), Ok(ResidualDecision::Save));
-        assert_eq!(EverythingSaveable.classify(&candidate(&[dot()])), Ok(ResidualDecision::Save));
+    fn test_everything_savable() {
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&EverythingSavable), "everything_savable");
+        assert_eq!(EverythingSavable.classify(&candidate(&[sine()])), Ok(ResidualDecision::Save));
+        assert_eq!(EverythingSavable.classify(&candidate(&[dot()])), Ok(ResidualDecision::Save));
     }
 
     #[test]
-    fn test_dots_saveable() {
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&DotsSaveable), "dots_saveable");
-        assert_eq!(DotsSaveable.classify(&candidate(&[dot()])), Ok(ResidualDecision::Save));
-        assert_eq!(DotsSaveable.classify(&candidate(&[batched_dot()])), Ok(ResidualDecision::Save));
-        assert_eq!(DotsSaveable.classify(&candidate(&[sine()])), Ok(ResidualDecision::Recompute));
+    fn test_dots_savable() {
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&DotsSavable), "dots_savable");
+        assert_eq!(DotsSavable.classify(&candidate(&[dot()])), Ok(ResidualDecision::Save));
+        assert_eq!(DotsSavable.classify(&candidate(&[batched_dot()])), Ok(ResidualDecision::Save));
+        assert_eq!(DotsSavable.classify(&candidate(&[sine()])), Ok(ResidualDecision::Recompute));
 
         // A residual that several producers may produce is saved when any of them is a dot product.
-        assert_eq!(DotsSaveable.classify(&candidate(&[sine(), dot()])), Ok(ResidualDecision::Save));
+        assert_eq!(DotsSavable.classify(&candidate(&[sine(), dot()])), Ok(ResidualDecision::Save));
 
         // Dot products are recognized in the array operation family itself too.
         let dot = ArrayOperation::<Array>::from(DotOperation::new(DotDimensionNumbers::new(
@@ -778,13 +777,13 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let producer = ResidualProducer::new(&dot, 0, Vec::new(), vec![scalar_type.clone()]);
         assert_eq!(
-            DotsSaveable.classify(&ResidualCandidate::new(vec![producer], scalar_type)),
+            DotsSavable.classify(&ResidualCandidate::new(vec![producer], scalar_type)),
             Ok(ResidualDecision::Save),
         );
 
         // Lifting a reference to the policy from `ArrayType` into `ArrayIrType` uses its native instantiation, which
         // classifies candidates whose types do not project into `ArrayType` instead of rejecting them.
-        let lifted = ResidualPolicyReference::<ArrayType>::new(DotsSaveable).lift::<ArrayIrType>();
+        let lifted = ResidualPolicyReference::<ArrayType>::new(DotsSavable).lift::<ArrayIrType>();
         let dimension_size = TestOperation::DimensionSize(
             DimensionSizeOperation::new(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap(),
         );
@@ -796,9 +795,9 @@ mod tests {
     }
 
     #[test]
-    fn test_dots_with_no_batch_dimensions_saveable() {
-        let policy = DotsWithNoBatchDimensionsSaveable;
-        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "dots_with_no_batch_dimensions_saveable");
+    fn test_dots_with_no_batch_dimensions_savable() {
+        let policy = DotsWithNoBatchDimensionsSavable;
+        assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "dots_with_no_batch_dimensions_savable");
         assert_eq!(policy.classify(&candidate(&[dot()])), Ok(ResidualDecision::Save));
         assert_eq!(policy.classify(&candidate(&[batched_dot()])), Ok(ResidualDecision::Recompute));
         assert_eq!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Recompute));
@@ -861,7 +860,7 @@ mod tests {
     fn test_save_and_offload_only_these_names() {
         let host = Memory::Host { pinned: false };
         let policy = SaveAndOffloadOnlyTheseNames::new(["a"], ["b"], host).unwrap();
-        assert_eq!(policy.saveable_names(), &["a".to_owned()]);
+        assert_eq!(policy.savable_names(), &["a".to_owned()]);
         assert_eq!(policy.offloadable_names(), &["b".to_owned()]);
         assert_eq!(policy.destination(), host);
         assert_eq!(ResidualPolicy::<ArrayIrType>::name(&policy), "save_and_offload_only_these_names");
@@ -882,7 +881,7 @@ mod tests {
         assert_eq!(
             SaveAndOffloadOnlyTheseNames::new(["a", "b", "c"], ["c", "a"], Memory::Device),
             Err(ProgramError::InvalidArgument {
-                message: "names `a`, `c` cannot be both saveable and offloadable by a \
+                message: "names `a`, `c` cannot be both savable and offloadable by a \
                     `save_and_offload_only_these_names` policy"
                     .to_owned(),
             }),
@@ -909,16 +908,15 @@ mod tests {
         // Rejections of either policy are returned as they are.
         let rejecting =
             PolicyFn::new::<ArrayIrType>(|_| Err::<ResidualDecision<NoStorage>, _>(ResidualRejection::new("rejected")));
-        let policy = SaveFromBothPolicies::new(NothingSaveable, rejecting);
+        let policy = SaveFromBothPolicies::new(NothingSavable, rejecting);
         assert_eq!(policy.classify(&candidate(&[sine()])).map(|_| ()), Err(ResidualRejection::new("rejected")));
-        let policy = SaveFromBothPolicies::new(EverythingSaveable, policy.second().clone());
+        let policy = SaveFromBothPolicies::new(EverythingSavable, policy.second().clone());
         assert!(matches!(policy.classify(&candidate(&[sine()])), Ok(ResidualDecision::Save)));
 
         // The policy declares no native instantiations, so lifting a reference to it projects the types of each
         // candidate and cannot classify the ones that do not project.
-        let lifted =
-            ResidualPolicyReference::<ArrayType>::new(SaveFromBothPolicies::new(DotsSaveable, NothingSaveable))
-                .lift::<ArrayIrType>();
+        let lifted = ResidualPolicyReference::<ArrayType>::new(SaveFromBothPolicies::new(DotsSavable, NothingSavable))
+            .lift::<ArrayIrType>();
         let dimension_size = TestOperation::DimensionSize(
             DimensionSizeOperation::new(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap(),
         );

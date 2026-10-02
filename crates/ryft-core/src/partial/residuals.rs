@@ -37,6 +37,7 @@
 //! complete lifecycle prefix, and lifecycles that the known program no longer observes are removed from it.
 
 use std::any::{Any, TypeId};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
@@ -212,14 +213,14 @@ pub struct ResidualCandidate<'o, T: Type> {
     producers: Vec<ResidualProducer<'o, T>>,
 
     /// Type of the residual.
-    residual_type: T,
+    r#type: T,
 }
 
 impl<'o, T: Type> ResidualCandidate<'o, T> {
     /// Creates a new [`ResidualCandidate`] with the provided producers, in semantic order, and residual type.
     #[inline]
-    pub fn new(producers: Vec<ResidualProducer<'o, T>>, residual_type: T) -> Self {
-        Self { producers, residual_type }
+    pub fn new(producers: Vec<ResidualProducer<'o, T>>, r#type: T) -> Self {
+        Self { producers, r#type }
     }
 
     /// Returns the operation outputs that may have produced this residual, in semantic order.
@@ -227,11 +228,14 @@ impl<'o, T: Type> ResidualCandidate<'o, T> {
     pub fn producers(&self) -> &[ResidualProducer<'o, T>] {
         self.producers.as_slice()
     }
+}
 
-    /// Returns the type of this residual.
+impl<T: Type> Typed for ResidualCandidate<'_, T> {
+    type Type = T;
+
     #[inline]
-    pub fn residual_type(&self) -> &T {
-        &self.residual_type
+    fn r#type(&self) -> Cow<'_, T> {
+        Cow::Borrowed(&self.r#type)
     }
 }
 
@@ -564,9 +568,9 @@ where
 
         // The residual type must project as well. A producer type that failed to project takes precedence in the
         // diagnostic, because it is usually the root cause (e.g., a dimension-producing operation).
-        let residual_type = project(candidate.residual_type());
+        let residual_type = project(candidate.r#type().as_ref());
         if residual_type.is_none() && unprojectable.is_none() {
-            unprojectable = Some(("the residual".to_owned(), candidate.residual_type().to_string()));
+            unprojectable = Some(("the residual".to_owned(), candidate.r#type().to_string()));
         }
 
         match (unprojectable, residual_type) {
@@ -2240,7 +2244,7 @@ mod tests {
         let candidate = ResidualCandidate::new(vec![producer], scalar_type());
         assert_eq!(candidate.producers().len(), 1);
         assert_eq!(candidate.producers()[0].name(), "dot");
-        assert_eq!(candidate.residual_type(), &scalar_type());
+        assert_eq!(candidate.r#type().as_ref(), &scalar_type());
     }
 
     #[test]
@@ -2378,7 +2382,7 @@ mod tests {
         let native = source.clone().with_native_instantiation::<ArrayIrType, _>(TestPolicy {
             name: "native_recompute",
             classify: |candidate: &ResidualCandidate<'_, ArrayIrType>| {
-                Ok(match candidate.residual_type() {
+                Ok(match candidate.r#type().as_ref() {
                     ArrayIrType::Dimension(_) => ResidualDecision::<NoStorage>::Save,
                     _ => ResidualDecision::Recompute,
                 })

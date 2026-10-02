@@ -2246,7 +2246,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_select_kernels_preserves_call_and_rematerialization_regions() {
-        use ryft_core::{NothingSaveable, RematerializeOperation, ResidualPolicyReference};
+        use ryft_core::{NothingSavable, RematerializeOperation, ResidualPolicyReference};
 
         use crate::experimental::ops::JitCallOperation;
 
@@ -2264,7 +2264,7 @@ pub(crate) mod tests {
         .unwrap();
         for operation in [
             XlaOperation::JitCall(JitCallOperation::new(0)),
-            XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable))),
+            XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
         ] {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(scalar.clone());

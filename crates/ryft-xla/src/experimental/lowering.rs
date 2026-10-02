@@ -16921,7 +16921,7 @@ mod tests {
 
     #[test]
     fn test_rematerialize_lowering_inlines_body_effects_on_the_enclosing_token_chain() {
-        use ryft_core::{NothingSaveable, PrintOperation, RematerializeOperation, ResidualPolicyReference};
+        use ryft_core::{NothingSavable, PrintOperation, RematerializeOperation, ResidualPolicyReference};
 
         // Rematerialization is a transform boundary, not an execution boundary. Lowering inlines its body, so prints
         // immediately before, inside, and after the call must form one ordered-I/O token chain.
@@ -16941,7 +16941,7 @@ mod tests {
         let before = builder.add_instruction(PrintOperation::new("before"), Vec::new(), vec![input], None).unwrap()[0];
         let rematerialized = builder
             .add_instruction(
-                XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable))),
+                XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
                 vec![body],
                 vec![before],
                 None,
@@ -16968,7 +16968,7 @@ mod tests {
 
     #[test]
     fn test_rematerialize_lowering_rejects_capture_constants_in_its_body() {
-        use ryft_core::{NothingSaveable, RematerializeOperation, ResidualPolicyReference};
+        use ryft_core::{NothingSavable, RematerializeOperation, ResidualPolicyReference};
 
         // Rematerialized bodies are traced through fresh-root contexts and can therefore never legally reference the
         // enclosing function's captures. A capture constant smuggled into such a body must fail loudly instead of
@@ -16991,7 +16991,7 @@ mod tests {
         let input = builder.add_input(scalar_type.clone().into());
         let output = builder
             .add_instruction(
-                XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable))),
+                XlaOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
                 vec![body],
                 vec![input],
                 None,
@@ -17017,7 +17017,7 @@ mod tests {
 
     #[test]
     fn test_rematerialize_lowering_places_an_input_barrier_on_differentiated_calls() {
-        use ryft_core::{NothingSaveable, RematerializeOperation, ResidualPolicyReference};
+        use ryft_core::{NothingSavable, RematerializeOperation, ResidualPolicyReference};
 
         // Only a differentiated call whose optimization barrier is enabled wraps its inputs in a barrier, which keeps
         // XLA from merging the recomputation with the original computation.
@@ -17042,7 +17042,7 @@ mod tests {
                 .unwrap();
             to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap()
         };
-        let operation = RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable));
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable));
         assert_eq!(
             lower(operation.clone().with_differentiated(true)),
             indoc! {r#"
@@ -17257,7 +17257,7 @@ mod tests {
 
     #[test]
     fn test_rematerialized_gradient_lowers_with_rounded_bf16_residuals() {
-        use ryft_core::{EverythingSaveable, differentiate_at, rematerialize};
+        use ryft_core::{EverythingSavable, differentiate_at, rematerialize};
 
         // Saving everything for `x ↦ sin(x)²` over `bf16` saves `sin(x)`, which the forward computation also squares.
         // It is rounded to `bf16` right after it is computed, so that XLA cannot use a more precise value for the
@@ -17268,7 +17268,7 @@ mod tests {
             let sine = context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &[x])?.remove(0);
             Ok(context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[sine.clone(), sine])?.remove(0))
         })
-        .with_policy(EverythingSaveable);
+        .with_policy(EverythingSavable);
         let (_, gradient) = DomainTracingContext::<XlaDomain<'static>>::trace(
             |x: XlaTracer<'static>| Ok(differentiate_at(x).gradient(|x| function.call(x))?),
             ArrayIrType::from(scalar_type.clone()),

@@ -2181,7 +2181,7 @@ mod tests {
 
     #[test]
     fn test_core_custom_function_and_rematerialization_promotions_preserve_metadata() {
-        use ryft_core::{DotsSaveable, ResidualPolicyReference};
+        use ryft_core::{DotsSavable, ResidualPolicyReference};
 
         // These payloads are promoted by move rather than reconstructed, so their complete stored surface must
         // survive: the rule layout and the non-differentiated operand split of custom-function calls, and the policy
@@ -2243,7 +2243,7 @@ mod tests {
                     && operation.output_tangent_types() == std::slice::from_ref(&tangent_type),
         ));
 
-        let rematerialize = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(DotsSaveable))
+        let rematerialize = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(DotsSavable))
             .with_optimization_barrier(RematerializationOptimizationBarrier::None)
             .with_differentiated(true);
         let promoted: XlaOperation<XlaConstant> =
@@ -2365,7 +2365,7 @@ mod tests {
 
     #[test]
     fn test_rematerialize_recomputes_known_jit_calls_in_its_body() {
-        use ryft_core::{NothingSaveable, rematerialize};
+        use ryft_core::{NothingSavable, rematerialize};
 
         // A rematerialized body squares its input inside a jitted call and squares the result of the call outside of
         // it. Linearizing it with the default policy, which saves nothing, saves only the input: the call, whose inputs
@@ -2386,7 +2386,7 @@ mod tests {
             let mut outputs = context.bind(MulOperation::new(), Vec::new(), &[called[0].clone(), called[0].clone()])?;
             Ok(outputs.remove(0))
         })
-        .with_policy(NothingSaveable);
+        .with_policy(NothingSavable);
         let (_, program) =
             DomainTracingContext::<XlaDomain<'static>>::trace(|x: XlaTracer<'static>| function.call(x), scalar_type)
                 .unwrap();
@@ -3946,7 +3946,7 @@ mod tests {
     #[test]
     fn test_rematerialization_policies_are_available_for_the_xla_operation_family() {
         use ryft_core::{
-            DotsSaveable, DotsWithNoBatchDimensionsSaveable, EverythingSaveable, Memory, NothingSaveable,
+            DotsSavable, DotsWithNoBatchDimensionsSavable, EverythingSavable, Memory, NothingSavable,
             OffloadDotsWithNoBatchDimensions, ResidualPolicy, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies,
             SaveOnlyTheseNames,
         };
@@ -3956,13 +3956,13 @@ mod tests {
         // payload projection. This is a compile-time capability check: the assertions below fail to compile if a
         // policy is not available for the universe.
         fn assert_policy<P: ResidualPolicy<ArrayIrType>>(_policy: P) {}
-        assert_policy(NothingSaveable);
-        assert_policy(EverythingSaveable);
-        assert_policy(DotsSaveable);
-        assert_policy(DotsWithNoBatchDimensionsSaveable);
+        assert_policy(NothingSavable);
+        assert_policy(EverythingSavable);
+        assert_policy(DotsSavable);
+        assert_policy(DotsWithNoBatchDimensionsSavable);
         assert_policy(SaveOnlyTheseNames::new(["u"]));
         assert_policy(SaveAndOffloadOnlyTheseNames::new(["u"], ["v"], Memory::Host { pinned: true }).unwrap());
         assert_policy(OffloadDotsWithNoBatchDimensions::new(Memory::Host { pinned: true }));
-        assert_policy(SaveFromBothPolicies::new(DotsSaveable, SaveOnlyTheseNames::new(["u"])));
+        assert_policy(SaveFromBothPolicies::new(DotsSavable, SaveOnlyTheseNames::new(["u"])));
     }
 }

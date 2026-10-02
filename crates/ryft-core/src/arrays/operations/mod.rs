@@ -1093,7 +1093,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableType, DotsSaveable, ForwardModeDifferentiate, LinearizationTracer, NothingSaveable,
+        DifferentiableType, DotsSavable, ForwardModeDifferentiate, LinearizationTracer, NothingSavable,
         ReverseModeDifferentiate,
     };
     use crate::interpretation::InterpretableOperation;
@@ -2522,7 +2522,7 @@ mod tests {
                 ));
             }
         }
-        let policy = ResidualPolicyReference::<ArrayType>::new(DotsSaveable);
+        let policy = ResidualPolicyReference::<ArrayType>::new(DotsSavable);
         assert!(matches!(
             TestOperation::from(ArrayOperation::Rematerialize(
                 RematerializeOperation::new(policy.clone())
@@ -2711,7 +2711,7 @@ mod tests {
         // The body is rebuilt around the threaded extent, which becomes a leading body input, keeping the
         // rematerialization boundary intact.
         let (program, batch_axis) = batched_composite_payload(
-            ArrayOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSaveable))),
+            ArrayOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
             vec![composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0)])],
         );
         assert_eq!(batch_axis, BatchAxis::new(0));
@@ -3755,7 +3755,7 @@ mod tests {
             (ArrayIrOperation::LinearCall(LinearCallOperation::new(0)), MemberKindSignature::RegionForwarding),
             (
                 ArrayIrOperation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(
-                    NothingSaveable,
+                    NothingSavable,
                 ))),
                 MemberKindSignature::RegionForwarding,
             ),
