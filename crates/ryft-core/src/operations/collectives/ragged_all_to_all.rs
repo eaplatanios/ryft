@@ -54,9 +54,9 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 
 use super::all_to_all::AllToAllOperation;
-use super::shape_changing::CollectiveArrayExtentBatchingPolicy;
 use super::{
-    CollectiveOptions, effective_collective_axis_size, reject_ragged_collective_inputs, resolve_named_axis_size,
+    CollectiveArrayExtentBatchingPolicy, CollectiveOptions, effective_collective_axis_size,
+    reject_ragged_collective_inputs, resolve_named_axis_size,
 };
 
 /// Input representation carried by [`RaggedAllToAllOperation`].

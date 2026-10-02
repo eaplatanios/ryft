@@ -43,20 +43,15 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 
 use super::all_gather::{AllGatherOperation, AllGatherOutputVariance};
-use super::linear::{
-    interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,
-    transpose_linear_collective,
-};
-use super::shape_changing::{
-    CollectiveArrayExtentBatchingPolicy, collective_input_extents, divided_collective_extent,
-    explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
-    impl_shape_changing_collective_member_operation, infer_explicit_shape_changing_collective_output_type,
-    jvp_shape_changing_collective_with_adjoint, require_collective_axis_extent,
-    validate_explicit_collective_output_extents,
-};
 use super::{
-    CollectiveMode, CollectiveOptions, forward_collective_to_parent, reject_ragged_collective_inputs,
-    resolve_named_axis_size, validate_collective_axis_size,
+    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
+    divided_collective_extent, explicit_collective_inputs, forward_collective_to_parent, forward_explicit_collective,
+    forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
+    infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
+    jvp_shape_changing_collective_with_adjoint, linear_collective, linear_collective_dimensions,
+    linear_collective_output_type, reject_ragged_collective_inputs, require_collective_axis_extent,
+    resolve_named_axis_size, transpose_linear_collective, validate_collective_axis_size,
+    validate_explicit_collective_output_extents,
 };
 
 /// Applies sum-scatter's reduction-state transition. Ordinary inputs preserve their variance metadata. An input that is

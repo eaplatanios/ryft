@@ -31,11 +31,10 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-use super::linear::{
-    interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,
-    transpose_linear_collective,
+use super::{
+    forward_collective_to_parent, interpret_degenerate_collective, linear_collective, linear_collective_dimensions,
+    linear_collective_output_type, resolve_named_axis_size, transpose_linear_collective, validate_collective_axis_size,
 };
-use super::{forward_collective_to_parent, resolve_named_axis_size, validate_collective_axis_size};
 
 linear_collective! {
     /// [`Operation`] that sends every participant's input to another participant along the named axis according to
