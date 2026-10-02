@@ -239,15 +239,6 @@ impl<T: Type> RematerializeOperation<T> {
         };
         Some(ErasedOperation::new(ReducePrecisionOperation::<ArrayType>::new(exponent_bits, mantissa_bits)))
     }
-
-    // TODO(eaplatanios): Inline this function.
-    /// Returns whether `operation` is a store operation of
-    /// [`MemoryTransferStorage`](crate::differentiation::MemoryTransferStorage), through which
-    /// [`PartitionedProgram::with_rounded_residuals`]
-    /// looks, so that offloaded residuals are rounded before they are offloaded.
-    fn is_memory_transfer<O: OperationPayloadProjection>(operation: &O) -> bool {
-        operation.projected_payload::<TransferToMemoryOperation>().is_some()
-    }
 }
 
 impl<T: 'static + Type> Display for RematerializeOperation<T> {
@@ -441,9 +432,12 @@ where
         }
 
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
+        // Look through memory transfers so offloaded residuals are rounded before they are offloaded.
         let partition = driver
             .partition_program(&context.clone().with_residual_policy(&self.policy), body, &input_known)?
-            .with_rounded_residuals(Self::excess_precision_rounding, Self::is_memory_transfer)?;
+            .with_rounded_residuals(Self::excess_precision_rounding, |operation| {
+                operation.projected_payload::<TransferToMemoryOperation>().is_some()
+            })?;
         let residual_operation = self.with_residual_optimization_barrier(&partition).with_differentiated(true);
         let (known_program, residual_program, known_input_indices, residual_inputs, outputs) = partition.into_parts();
 
@@ -609,8 +603,10 @@ where
                 required_known_outputs.as_slice(),
                 &self.policy,
             )?;
-            let partition =
-                partition.with_rounded_residuals(Self::excess_precision_rounding, Self::is_memory_transfer)?;
+            // Look through memory transfers so offloaded residuals are rounded before they are offloaded.
+            let partition = partition.with_rounded_residuals(Self::excess_precision_rounding, |operation| {
+                operation.projected_payload::<TransferToMemoryOperation>().is_some()
+            })?;
             let residual_operation =
                 fused_operation.with_residual_optimization_barrier(&partition).with_differentiated(true);
             partition.interpret_in_context_with(context, fused_inputs.as_slice(), output_count, |program, inputs| {
