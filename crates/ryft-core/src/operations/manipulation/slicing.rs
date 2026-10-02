@@ -228,12 +228,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
 
         // Static or clamped windows cannot describe a changed ragged extent.
-        if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{SLICE_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            }
-            .into());
-        }
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         // A batched input keeps its batch axis by slicing it whole, so the lifted operation inserts start index `0`,
         // the batch axis's own extent as its limit (which keeps a dynamic mapped extent whole too), and stride `1` at
@@ -939,12 +934,7 @@ where
         // The input and update inputs are aligned on one physical batch axis (replicated inputs are broadcast to gain
         // it), and the lifted operation inserts start index `0` at that axis so each batch item updates its own block.
         // Static or clamped windows cannot describe a changed ragged extent.
-        if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{UPDATE_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            }
-            .into());
-        }
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
         check_count!("input", inputs, 2, ProgramError);
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
@@ -1692,12 +1682,7 @@ where
         // map, so the batched input passes through unchanged. Static or clamped windows cannot describe a changed
         // ragged extent.
         check_count!("input", inputs, 1 + self.sizes().len(), ProgramError);
-        if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            }
-            .into());
-        }
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         let batch_axes = inputs.iter().map(|input| input.batch_axis_position()).collect::<Vec<_>>();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
@@ -2257,12 +2242,7 @@ impl<
         // stride count and the input's rank bound the arity independently as a payload built for another rank must
         // be rejected rather than indexed.
         check_count!("input", inputs, 1 + 2 * self.strides.len(), ProgramError);
-        if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            }
-            .into());
-        }
+        ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
 
         let (input, bounds) = inputs.split_first().unwrap();
         let unbatched_type = input.unbatched_type();
@@ -3340,14 +3320,7 @@ where
         // it only goes through the value capability traits.
         //
         // Static or clamped windows cannot describe a changed ragged extent.
-        if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs",
-                ),
-            }
-            .into());
-        }
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
@@ -4869,8 +4842,10 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
         assert!(matches!(
             SliceOperation::new(vec![1], vec![3]).batch(&context, &EmptyRegionDriver, &[ragged_batch()]),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!("`{SLICE_OPERATION_NAME}` does not support bounded ragged array inputs"),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == format!(
+                    "`{SLICE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
+                ),
         ));
         assert_eq!(
             SliceOperation::new(vec![1], vec![3]).batch(&context, &EmptyRegionDriver, &[]).unwrap_err(),
@@ -5686,8 +5661,10 @@ mod tests {
         let update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]).unwrap());
         assert!(matches!(
             UpdateSliceOperation::new(vec![1]).batch(&context, &EmptyRegionDriver, &[ragged_batch(), update.clone()]),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!("`{UPDATE_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs"),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == format!(
+                    "`{UPDATE_SLICE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
+                ),
         ));
         assert_eq!(
             UpdateSliceOperation::new(vec![1]).batch(&context, &EmptyRegionDriver, &[update]).unwrap_err(),
@@ -6464,8 +6441,10 @@ mod tests {
         let start = ArrayBatch::replicated(start);
         assert!(matches!(
             DynamicSliceOperation::new(vec![2]).batch(&context, &EmptyRegionDriver, &[ragged_batch(), start.clone()]),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == format!("`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs"),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == format!(
+                    "`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
+                ),
         ));
         let input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());
         assert_eq!(
@@ -8267,9 +8246,9 @@ mod tests {
                 &EmptyRegionDriver,
                 &[input, start, size],
             ),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
+            Err(BatchingError::UnsupportedOperation { message })
                 if message == format!(
-                    "`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs",
+                    "`{DYNAMIC_SLICE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
                 ),
         ));
     }
@@ -9009,9 +8988,10 @@ mod tests {
                 &EmptyRegionDriver,
                 &[ragged_batch(), update.clone(), ArrayBatch::replicated(Array::scalar(1_i32).unwrap())],
             ),
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
+            Err(BatchingError::UnsupportedOperation { message })
                 if message == format!(
-                    "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` does not support bounded ragged array inputs",
+                    "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` does not support bounded ragged dimension `length` on \
+                     input 0",
                 ),
         ));
         let input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]).unwrap());

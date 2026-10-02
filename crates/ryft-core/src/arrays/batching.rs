@@ -621,6 +621,34 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     pub fn sharding_for_inputs(inputs: &[Self]) -> Result<ShardingDimension, ProgramError> {
         batch_axis_sharding(inputs.iter().map(|input| (input.r#type(), input.batch_axis_position())))
     }
+
+    /// Rejects the `inputs` of `operation` if any of them carries a bounded ragged axis. Batching rules call this
+    /// function when their operation cannot account for ragged padding (e.g., when it would move padding into live
+    /// positions or combine the padding of one batch item with the live elements of another), before they bind any
+    /// work into the parent context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchingError::UnsupportedOperation`] for the first input that carries a ragged axis, naming
+    /// `operation`, the dimension variable of that input's first ragged axis, and the input's position.
+    #[inline]
+    pub fn reject_ragged_inputs<O: Operation>(operation: &O, inputs: &[Self]) -> Result<(), BatchingError> {
+        match inputs
+            .iter()
+            .enumerate()
+            .find_map(|(index, input)| input.ragged_axes().first().map(|axis| (index, axis)))
+        {
+            None => Ok(()),
+            Some((index, ragged_axis)) => Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{}` does not support bounded ragged dimension `{}` on input {}",
+                    operation.name(),
+                    ragged_axis.dimension(),
+                    index,
+                ),
+            }),
+        }
+    }
 }
 
 impl<V: Display + Typed<Type = ArrayType>> Display for ArrayBatch<V> {
@@ -1032,6 +1060,32 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
             }
         };
         Err(BatchingError::MappedDimension { r#type: Box::new(r#type), axis: self.batch_axis })
+    }
+
+    /// Rejects the `inputs` of `operation` if any of them carries a bounded ragged axis. Only array members carry
+    /// ragged axes. Refer to [`ArrayBatch::reject_ragged_inputs`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchingError::UnsupportedOperation`] for the first input that carries a ragged axis, naming
+    /// `operation`, the dimension variable of that input's first ragged axis, and the input's position.
+    #[inline]
+    pub fn reject_ragged_inputs<O: Operation>(operation: &O, inputs: &[Self]) -> Result<(), BatchingError> {
+        match inputs
+            .iter()
+            .enumerate()
+            .find_map(|(index, input)| input.ragged_axes().first().map(|axis| (index, axis)))
+        {
+            None => Ok(()),
+            Some((index, ragged_axis)) => Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{}` does not support bounded ragged dimension `{}` on input {}",
+                    operation.name(),
+                    ragged_axis.dimension(),
+                    index,
+                ),
+            }),
+        }
     }
 }
 
@@ -6305,9 +6359,9 @@ mod tests {
         );
         assert_eq!(
             slice,
-            Err(BatchingError::Program(ProgramError::UnsupportedOperation {
-                message: "`slice` does not support bounded ragged array inputs".to_string(),
-            })),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`slice` does not support bounded ragged dimension `length` on input 0".to_string(),
+            }),
         );
 
         // Concatenation preserves the unrelated ragged axis, which still cannot escape as an ordinary array
@@ -6368,7 +6422,7 @@ mod tests {
         assert_eq!(
             reshape,
             Err(BatchingError::UnsupportedOperation {
-                message: "dynamic `reshape` does not support bounded ragged array inputs".to_string(),
+                message: "`reshape` does not support bounded ragged dimension `length` on input 0".to_string(),
             }),
         );
         Ok(())

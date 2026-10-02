@@ -55,8 +55,7 @@ use crate::tracing::{Tracer, TracingContext};
 
 use super::all_to_all::AllToAllOperation;
 use super::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveOptions, effective_collective_axis_size,
-    reject_ragged_collective_inputs, resolve_named_axis_size,
+    CollectiveArrayExtentBatchingPolicy, CollectiveOptions, effective_collective_axis_size, resolve_named_axis_size,
 };
 
 /// Input representation carried by [`RaggedAllToAllOperation`].
@@ -676,7 +675,7 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
-        reject_ragged_collective_inputs(self.name(), inputs)?;
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
         check_count!("input", inputs, 6, ProgramError);
 
         if context.axis_name() != Some(self.axis_name()) {

@@ -119,11 +119,7 @@ impl<C: Context<Type = ArrayType, Value: Reverse>, P: ArrayExtentBatchingPolicy<
             return Ok(vec![inputs[0].clone()].into());
         }
 
-        if !inputs[0].ragged_axes().is_empty() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!("`{REVERSE_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            });
-        }
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         // The mapped axis indexes independent arrays and must never be reversed with their logical axes.
         let batch_axis = inputs[0].batch_axis_position();
@@ -407,7 +403,9 @@ mod tests {
         assert!(matches!(
             ReverseOperation::new([0]).batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)),
             Err(BatchingError::UnsupportedOperation { message })
-                if message == format!("`{REVERSE_OPERATION_NAME}` does not support bounded ragged array inputs"),
+                if message == format!(
+                    "`{REVERSE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
+                ),
         ));
         let outputs = ReverseOperation::new(Vec::<usize>::new())
             .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))

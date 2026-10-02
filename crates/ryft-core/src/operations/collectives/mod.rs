@@ -258,28 +258,6 @@ pub(super) fn effective_collective_axis_size(
 
 // TODO(eaplatanios): Review form here onwards.
 
-/// Rejects ragged collective inputs before any parent binding can stage or execute collective work.
-pub(super) fn reject_ragged_collective_inputs<V: Value<Type = ArrayType>>(
-    operation_name: &str,
-    inputs: &[ArrayBatch<V>],
-) -> Result<(), BatchingError> {
-    if let Some((index, ragged_axis)) = inputs
-        .iter()
-        .enumerate()
-        .find_map(|(index, input)| input.ragged_axes().first().map(|ragged_axis| (index, ragged_axis)))
-    {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "`{}` does not support bounded ragged dimension `{}` on input {}",
-                operation_name,
-                ragged_axis.dimension(),
-                index,
-            ),
-        });
-    }
-    Ok(())
-}
-
 /// Resolves the static, non-zero size of the named axis bound by the active [`NamedAxes`] environment, failing fast
 /// with [`AxisError::UnboundAxisName`] when no enclosing binder binds `axis_name`. The collective capabilities bake the
 /// resolved size into their operation payloads at staging time, because their output shapes and payload validation

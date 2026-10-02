@@ -21,7 +21,7 @@ use crate::programs::{MaybeZero, Operation, OperationFormatter, ProgramError, Re
 
 // TODO(eaplatanios): Review from here onwards.
 
-use super::{effective_collective_axis_size, reject_ragged_collective_inputs, resolve_named_axis_size};
+use super::{effective_collective_axis_size, resolve_named_axis_size};
 
 /// Name of [`ParallelReduceOperation`]. The operation's [`ParallelReductionKind`] is rendered as its `kind` attribute.
 pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
@@ -400,7 +400,7 @@ impl<
         }
 
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            reject_ragged_collective_inputs(self.name(), inputs)?;
+            ArrayBatch::reject_ragged_inputs(self, inputs)?;
             return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
         }
 

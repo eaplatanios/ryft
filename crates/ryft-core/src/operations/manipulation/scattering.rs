@@ -1051,12 +1051,7 @@ where
         // axis. Mapped indices use an explicit paired batching dimension, while replicated indices keep it in the
         // update window.
         check_count!("input", inputs, 3, ProgramError);
-        if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{SCATTER_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            }
-            .into());
-        }
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         if inputs.iter().all(|input| input.batch_axis_position().is_none()) {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
@@ -4005,9 +4000,11 @@ mod tests {
         let updates = ArrayBatch::new(Array::matrix(2, 1, vec![1.0; 2]).unwrap(), BatchAxis::new(0)).unwrap();
         assert_eq!(
             operation.batch(&context, &EmptyRegionDriver, &[ragged, indices, updates]).unwrap_err(),
-            BatchingError::Program(ProgramError::UnsupportedOperation {
-                message: format!("`{SCATTER_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            }),
+            BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{SCATTER_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
+                ),
+            },
         );
 
         // Mapped axes away from position zero are moved to the front first, and a requested output placement gains a

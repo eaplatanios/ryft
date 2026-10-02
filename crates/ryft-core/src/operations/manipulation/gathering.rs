@@ -619,11 +619,7 @@ where
         // mapped indices alone add an output batch axis, and jointly mapped inputs gain a paired input/indices batching
         // axis.
         check_count!("input", inputs, 2, ProgramError);
-        if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!("`{GATHER_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            });
-        }
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
 
         let mapped_input = inputs[0].batch_axis_position().is_some();
         let mapped_indices = inputs[1].batch_axis_position().is_some();
@@ -3593,7 +3589,9 @@ mod tests {
         assert_eq!(
             operation.batch(&context, &EmptyRegionDriver, &[ragged, indices]).unwrap_err(),
             BatchingError::UnsupportedOperation {
-                message: format!("`{GATHER_OPERATION_NAME}` does not support bounded ragged array inputs"),
+                message: format!(
+                    "`{GATHER_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
+                ),
             },
         );
     }

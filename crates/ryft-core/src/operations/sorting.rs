@@ -189,8 +189,6 @@ pub struct SortOperation {
     ordering: SortOrdering,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl SortOperation {
     /// Creates a new [`SortOperation`] that sorts along `axis` in the provided `direction` with a single key input and
     /// the default [`SortOrdering::Canonical`] ordering.
@@ -212,7 +210,10 @@ impl SortOperation {
         let Some(first) = inputs.first() else {
             return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` needs at least one input")).into());
         };
-        let axis = normalize_axis(SORT_OPERATION_NAME, axis, first.r#type().rank())?;
+        let rank = first.r#type().rank();
+        let axis = axis.normalize(rank).map_err(|_| {
+            TypeError::invalid(format!("`{SORT_OPERATION_NAME}` axis {axis} is out of bounds for rank {rank}"))
+        })?;
         let key_count = NonZeroUsize::new(key_count).ok_or_else(|| ProgramError::InvalidArgument {
             message: format!("`{SORT_OPERATION_NAME}` `key_count` must be at least 1"),
         })?;
@@ -221,40 +222,44 @@ impl SortOperation {
 
     /// Returns this [`SortOperation`] with the provided number of leading key inputs compared lexicographically.
     #[inline]
-    pub fn with_key_count(self, key_count: NonZeroUsize) -> Self {
-        Self { key_count, ..self }
+    pub fn with_key_count(mut self, key_count: NonZeroUsize) -> Self {
+        self.key_count = key_count;
+        self
     }
 
     /// Returns this [`SortOperation`] with the provided floating-point key [`SortOrdering`].
     #[inline]
-    pub fn with_ordering(self, ordering: SortOrdering) -> Self {
-        Self { ordering, ..self }
+    pub fn with_ordering(mut self, ordering: SortOrdering) -> Self {
+        self.ordering = ordering;
+        self
     }
 
-    /// Returns the axis along which the inputs are sorted.
+    /// Returns the axis along which the inputs are sorted for this [`SortOperation`].
     #[inline]
     pub fn axis(&self) -> usize {
         self.axis
     }
 
-    /// Returns the number of leading inputs that act as lexicographic sort keys.
+    /// Returns the number of leading inputs that act as lexicographic sort keys for this [`SortOperation`].
     #[inline]
     pub fn key_count(&self) -> NonZeroUsize {
         self.key_count
     }
 
-    /// Returns the direction in which the key inputs are ordered.
+    /// Returns the [`SortDirection`] in which the key inputs are ordered for this [`SortOperation`].
     #[inline]
     pub fn direction(&self) -> SortDirection {
         self.direction
     }
 
-    /// Returns the order in which floating-point keys are compared.
+    /// Returns the [`SortOrdering`] in which floating-point keys are compared for this [`SortOperation`].
     #[inline]
     pub fn ordering(&self) -> SortOrdering {
         self.ordering
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Display for SortOperation {
     #[inline]
@@ -383,13 +388,10 @@ impl<C: Context<Type = ArrayType, Value: Sort + Broadcast + Transpose>, P: Array
         // Every mapped input's batch axis moves to the leading physical position, replicated inputs broadcast to the
         // batched physical shape (because all sort inputs must agree on shape), and the sort axis lifts past the
         // inserted leading batch axis while the key count and ordering carry through unchanged.
-        if inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
-            // Sorting a padded ragged axis would move padding into valid data, and repacking the inputs would drop
-            // the ragged metadata of every other axis.
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!("`{SORT_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            });
-        }
+
+        // Sorting a padded ragged axis would move padding into valid data, and repacking the inputs would drop
+        // the ragged metadata of every other axis.
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
             return Ok(self
                 .interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); inputs.len()])?
@@ -1033,14 +1035,11 @@ fn ranking_dimensions(name: &str, value_type: &ArrayType, axis: Axis) -> Result<
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok((normalize_axis(name, axis, dimensions.len())?, dimensions))
-}
-
-/// Normalizes the possibly negative `axis` that the sorting or ranking function named `name` received for values of
-/// rank `rank`, returning its nonnegative position.
-fn normalize_axis(name: &str, axis: Axis, rank: usize) -> Result<usize, ProgramError> {
-    axis.normalize(rank)
-        .map_err(|_| TypeError::invalid(format!("`{name}` axis {axis} is out of bounds for rank {rank}")).into())
+    let rank = dimensions.len();
+    let axis = axis
+        .normalize(rank)
+        .map_err(|_| TypeError::invalid(format!("`{name}` axis {axis} is out of bounds for rank {rank}")))?;
+    Ok((axis, dimensions))
 }
 
 /// Returns the `i32` index passenger of a ranking of the eager [`Array`] `value` along `axis`, which holds the index of
@@ -1598,7 +1597,7 @@ mod tests {
         assert!(matches!(
             SortOperation::new(0, SortDirection::Ascending).batch(&context, &EmptyRegionDriver, &[input]),
             Err(BatchingError::UnsupportedOperation { message })
-                if message == "`sort` does not support bounded ragged array inputs",
+                if message == "`sort` does not support bounded ragged dimension `length` on input 0",
         ));
     }
 

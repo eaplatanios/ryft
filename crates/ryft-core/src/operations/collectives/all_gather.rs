@@ -52,9 +52,8 @@ use super::{
     forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
     jvp_shape_changing_collective_with_adjoint, linear_collective, linear_collective_dimensions,
-    linear_collective_output_type, multiplied_collective_extent, reject_ragged_collective_inputs,
-    resolve_named_axis_size, transpose_linear_collective, validate_collective_axis_size,
-    validate_explicit_collective_output_extents,
+    linear_collective_output_type, multiplied_collective_extent, resolve_named_axis_size, transpose_linear_collective,
+    validate_collective_axis_size, validate_explicit_collective_output_extents,
 };
 
 /// Named-axis variance carried by an all-gather result.
@@ -331,7 +330,7 @@ where
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            reject_ragged_collective_inputs(self.name(), inputs)?;
+            ArrayBatch::reject_ragged_inputs(self, inputs)?;
             let [input] = inputs else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             };
@@ -481,15 +480,7 @@ where
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
 
         if context.axis_name() != Some(self.axis_name()) {
-            if let Some(ragged_axis) = array.ragged_axes().first() {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "`{}` does not support bounded ragged dimension `{}` on input 0",
-                        self.name(),
-                        ragged_axis.dimension(),
-                    ),
-                });
-            }
+            ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
             validate_explicit_collective_output_extents(output_extents)?;
             if array.batch_axis().is_replicated() {
                 return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());

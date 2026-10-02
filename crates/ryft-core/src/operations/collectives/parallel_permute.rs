@@ -33,8 +33,7 @@ use crate::tracing::{Tracer, TracingContext};
 
 use super::{
     interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,
-    reject_ragged_collective_inputs, resolve_named_axis_size, transpose_linear_collective,
-    validate_collective_axis_size,
+    resolve_named_axis_size, transpose_linear_collective, validate_collective_axis_size,
 };
 
 linear_collective! {
@@ -101,7 +100,7 @@ where
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            reject_ragged_collective_inputs(self.name(), inputs)?;
+            ArrayBatch::reject_ragged_inputs(self, inputs)?;
             return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
         }
         let [input] = inputs else {

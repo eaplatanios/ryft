@@ -194,11 +194,7 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        if !inputs[0].ragged_axes().is_empty() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!("`{RESHAPE_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            });
-        }
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
         let Some(_) = inputs[0].batch_axis_position() else {
             // Replicated input meaning there is no batch axis to thread through the reshape, so interpret it as given
             // and report the output replicated.
@@ -831,11 +827,7 @@ where
 
         <&ArrayType>::try_from(&input.unbatched_type())?;
 
-        if !input.ragged_axes().is_empty() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!("dynamic `{RESHAPE_OPERATION_NAME}` does not support bounded ragged array inputs"),
-            });
-        }
+        ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
 
         for extent in output_extents {
             extent.validate_replicated_dimension()?;
@@ -2191,7 +2183,9 @@ mod tests {
         assert_eq!(
             operation.batch(&context, &EmptyRegionDriver, &[input]).unwrap_err(),
             BatchingError::UnsupportedOperation {
-                message: format!("`{RESHAPE_OPERATION_NAME}` does not support bounded ragged array inputs"),
+                message: format!(
+                    "`{RESHAPE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
+                ),
             },
         );
 
@@ -3799,7 +3793,9 @@ mod tests {
         assert_eq!(
             DynamicReshapeOperation::new().batch(&context, &EmptyRegionDriver, &[input, three]).unwrap_err(),
             BatchingError::UnsupportedOperation {
-                message: format!("dynamic `{RESHAPE_OPERATION_NAME}` does not support bounded ragged array inputs"),
+                message: format!(
+                    "`{RESHAPE_OPERATION_NAME}` does not support bounded ragged dimension `length` on input 0",
+                ),
             },
         );
     }

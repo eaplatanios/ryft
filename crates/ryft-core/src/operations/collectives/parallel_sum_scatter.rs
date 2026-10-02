@@ -49,9 +49,8 @@ use super::{
     forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
     jvp_shape_changing_collective_with_adjoint, linear_collective, linear_collective_dimensions,
-    linear_collective_output_type, reject_ragged_collective_inputs, require_collective_axis_extent,
-    resolve_named_axis_size, transpose_linear_collective, validate_collective_axis_size,
-    validate_explicit_collective_output_extents,
+    linear_collective_output_type, require_collective_axis_extent, resolve_named_axis_size,
+    transpose_linear_collective, validate_collective_axis_size, validate_explicit_collective_output_extents,
 };
 
 /// Applies sum-scatter's reduction-state transition. Ordinary inputs preserve their variance metadata. An input that is
@@ -288,7 +287,7 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
-        reject_ragged_collective_inputs(self.name(), inputs)?;
+        ArrayBatch::reject_ragged_inputs(self, inputs)?;
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let [input] = inputs else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -408,15 +407,7 @@ where
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let (array, output_extents) = explicit_collective_inputs(inputs)?;
-        if let Some(ragged_axis) = array.ragged_axes().first() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`{}` does not support bounded ragged dimension `{}` on input 0",
-                    self.name(),
-                    ragged_axis.dimension(),
-                ),
-            });
-        }
+        ArrayIrBatch::reject_ragged_inputs(self, inputs)?;
         validate_explicit_collective_output_extents(output_extents)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types =
