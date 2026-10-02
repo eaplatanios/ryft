@@ -46,7 +46,7 @@ pub use assertions::{
 };
 pub use collectives::{
     ManualVariationAlignment, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelReduce,
-    ParallelReduceOperation, ParallelReductionKind, ParallelVary, ParallelVaryOperation, forward_collective_to_parent,
+    ParallelReduceOperation, ParallelReductionKind, ParallelVary, ParallelVaryOperation,
 };
 pub use comparisons::{
     COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonTypeSemantics,

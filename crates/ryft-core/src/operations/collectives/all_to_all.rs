@@ -43,8 +43,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,
-    collective_input_extents, divided_collective_extent, explicit_collective_inputs, forward_collective_to_parent,
-    forward_explicit_collective, forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
+    collective_input_extents, divided_collective_extent, explicit_collective_inputs, forward_explicit_collective,
+    forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
     jvp_shape_changing_collective_with_adjoint, linear_collective, linear_collective_dimensions,
     linear_collective_output_type, multiplied_collective_extent, require_collective_axis_divisible,
@@ -291,11 +291,12 @@ impl AllToAllOperation {
 }
 
 // Batching rule for [`AllToAllOperation`]. A matching `batch` level consumes the mapped batch axis with a
-// reshape/transpose block exchange: the per-item `split_axis` is split into `(b, d_p / b)` chunks, the chunk axis
-// is swapped with the leading batch axis (so the batch axis indexes the *receiving* item), and the sender axis is
-// then merged item-major into the per-item `concat_axis` — batch item `i` receives every item's chunk `i`,
-// concatenated along `concat_axis`. A non-matching level forwards the collective untouched to the parent context
-// via [`forward_collective_to_parent`].
+// reshape/transpose block exchange: the per-item `split_axis` is split into `(b, d_p / b)` chunks, the chunk axis is
+// swapped with the leading batch axis (so the batch axis indexes the *receiving* item), and the sender axis is then
+// merged item-major into the per-item `concat_axis` — batch item `i` receives every item's chunk `i`, concatenated
+// along `concat_axis`. A non-matching level forwards the collective to the parent context, unchanged for a replicated
+// input (through `BatchingContext::forward_to_parent`) and with its array axes shifted past the batch axis for a mapped
+// one.
 impl<C, P: CollectiveArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for AllToAllOperation
 where
     C: Context<Type = ArrayType>,
@@ -322,7 +323,7 @@ where
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             };
             let Some(batch_axis) = input.batch_axis_position() else {
-                return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
+                return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
             };
             let (split_axis, concat_axis, output_batch_axis) =
                 forwarded_all_to_all_axes(self.options.mode, self.split_axis, self.concat_axis, batch_axis);

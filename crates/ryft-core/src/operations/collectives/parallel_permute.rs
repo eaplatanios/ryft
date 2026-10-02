@@ -32,8 +32,9 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 
 use super::{
-    forward_collective_to_parent, interpret_degenerate_collective, linear_collective, linear_collective_dimensions,
-    linear_collective_output_type, resolve_named_axis_size, transpose_linear_collective, validate_collective_axis_size,
+    interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,
+    reject_ragged_collective_inputs, resolve_named_axis_size, transpose_linear_collective,
+    validate_collective_axis_size,
 };
 
 linear_collective! {
@@ -86,7 +87,7 @@ impl ParallelPermuteOperation {
 // Batching rule for [`ParallelPermuteOperation`]. A matching `batch` level consumes the mapped batch axis by
 // reassembling it in target order: for each position `t` along the batch axis, the output receives the slice of the
 // source item that sends to `t`, or a zero slice when no pair targets `t`. A non-matching level forwards the
-// collective untouched to the parent context via [`forward_collective_to_parent`].
+// collective untouched to the parent context via `BatchingContext::forward_to_parent`.
 impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelPermuteOperation
 where
     C: Context<Type = ArrayType>,
@@ -100,7 +101,8 @@ where
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
+            reject_ragged_collective_inputs(self.name(), inputs)?;
+            return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
         }
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());

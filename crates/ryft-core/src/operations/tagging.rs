@@ -165,11 +165,7 @@ impl<C: Context<Type = ArrayType, Operation: From<TagOperation<ArrayType>>>, P: 
         // metadata. Treating the tag as an interpreted identity would drop it from staged batched programs, where
         // key-based consumers such as rematerialization policies look for it.
         check_count!("input", inputs, 1, ProgramError);
-        let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].value()))?;
-        check_count!("output", outputs, 1, ProgramError);
-        let output = ArrayBatch::new(outputs.remove(0), inputs[0].batch_axis())?
-            .with_ragged_axes(inputs[0].ragged_axes().to_vec())?;
-        Ok(vec![output].into())
+        Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into())
     }
 }
 

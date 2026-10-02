@@ -21,7 +21,7 @@ use crate::programs::{MaybeZero, Operation, OperationFormatter, ProgramError, Re
 
 // TODO(eaplatanios): Review from here onwards.
 
-use super::{effective_collective_axis_size, forward_collective_to_parent, resolve_named_axis_size};
+use super::{effective_collective_axis_size, reject_ragged_collective_inputs, resolve_named_axis_size};
 
 /// Name of [`ParallelReduceOperation`]. The operation's [`ParallelReductionKind`] is rendered as its `kind` attribute.
 pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
@@ -396,17 +396,12 @@ impl<
 
             // A mesh reduction combines the local shards elementwise, so unrelated mapped and ragged axes pass through
             // untouched, exactly as they do through its adjoint `parallel_vary`.
-            let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?;
-            check_count!("output", outputs, 1, ProgramError);
-            return Ok(vec![
-                ArrayBatch::new(outputs.remove(0), input.batch_axis())?
-                    .with_ragged_axes(input.ragged_axes().to_vec())?,
-            ]
-            .into());
+            return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
         }
 
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
+            reject_ragged_collective_inputs(self.name(), inputs)?;
+            return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
         }
 
         if self.axis_index_groups.is_some() {

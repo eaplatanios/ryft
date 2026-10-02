@@ -48,7 +48,7 @@ use crate::tracing::{Tracer, TracingContext};
 use super::parallel_sum_scatter::ParallelSumScatterOperation;
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,
-    collective_input_extents, explicit_collective_inputs, forward_collective_to_parent, forward_explicit_collective,
+    collective_input_extents, explicit_collective_inputs, forward_explicit_collective,
     forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
     jvp_shape_changing_collective_with_adjoint, linear_collective, linear_collective_dimensions,
@@ -312,11 +312,12 @@ impl AllGatherOperation {
     }
 }
 
-// Batching rule for [`AllGatherOperation`]. A matching `batch` level consumes the mapped batch axis by
-// materializing the gather: the batch axis is transposed to sit immediately before the per-item `concat_axis` and
-// merged into it, laying the gathered chunks out item-major (item 0's chunk first), which matches the tiled
-// StableHLO `all_gather` ordering. Every batch item sees the same gathered value, so the output is replicated. A
-// non-matching level forwards the collective untouched to the parent context via [`forward_collective_to_parent`].
+// Batching rule for [`AllGatherOperation`]. A matching `batch` level consumes the mapped batch axis by materializing
+// the gather: the batch axis is transposed to sit immediately before the per-item `concat_axis` and merged into it,
+// laying the gathered chunks out item-major (item 0's chunk first), which matches the tiled StableHLO `all_gather`
+// ordering. Every batch item sees the same gathered value, so the output is replicated. A non-matching level forwards
+// the collective to the parent context, unchanged for a replicated input (through `BatchingContext::forward_to_parent`)
+// and with its array axes shifted past the batch axis for a mapped one.
 impl<C, P: CollectiveArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for AllGatherOperation
 where
     C: Context<Type = ArrayType>,
@@ -335,7 +336,7 @@ where
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             };
             let Some(batch_axis) = input.batch_axis_position() else {
-                return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
+                return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
             };
             let (concat_axis, output_batch_axis) =
                 forwarded_all_gather_axes(self.options.mode, self.concat_axis, batch_axis);

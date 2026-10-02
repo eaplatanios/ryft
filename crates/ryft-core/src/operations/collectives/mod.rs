@@ -2,8 +2,8 @@
 //! their interpretation, partial-evaluation, batching, forward-mode differentiation, and transposition rules. These
 //! are the analogues of [JAX's parallel operators](https://docs.jax.dev/en/latest/jax.lax.html#parallel-operators).
 //!
-//! This module owns the vocabulary that every collective shares (i.e., [`CollectiveMode`], [`CollectiveOptions`], named
-//! axis resolution, and [`forward_collective_to_parent`]), while each operation family lives in its own submodule:
+//! This module owns the vocabulary that every collective shares (i.e., [`CollectiveMode`], [`CollectiveOptions`], and
+//! named axis resolution), while each operation family lives in its own submodule:
 //! [`parallel_reduce`], [`parallel_vary`], [`all_gather`], [`parallel_sum_scatter`], [`parallel_permute`],
 //! [`all_to_all`], and [`ragged_all_to_all`]. It also owns the shared machinery of the single-input linear collectives
 //! ([`ParallelPermuteOperation`], [`AllGatherOperation`], [`ParallelSumScatterOperation`], and [`AllToAllOperation`]).
@@ -43,7 +43,7 @@ use crate::arrays::{
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchingContext, BatchingError};
-use crate::contexts::{Context, Domain, ProjectedContext};
+use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
 };
@@ -227,33 +227,6 @@ pub(super) fn reject_ragged_collective_inputs<V: Value<Type = ArrayType>>(
         });
     }
     Ok(())
-}
-
-/// Re-stages a collective that targets a different (outer) named axis into the batching context's parent.
-///
-/// Under nested `batch` levels, a collective is consumed by the level whose
-/// [`axis_name`](BatchingContext::axis_name) matches its axis name and must pass through every inner
-/// level untouched: each inner batch item participates in the outer collective independently, so the inputs' mapped
-/// axes are preserved as-is on the forwarded outputs. The parent may itself be another [`BatchingContext`] — whose own
-/// rule dispatch repeats this name resolution at the next level — or an ordinary tracing context. Batching rules for
-/// custom collective-like operations should use this helper for their "not my axis" arm.
-pub fn forward_collective_to_parent<C, P: ArrayExtentBatchingPolicy<C>>(
-    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-    parent_operation: C::Operation,
-    inputs: &[ArrayBatch<<C as Domain>::Value>],
-) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
-where
-    C: Context<Type = ArrayType>,
-{
-    reject_ragged_collective_inputs(parent_operation.name(), inputs)?;
-    let parent_input_values: Vec<<C as Domain>::Value> = inputs.iter().map(|batch| batch.value().clone()).collect();
-    let parent_outputs = context.parent().bind(parent_operation, Vec::new(), &parent_input_values)?;
-    check_count!("output", parent_outputs, inputs.len(), ProgramError);
-    parent_outputs
-        .into_iter()
-        .zip(inputs.iter())
-        .map(|(parent_value, input_batch)| ArrayBatch::new(parent_value, input_batch.batch_axis()))
-        .collect()
 }
 
 /// Resolves the size of the named axis bound by the active [`NamedAxes`] environment, failing fast with

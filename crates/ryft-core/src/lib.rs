@@ -150,7 +150,7 @@ pub use operations::{
     WHILE_OPERATION_NAME, WeakCustomRuleRegistration, WhileOperation, WhilePredicate, WhileTypeSemantics,
     WithAccumulatingVjp, WithBatching, WithJvp, WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, XOR_OPERATION_NAME,
     Xor, XorOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
-    associative_scan, custom_function, forward_collective_to_parent, transpose_primal_condition, transpose_primal_scan,
+    associative_scan, custom_function, transpose_primal_condition, transpose_primal_scan,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

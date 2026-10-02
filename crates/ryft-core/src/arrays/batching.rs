@@ -3704,6 +3704,44 @@ impl<
     }
 }
 
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingContext<C, ArrayBatchingPolicy<P>> {
+    /// Binds `operation` unchanged into the [parent](Self::parent) context on the packed values of `inputs`, and
+    /// returns one output per input, each carrying the batch axis and ragged axes of the input at the same position.
+    /// This is the batching rule of an operation that leaves the mapped axis alone (i.e., one whose application to the
+    /// packed values already computes every batch item's result independently, without any per-item axis parameter that
+    /// the inserted batch axis would shift). Examples are manual-variation transitions, value tags, reductions over a
+    /// manual mesh axis, and named-axis collectives that target an enclosing `batch` level, which this level must pass
+    /// through untouched so that each of its batch items participates in the outer collective independently. The parent
+    /// may itself be another [`BatchingContext`], whose own rule dispatch then handles the operation, or an ordinary
+    /// context that interprets or stages it.
+    ///
+    /// The operation is bound rather than interpreted, so a staging parent records it even when its interpretation
+    /// would be an identity (e.g., for value tags) or an error (e.g., for collectives). Callers whose operations cannot
+    /// pass bounded ragged axes through must reject ragged inputs before forwarding them. For example, a collective
+    /// that targets an enclosing level would combine the padding of different batch items of this level.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] if the parent fails to bind `operation`, if it does not produce exactly one output
+    /// per input, or if an output cannot carry the batch and ragged axes of its input.
+    pub fn forward_to_parent(
+        &self,
+        operation: C::Operation,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        let values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        let outputs = self.parent().bind(operation, Vec::new(), values.as_slice())?;
+        check_count!("output", outputs, inputs.len(), ProgramError);
+        outputs
+            .into_iter()
+            .zip(inputs)
+            .map(|(output, input)| {
+                ArrayBatch::new(output, input.batch_axis())?.with_ragged_axes(input.ragged_axes().to_vec())
+            })
+            .collect()
+    }
+}
+
 /// [`Region`] [`Transform`] marker for retained homogeneous array batched [`Program`]s.
 struct ArrayBatchingTransform;
 
@@ -9408,6 +9446,51 @@ mod tests {
                     .to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_batching_context_forward_to_parent() {
+        // Under an eager parent, forwarding applies the operation to the packed values, and each output keeps the batch
+        // axis of the input at the same position.
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let input =
+            ArrayBatch::new(Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(), BatchAxis::new(1))
+                .unwrap();
+        assert_eq!(
+            context.forward_to_parent(ArrayOperation::Neg(NegOperation::new()), std::slice::from_ref(&input)),
+            Ok(vec![
+                ArrayBatch::new(
+                    Array::matrix(3, 2, vec![-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]).unwrap(),
+                    BatchAxis::new(1)
+                )
+                .unwrap(),
+            ]),
+        );
+
+        // Under a staging parent, the operation is bound unchanged into the parent trace, and each output also keeps
+        // the ragged axes of its input.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let input = ArrayBatch::new(trace.input(ArrayType::new_static(DataType::F32, [2, 3])), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(
+                1,
+                trace.input(ArrayType::new_static(DataType::I32, [2])),
+                length,
+                vec![0],
+            )])
+            .unwrap();
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
+        let outputs = context
+            .forward_to_parent(ArrayOperation::Neg(NegOperation::new()), std::slice::from_ref(&input))
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), input.batch_axis());
+        assert_eq!(outputs[0].ragged_axes(), input.ragged_axes());
+        assert_eq!(outputs[0].value().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2, 3]));
+        assert_eq!(trace.builder().borrow().instructions().len(), 1);
+        assert!(matches!(trace.builder().borrow().instructions()[0].operation(), ArrayOperation::Neg(_)));
     }
 
     #[test]

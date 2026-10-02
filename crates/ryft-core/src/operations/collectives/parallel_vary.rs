@@ -166,14 +166,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelVaryOperation>>, P: Ar
             }
             .into());
         }
-
-        let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].value()))?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![
-            ArrayBatch::new(outputs.remove(0), inputs[0].batch_axis())?
-                .with_ragged_axes(inputs[0].ragged_axes().to_vec())?,
-        ]
-        .into())
+        Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into())
     }
 }
 

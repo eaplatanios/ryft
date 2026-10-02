@@ -45,7 +45,7 @@ use crate::tracing::{Tracer, TracingContext};
 use super::all_gather::{AllGatherOperation, AllGatherOutputVariance};
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
-    divided_collective_extent, explicit_collective_inputs, forward_collective_to_parent, forward_explicit_collective,
+    divided_collective_extent, explicit_collective_inputs, forward_explicit_collective,
     forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
     jvp_shape_changing_collective_with_adjoint, linear_collective, linear_collective_dimensions,
@@ -270,11 +270,11 @@ impl ParallelSumScatterOperation {
     }
 }
 
-// Batching rule for [`ParallelSumScatterOperation`]. A matching `batch` level consumes the mapped batch axis by
-// summing over it and re-mapping the chunks of the per-item `scatter_axis` onto it: the sum's `scatter_axis` is split
-// into `(b, d_s / b)` chunks and the new chunk axis becomes the output batch axis, so batch item `i` receives chunk
-// `i` of the sum. A non-matching level forwards the collective untouched to the parent context via
-// [`forward_collective_to_parent`].
+// Batching rule for [`ParallelSumScatterOperation`]. A matching `batch` level consumes the mapped batch axis by summing
+// over it and re-mapping the chunks of the per-item `scatter_axis` onto it: the sum's `scatter_axis` is split into
+// `(b, d_s / b)` chunks and the new chunk axis becomes the output batch axis, so batch item `i` receives chunk `i` of
+// the sum. A non-matching level forwards the collective to the parent context, unchanged for a replicated input (through
+// `BatchingContext::forward_to_parent`) and with its array axes shifted past the batch axis for a mapped one.
 impl<C, P: CollectiveArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ParallelSumScatterOperation
 where
@@ -294,7 +294,7 @@ where
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             };
             let Some(batch_axis) = input.batch_axis_position() else {
-                return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
+                return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
             };
             let (scatter_axis, output_batch_axis) =
                 forwarded_parallel_sum_scatter_axes(self.options.mode, self.scatter_axis, batch_axis);
