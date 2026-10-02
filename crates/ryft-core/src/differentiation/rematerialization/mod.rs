@@ -1,36 +1,33 @@
-//! Rematerialization (i.e., gradient checkpointing), which trades computation for memory under differentiation. A
-//! rematerialized function computes what its body computes, but differentiation saves only the values of the body that
-//! its [`ResidualPolicy`] selects and recomputes the others from the saved values when the derivative computation
-//! needs them, instead of keeping every value of the body alive until then. This is the analogue of
-//! [`jax.checkpoint`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html) (also known as `jax.remat`).
+//! Rematerialization (i.e., gradient checkpointing), which trades computation for memory under differentiation.
+//! A rematerialized function computes what its body computes, but differentiation saves only the values of the body
+//! that its [`ResidualPolicy`] selects and recomputes the others from the saved values when the derivative computation
+//! needs them, instead of keeping every value of the body alive until then. This is the Ryft analogue of JAX's
+//! [`jax.checkpoint`/`jax.remat`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html).
 //!
 //! [`rematerialize`] creates a rematerialized function from a closure, [`Rematerialize::with_policy`] selects which
-//! values it saves (refer to the [`policies`] module for the built-in policies), and [`Rematerialize::call`] stages one
-//! call of the function as a [`RematerializeOperation`] whose body is the traced closure. Nothing is derived when the
-//! function is called: the transforms derive the derivatives of the body when they need them. Linearization and
-//! reverse-mode differentiation split the derivative of the body into the work that runs up front, which computes the
-//! outputs and the values that the policy saves, and a _differentiated_ call that recomputes everything else from the
-//! saved values when the backward computation runs. [`saved_residuals`] reports which values a function saves.
+//! values it saves, and [`Rematerialize::call`] stages one call of the function as a [`RematerializeOperation`] whose
+//! body is the traced closure. Nothing is derived when the function is called: the transforms derive the derivatives
+//! of the body when they need them. Linearization and reverse mode differentiation split the derivative of the body
+//! into the work that runs up front, which computes the outputs and the values that the policy saves, and a
+//! _differentiated_ call that recomputes everything else from the saved values when the backward computation runs.
+//! [`saved_residuals`] reports which values a function saves.
 //!
 //! # Examples
 //!
 //! ## Gradients
 //!
 //! A rematerialized function is differentiated like any other function. Its closure annotates its tracer input, which
-//! determines the type universe that the function is traced in. By default it saves nothing but its inputs, so the
+//! determines the type universe that the function is traced in. By default, it saves nothing but its inputs, so the
 //! backward computation of `x ↦ sin(x · x)` recomputes the dot product and its cosine from `x`, while saving dot
 //! products saves the dot product and recomputes only the cosine:
 //!
 //! ```rust
-//! # use ryft_core::differentiation::rematerialization::{
-//! #     DotsSaveable, ResidualSource, SavedResidual, rematerialize, saved_residuals,
-//! # };
 //! # use ryft_core::{
-//! #     Array, ArrayOperation, ArrayType, DataType, Dot, DotDimensionNumbers, ProgramError, Sin, TracingContext,
-//! #     differentiate_at,
+//! #     Array, ArrayOperation, ArrayType, DataType, Dot, DotsSaveable, DotDimensionNumbers, ProgramError, Sin,
+//! #     ResidualSource, SavedResidual, TracingContext, differentiate_at, rematerialize, saved_residuals,
 //! # };
 //! # fn main() -> Result<(), ProgramError> {
-//! type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+//! # type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 //!
 //! let sine_of_dot = |x: Tracer| Ok(x.dot(&x, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.sin()?);
 //! let function = rematerialize(sine_of_dot);
@@ -50,16 +47,16 @@
 //!
 //! ## Named Checkpoints
 //!
-//! [`Tag`](crate::Tag)ged values (the analogue of `jax.ad_checkpoint.checkpoint_name`) can be saved by name, e.g.,
-//! with [`SaveOnlyTheseNames`], which saves the tagged values whose names it lists and recomputes everything else:
+//! [`Tag`](crate::Tag)ged values (the analogue of `jax.ad_checkpoint.checkpoint_name`) can be saved by name (e.g.,
+//! with [`SaveOnlyTheseNames`]), which saves the tagged values whose names it lists and recomputes everything else:
 //!
 //! ```rust
-//! # use ryft_core::differentiation::rematerialization::{
-//! #     ResidualSource, SaveOnlyTheseNames, SavedResidual, rematerialize, saved_residuals,
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, ArrayType, DataType, ProgramError, ResidualSource, SaveOnlyTheseNames, SavedResidual,
+//! #     Sin, Tag, TracingContext, rematerialize, saved_residuals,
 //! # };
-//! # use ryft_core::{Array, ArrayOperation, ArrayType, DataType, ProgramError, Sin, Tag, TracingContext};
 //! # fn main() -> Result<(), ProgramError> {
-//! type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+//! # type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 //!
 //! let function = rematerialize(|x: Tracer| Ok((x.clone() * x).tag("square")?.sin()?.sin()?))
 //!     .with_policy(SaveOnlyTheseNames::new(["square"]));
@@ -77,19 +74,17 @@
 //!
 //! ## Custom Policies
 //!
-//! [`PolicyFn`] defines a policy through a closure that classifies each candidate residual, e.g., by the payloads of
-//! the operations that may produce it (refer to [`ResidualProducer::payload`](crate::ResidualProducer::payload)):
+//! [`PolicyFn`] defines a policy through a closure that classifies each candidate residual (e.g., by the payloads of
+//! the operations that may produce it; refer to [`ResidualProducer::payload`](crate::ResidualProducer::payload)):
 //!
 //! ```rust
-//! # use ryft_core::differentiation::rematerialization::{
-//! #     PolicyFn, ResidualSource, SavedResidual, rematerialize, saved_residuals,
-//! # };
 //! # use ryft_core::{
-//! #     Array, ArrayOperation, ArrayType, DataType, NoStorage, ProgramError, ResidualDecision, ResidualRejection, Sin,
-//! #     SinOperation, TracingContext,
+//! #     Array, ArrayOperation, ArrayType, DataType, NoStorage, PolicyFn, ProgramError, ResidualDecision,
+//! #     ResidualSource, ResidualRejection, SavedResidual, Sin, SinOperation, TracingContext, rematerialize,
+//! #     saved_residuals,
 //! # };
 //! # fn main() -> Result<(), ProgramError> {
-//! type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+//! # type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 //!
 //! // Saves the sines and recomputes everything else.
 //! let policy = PolicyFn::new::<ArrayType>(|candidate| {
@@ -120,12 +115,12 @@
 //! computed and back before the backward computation uses them (refer to [`MemoryTransferStorage`]):
 //!
 //! ```rust
-//! # use ryft_core::differentiation::rematerialization::{
-//! #     ResidualSource, SaveAndOffloadOnlyTheseNames, SavedResidual, rematerialize, saved_residuals,
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, ArrayType, DataType, Memory, ProgramError, ResidualSource,
+//! #     SaveAndOffloadOnlyTheseNames, SavedResidual, Sin, Tag, TracingContext, rematerialize, saved_residuals,
 //! # };
-//! # use ryft_core::{Array, ArrayOperation, ArrayType, DataType, Memory, ProgramError, Sin, Tag, TracingContext};
 //! # fn main() -> Result<(), ProgramError> {
-//! type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+//! # type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 //!
 //! let host = Memory::Host { pinned: true };
 //! let policy = SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["square"], host)?;
@@ -154,9 +149,10 @@
 //! [JAX recommends](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html) `prevent_cse=False` there:
 //!
 //! ```rust
-//! # use ryft_core::differentiation::rematerialization::rematerialize;
-//! # use ryft_core::{Array, ArrayOperation, ProgramError, RematerializationOptimizationBarrier, Sin, TracingContext};
-//! type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, ProgramError, RematerializationOptimizationBarrier, Sin, TracingContext, rematerialize,
+//! # };
+//! # type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 //!
 //! // A layer that a `scan` over the layers of a model calls once per iteration.
 //! let layer = rematerialize(|x: Tracer| Ok::<_, ProgramError>(x.sin()?.sin()?))
@@ -170,9 +166,9 @@
 //! recomputation (e.g., the parameters of a layer, as opposed to the activations that it receives):
 //!
 //! ```rust
-//! # use ryft_core::differentiation::rematerialization::rematerialize;
 //! # use ryft_core::{
 //! #     Array, ArrayOperation, Mul, ProgramError, RematerializationOptimizationBarrier, Sin, TracingContext,
+//! #     rematerialize,
 //! # };
 //! type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 //!
@@ -181,8 +177,6 @@
 //!     .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![true, false]));
 //! # let _ = layer;
 //! ```
-
-// TODO(eaplatanios): Review this module.
 
 pub mod policies;
 
@@ -218,6 +212,8 @@ pub use policies::{
     SAVE_FROM_BOTH_POLICIES_POLICY_NAME, SAVE_ONLY_THESE_NAMES_POLICY_NAME, SaveAndOffloadOnlyTheseNames,
     SaveAnyNamesButThese, SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
 };
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// [`PolicyReferences`] of the default [`NothingSaveable`] policy, which every [`Rematerialize`] that does not select
 /// a policy shares, so that all of their calls stage operations whose policies compare equal.
