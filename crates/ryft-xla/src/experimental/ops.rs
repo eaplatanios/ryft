@@ -1722,11 +1722,11 @@ mod tests {
         DomainTracingContext, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, EffectClass, EffectClasses,
         ErasedOperation, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh, MaybeZero, Memory, MeshAxis,
         MeshAxisType, MulOperation, NoStorage, Operation, OperationPayloadProjection, OperationProvider,
-        OptimizationBarrier, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
-        ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
-        RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualCandidate, ResidualDecision,
+        OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAccessOperation,
+        ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
+        ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionDriver, RegionInterface,
+        RegionRef, RematerializationOptimizationBarrier, RematerializeOperation, ResidualCandidate, ResidualDecision,
         ResidualPolicy, ResidualPolicyReference, ResidualRejection, ResidualZeroProvider, ScanOperation, Shape,
         Sharding, ShardingDimension, StagingContext, TagOperation, Tracer, TracingContext, TransferToMemoryOperation,
         TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection, ValueResolution,
@@ -2244,7 +2244,7 @@ mod tests {
         ));
 
         let rematerialize = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(DotsSaveable))
-            .with_optimization_barrier(OptimizationBarrier::None)
+            .with_optimization_barrier(RematerializationOptimizationBarrier::None)
             .with_differentiated(true);
         let promoted: XlaOperation<XlaConstant> =
             ArrayIrOperation::<XlaArrayConstant>::Rematerialize(rematerialize.clone()).into();
@@ -2265,8 +2265,7 @@ mod tests {
             ArrayOperation<XlaArrayConstant>,
         >::new("member"));
         let promoted: XlaOperation<XlaConstant> =
-            ArrayOperation::<XlaArrayConstant>::CustomFunction(CustomFunctionOperation::new(member.reference()))
-                .into();
+            ArrayOperation::<XlaArrayConstant>::CustomFunction(CustomFunctionOperation::new(member.reference())).into();
         assert!(matches!(
             &promoted,
             XlaOperation::LiftedCustomFunction(operation)
@@ -2291,10 +2290,9 @@ mod tests {
             )
             .with_jvp(|primals, tangents| Ok((primals.to_vec(), tangents.to_vec()))),
         );
-        let promoted: XlaOperation<XlaConstant> = ArrayIrOperation::<XlaArrayConstant>::CustomFunction(
-            CustomFunctionOperation::new(composite.reference()),
-        )
-        .into();
+        let promoted: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::CustomFunction(CustomFunctionOperation::new(composite.reference()))
+                .into();
         assert!(matches!(
             &promoted,
             XlaOperation::LiftedCustomFunction(operation)

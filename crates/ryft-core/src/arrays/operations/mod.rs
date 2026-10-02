@@ -1104,8 +1104,9 @@ mod tests {
         AddOperation, AssertOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
         CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation, CustomRuleDefinition,
         CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation,
-        DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, OptimizationBarrier,
-        ReduceOperation, ReductionKind, ScanOperation, SinOperation, WhileOperation, ZeroOperation,
+        DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation,
+        ReductionKind, RematerializationOptimizationBarrier, ScanOperation, SinOperation, WhileOperation,
+        ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialValue, ResidualPolicyReference};
@@ -2525,13 +2526,13 @@ mod tests {
         assert!(matches!(
             TestOperation::from(ArrayOperation::Rematerialize(
                 RematerializeOperation::new(policy.clone())
-                    .with_optimization_barrier(OptimizationBarrier::None)
+                    .with_optimization_barrier(RematerializationOptimizationBarrier::None)
                     .with_differentiated(true),
             )),
             ArrayIrOperation::Rematerialize(operation)
                 if operation.policy().id() == policy.id()
                     && operation.policy().name() == "dots_saveable"
-                    && operation.optimization_barrier() == &OptimizationBarrier::None
+                    && operation.optimization_barrier() == &RematerializationOptimizationBarrier::None
                     && operation.differentiated(),
         ));
         assert!(matches!(

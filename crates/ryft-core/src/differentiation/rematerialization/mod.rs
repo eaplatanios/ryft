@@ -155,28 +155,30 @@
 //!
 //! ```rust
 //! # use ryft_core::differentiation::rematerialization::rematerialize;
-//! # use ryft_core::{Array, ArrayOperation, OptimizationBarrier, ProgramError, Sin, TracingContext};
+//! # use ryft_core::{Array, ArrayOperation, ProgramError, RematerializationOptimizationBarrier, Sin, TracingContext};
 //! type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 //!
 //! // A layer that a `scan` over the layers of a model calls once per iteration.
 //! let layer = rematerialize(|x: Tracer| Ok::<_, ProgramError>(x.sin()?.sin()?))
-//!     .with_optimization_barrier(OptimizationBarrier::None);
+//!     .with_optimization_barrier(RematerializationOptimizationBarrier::None);
 //! # let _ = layer;
 //! ```
 //!
-//! The barrier can also be limited to some of the inputs with [`OptimizationBarrier::Inputs`], whose entries select
-//! the leaves of the input in [`Parameterized::parameters`] order. The values that differentiation saves are always
-//! behind the barrier, and the unselected inputs stay free for compilers to optimize together with the recomputation
-//! (e.g., the parameters of a layer, as opposed to the activations that it receives):
+//! The barrier can also be limited to some of the inputs with [`RematerializationOptimizationBarrier::Inputs`], whose
+//! entries select the leaves of the input in [`Parameterized::parameters`] order. The values that differentiation saves
+//! are always behind the barrier, and the unselected inputs stay free for compilers to optimize together with the
+//! recomputation (e.g., the parameters of a layer, as opposed to the activations that it receives):
 //!
 //! ```rust
 //! # use ryft_core::differentiation::rematerialization::rematerialize;
-//! # use ryft_core::{Array, ArrayOperation, Mul, OptimizationBarrier, ProgramError, Sin, TracingContext};
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, Mul, ProgramError, RematerializationOptimizationBarrier, Sin, TracingContext,
+//! # };
 //! type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
 //!
 //! // Only the activation `x`, which is the first leaf of the input, goes through the barrier.
 //! let layer = rematerialize(|(x, w): (Tracer, Tracer)| Ok::<_, ProgramError>(x.mul(&w)?.sin()?))
-//!     .with_optimization_barrier(OptimizationBarrier::Inputs(vec![true, false]));
+//!     .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![true, false]));
 //! # let _ = layer;
 //! ```
 
@@ -197,7 +199,8 @@ use crate::differentiation::forward::DifferentiableOperation;
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::operations::{
-    OptimizationBarrier, ReducePrecisionOperation, RematerializeOperation, TagOperation, TransferToMemoryOperation,
+    ReducePrecisionOperation, RematerializationOptimizationBarrier, RematerializeOperation, TagOperation,
+    TransferToMemoryOperation,
 };
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{
@@ -273,7 +276,7 @@ pub struct Rematerialize<Input, Output, Body, P = NothingSaveable> {
 
     /// Inputs of the staged calls on which backends place an optimization barrier when the calls are differentiated
     /// (refer to [`RematerializeOperation::optimization_barrier`]).
-    optimization_barrier: OptimizationBarrier,
+    optimization_barrier: RematerializationOptimizationBarrier,
 
     /// Input and output types of the closure.
     marker: PhantomData<fn() -> (Input, Output)>,
@@ -293,14 +296,15 @@ impl<Input, Output, Body, P> Rematerialize<Input, Output, Body, P> {
     }
 
     /// Sets the inputs on which backends place an optimization barrier when the staged calls of this function are
-    /// differentiated, which are [all of them](OptimizationBarrier::All) by default (refer to
-    /// [`RematerializeOperation::optimization_barrier`]). An [`OptimizationBarrier::Inputs`] selection has one entry
-    /// per leaf of the input of this function, in [`Parameterized::parameters`] order. This is the analogue of the
-    /// `prevent_cse` parameter of [`jax.checkpoint`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html),
-    /// which can be disabled when the function is called in a loop body (e.g., of a `scan`), where the loop already
-    /// keeps the recomputation from being merged with the original computation.
+    /// differentiated, which are [all of them](RematerializationOptimizationBarrier::All) by default (refer to
+    /// [`RematerializeOperation::optimization_barrier`]). A [`RematerializationOptimizationBarrier::Inputs`] selection
+    /// has one entry per leaf of the input of this function, in [`Parameterized::parameters`] order. This is the
+    /// analogue of the `prevent_cse` parameter of
+    /// [`jax.checkpoint`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html), which can be disabled when
+    /// the function is called in a loop body (e.g., of a `scan`), where the loop already keeps the recomputation from
+    /// being merged with the original computation.
     #[inline]
-    pub fn with_optimization_barrier(mut self, optimization_barrier: OptimizationBarrier) -> Self {
+    pub fn with_optimization_barrier(mut self, optimization_barrier: RematerializationOptimizationBarrier) -> Self {
         self.optimization_barrier = optimization_barrier;
         self
     }
@@ -453,7 +457,7 @@ pub fn rematerialize<Input, Output, Body: Fn(Input) -> Result<Output, ProgramErr
     Rematerialize {
         body,
         policy: DEFAULT_POLICY_REFERENCES.clone(),
-        optimization_barrier: OptimizationBarrier::All,
+        optimization_barrier: RematerializationOptimizationBarrier::All,
         marker: PhantomData,
     }
 }
@@ -696,13 +700,19 @@ mod tests {
     #[test]
     fn test_rematerialize_with_optimization_barrier() {
         let function = rematerialize(|x: TestTracer| Ok(x.sin()?));
-        assert_eq!(operation(&trace(|x| function.call(x)), 0).optimization_barrier(), &OptimizationBarrier::All);
-        let function = function.with_optimization_barrier(OptimizationBarrier::None);
-        assert_eq!(operation(&trace(|x| function.call(x)), 0).optimization_barrier(), &OptimizationBarrier::None);
-        let function = function.with_optimization_barrier(OptimizationBarrier::Inputs(vec![false]));
         assert_eq!(
             operation(&trace(|x| function.call(x)), 0).optimization_barrier(),
-            &OptimizationBarrier::Inputs(vec![false]),
+            &RematerializationOptimizationBarrier::All
+        );
+        let function = function.with_optimization_barrier(RematerializationOptimizationBarrier::None);
+        assert_eq!(
+            operation(&trace(|x| function.call(x)), 0).optimization_barrier(),
+            &RematerializationOptimizationBarrier::None
+        );
+        let function = function.with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![false]));
+        assert_eq!(
+            operation(&trace(|x| function.call(x)), 0).optimization_barrier(),
+            &RematerializationOptimizationBarrier::Inputs(vec![false]),
         );
     }
 
@@ -884,7 +894,8 @@ mod tests {
 
     #[test]
     fn test_rematerialize_debug() {
-        let function = rematerialize(|x: TestTracer| Ok(x.sin()?)).with_optimization_barrier(OptimizationBarrier::None);
+        let function = rematerialize(|x: TestTracer| Ok(x.sin()?))
+            .with_optimization_barrier(RematerializationOptimizationBarrier::None);
         assert_eq!(
             format!("{function:?}"),
             "Rematerialize { policy: NothingSaveable, optimization_barrier: None, .. }",

@@ -30,10 +30,10 @@ use ryft_core::{
     DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation, ExternalReferenceBinding, FloorOperation,
     GatherMode, GatherOperation, Instruction, IotaOperation, LINEAR_CALL_OPERATION_NAME, Layout, Ln1pOperation,
     LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation,
-    MulOperation, NegOperation, Operation, OptimizationBarrier, PadOperation, ParallelReduceOperation,
-    ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError, ProjectedValue, Provenance,
-    REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReducePrecisionOperation,
-    ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation, ReverseOperation, RoundOperation,
+    MulOperation, NegOperation, Operation, PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized,
+    PowOperation, Program, ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME,
+    REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReducePrecisionOperation, ReductionKind, RegionId,
+    RegionRef, RemOperation, RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation, RoundOperation,
     RsqrtOperation, SCAN_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation,
     ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation,
     SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed,
@@ -8011,7 +8011,7 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
             context,
             location,
             captured_values,
-            &OptimizationBarrier::None,
+            &RematerializationOptimizationBarrier::None,
             nested_functions,
             collective_state,
             &mut region_effect_tokens,
@@ -8203,7 +8203,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
             context,
             location,
             captured_values,
-            &OptimizationBarrier::None,
+            &RematerializationOptimizationBarrier::None,
             nested_functions,
             collective_state,
             effect_tokens,
@@ -8267,7 +8267,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
                 context,
                 location,
                 captured_values,
-                &OptimizationBarrier::None,
+                &RematerializationOptimizationBarrier::None,
                 nested_functions,
                 collective_state,
                 &mut condition_effect_tokens,
@@ -8329,7 +8329,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
             context,
             location,
             captured_values,
-            &OptimizationBarrier::None,
+            &RematerializationOptimizationBarrier::None,
             nested_functions,
             collective_state,
             &mut body_effect_tokens,
@@ -8401,7 +8401,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
                 context,
                 location,
                 captured_values,
-                &OptimizationBarrier::None,
+                &RematerializationOptimizationBarrier::None,
                 nested_functions,
                 collective_state,
                 &mut body_effect_tokens,
@@ -8839,7 +8839,7 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c>(
         context,
         location,
         captured_values,
-        &OptimizationBarrier::None,
+        &RematerializationOptimizationBarrier::None,
         nested_functions,
         collective_state,
         effect_tokens,
@@ -9006,7 +9006,7 @@ fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
             context,
             location,
             &[],
-            &OptimizationBarrier::None,
+            &RematerializationOptimizationBarrier::None,
             Some(nested_functions),
             collective_state,
             &mut effect_tokens,
@@ -9308,7 +9308,7 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
             context,
             location,
             &[],
-            &OptimizationBarrier::None,
+            &RematerializationOptimizationBarrier::None,
             Some(nested_functions),
             collective_state,
             &mut effect_tokens,
@@ -9401,7 +9401,7 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c>(
         context,
         location,
         captured_values.as_slice(),
-        &OptimizationBarrier::None,
+        &RematerializationOptimizationBarrier::None,
         nested_functions,
         collective_state,
         effect_tokens,
@@ -9432,7 +9432,7 @@ fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
-    optimization_barrier: &OptimizationBarrier,
+    optimization_barrier: &RematerializationOptimizationBarrier,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
@@ -9461,7 +9461,7 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
-    optimization_barrier: &OptimizationBarrier,
+    optimization_barrier: &RematerializationOptimizationBarrier,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
@@ -10009,7 +10009,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.context,
                 lowerer.location,
                 &[],
-                &OptimizationBarrier::None,
+                &RematerializationOptimizationBarrier::None,
                 lowerer.nested_functions.as_ref(),
                 &lowerer.collective_state,
                 &mut lowerer.effect_tokens,
@@ -10040,7 +10040,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             // two computations or from scheduling the recomputation before those inputs are available.
             let optimization_barrier = match operation.differentiated() {
                 true => operation.optimization_barrier(),
-                false => &OptimizationBarrier::None,
+                false => &RematerializationOptimizationBarrier::None,
             };
             lower_nested_program_inline(
                 body,
@@ -10068,7 +10068,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.context,
                 lowerer.location,
                 captured_values,
-                &OptimizationBarrier::None,
+                &RematerializationOptimizationBarrier::None,
                 lowerer.nested_functions.as_ref(),
                 &lowerer.collective_state,
                 &mut lowerer.effect_tokens,
@@ -13322,7 +13322,7 @@ mod tests {
                 &context,
                 location.as_ref(),
                 &[],
-                &OptimizationBarrier::All,
+                &RematerializationOptimizationBarrier::All,
                 None,
                 &CollectiveLoweringState::new(),
                 &mut effect_tokens,
@@ -17065,7 +17065,11 @@ mod tests {
         "#};
         assert_eq!(lower(operation.clone()), unbarriered);
         assert_eq!(
-            lower(operation.with_differentiated(true).with_optimization_barrier(OptimizationBarrier::None)),
+            lower(
+                operation
+                    .with_differentiated(true)
+                    .with_optimization_barrier(RematerializationOptimizationBarrier::None)
+            ),
             unbarriered,
         );
     }
@@ -17079,7 +17083,7 @@ mod tests {
         // it is disabled, keeps XLA from reusing the forward computation instead. When the barrier selects no input of
         // the function, it still covers the cotangent that the backward computation receives.
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let lower = |optimization_barrier: OptimizationBarrier| {
+        let lower = |optimization_barrier: RematerializationOptimizationBarrier| {
             let function = rematerialize(|x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
                 let context = x.context();
                 let square =
@@ -17095,7 +17099,7 @@ mod tests {
             to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap()
         };
         assert_eq!(
-            lower(OptimizationBarrier::All),
+            lower(RematerializationOptimizationBarrier::All),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
@@ -17115,7 +17119,7 @@ mod tests {
             "#},
         );
         assert_eq!(
-            lower(OptimizationBarrier::Inputs(vec![false])),
+            lower(RematerializationOptimizationBarrier::Inputs(vec![false])),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
@@ -17135,7 +17139,7 @@ mod tests {
             "#},
         );
         assert_eq!(
-            lower(OptimizationBarrier::None),
+            lower(RematerializationOptimizationBarrier::None),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<f64>) -> tensor<f64> {

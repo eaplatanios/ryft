@@ -33,5 +33,5 @@ pub mod rematerialize;
 pub mod stop_gradient;
 
 pub use linear_call::{LINEAR_CALL_OPERATION_NAME, LinearCallOperation};
-pub use rematerialize::{OptimizationBarrier, REMATERIALIZE_OPERATION_NAME, RematerializeOperation};
+pub use rematerialize::{REMATERIALIZE_OPERATION_NAME, RematerializationOptimizationBarrier, RematerializeOperation};
 pub use stop_gradient::{STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients};
