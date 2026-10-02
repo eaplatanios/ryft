@@ -126,10 +126,13 @@
 //! affect another. Registry and namespace locks protect only bookkeeping (i.e., derivation, rechecking, formatting,
 //! and caller-owned destruction run after those locks are released).
 //!
-//! Thread safety remains structural. A typed [`TransformCache`] is `Send` and `Sync` exactly when its arguments and
-//! artifacts are. A region registry preserves the same rule for its concrete program universe, while requiring erased
-//! arguments and metadata to be `'static + Send + Sync`. Different threads may derive one cold specialization
-//! concurrently under [`SpecializationCache`]'s deliberate last-writer-wins policy.
+//! Thread safety remains conditional on contents. A typed [`TransformCache`] is `Send` and `Sync` exactly when its
+//! arguments and artifacts are. A region registry preserves the same rule for its concrete program universe, while
+//! requiring erased arguments and metadata to be `'static + Send + Sync`. The region handle states that rule directly
+//! (i.e., it is `Send` and `Sync` exactly when its retained programs are) rather than leaving it to structural
+//! auto-trait derivation, whose region-to-program-to-region round trip is too deep for downstream auto-trait checks.
+//! Different threads may derive one cold specialization concurrently under [`SpecializationCache`]'s deliberate
+//! last-writer-wins policy.
 //!
 //! ## Ownership-Cycle Prevention
 //!
@@ -176,7 +179,7 @@ use crate::parameters::Parameter;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::regions::{Region, RegionRef};
-use crate::programs::types::Typed;
+use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 use crate::specialization::{ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry};
 
@@ -487,6 +490,42 @@ impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
         drop(candidate);
         namespace
     }
+}
+
+// SAFETY: The registry behind `state` is built only from `Arc`, `Mutex`, `HashMap`, `TypeId`, `SpecializationCache`,
+// `LruCache`, erased `Send + Sync` arguments and metadata, and `&'static str` names, so it is thread-safe exactly when
+// the `Program<V, O, Vec<V>, Vec<V>>` values that it retains are both `Send` and `Sync` (an `Arc<Program<...>>` is
+// `Send` only if the program is also `Sync`). Apart from the transform caches of their own regions, which are
+// thread-safe by these same implementations, such programs own exactly the following leaf data: constants of type `V`,
+// variable types `V::Type`, type identities `<V::Type as Type>::Identity`, and operations `O`. All other fields are
+// thread-safe concrete bookkeeping (e.g., identifiers, effect summaries, and provenance). The unit test
+// `test_region_transform_cache_is_send_and_sync` proves for generic `V` and `O` that these leaf bounds make the
+// registry `Send` and `Sync`, so a future non-thread-safe field anywhere in that structure fails to compile there
+// instead of silently becoming unsound here.
+//
+// The structural derivation that these implementations replace is correct but too deep to remain usable. Proving that
+// a `Region` is `Send` or `Sync` walks a round trip of more than twenty nested types, most of them standard-library and
+// `lru` wrappers, from the region through this cache and the retained programs back to the region, and operation
+// payloads that nest regions of other operation families repeat that round trip. Auto-trait checks on downstream types
+// that nest concrete operation families (e.g., the auto-trait implementations that rustdoc synthesizes for `ryft-xla`
+// compiled functions) then exceed the default recursion limit (E0275). The bounds deliberately name only leaves rather
+// than `Program<V, O, Vec<V>, Vec<V>>: Send + Sync`. A program bound would re-enter the region cycle through a
+// where-clause, which the trait solver fails to close when `V` and `O` are still inference variables (e.g., while
+// checking closures that capture custom functions), whereas leaf bounds terminate immediately.
+unsafe impl<V, O> Send for RegionTransformCache<V, O>
+where
+    V: Typed<Type: Send + Sync + Type<Identity: Send + Sync>> + Send + Sync + Parameter,
+    O: Send + Sync,
+{
+}
+
+// SAFETY: Refer to the safety argument of the `Send` implementation above. Sharing this handle across threads shares
+// the same `Arc`-backed registry that sending it does, so the same bounds are required and sufficient.
+unsafe impl<V, O> Sync for RegionTransformCache<V, O>
+where
+    V: Typed<Type: Send + Sync + Type<Identity: Send + Sync>> + Send + Sync + Parameter,
+    O: Send + Sync,
+{
 }
 
 impl<V: Typed + Parameter, O> Clone for RegionTransformCache<V, O> {
@@ -815,6 +854,17 @@ mod tests {
     fn test_region_transform_cache_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
 
+        // Type-checking this generic body proves the safety argument of the handwritten `Send` and `Sync`
+        // implementations for `RegionTransformCache`: the registry is thread-safe whenever the leaf data of its
+        // retained programs is.
+        fn assert_registry_is_send_and_sync<
+            V: Send + Sync + Typed<Type: Send + Sync + Type<Identity: Send + Sync>> + Parameter,
+            O: Send + Sync,
+        >() {
+            assert_send_sync::<RegionTransformRegistry<V, O>>();
+        }
+
+        assert_registry_is_send_and_sync::<Array, TestRegionOperation>();
         assert_send_sync::<RegionTransformCache<Array, TestRegionOperation>>();
     }
 
