@@ -12,12 +12,12 @@
 //!     [`SortOperation`], [`Slice`], and [`Reshape`], and their indices are always `i32`.
 //!
 //! A [`SortOrdering`] selects how floating-point keys, including the real and imaginary parts of complex keys, compare.
-//! Under the default [`SortOrdering::Canonical`] ordering, `-0.0` and `+0.0` compare equal, every NaN compares equal to
-//! every other NaN and greater than `+∞`, and complex keys order lexicographically by their real part and then their
-//! imaginary part, same as JAX's [`lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html). Under
-//! [`SortOrdering::Total`], keys order by the IEEE 754 total order of
-//! [StableHLO's `TOTALORDER` comparison](https://openxla.org/stablehlo/spec#compare) (i.e., `-NaN < -∞ < … < -0.0 <
-//! +0.0 < … < +∞ < +NaN`), and complex keys are rejected. [`TopK`] ranks under the total ordering, following JAX's
+//! Under the default [`SortOrdering::Canonical`] ordering, `-0.0` and `+0.0` compare equal, every NaN compares equal
+//! to every other NaN and greater than `+∞`, and complex keys order lexicographically by their real part and then their
+//! imaginary part, same as JAX's [`lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html).
+//! Under [`SortOrdering::Total`], keys order by the IEEE 754 total order of StableHLO's
+//! [`TOTALORDER`](https://openxla.org/stablehlo/spec#compare) comparison (i.e., `-NaN < -∞ < … < -0.0 < +0.0
+//! < … < +∞ < +NaN`), and complex keys are rejected. [`TopK`] ranks under the total ordering, following JAX's
 //! [`lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html), while [`ArgMax`] and [`ArgMin`] rank
 //! under the canonical ordering, so that an axis that contains a NaN of either sign reports its first NaN, following
 //! [`jnp.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.argmax.html). Every sort is stable, so
@@ -97,8 +97,6 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Direction in which a [`SortOperation`] orders its key inputs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SortDirection {
@@ -125,16 +123,16 @@ impl Display for SortDirection {
 pub enum SortOrdering {
     /// Orders floating-point keys by value: `-0.0` and `+0.0` compare equal, and every NaN, regardless of its sign and
     /// payload, compares equal to every other NaN and greater than `+∞`. Complex keys order lexicographically by their
-    /// real part and then their imaginary part, each compared this way. This is the ordering of
-    /// [JAX's `lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html) and of NumPy's sorts.
+    /// real part and then their imaginary part, each compared this way. This is the ordering of JAX's
+    /// [`lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html) and of NumPy's sorts.
     #[default]
     Canonical,
 
-    /// Orders floating-point keys by the IEEE 754 total order,
-    /// `-NaN < -∞ < … < -0.0 < +0.0 < … < +∞ < +NaN`, where NaNs of the same sign are further ordered by payload. This
-    /// is the ordering of [StableHLO's `TOTALORDER` comparison](https://openxla.org/stablehlo/spec#compare) and of
-    /// [JAX's `lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html). Complex keys have no total
-    /// order and are rejected.
+    /// Orders floating-point keys by the IEEE 754 total order, `-NaN < -∞ < … < -0.0 < +0.0 < … < +∞ < +NaN`,
+    /// where NaNs of the same sign are further ordered by payload. This is the ordering of StableHLO's
+    /// [`TOTALORDER`](https://openxla.org/stablehlo/spec#compare) comparison and of JAX's
+    /// [`lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html).
+    /// Complex keys have no total order and are rejected.
     Total,
 }
 
@@ -148,17 +146,19 @@ impl Display for SortOrdering {
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Canonical operation name for [`SortOperation`].
 pub const SORT_OPERATION_NAME: &str = "sort";
 
-/// [`Operation`] that sorts one or more same-shaped inputs along one axis by the values of its first `key_count`
-/// inputs (i.e., its keys). Elements are ordered lexicographically by the keys in input order (i.e., key 0 decides,
-/// ties on key 0 fall through to key 1, and so on), with every key compared in the same [`SortDirection`] and under the
-/// same [`SortOrdering`], and every other input is co-permuted as a passenger. The sort is always stable, so elements
-/// that are equal on every key keep their original relative order, which is what routes ranking ties (e.g., in
-/// [`ArgMax`]) to the lowest index. An ascending sort under the default [`SortOrdering::Canonical`] ordering computes
-/// [JAX's `lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html) with `num_keys = key_count`, and a
-/// descending one computes the stable descending sort of `jnp.sort(..., descending=True)`.
+/// [`Operation`] that sorts one or more same-shaped inputs along one axis by the values of its first `key_count` inputs
+/// (i.e., its keys). Elements are ordered lexicographically by the keys in input order (i.e., key 0 decides, ties on
+/// key 0 fall through to key 1, and so on), with every key compared in the same [`SortDirection`] and under the same
+/// [`SortOrdering`], and every other input is co-permuted as a passenger. The sort is always stable, so elements that
+/// are equal on every key keep their original relative order, which is what routes ranking ties (e.g., in [`ArgMax`])
+/// to the lowest index. An ascending sort under the default [`SortOrdering::Canonical`] ordering computes JAX's
+/// [`lax.sort`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.sort.html) with `num_keys = key_count`, and
+/// a descending one computes the stable descending sort of `jnp.sort(..., descending=True)`.
 ///
 /// Inputs must agree on shape, while their element types may differ. Token and structural-zero keys are rejected, as
 /// are complex keys under [`SortOrdering::Total`]. The sorted axis must not be sharded, because sorting across shards
@@ -167,8 +167,8 @@ pub const SORT_OPERATION_NAME: &str = "sort";
 /// reduction state, because permutations preserve their zero-filled replicas. Inputs must have matching manual
 /// variation, and [`Sort`] inserts the required transitions before binding.
 ///
-/// There is no user-provided comparator: the fixed lexicographic key ordering covers the ranking use cases
-/// ([`TopK`], [`ArgMax`], and [`ArgMin`]) and multi-key sorts without carrying a comparator region through every
+/// There is no user-provided comparator: the fixed lexicographic key ordering covers the ranking use cases (i.e.,
+/// [`TopK`], [`ArgMax`], and [`ArgMin`]) and multi-key sorts without carrying a comparator region through every
 /// program transform.
 ///
 /// The permutation is piecewise constant in the keys, so every input, including each key, differentiates as a
