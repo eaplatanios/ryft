@@ -1929,7 +1929,8 @@ mod tests {
         // The policy of the call decides which residuals its pullback saves, while the value and the gradient are the
         // same for every policy: saving nothing saves only `x`, saving everything also saves the cosine, saving dot
         // products also saves the dot product, offloading policies save it in host memory, and name-based policies
-        // follow the tags in the body. The classification of every built-in policy is tested in the `policies` module.
+        // follow the tags in the body. The classification of every built-in policy is tested where the policies are
+        // defined, in `differentiation::rematerialization`.
         // The gradient of `sin(x · x)` is `2 cos(x · x) x`.
         let x = [0.1f64, 0.2, 0.3];
         let dot = 0.14f64;
