@@ -1342,25 +1342,10 @@ mod tests {
         }
     }
 
-    /// Returns the [`ArrayIrType`] of `f64` scalars.
-    fn scalar_type() -> ArrayIrType {
-        ArrayType::scalar(DataType::F64).into()
-    }
-
-    /// Returns the [`ArrayIrType`] of dimensions named `n`, which does not project into [`ArrayType`].
-    fn dimension_type() -> ArrayIrType {
-        ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::non_negative(None).unwrap()))
-    }
-
-    /// Returns the dimension numbers of a dot product that contracts the leading dimensions of its inputs and has no
-    /// batching dimensions.
-    fn contracting_dimensions() -> DotDimensionNumbers {
-        DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![])
-    }
-
     /// Returns a dot product that contracts the leading dimensions of its inputs and has no batching dimensions.
     fn dot() -> TestIrOperation {
-        ArrayOperation::<Array>::from(DotOperation::new(contracting_dimensions())).into()
+        ArrayOperation::<Array>::from(DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![])))
+            .into()
     }
 
     /// Returns a dot product that contracts the trailing dimensions of its inputs and batches their leading ones.
@@ -1382,11 +1367,12 @@ mod tests {
     /// Returns a scalar candidate that output 0 of any of `operations` may produce. The built-in policies classify
     /// candidates by the payloads of their producers only, so the producers carry no input types.
     fn candidate(operations: &[TestIrOperation]) -> ResidualCandidate<'_, ArrayIrType> {
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
         let producers = operations
             .iter()
-            .map(|operation| ResidualProducer::new(operation, 0, Vec::new(), vec![scalar_type()]))
+            .map(|operation| ResidualProducer::new(operation, 0, Vec::new(), vec![scalar_type.clone()]))
             .collect();
-        ResidualCandidate::new(producers, scalar_type())
+        ResidualCandidate::new(producers, scalar_type)
     }
 
     /// Classifies a dimension candidate, whose type does not project into [`ArrayType`], with a reference to `policy`
@@ -1396,13 +1382,15 @@ mod tests {
     fn classify_lifted_dimension<P: ResidualPolicy<ArrayType>>(
         policy: P,
     ) -> Result<ResidualDecision<ErasedResidualStorage<ArrayIrType>>, ResidualPolicyError> {
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::non_negative(None).unwrap()));
         let dimension_size = TestIrOperation::DimensionSize(
             DimensionSizeOperation::new(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap(),
         );
-        let producer = ResidualProducer::new(&dimension_size, 0, Vec::new(), vec![dimension_type()]);
+        let producer = ResidualProducer::new(&dimension_size, 0, Vec::new(), vec![dimension_type.clone()]);
         ResidualPolicyReference::<ArrayType>::new(policy)
             .lift::<ArrayIrType>()
-            .classify(&ResidualCandidate::new(vec![producer], dimension_type()))
+            .classify(&ResidualCandidate::new(vec![producer], dimension_type))
     }
 
     #[test]
@@ -1937,7 +1925,12 @@ mod tests {
         assert_eq!(DotsSavable.classify(&candidate(&[sine(), dot()])), Ok(ResidualDecision::Save));
 
         // Dot products are recognized in the array operation family itself too.
-        let dot = ArrayOperation::<Array>::from(DotOperation::new(contracting_dimensions()));
+        let dot = ArrayOperation::<Array>::from(DotOperation::new(DotDimensionNumbers::new(
+            vec![0],
+            vec![0],
+            vec![],
+            vec![],
+        )));
         let scalar_type = ArrayType::scalar(DataType::F64);
         let producer = ResidualProducer::new(&dot, 0, Vec::new(), vec![scalar_type.clone()]);
         assert_eq!(
@@ -2118,7 +2111,7 @@ mod tests {
             panic!("expected an offloaded residual");
         };
         assert_eq!(storage.name(), "memory_transfer");
-        let mut store = storage.store_payloads(&scalar_type()).unwrap();
+        let mut store = storage.store_payloads(&ArrayIrType::from(ArrayType::scalar(DataType::F64))).unwrap();
         assert_eq!(store.len(), 1);
         assert_eq!(store.remove(0).downcast::<TransferToMemoryOperation>().unwrap().destination(), host);
         assert!(matches!(policy.classify(&candidate(&[tag("a")])), Ok(ResidualDecision::Save)));
@@ -2143,7 +2136,7 @@ mod tests {
             Err(ResidualPolicyError::UnsupportedProjection {
                 policy: SAVE_FROM_BOTH_POLICIES_POLICY_NAME.to_owned(),
                 position: "the output 0 of producer `dimension_size`".to_owned(),
-                residual_type: dimension_type().to_string(),
+                residual_type: DimensionType::new("n", DimensionBounds::non_negative(None).unwrap()).to_string(),
             }),
         );
     }
@@ -2181,28 +2174,31 @@ mod tests {
 
     #[test]
     fn test_memory_transfer_storage() {
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::non_negative(None).unwrap()));
         let host = Memory::Host { pinned: true };
         let storage = MemoryTransferStorage::new(host);
         assert_eq!(storage.destination(), host);
         assert_eq!(ResidualStorage::<ArrayIrType>::name(&storage), "memory_transfer");
 
         // Storing transfers the residual to the destination, and restoring transfers it back to its own memory.
-        let mut store = storage.store_payloads(&scalar_type()).unwrap();
+        let mut store = storage.store_payloads(&scalar_type).unwrap();
         assert_eq!(store.len(), 1);
         assert_eq!(store.remove(0).downcast::<TransferToMemoryOperation>().unwrap().destination(), host);
         let stored_type = ArrayIrType::from(ArrayType::scalar(DataType::F64).with_memory(host));
-        let mut restore = storage.restore_payloads(&stored_type, &scalar_type()).unwrap();
+        let mut restore = storage.restore_payloads(&stored_type, &scalar_type).unwrap();
         assert_eq!(restore.len(), 1);
         assert_eq!(restore.remove(0).downcast::<TransferToMemoryOperation>().unwrap().destination(), Memory::Device);
 
         // Residuals that are not arrays cannot be offloaded.
         let error = ResidualPolicyError::UnsupportedStorage {
             storage: "memory_transfer".to_owned(),
-            residual_type: dimension_type().to_string(),
+            residual_type: dimension_type.to_string(),
             message: "the residual is not an array".to_owned(),
         };
-        assert_eq!(storage.store_payloads(&dimension_type()).map(|_| ()), Err(error.clone()));
-        assert_eq!(storage.restore_payloads(&dimension_type(), &dimension_type()).map(|_| ()), Err(error));
+        assert_eq!(storage.store_payloads(&dimension_type).map(|_| ()), Err(error.clone()));
+        assert_eq!(storage.restore_payloads(&dimension_type, &dimension_type).map(|_| ()), Err(error));
 
         // Storages compare and hash by their destination.
         let storages = HashSet::from([storage]);
