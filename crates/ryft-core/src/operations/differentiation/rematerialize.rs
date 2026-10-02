@@ -752,23 +752,25 @@ impl<
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
-        DimensionBounds, DimensionType, DimensionValue, Memory, ShardingDimension,
+        DimensionBounds, DimensionType, DimensionValue, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
+        ShardingDimension,
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
-    use crate::contexts::EagerContext;
+    use crate::captures::{CaptureReference, ClosedProgram};
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
-        CotangentDestination, CotangentSeed, DotsSaveable, DotsWithNoBatchDimensionsSaveable, EverythingSaveable,
-        NothingSaveable, OffloadDotsWithNoBatchDimensions, PolicyFn, SaveAndOffloadOnlyTheseNames,
-        SaveAnyNamesButThese, SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, differentiate_at,
-        rematerialize,
+        CotangentDestination, CotangentSeed, DotsSaveable, EverythingSaveable, NothingSaveable,
+        OffloadDotsWithNoBatchDimensions, SaveOnlyTheseNames, differentiate_at, rematerialize,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
+    use crate::operations::collectives::parallel_reduce::{ParallelReduceOperation, ParallelReductionKind};
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::WhileOperation;
@@ -783,9 +785,10 @@ mod tests {
     use crate::operations::tagging::Tag;
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
-    use crate::partial::{NoStorage, ResidualDecision, ResidualPolicy, ResidualRejection};
+    use crate::partial::ResidualPolicy;
     use crate::programs::{
-        EffectClasses, ExternalReferenceBinding, Program, ProgramBuilder, ReferenceSource, ReferenceType,
+        EffectClasses, ExternalReferenceBinding, Program, ProgramBuilder, ReferenceSource, ReferenceType, RegionDriver,
+        RegionRef,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -794,6 +797,12 @@ mod tests {
     type TestIrValue = ArrayIrValue<Array>;
     type TestIrOperation = ArrayIrOperation<Array>;
     type TestTracer = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+
+    // The transform tests below stage complete programs rather than using the `check_operation_*` macros, because their
+    // subject is the transformation of the attached body region, for which those macros recommend explicit setup. They
+    // also compare derivatives with analytic values rather than with `check_gradient!`, which instantiates the function
+    // under test over both linearization tracers and concrete arrays, while a rematerialized function fixes the type of
+    // its tracer input.
 
     /// Returns a [`RematerializeOperation`] over [`ArrayType`] with the default [`NothingSaveable`] policy.
     fn rematerialize_operation() -> RematerializeOperation<ArrayType> {
@@ -974,7 +983,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_region_input_types(&[scalar.clone(), scalar.clone()], std::slice::from_ref(&body)),
-            Err(TypeError::invalid("PLACEHOLDER")),
+            Err(TypeError::invalid("declared type count 1 does not match actual type count 2")),
         );
         let bounds = DimensionBounds::new(1, Some(5)).unwrap();
         let extent = DimensionType::new("n", bounds);
@@ -1091,6 +1100,64 @@ mod tests {
         assert_eq!(
             discharged.external_reference_bindings(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_discharge_references_captured_reference() {
+        // The body `x ↦ (c += x; read(c))` mutates a captured outer reference `c`. Discharging appends the state of `c`
+        // as an input of the call, which carries no derivative values and which its optimization barrier therefore does
+        // not select, and publishes the mutated state of `c`.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let mut body =
+            ProgramBuilder::<CaptureReference<ArrayIrType>, ArrayIrOperation<CaptureReference<ArrayType>>>::new();
+        let x = body.add_input(scalar_type.clone().into());
+        let reference = body.add_constant(CaptureReference::new(0, reference_type.into()));
+        body.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, x], None)
+            .unwrap();
+        let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let body = body
+            .build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+                vec![value],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder =
+            ProgramBuilder::<CaptureReference<ArrayIrType>, ArrayIrOperation<CaptureReference<ArrayType>>>::new();
+        let body = builder.import_program(body);
+        let x = builder.add_input(scalar_type.into());
+        let operation = rematerialize_operation()
+            .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![true]))
+            .lift::<ArrayIrType>();
+        let output = builder.add_instruction(operation, vec![body], vec![x], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let reference = ArrayReference::new(Array::scalar(1.0f32).unwrap());
+        let closed = ClosedProgram::new(program, vec![TestIrValue::Reference(reference)]).unwrap();
+        let discharged = closed.discharge_references().unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[], %3:f32[] = rematerialize [optimization_barrier=[true, false]] %1 %0 [
+                    body={
+                        lambda %0:f32[], %1:f32[] .
+                        let %2:f32[] = add %1 %0
+                        in (%2, %2)
+                    },
+                ]
+                in (%2, %3)"},
+        );
+        assert_eq!(
+            discharged.external_reference_bindings(),
+            &[ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(1))],
         );
     }
 
@@ -1311,7 +1378,23 @@ mod tests {
         assert_eq!(
             program.partition(&[true, false]).unwrap().to_string(),
             indoc! {"
-            PLACEHOLDER"},
+                partition [known_inputs=[0], residual_inputs=[Unknown(1), Known(0)], outputs=[Unknown(0)]]
+                known={
+                    lambda %0:f64[] .
+                    in (%0)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = rematerialize %1 %0 [
+                        body={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = print [label=x] %0
+                                %3:f64[] = mul %2 %1
+                            in (%3)
+                        },
+                    ]
+                    in (%2)
+                }"},
         );
     }
 
@@ -1356,6 +1439,93 @@ mod tests {
                     ]
                     %4:f64[] = add %2 %3
                 in (%4)"},
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_partial_evaluation_pending_error() {
+        // A partial evaluation that already retained a binding error reports that error before it hoists the known side
+        // of a call into the known-side context, which would otherwise stage the dot product into the enclosing trace.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = PartialEvaluationContext::new(trace.clone());
+        let left = context.lift(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap()).unwrap();
+        let right = context.lift(Array::vector(vec![1.0f64, 2.0]).unwrap()).unwrap();
+        let error = context.bind(MulOperation::new(), Vec::new(), &[left, right]).err().unwrap();
+        assert_eq!(error, ProgramError::Type(TypeError::invalid("TODO")));
+        let program = sine_of_dot_program(RematerializeOperation::new(ResidualPolicyReference::new(DotsSaveable)));
+        let inputs = vec![
+            PartialEvaluationValue::known(trace.input(ArrayType::new_static(DataType::F64, [3]))),
+            context.unknown_input(ArrayType::scalar(DataType::F64), 1),
+        ];
+        assert_eq!(context.inline_program(&program, inputs).err(), Some(error));
+        assert!(trace.builder().borrow().instructions().is_empty());
+
+        // Without a pending error, the same call hoists the dot product into the enclosing trace.
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = PartialEvaluationContext::new(trace.clone());
+        let inputs = vec![
+            PartialEvaluationValue::known(trace.input(ArrayType::new_static(DataType::F64, [3]))),
+            context.unknown_input(ArrayType::scalar(DataType::F64), 1),
+        ];
+        assert!(context.inline_program(&program, inputs).is_ok());
+        let instructions = trace
+            .builder()
+            .borrow()
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert_eq!(instructions, vec!["dot"]);
+    }
+
+    #[test]
+    fn test_rematerialize_partial_evaluation_unsupported_known_operation() {
+        // The body `(x, y) ↦ parallel_sum(x) · y` reduces `x` over a manual mesh axis, which an eager known side cannot
+        // execute. Saving everything would hoist that reduction out of the call, so the call stays whole and
+        // undifferentiated on the residual side instead, for an execution backend that owns the mesh.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 0);
+        let invariant_type = ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap();
+        let varying_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(sharding.with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let x = body.add_input(varying_type.clone());
+        let y = body.add_input(invariant_type.clone());
+        let sum = ParallelReduceOperation::new("m".to_string(), ParallelReductionKind::Sum).with_mesh(mesh);
+        let sum = body.add_instruction(sum, Vec::new(), vec![x], None).unwrap()[0];
+        let product = body.add_instruction(MulOperation::new(), Vec::new(), vec![sum, y], None).unwrap()[0];
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let x = builder.add_input(varying_type.clone());
+        let y = builder.add_input(invariant_type.clone());
+        let operation = RematerializeOperation::new(ResidualPolicyReference::new(EverythingSaveable));
+        let output = builder.add_instruction(operation, vec![body], vec![x, y], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Known(Array::from_elements(varying_type, &[2.0f32]).unwrap()),
+                PartialValue::Unknown(invariant_type),
+            ])
+            .unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['m'=4:manual]>, []}], %1:f32[][sharding={mesh<['m'=4:manual]>, [], varying_manual={'m'}}] .
+                let %2:f32[][sharding={mesh<['m'=4:manual]>, []}] = rematerialize [policy=\"everything_saveable\"] %1 %0 [
+                    body={
+                        lambda %0:f32[][sharding={mesh<['m'=4:manual]>, [], varying_manual={'m'}}], %1:f32[][sharding={mesh<['m'=4:manual]>, []}] .
+                        let %2:f32[][sharding={mesh<['m'=4:manual]>, []}] = parallel_sum [axis_name=\"m\", mesh=['m'=4:manual]] %0
+                            %3:f32[][sharding={mesh<['m'=4:manual]>, []}] = mul %2 %1
+                        in (%3)
+                    },
+                ]
+                in (%2)"},
         );
     }
 
@@ -1406,7 +1576,16 @@ mod tests {
         assert_eq!(
             batched.to_string(),
             indoc! {"
-            PLACEHOLDER"},
+                lambda %0:f64[] .
+                let %1:f64[] = rematerialize %0 [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%1)"},
         );
 
         // A mapped reference input enters the batched body as a reference to the stacked values, and the body may
@@ -1533,7 +1712,19 @@ mod tests {
         assert_eq!(
             program.jvp().unwrap().to_string(),
             indoc! {"
-            PLACEHOLDER"},
+                lambda %0:f64[], %1:i64[], %2:f64[] .
+                let %3:f64[], %4:i64[], %5:f64[] = rematerialize %0 %1 %2 [
+                    body={
+                        lambda %0:f64[], %1:i64[], %2:f64[] .
+                        let %3:f64[] = mul %0 %0
+                            %4:f64[] = mul %0 %2
+                            %5:f64[] = mul %0 %2
+                            %6:f64[] = add %4 %5
+                            %7:i64[] = mul %1 %1
+                        in (%3, %7, %6)
+                    },
+                ]
+                in (%3, %4, %5)"},
         );
         let body = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -1552,7 +1743,15 @@ mod tests {
         assert_eq!(
             program.jvp().unwrap().to_string(),
             indoc! {"
-            PLACEHOLDER"},
+                lambda %0:i64[] .
+                let %1:i64[] = rematerialize %0 [
+                    body={
+                        lambda %0:i64[] .
+                        let %1:i64[] = mul %0 %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
         );
 
         // The optimization barrier of the fused call additionally selects the live input tangents, and that of the
@@ -1727,8 +1926,11 @@ mod tests {
 
     #[test]
     fn test_rematerialize_differentiation_policies() {
-        // Every built-in policy computes the same value and gradient, while the residuals that the pullback saves
-        // differ (and offloading policies save them in host memory). The gradient of `sin(x · x)` is `2 cos(x · x) x`.
+        // The policy of the call decides which residuals its pullback saves, while the value and the gradient are the
+        // same for every policy: saving nothing saves only `x`, saving everything also saves the cosine, saving dot
+        // products also saves the dot product, offloading policies save it in host memory, and name-based policies
+        // follow the tags in the body. The classification of every built-in policy is tested in the `policies` module.
+        // The gradient of `sin(x · x)` is `2 cos(x · x) x`.
         let x = [0.1f64, 0.2, 0.3];
         let dot = 0.14f64;
         let value = Array::scalar(dot.sin()).unwrap();
@@ -1740,43 +1942,17 @@ mod tests {
         assert_eq!(tagged_sine_of_dot_vjp(NothingSaveable), (value.clone(), gradient.clone(), vec![vector.clone()]));
         assert_eq!(
             tagged_sine_of_dot_vjp(EverythingSaveable),
-            (value.clone(), gradient.clone(), vec![vector.clone(), cosine.clone()]),
+            (value.clone(), gradient.clone(), vec![vector.clone(), cosine]),
         );
         assert_eq!(
             tagged_sine_of_dot_vjp(DotsSaveable),
             (value.clone(), gradient.clone(), vec![vector.clone(), dot.clone()]),
         );
         assert_eq!(
-            tagged_sine_of_dot_vjp(DotsWithNoBatchDimensionsSaveable),
-            (value.clone(), gradient.clone(), vec![vector.clone(), dot.clone()]),
-        );
-        assert_eq!(
             tagged_sine_of_dot_vjp(OffloadDotsWithNoBatchDimensions::new(host)),
             (value.clone(), gradient.clone(), vec![vector.clone(), dot.transfer_to_memory(host).unwrap()]),
         );
-        assert_eq!(
-            tagged_sine_of_dot_vjp(SaveOnlyTheseNames::new(["dot"])),
-            (value.clone(), gradient.clone(), vec![vector.clone(), dot.clone()]),
-        );
-        assert_eq!(
-            tagged_sine_of_dot_vjp(SaveAnyNamesButThese::new(["dot"])),
-            (value.clone(), gradient.clone(), vec![vector.clone()]),
-        );
-        assert_eq!(
-            tagged_sine_of_dot_vjp(SaveAnythingExceptTheseNames::new(["dot"])),
-            (value.clone(), gradient.clone(), vec![vector.clone(), cosine.clone()]),
-        );
-        assert_eq!(
-            tagged_sine_of_dot_vjp(SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["dot"], host).unwrap()),
-            (value.clone(), gradient.clone(), vec![vector.clone(), dot.transfer_to_memory(host).unwrap()]),
-        );
-        assert_eq!(
-            tagged_sine_of_dot_vjp(SaveFromBothPolicies::new(NothingSaveable, DotsSaveable)),
-            (value.clone(), gradient.clone(), vec![vector.clone(), dot.clone()]),
-        );
-        let policy =
-            PolicyFn::new::<ArrayType>(|_| Ok::<_, ResidualRejection>(ResidualDecision::<NoStorage>::Recompute));
-        assert_eq!(tagged_sine_of_dot_vjp(policy), (value, gradient, vec![vector]));
+        assert_eq!(tagged_sine_of_dot_vjp(SaveOnlyTheseNames::new(["dot"])), (value, gradient, vec![vector, dot]));
     }
 
     #[test]
@@ -2350,6 +2526,64 @@ mod tests {
                 ]
                 in (%3, %4)"},
         );
+    }
+
+    #[test]
+    fn test_rematerialize_transposition_zero_linear_map() {
+        // A call without live output cotangents and without live reference state is a zero linear map, so its rule
+        // stages nothing and leaves structural zeros for its inputs. Program transposition skips such a call before
+        // reaching the rule, so the rule is invoked directly, through a driver that exposes the body `(x, t) ↦ x · t`
+        // and refuses to transpose it, because a zero linear map never needs its transposed body.
+        struct BodyDriver<'r> {
+            body: RegionRef<'r, Array, ArrayOperation<Array>>,
+        }
+
+        impl RegionDriver<Array, ArrayOperation<Array>> for BodyDriver<'_> {
+            fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, Array, ArrayOperation<Array>>>
+            where
+                Array: 'r,
+                ArrayOperation<Array>: 'r,
+            {
+                std::iter::once(self.body)
+            }
+        }
+
+        impl TranspositionDriver<Array, ArrayOperation<Array>> for BodyDriver<'_> {
+            fn transpose_program(
+                &self,
+                _region: RegionRef<'_, Array, ArrayOperation<Array>>,
+                _input_indices: &[usize],
+                _destination_kinds: &[CotangentDestinationKind],
+            ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError>
+            {
+                Err(ProgramError::UnsupportedOperation {
+                    message: "a zero linear map never transposes its body".to_string(),
+                }
+                .into())
+            }
+        }
+
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let x = body.add_input(scalar_type.clone());
+        let t = body.add_input(scalar_type.clone());
+        let product = body.add_instruction(MulOperation::new(), Vec::new(), vec![x, t], None).unwrap()[0];
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let driver = BodyDriver { body: body.entry_region_ref() };
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let mut context = TranspositionContext::new(trace.clone());
+        let inputs =
+            [PartialValue::Known(trace.input(scalar_type.clone())), PartialValue::Unknown(scalar_type.clone())];
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
+        rematerialize_operation()
+            .transpose(&mut context, &driver, &inputs, &[MaybeZero::Zero(scalar_type)], &accumulators)
+            .unwrap();
+        let cotangents = context.take_cotangents(&accumulators).unwrap();
+        assert_eq!(cotangents.len(), 2);
+        assert!(cotangents.iter().all(MaybeZero::is_zero));
+        assert!(trace.builder().borrow().instructions().is_empty());
     }
 
     #[test]
