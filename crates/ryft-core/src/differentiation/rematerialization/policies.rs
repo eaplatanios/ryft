@@ -32,8 +32,9 @@ use crate::programs::{ErasedOperation, ProgramError, Type};
 pub const NOTHING_SAVABLE_POLICY_NAME: &str = "nothing_savable";
 
 /// [`ResidualPolicy`] that saves nothing, so that differentiation recomputes every residual from the inputs of the
-/// rematerialized function. This is the default policy of [`rematerialize`](super::rematerialize), and the analogue of
-/// JAX's `nothing_savable`.
+/// rematerialized function. This is the default policy of [`rematerialize`](super::rematerialize). This is the Ryft
+/// analogue of JAX's
+/// [`nothing_saveable`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.nothing_saveable.html).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct NothingSavable;
 
@@ -64,8 +65,9 @@ impl<T: 'static + Type> ResidualPolicy<T> for NothingSavable {
 /// Canonical policy name for [`EverythingSavable`].
 pub const EVERYTHING_SAVABLE_POLICY_NAME: &str = "everything_savable";
 
-/// [`ResidualPolicy`] that saves every residual, so that differentiation recomputes nothing, which is the analogue of
-/// JAX's `everything_savable`.
+/// [`ResidualPolicy`] that saves every residual, so that differentiation recomputes nothing. This is the Ryft analogue
+/// of JAX's
+/// [`everything_saveable`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.everything_saveable.html).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EverythingSavable;
 
@@ -96,8 +98,9 @@ impl<T: 'static + Type> ResidualPolicy<T> for EverythingSavable {
 /// Canonical policy name for [`DotsSavable`].
 pub const DOTS_SAVABLE_POLICY_NAME: &str = "dots_savable";
 
-/// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s produce and recomputes every other residual,
-/// which is the analogue of JAX's `dots_savable` (also known as `checkpoint_dots`).
+/// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s produce and recomputes every other residual.
+/// This is the Ryft analogue of JAX's
+/// [`dots_saveable`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.dots_saveable.html#jax.checkpoint_policies.dots_saveable).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotsSavable;
 
