@@ -14,8 +14,6 @@
 //! rematerialization from one of these universes to the other re-instantiates its policy rather than projecting the
 //! types of its candidates.
 
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -100,7 +98,7 @@ pub const DOTS_SAVABLE_POLICY_NAME: &str = "dots_savable";
 
 /// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s produce and recomputes every other residual.
 /// This is the Ryft analogue of JAX's
-/// [`dots_saveable`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.dots_saveable.html#jax.checkpoint_policies.dots_saveable).
+/// [`dots_saveable`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.dots_saveable.html).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotsSavable;
 
@@ -132,8 +130,8 @@ impl<T: 'static + Type> ResidualPolicy<T> for DotsSavable {
 pub const DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME: &str = "dots_with_no_batch_dimensions_savable";
 
 /// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s without batching dimensions (e.g., matrix
-/// multiplications) produce and recomputes every other residual, which is the analogue of JAX's
-/// `dots_with_no_batch_dims_savable`.
+/// multiplications) produce and recomputes every other residual. This is the Ryft analogue of JAX's
+/// [`dots_with_no_batch_dims_saveable`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.dots_with_no_batch_dims_saveable.html).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotsWithNoBatchDimensionsSavable;
 
@@ -167,9 +165,9 @@ impl<T: 'static + Type> ResidualPolicy<T> for DotsWithNoBatchDimensionsSavable {
 /// Canonical policy name for [`OffloadDotsWithNoBatchDimensions`].
 pub const OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME: &str = "offload_dots_with_no_batch_dimensions";
 
-/// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s without batching dimensions produce by
-/// offloading them to the provided [`Memory`] (refer to [`MemoryTransferStorage`]) and recomputes every other residual,
-/// which is the analogue of JAX's `offload_dot_with_no_batch_dims`.
+/// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s without batching dimensions produce by offloading
+/// them to the provided [`Memory`] and recomputes every other residual. This is the Ryft analogue of JAX's
+/// [`offload_dot_with_no_batch_dims`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.offload_dot_with_no_batch_dims.html).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OffloadDotsWithNoBatchDimensions {
     /// [`Memory`] that the saved residuals are offloaded to.
@@ -227,8 +225,9 @@ where
 /// Canonical policy name for [`SaveOnlyTheseNames`].
 pub const SAVE_ONLY_THESE_NAMES_POLICY_NAME: &str = "save_only_these_names";
 
-/// [`ResidualPolicy`] that saves the residuals that are tagged (refer to [`Tag`](crate::Tag)) with one of the provided
-/// names and recomputes every other residual, which is the analogue of JAX's `save_only_these_names`.
+/// [`ResidualPolicy`] that saves the residuals that are tagged (using [`Tag`](crate::Tag)) with one of the provided
+/// names and recomputes every other residual. This is the Ryft analogue of JAX's
+/// [`save_only_these_names`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.save_only_these_names.html).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SaveOnlyTheseNames {
     /// Names of the tags whose values are saved.
@@ -277,9 +276,9 @@ impl<T: 'static + Type> ResidualPolicy<T> for SaveOnlyTheseNames {
 /// Canonical policy name for [`SaveAnyNamesButThese`].
 pub const SAVE_ANY_NAMES_BUT_THESE_POLICY_NAME: &str = "save_any_names_but_these";
 
-/// [`ResidualPolicy`] that saves the residuals that are tagged (refer to [`Tag`](crate::Tag)) with any name other than
-/// the provided ones and recomputes every other residual, including untagged ones, which is the analogue of JAX's
-/// `save_any_names_but_these`.
+/// [`ResidualPolicy`] that saves the residuals that are tagged (using [`Tag`](crate::Tag)) with any name other than the
+/// provided ones and recomputes every other residual, including untagged ones. This is the Ryft analogue of JAX's
+/// [`save_any_names_but_these`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.save_any_names_but_these.html).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SaveAnyNamesButThese {
     /// Names of the tags whose values are not saved.
@@ -328,9 +327,8 @@ impl<T: 'static + Type> ResidualPolicy<T> for SaveAnyNamesButThese {
 /// Canonical policy name for [`SaveAnythingExceptTheseNames`].
 pub const SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME: &str = "save_anything_except_these_names";
 
-/// [`ResidualPolicy`] that saves every residual except the ones that are tagged (refer to [`Tag`](crate::Tag)) with
-/// one of the provided names, which is the analogue of JAX's `save_anything_except_these_names`. Unlike
-/// [`SaveAnyNamesButThese`], it also saves untagged residuals.
+/// [`ResidualPolicy`] that saves every residual except the ones that are tagged (using [`Tag`](crate::Tag)) with
+/// one of the provided names. Unlike [`SaveAnyNamesButThese`], it also saves untagged residuals.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SaveAnythingExceptTheseNames {
     /// Names of the tags whose values are not saved.
@@ -378,10 +376,10 @@ impl<T: 'static + Type> ResidualPolicy<T> for SaveAnythingExceptTheseNames {
 /// Canonical policy name for [`SaveAndOffloadOnlyTheseNames`].
 pub const SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME: &str = "save_and_offload_only_these_names";
 
-/// [`ResidualPolicy`] that saves the residuals that are tagged (refer to [`Tag`](crate::Tag)) with one of the provided
+/// [`ResidualPolicy`] that saves the residuals that are tagged (using [`Tag`](crate::Tag)) with one of the provided
 /// savable names, offloads the ones that are tagged with one of the provided offloadable names to the provided
-/// [`Memory`] (refer to [`MemoryTransferStorage`]), and recomputes every other residual, which is the analogue of JAX's
-/// `save_and_offload_only_these_names`.
+/// [`Memory`], and recomputes every other residual. This is the Ryft analogue of JAX's
+/// [`save_and_offload_only_these_names`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.save_and_offload_only_these_names.html).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SaveAndOffloadOnlyTheseNames {
     /// Names of the tags whose values are saved.
@@ -417,9 +415,9 @@ impl SaveAndOffloadOnlyTheseNames {
         if !overlapping_names.is_empty() {
             return Err(ProgramError::InvalidArgument {
                 message: format!(
-                    "names {} cannot be both savable and offloadable by a \
-                     `{SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME}` policy",
+                    "names {} cannot be both savable and offloadable by a `{}` policy",
                     overlapping_names.join(", "),
+                    SAVE_AND_OFFLOAD_ONLY_THESE_NAMES_POLICY_NAME,
                 ),
             });
         }
@@ -486,15 +484,16 @@ where
 /// Canonical policy name for [`SaveFromBothPolicies`].
 pub const SAVE_FROM_BOTH_POLICIES_POLICY_NAME: &str = "save_from_both_policies";
 
-/// [`ResidualPolicy`] that combines two policies, saving each residual that either of them saves, which is the analogue
-/// of JAX's `save_from_both_policies`. The first policy classifies each residual first, and the second policy is only
-/// consulted for the residuals that the first one recomputes. A residual that the first policy saves through a
-/// [`ResidualStorage`] therefore keeps that storage, which makes this a strict superset of JAX's policy, whose
-/// combination of two policies rejects offloading. Rejections of either policy are returned as they are.
+/// [`ResidualPolicy`] that combines two policies, saving each residual that either of them saves. The first policy
+/// classifies each residual first, and the second policy is only consulted for the residuals that the first one
+/// recomputes. A residual that the first policy saves through a [`ResidualStorage`] therefore keeps that storage,
+/// which makes this a strict superset of JAX's policy, whose combination of two policies rejects offloading.
+/// Rejections of either policy are returned as they are. This is the Ryft analogue of JAX's
+/// [`save_from_both_policies`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.save_from_both_policies.html).
 ///
-/// Unlike the other built-in policies, this policy declares no instantiations in other type universes, because its
-/// two policies may be defined for one universe only (e.g., [`PolicyFn`]s). Promoting a staged rematerialization that
-/// uses it to another universe therefore projects the types of its candidates (refer to
+/// Unlike the other built-in policies, this policy declares no instantiations in other type universes, because its two
+/// policies may be defined for one universe only (e.g., [`PolicyFn`]s). Promoting a staged rematerialization that uses
+/// it to another universe therefore projects the types of its candidates (refer to
 /// [`ResidualPolicyReference::lift`](crate::ResidualPolicyReference::lift)).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SaveFromBothPolicies<P1, P2> {
@@ -545,6 +544,8 @@ impl<T: 'static + Type, P1: ResidualPolicy<T>, P2: ResidualPolicy<T>> ResidualPo
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Default name for [`PolicyFn`].
 pub const POLICY_FN_POLICY_NAME: &str = "policy_fn";
