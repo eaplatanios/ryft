@@ -52,8 +52,8 @@ pub mod rules;
 
 pub use functions::{
     CustomCallPrimal, CustomFunction, CustomFunctionBatching, CustomFunctionJvp, CustomFunctionVjp, DefaultBatching,
-    DefaultJvp, DefaultVjp, JvpFromPrimal, WithAccumulatingVjp, WithBatching, WithJvp, WithSymbolicZeroJvp,
-    WithSymbolicZeroVjp, WithVjp, custom_function,
+    DefaultJvp, DefaultVjp, JvpFromPrimal, WithAccumulatingVjp, WithAxisDependentBatching, WithBatching, WithJvp,
+    WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, custom_function,
 };
 pub use operations::{
     CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CustomFunctionJvpRule,

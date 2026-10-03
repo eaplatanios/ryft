@@ -22,12 +22,12 @@ use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::elements::ArrayElement;
 use crate::arrays::sharding::{Sharding, ShardingDimension, ShardingError};
-use crate::arrays::types::{ArrayIrType, ArrayType, Dimension, DimensionType, DimensionVariable, Shape};
+use crate::arrays::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedOutputs, BatchedProgram,
     BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent,
-    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram,
+    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DiagonalBatchingPolicy,
     InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, RecursiveBatchingPolicy,
 };
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext, ValueResolution};
@@ -36,8 +36,8 @@ use crate::macros::{check_builders, check_count, dispatch_on_array_element_type}
 use crate::operations::{
     AndOperation, Assert, Broadcast, BroadcastOperation, Compare, CompareOperation, ComparisonDirection,
     ConstantOperation, DimensionConstant, DimensionSize, DimensionSizeOperation, DynamicBroadcast,
-    DynamicBroadcastOperation, ElementwiseOperation, IotaOperation, ReductionKind, SelectOperation, Transpose,
-    TransposeOperation, ZeroLikeOperation,
+    DynamicBroadcastOperation, DynamicIota, ElementwiseOperation, Gather, GatherDimensionNumbers, GatherOptions, Iota,
+    IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation, ZeroLikeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -2282,6 +2282,32 @@ where
     }
 }
 
+impl<C: Context<Type = ArrayType, Value: Gather> + Iota<C::Value>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Value>>>
+    DiagonalBatchingPolicy<C> for ArrayBatchingPolicy<P>
+{
+    fn diagonal(
+        context: &C,
+        value: &C::Value,
+        kept_axis: usize,
+        removed_axis: usize,
+    ) -> Result<C::Value, BatchingError> {
+        // Homogeneous array contexts construct indices from host extents only, so every extent must be static.
+        let r#type = value.r#type();
+        let (indices_type, iota_dimension, dimensions, slice_sizes) =
+            diagonal_gather_layout(r#type.as_ref(), kept_axis, removed_axis)?;
+        if indices_type.shape().dimensions().iter().any(|dimension| dimension.value().is_none()) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "cannot take the diagonal of a value of type `{type}` with dynamic extents in a homogeneous array \
+                     context",
+                ),
+            });
+        }
+        let indices = context.iota(&indices_type, iota_dimension)?;
+        Ok(value.gather(&indices, &dimensions, &slice_sizes, &GatherOptions::new())?)
+    }
+}
+
 impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchingEntrypointPolicy<C> for ArrayBatchingPolicy {
     fn pack_inputs(
         context: &C,
@@ -2917,6 +2943,36 @@ where
             }
             ValueResolution::Staged(_) | ValueResolution::Opaque => None,
         }
+    }
+}
+
+impl<C: Context<Type = ArrayIrType> + DynamicIota<C::Value>> DiagonalBatchingPolicy<C> for ArrayIrBatchingPolicy
+where
+    C::Value: DimensionSize + ValueProjection<ArrayType, Projected: Gather>,
+{
+    fn diagonal(
+        context: &C,
+        value: &C::Value,
+        kept_axis: usize,
+        removed_axis: usize,
+    ) -> Result<C::Value, BatchingError> {
+        // Dynamic extents are read from `value` itself, so the indices share their dimension identities
+        // with the paired input axes. Static extents consume no dimension values.
+        let r#type = value.r#type();
+        let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
+        let (indices_type, iota_dimension, dimensions, slice_sizes) =
+            diagonal_gather_layout(r#type, kept_axis, removed_axis)?;
+        let mut extents = Vec::new();
+        for axis in (0..r#type.rank()).filter(|axis| *axis != removed_axis) {
+            if r#type.dimension(axis).value().is_none() {
+                extents.push(value.dimension_size(axis)?);
+            }
+        }
+        let indices = context.dynamic_iota(&indices_type, iota_dimension, &extents)?;
+        let value = <C::Value as ValueProjection<ArrayType>>::into_projected(value.clone())?;
+        let indices = <C::Value as ValueProjection<ArrayType>>::into_projected(indices)?;
+        let diagonal = value.gather(&indices, &dimensions, &slice_sizes, &GatherOptions::new())?;
+        Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(diagonal))
     }
 }
 
@@ -4088,6 +4144,50 @@ fn batch_axis_sharding<T: std::borrow::Borrow<ArrayType>, I: IntoIterator<Item =
     Ok(dimension.unwrap_or(ShardingDimension::Replicated))
 }
 
+/// Returns the paired gather that takes the diagonal of an array of type `type` along `kept_axis` and `removed_axis`
+/// (refer to [`DiagonalBatchingPolicy::diagonal`]), as the type of its indices, the indices axis along which they
+/// count, its dimension numbers, and its window sizes. The indices enumerate every input coordinate except those of
+/// `removed_axis`, followed by a one-component index vector, and count along the coordinates of `kept_axis`. Pairing
+/// every enumerated axis with the input axis that it enumerates (i.e., as gather batching dimensions) then reads, for
+/// each input coordinate, the element whose `removed_axis` index equals its `kept_axis` index, with no window over a
+/// possibly dynamic extent.
+fn diagonal_gather_layout(
+    r#type: &ArrayType,
+    kept_axis: usize,
+    removed_axis: usize,
+) -> Result<(ArrayType, usize, GatherDimensionNumbers, Vec<usize>), BatchingError> {
+    let rank = r#type.rank();
+    if kept_axis >= rank || removed_axis >= rank || kept_axis == removed_axis {
+        return Err(TypeError::invalid(format!(
+            "cannot take the diagonal of a value of type `{type}` along axes {kept_axis} and {removed_axis}, \
+             which must be two distinct axes of its rank {rank}",
+        ))
+        .into());
+    }
+
+    if r#type.dimension(kept_axis) != r#type.dimension(removed_axis) {
+        return Err(TypeError::invalid(format!(
+            "cannot take the diagonal of a value of type `{type}` along axes {kept_axis} and {removed_axis}, \
+             whose extents differ",
+        ))
+        .into());
+    }
+
+    let paired_axes = (0..rank).filter(|axis| *axis != removed_axis).collect::<Vec<_>>();
+    let mut indices_shape = paired_axes.iter().map(|axis| r#type.dimension(*axis)).collect::<Vec<_>>();
+    indices_shape.push(Dimension::Static(1));
+    let indices_type = ArrayType::new(DataType::I64, Shape::new(indices_shape));
+    let iota_dimension = if removed_axis < kept_axis { kept_axis - 1 } else { kept_axis };
+    let dimensions = GatherDimensionNumbers::new(Vec::new(), vec![removed_axis], vec![removed_axis])
+        .with_batching_dimensions(paired_axes.iter().enumerate().map(|(index, axis)| (*axis, index)).collect());
+
+    // Paired axes use a zero window when they may be empty, exactly as `DynamicGather::dynamic_gather_axis` does.
+    let slice_sizes = (0..rank)
+        .map(|axis| if axis == removed_axis { 1 } else { r#type.dimension(axis).bounds().lower().min(1) })
+        .collect();
+    Ok((indices_type, iota_dimension, dimensions, slice_sizes))
+}
+
 /// Returns the [`ArrayType`] required to place `position` on `axis_sharding`,
 /// or `None` when no normalization is needed.
 fn normalized_batch_axis_type(
@@ -4191,8 +4291,8 @@ mod tests {
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::{
-        Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, InterpretableBatchableOperation,
-        RecursiveBatchingPolicy, batch,
+        Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, DiagonalBatchingPolicy,
+        InterpretableBatchableOperation, RecursiveBatchingPolicy, batch,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer};
@@ -6122,6 +6222,110 @@ mod tests {
     }
 
     #[test]
+    fn test_array_batching_policy_diagonal() -> Result<(), BatchingError> {
+        type Context = EagerContext<Array, ArrayOperation<Array>>;
+        let diagonal = |value: &Array, kept_axis: usize, removed_axis: usize| {
+            <ArrayBatchingPolicy as DiagonalBatchingPolicy<Context>>::diagonal(
+                &Context::new(),
+                value,
+                kept_axis,
+                removed_axis,
+            )
+        };
+
+        // The diagonal of a square matrix is the same along either axis order.
+        let matrix = Array::matrix(3, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])?;
+        assert_eq!(diagonal(&matrix, 0, 1), Ok(Array::vector(vec![1.0f64, 5.0, 9.0])?));
+        assert_eq!(diagonal(&matrix, 1, 0), Ok(Array::vector(vec![1.0f64, 5.0, 9.0])?));
+
+        // The other axes keep their positions, and the kept axis moves one position earlier when it follows the
+        // removed axis: element `(i, j)` of the first result and element `(j, i)` of the second are element `(i, j, i)`
+        // of the input, whose value is `7i + 3j`.
+        let values = (0..18).map(f64::from).collect::<Vec<_>>();
+        let cube = Array::from_elements(ArrayType::new_static(DataType::F64, [3, 2, 3]), &values)?;
+        assert_eq!(diagonal(&cube, 0, 2), Ok(Array::matrix(3, 2, vec![0.0f64, 3.0, 7.0, 10.0, 14.0, 17.0])?));
+        assert_eq!(diagonal(&cube, 2, 0), Ok(Array::matrix(2, 3, vec![0.0f64, 7.0, 14.0, 3.0, 10.0, 17.0])?));
+
+        // Elements are copied exactly, including signed zeros, `NaN`s, and complex values.
+        let special = diagonal(&Array::matrix(2, 2, vec![-0.0f64, 1.0, 2.0, f64::NAN])?, 0, 1)?.elements::<f64>()?;
+        assert!(special[0] == 0.0 && special[0].is_sign_negative() && special[1].is_nan());
+        let complex = Array::matrix(
+            2,
+            2,
+            vec![Complex::new(1.0f64, -1.0), Complex::new(2.0, 0.0), Complex::new(3.0, 0.0), Complex::new(4.0, 4.0)],
+        )?;
+        assert_eq!(
+            diagonal(&complex, 0, 1),
+            Ok(Array::vector(vec![Complex::new(1.0f64, -1.0), Complex::new(4.0, 4.0)])?),
+        );
+
+        // Staging records one gather whose indices count along the kept axis.
+        let (_, program) = DomainTracingContext::<Context>::trace(
+            |value| {
+                Ok(
+                        <ArrayBatchingPolicy as DiagonalBatchingPolicy<
+                            TracingContext<Array, ArrayOperation<Array>>,
+                        >>::diagonal(value.context(), &value, 0, 1)?,
+                    )
+            },
+            ArrayType::new_static(DataType::F64, [3, 3]),
+        )
+        .map_err(BatchingError::Program)?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3, 3] .
+                let %1:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
+                    %2:f64[3] = gather [
+                        dimensions=(offset=[], collapsed_slice=[1], start_index_map=[1], batching=[(0, 0)]),
+                        slice_sizes=[1, 1],
+                    ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // The axes must be two distinct in-range axes with equal extents, and a homogeneous context can only take the
+        // diagonal of static extents.
+        let invalid_axes = "cannot take the diagonal of a value of type `f64[3, 3]` along axes {} and {}, \
+                            which must be two distinct axes of its rank 2";
+        assert_eq!(diagonal(&matrix, 0, 0), Err(TypeError::invalid(invalid_axes.replacen("{}", "0", 2)).into()),);
+        assert_eq!(
+            diagonal(&matrix, 0, 2),
+            Err(TypeError::invalid(invalid_axes.replacen("{}", "0", 1).replacen("{}", "2", 1)).into()),
+        );
+        assert_eq!(
+            diagonal(&Array::matrix(2, 3, vec![0.0f64; 6])?, 0, 1),
+            Err(TypeError::invalid(
+                "cannot take the diagonal of a value of type `f64[2, 3]` along axes 0 and 1, whose extents differ",
+            )
+            .into()),
+        );
+        let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap());
+        let dynamic = Dimension::Dynamic(extent);
+        let result = DomainTracingContext::<Context>::trace(
+            |value| {
+                Ok(<ArrayBatchingPolicy as DiagonalBatchingPolicy<TracingContext<Array, ArrayOperation<Array>>>>::diagonal(
+                    value.context(),
+                    &value,
+                    0,
+                    1,
+                )?)
+            },
+            ArrayType::new(DataType::F64, Shape::new(vec![dynamic.clone(), dynamic])),
+        );
+        assert_eq!(
+            result.map(|_| ()),
+            Err(ProgramError::from(BatchingError::UnsupportedOperation {
+                message: "cannot take the diagonal of a value of type `f64[n, n]` with dynamic extents in a \
+                          homogeneous array context"
+                    .to_string(),
+            })),
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_array_batching_policy_pack_inputs() -> Result<(), BatchingError> {
         let parent = TestArrayContext::new();
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
@@ -7144,6 +7348,61 @@ mod tests {
             trace.input(DimensionType::from(items).into()),
         );
         assert_eq!(ArrayIrBatchingPolicy::static_batch_axis_extent(&staged), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_batching_policy_diagonal() -> Result<(), ProgramError> {
+        // Dynamic extents are read from the value, so one staged diagonal serves every extent, and static extents
+        // consume no dimension values.
+        let extent = DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap());
+        let dynamic = Dimension::Dynamic(extent);
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic.clone(), Dimension::Static(2), dynamic]));
+        let (_, program) = DomainTracingContext::<ArrayIrEagerContext>::trace(
+            |value| {
+                Ok(<ArrayIrBatchingPolicy as DiagonalBatchingPolicy<ArrayIrTraceContext>>::diagonal(
+                    value.context(),
+                    &value,
+                    2,
+                    0,
+                )?)
+            },
+            ArrayIrType::from(r#type),
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[n, 2, n] .
+                let %1:dimension<n ∈ [1, 8)> = dimension_size [axis=2] %0
+                    %2:i64[2, n, 1] = iota [type=i64[2, n, 1], dimension=1] %1
+                    %3:f32[2, n] = gather [
+                        dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0), (2, 1)]),
+                        slice_sizes=[1, 1, 1],
+                    ] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        let values = (0..18).map(|value| value as f32).collect::<Vec<_>>();
+        let cube = Array::from_elements(ArrayType::new_static(DataType::F32, [3, 2, 3]), &values)?;
+        assert_eq!(
+            program.interpret(ArrayIrValue::Array(cube)),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0f32, 7.0, 14.0, 3.0, 10.0, 17.0])?)),
+        );
+
+        // Mismatched extents are rejected before anything is staged.
+        assert_eq!(
+            <ArrayIrBatchingPolicy as DiagonalBatchingPolicy<ArrayIrEagerContext>>::diagonal(
+                &ArrayIrEagerContext::new(),
+                &ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0f32; 6])?),
+                0,
+                1,
+            ),
+            Err(TypeError::invalid(
+                "cannot take the diagonal of a value of type `f32[2, 3]` along axes 0 and 1, whose extents differ",
+            )
+            .into()),
+        );
         Ok(())
     }
 

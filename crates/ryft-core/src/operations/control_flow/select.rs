@@ -8,12 +8,13 @@
 //! element elsewhere. The shapes of all three inputs broadcast together, and the two branch [`DataType`]s promote to
 //! the output data type. The condition must be [`DataType::Boolean`] and it does not take part in that promotion
 //! because it is a mask rather than a value. This is the three-argument form of JAX's
-//! [`jax.numpy.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html), which is more permissive than
-//! [`jax.lax.select`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.select.html), whose inputs must share one
-//! shape and data type. The output keeps the broadcast placement of its inputs and uses the dense row-major layout.
-//! Branches that carry pending reductions must carry identical reduction state, which the output inherits, while the
-//! condition must neither be unreduced nor vary over any of those reduction axes, because selection commutes with a
-//! pending sum only when every shard selects the same way.
+//! [`jax.numpy.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html), which is more permissive
+//! than [`jax.lax.select`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.select.html), whose branches must share
+//! a shape and data type and whose condition must be a scalar or have that shape. The output keeps the broadcast
+//! placement of its inputs and uses the dense row-major layout. Branches that carry pending reductions must carry
+//! identical reduction state, which the output inherits, while the condition must neither be unreduced nor vary over
+//! any of those reduction axes, because selection commutes with a pending sum only when every shard selects the same
+//! way.
 //!
 //! For a fixed condition, `select` is linear in its two branches. Forward mode differentiation therefore selects the
 //! branch tangents under the primal condition and keeps a structural-zero output tangent when both branch tangents are
@@ -274,7 +275,7 @@ impl_differentiable_operation! {
         C: Zero<C::Value>,
         C::Type: DifferentiableType,
         C::Value: ElementwiseDerivativeAlignment<C::Type>,
-        C::Operation: From<SelectOperation<C::Type>>,
+        C::Operation: From<SelectOperation<C::Type>> + From<ZeroLikeOperation<C::Type>>,
     {
         |_operation, context, _driver, inputs| {
             // For a fixed condition, `select` is linear in its branches, and so the output tangent selects the branch
@@ -296,11 +297,32 @@ impl_differentiable_operation! {
                 MaybeZero::Zero(tangent_type)
             } else {
                 let condition = context.primal_to_tangent(condition.primal().clone())?;
-                let on_true = on_true.tangent().clone().materialize(context.tangent())?;
-                let on_false = on_false.tangent().clone().materialize(context.tangent())?;
                 let exemplar = context.primal_to_tangent(primal.clone())?;
-                let mut tangent =
-                    context.tangent().bind(SelectOperation::new(), Vec::new(), &[condition, on_true, on_false])?;
+
+                // Some primal formats cannot represent zero and use a wider tangent format. Convert the shape
+                // exemplar before constructing any zero or using it to broadcast a tangent.
+                let exemplar = exemplar.align_tangent(&tangent_type, &exemplar)?;
+                let mut tangent_inputs = vec![condition];
+                for branch in [on_true, on_false] {
+                    // Align live tangents to the output type before selection. Missing tangents use that same type,
+                    // which also lets an integer branch contribute zero when promotion gives the output a tangent
+                    // space. Dynamic output geometry comes from the primal exemplar rather than a nullary zero.
+                    let tangent = match branch.tangent() {
+                        MaybeZero::Value(tangent) => tangent.align_tangent(&tangent_type, &exemplar)?,
+                        MaybeZero::Zero(_) if tangent_type.identities().next().is_some() => {
+                            let mut zero = context.tangent().bind(
+                                ZeroLikeOperation::new(),
+                                Vec::new(),
+                                std::slice::from_ref(&exemplar),
+                            )?;
+                            check_count!("output", zero, 1, ProgramError);
+                            zero.remove(0).align_tangent(&tangent_type, &exemplar)?
+                        }
+                        MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type.clone()).materialize(context.tangent())?,
+                    };
+                    tangent_inputs.push(tangent);
+                }
+                let mut tangent = context.tangent().bind(SelectOperation::new(), Vec::new(), &tangent_inputs)?;
                 check_count!("output", tangent, 1, ProgramError);
                 MaybeZero::Value(tangent.remove(0).align_tangent(&tangent_type, &exemplar)?)
             };
@@ -395,11 +417,12 @@ impl<A: Value<Type = ArrayType>> From<SelectOperation<ArrayIrType>> for ArrayIrO
 /// values).
 ///
 /// For arrays, the three input shapes broadcast together and the two branch element data types promote to the output
-/// data type, so the inputs need not share a shape and the branches need not share a data type. Selection copies the
-/// chosen element encodings exactly, including NaN payloads and signed zeros, and the output uses the dense row-major
-/// layout. A staged call retains all three inputs, so dynamic extents are read at execution time. Selection is linear
-/// in its branches for a fixed condition. Refer to the [module documentation](self) for its sharding, differentiation,
-/// and batching semantics.
+/// data type, so the inputs need not share a shape and the branches need not share a data type. After any required
+/// element type conversion, selection copies the chosen element encodings exactly, including NaN payloads and signed
+/// zeros. Equal-typed branches retain their original encodings, and the output uses the dense row-major layout. A
+/// staged call retains all three inputs, so dynamic extents are read at execution time. Selection is linear in its
+/// branches for a fixed condition. Refer to the [module documentation](self) for its sharding, differentiation, and
+/// batching semantics.
 ///
 /// # Example
 ///
@@ -413,7 +436,13 @@ impl<A: Value<Type = ArrayType>> From<SelectOperation<ArrayIrType>> for ArrayIrO
 /// ```
 pub trait Select: Sized {
     /// Returns the value whose elements are taken from `on_true` wherever `condition` is `true` and from `on_false`
-    /// elsewhere. Returns an error if `condition` is not Boolean or if the inputs are not broadcast-compatible.
+    /// elsewhere. The inputs broadcast and the branch element types promote as described on [`Select`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if `condition` is not Boolean, if the inputs are not broadcast-compatible, if their
+    /// reduction state violates the constraints in the [module documentation](self), or if their context fails to
+    /// bind the operation.
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError>;
 }
 
@@ -510,11 +539,12 @@ impl<
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
         Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, StridedLayout,
+        MeshAxisType, Shape, StridedLayout, i4,
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::{
@@ -772,6 +802,24 @@ mod tests {
             Array::vector(vec![f32::from_bits(0x7fc00123), -0.0]).unwrap().storage_bytes(),
         );
 
+        // Sub-byte and complex branches preserve their complete element encodings as well.
+        assert_eq!(
+            Array::select(
+                &Array::vector(vec![true, false]).unwrap(),
+                &Array::vector(vec![i4::MIN, i4::MAX]).unwrap(),
+                &Array::scalar(i4::new(-1).unwrap()).unwrap(),
+            ),
+            Ok(Array::vector(vec![i4::MIN, i4::new(-1).unwrap()]).unwrap()),
+        );
+        assert_eq!(
+            Array::select(
+                &Array::vector(vec![true, false]).unwrap(),
+                &Array::scalar(Complex::new(1.0f64, 2.0)).unwrap(),
+                &Array::vector(vec![Complex::new(3.0f64, 4.0), Complex::new(5.0, 6.0)]).unwrap(),
+            ),
+            Ok(Array::vector(vec![Complex::new(1.0f64, 2.0), Complex::new(5.0, 6.0)]).unwrap()),
+        );
+
         // Every input is read through its own physical layout under general broadcasting, and the output is dense.
         let condition = Array::from_elements(
             ArrayType::new_static(DataType::Boolean, [2, 1])
@@ -891,6 +939,8 @@ mod tests {
     fn test_select_differentiation() {
         // Differentiation routes tangents and cotangents through the selected branch. These checks stay explicit
         // because the finite-difference oracle of `check_operation_differentiation!` cannot perturb a Boolean input.
+
+        /// Selects a scaled branch under a comparison of the two inputs.
         fn piecewise<V: Clone + Compare<V> + Select + std::ops::Add<Output = V>>(
             x: V,
             y: V,
@@ -987,6 +1037,126 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_select_differentiation_higher_order() {
+        // Differentiating the gradient of a selected square returns the selected branch's second derivative.
+        for (input, first, second) in [(3.0f64, 6.0f64, 2.0f64), (-3.0, 0.0, 0.0)] {
+            assert_eq!(
+                differentiate_at(Array::scalar(input).unwrap()).value_and_gradient(|value| {
+                    differentiate_at(value)
+                        .gradient(|value| {
+                            let zero = value.zero_like()?;
+                            let condition = value.compare(&zero, ComparisonDirection::GreaterThan)?;
+                            Select::select(&condition, &(value.clone() * value), &zero)
+                        })
+                        .map_err(Into::into)
+                }),
+                Ok((Array::scalar(first).unwrap(), Array::scalar(second).unwrap())),
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_differentiation_dynamic() {
+        // Exercise both positions of a missing tangent with symbolic geometry, including runtime empty arrays.
+        for (live_true_branch, true_data_type) in
+            [(true, DataType::F64), (false, DataType::F64), (false, DataType::I32)]
+        {
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+            let shape = Shape::new(vec![Dimension::Dynamic(size)]);
+            let branch_type = ArrayType::new(DataType::F64, shape.clone());
+            let condition = context.input(ArrayType::new(DataType::Boolean, shape));
+            let on_true = context.input(branch_type.clone().with_data_type(true_data_type));
+            let on_false = context.input(branch_type.clone());
+            let tangent = context.input(branch_type);
+            let true_dual = if live_true_branch {
+                DifferentiationDual::new(on_true, MaybeZero::Value(tangent.clone())).unwrap()
+            } else {
+                DifferentiationDual::new_with_zero_tangent(on_true).unwrap()
+            };
+            let false_dual = if live_true_branch {
+                DifferentiationDual::new_with_zero_tangent(on_false).unwrap()
+            } else {
+                DifferentiationDual::new(on_false, MaybeZero::Value(tangent)).unwrap()
+            };
+            let outputs = SelectOperation::<ArrayType>::new()
+                .jvp(
+                    &DifferentiationContext::fused(context.clone()),
+                    &EmptyRegionDriver,
+                    &[DifferentiationDual::new_with_zero_tangent(condition).unwrap(), true_dual, false_dual],
+                )
+                .unwrap();
+            let MaybeZero::Value(tangent) = outputs[0].tangent() else { panic!("expected a live tangent") };
+            let program = context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<Array>, Vec<Array>>(
+                    vec![outputs[0].primal().atom_id().unwrap(), tangent.atom_id().unwrap()],
+                    vec![Placeholder; 4],
+                    vec![Placeholder; 2],
+                )
+                .unwrap();
+            assert_eq!(
+                program.interpret(vec![
+                    Array::vector(vec![true, false]).unwrap(),
+                    if true_data_type == DataType::I32 {
+                        Array::vector(vec![1i32, 2]).unwrap()
+                    } else {
+                        Array::vector(vec![1.0f64, 2.0]).unwrap()
+                    },
+                    Array::vector(vec![3.0f64, 4.0]).unwrap(),
+                    Array::vector(vec![5.0f64, 7.0]).unwrap(),
+                ]),
+                Ok(vec![
+                    Array::vector(vec![1.0f64, 4.0]).unwrap(),
+                    Array::vector(if live_true_branch { vec![5.0f64, 0.0] } else { vec![0.0f64, 7.0] }).unwrap(),
+                ]),
+            );
+            assert_eq!(
+                program.interpret(vec![
+                    Array::vector(Vec::<bool>::new()).unwrap(),
+                    if true_data_type == DataType::I32 {
+                        Array::vector(Vec::<i32>::new()).unwrap()
+                    } else {
+                        Array::vector(Vec::<f64>::new()).unwrap()
+                    },
+                    Array::vector(Vec::<f64>::new()).unwrap(),
+                    Array::vector(Vec::<f64>::new()).unwrap(),
+                ]),
+                Ok(vec![Array::vector(Vec::<f64>::new()).unwrap(); 2]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_differentiation_dynamic_widened_tangent() {
+        // This primal format cannot represent zero. Its F32 tangent exemplar must be used for the missing tangent.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let shape = Shape::new(vec![Dimension::Dynamic(size)]);
+        let branch_type = ArrayType::new(DataType::F8E8M0FNU, shape.clone());
+        let condition = context.input(ArrayType::new(DataType::Boolean, shape));
+        let on_true = context.input(branch_type.clone());
+        let on_false = context.input(branch_type.clone());
+        let tangent_type = branch_type.tangent().unwrap();
+        let tangent = context.input(tangent_type.clone());
+        let outputs = SelectOperation::<ArrayType>::new()
+            .jvp(
+                &DifferentiationContext::fused(context.clone()),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new_with_zero_tangent(condition).unwrap(),
+                    DifferentiationDual::new(on_true, MaybeZero::Value(tangent)).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(on_false).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs[0].primal().r#type().as_ref(), &branch_type);
+        assert_eq!(outputs[0].tangent().r#type().as_ref(), &tangent_type);
     }
 
     #[test]
@@ -1095,6 +1265,55 @@ mod tests {
                 if message == "operation `select` does not support transposition for input pattern \
                                [condition = linear, on_true = linear, on_false = linear]",
         ));
+    }
+
+    #[test]
+    fn test_select_transposition_dynamic() {
+        // Dynamic zeros read the cotangent's geometry, and the scalar branch sums its selected contributions.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let shape = Shape::new(vec![Dimension::Dynamic(size)]);
+        let branch_type = ArrayType::new(DataType::F64, shape.clone());
+        let cotangent = context.input(branch_type.clone());
+        let condition = context.input(ArrayType::new(DataType::Boolean, shape));
+        let inputs = [
+            PartialValue::Known(condition),
+            PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+            PartialValue::Unknown(branch_type),
+        ];
+        let mut rule_context = TranspositionContext::new(context.clone());
+        let accumulators = rule_context.cotangent_accumulators(&inputs, &[]).unwrap();
+        SelectOperation::<ArrayType>::new()
+            .transpose(&mut rule_context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(cotangent)], &accumulators)
+            .unwrap();
+        let contributions = rule_context.take_cotangents(&accumulators).unwrap();
+        let output_ids = contributions[1..]
+            .iter()
+            .map(|contribution| {
+                let MaybeZero::Value(value) = contribution else { panic!("expected a live cotangent") };
+                value.atom_id().unwrap()
+            })
+            .collect();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(output_ids, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.interpret(vec![
+                Array::vector(vec![5.0f64, 7.0, 11.0]).unwrap(),
+                Array::vector(vec![true, false, true]).unwrap(),
+            ]),
+            Ok(vec![Array::scalar(16.0f32).unwrap(), Array::vector(vec![0.0f64, 7.0, 0.0]).unwrap()]),
+        );
+        assert_eq!(
+            program
+                .interpret(
+                    vec![Array::vector(Vec::<f64>::new()).unwrap(), Array::vector(Vec::<bool>::new()).unwrap(),]
+                ),
+            Ok(vec![Array::scalar(0.0f32).unwrap(), Array::vector(Vec::<f64>::new()).unwrap()]),
+        );
     }
 
     #[test]

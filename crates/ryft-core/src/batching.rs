@@ -965,6 +965,31 @@ pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
     }
 }
 
+/// Policy capability for taking the diagonal of a value along two of its batch axes that share one extent. When two
+/// batching levels of the same extent batch one computation (e.g., a batch of tangents batched around a program that
+/// is itself already batched), the per-item result of item `i` is the element at index `i` along both batch axes, and
+/// the remaining elements form the outer product of the two batches. Custom functions whose batching rules depend on
+/// their input batch axes use this capability to recover exact per-item tangents from such an outer product. Refer to
+/// [`CustomFunction::with_axis_dependent_batching`](crate::CustomFunction::with_axis_dependent_batching) for more
+/// information.
+pub trait DiagonalBatchingPolicy<C: Context>: BatchingPolicy<C> {
+    /// Returns the elements of `value` whose indices along `kept_axis` and `removed_axis` agree. The result has
+    /// the shape of `value` without `removed_axis`, so `kept_axis` moves one position earlier when it follows
+    /// `removed_axis`. Elements are copied exactly (e.g., signed zeros and `NaN`s are preserved).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BatchingError`] when either axis is out of range, when the two axes are the same, when their extents
+    /// differ, or when the policy cannot represent an extent of `value` (e.g., a dynamic extent of a homogeneous array
+    /// policy, whose extents are host integers).
+    fn diagonal(
+        context: &C,
+        value: &C::Value,
+        kept_axis: usize,
+        removed_axis: usize,
+    ) -> Result<C::Value, BatchingError>;
+}
+
 /// Policy capability for invoking the public batching transform on flat parent values. [`Batch::batch`] owns
 /// [`Parameterized`] broadcasting, tracer construction, closure invocation, and output structure reconstruction once
 /// for every program universe. This capability owns the universe-specific boundary mechanics: selecting and validating
