@@ -18,8 +18,8 @@
 //!     the index of the largest and smallest element along one non-empty axis as an integer of a configurable data
 //!     type. An axis that contains a NaN of either sign reports the index of its first NaN, and ties (including ties
 //!     between `-0.0` and `+0.0`) select the lowest index. These are the semantics of JAX's
-//!     [`lax.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmax.html) and
-//!     [`lax.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmin.html).
+//!     [`jax.lax.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmax.html) and
+//!     [`jax.lax.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmin.html).
 //!
 //! The reduced axes are removed from the output shape, and the remaining axes keep their order, as for StableHLO's
 //! [`reduce`](https://openxla.org/stablehlo/spec#reduce). Sums, products, extrema, and Boolean reductions start from
@@ -1718,8 +1718,6 @@ macro_rules! impl_element_divide_by_count_for_complex {
 impl_element_divide_by_count_for_complex!(f32);
 impl_element_divide_by_count_for_complex!(f64);
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Canonical operation name for [`ArgMaxOperation`].
 pub const ARG_MAX_OPERATION_NAME: &str = "argmax";
 
@@ -1788,7 +1786,7 @@ impl Operation for ArgMaxOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        Ok(vec![input_types[0].extremal_index(ARG_MAX_OPERATION_NAME, self.axis, self.index_data_type)?])
+        Ok(vec![input_types[0].index_reduction(ARG_MAX_OPERATION_NAME, self.axis, self.index_data_type)?])
     }
 
     #[inline]
@@ -1829,9 +1827,9 @@ impl<C: Context<Type = ArrayType, Value: ArgMax>, P: RaggedArrayExtentBatchingPo
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         // Padding along a bounded ragged reduced axis is replaced by the lowest value of the input data type, which
-        // can never be strictly larger than a live element. Padding follows the live elements of every batch item, so
-        // a live element that equals the lowest value still wins the tie by its lower index.
-        batch_extremal_index(context, inputs, self.axis, RaggedMaskIdentity::Lowest, |axis| {
+        // can never be strictly larger than a live element. Padding follows the live elements of every batch item,
+        // so a live element that equals the lowest value still wins the tie by its lower index.
+        batch_index_reduction(context, inputs, self.axis, RaggedMaskIdentity::Lowest, |axis| {
             Self::new(axis, self.index_data_type)
         })
     }
@@ -1840,16 +1838,16 @@ impl<C: Context<Type = ArrayType, Value: ArgMax>, P: RaggedArrayExtentBatchingPo
 impl_non_differentiable_operation!(ArgMaxOperation);
 impl_non_transposable_operation!(ArgMaxOperation);
 
-/// Represents the ability to compute the index of the largest element of a value along one axis. Ties select the
-/// lowest index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign reports the index
-/// of its first NaN, and the reduced axis is dropped from the result shape. Boolean, integer, and floating-point values
+/// Represents the ability to compute the index of the largest element of a value along one axis. Ties select the lowest
+/// index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign reports the index of
+/// its first NaN, and the reduced axis is dropped from the result shape. Boolean, integer, and floating-point values
 /// are supported, while complex values are rejected, because complex numbers have no order. The reduced axis must be
 /// non-empty, and the integer index data type must be able to represent every index along it (i.e., its static extent
-/// or the upper bound of its dynamic extent). An explicitly sharded reduced axis is supported, and its sharding entry is
-/// dropped from the output, leaving the cross-shard combination to the backend partitioner, while inputs with unreduced
-/// axes are rejected. These are the semantics of
-/// [JAX's `lax.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmax.html), except that JAX silently
-/// wraps indices that its index data type cannot represent.
+/// or the upper bound of its dynamic extent). An explicitly sharded reduced axis is supported, and its sharding entry
+/// is dropped from the output, leaving the cross-shard combination to the backend partitioner, while inputs with
+/// unreduced axes are rejected. These are the semantics of JAX's
+/// [`jax.lax.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmax.html),
+/// except that JAX silently wraps indices that its index data type cannot represent.
 ///
 /// Concrete [`Array`]s compute the indices immediately, while context-carrying values bind an [`ArgMaxOperation`]
 /// through their own context. The indices are integers, and so their derivative is a structural zero.
@@ -1907,7 +1905,7 @@ impl ArgMax for Array {
         let operation = ArgMaxOperation::from_arguments(&self.r#type(), axis.into(), index_data_type)?;
         let mut output_types = operation.infer_output_types(&[self.r#type().into_owned()], &[])?;
         check_count!("output", output_types, 1, ProgramError);
-        self.extremal_index_elements(output_types.remove(0), operation.axis(), true)
+        self.index_reduction_elements(output_types.remove(0), operation.axis(), true)
     }
 }
 
@@ -1928,6 +1926,8 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`ArgMinOperation`].
 pub const ARG_MIN_OPERATION_NAME: &str = "argmin";
@@ -1997,7 +1997,7 @@ impl Operation for ArgMinOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
-        Ok(vec![input_types[0].extremal_index(ARG_MIN_OPERATION_NAME, self.axis, self.index_data_type)?])
+        Ok(vec![input_types[0].index_reduction(ARG_MIN_OPERATION_NAME, self.axis, self.index_data_type)?])
     }
 
     #[inline]
@@ -2040,7 +2040,7 @@ impl<C: Context<Type = ArrayType, Value: ArgMin>, P: RaggedArrayExtentBatchingPo
         // Padding along a bounded ragged reduced axis is replaced by the highest value of the input data type, which
         // can never be strictly smaller than a live element. Padding follows the live elements of every batch item, so
         // a live element that equals the highest value still wins the tie by its lower index.
-        batch_extremal_index(context, inputs, self.axis, RaggedMaskIdentity::Highest, |axis| {
+        batch_index_reduction(context, inputs, self.axis, RaggedMaskIdentity::Highest, |axis| {
             Self::new(axis, self.index_data_type)
         })
     }
@@ -2056,8 +2056,8 @@ impl_non_transposable_operation!(ArgMinOperation);
 /// non-empty, and the integer index data type must be able to represent every index along it (i.e., its static extent
 /// or the upper bound of its dynamic extent). An explicitly sharded reduced axis is supported, and its sharding entry is
 /// dropped from the output, leaving the cross-shard combination to the backend partitioner, while inputs with unreduced
-/// axes are rejected. These are the semantics of
-/// [JAX's `lax.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmin.html), except that JAX silently
+/// axes are rejected. These are the semantics of JAX's
+/// [`jax.lax.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.argmin.html), except that JAX silently
 /// wraps indices that its index data type cannot represent.
 ///
 /// Concrete [`Array`]s compute the indices immediately, while context-carrying values bind an [`ArgMinOperation`]
@@ -2116,7 +2116,7 @@ impl ArgMin for Array {
         let operation = ArgMinOperation::from_arguments(&self.r#type(), axis.into(), index_data_type)?;
         let mut output_types = operation.infer_output_types(&[self.r#type().into_owned()], &[])?;
         check_count!("output", output_types, 1, ProgramError);
-        self.extremal_index_elements(output_types.remove(0), operation.axis(), false)
+        self.index_reduction_elements(output_types.remove(0), operation.axis(), false)
     }
 }
 
@@ -2139,8 +2139,8 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 }
 
 impl ArrayType {
-    /// Returns the output [`ArrayType`] of the extremal-index reduction named `operation_name` (i.e., `argmax` or
-    /// `argmin`) of `self` along `axis` with `index_data_type` indices, after validating that:
+    /// Returns the output [`ArrayType`] of the index reduction named `operation_name` (i.e., `argmax` or `argmin`) of
+    /// `self` along `axis` with `index_data_type` indices, after validating that:
     ///
     ///   - `axis` is within `0..self.rank()`,
     ///   - the element data type of `self` is Boolean, integer, or floating point, since complex numbers have no order,
@@ -2154,7 +2154,7 @@ impl ArrayType {
     ///
     /// The output is the type of a maximum reduction of `self` along `axis` (refer to the documentation of
     /// `ArrayType::reduce`), with the element data type replaced by `index_data_type`.
-    fn extremal_index(&self, operation_name: &str, axis: usize, index_data_type: DataType) -> Result<Self, TypeError> {
+    fn index_reduction(&self, operation_name: &str, axis: usize, index_data_type: DataType) -> Result<Self, TypeError> {
         let rank = self.rank();
         if axis >= rank {
             return Err(TypeError::invalid(format!("`{operation_name}` axis {axis} is out of bounds for rank {rank}")));
@@ -2201,7 +2201,7 @@ impl Array {
     /// validated the input and derived `output_type` through the type inference of [`ArgMaxOperation`] or
     /// [`ArgMinOperation`], which guarantees a non-empty reduced axis, an ordered element data type, and indices that
     /// `output_type` can represent.
-    fn extremal_index_elements(
+    fn index_reduction_elements(
         &self,
         output_type: ArrayType,
         axis: usize,
@@ -2244,14 +2244,14 @@ impl Array {
     }
 }
 
-/// Batches the extremal-index reduction that `operation` creates for a given reduced axis (i.e., an [`ArgMaxOperation`]
-/// or an [`ArgMinOperation`]) of the single input in `inputs` along the per-item axis `axis`. The reduced axis is
-/// expressed in the per-item coordinate system, so it shifts past the inserted batch axis, and the output batch axis
-/// moves down by one when the reduced axis precedes it, because the output drops that axis. Padding along a bounded
-/// ragged reduced axis is replaced by `identity` before the reduction, which consumes that axis and is reported as the
+/// Batches the index reduction that `operation` creates for a given reduced axis (i.e., an [`ArgMaxOperation`] or an
+/// [`ArgMinOperation`]) of the single input in `inputs` along the per-item axis `axis`. The reduced axis is expressed
+/// in the per-item coordinate system, so it shifts past the inserted batch axis, and the output batch axis moves down
+/// by one when the reduced axis precedes it, because the output drops that axis. Padding along a bounded ragged reduced
+/// axis is replaced by `identity` before the reduction, which consumes that axis and is reported as the
 /// [`BatchedOutputs`] evidence, while every other ragged axis survives onto the output. A batch item whose ragged
 /// extent along the reduced axis is zero has no live elements and produces index zero.
-fn batch_extremal_index<
+fn batch_index_reduction<
     C: Context<Type = ArrayType>,
     P: RaggedArrayExtentBatchingPolicy<C>,
     O: InterpretableOperation<C> + Operation<Type = ArrayType>,
@@ -4287,7 +4287,7 @@ mod tests {
     fn test_argmax_interpretation() {
         // An axis that contains a NaN of either sign reports its first NaN, ties select the lowest index (including
         // ties between `-0.0` and `+0.0`), and the reduced axis is dropped from the result, which are the indices that
-        // JAX's `lax.argmax` returns.
+        // JAX's `jax.lax.argmax` returns.
         assert_eq!(Array::vector(vec![1.0, f64::NAN, 3.0]).unwrap().argmax(0), Ok(Array::scalar(1i32).unwrap()));
         assert_eq!(Array::vector(vec![1.0, -f64::NAN, f64::NAN]).unwrap().argmax(0), Ok(Array::scalar(1i32).unwrap()));
         assert_eq!(Array::vector(vec![-0.0, 0.0]).unwrap().argmax(0), Ok(Array::scalar(0i32).unwrap()));
