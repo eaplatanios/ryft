@@ -69,11 +69,11 @@ pub const PARALLEL_REDUCE_OPERATION_NAME: &str = "parallel_reduce";
 /// participant count, the present-value count, and the logical-element count define different operations.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelReduceOperation {
-    /// Refer to the documentation of [`axis_name`](Self::axis_name) for more information.
-    axis_name: String,
-
     /// Refer to the documentation of [`kind`](Self::kind) for more information.
     kind: ReductionKind,
+
+    /// Refer to the documentation of [`axis_name`](Self::axis_name) for more information.
+    axis_name: String,
 
     /// Refer to the documentation of [`axis_size`](Self::axis_size) for more information.
     axis_size: Option<usize>,
@@ -88,13 +88,13 @@ pub struct ParallelReduceOperation {
 // TODO(eaplatanios): Review from here onwards.
 
 impl ParallelReduceOperation {
-    /// Creates a new ordinary [`ParallelReduceOperation`] over `axis_name` with the provided `kind`.
+    /// Creates a new ordinary [`ParallelReduceOperation`] with the provided `kind` over `axis_name`.
     #[inline]
-    pub fn new(axis_name: String, kind: ReductionKind) -> Self {
-        Self { axis_name, kind, axis_size: None, axis_index_groups: None, mesh: None }
+    pub fn new(kind: ReductionKind, axis_name: String) -> Self {
+        Self { kind, axis_name, axis_size: None, axis_index_groups: None, mesh: None }
     }
 
-    /// Creates a new grouped [`ParallelReduceOperation`] over `axis_name` with the provided `kind`, after validating
+    /// Creates a new grouped [`ParallelReduceOperation`] with the provided `kind` over `axis_name`, after validating
     /// that `axis_index_groups` is an equal-sized exact partition of `0..axis_size`.
     ///
     /// # Errors
@@ -102,13 +102,13 @@ impl ParallelReduceOperation {
     /// Returns a [`TypeError`] if `axis_size` is zero or if `axis_index_groups` is empty, contains an empty group,
     /// contains groups of different sizes, or does not contain every participant in `0..axis_size` exactly once.
     pub fn grouped(
-        axis_name: String,
         kind: ReductionKind,
+        axis_name: String,
         axis_size: usize,
         axis_index_groups: Vec<Vec<usize>>,
     ) -> Result<Self, TypeError> {
         effective_collective_axis_size(PARALLEL_REDUCE_OPERATION_NAME, axis_size, Some(axis_index_groups.as_slice()))?;
-        Ok(Self { axis_name, kind, axis_size: Some(axis_size), axis_index_groups: Some(axis_index_groups), mesh: None })
+        Ok(Self { kind, axis_name, axis_size: Some(axis_size), axis_index_groups: Some(axis_index_groups), mesh: None })
     }
 
     /// Returns this [`ParallelReduceOperation`] configured to reduce over a manual axis of `mesh`. The input must vary
@@ -121,16 +121,16 @@ impl ParallelReduceOperation {
         self
     }
 
-    /// Returns the name of the axis across whose participants this [`ParallelReduceOperation`] reduces.
-    #[inline]
-    pub fn axis_name(&self) -> &str {
-        &self.axis_name
-    }
-
     /// Returns the [`ReductionKind`] of this [`ParallelReduceOperation`].
     #[inline]
     pub fn kind(&self) -> ReductionKind {
         self.kind
+    }
+
+    /// Returns the name of the axis across whose participants this [`ParallelReduceOperation`] reduces.
+    #[inline]
+    pub fn axis_name(&self) -> &str {
+        &self.axis_name
     }
 
     /// Returns the full size of the named axis of a grouped [`ParallelReduceOperation`], or [`None`] for an ungrouped
@@ -623,7 +623,7 @@ where
             .named_axis(axis_name)
             .ok_or_else(|| AxisError::UnboundAxisName { name: axis_name.to_string() })?;
         let NamedAxis::Mesh { mesh, size, .. } = named_axis else {
-            let operation = ParallelReduceOperation::new(axis_name.to_string(), kind);
+            let operation = ParallelReduceOperation::new(kind, axis_name.to_string());
             let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(self))?;
             check_count!("output", outputs, 1, ProgramError);
             return Ok(outputs.remove(0));
@@ -663,7 +663,7 @@ where
                 return sum.log()?.add(&shift);
             }
             kind => {
-                let operation = ParallelReduceOperation::new(axis_name.to_string(), kind).with_mesh(mesh);
+                let operation = ParallelReduceOperation::new(kind, axis_name.to_string()).with_mesh(mesh);
                 let mut outputs = context.bind(operation, Vec::new(), &[input])?;
                 check_count!("output", outputs, 1, ProgramError);
                 return Ok(outputs.remove(0));
@@ -672,7 +672,7 @@ where
 
         // A mean over a manual mesh axis is the mesh-form sum divided by the axis size, exactly as JAX's `pmean` is
         // `psum(x) / n` at the wrapper level with no `pmean` primitive. The division happens in the element data type.
-        let operation = ParallelReduceOperation::new(axis_name.to_string(), ReductionKind::Sum).with_mesh(mesh);
+        let operation = ParallelReduceOperation::new(ReductionKind::Sum, axis_name.to_string()).with_mesh(mesh);
         let mut outputs = context.bind(operation, Vec::new(), &[input])?;
         check_count!("output", outputs, 1, ProgramError);
         let output = outputs.remove(0);
@@ -696,7 +696,7 @@ where
     ) -> Result<Self, ProgramError> {
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        let operation = ParallelReduceOperation::grouped(axis_name.to_string(), kind, axis_size, axis_index_groups)?;
+        let operation = ParallelReduceOperation::grouped(kind, axis_name.to_string(), axis_size, axis_index_groups)?;
         let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -786,10 +786,10 @@ mod tests {
 
     #[test]
     fn test_parallel_reduce() {
-        let operation = ParallelReduceOperation::new("i".to_string(), ReductionKind::Sum);
+        let operation = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string());
         assert_eq!(operation.name(), PARALLEL_REDUCE_OPERATION_NAME);
-        assert_eq!(operation.axis_name(), "i");
         assert_eq!(operation.kind(), ReductionKind::Sum);
+        assert_eq!(operation.axis_name(), "i");
         assert_eq!(operation.axis_size(), None);
         assert_eq!(operation.axis_index_groups(), None);
         assert_eq!(operation.group_size(), None);
@@ -798,7 +798,7 @@ mod tests {
 
         // Grouped reductions record the full axis size and their participant groups in order.
         let grouped =
-            ParallelReduceOperation::grouped("x".to_string(), ReductionKind::Mean, 4, vec![vec![0, 2], vec![3, 1]])
+            ParallelReduceOperation::grouped(ReductionKind::Mean, "x".to_string(), 4, vec![vec![0, 2], vec![3, 1]])
                 .unwrap();
         assert_eq!(grouped.name(), PARALLEL_REDUCE_OPERATION_NAME);
         assert_eq!(grouped.axis_size(), Some(4));
@@ -827,21 +827,21 @@ mod tests {
             (2, vec![vec![0, 2]], "`parallel_reduce` axis index 2 is out of bounds for axis size 2"),
         ] {
             assert_eq!(
-                ParallelReduceOperation::grouped("x".to_string(), ReductionKind::Sum, axis_size, axis_index_groups,),
+                ParallelReduceOperation::grouped(ReductionKind::Sum, "x".to_string(), axis_size, axis_index_groups,),
                 Err(TypeError::invalid(message)),
             );
         }
 
         // Mesh reductions record and render their mesh.
         let (mesh, _, _) = mesh_scalar_types();
-        let operation = ParallelReduceOperation::new("m".to_string(), ReductionKind::Max).with_mesh(mesh.clone());
+        let operation = ParallelReduceOperation::new(ReductionKind::Max, "m".to_string()).with_mesh(mesh.clone());
         assert_eq!(operation.name(), PARALLEL_REDUCE_OPERATION_NAME);
         assert_eq!(operation.mesh(), Some(&mesh));
         assert_eq!(
             operation.to_string(),
             "parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]]",
         );
-        assert_ne!(operation, ParallelReduceOperation::new("m".to_string(), ReductionKind::Max));
+        assert_ne!(operation, ParallelReduceOperation::new(ReductionKind::Max, "m".to_string()));
     }
 
     #[test]
@@ -850,7 +850,7 @@ mod tests {
         // validates the element data type of its kind.
         let (mesh, invariant, varying) = mesh_scalar_types();
         check_operation_type_inference!(
-            operation = ParallelReduceOperation::new("i".to_string(), ReductionKind::Sum),
+            operation = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string()),
             cases = [
                 {
                     input_types = [ArrayType::new_static(DataType::F32, [2, 3])],
@@ -869,8 +869,8 @@ mod tests {
         );
         check_operation_type_inference!(
             operation = ParallelReduceOperation::grouped(
-                "i".to_string(),
                 ReductionKind::Mean,
+                "i".to_string(),
                 4,
                 vec![vec![0, 1], vec![2, 3]],
             )
@@ -884,7 +884,7 @@ mod tests {
             ],
         );
         check_operation_type_inference!(
-            operation = ParallelReduceOperation::new("i".to_string(), ReductionKind::Max),
+            operation = ParallelReduceOperation::new(ReductionKind::Max, "i".to_string()),
             cases = [
                 {
                     input_types = [ArrayType::new_static(DataType::Boolean, [2])],
@@ -897,7 +897,7 @@ mod tests {
             ],
         );
         check_operation_type_inference!(
-            operation = ParallelReduceOperation::new("i".to_string(), ReductionKind::Min),
+            operation = ParallelReduceOperation::new(ReductionKind::Min, "i".to_string()),
             cases = [
                 {
                     input_types = [ArrayType::new_static(DataType::I32, [2])],
@@ -910,7 +910,7 @@ mod tests {
             ],
         );
         check_operation_type_inference!(
-            operation = ParallelReduceOperation::new("i".to_string(), ReductionKind::Product),
+            operation = ParallelReduceOperation::new(ReductionKind::Product, "i".to_string()),
             cases = [
                 {
                     input_types = [ArrayType::new_static(DataType::I32, [2])],
@@ -923,7 +923,7 @@ mod tests {
             ],
         );
         check_operation_type_inference!(
-            operation = ParallelReduceOperation::new("i".to_string(), ReductionKind::LogSumExp),
+            operation = ParallelReduceOperation::new(ReductionKind::LogSumExp, "i".to_string()),
             cases = [
                 {
                     input_types = [ArrayType::new_static(DataType::F32, [2])],
@@ -947,7 +947,7 @@ mod tests {
         );
         for kind in [ReductionKind::Any, ReductionKind::All] {
             check_operation_type_inference!(
-                operation = ParallelReduceOperation::new("i".to_string(), kind),
+                operation = ParallelReduceOperation::new(kind, "i".to_string()),
                 cases = [
                     {
                         input_types = [ArrayType::new_static(DataType::Boolean, [2])],
@@ -969,11 +969,11 @@ mod tests {
                 .unwrap()
         };
         check_operation_type_inference!(
-            operation = ParallelReduceOperation::new("i".to_string(), ReductionKind::Sum),
+            operation = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string()),
             cases = [{ input_types = [unreduced(DataType::I32)], output_types = [unreduced(DataType::I32)] }],
         );
         check_operation_type_inference!(
-            operation = ParallelReduceOperation::new("i".to_string(), ReductionKind::Mean),
+            operation = ParallelReduceOperation::new(ReductionKind::Mean, "i".to_string()),
             cases = [
                 { input_types = [unreduced(DataType::F32)], output_types = [unreduced(DataType::F32)] },
                 {
@@ -984,7 +984,7 @@ mod tests {
         );
         for kind in [ReductionKind::Product, ReductionKind::LogSumExp, ReductionKind::Max, ReductionKind::Min] {
             check_operation_type_inference!(
-                operation = ParallelReduceOperation::new("i".to_string(), kind),
+                operation = ParallelReduceOperation::new(kind, "i".to_string()),
                 cases = [{
                     input_types = [unreduced(DataType::F32)],
                     error = format!("`parallel_reduce` with kind `{kind}` cannot reduce inputs with unreduced axes"),
@@ -997,7 +997,7 @@ mod tests {
         let sharding = invariant.sharding().unwrap().clone();
         let with_sharding = |sharding: Sharding| ArrayType::scalar(DataType::F32).with_sharding(sharding).unwrap();
         for kind in [ReductionKind::Sum, ReductionKind::Product, ReductionKind::Max, ReductionKind::Min] {
-            let operation = ParallelReduceOperation::new("m".to_string(), kind).with_mesh(mesh.clone());
+            let operation = ParallelReduceOperation::new(kind, "m".to_string()).with_mesh(mesh.clone());
             assert_eq!(operation.infer_output_types(&[varying.clone()], &[]), Ok(vec![invariant.clone()]));
             assert_eq!(operation.fold(&[varying.clone()], &[]), Ok(None));
             assert_eq!(
@@ -1040,20 +1040,20 @@ mod tests {
             }
             let other_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Manual).unwrap()]).unwrap();
             assert_eq!(
-                ParallelReduceOperation::new("m".to_string(), kind)
+                ParallelReduceOperation::new(kind, "m".to_string())
                     .with_mesh(other_mesh)
                     .infer_output_types(&[varying.clone()], &[]),
                 Err(TypeError::invalid("`parallel_reduce` input mesh does not match the operation mesh")),
             );
             let explicit = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
             assert_eq!(
-                ParallelReduceOperation::new("m".to_string(), kind)
+                ParallelReduceOperation::new(kind, "m".to_string())
                     .with_mesh(explicit)
                     .infer_output_types(&[varying.clone()], &[]),
                 Err(TypeError::invalid("`parallel_reduce` mesh axis `m` must be manual")),
             );
             assert_eq!(
-                ParallelReduceOperation::grouped("m".to_string(), kind, 4, vec![vec![0, 1], vec![2, 3]])
+                ParallelReduceOperation::grouped(kind, "m".to_string(), 4, vec![vec![0, 1], vec![2, 3]])
                     .unwrap()
                     .with_mesh(mesh.clone())
                     .infer_output_types(&[varying.clone()], &[]),
@@ -1065,7 +1065,7 @@ mod tests {
         let boolean = |sharding: Sharding| ArrayType::scalar(DataType::Boolean).with_sharding(sharding).unwrap();
         for kind in [ReductionKind::Any, ReductionKind::All] {
             assert_eq!(
-                ParallelReduceOperation::new("m".to_string(), kind)
+                ParallelReduceOperation::new(kind, "m".to_string())
                     .with_mesh(mesh.clone())
                     .infer_output_types(&[boolean(sharding.clone().with_varying_manual_axes(["m"]).unwrap())], &[]),
                 Ok(vec![boolean(sharding.clone())]),
@@ -1077,20 +1077,20 @@ mod tests {
         let unreduced = sharding.with_unreduced_axes(["outer"]).unwrap();
         let input = with_sharding(unreduced.clone().with_varying_manual_axes(["m"]).unwrap());
         assert_eq!(
-            ParallelReduceOperation::new("m".to_string(), ReductionKind::Sum)
+            ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string())
                 .with_mesh(mesh.clone())
                 .infer_output_types(std::slice::from_ref(&input), &[]),
             Ok(vec![with_sharding(unreduced)]),
         );
         assert_eq!(
-            ParallelReduceOperation::new("m".to_string(), ReductionKind::Max)
+            ParallelReduceOperation::new(ReductionKind::Max, "m".to_string())
                 .with_mesh(mesh.clone())
                 .infer_output_types(&[input], &[]),
             Err(TypeError::invalid("`parallel_reduce` with kind `max` cannot reduce inputs with unreduced axes")),
         );
         for kind in [ReductionKind::Mean, ReductionKind::LogSumExp] {
             assert_eq!(
-                ParallelReduceOperation::new("m".to_string(), kind)
+                ParallelReduceOperation::new(kind, "m".to_string())
                     .with_mesh(mesh.clone())
                     .infer_output_types(std::slice::from_ref(&varying), &[]),
                 Err(TypeError::invalid(format!(
@@ -1109,16 +1109,16 @@ mod tests {
         let input = Array::scalar(2.0f32).unwrap();
         for (operation, message) in [
             (
-                ParallelReduceOperation::new("i".to_string(), ReductionKind::Sum),
+                ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string()),
                 "cannot interpret `parallel_reduce` over axis `i` without an enclosing binder",
             ),
             (
-                ParallelReduceOperation::grouped("i".to_string(), ReductionKind::Mean, 2, vec![vec![0], vec![1]])
+                ParallelReduceOperation::grouped(ReductionKind::Mean, "i".to_string(), 2, vec![vec![0], vec![1]])
                     .unwrap(),
                 "cannot interpret `parallel_reduce` over axis `i` without an enclosing binder",
             ),
             (
-                ParallelReduceOperation::new("m".to_string(), ReductionKind::Max).with_mesh(mesh),
+                ParallelReduceOperation::new(ReductionKind::Max, "m".to_string()).with_mesh(mesh),
                 "`parallel_reduce` over manual mesh axis `m` requires an execution backend owning the mesh",
             ),
         ] {
@@ -1132,8 +1132,8 @@ mod tests {
     #[test]
     fn test_parallel_reduce_partial_evaluation() {
         let (mesh, invariant, varying) = mesh_scalar_types();
-        let ordinary = ParallelReduceOperation::new("i".to_string(), ReductionKind::Sum);
-        let mesh_sum = ParallelReduceOperation::new("m".to_string(), ReductionKind::Sum).with_mesh(mesh);
+        let ordinary = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string());
+        let mesh_sum = ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string()).with_mesh(mesh);
         for (operation, input_type, output_type) in [
             (ordinary, ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F32)),
             (mesh_sum, varying.clone(), invariant.clone()),
@@ -1174,9 +1174,9 @@ mod tests {
     fn test_parallel_reduce_batching() {
         // A level that binds the reduction's axis collapses its mapped axis, wherever that axis sits, and returns a
         // replicated result that preserves the element data type (so integer means truncate toward zero).
-        let sum = ParallelReduceOperation::new("i".to_string(), ReductionKind::Sum);
-        let mean = ParallelReduceOperation::new("i".to_string(), ReductionKind::Mean);
-        let max = ParallelReduceOperation::new("i".to_string(), ReductionKind::Max);
+        let sum = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string());
+        let mean = ParallelReduceOperation::new(ReductionKind::Mean, "i".to_string());
+        let max = ParallelReduceOperation::new(ReductionKind::Max, "i".to_string());
         let mapped = |value: Array, axis: usize| ArrayBatch::new(value, BatchAxis::new(axis)).unwrap();
         assert_eq!(
             batch_parallel_reduce(&sum, 2, mapped(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(), 0)),
@@ -1198,11 +1198,11 @@ mod tests {
             batch_parallel_reduce(&mean, 2, mapped(Array::matrix(2, 2, vec![1i32, 2, 2, 5]).unwrap(), 0)),
             Ok(vec![ArrayBatch::replicated(Array::vector(vec![1i32, 3]).unwrap())]),
         );
-        let product = ParallelReduceOperation::new("i".to_string(), ReductionKind::Product);
-        let log_sum_exp = ParallelReduceOperation::new("i".to_string(), ReductionKind::LogSumExp);
-        let min = ParallelReduceOperation::new("i".to_string(), ReductionKind::Min);
-        let any = ParallelReduceOperation::new("i".to_string(), ReductionKind::Any);
-        let all = ParallelReduceOperation::new("i".to_string(), ReductionKind::All);
+        let product = ParallelReduceOperation::new(ReductionKind::Product, "i".to_string());
+        let log_sum_exp = ParallelReduceOperation::new(ReductionKind::LogSumExp, "i".to_string());
+        let min = ParallelReduceOperation::new(ReductionKind::Min, "i".to_string());
+        let any = ParallelReduceOperation::new(ReductionKind::Any, "i".to_string());
+        let all = ParallelReduceOperation::new(ReductionKind::All, "i".to_string());
         assert_eq!(
             batch_parallel_reduce(&product, 2, mapped(Array::matrix(2, 2, vec![2i32, 3, 4, -5]).unwrap(), 0)),
             Ok(vec![ArrayBatch::replicated(Array::vector(vec![8i32, -15]).unwrap())]),
@@ -1253,7 +1253,7 @@ mod tests {
 
         // A level that binds the axis rejects participant groups.
         let grouped =
-            ParallelReduceOperation::grouped("i".to_string(), ReductionKind::Sum, 2, vec![vec![0], vec![1]]).unwrap();
+            ParallelReduceOperation::grouped(ReductionKind::Sum, "i".to_string(), 2, vec![vec![0], vec![1]]).unwrap();
         assert_eq!(
             batch_parallel_reduce(&grouped, 2, mapped(Array::vector(vec![1.0, 2.0]).unwrap(), 0)),
             Err(BatchingError::UnsupportedOperation {
@@ -1285,7 +1285,7 @@ mod tests {
         // intact, exactly as it does its adjoint `parallel_vary`, while a level that binds the same name cannot stand
         // in for the manual mesh axis.
         let (mesh, _, _) = mesh_scalar_types();
-        let operation = ParallelReduceOperation::new("m".to_string(), ReductionKind::Sum).with_mesh(mesh.clone());
+        let operation = ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string()).with_mesh(mesh.clone());
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let packed = trace.input(
             ArrayType::new_static(DataType::F32, [2, 3])
@@ -1348,7 +1348,7 @@ mod tests {
         .with_axis_name("i".to_string());
         let batch_ragged = |kind: ReductionKind, input: ArrayBatch<Array>| {
             Ok::<_, BatchingError>(
-                ParallelReduceOperation::new("i".to_string(), kind)
+                ParallelReduceOperation::new(kind, "i".to_string())
                     .batch(&context, &EmptyRegionDriver, &[input])?
                     .into_parts()
                     .0,
@@ -1469,7 +1469,7 @@ mod tests {
                 .unwrap()
                 .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected().unwrap(), length.clone(), vec![0])])
                 .unwrap();
-            let output = ParallelReduceOperation::new("i".to_string(), kind)
+            let output = ParallelReduceOperation::new(kind, "i".to_string())
                 .batch(&context, &EmptyRegionDriver, &[input])
                 .unwrap()
                 .into_parts()
@@ -1510,7 +1510,7 @@ mod tests {
         )
         .with_axis_name("i".to_string());
         let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0)).unwrap();
-        let output = ParallelReduceOperation::new("i".to_string(), ReductionKind::Mean)
+        let output = ParallelReduceOperation::new(ReductionKind::Mean, "i".to_string())
             .batch(&context, &EmptyRegionDriver, &[input])
             .unwrap()
             .into_parts()
@@ -1544,7 +1544,7 @@ mod tests {
         let (mesh, invariant, varying) = mesh_scalar_types();
         let input_type = ArrayType::scalar(DataType::F32);
         assert_eq!(
-            parallel_reduce_program(ParallelReduceOperation::new("i".to_string(), ReductionKind::Mean), input_type,)
+            parallel_reduce_program(ParallelReduceOperation::new(ReductionKind::Mean, "i".to_string()), input_type,)
                 .jvp()
                 .unwrap()
                 .to_string(),
@@ -1555,7 +1555,7 @@ mod tests {
                 in (%2, %3)"
             },
         );
-        let mesh_sum = ParallelReduceOperation::new("m".to_string(), ReductionKind::Sum).with_mesh(mesh.clone());
+        let mesh_sum = ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string()).with_mesh(mesh.clone());
         assert_eq!(
             parallel_reduce_program(mesh_sum.clone(), varying.clone()).jvp().unwrap().to_string(),
             indoc! {"
@@ -1586,7 +1586,7 @@ mod tests {
         // Every other kind is nonlinear and has no differentiation rule, although a structural zero tangent still
         // stays a structural zero, because every JVP is linear in its tangent.
         for kind in [ReductionKind::Product, ReductionKind::LogSumExp, ReductionKind::Max, ReductionKind::Min] {
-            let operation = ParallelReduceOperation::new("i".to_string(), kind);
+            let operation = ParallelReduceOperation::new(kind, "i".to_string());
             let context = TracingContext::<Array, ArrayOperation<Array>>::new();
             let input = context.input(ArrayType::scalar(DataType::F32));
             let outputs = operation
@@ -1670,7 +1670,7 @@ mod tests {
         let (mesh, invariant, varying) = mesh_scalar_types();
         for kind in [ReductionKind::Sum, ReductionKind::Mean] {
             let program = parallel_reduce_program(
-                ParallelReduceOperation::new("i".to_string(), kind),
+                ParallelReduceOperation::new(kind, "i".to_string()),
                 ArrayType::scalar(DataType::F32),
             );
             assert_eq!(
@@ -1681,7 +1681,7 @@ mod tests {
 
         // A mesh sum hands the shared cotangent to every device, which is a `parallel_vary`, and transposing that
         // recovers the sum.
-        let mesh_sum = ParallelReduceOperation::new("m".to_string(), ReductionKind::Sum).with_mesh(mesh);
+        let mesh_sum = ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string()).with_mesh(mesh);
         let program = parallel_reduce_program(mesh_sum.clone(), varying.clone());
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
@@ -1728,7 +1728,7 @@ mod tests {
         // A maximum is nonlinear and cannot be transposed.
         let accumulators = transposition.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
-            ParallelReduceOperation::new("i".to_string(), ReductionKind::Max).transpose(
+            ParallelReduceOperation::new(ReductionKind::Max, "i".to_string()).transpose(
                 &mut transposition,
                 &EmptyRegionDriver,
                 &inputs,

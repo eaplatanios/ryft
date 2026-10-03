@@ -233,7 +233,7 @@ impl_differentiable_operation! {
                 };
 
                 let mut contributions = context.bind(
-                    ParallelReduceOperation::new(operation.axis_name.clone(), ReductionKind::Sum)
+                    ParallelReduceOperation::new(ReductionKind::Sum, operation.axis_name.clone())
                         .with_mesh(mesh),
                     Vec::new(),
                     std::slice::from_ref(cotangent),
