@@ -259,8 +259,6 @@ impl SortOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Display for SortOperation {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -284,6 +282,7 @@ impl Operation for SortOperation {
         let Some(key_type) = input_types.first() else {
             return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` needs at least one input")));
         };
+
         let key_count = self.key_count.get();
         if key_count > input_types.len() {
             return Err(TypeError::invalid(format!(
@@ -293,24 +292,28 @@ impl Operation for SortOperation {
                 input_types.len(),
             )));
         }
+
         for input_type in &input_types[..key_count] {
             // A reduced key can select a different permutation on its zero-filled replicas, so invariant passengers
             // would need additional variation tracking. Reduced passengers remain valid.
             if !input_type.reduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` does not support reduced keys")));
             }
+
             let data_type = input_type.data_type();
             if data_type.is_token() || data_type.is_zero() {
                 return Err(TypeError::invalid(format!(
                     "`{SORT_OPERATION_NAME}` does not support key data type `{data_type}`",
                 )));
             }
+
             if data_type.is_complex() && self.ordering == SortOrdering::Total {
                 return Err(TypeError::invalid(format!(
                     "`{SORT_OPERATION_NAME}` does not support key data type `{data_type}` under the `total` ordering",
                 )));
             }
         }
+
         if self.axis >= key_type.rank() {
             return Err(TypeError::invalid(format!(
                 "`{}` axis {} is out of bounds for rank {}",
@@ -319,6 +322,7 @@ impl Operation for SortOperation {
                 key_type.rank(),
             )));
         }
+
         for input_type in input_types {
             if input_type.shape() != key_type.shape() {
                 return Err(TypeError::invalid(format!(
@@ -328,18 +332,21 @@ impl Operation for SortOperation {
                     input_type.shape(),
                 )));
             }
+
             if !input_type.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` does not support unreduced inputs")));
             }
-            if let Some(sharding) = input_type.sharding() {
-                if matches!(sharding.dimensions()[self.axis], ShardingDimension::Sharded(_)) {
-                    return Err(TypeError::invalid(format!(
-                        "`{}` cannot sort along sharded axis {}",
-                        SORT_OPERATION_NAME, self.axis,
-                    )));
-                }
+
+            if let Some(sharding) = input_type.sharding()
+                && matches!(sharding.dimensions()[self.axis], ShardingDimension::Sharded(_))
+            {
+                return Err(TypeError::invalid(format!(
+                    "`{}` cannot sort along sharded axis {}",
+                    SORT_OPERATION_NAME, self.axis,
+                )));
             }
         }
+
         ArrayType::check_matching_manual_variation(SORT_OPERATION_NAME, &input_types.iter().collect::<Vec<_>>())?;
         Ok(input_types.to_vec())
     }
@@ -389,9 +396,10 @@ impl<C: Context<Type = ArrayType, Value: Sort + Broadcast + Transpose>, P: Array
         // batched physical shape (because all sort inputs must agree on shape), and the sort axis lifts past the
         // inserted leading batch axis while the key count and ordering carry through unchanged.
 
-        // Sorting a padded ragged axis would move padding into valid data, and repacking the inputs would drop
-        // the ragged metadata of every other axis.
+        // Sorting a padded ragged axis would move padding into valid data, and repacking the inputs would drop the
+        // ragged metadata of every other axis.
         ArrayBatch::reject_ragged_inputs(self, inputs)?;
+
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
             return Ok(self
                 .interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); inputs.len()])?
@@ -461,10 +469,12 @@ impl_differentiable_operation! {
                 let mut sorted_tangents = context.tangent().bind(*operation, Vec::new(), sort_inputs.as_slice())?;
                 (outputs, sorted_tangents.split_off(key_count))
             };
+
             let mut tangents = vec![None; inputs.len()];
             for ((index, _), tangent) in live_tangents.iter().zip(sorted_tangents) {
                 tangents[*index] = Some(tangent);
             }
+
             outputs
                 .into_iter()
                 .zip(tangents)
@@ -486,11 +496,11 @@ impl_differentiable_operation! {
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // With known keys, the forward map permutes every passenger by the same permutation `p` along the sorted
-            // axis (i.e., `y[i] = x[p[i]]`), so its transpose applies the inverse permutation to the output
-            // cotangents (i.e., `x̄[p[i]] = ȳ[i]`). The rule recovers `p` by sorting the known keys with an index iota
-            // passenger and then sorts the output cotangents by `p` itself in ascending order, which moves the
-            // cotangent at position `i` to position `p[i]`. `p` is a permutation, so this second sort has no ties.
-            // Keys and known passengers receive no cotangents, and structural-zero cotangents remain symbolic.
+            // axis (i.e., `y[i] = x[p[i]]`), so its transpose applies the inverse permutation to the output cotangents
+            // (i.e., `x̄[p[i]] = ȳ[i]`). The rule recovers `p` by sorting the known keys with an index iota passenger
+            // and then sorts the output cotangents by `p` itself in ascending order, which moves the cotangent at
+            // position `i` to position `p[i]`. `p` is a permutation, so this second sort has no ties. Keys and known
+            // passengers receive no cotangents, and structural-zero cotangents remain symbolic.
             check_count!("output", outputs, inputs.len(), ProgramError);
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
             let mut keys = inputs[..operation.key_count().get()]
@@ -501,6 +511,7 @@ impl_differentiable_operation! {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+
             let cotangents = (operation.key_count().get()..inputs.len())
                 .filter_map(|index| match &outputs[index] {
                     MaybeZero::Value(cotangent) if accumulators[index].is_needed() => Some((index, cotangent.clone())),
@@ -510,6 +521,7 @@ impl_differentiable_operation! {
             if cotangents.is_empty() {
                 return Ok(());
             }
+
             let index_type = staged_index_passenger_type(&keys[0].r#type())?;
             let index_operation = IotaOperation::new(index_type, operation.axis())?;
             let mut indices = context.stage_nullary_operation(index_operation)?;
@@ -524,6 +536,7 @@ impl_differentiable_operation! {
             )?
             .pop()
             .unwrap();
+
             let mut inverse_inputs = vec![permutation];
             inverse_inputs.extend(cotangents.iter().map(|(_, cotangent)| cotangent.clone()));
             let inverted = Sort::sort(inverse_inputs.as_slice(), operation.axis(), SortDirection::Ascending)?;
@@ -535,6 +548,8 @@ impl_differentiable_operation! {
         }
     },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to sort same-shaped inputs along one axis by the values of their leading key inputs.
 /// [`Sort`] executes or stages a [`SortOperation`], so refer to its documentation for the lexicographic ordering
