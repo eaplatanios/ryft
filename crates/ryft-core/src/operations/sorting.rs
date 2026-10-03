@@ -549,24 +549,47 @@ impl_differentiable_operation! {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Represents the ability to sort same-shaped inputs along one axis by the values of their leading key inputs.
-/// [`Sort`] executes or stages a [`SortOperation`], so refer to its documentation for the lexicographic ordering
-/// policy, the input requirements, and the transform rules. The functions of this capability dispatch through the
-/// first input's context.
+/// Represents the ability to sort same-shaped inputs along one axis by the values of their leading key inputs. Elements
+/// are ordered lexicographically by the keys (i.e., ties on earlier keys fall through to later keys), every key is
+/// compared in the same [`SortDirection`] and under the same [`SortOrdering`], and every non-key input is co-permuted
+/// as a passenger. Sorting is stable, so elements that tie on every key keep their original relative order. Concrete
+/// [`Array`]s sort immediately, while context-carrying values align their manual variation and bind a [`SortOperation`]
+/// through the context of their first input. Refer to the documentation of [`SortOperation`] for the input requirements
+/// and the transform rules.
+///
+/// Besides the general [`Self::sort_with_ordering`] function, this trait provides the [`Self::sort`] and
+/// [`Self::sort_with_key_count`] shortcut functions for single-key and canonically ordered sorts, which share
+/// the axis and error contract of [`Self::sort_with_ordering`].
+///
+/// # Example
+///
+/// The following example sorts by a primary key whose ties are broken by a secondary key:
+///
+/// ```rust
+/// # use ryft_core::{Array, ProgramError, Sort, SortDirection};
+/// # fn main() -> Result<(), ProgramError> {
+/// let primary = Array::vector(vec![2i32, 1, 2])?;
+/// let secondary = Array::vector(vec![5.0, 9.0, 4.0])?;
+/// let sorted = Array::sort_with_key_count(&[primary, secondary], 0, 2, SortDirection::Ascending)?;
+/// assert_eq!(sorted[0], Array::vector(vec![1i32, 2, 2])?);
+/// assert_eq!(sorted[1], Array::vector(vec![9.0, 4.0, 5.0])?);
+/// # Ok(())
+/// # }
+/// ```
 pub trait Sort: Sized {
-    /// Sorts `inputs` along `axis` by the values of the first input in the provided `direction` under the default
-    /// [`SortOrdering::Canonical`] ordering, co-permuting every other input by the key's order. Refer to
-    /// [`Self::sort_with_ordering`] for the semantics of `axis` and for the errors that this function may return.
+    /// Sorts `inputs` along `axis` by the values of their first input in the provided `direction` under the default
+    /// [`SortOrdering::Canonical`] ordering, co-permuting every other input. Refer to [`Self::sort_with_ordering`]
+    /// for the semantics of the parameters and for the errors that this function may return.
+    #[inline]
     fn sort<A: Into<Axis>>(inputs: &[Self], axis: A, direction: SortDirection) -> Result<Vec<Self>, ProgramError> {
         Self::sort_with_key_count(inputs, axis, 1, direction)
     }
 
-    /// Sorts `inputs` along `axis` lexicographically by the values of the first `key_count` inputs in the provided
-    /// `direction` under the default [`SortOrdering::Canonical`] ordering (i.e., ties on earlier keys fall through to
-    /// later keys), co-permuting every remaining input by that order. Refer to [`Self::sort_with_ordering`] for the
-    /// semantics of `axis` and for the errors that this function may return.
+    /// Sorts `inputs` along `axis` lexicographically by the values of their first `key_count` inputs in the provided
+    /// `direction` under the default [`SortOrdering::Canonical`] ordering, co-permuting every remaining input. Refer
+    /// to [`Self::sort_with_ordering`] for the semantics of the parameters and for the errors that this function may
+    /// return.
+    #[inline]
     fn sort_with_key_count<A: Into<Axis>>(
         inputs: &[Self],
         axis: A,
@@ -576,15 +599,14 @@ pub trait Sort: Sized {
         Self::sort_with_ordering(inputs, axis, key_count, direction, SortOrdering::default())
     }
 
-    /// Sorts `inputs` along `axis` lexicographically by the values of the first `key_count` inputs in the provided
-    /// `direction`, comparing floating-point keys under `ordering`, and co-permuting every remaining input by that
-    /// order.
+    /// Sorts `inputs` along `axis` lexicographically by the values of their first `key_count` inputs in the provided
+    /// `direction`, comparing floating-point keys under `ordering` and co-permuting every remaining input.
     ///
     /// # Parameters
     ///
     ///   - `inputs`: Same-shaped values to sort, starting with the keys.
-    ///   - `axis`: Axis of the inputs to sort along, with negative indices counted from the end. Its dimension must
-    ///     not be sharded.
+    ///   - `axis`: [`Axis`] along which the inputs are sorted. Negative axes count from the end.
+    ///     Its dimension must not be sharded.
     ///   - `key_count`: Number of leading `inputs` that act as lexicographic sort keys, which must be at least 1.
     ///   - `direction`: [`SortDirection`] in which every key is ordered.
     ///   - `ordering`: [`SortOrdering`] under which floating-point keys are compared.
@@ -602,6 +624,8 @@ pub trait Sort: Sized {
         ordering: SortOrdering,
     ) -> Result<Vec<Self>, ProgramError>;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Sort for Array {
     fn sort_with_ordering<A: Into<Axis>>(
@@ -769,17 +793,25 @@ fn sort_permutation(key_ranks: &[&[u64]], dimensions: &[usize], axis: usize, dir
 }
 
 /// Represents the ability to select the `k` largest elements of a value along one axis together with their indices.
-/// [`TopK`] is not a primitive operation: it is a stable descending [`Sort`] of the value with an `i32` index
-/// [`iota`](IotaOperation) passenger under [`SortOrdering::Total`], followed by a [`Slice`] of the leading `k` entries
-/// of both sorted outputs. Its semantics are those of
-/// [JAX's `lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html) generalized to any axis: ties
-/// select the lowest index first, values rank by the IEEE 754 total order (so `+NaN` ranks above `+∞`, `+0.0` ranks
-/// above `-0.0`, and `-NaN` ranks below `-∞`), complex values are rejected, and the returned indices are `i32`. The
-/// staged form is exactly the sort-plus-slice idiom that XLA's top-k rewriter replaces with its fast top-k
-/// implementation. When the ranked axis is the trailing axis, leading size-1 dimensions are reshaped away before the
-/// composition and reinserted afterward (refer to the documentation of `top_k_via_squeezed_view` for why).
+/// Values rank by the IEEE 754 total order of [`SortOrdering::Total`] (i.e., `+NaN` ranks above `+∞`, `+0.0` ranks
+/// above `-0.0`, and `-NaN` ranks below `-∞`), ties select the lowest index first, and the indices are `i32`. Complex
+/// values are rejected, because they have no total order. These are the semantics of [JAX's
+/// `lax.top_k`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.top_k.html), generalized from the trailing axis to
+/// any axis.
+///
+/// [`TopK`] is not a primitive operation: [`Self::top_k`] stably sorts the value in descending order together with an
+/// `i32` index [`iota`](IotaOperation) passenger and slices the leading `k` entries of both sorted outputs, so every
+/// program transform supports it through the rules of [`SortOperation`] and [`Slice`]. This staged form is the
+/// sort-plus-slice idiom that XLA's top-k rewriter replaces with its fast top-k implementation. That rewriter only
+/// accepts `iota` or `broadcast(iota)` index passengers, while the StableHLO-to-HLO import turns the index iota of an
+/// input with leading size-1 dimensions (e.g., `f32[1, 32000]`) into `reshape(iota)`. Therefore, when the ranked axis
+/// is the trailing axis, the leading size-1 dimensions are reshaped away before the composition and reinserted
+/// afterward, which leaves the values and indices unchanged.
 ///
 /// # Example
+///
+/// The following example selects the three largest scores, where the tie between the two `3.0` scores selects the
+/// lower index first:
 ///
 /// ```rust
 /// # use ryft_core::{Array, ProgramError, TopK};
@@ -791,9 +823,18 @@ fn sort_permutation(key_ranks: &[&[u64]], dimensions: &[usize], axis: usize, dir
 /// # }
 /// ```
 pub trait TopK: Sized {
-    /// Returns the `k` largest elements of this value along `axis` together with their `i32` indices, both with the
-    /// `axis` dimension resized to `k`. Negative axes count from the end. Returns an error if `k` exceeds the size of
-    /// `axis`, if the value has dynamic dimensions or complex elements, or if `axis` is out of bounds.
+    /// Returns the `k` largest elements of this value along `axis` in descending order together with their indices,
+    /// both with the `axis` dimension resized to `k`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `k`: Number of elements to select, which must not exceed the size of `axis`.
+    ///   - `axis`: [`Axis`] along which the elements are ranked. Negative axes count from the end.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if the value has complex elements or dynamic dimensions, if `axis` is out of bounds,
+    /// if `k` exceeds the size of `axis`, or if executing or staging the composition fails.
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError>;
 }
 
@@ -892,14 +933,19 @@ fn top_k_with_index_passenger<V: Clone + Sort + Slice>(
     ))
 }
 
-/// Represents the ability to compute the index of the largest element of a value along one axis. [`ArgMax`] is not a
-/// primitive operation: it is a stable descending [`Sort`] of the value with an `i32` index [`iota`](IotaOperation)
-/// passenger under [`SortOrdering::Canonical`], sliced to the leading entry and reshaped to drop the reduced axis. Its
-/// semantics are those of [`jnp.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.argmax.html): ties
-/// select the lowest index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign
-/// reports the index of its first NaN, complex values and empty axes are rejected, and the returned indices are `i32`.
+/// Represents the ability to compute the index of the largest element of a value along one axis. Ties select the lowest
+/// index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign reports the index of
+/// its first NaN, and the indices are `i32`. Complex values and empty axes are rejected. These are the semantics of
+/// [`jnp.argmax`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.argmax.html).
+///
+/// [`ArgMax`] is not a primitive operation: [`Self::argmax`] stably sorts the value in descending order under
+/// [`SortOrdering::Canonical`] (which ties signed zeros and orders every NaN first) together with an `i32` index
+/// [`iota`](IotaOperation) passenger, slices the leading entry, and reshapes it to drop the reduced axis.
 ///
 /// # Example
+///
+/// The following example finds the largest element of each row, where the first row's tie selects the lower index and
+/// the second row reports its NaN:
 ///
 /// ```rust
 /// # use ryft_core::{Array, ArgMax, ProgramError};
@@ -910,9 +956,17 @@ fn top_k_with_index_passenger<V: Clone + Sort + Slice>(
 /// # }
 /// ```
 pub trait ArgMax: Sized {
-    /// Returns the `i32` indices of the largest elements of this value along `axis`, with that axis dropped from the
-    /// result shape. Negative axes count from the end. Returns an error if the value has dynamic dimensions or complex
-    /// elements, or if `axis` is out of bounds or empty.
+    /// Returns the indices of the largest elements of this value along `axis`, with that axis dropped from the result
+    /// shape.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: [`Axis`] along which the elements are ranked. Negative axes count from the end.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if the value has complex elements or dynamic dimensions, if `axis` is out of bounds
+    /// or empty, or if executing or staging the composition fails.
     fn argmax<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>;
 }
 
@@ -935,15 +989,21 @@ where
     }
 }
 
-/// Represents the ability to compute the index of the smallest element of a value along one axis. [`ArgMin`] is not a
-/// primitive operation: it is a stable ascending [`Sort`] of the value with an `i32` index [`iota`](IotaOperation)
-/// passenger under [`SortOrdering::Canonical`], sliced to the leading entry and reshaped to drop the reduced axis.
-/// Floating-point values sort on the two keys `(x == x, x)`, so that NaNs (for which `x == x` is `false`) come first.
-/// Its semantics are those of [`jnp.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.argmin.html): ties
-/// select the lowest index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign
-/// reports the index of its first NaN, complex values and empty axes are rejected, and the returned indices are `i32`.
+/// Represents the ability to compute the index of the smallest element of a value along one axis. Ties select the
+/// lowest index (including ties between `-0.0` and `+0.0`), an axis that contains a NaN of either sign reports the
+/// index of its first NaN, and the indices are `i32`. Complex values and empty axes are rejected. These are the
+/// semantics of [`jnp.argmin`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.argmin.html).
+///
+/// [`ArgMin`] is not a primitive operation: [`Self::argmin`] stably sorts the value in ascending order under
+/// [`SortOrdering::Canonical`] (which ties signed zeros) together with an `i32` index [`iota`](IotaOperation)
+/// passenger, slices the leading entry, and reshapes it to drop the reduced axis. The canonical ordering places NaNs
+/// last, so floating-point values sort on the two keys `x == x` and `x`, where the first key is `false` exactly for
+/// NaNs and therefore orders them first.
 ///
 /// # Example
+///
+/// The following example finds the smallest element of each row, where the first row's tie selects the lower index and
+/// the second row reports its NaN:
 ///
 /// ```rust
 /// # use ryft_core::{Array, ArgMin, ProgramError};
@@ -954,9 +1014,17 @@ where
 /// # }
 /// ```
 pub trait ArgMin: Sized {
-    /// Returns the `i32` indices of the smallest elements of this value along `axis`, with that axis dropped from the
-    /// result shape. Negative axes count from the end. Returns an error if the value has dynamic dimensions or complex
-    /// elements, or if `axis` is out of bounds or empty.
+    /// Returns the indices of the smallest elements of this value along `axis`, with that axis dropped from the result
+    /// shape.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: [`Axis`] along which the elements are ranked. Negative axes count from the end.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] if the value has complex elements or dynamic dimensions, if `axis` is out of bounds
+    /// or empty, or if executing or staging the composition fails.
     fn argmin<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>;
 }
 
