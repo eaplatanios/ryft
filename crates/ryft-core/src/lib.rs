@@ -1,5 +1,6 @@
 // Derive macros emitted by `ryft-macros` use the public `ryft::...` facade path by default. This `self`-alias
 // lets those same generated paths resolve when those macros are used inside `ryft-core` itself.
+extern crate core;
 extern crate self as ryft;
 
 pub mod arrays;
@@ -37,7 +38,7 @@ pub use arrays::{
     encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
     f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, materialize_array_tangent, u1, u2, u4,
 };
-pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
+pub use axes::{Axes, Axis, AxisError, NamedAxes, NamedAxis};
 pub use batching::{
     Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedOutputs, BatchedProgram,
     BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent,
@@ -89,13 +90,13 @@ pub use interpretation::{
 };
 pub use operations::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, AND_OPERATION_NAME, ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME,
-    ASSERT_OPERATION_NAME, ATAN2_OPERATION_NAME, Abs, AbsOperation, Accuracy, Add, AddOperation, And, AndOperation,
-    ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation, ArithmeticDimensionOperation, Assert, AssertOperation,
-    AssertionError, AssertionFailure, AssertionValue, Atan2, Atan2Operation, BROADCAST_OPERATION_NAME, BasicIndex,
-    BatchingRuleConsistencyError, BlockQuantize, Broadcast, BroadcastOperation, CEIL_OPERATION_NAME,
-    CLAMP_OPERATION_NAME, COMPARE_OPERATION_NAME, CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME,
-    CONSTANT_OPERATION_NAME, CONSTRAIN_SHARDING_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME,
-    COS_OPERATION_NAME, CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME,
+    ASSERT_OPERATION_NAME, ATAN2_OPERATION_NAME, AXIS_INDEX_OPERATION_NAME, Abs, AbsOperation, Accuracy, Add,
+    AddOperation, And, AndOperation, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation, ArithmeticDimensionOperation,
+    Assert, AssertOperation, AssertionError, AssertionFailure, AssertionValue, Atan2, Atan2Operation, AxisIndex,
+    AxisIndexOperation, BROADCAST_OPERATION_NAME, BasicIndex, BatchingRuleConsistencyError, BlockQuantize, Broadcast,
+    BroadcastOperation, CEIL_OPERATION_NAME, CLAMP_OPERATION_NAME, COMPARE_OPERATION_NAME, CONCATENATE_OPERATION_NAME,
+    CONDITION_OPERATION_NAME, CONSTANT_OPERATION_NAME, CONSTRAIN_SHARDING_OPERATION_NAME,
+    CONVERT_ELEMENT_TYPE_OPERATION_NAME, COS_OPERATION_NAME, CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME,
     CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CategoricalSamplingMode, Ceil, CeilOperation, Clamp, ClampOperation,
     Compare, CompareOperation, ComparisonDirection, Concatenate, ConcatenateOperation, ConditionOperation, Constant,
     ConstantOperation, ConstrainSharding, ConstrainShardingOperation, ConvertElementType, ConvertElementTypeOperation,
@@ -121,10 +122,10 @@ pub use operations::{
     GatherMode, GatherOperation, GatherOptions, IOTA_OPERATION_NAME, IndexInteger, IndexMask, IndexSelector,
     IndexSlice, Indexed, Indexing, Iota, IotaOperation, JvpFromPrimal, LINEAR_CALL_OPERATION_NAME,
     LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, LiftedCustomRules,
-    LinearCallOperation, LiteralIdentity, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation,
-    Logistic, LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME, ManualVariationAlignment,
-    Max, MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME, NOT_OPERATION_NAME, Neg, NegOperation,
-    Not, NotOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, OR_OPERATION_NAME, One, OneLike, OneLikeOperation,
+    LinearCallOperation, Ln1p, Ln1pOperation, Log, LogAddExp, LogAddExpOperation, LogOperation, Logistic,
+    LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME, ManualVariationAlignment, Max,
+    MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME, NOT_OPERATION_NAME, Neg, NegOperation, Not,
+    NotOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, OR_OPERATION_NAME, One, OneLike, OneLikeOperation,
     OneOperation, Or, OrOperation, PAD_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME,
     POW_OPERATION_NAME, PRINT_OPERATION_NAME, Pad, PadOperation, ParallelReduce, ParallelReduceOperation, ParallelVary,
     ParallelVaryOperation, Permutation, Pow, PowOperation, Print, PrintOperation, RAGGED_DOT_OPERATION_NAME,
@@ -170,12 +171,12 @@ pub use programs::{
     Atom, AtomId, AttachedRegionStatistics, BatchableReferenceTransform, BindingRegionDriver, BoundReferenceTransform,
     CalleeRegionDriver, Concretizable, EffectClass, EffectClassOccurrence, EffectClasses, Effects, EffectsSummary,
     EmptyRegionDriver, ErasedOperation, ExternalReferenceBinding, FlatProgram, InputRegionProvenance, Instruction,
-    InstructionId, MaybeZero, MemberOperation, NoIdentity, NoReferenceTransform, NoReferenceTransformBinding,
-    NoReferent, Operation, OperationBoundaryPruning, OperationFoldOutput, OperationFoldReplacement, OperationFormatter,
-    OperationPayloadProjection, OperationProjection, OperationProvider, OutputRegionProvenance, ParameterProjection,
-    PartialReferenceDischargeResult, PreparedReferenceReplacement, Program, ProgramBuilder, ProgramBuilderId,
-    ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics, ProjectedValue, Provenance,
-    ProvenanceScope, ProvenanceState, ReadyOrPendingReferenceGuard, ReadyReferenceGuard,
+    InstructionId, LiteralIdentity, MaybeZero, MemberOperation, NoIdentity, NoReferenceTransform,
+    NoReferenceTransformBinding, NoReferent, Operation, OperationBoundaryPruning, OperationFoldOutput,
+    OperationFoldReplacement, OperationFormatter, OperationPayloadProjection, OperationProjection, OperationProvider,
+    OutputRegionProvenance, ParameterProjection, PartialReferenceDischargeResult, PreparedReferenceReplacement,
+    Program, ProgramBuilder, ProgramBuilderId, ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics,
+    ProjectedValue, Provenance, ProvenanceScope, ProvenanceState, ReadyOrPendingReferenceGuard, ReadyReferenceGuard,
     RecursiveReferenceDischargeDriver, Reference, ReferenceAccess, ReferenceAccessDescriptor, ReferenceAccessMode,
     ReferenceAccessOperation, ReferenceAccumulationPolicy, ReferenceAliasEdge, ReferenceAnalysis,
     ReferenceAnalysisError, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion,
@@ -209,10 +210,12 @@ pub use tracing::{
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use core::hash::Hash;
     use std::any::TypeId;
     use std::borrow::Cow;
     use std::convert::Infallible;
     use std::fmt::{Debug, Display};
+    use std::hash::{DefaultHasher, Hash, Hasher};
     use std::sync::{Arc, Weak};
 
     use ryft_macros::Operation;
@@ -241,13 +244,29 @@ pub(crate) mod tests {
     use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
     use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
     use crate::programs::{
-        EffectClass, EffectClasses, Effects, MaybeZero, NoIdentity, NoReferenceTransform, NoReferent, Operation,
-        OperationProjection, OperationProvider, Program, ProgramError, ReferenceAccessDescriptor,
+        EffectClass, EffectClasses, Effects, LiteralIdentity, MaybeZero, NoIdentity, NoReferenceTransform, NoReferent,
+        Operation, OperationProjection, OperationProvider, Program, ProgramError, ReferenceAccessDescriptor,
         ReferenceAccessOperation, Region, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, Type,
         TypeError, Typed, Value, ValueProjection,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tracing::{Tracer, TracingContext};
+
+    /// Returns the hash of `value` under the standard library's default hasher, so that tests can check that equal
+    /// values hash equally (e.g., for operation payloads whose [`Hash`] implementations normalize floating-point
+    /// values).
+    pub(crate) fn hash_of<T: Hash>(value: &T) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Returns the [`LiteralIdentity::literal_hash`] of `value` under the standard library's default hasher.
+    pub(crate) fn literal_hash_of<V: LiteralIdentity>(value: &V) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.literal_hash(&mut hasher);
+        hasher.finish()
+    }
 
     /// Small ordinary array operation family for core tests. Each payload is a real operation, while malformed rules
     /// and arbitrary region interfaces remain explicit, separate protocol fixtures. Captures and interpretation need

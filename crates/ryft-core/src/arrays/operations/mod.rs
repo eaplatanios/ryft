@@ -16,7 +16,6 @@ use crate::arrays::references::ArrayReferenceTransform;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
-use crate::axes::AxisIndexOperation;
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
@@ -38,10 +37,10 @@ use crate::operations::complex::{
 use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::{
     Abs, AbsOperation, Add, AddOperation, And, AndOperation, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation, Assert,
-    AssertOperation, Atan2, Atan2Operation, Broadcast, BroadcastOperation, Ceil, CeilOperation, Clamp, ClampOperation,
-    Compare, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation, ConstantOperation,
-    ConstrainShardingOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation, Cumulative,
-    CumulativeOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DimensionAddOperation,
+    AssertOperation, Atan2, Atan2Operation, AxisIndexOperation, Broadcast, BroadcastOperation, Ceil, CeilOperation,
+    Clamp, ClampOperation, Compare, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation,
+    ConstantOperation, ConstrainShardingOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation,
+    Cumulative, CumulativeOperation, CustomFunctionOperation, CustomFunctionTransposeOperation, DimensionAddOperation,
     DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
     DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
     DimensionRemOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,

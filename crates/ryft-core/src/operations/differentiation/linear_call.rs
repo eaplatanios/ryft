@@ -701,7 +701,6 @@ pub(crate) mod tests {
         DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
         ShardingDimension,
     };
-    use crate::axes::AxisIndexOperation;
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -709,6 +708,7 @@ pub(crate) mod tests {
         TranspositionDriver,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
+    use crate::operations::collectives::axis_index::AxisIndexOperation;
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
     use crate::operations::manipulation::broadcasting::DynamicBroadcast;

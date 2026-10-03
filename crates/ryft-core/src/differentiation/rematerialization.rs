@@ -1301,13 +1301,13 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
         DimensionBounds, DimensionType, Memory, ShardingDimension,
     };
-    use crate::axes::{AxisError, AxisIndex};
+    use crate::axes::AxisError;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::operations::{
-        Constant, ConvertElementType, Cos, DimensionSizeOperation, Dot, DotDimensionNumbers, Exp, MulOperation,
-        ReducePrecision, ReferenceRead, Sin, SinOperation, Tag, custom_function,
+        AxisIndex, Constant, ConvertElementType, Cos, DimensionSizeOperation, Dot, DotDimensionNumbers, Exp,
+        MulOperation, ReducePrecision, ReferenceRead, Sin, SinOperation, Tag, custom_function,
     };
     use crate::partial::ResidualProducer;
     use crate::programs::{Program, ReferenceType};

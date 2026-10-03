@@ -366,7 +366,6 @@ impl BlockWindow {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::hash::DefaultHasher;
 
     use pretty_assertions::assert_eq;
 
@@ -374,15 +373,9 @@ mod tests {
     use crate::operations::{DimensionMulOperation, ZERO_OPERATION_NAME, ZeroOperation};
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{ProgramBuilder, ReferenceType};
+    use crate::tests::hash_of;
 
     use super::*;
-
-    /// Returns the hash of `value` under the standard library's default hasher.
-    fn hash_of<T: Hash>(value: &T) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        value.hash(&mut hasher);
-        hasher.finish()
-    }
 
     /// Builds a dimension-only identity mapping with independently bounded coordinate inputs.
     fn identity_program(rank: usize) -> FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>> {

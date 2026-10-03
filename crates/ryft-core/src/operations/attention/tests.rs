@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 
 use approx::assert_abs_diff_eq;
 use indoc::indoc;
@@ -9,16 +8,10 @@ use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, Dime
 use crate::batching::batch;
 use crate::contexts::StagingContext;
 use crate::parameters::Placeholder;
+use crate::tests::hash_of;
 use crate::tracing::TracingContext;
 
 use super::*;
-
-/// Returns the hash of `value` under the standard library's default hasher.
-fn hash_of<T: Hash>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
 
 #[test]
 fn test_attention_configuration() {

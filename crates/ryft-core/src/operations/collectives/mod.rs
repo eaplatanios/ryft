@@ -3,16 +3,17 @@
 //! are the analogues of [JAX's parallel operators](https://docs.jax.dev/en/latest/jax.lax.html#parallel-operators).
 //!
 //! This module owns the vocabulary that every collective shares (i.e., [`CollectiveMode`], [`CollectiveOptions`], and
-//! named axis resolution), while each operation family lives in its own submodule:
-//! [`parallel_reduce`], [`parallel_vary`], [`all_gather`], [`parallel_sum_scatter`], [`parallel_permute`],
-//! [`all_to_all`], and [`ragged_all_to_all`]. It also owns the shared machinery of the single-input linear collectives
-//! ([`ParallelPermuteOperation`], [`AllGatherOperation`], [`ParallelSumScatterOperation`], and [`AllToAllOperation`]).
-//! Each carries the referenced axis name and the participant count resolved from the active [`NamedAxes`] environment,
-//! consumes one statically shaped array input, and has only degenerate single-participant semantics outside a binder.
-//! Its tangent rides the same collective, and its transpose is another collective over the same axis. The private
-//! `define_linear_collective_operation!` macro generates their common operation structure and the private
-//! `impl_differentiable_linear_collective_operation!` macro their differentiation rules, while shared functions support
-//! the generated code and hand-written rules.
+//! named axis resolution), while each operation family lives in its own submodule: [`parallel_reduce`],
+//! [`parallel_vary`], [`all_gather`], [`parallel_sum_scatter`], [`parallel_permute`], [`all_to_all`], and
+//! [`ragged_all_to_all`]. The [`axis_index`] submodule holds the one named-axis operation that exchanges nothing; it
+//! reads the current batch item's or device shard's position along the axis. This module also owns the shared machinery
+//! of the single-input linear collectives ([`ParallelPermuteOperation`], [`AllGatherOperation`],
+//! [`ParallelSumScatterOperation`], and [`AllToAllOperation`]). Each carries the referenced axis name and the
+//! participant count resolved from the active [`NamedAxes`] environment, consumes one statically shaped array input,
+//! and has only degenerate single-participant semantics outside a binder. Its tangent rides the same collective, and
+//! its transpose is another collective over the same axis. The private `define_linear_collective_operation!` macro
+//! generates their common operation structure and the private `impl_differentiable_linear_collective_operation!` macro
+//! their differentiation rules, while shared functions support the generated code and hand-written rules.
 //!
 //! The collectives that resize an array axis ([`AllGatherOperation`], [`ParallelSumScatterOperation`], and
 //! [`AllToAllOperation`]) share additional machinery. Their output shapes depend
@@ -65,6 +66,7 @@ use crate::programs::{
 
 pub mod all_gather;
 pub mod all_to_all;
+pub mod axis_index;
 pub mod parallel_permute;
 pub mod parallel_reduce;
 pub mod parallel_sum_scatter;
@@ -73,6 +75,7 @@ pub mod ragged_all_to_all;
 
 pub use all_gather::{ALL_GATHER_OPERATION_NAME, AllGather, AllGatherOperation, AllGatherOutputVariance};
 pub use all_to_all::{ALL_TO_ALL_OPERATION_NAME, AllToAll, AllToAllOperation, ParallelSwapAxes};
+pub use axis_index::{AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation};
 pub use parallel_permute::{
     PARALLEL_PERMUTE_OPERATION_NAME, ParallelPermute, ParallelPermuteOperation, ParallelShuffle,
 };

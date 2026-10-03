@@ -46,8 +46,8 @@ pub use assertions::{
     ASSERT_OPERATION_NAME, Assert, AssertOperation, AssertionError, AssertionFailure, AssertionValue,
 };
 pub use collectives::{
-    ManualVariationAlignment, PARALLEL_REDUCE_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelReduce,
-    ParallelReduceOperation, ParallelVary, ParallelVaryOperation,
+    AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, ManualVariationAlignment, PARALLEL_REDUCE_OPERATION_NAME,
+    PARALLEL_VARY_OPERATION_NAME, ParallelReduce, ParallelReduceOperation, ParallelVary, ParallelVaryOperation,
 };
 pub use comparisons::{
     COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonTypeSemantics,

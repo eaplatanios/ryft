@@ -10,7 +10,7 @@ use crate::arrays::{
     Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LinearResiduals, RaggedAxis,
     Shape, Sharding,
 };
-use crate::axes::{AxisIndexOperation, NamedAxes};
+use crate::axes::NamedAxes;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     MemberBatchableOperation,
@@ -40,6 +40,7 @@ use crate::programs::{
     TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
+use super::axis_index::AxisIndexOperation;
 use super::parallel_sum_scatter::ParallelSumScatterOperation;
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,

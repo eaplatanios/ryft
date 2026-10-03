@@ -2338,7 +2338,7 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArraySliceAxis, ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue, ShardingDimension,
     };
-    use crate::axes::{AxisError, AxisIndex};
+    use crate::axes::AxisError;
     use crate::batching::{
         BatchAxis, BatchAxisSpecification, BatchedProgram, BatchingError, ProgramBatchingOutputAxesPolicy, batch,
     };
@@ -2347,6 +2347,7 @@ mod tests {
         CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationRule, differentiate_at,
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
+    use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;

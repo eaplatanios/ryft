@@ -947,12 +947,10 @@ where
 /// discharge make it explicit as arrays. Under a batched predicate the prefix requirement applies to the array members
 /// only, since a first-class dimension carries no shape, and such a dimension carry must additionally be
 /// *loop-invariant*: one dimension value cannot represent independently masked per-item extents, but masking a carry
-/// that the body forwards unchanged is the identity. Eager
-/// interpretation enforces that invariance dynamically through
-/// [`ArrayIrValue`](crate::arrays::ArrayIrValue)'s
-/// [`mask_select`](WhilePredicate::mask_select), which returns equal dimension carries unchanged and falls back to
-/// scalar-predicate concretization — an error under a batched predicate — for distinct ones. Structural composite
-/// batching relies on this relaxation to thread its loop-invariant mapped extent through batch-varying loops.
+/// that the body forwards unchanged is the identity. Eager interpretation enforces that invariance dynamically through
+/// [`ArrayIrValue`]'s [`mask_select`](WhilePredicate::mask_select), which returns equal dimension carries unchanged and
+/// falls back to scalar-predicate concretization — an error under a batched predicate — for distinct ones. Structural
+/// composite batching relies on this relaxation to thread its loop-invariant mapped extent through batch-varying loops.
 ///
 /// The loop-carried state rule is otherwise identical for every type family: the condition and body consume the same
 /// state signature, and the body returns the next state with that same signature.
@@ -2872,11 +2870,10 @@ where
 /// item's predicate is recomputed from its frozen state, so a finished item can never rejoin the loop.
 ///
 /// The default implementations are the scalar-predicate semantics, expressed through [`Concretizable<bool>`]: the
-/// predicate's
-/// own truth decides continuation, and a true predicate takes the candidate wholesale. Value types with genuinely
-/// batched payloads (e.g. [`Array`](crate::arrays::Array)) override both methods with per-item semantics, and
-/// symbolic values (tracers and capture references) inherit the defaults, which surface [`Concretizable::concretize`]'s
-/// concretization errors — a staged while is consumed by staging and lowering rather than by this eager loop.
+/// predicate's own truth decides continuation, and a true predicate takes the candidate wholesale. Value types with
+/// genuinely batched payloads (e.g. [`Array`]) override both methods with per-item semantics, and symbolic values
+/// (tracers and capture references) inherit the defaults, which surface [`Concretizable::concretize`]'s concretization
+/// errors — a staged while is consumed by staging and lowering rather than by this eager loop.
 pub trait WhilePredicate: Concretizable<bool> + Clone + Sized {
     /// Returns `true` when any element of this Boolean predicate is true — the loop-continuation decision.
     fn any_true(&self) -> Result<bool, ProgramError> {
@@ -3040,7 +3037,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType,
+        Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::batch;
@@ -3060,8 +3058,9 @@ mod tests {
     use crate::operations::constants::one_like::{OneLike, OneLikeOperation};
     use crate::operations::constants::zero::Zero;
     use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
-    use crate::operations::control_flow::tests::CountingBatchingDriver;
+    use crate::operations::control_flow::tests::{CountingBatchingDriver, array, dimension};
     use crate::operations::debugging::PrintOperation;
+    use crate::operations::manipulation::reshaping::DynamicReshapeOperation;
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
         ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation,
@@ -7802,7 +7801,11 @@ mod tests {
             )
             .unwrap()[0];
         let body = body_builder
-            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![extent, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![extent, doubled],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
             .unwrap();
 
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();

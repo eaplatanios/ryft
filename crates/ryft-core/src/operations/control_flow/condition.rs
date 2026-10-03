@@ -1761,12 +1761,13 @@ mod tests {
     use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
-    use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
+    use crate::differentiation::{Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation};
     use crate::operations::assertions::AssertionError;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
-    use crate::operations::control_flow::tests::{CountingBatchingDriver, resolve_captures};
+    use crate::operations::control_flow::tests::{CountingBatchingDriver, array, dimension, resolve_captures};
+    use crate::operations::differentiation::stop_gradient::StopGradientOperation;
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,

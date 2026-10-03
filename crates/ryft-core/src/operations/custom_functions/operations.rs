@@ -2841,7 +2841,6 @@ mod tests {
         Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
         MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::axes::AxisIndexOperation;
     use crate::batching::{
         BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch,
     };
@@ -2854,6 +2853,7 @@ mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::assertions::{AssertOperation, AssertionError};
+    use crate::operations::collectives::axis_index::AxisIndexOperation;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;

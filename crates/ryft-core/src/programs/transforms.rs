@@ -454,6 +454,13 @@ impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
+    /// Feeds the [`Region`]-content identity of this [`RegionTransformCache`] into `state`, consistently with
+    /// [`Self::ptr_eq`]. The identity is the address of the shared handle, which stays unique while it is alive.
+    #[inline]
+    pub(crate) fn hash_identity<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.state).cast::<()>().hash(state);
+    }
+
     /// Returns the [`SpecializationCache`] (i.e., namespace) for [`Transform`] `T`, creating it with `capacity`
     /// if it does not exist yet.
     fn namespace<T: 'static>(

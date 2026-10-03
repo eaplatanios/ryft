@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionType,
-    DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, Shape, ShardingDimension,
+    ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, DataType,
+    Dimension, DimensionType, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT, MeshAxisType, Shape,
+    ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1866,9 +1867,9 @@ pub trait ScanTypeSemantics: Type<Identity = DimensionVariable> {
     /// Actual `input_types` may carry more precise metadata, such as the normalized
     /// [`Sharding`](crate::arrays::Sharding)s that concrete backend array types carry. Validation therefore uses the
     /// directional declared-vs-actual [`Type::is_refined_by`] relation instead of strict type equality. The output types
-    /// are the carry output types of the body followed by the [`stacked_scan_type`]s of its stacked output types, so
-    /// they carry the shardings that the body declares (e.g., after staging specialized the body to sharded inputs) and
-    /// leave unspecified the ones that it does not.
+    /// are the carry output types of the body followed by its stacked output types, each stacked along a new leading
+    /// scan axis, so they carry the shardings that the body declares (e.g., after staging specialized the body to
+    /// sharded inputs) and leave unspecified the ones that it does not.
     ///
     /// # Parameters
     ///
@@ -3986,13 +3987,16 @@ mod tests {
         differentiate_at,
     };
     use crate::macros::check_operation_batching;
-    use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation};
+    use crate::operations::arithmetic::{Add, AddOperation, DivOperation, MulOperation, NegOperation};
     use crate::operations::control_flow::condition::ConditionOperation;
-    use crate::operations::control_flow::tests::{CountingBatchingDriver, resolve_captures};
+    use crate::operations::control_flow::tests::{CountingBatchingDriver, array, dimension, resolve_captures};
     use crate::operations::debugging::PrintOperation;
+    use crate::operations::differentiation::stop_gradient::StopGradientOperation;
+    use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
     use crate::operations::exponential::ExpOperation;
     use crate::operations::manipulation::memory::TransferToMemoryOperation;
     use crate::operations::manipulation::slicing::DynamicSliceOperation;
+    use crate::operations::reductions::{ReduceOperation, ReductionKind};
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceWriteOperation,
@@ -11801,7 +11805,11 @@ mod tests {
                 )
                 .unwrap()[0];
             builder
-                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![extent, sum], vec![Placeholder; 4], vec![Placeholder; 2])
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                    vec![extent, sum],
+                    vec![Placeholder; 4],
+                    vec![Placeholder; 2],
+                )
                 .unwrap()
         };
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();

@@ -11,7 +11,6 @@ pub use condition::{CONDITION_OPERATION_NAME, ConditionOperation, transpose_prim
 pub use scan::{SCAN_OPERATION_NAME, ScanOperation};
 pub use select::{SELECT_OPERATION_NAME, Select, SelectOperation};
 pub use r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics};
-pub(crate) use r#while::{WhileResidualStackOperation, WhileResidualStackType};
 
 /// Type-family storage policy for values that must cross an iteration boundary as stacked residuals.
 ///
@@ -38,7 +37,7 @@ pub(crate) trait TemporalResidualOperation<T: TemporalResidualType>: Operation<T
 pub(crate) mod tests {
     use std::cell::Cell;
 
-    use crate::arrays::{Array, ArrayIrType, ArrayIrValue};
+    use crate::arrays::{Array, ArrayIrType, ArrayIrValue, DimensionType, DimensionValue};
     use crate::axes::Axis;
     use crate::batching::{
         BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
@@ -48,6 +47,16 @@ pub(crate) mod tests {
     use crate::contexts::Context;
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, Operation, Program, Region, RegionDriver, RegionRef, Value};
+
+    /// Wraps an [`Array`] as an array [`ArrayIrValue`].
+    pub(crate) fn array(value: Array) -> ArrayIrValue<Array> {
+        ArrayIrValue::Array(value)
+    }
+
+    /// Returns a first-class dimension [`ArrayIrValue`] of type `r#type` whose runtime extent is `extent`.
+    pub(crate) fn dimension(r#type: &DimensionType, extent: usize) -> ArrayIrValue<Array> {
+        ArrayIrValue::Dimension(DimensionValue::new(r#type.clone(), extent).unwrap())
+    }
 
     /// Replaces every capture constant of a capture-lifted `program` with the concrete capture value it names, so that
     /// control-flow tests can interpret the discharged form of a captured program eagerly. Lifting turns the entry
