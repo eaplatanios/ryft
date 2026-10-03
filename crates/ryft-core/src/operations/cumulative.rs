@@ -362,7 +362,7 @@ impl_differentiable_operation! {
     {
         |operation, context, driver, inputs| {
             // A cumulative sum is linear in its input, so its tangent is the same prefix sum of the input tangent.
-            // Every other kind is nonlinear, so its rule differentiates through the associative-scan decomposition
+            // Every other kind is non-linear, so its rule differentiates through the associative-scan decomposition
             // with the kind's own combining operator, and every primitive that construction stages contributes its
             // own forward-mode rule. The composite array universe reaches this rule through the default projected
             // fall-through of `MemberDifferentiableOperation`, because the operation is shape-preserving and its
@@ -404,7 +404,7 @@ impl_differentiable_operation! {
             // while the primitive returns the other argument, and its first complex prefix is the raw first input,
             // while the primitive wraps it onto the principal branch.
 
-            // Attribute the decomposition to this differentiation rule using provenance scopes. Its  manipulation
+            // Attribute the decomposition to this differentiation rule using provenance scopes. Its manipulation
             // primitives do not preserve rank-specific layouts, so an identity broadcast restores the input layout
             // and makes the outputs have the cumulative primitive's type. Backends lower that broadcast as a layout
             // constraint (e.g., XLA's `LayoutConstraint`).
@@ -469,7 +469,7 @@ impl_differentiable_operation! {
             // A forward prefix sum sends input element `i` into every output element `j >= i`, so the cotangent of
             // input `i` is the sum of the output cotangents `j >= i` (i.e., a reverse prefix sum). The adjoint of
             // a reverse prefix sum is symmetrically a forward one, which is why a cumulative sum is closed under
-            // transposition and needs no companion primitive. Every other kind is nonlinear and is instead
+            // transposition and needs no companion primitive. Every other kind is non-linear and is instead
             // differentiated through the linear operations staged by its JVP, so it is rejected here regardless
             // of its cotangent.
             check_count!("input", inputs, 1, ProgramError);
@@ -484,6 +484,9 @@ impl_differentiable_operation! {
                     ),
                 }
                 .into());
+            }
+            if !accumulators[0].is_needed() {
+                return Ok(());
             }
             let contribution = match &outputs[0] {
                 MaybeZero::Zero(_) => MaybeZero::Zero(inputs[0].r#type().cotangent()?),
@@ -520,7 +523,8 @@ pub trait Cumulative: Sized {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if `kind` does not support the data type of `self`, if `axis` is out of bounds, if
-    /// the scanned dimension is dynamic or sharded, or if the context of `self` fails to bind the scan.
+    /// the scanned dimension is dynamic or sharded, if a non-linear kind receives unreduced inputs, or if the context
+    /// of `self` fails to bind the scan.
     fn cumulative<A: Into<Axis>>(&self, axis: A, kind: CumulativeKind, reverse: bool) -> Result<Self, ProgramError>;
 
     /// Returns the inclusive prefix sum of `self` along `axis` using [`CumulativeKind::Sum`]. Refer to
@@ -607,7 +611,8 @@ impl Cumulative for Array {
         // The type rule validates the scan and supplies the complete output metadata. The kernels below then decode the
         // input's logical elements, run the sequential prefix scan over them with the kind's element-level combining
         // operator, and re-encode the result into the input's own type. Accumulation happens in the input's element
-        // data type, so a low-precision payload rounds every partial result exactly as a staged program does.
+        // data type, so a low-precision payload rounds every partial result to that encoding. A backend may associate
+        // combinations differently and therefore produce different final bits.
         let output_type = self.r#type().cumulative(axis, kind)?;
         let data_type = output_type.data_type();
 
@@ -792,7 +797,7 @@ impl Array {
     ///
     /// # Parameters
     ///
-    ///   - `axis`: Validated nonnegative scanned axis.
+    ///   - `axis`: Validated non-negative scanned axis.
     ///   - `reverse`: Whether to accumulate from the end of the scanned axis toward its start.
     ///   - `combine_fn`: Binary associative operator, receiving the accumulated prefix and the next element.
     fn cumulative_elements<T: ArrayElement, F: Fn(T, T) -> Result<T, ProgramError>>(
@@ -878,7 +883,8 @@ impl Array {
 /// scan mirrors the same recursion around the end of the axis (the pairing simply starts one element in when the extent
 /// is odd) instead of reversing the arrays before and after a forward scan, which saves two array reversals per array
 /// and scan. Boolean arrays are interleaved with a disjunction rather than an addition, because Booleans have no
-/// addition.
+/// addition. Arrays of [`DataType::F8E8M0FNU`], which cannot represent zero, are interleaved by concatenating slices
+/// instead. This fallback stages one slice per element along the scanned axis.
 ///
 /// For example, a forward scan over five elements reduces the pairs `(x0, x1)` and `(x2, x3)`, scans those two
 /// reductions recursively to obtain the results at the odd positions, extends each of them by the next input element
@@ -936,9 +942,7 @@ impl Array {
 ///
 /// Returns a [`ProgramError`] if `axis` is out of bounds for any array, if the scanned extent of any array is not
 /// static, if the arrays have different extents along `axis`, if `combine_fn` returns a different number of arrays,
-/// if the data type of any array cannot represent the zero that the interleaving pads with (e.g.,
-/// [`DataType::F8E8M0FNU`]), or if staging any of the primitives of the construction (including
-/// those that `combine_fn` stages) fails.
+/// or if staging any of the primitives of the construction (including those that `combine_fn` stages) fails.
 pub fn associative_scan<
     V: Value<Type = ArrayType, DispatchDomain: Context + Zero<V>> + Add + Or + Concatenate + Pad + Slice,
     P: Parameterized<V>,
@@ -1047,8 +1051,8 @@ fn associative_scan_impl<
     let half = extent / 2;
 
     // Pair adjacent elements. A forward scan pairs from the start of the axis and a reverse scan pairs from its end,
-    // which is the one place the two directions differ: an odd extent leaves the first element unpaired going forward
-    // and the _last_ one unpaired going backward, so the pairing starts one element in.
+    // which is the one place the two directions differ: an odd extent leaves the last element unpaired going forward
+    // and the first one unpaired going backward, so reverse pairing starts one element in.
     let pair_offset = match reverse {
         true => extent % 2,
         false => 0,
@@ -1146,9 +1150,10 @@ fn associative_scan_impl<
 ///
 /// Both arrays are dilated into the output extent with interior padding (writing zeros into the positions that the
 /// other array occupies) and then combined with an addition, or with a disjunction for Boolean arrays, which have no
-/// addition. The combination is exact because the two dilated arrays have disjoint support and zero (i.e., `false`)
-/// is the identity of both combiners. For example, interleaving three elements with two along `axis` pads `left` only
-/// in its interior and pads `right` in its interior and with one zero at each end:
+/// addition. The two dilated arrays have disjoint support and zero (i.e., `false`) is the identity of both combiners,
+/// although floating-point addition can turn a negative zero into a positive zero. For example, interleaving three
+/// elements with two along `axis` pads `left` only in its interior and pads `right` in its interior and with one zero
+/// at each end:
 ///
 /// ```text
 ///     left           = [a0,     a1,     a2]
@@ -1160,7 +1165,10 @@ fn associative_scan_impl<
 ///
 /// When both sides hold the same number of elements, `left` instead gets one zero of high padding and `right` one zero
 /// of low padding, so that `[a0, a1]` and `[b0, b1]` interleave into `[a0, b0, a1, b1]`.
-fn scan_interleave<V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + Or + Pad>(
+///
+/// [`DataType::F8E8M0FNU`] has no representable zero, so it instead interleaves whole element encodings through
+/// slices and concatenation, appending the extra left element when the lengths differ.
+fn scan_interleave<V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + Or + Concatenate + Pad + Slice>(
     left: &[V],
     right: &[V],
     axis: usize,
@@ -1176,6 +1184,18 @@ fn scan_interleave<V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + O
     left.iter()
         .zip(right)
         .map(|(left, right)| {
+            if left.r#type().data_type() == DataType::F8E8M0FNU {
+                // This format has no zero for padding. Concatenate one-element slices in alternating order,
+                // preserving symbolic unscanned dimensions without a dynamic reshape or a padding identity.
+                let mut slices = Vec::with_capacity(left_count + right_count);
+                for index in 0..left_count {
+                    slices.push(left.slice_axis(axis, index, index + 1, 1)?);
+                    if index < right_count {
+                        slices.push(right.slice_axis(axis, index, index + 1, 1)?);
+                    }
+                }
+                return slices[0].concatenate_with(slices.iter().skip(1), axis);
+            }
             let rank = left.r#type().rank();
             let padding_value = left.dispatch_domain().zero(&left.r#type().scalar_like()?)?;
             let mut edge_padding_low = vec![0; rank];
@@ -1208,7 +1228,7 @@ mod tests {
     use crate::arrays::{
         ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionType, DimensionVariable, Layout,
         LogicalMesh, Memory, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, StridedLayout, f4e2m1fn, f8e4m3fn,
-        f8e4m3fnuz, f8e5m2,
+        f8e4m3fnuz, f8e5m2, f8e8m0fnu,
     };
     use crate::batching::batch;
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -1221,7 +1241,9 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::operations::comparisons::{Compare, ComparisonDirection};
+    use crate::operations::constants::zero_like::ZeroLike;
     use crate::operations::control_flow::select::Select;
+    use crate::operations::manipulation::reshaping::Reshape;
     use crate::operations::reductions::Reduce;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -1229,8 +1251,7 @@ mod tests {
 
     use super::*;
 
-    // Pairwise stable `log(exp(a) + exp(b))`, spelled out so that the expected values below pin the construction that
-    // the log-sum-exp scan folds rather than an equivalent-in-exact-arithmetic alternative.
+    /// Pairwise stable `log(exp(a) + exp(b))`, pinning the construction folded by the log-sum-exp scan.
     fn log_add_exp(left: f64, right: f64) -> f64 {
         let delta = left - right;
         match delta.is_nan() {
@@ -1239,8 +1260,7 @@ mod tests {
         }
     }
 
-    // Single-instruction program that applies `operation` to one input of type `input_type`, which the tests below
-    // transform to inspect the programs that the differentiation rule stages.
+    /// Creates a single-instruction program for inspecting the staged differentiation rule.
     fn cumulative_program(
         operation: CumulativeOperation,
         input_type: ArrayType,
@@ -1694,7 +1714,7 @@ mod tests {
     #[test]
     fn test_cumulative_differentiation_zero_tangent() {
         // Every JVP is linear in its tangent, so a structural zero input tangent stays a structural zero output tangent
-        // without differentiating through the associative-scan decomposition of a nonlinear kind.
+        // without differentiating through the associative-scan decomposition of a non-linear kind.
         let outputs = CumulativeOperation::new(0, CumulativeKind::Product)
             .jvp(
                 &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
@@ -1725,7 +1745,7 @@ mod tests {
 
     #[test]
     fn test_cumulative_differentiation_associative_scan_decomposition() {
-        // A nonlinear kind's forward mode differentiates *through* the decomposition, so the fused program holds no
+        // A non-linear kind's forward mode differentiates _through_ the decomposition, so the fused program holds no
         // `cumulative` instruction at all: it is the parallel-prefix construction (two halving levels over a
         // length-four axis) with each of its primitives' own rules interleaved. The primal half is recomputed there
         // rather than taken from the primitive.
@@ -1794,7 +1814,7 @@ mod tests {
 
     #[test]
     fn test_cumulative_differentiation_associative_scan_provenance() {
-        // The decomposition that a nonlinear kind differentiates through is staged under the framework's
+        // The decomposition that a non-linear kind differentiates through is staged under the framework's
         // differentiation scope, which wraps the `associative_scan` scope of the function that stages it.
         let jvp = cumulative_program(
             CumulativeOperation::new(0, CumulativeKind::Max),
@@ -1806,12 +1826,17 @@ mod tests {
             std::fmt::from_fn(|formatter| jvp.render(formatter, 0, ProgramRenderingMode::WithProvenance)).to_string(),
             indoc! {"
                 lambda %0:f64[2], %1:f64[2] .
-                let %2:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %3:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %4:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %5:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
+                let %2:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %0 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
+                    %3:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %1 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
+                    %4:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %0 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
+                    %5:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %1 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
                     %6:f64[1] = max %2 %4 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %7:bool[1] = compare [direction=GreaterThan] %2 %4 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %7:bool[1] = compare [direction=GreaterThan] %2 %4 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
                     %8:bool[1] = compare [direction=Equal] %2 %4 ; provenance=ryft::differentiation::ryft::associative_scan
                     %9:f64[1] = one_like %2 ; provenance=ryft::differentiation::ryft::associative_scan
                     %10:f64[1] = add %9 %9 ; provenance=ryft::differentiation::ryft::associative_scan
@@ -1820,8 +1845,10 @@ mod tests {
                     %13:f64[1] = select %8 %11 %12 ; provenance=ryft::differentiation::ryft::associative_scan
                     %14:f64[1] = select %7 %9 %13 ; provenance=ryft::differentiation::ryft::associative_scan
                     %15:f64[1] = mul %14 %3 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %16:bool[1] = compare [direction=GreaterThan] %4 %2 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %17:bool[1] = compare [direction=Equal] %4 %2 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %16:bool[1] = compare [direction=GreaterThan] %4 %2 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
+                    %17:bool[1] = compare [direction=Equal] %4 %2 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
                     %18:f64[1] = one_like %4 ; provenance=ryft::differentiation::ryft::associative_scan
                     %19:f64[1] = add %18 %18 ; provenance=ryft::differentiation::ryft::associative_scan
                     %20:f64[1] = div %18 %19 ; provenance=ryft::differentiation::ryft::associative_scan
@@ -1830,15 +1857,21 @@ mod tests {
                     %23:f64[1] = select %16 %18 %22 ; provenance=ryft::differentiation::ryft::associative_scan
                     %24:f64[1] = mul %23 %5 ; provenance=ryft::differentiation::ryft::associative_scan
                     %25:f64[1] = add %15 %24 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %26:f64[1] = slice [start_indices=[0], limits=[1]] %0 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %27:f64[1] = slice [start_indices=[0], limits=[1]] %1 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %26:f64[1] = slice [start_indices=[0], limits=[1]] %0 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
+                    %27:f64[1] = slice [start_indices=[0], limits=[1]] %1 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
                     %28:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::ryft::associative_scan
-                    %29:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %26 %28 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %29:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %26 %28 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
                     %30:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::ryft::associative_scan
-                    %31:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %27 %30 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %32:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %6 %28 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %31:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %27 %30 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
+                    %32:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %6 %28 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
                     %33:f64[] = zero [type=f64[]] ; provenance=ryft::differentiation::ryft::associative_scan
-                    %34:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %25 %33 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %34:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %25 %33 ; \
+                        provenance=ryft::differentiation::ryft::associative_scan
                     %35:f64[2] = add %29 %32 ; provenance=ryft::differentiation::ryft::associative_scan
                     %36:f64[2] = add %31 %34 ; provenance=ryft::differentiation::ryft::associative_scan
                 in (%35, %36)"
@@ -1871,41 +1904,61 @@ mod tests {
 
     #[test]
     fn test_cumulative_differentiation_dynamic_unscanned_axis() {
-        // Only the scanned axis must be static: the decomposition keeps every other axis whole, so each nonlinear kind
+        // Only the scanned axis must be static: the decomposition keeps every other axis whole, so each non-linear kind
         // differentiates over a dynamic unscanned axis in forward mode, and its linearized tangent transposes into a
         // pullback over the same dynamic type. On a concrete input, the dynamic programs compute exactly what the
         // statically shaped ones do.
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
         let dynamic_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
-        let static_type = ArrayType::new_static(DataType::F64, [2, 3]);
-        let primal = Array::matrix(2, 3, vec![0.5, 2.0, 1.0, -1.0, 3.0, 0.25]).unwrap();
-        let tangent = Array::matrix(2, 3, vec![1.0, -2.0, 0.5, 3.0, 1.0, -1.0]).unwrap();
-        let cotangent = Array::matrix(2, 3, vec![2.0, -1.0, 0.5, 1.0, 3.0, -2.0]).unwrap();
+        for reverse in [false, true] {
+            for empty in [false, true] {
+                let rows = if empty { 0 } else { 2 };
+                let static_type = ArrayType::new_static(DataType::F64, [rows, 3]);
+                let primal =
+                    Array::matrix(rows, 3, if empty { Vec::new() } else { vec![0.5, 2.0, 1.0, -1.0, 3.0, 0.25] })
+                        .unwrap();
+                let tangent =
+                    Array::matrix(rows, 3, if empty { Vec::new() } else { vec![1.0, -2.0, 0.5, 3.0, 1.0, -1.0] })
+                        .unwrap();
+                let cotangent =
+                    Array::matrix(rows, 3, if empty { Vec::new() } else { vec![2.0, -1.0, 0.5, 1.0, 3.0, -2.0] })
+                        .unwrap();
 
-        // The pullback of a program's linearization at `primal`, applied to `cotangent`, along with its output types.
-        let pullback = |program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>| {
-            let linearization = program.linearize().unwrap();
-            let mut primal_outputs = linearization.primal().interpret(vec![primal.clone()]).unwrap();
-            let residuals = primal_outputs.split_off(1);
-            let transposed = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
-            let cotangents = transposed.interpret([vec![cotangent.clone()], residuals].concat());
-            (transposed.output_types(), cotangents)
-        };
-        for kind in [CumulativeKind::Product, CumulativeKind::LogSumExp, CumulativeKind::Max, CumulativeKind::Min] {
-            let dynamic = cumulative_program(CumulativeOperation::new(1, kind), dynamic_type.clone());
-            let r#static = cumulative_program(CumulativeOperation::new(1, kind), static_type.clone());
-            let jvp = dynamic.jvp().unwrap();
-            assert_eq!(jvp.output_types(), vec![dynamic_type.clone(), dynamic_type.clone()], "{kind}");
-            assert_eq!(
-                jvp.interpret(vec![primal.clone(), tangent.clone()]),
-                r#static.jvp().unwrap().interpret(vec![primal.clone(), tangent.clone()]),
-                "{kind}",
-            );
-            let (dynamic_types, dynamic_cotangents) = pullback(&dynamic);
-            let (_, static_cotangents) = pullback(&r#static);
-            assert_eq!(dynamic_types, vec![dynamic_type.clone()], "{kind}");
-            assert_eq!(dynamic_cotangents, static_cotangents, "{kind}");
+                // The pullback of a program's linearization at `primal`, applied to `cotangent`, along with its
+                // output types.
+                let pullback = |program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>| {
+                    let linearization = program.linearize().unwrap();
+                    let mut primal_outputs = linearization.primal().interpret(vec![primal.clone()]).unwrap();
+                    let residuals = primal_outputs.split_off(1);
+                    let transposed = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
+                    let cotangents = transposed.interpret([vec![cotangent.clone()], residuals].concat());
+                    (transposed.output_types(), cotangents)
+                };
+                for kind in
+                    [CumulativeKind::Product, CumulativeKind::LogSumExp, CumulativeKind::Max, CumulativeKind::Min]
+                {
+                    let dynamic = cumulative_program(
+                        CumulativeOperation::new(1, kind).with_reverse(reverse),
+                        dynamic_type.clone(),
+                    );
+                    let r#static = cumulative_program(
+                        CumulativeOperation::new(1, kind).with_reverse(reverse),
+                        static_type.clone(),
+                    );
+                    let jvp = dynamic.jvp().unwrap();
+                    assert_eq!(jvp.output_types(), vec![dynamic_type.clone(), dynamic_type.clone()], "{kind}");
+                    assert_eq!(
+                        jvp.interpret(vec![primal.clone(), tangent.clone()]),
+                        r#static.jvp().unwrap().interpret(vec![primal.clone(), tangent.clone()]),
+                        "{kind}",
+                    );
+                    let (dynamic_types, dynamic_cotangents) = pullback(&dynamic);
+                    let (_, static_cotangents) = pullback(&r#static);
+                    assert_eq!(dynamic_types, vec![dynamic_type.clone()], "{kind}");
+                    assert_eq!(dynamic_cotangents, static_cotangents, "{kind}");
+                }
+            }
         }
     }
 
@@ -1929,6 +1982,57 @@ mod tests {
                     tolerance = 1e-6,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_cumulative_differentiation_widened_tangents() {
+        let input = Array::vector(vec![
+            f8e8m0fnu::from_bits(127),
+            f8e8m0fnu::from_bits(128),
+            f8e8m0fnu::from_bits(129),
+            f8e8m0fnu::from_bits(130),
+        ])
+        .unwrap();
+        let tangent = Array::vector(vec![1.0f32; 4]).unwrap();
+        for kind in [CumulativeKind::Sum, CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min] {
+            for reverse in [false, true] {
+                let expected_tangent = match kind {
+                    CumulativeKind::Sum if reverse => vec![4.0f32, 3.0, 2.0, 1.0],
+                    CumulativeKind::Sum => vec![1.0f32, 2.0, 3.0, 4.0],
+                    CumulativeKind::Product if reverse => vec![120.0f32, 56.0, 12.0, 1.0],
+                    CumulativeKind::Product => vec![1.0f32, 3.0, 14.0, 120.0],
+                    _ => vec![1.0f32; 4],
+                };
+                assert_eq!(
+                    differentiate_at(input.clone()).jvp(tangent.clone(), |value| value.cumulative(0, kind, reverse)),
+                    Ok((input.cumulative(0, kind, reverse).unwrap(), Array::vector(expected_tangent).unwrap())),
+                    "{kind}, reverse={reverse}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cumulative_differentiation_higher_order() {
+        // Product scans of [x, x] sum to x + x²; log-sum-exp scans of [x, 0] have curvature 1/4 at x = 0.
+        for (kind, input, first, second) in
+            [(CumulativeKind::Product, 3.0f64, 7.0f64, 2.0f64), (CumulativeKind::LogSumExp, 0.0f64, 1.5f64, 0.25f64)]
+        {
+            assert_eq!(
+                differentiate_at(Array::scalar(input).unwrap()).value_and_gradient(|value| {
+                    differentiate_at(value)
+                        .gradient(|value| {
+                            let first = value.reshape([1])?;
+                            let second =
+                                if kind == CumulativeKind::Product { first.clone() } else { first.zero_like()? };
+                            first.concatenate_with([&second], 0)?.cumulative(0, kind, false)?.reduce_sum(&[0], None)
+                        })
+                        .map_err(Into::into)
+                }),
+                Ok((Array::scalar(first).unwrap(), Array::scalar(second).unwrap())),
+                "{kind}",
+            );
         }
     }
 
@@ -1992,7 +2096,22 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_transposition_nonlinear_kinds() {
+    fn test_cumulative_transposition_unrequested_cotangent() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input_type = ArrayType::new_static(DataType::F64, [3]);
+        let cotangent = context.input(input_type.clone());
+        let mut transposition = TranspositionContext::new(context.clone());
+        let inputs = [PartialValue::Unknown(input_type)];
+        let accumulators = transposition.cotangent_accumulators(&inputs, &[false]).unwrap();
+        CumulativeOperation::new(0, CumulativeKind::Sum)
+            .transpose(&mut transposition, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(cotangent)], &accumulators)
+            .unwrap();
+        assert!(transposition.take_cotangents(&accumulators).unwrap().iter().all(MaybeZero::is_zero));
+        assert!(context.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_cumulative_transposition_non_linear_kinds() {
         // Only sums are linear. Every other kind is differentiated through the linear operations staged by its JVP
         // instead, and so direct transposition rejects it, even when the cotangent is a structural zero.
         for kind in [CumulativeKind::Product, CumulativeKind::LogSumExp, CumulativeKind::Max, CumulativeKind::Min] {
@@ -2024,7 +2143,7 @@ mod tests {
 
     #[test]
     fn test_cumulative_cumulative() {
-        // Negative axes count from the end and select the same scan as the corresponding nonnegative axis, for every
+        // Negative axes count from the end and select the same scan as the corresponding non-negative axis, for every
         // kind and direction, both for concrete arrays and for context-carrying values that bind the operation.
         let input = Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         for (axis, position) in [(-1, 1usize), (-2, 0usize)] {
@@ -2698,6 +2817,37 @@ mod tests {
     }
 
     #[test]
+    fn test_associative_scan_zero_free_interleaving() {
+        // Exercise even/odd interleaving along a non-leading axis, preserving a symbolic unscanned dimension.
+        for extent in [3, 4] {
+            let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+            let input_type = ArrayType::new(
+                DataType::F8E8M0FNU,
+                Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(extent)]),
+            );
+            for reverse in [false, true] {
+                let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                    |input| associative_scan(&input, 1, reverse, &|left, right| left.mul(right)),
+                    input_type.clone(),
+                )
+                .unwrap();
+                let input = Array::from_elements(
+                    ArrayType::new_static(DataType::F8E8M0FNU, [1, extent]),
+                    &(0..extent).map(|index| f8e8m0fnu::from_bits(127 + index as u8)).collect::<Vec<_>>(),
+                )
+                .unwrap();
+                assert_eq!(program.interpret(input.clone()), input.cumulative(1, CumulativeKind::Product, reverse));
+                let empty = Array::from_elements(
+                    ArrayType::new_static(DataType::F8E8M0FNU, [0, extent]),
+                    &Vec::<f8e8m0fnu>::new(),
+                )
+                .unwrap();
+                assert_eq!(program.interpret(empty.clone()), Ok(empty));
+            }
+        }
+    }
+
+    #[test]
     fn test_associative_scan_structures() {
         // A structure of arrays is scanned in lockstep under one combining operator over whole structures, which lets
         // arrays of different data types and ranks combine jointly. Here, a running maximum carries the position at
@@ -2918,10 +3068,7 @@ mod tests {
                 false,
                 &first,
             ),
-            Err(ProgramError::Type(TypeError::invalid(format!(
-                "data type `{}` cannot represent zero",
-                DataType::F8E8M0FNU,
-            )))),
+            Ok(Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![127, 127]).unwrap()),
         );
     }
 
@@ -3026,7 +3173,7 @@ mod tests {
             .unwrap();
         assert_eq!(pullback.apply(cotangent), Ok(Array::vector(vec![1.0, 3.0, 6.0, 10.0, 15.0]).unwrap()));
 
-        // A running product is nonlinear, so its pullback goes through the transposed linearization, which, for a unit
+        // A running product is non-linear, so its pullback goes through the transposed linearization, which, for a unit
         // cotangent, accumulates each prefix product divided by the factor it is differentiated with respect to.
         let (output, pullback) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap())
             .vjp(|input| associative_scan(&input, 0, false, &|left, right| left.mul(right)))
