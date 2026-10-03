@@ -155,9 +155,9 @@ Landed in `operations/random.rs`, in exactly the stateless-key shape the plan as
 | Primitive (JAX) | Used by | State | Notes |
 |---|---|---|---|
 | `rng_bit_generator` | the base primitive | ✅ | `RngBitGeneratorOperation` with `RandomAlgorithm::{ThreeFry, Philox}`; lowers to `stablehlo.rng_bit_generator`; host reference kernels (`threefry2x32`, `philox4x32`) keep the CPU backend bit-compatible |
-| `jax.random.split` | reproducible streams per layer / per batch | ✅ | `Random::split_key(count) -> (advanced_state, fresh_states)`; keys are plain `u64` state arrays (no dedicated key type) |
-| `jax.random.normal` / `uniform` | weight initialization, sampling | ✅ | `Random::normal(shape, data_type)` / `Random::uniform(...)`, each returning `(advanced_state, samples)` |
-| `jax.random.categorical` | inference sampling | ✅ | `Random::categorical(logits, axis)` |
+| `jax.random.split` | reproducible streams per layer / per batch | ✅ | `Random::split_rng_key(count) -> (advanced_state, fresh_states)`; keys are plain `u64` state arrays (no dedicated key type) |
+| `jax.random.normal` / `uniform` | weight initialization, sampling | ✅ | `Random::random_normal(&array_type)` / `Random::random_uniform(&array_type)`, each returning `(advanced_state, samples)` |
+| `jax.random.categorical` | inference sampling | ✅ | `Random::random_categorical(logits, axis)` |
 | `jax.random.bernoulli` | dropout mask | ⚠️ | composite on `uniform` + `compare`; moreover the fused attention op carries its own `with_dropout(p, seed)`, which is the only dropout Gemma training would use |
 | truncated normal init | Flax-default weight init | ⚠️ | still a composition (uniform + erf-inverse or rejection); ordinary `normal` covers the practical need |
 
@@ -221,7 +221,7 @@ The transform stack was rebuilt around a single builder entry point:
 - [x] `gather`, `scatter` (with `Add`/`Mul`/`Min`/`Max` reductions), `sort`, `top_k`, `argmax`, `argmin`
 - [x] `dot_general` (+ accumulation type and output sharding), `scaled_dot` (block-scaled, §4)
 - [x] fused `dot_product_attention` (+ backward) with causal mask, sliding window, GQA, dropout, bias, sequence lengths, cuDNN FMHA lowering
-- [x] Device-side RNG (`rng_bit_generator` with ThreeFry/Philox; `split_key`, `normal`, `uniform`, `categorical`)
+- [x] Device-side RNG (`rng_bit_generator` with ThreeFry/Philox; `split_rng_key`, `random_normal`, `random_uniform`, `random_categorical`)
 - [x] `condition`, `while_loop`, `scan`
 - [x] Collectives (`parallel_sum`/`parallel_mean`/`parallel_max`, `all_gather`, `parallel_sum_scatter`, `parallel_permute`, `all_to_all`) + `shard_map`, `reshard`, sharding constraints
 - [x] Activation checkpointing (`rematerialize` with JAX-parity policies and offload)
@@ -943,7 +943,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = plugin.client(client_options)?;
     let mesh = single_axis_mesh(&client)?; // LogicalMesh::new(vec![MeshAxis::new("data", n, MeshAxisType::Auto)?])?
 
-    // Initialize parameters with the device RNG (`Random::split_key` + `Random::normal` per leaf).
+    // Initialize parameters with the device RNG (`Random::split_rng_key` + `Random::random_normal` per leaf).
     let mut model: Gemma4Params<Array> = initialize_gemma_4(&client, &mesh, &config, /*seed=*/ 0)?;
     let mut optimizer_state = AdamWState::zeros_like(&model)?;
     let hyper = AdamWHyper {

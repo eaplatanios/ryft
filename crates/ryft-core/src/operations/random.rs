@@ -17,16 +17,17 @@
 //! The following example splits a state into two independent states and draws uniform samples from one of them:
 //!
 //! ```rust
-//! # use ryft_core::{Array, DataType, ProgramError, Random, RandomAlgorithm};
+//! # use ryft_core::{Array, ArrayType, DataType, ProgramError, Random, RandomAlgorithm};
 //! # fn main() -> Result<(), ProgramError> {
 //! let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[42u64, 0])?;
 //! let (_, keys) = state.split_rng_key(2)?;
-//! let (_, samples) = keys[0].random_uniform([3], DataType::F32)?;
+//! let sample_type = ArrayType::new_static(DataType::F32, [3]);
+//! let (_, samples) = keys[0].random_uniform(&sample_type)?;
 //! assert!(samples.to_f64s().iter().all(|sample| (0.0..1.0).contains(sample)));
 //!
 //! // Drawing from the same state again reproduces the same samples, while a different state draws different ones.
-//! assert_eq!(keys[0].random_uniform([3], DataType::F32)?.1, samples);
-//! assert_ne!(keys[1].random_uniform([3], DataType::F32)?.1, samples);
+//! assert_eq!(keys[0].random_uniform(&sample_type)?.1, samples);
+//! assert_ne!(keys[1].random_uniform(&sample_type)?.1, samples);
 //! # Ok(())
 //! # }
 //! ```
@@ -753,10 +754,10 @@ impl<
 /// # Example
 ///
 /// ```rust
-/// # use ryft_core::{Array, DataType, ProgramError, Random, RandomAlgorithm};
+/// # use ryft_core::{Array, ArrayType, DataType, ProgramError, Random, RandomAlgorithm};
 /// # fn main() -> Result<(), ProgramError> {
 /// let state = Array::from_elements(RandomAlgorithm::Philox.state_type(), &[7u64, 0, 0])?;
-/// let (state, normal) = state.random_normal([2, 3], DataType::F64)?;
+/// let (state, normal) = state.random_normal(&ArrayType::new_static(DataType::F64, [2, 3]))?;
 /// assert!(normal.to_f64s().iter().all(|sample| sample.is_finite()));
 ///
 /// // The masked category has probability zero and the second category dominates the remaining two.
@@ -776,22 +777,23 @@ pub trait Random: Sized {
     /// an operation.
     fn split_rng_key(&self, count: usize) -> Result<(Self, Vec<Self>), ProgramError>;
 
-    /// Draws uniformly distributed samples in `[0, 1)` of the provided shape and floating-point data type, returning
-    /// the advanced state together with the samples.
+    /// Draws uniformly distributed samples in `[0, 1)` of type `r#type`, returning the advanced state together with
+    /// the samples. The samples have the shape, element data type, and memory space of `r#type`.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if this value is not a generator state, if `shape` is not static, if `data_type` is
-    /// neither `f32` nor `f64`, or if the context of the value fails to bind an operation.
-    fn random_uniform<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError>;
+    /// Returns a [`ProgramError`] if this value is not a generator state, if `r#type` is not statically shaped, if its
+    /// element data type is neither `f32` nor `f64`, if it is sharded, or if the context of the value fails to bind an
+    /// operation.
+    fn random_uniform(&self, r#type: &ArrayType) -> Result<(Self, Self), ProgramError>;
 
-    /// Draws standard-normal samples of the provided shape and floating-point data type, returning the advanced state
-    /// together with the samples.
+    /// Draws standard-normal samples of type `r#type`, returning the advanced state together with the samples. The
+    /// samples have the shape, element data type, and memory space of `r#type`.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] under the same conditions as [`Self::random_uniform`].
-    fn random_normal<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError>;
+    fn random_normal(&self, r#type: &ArrayType) -> Result<(Self, Self), ProgramError>;
 
     /// Draws one categorical sample for every position of `logits` outside `axis`, where the values along `axis` are
     /// unnormalized log-probabilities, returning the advanced state together with the sampled `i32` indices. The
@@ -843,7 +845,8 @@ impl<
         Ok((state, fresh_states))
     }
 
-    fn random_uniform<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError> {
+    fn random_uniform(&self, r#type: &ArrayType) -> Result<(Self, Self), ProgramError> {
+        let data_type = r#type.data_type();
         let (bits_data_type, bit_count, precision) = match data_type {
             DataType::F32 => (DataType::U32, 32, 24),
             DataType::F64 => (DataType::U64, 64, 53),
@@ -854,28 +857,28 @@ impl<
                 .into());
             }
         };
-        let shape = shape.into();
         let algorithm = RandomAlgorithm::from_state_type(&self.r#type())?;
-        let bits_type = ArrayType::new(bits_data_type, shape.clone());
+
+        // The bits share the shape, memory space, and sharding of the samples, but not their physical layout, whose
+        // strides depend on the element size.
+        let bits_type = r#type.clone().with_data_type(bits_data_type).with_layout(None);
         let (state, bits) = self.rng_bit_generator(algorithm, &bits_type)?;
 
         // Dividing by `2^(bit_count - precision)` keeps the top `precision` bits as an integer below `2^precision`,
         // which `data_type` represents exactly, so the conversion and the scaling by `2^-precision` are exact as well.
         let domain = self.dispatch_domain();
         let divisor: Self = domain.fill(&bits_type, 2.0f64.powi(bit_count - precision))?;
-        let scale: Self = domain.fill(&ArrayType::new(data_type, shape), 2.0f64.powi(-precision))?;
+        let scale: Self = domain.fill(r#type, 2.0f64.powi(-precision))?;
         Ok((state, bits.div(&divisor)?.convert_element_type(data_type)?.mul(&scale)?))
     }
 
-    fn random_normal<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError> {
-        let shape = shape.into();
-        let (state, first) = self.random_uniform(shape.clone(), data_type)?;
-        let (state, second) = state.random_uniform(shape.clone(), data_type)?;
-        let sample_type = ArrayType::new(data_type, shape);
+    fn random_normal(&self, r#type: &ArrayType) -> Result<(Self, Self), ProgramError> {
+        let (state, first) = self.random_uniform(r#type)?;
+        let (state, second) = state.random_uniform(r#type)?;
         let domain = self.dispatch_domain();
-        let one: Self = domain.fill(&sample_type, 1.0)?;
-        let minus_two: Self = domain.fill(&sample_type, -2.0)?;
-        let two_pi: Self = domain.fill(&sample_type, std::f64::consts::TAU)?;
+        let one: Self = domain.fill(r#type, 1.0)?;
+        let minus_two: Self = domain.fill(r#type, -2.0)?;
+        let two_pi: Self = domain.fill(r#type, std::f64::consts::TAU)?;
         let radius = one.sub(&first)?.log()?.mul(&minus_two)?.sqrt()?;
         let angle = second.mul(&two_pi)?.cos()?;
         Ok((state, radius.mul(&angle)?))
@@ -893,7 +896,7 @@ impl<
                 .into());
             }
         };
-        let (state, uniform) = self.random_uniform(logits_type.shape().clone(), logits_type.data_type())?;
+        let (state, uniform) = self.random_uniform(&logits_type)?;
 
         // Shifting the samples from `[0, 1)` to `[tiny, 1)` keeps the Gumbel noise `-ln(-ln(u + tiny))` finite.
         // The shift only changes `u = 0`, because `tiny` is far below the spacing between non-zero samples.
@@ -1049,8 +1052,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, DimensionBounds, Layout, LogicalMesh, MeshAxis, MeshAxisType, Sharding,
-        StridedLayout,
+        ArrayIrOperation, ArrayOperation, DimensionBounds, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        Sharding, StridedLayout,
     };
     use crate::batching::{BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy};
     use crate::contexts::{EagerContext, StagingContext};
@@ -1820,7 +1823,7 @@ mod tests {
         // `f32` samples keep the top 24 bits of each 32-bit word, and `f64` samples keep the top 53 bits of each 64-bit
         // word, so both are exact multiples of their spacing.
         let state = threefry_state(42, 7);
-        let (advanced_state, samples) = state.random_uniform([2, 3], DataType::F32).unwrap();
+        let (advanced_state, samples) = state.random_uniform(&ArrayType::new_static(DataType::F32, [2, 3])).unwrap();
         let (words, counter) = threefry_u32_words(42, 7, &[2, 3]);
         assert_eq!(advanced_state, threefry_state(42, counter));
         assert_eq!(samples.r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2, 3]));
@@ -1828,7 +1831,7 @@ mod tests {
             samples.elements::<f32>(),
             Ok(words.into_iter().map(|word| (word >> 8) as f32 * 2.0f32.powi(-24)).collect()),
         );
-        let (advanced_state, samples) = state.random_uniform([2, 3], DataType::F64).unwrap();
+        let (advanced_state, samples) = state.random_uniform(&ArrayType::new_static(DataType::F64, [2, 3])).unwrap();
         let (words, counter) = threefry_u64_words(42, 7, 6);
         assert_eq!(advanced_state, threefry_state(42, counter));
         assert_eq!(
@@ -1837,16 +1840,16 @@ mod tests {
         );
 
         // Philox states draw with Philox, and the same state always draws the same samples.
-        let (_, samples) = philox_state(42, 7).random_uniform([5], DataType::F32).unwrap();
+        let (_, samples) = philox_state(42, 7).random_uniform(&ArrayType::new_static(DataType::F32, [5])).unwrap();
         let (words, _) = philox_u32_words(42, 7, 5);
         assert_eq!(
             samples.elements::<f32>(),
             Ok(words.into_iter().map(|word| (word >> 8) as f32 * 2.0f32.powi(-24)).collect()),
         );
-        assert_eq!(philox_state(42, 7).random_uniform([5], DataType::F32).unwrap().1, samples);
+        assert_eq!(philox_state(42, 7).random_uniform(&ArrayType::new_static(DataType::F32, [5])).unwrap().1, samples);
 
         // Many samples stay in `[0, 1)` with the moments of the uniform distribution.
-        let (_, samples) = state.random_uniform([4096], DataType::F32).unwrap();
+        let (_, samples) = state.random_uniform(&ArrayType::new_static(DataType::F32, [4096])).unwrap();
         let values = samples.to_f64s();
         assert!(values.iter().all(|value| (0.0..1.0).contains(value)));
         let mean = values.iter().sum::<f64>() / values.len() as f64;
@@ -1854,8 +1857,19 @@ mod tests {
         assert!((mean - 0.5).abs() < 0.02);
         assert!((variance - 1.0 / 12.0).abs() < 0.01);
 
+        // The samples keep the memory space of the requested type, while its physical layout is a storage request that
+        // the elementwise sampling arithmetic does not preserve.
+        let sample_type = ArrayType::new_static(DataType::F32, [2, 3]).with_memory(Memory::Host { pinned: true });
+        let (_, samples) = state.random_uniform(&sample_type).unwrap();
+        assert_eq!(samples.r#type().as_ref(), &sample_type);
+        let sample_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let (_, samples) = state
+            .random_uniform(&sample_type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4, 8]))))
+            .unwrap();
+        assert_eq!(samples.r#type().as_ref(), &sample_type);
+
         assert!(matches!(
-            state.random_uniform([2], DataType::F16),
+            state.random_uniform(&ArrayType::new_static(DataType::F16, [2])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`random_uniform` does not support output data type `f16`",
         ));
@@ -1865,9 +1879,10 @@ mod tests {
     fn test_random_normal() {
         // Samples follow the Box–Muller transform of two consecutive uniform draws.
         let state = threefry_state(42, 7);
-        let (advanced_state, samples) = state.random_normal([3], DataType::F64).unwrap();
-        let (state_after_first, first) = state.random_uniform([3], DataType::F64).unwrap();
-        let (expected_state, second) = state_after_first.random_uniform([3], DataType::F64).unwrap();
+        let (advanced_state, samples) = state.random_normal(&ArrayType::new_static(DataType::F64, [3])).unwrap();
+        let (state_after_first, first) = state.random_uniform(&ArrayType::new_static(DataType::F64, [3])).unwrap();
+        let (expected_state, second) =
+            state_after_first.random_uniform(&ArrayType::new_static(DataType::F64, [3])).unwrap();
         assert_eq!(advanced_state, expected_state);
         for ((sample, first), second) in samples.to_f64s().into_iter().zip(first.to_f64s()).zip(second.to_f64s()) {
             let expected = (-2.0 * (1.0 - first).ln()).sqrt() * (std::f64::consts::TAU * second).cos();
@@ -1875,7 +1890,7 @@ mod tests {
         }
 
         // Many samples are finite with the moments of the standard normal distribution.
-        let (_, samples) = state.random_normal([4096], DataType::F32).unwrap();
+        let (_, samples) = state.random_normal(&ArrayType::new_static(DataType::F32, [4096])).unwrap();
         assert_eq!(samples.r#type().as_ref(), &ArrayType::new_static(DataType::F32, [4096]));
         let values = samples.to_f64s();
         assert!(values.iter().all(|value| value.is_finite()));

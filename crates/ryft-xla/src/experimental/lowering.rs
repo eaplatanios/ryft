@@ -12287,8 +12287,9 @@ fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Builds the scalar reducer body region of a prefix scan's `reduce_window` for the combining operator selected by
-/// `kind`. The three combiners that a reduction kind also names delegate to [`build_reduce_body_region`] verbatim,
-/// which keeps the extrema on the same portable total-order expansion that `reduce` emits. The other two build their own
+/// `kind`. Sum and extrema delegate to [`build_reduce_body_region`] except for one-bit integers, whose predicate
+/// carriers require integer arithmetic and signed ordering. Delegation keeps other extrema on the same portable
+/// total-order expansion that `reduce` emits. Product, log-sum-exp, and one-bit integer combiners build their own
 /// region over the same pair of scalar block arguments.
 fn build_cumulative_body_region<'c, 't>(
     kind: CumulativeKind,
@@ -12302,18 +12303,34 @@ fn build_cumulative_body_region<'c, 't>(
         CumulativeKind::Min => Some(ReductionKind::Min),
         CumulativeKind::Product | CumulativeKind::LogSumExp => None,
     };
-    if let Some(reduction_kind) = reduction_kind {
+    if let Some(reduction_kind) = reduction_kind
+        && !matches!(element_type, DataType::I1 | DataType::U1)
+    {
         return build_reduce_body_region(reduction_kind, element_type, context, location);
     }
 
-    // The remaining two combiners own their body, which they build over a pair of scalar block arguments.
+    // Product, log-sum-exp, and one-bit integer combiners build their body over a pair of scalar block arguments.
     let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
     let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
     let mut region = context.region();
     let mut block_ref = region.append_block(block)?;
     let left = block_ref.argument(0)?.as_ref();
     let right = block_ref.argument(1)?.as_ref();
+    // One-bit integers use a predicate carrier. Addition wraps modulo two (XOR), and signed I1 extrema
+    // reverse the Boolean order because the set bit represents -1 rather than +1.
     let body_value = match kind {
+        CumulativeKind::Sum if matches!(element_type, DataType::I1 | DataType::U1) => {
+            block_ref.append_operation(stable_hlo::xor(left, right, location)?)?.result(0).unwrap().as_ref()
+        }
+        CumulativeKind::Max | CumulativeKind::Min if matches!(element_type, DataType::I1 | DataType::U1) => {
+            let use_or = (kind == CumulativeKind::Min) == (element_type == DataType::I1);
+            let combined = if use_or {
+                block_ref.append_operation(stable_hlo::or(left, right, location)?)?
+            } else {
+                block_ref.append_operation(stable_hlo::and(left, right, location)?)?
+            };
+            combined.result(0).unwrap().as_ref()
+        }
         CumulativeKind::LogSumExp if element_type.is_complex() => {
             // An operand whose real component is negative infinity has a zero exponential, so it leaves the other
             // operand unchanged. The complex expansion cannot see this when both operands are such values (e.g., the
@@ -12414,6 +12431,11 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
         return Ok(input_value);
     }
     let element_type = output_array_type.data_type();
+    // A structural zero has no payload and both its prefix sums and products stay zero. In particular, its
+    // product must not construct a multiplicative identity, which this element type cannot represent.
+    if element_type == DataType::Zero {
+        return Ok(input_value);
+    }
     if kind == CumulativeKind::Sum
         && !reverse
         && matches!(target_platform, Some("cuda" | "rocm"))
@@ -12441,7 +12463,13 @@ fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
             body_region.append_block(context.block(&[(carry_tensor_type, location), (carry_tensor_type, location)]))?;
         let slice = body_block.argument(0)?.as_ref();
         let carry = body_block.argument(1)?.as_ref();
-        let sum = body_block.append_operation(stable_hlo::add(slice, carry, location)?)?.result(0).unwrap().as_ref();
+        let sum = if matches!(element_type, DataType::I1 | DataType::U1) {
+            // Predicate-carrier addition is OR, while one-bit integer addition wraps modulo two.
+            body_block.append_operation(stable_hlo::xor(slice, carry, location)?)?
+        } else {
+            body_block.append_operation(stable_hlo::add(slice, carry, location)?)?
+        };
+        let sum = sum.result(0).unwrap().as_ref();
         body_block.append_operation(stable_hlo::r#return(&[sum, sum], location)?)?;
         let scan = block.append_operation(chlo::scan(
             &[input_value],
@@ -19785,6 +19813,80 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_lower_cumulative_one_bit_sum_on_gpu() {
+        for data_type in [DataType::I1, DataType::U1] {
+            let input_type = ArrayType::new_static(data_type, [2, 4]);
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let output = builder
+                .add_instruction(CumulativeOperation::new(1, CumulativeKind::Sum), Vec::new(), vec![input], None)
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let program = unproject_plain_program(program);
+            let types = vec![input_type];
+            for target_platform in ["cuda", "rocm"] {
+                assert_eq!(
+                    lower_mlir_module_for_program(
+                        &program,
+                        &[],
+                        &types,
+                        &types,
+                        "main",
+                        None,
+                        None,
+                        Some(target_platform),
+                    )
+                    .unwrap()
+                    .stable_hlo,
+                    indoc! {"
+                        module {
+                          func.func @main(%arg0: tensor<2x4xi1>) -> tensor<2x4xi1> {
+                            %c = stablehlo.constant dense<false> : tensor<i1>
+                            %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<2xi1>
+                            %1:2 = chlo.scan(%arg0) inits (%0) dimension=1  attributes {is_associative = true} {
+                            ^bb0(%input: tensor<2xi1>, %carry: tensor<2xi1>):
+                              %2 = stablehlo.xor %input, %carry : tensor<2xi1>
+                              stablehlo.return %2, %2 : tensor<2xi1>, tensor<2xi1>
+                            } : (tensor<2x4xi1>, tensor<2xi1>) -> (tensor<2x4xi1>, tensor<2xi1>)
+                            return %1#0 : tensor<2x4xi1>
+                          }
+                        }
+                    "},
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_cumulative_structural_zero() {
+        for kind in [CumulativeKind::Sum, CumulativeKind::Product] {
+            for reverse in [false, true] {
+                assert_eq!(
+                    lowered_unary_module(
+                        ArrayOperation::Cumulative(CumulativeOperation::new(0, kind).with_reverse(reverse)),
+                        DataType::Zero,
+                        vec![3],
+                    ),
+                    Ok(indoc! {"
+                        module {
+                          func.func @main(%arg0: tensor<3xi1>) -> tensor<3xi1> {
+                            return %arg0 : tensor<3xi1>
+                          }
+                        }
+                    "}
+                    .to_string()),
+                );
+            }
+        }
     }
 
     #[test]

@@ -245,9 +245,8 @@ impl<V> RaggedAxis<V> {
 /// [`Lowest`](Self::Lowest) for every real data type and the lowest real component paired with a zero imaginary one
 /// (i.e., `-∞ + 0i`) for the complex types. [`One`](Self::One) is the element type's canonical multiplicative identity
 /// (i.e., [`ArrayElement::one`]): `true` for Booleans, `1 + 0i` for the complex types, and the all-ones encoding `-1`
-/// for the two-valued [`DataType::I1`](crate::DataType::I1), which is the multiplicative identity of its arithmetic
-/// modulo two. Those four identities require an element type with a payload, so the payload-free
-/// [`DataType::Token`](crate::DataType::Token) and [`DataType::Zero`](crate::DataType::Zero)
+/// for the two-valued [`DataType::I1`], which is the multiplicative identity of its arithmetic modulo two. Those four
+/// identities require an element type with a payload, so the payload-free [`DataType::Token`] and [`DataType::Zero`]
 /// element types are rejected.
 ///
 /// [`Zero`](Self::Zero), the additive identity, never reaches that rejection in practice. Instead, a masking

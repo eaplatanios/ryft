@@ -7170,7 +7170,7 @@ mod tests {
             DecodeSampling::Greedy => (generator, logits.argmax(0)?),
             DecodeSampling::TopK => {
                 let (top_logits, top_indices) = logits.top_k(configuration.top_k, 0)?;
-                let (generator, choice) = generator.categorical(&top_logits, 0)?;
+                let (generator, choice) = generator.random_categorical(&top_logits, 0)?;
                 let next_token = top_indices.dynamic_slice(&[choice], &[1])?.reshape(static_shape(&[]))?;
                 (generator, next_token)
             }

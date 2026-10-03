@@ -316,13 +316,13 @@ mod tests {
 
     use ryft_core::{
         Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Clamp, Compare, ComparisonDirection, Concatenate,
-        ConvertElementType, ConvertElementTypeOperation, Cos, Cumulative, DenseDifferentiableType, Device, DeviceMesh,
-        Differentiate, Dimension, DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Gather,
-        GatherDimensionNumbers, GatherMode, GatherOptions, Ln1p, Log, LogAddExp, LogicalMesh, Logistic, Max, MeshAxis,
-        MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReducePrecision, ReductionKind, Rem, Reshape,
-        ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind,
-        Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose,
-        TypeError, UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
+        ConvertElementType, ConvertElementTypeOperation, Cos, Cumulative, CumulativeKind, DenseDifferentiableType,
+        Device, DeviceMesh, Differentiate, Dimension, DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate,
+        Gather, GatherDimensionNumbers, GatherMode, GatherOptions, Ln1p, Log, LogAddExp, LogicalMesh, Logistic, Max,
+        MeshAxis, MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReducePrecision, ReductionKind, Rem,
+        Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOptions,
+        ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient,
+        Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -2979,9 +2979,9 @@ mod tests {
         )
         .unwrap();
 
-        let shape = Shape::new(vec![Dimension::Static(8)]);
-        let (_, device_uniform) = state.uniform(shape.clone(), DataType::F32).unwrap();
-        let (_, reference_uniform) = reference_state.uniform(shape.clone(), DataType::F32).unwrap();
+        let sample_type = ArrayType::new_static(DataType::F32, [8]);
+        let (_, device_uniform) = state.random_uniform(&sample_type).unwrap();
+        let (_, reference_uniform) = reference_state.random_uniform(&sample_type).unwrap();
         let device_bits = read_f32s(&device_uniform).into_iter().map(f32::to_bits).collect::<Vec<_>>();
         let reference_bits =
             reference_uniform.to_f64s().into_iter().map(|value| (value as f32).to_bits()).collect::<Vec<_>>();
@@ -2990,8 +2990,8 @@ mod tests {
             assert!((0.0..1.0).contains(&value), "uniform sample {value} escapes [0, 1)");
         }
 
-        let (_, device_normal) = state.normal(shape.clone(), DataType::F32).unwrap();
-        let (_, reference_normal) = reference_state.normal(shape, DataType::F32).unwrap();
+        let (_, device_normal) = state.random_normal(&sample_type).unwrap();
+        let (_, reference_normal) = reference_state.random_normal(&sample_type).unwrap();
         for (device_value, reference_value) in read_f32s(&device_normal).iter().zip(reference_normal.to_f64s()) {
             assert!(
                 (f64::from(*device_value) - reference_value).abs() < 1e-5,
@@ -3006,13 +3006,13 @@ mod tests {
             .unwrap()
             .convert_element_type(DataType::F32)
             .unwrap();
-        let (_, device_samples) = state.categorical(&device_logits, 0).unwrap();
-        let (_, reference_samples) = reference_state.categorical(&reference_logits, 0).unwrap();
+        let (_, device_samples) = state.random_categorical(&device_logits, 0).unwrap();
+        let (_, reference_samples) = reference_state.random_categorical(&reference_logits, 0).unwrap();
         assert_eq!(read_i32s(&device_samples), vec![1]);
         assert_eq!(reference_samples.elements::<i32>().unwrap(), vec![1]);
 
-        let (_, device_keys) = state.split_key(2).unwrap();
-        let (_, reference_keys) = reference_state.split_key(2).unwrap();
+        let (_, device_keys) = state.split_rng_key(2).unwrap();
+        let (_, reference_keys) = reference_state.split_rng_key(2).unwrap();
         for (device_key, reference_key) in device_keys.iter().zip(reference_keys.iter()) {
             let device_words = values_from_bytes::<u64>(
                 shard_host_bytes(&device_key.addressable_shards().next().unwrap()).unwrap().as_slice(),
@@ -3364,6 +3364,30 @@ mod tests {
 
         let selected = Array::select(&less_than, &a, &b).unwrap();
         assert_eq!(read_f32s(&selected), vec![1.0, 2.0, 3.0, 8.0]);
+    }
+
+    #[test]
+    fn test_eager_cumulative_one_bit_integers() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let bits = [1, 1, 0, 1];
+        for data_type in [DataType::I1, DataType::U1] {
+            let input =
+                Array::from_host_buffer(&client, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &bits).unwrap();
+            let reference = CpuArray::from_logical_bytes(ArrayType::new_static(data_type, [4]), &bits).unwrap();
+            // Sum must wrap modulo two rather than behave like Boolean OR. Signed extrema reverse the
+            // predicate carrier's order, while unsigned extrema and multiplication use its ordinary order.
+            for kind in [CumulativeKind::Sum, CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min] {
+                for reverse in [false, true] {
+                    let output = input.cumulative(0, kind, reverse).unwrap();
+                    assert_eq!(output.data_type(), data_type);
+                    assert_eq!(
+                        shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+                        reference.cumulative(0, kind, reverse).unwrap().logical_bytes(),
+                    );
+                }
+            }
+        }
     }
 
     #[test]
