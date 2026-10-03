@@ -324,11 +324,11 @@ fn infer_linear_collective_operation_output_type(
     output_dimensions: Vec<usize>,
 ) -> Result<ArrayType, TypeError> {
     let output_sizes = output_dimensions.into_iter().map(Dimension::Static).collect::<Vec<_>>();
+    let output_sharding = input_type.resized_sharding(output_sizes.as_slice(), operation_name)?;
     let output_shape = Shape::new(output_sizes);
-    let sharding = input_type.resized_sharding(output_sizes.as_slice(), operation_name)?;
-    let mut output_type = ArrayType::new(input_type.data_type(), output_shape).with_memory(input_type.memory());
-    output_type.sharding = sharding;
-    Ok(output_type)
+    Ok(ArrayType::new(input_type.data_type(), output_shape)
+        .with_sharding(output_sharding)?
+        .with_memory(input_type.memory()))
 }
 
 // TODO(eaplatanios): Review form here onwards.

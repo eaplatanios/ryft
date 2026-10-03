@@ -192,9 +192,9 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 /// the implementing type and stage or execute one [`ArrayOperation`] variant. Everything that a variant needs in
 /// order to exist, but that a value does not itself perform, stays out:
 ///
-///   - type-semantics plumbing such as [`WhileTypeSemantics`](crate::operations::control_flow::WhileTypeSemantics),
-///     [`ScanTypeSemantics`](crate::operations::control_flow::scan::ScanTypeSemantics),
-///     [`ConditionTypeSemantics`](crate::operations::control_flow::condition::ConditionTypeSemantics), and
+///   - type-family plumbing such as [`WhileType`](crate::operations::control_flow::WhileType),
+///     [`ScanType`](crate::operations::control_flow::scan::ScanType),
+///     [`ConditionType`](crate::operations::control_flow::condition::ConditionType), and
 ///     [`WhilePredicate`](crate::WhilePredicate);
 ///   - staging machinery such as [`Constant`](crate::operations::constants::Constant) and
 ///     [`Tag`](crate::operations::tagging::Tag), and the context-side constructors [`Zero`],

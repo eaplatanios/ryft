@@ -49,9 +49,7 @@ pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, ManualVariationAlignment, PARALLEL_REDUCE_OPERATION_NAME,
     PARALLEL_VARY_OPERATION_NAME, ParallelReduce, ParallelReduceOperation, ParallelVary, ParallelVaryOperation,
 };
-pub use comparisons::{
-    COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonTypeSemantics,
-};
+pub use comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonType};
 pub use constants::{
     CONSTANT_OPERATION_NAME, Constant, ConstantOperation, DimensionConstant, DynamicFill, DynamicIota, DynamicOne,
     DynamicZero, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation, ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One,
@@ -60,8 +58,7 @@ pub use constants::{
 };
 pub use control_flow::{
     CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation, Select,
-    SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics,
-    transpose_primal_condition,
+    SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileType, transpose_primal_condition,
 };
 pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation, associative_scan};
 pub use custom_functions::{

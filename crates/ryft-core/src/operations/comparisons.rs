@@ -194,7 +194,7 @@ where
     }
 }
 
-impl<T: ComparisonTypeSemantics> Operation for CompareOperation<T> {
+impl<T: ComparisonType> Operation for CompareOperation<T> {
     type Type = T;
 
     #[inline]
@@ -234,7 +234,7 @@ impl ElementwiseOperation for CompareOperation<ArrayType> {
 
 impl_reference_dischargeable_operation!(@reference_free <T> CompareOperation<T> where T: Type);
 
-impl<D: Domain<Type: ComparisonTypeSemantics, Value: Compare<D::Value>>> InterpretableOperation<D>
+impl<D: Domain<Type: ComparisonType, Value: Compare<D::Value>>> InterpretableOperation<D>
     for CompareOperation<D::Type>
 {
     #[inline]
@@ -329,7 +329,7 @@ impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Type);
 impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
 
 /// Type-family comparison semantics for [`CompareOperation`].
-pub trait ComparisonTypeSemantics: Type {
+pub trait ComparisonType: Type {
     /// Infers the Boolean output type for comparing this type with `other` in the given `direction`.
     /// Returns an error if the inputs are incompatible or the direction is unsupported for their types.
     ///
@@ -340,7 +340,7 @@ pub trait ComparisonTypeSemantics: Type {
     fn infer_comparison_output_type(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, TypeError>;
 }
 
-impl ComparisonTypeSemantics for DataType {
+impl ComparisonType for DataType {
     fn infer_comparison_output_type(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, TypeError> {
         // Complex inputs are unordered, so only the equality comparison directions are defined for them.
         if !matches!(direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual)
@@ -363,7 +363,7 @@ impl ComparisonTypeSemantics for DataType {
     }
 }
 
-impl ComparisonTypeSemantics for ArrayType {
+impl ComparisonType for ArrayType {
     fn infer_comparison_output_type(&self, other: &Self, direction: ComparisonDirection) -> Result<Self, TypeError> {
         // Complex inputs are unordered, so only the equality comparison directions are defined for them.
         if !matches!(direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual)
@@ -392,7 +392,7 @@ impl ComparisonTypeSemantics for ArrayType {
     }
 }
 
-impl ComparisonTypeSemantics for ArrayIrType {
+impl ComparisonType for ArrayIrType {
     fn infer_comparison_output_type(&self, other: &Self, _direction: ComparisonDirection) -> Result<Self, TypeError> {
         // Validate that both inputs are dimensions. Array comparisons use the projected `ArrayType` operation instead.
         <&DimensionType>::try_from(self)?;

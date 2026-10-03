@@ -1,3 +1,7 @@
+use thiserror::Error;
+
+use crate::programs::TypeError;
+
 pub mod meshes;
 pub mod shardings;
 pub mod visualizations;
@@ -5,8 +9,6 @@ pub mod visualizations;
 pub use meshes::{Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex};
 pub use shardings::{Sharding, ShardingDimension};
 pub use visualizations::ShardingVisualization;
-
-use thiserror::Error;
 
 /// Represents sharding-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -64,4 +66,25 @@ pub enum ShardingError {
 
     #[error("sharding visualization only supports rank-1 and rank-2 shapes, but got rank {rank}")]
     UnsupportedVisualizationRank { rank: usize },
+}
+
+impl From<ShardingError> for TypeError {
+    #[inline]
+    fn from(error: ShardingError) -> Self {
+        Self::custom(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sharding_error_to_type_error() {
+        let error = ShardingError::ShardingRankMismatch { sharding_rank: 1, array_rank: 2 };
+        let type_error = TypeError::from(error.clone());
+        assert_eq!(type_error.downcast_custom::<ShardingError>(), Some(&error));
+        assert_eq!(type_error.clone().downcast_custom::<ShardingError>(), Some(&error));
+        assert_eq!(type_error.to_string(), error.to_string());
+    }
 }
