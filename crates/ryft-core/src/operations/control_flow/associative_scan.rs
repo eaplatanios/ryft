@@ -3,8 +3,22 @@
 //!
 //! Unlike the control-flow [`ScanOperation`](crate::operations::control_flow::ScanOperation), which stages one
 //! region-carrying instruction that runs its body sequentially, [`associative_scan`] is a function rather than an
-//! operation. It stages the logarithmic-depth construction directly, so every transformation (e.g., batching,
-//! differentiation, or partial evaluation) applies the rules of the primitives it stages.
+//! operation. It stages the logarithmic-depth construction directly, so it has no transformation rules of its own and
+//! every transformation (e.g., batching, differentiation, or partial evaluation) applies the rules of the primitives
+//! it stages.
+//!
+//! # Example
+//!
+//! ```rust
+//! # use ryft_core::{Array, Mul, ProgramError, associative_scan};
+//! # fn main() -> Result<(), ProgramError> {
+//! let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0])?;
+//! let product = |left: &Array, right: &Array| left.mul(right);
+//! assert_eq!(associative_scan(&input, 0, false, &product)?, Array::vector(vec![1.0, 2.0, 6.0, 24.0])?);
+//! assert_eq!(associative_scan(&input, 0, true, &product)?, Array::vector(vec![24.0, 24.0, 12.0, 4.0])?);
+//! # Ok(())
+//! # }
+//! ```
 
 // TODO(eaplatanios): Review this module.
 
@@ -45,17 +59,19 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Typed, Value};
 /// so they must all have the same extent along it, while their other dimensions and their data types can differ.
 ///
 /// The recursion combines adjacent pairs along `axis`, scans the halved sequence recursively, combines the scanned
-/// halves back against the elements the pairing skipped, and interleaves the two halves into the result. `combine`
-/// always receives its inputs in scan order (the accumulated prefix first), so the construction stays correct for
-/// associative operators that are not commutative. A `reverse` scan mirrors the same recursion around the end of the
-/// axis (the pairing simply starts one element in when the extent is odd) instead of reversing the arrays before and
-/// after a forward scan, which saves two array reversals per array and scan. Boolean arrays are interleaved with a
-/// disjunction rather than an addition, because Booleans have no addition.
+/// halves back against the elements the pairing skipped, and interleaves the two halves into the result. Each call of
+/// `combine` therefore operates on many positions at once (i.e., it must be vectorized along `axis`): it receives two
+/// structures whose arrays hold the same number of positions along `axis` (at most half of the scanned extent) and must
+/// combine them position by position. `combine` always receives its inputs in scan order (the accumulated prefix
+/// first), so the construction stays correct for associative operators that are not commutative. A `reverse` scan
+/// mirrors the same recursion around the end of the axis (the pairing simply starts one element in when the extent is
+/// odd) instead of reversing the arrays before and after a forward scan, which saves two array reversals per array and
+/// scan. Boolean arrays are interleaved with a disjunction rather than an addition, because Booleans have no addition.
 ///
 /// The scanned axis of every array must have a static extent, because the construction slices it at staging-time
 /// positions, while every other axis can be dynamic (it is kept whole). A scanned axis shorter than two elements leaves
-/// the arrays unchanged, and so does a structure that holds no arrays. A negative
-/// `axis` counts from the end of the shape of the first array, and the resulting position is scanned in every array.
+/// the arrays unchanged without invoking `combine`, and so does a structure that holds no arrays. A negative `axis`
+/// counts from the end of the shape of the first array, and the resulting position is scanned in every array.
 ///
 /// # Parameters
 ///
@@ -63,24 +79,25 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Typed, Value};
 ///   - `axis`: Scanned [`Axis`] of every array, normalized against the rank of the first array.
 ///   - `reverse`: Whether to accumulate from the end of the scanned axis toward its start.
 ///   - `combine`: Associative binary operator over structures shaped like `values`, receiving the accumulated prefix
-///     and the next elements in scan order. It must return as many arrays as `values` holds.
+///     and the next elements in scan order and combining them position by position along `axis`. It must return as
+///     many arrays as `values` holds, each with the type of the corresponding array that it receives.
 ///
 /// # Errors
 ///
 /// Returns a [`ProgramError`] if `axis` is out of bounds for any array, if the scanned extent of any array is not
-/// static, if
-/// the arrays have different extents along `axis`, if `combine` returns a different number of arrays, or if staging
-/// any of the primitives of the construction (including those that `combine` stages) fails.
-pub fn associative_scan<V, Values, A: Into<Axis>, F>(
+/// static, if the arrays have different extents along `axis`, if `combine` returns a different number of arrays, if
+/// the data type of any array cannot represent the zero that the interleaving pads with (e.g.,
+/// [`DataType::F8E8M0FNU`]), or if staging any of the primitives of the construction (including those that `combine`
+/// stages) fails.
+pub fn associative_scan<V: Value<Type = ArrayType>, Values: Parameterized<V>, A: Into<Axis>, F>(
     values: &Values,
     axis: A,
     reverse: bool,
     combine: &F,
 ) -> Result<Values, ProgramError>
 where
-    V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
-    V::DispatchDomain: Context<Type = ArrayType> + Zero<V>,
-    Values: Parameterized<V>,
+    V: Add + Concatenate + Or + Pad + Slice,
+    V::DispatchDomain: Context + Zero<V>,
     F: Fn(&Values, &Values) -> Result<Values, ProgramError>,
 {
     let structure = values.parameter_structure();
@@ -147,7 +164,7 @@ where
 
 /// Recursive half of [`associative_scan`], operating on the flat arrays of the scanned structure, whose (static) extent
 /// along `axis` is `extent`.
-fn associative_scan_recursively<V, F>(
+fn associative_scan_recursively<V: Value<Type = ArrayType>, F>(
     values: &[V],
     extent: usize,
     axis: usize,
@@ -155,8 +172,8 @@ fn associative_scan_recursively<V, F>(
     combine: &F,
 ) -> Result<Vec<V>, ProgramError>
 where
-    V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
-    V::DispatchDomain: Context<Type = ArrayType> + Zero<V>,
+    V: Add + Concatenate + Or + Pad + Slice,
+    V::DispatchDomain: Zero<V>,
     F: Fn(&[V], &[V]) -> Result<Vec<V>, ProgramError>,
 {
     if extent < 2 {
@@ -182,57 +199,56 @@ where
     // positions congruent to `pair_offset` of a reverse one.
     let aligned = associative_scan_recursively(&reduced, half, axis, reverse, combine)?;
 
-    // Each complementary position extends the aligned result before it by the one element that separates them, except
-    // for the position at the scan's own start, which is just the input element there. An even extent has one fewer
-    // complementary combination than there are aligned results, so the aligned side is trimmed; an extent of exactly
-    // two has none at all, and its complementary half is that lone start element.
+    // Each complementary position extends the aligned result just before it in scan order by its own input element,
+    // except for the position at the scan's own start, which is just the input element there. An even extent has one
+    // fewer complementary combination than there are aligned results, so the aligned side is trimmed; an extent of
+    // exactly two has none at all, and its complementary half is that lone start element.
     let complement_count = match extent % 2 {
         0 => half - 1,
         _ => half,
     };
-    let (complement, aligned_leads) = match reverse {
+    let complement = match reverse {
         true => {
             let last = scan_slice(values, axis, extent - 1, extent, 1)?;
-            let complement = match complement_count {
+            match complement_count {
                 0 => last,
                 _ => {
                     let trimmed = match extent % 2 {
                         0 => scan_slice(&aligned, axis, 1, half, 1)?,
                         _ => aligned.clone(),
                     };
-                    let start = (pair_offset + 1) % 2;
-                    let inputs = scan_slice(values, axis, start, start + 2 * complement_count, 2)?;
+                    let inputs = scan_slice(values, axis, 1 - pair_offset, extent - 1, 2)?;
                     combine(&trimmed, &inputs)?
                         .iter()
                         .zip(&last)
-                        .map(|(combined, last)| V::concatenate([combined, last], axis))
+                        .map(|(combined, last)| combined.concatenate_with([last], axis))
                         .collect::<Result<Vec<_>, _>>()?
                 }
-            };
-            (complement, extent % 2 == 0)
+            }
         }
         false => {
             let first = scan_slice(values, axis, 0, 1, 1)?;
-            let complement = match complement_count {
+            match complement_count {
                 0 => first,
                 _ => {
                     let trimmed = match extent % 2 {
                         0 => scan_slice(&aligned, axis, 0, half - 1, 1)?,
                         _ => aligned.clone(),
                     };
-                    let inputs = scan_slice(values, axis, 2, (2 + 2 * complement_count).min(extent), 2)?;
+                    let inputs = scan_slice(values, axis, 2, extent, 2)?;
                     first
                         .iter()
                         .zip(&combine(&trimmed, &inputs)?)
-                        .map(|(first, combined)| V::concatenate([first, combined], axis))
+                        .map(|(first, combined)| first.concatenate_with([combined], axis))
                         .collect::<Result<Vec<_>, _>>()?
                 }
-            };
-            (complement, false)
+            }
         }
     };
 
-    match aligned_leads {
+    // The aligned results lead exactly when they include the start of the axis, which happens only for a reverse scan
+    // over an even extent.
+    match reverse && extent % 2 == 0 {
         true => scan_interleave(&aligned, &complement, axis, half, extent - half),
         false => scan_interleave(&complement, &aligned, axis, extent - half, half),
     }
@@ -240,7 +256,7 @@ where
 
 /// Returns the elements of each array in `values` at positions `start`, `start + stride`, ... below `limit` along
 /// `axis`, keeping every other axis whole (including a dynamic one) through [`Slice::slice_axis`].
-fn scan_slice<V: Slice + Typed<Type = ArrayType>>(
+fn scan_slice<V: Typed<Type = ArrayType> + Slice>(
     values: &[V],
     axis: usize,
     start: usize,
@@ -303,10 +319,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayOperation, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::contexts::StagingContext;
+    use crate::batching::{BatchAxis, batch};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::differentiate_at;
+    use crate::operations::arithmetic::Mul;
     use crate::operations::comparisons::{Compare, ComparisonDirection};
     use crate::operations::control_flow::select::Select;
-    use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
     use crate::programs::ProgramRenderingMode;
     use crate::tracing::TracingContext;
 
@@ -314,122 +333,37 @@ mod tests {
 
     #[test]
     fn test_associative_scan() {
-        // The decomposition is checked against explicit prefix and suffix results, over both parities of the
-        // scanned extent and in both directions. Summation pins the positions each output accumulates over, and the
-        // left projection (which is associative but not commutative) additionally pins the input order that the
-        // construction passes to the combiner: its forward scan is the first element repeated and its reverse scan the
-        // last.
-        let add = |left: &Array, right: &Array| left.add(right);
-        let first = |left: &Array, _right: &Array| Ok(left.clone());
-        for extent in 0..=9usize {
-            let values = (1..=extent).map(|value| value as f64).collect::<Vec<_>>();
-            let input = Array::vector(values.clone()).unwrap();
-            for reverse in [false, true] {
-                let sums = (0..extent)
-                    .map(|index| {
-                        if reverse {
-                            values[index..].iter().sum::<f64>()
-                        } else {
-                            values[..=index].iter().sum::<f64>()
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let first_value = if reverse { values.last() } else { values.first() };
-                let first_values = first_value.map_or_else(Vec::new, |&value| vec![value; extent]);
-                assert_eq!(
-                    associative_scan(&input, 0, reverse, &add).map(|output| output.to_f64s()),
-                    Ok(sums),
-                    "summation over extent {extent}, reverse {reverse}",
-                );
-                assert_eq!(
-                    associative_scan(&input, 0, reverse, &first).map(|output| output.to_f64s()),
-                    Ok(first_values),
-                    "left projection over extent {extent}, reverse {reverse}",
-                );
-            }
-        }
+        // An odd extent exercises every part of one recursion level. A forward scan pairs from the start of the axis,
+        // combines the scanned pairs with the elements at the remaining even positions, and prepends the first element.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| associative_scan(&input, 0, false, &|left, right| left.add(right)),
+            ArrayType::new_static(DataType::F64, [3]),
+        )
+        .unwrap();
+        assert_eq!(program.to_string(), indoc! {"
+            FORWARD"
+        });
 
-        // Boolean inputs are interleaved with a disjunction, because Booleans have no addition.
-        let or = |left: &Array, right: &Array| left.or(right);
-        let booleans = Array::vector(vec![false, false, true, false, false]).unwrap();
-        assert_eq!(
-            associative_scan(&booleans, 0, false, &or),
-            Ok(Array::vector(vec![false, false, true, true, true]).unwrap()),
-        );
-        assert_eq!(
-            associative_scan(&booleans, 0, true, &or),
-            Ok(Array::vector(vec![true, true, true, false, false]).unwrap()),
-        );
-
-        // The construction scans one axis of a higher-rank input independently per row.
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        assert_eq!(
-            associative_scan(&matrix, 1, false, &add),
-            Ok(Array::matrix(2, 3, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]).unwrap()),
-        );
-        assert_eq!(
-            associative_scan(&matrix, 1, true, &add),
-            Ok(Array::matrix(2, 3, vec![6.0, 5.0, 3.0, 15.0, 11.0, 6.0]).unwrap()),
-        );
-        assert_eq!(
-            associative_scan(&matrix, 0, false, &add),
-            Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]).unwrap()),
-        );
-
-        // Negative axes count from the end of the shape.
-        assert_eq!(associative_scan(&matrix, -1, false, &add), associative_scan(&matrix, 1, false, &add));
-        assert_eq!(associative_scan(&matrix, -2, true, &add), associative_scan(&matrix, 0, true, &add));
+        // A reverse scan mirrors that recursion: it pairs from the end of the axis, combines the scanned pairs with
+        // the elements at the remaining positions (passing the accumulated suffix first), and appends the last element.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| associative_scan(&input, 0, true, &|left, right| left.add(right)),
+            ArrayType::new_static(DataType::F64, [3]),
+        )
+        .unwrap();
+        assert_eq!(program.to_string(), indoc! {"
+            REVERSE"
+        });
 
         // The construction slices at staging-time positions, so it needs an in-bounds axis.
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(
-            associative_scan(&matrix, 2, false, &add),
+            associative_scan(&matrix, 2, false, &|left, right| left.add(right)),
             Err(ProgramError::Type(TypeError::invalid("`associative_scan` axis 2 is out of bounds for rank 2"))),
         );
         assert_eq!(
-            associative_scan(&matrix, -3, false, &add),
+            associative_scan(&matrix, -3, false, &|left, right| left.add(right)),
             Err(ProgramError::Type(TypeError::invalid("`associative_scan` axis -3 is out of bounds for rank 2"))),
-        );
-    }
-
-    #[test]
-    fn test_associative_scan_dynamic_unscanned_axes() {
-        // Only the scanned axis needs a static extent: every other axis is sliced whole, so a dynamic one keeps its
-        // dynamic extent through the construction.
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input = context.input(ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]),
-        ));
-        let output = associative_scan(&input, 1, false, &|left, right| left.add(right)).unwrap();
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[batch, 2] .
-                let %1:f64[batch, 1] = slice [start_indices=[0, 0], limits=[batch, 1], strides=[1, 2]] %0
-                    %2:f64[batch, 1] = slice [start_indices=[0, 1], limits=[batch, 2], strides=[1, 2]] %0
-                    %3:f64[batch, 1] = add %1 %2
-                    %4:f64[batch, 1] = slice [start_indices=[0, 0], limits=[batch, 1]] %0
-                    %5:f64[] = zero [type=f64[]]
-                    %6:f64[batch, 2] = pad [edge_padding_low=[0, 0], edge_padding_high=[0, 1], interior_padding=[0, 1]] %4 %5
-                    %7:f64[batch, 2] = pad [edge_padding_low=[0, 1], edge_padding_high=[0, 0], interior_padding=[0, 1]] %3 %5
-                    %8:f64[batch, 2] = add %6 %7
-                in (%8)"
-            },
-        );
-
-        // The scanned axis itself must still be static, since the construction slices it at staging-time positions.
-        assert_eq!(
-            associative_scan(&input, 0, false, &|left, right| left.add(right)),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`associative_scan` requires a static extent along the scanned axis 0 but got `f64[batch, 2]`",
-            ))),
         );
     }
 
@@ -510,18 +444,57 @@ mod tests {
     }
 
     #[test]
+    fn test_associative_scan_dynamic_unscanned_axes() {
+        // Only the scanned axis needs a static extent: every other axis is sliced whole, so a dynamic one keeps its
+        // dynamic extent through the construction.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]),
+        );
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| associative_scan(&input, 1, false, &|left, right| left.add(right)),
+            input_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[batch, 2] .
+                let %1:f64[batch, 1] = slice [start_indices=[0, 0], limits=[batch, 1], strides=[1, 2]] %0
+                    %2:f64[batch, 1] = slice [start_indices=[0, 1], limits=[batch, 2], strides=[1, 2]] %0
+                    %3:f64[batch, 1] = add %1 %2
+                    %4:f64[batch, 1] = slice [start_indices=[0, 0], limits=[batch, 1]] %0
+                    %5:f64[] = zero [type=f64[]]
+                    %6:f64[batch, 2] = pad [edge_padding_low=[0, 0], edge_padding_high=[0, 1], interior_padding=[0, 1]] %4 %5
+                    %7:f64[batch, 2] = pad [edge_padding_low=[0, 1], edge_padding_high=[0, 0], interior_padding=[0, 1]] %3 %5
+                    %8:f64[batch, 2] = add %6 %7
+                in (%8)"
+            },
+        );
+
+        // The scanned axis itself must still be static, since the construction slices it at staging-time positions.
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |input| associative_scan(&input, 0, false, &|left, right| left.add(right)),
+                input_type,
+            )
+            .err(),
+            Some(ProgramError::Type(TypeError::invalid(
+                "`associative_scan` requires a static extent along the scanned axis 0 but got `f64[batch, 2]`",
+            ))),
+        );
+    }
+
+    #[test]
     fn test_associative_scan_provenance() {
         // Every instruction that the decomposition stages carries the nested framework scopes, which attribute it to
         // the associative-scan decomposition in renderings that include provenance.
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let input = context.input(ArrayType::new_static(DataType::F64, [2]));
-        let output = associative_scan(&input, 0, false, &|left, right| left.add(right)).unwrap();
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |input| associative_scan(&input, 0, false, &|left, right| left.add(right)),
+            ArrayType::new_static(DataType::F64, [2]),
+        )
+        .unwrap();
         assert_eq!(
             std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithProvenance))
                 .to_string(),
@@ -537,6 +510,195 @@ mod tests {
                     %8:f64[2] = add %6 %7 ; provenance=ryft::associative_scan
                 in (%8)"
             },
+        );
+    }
+
+    #[test]
+    fn test_associative_scan_interpretation() {
+        // The decomposition is checked against explicit prefix and suffix results, over both parities of the scanned
+        // extent, several recursion depths, and both directions. Summation pins the positions each output accumulates
+        // over, and the left projection (which is associative but not commutative) additionally pins the input order
+        // that the construction passes to the combiner: its forward scan is the first element repeated and its reverse
+        // scan the last.
+        let add = |left: &Array, right: &Array| left.add(right);
+        let first = |left: &Array, _right: &Array| Ok(left.clone());
+        for extent in 0..=9usize {
+            let values = (1..=extent).map(|value| value as f64).collect::<Vec<_>>();
+            let input = Array::vector(values.clone()).unwrap();
+            for reverse in [false, true] {
+                let sums = (0..extent)
+                    .map(|index| {
+                        if reverse {
+                            values[index..].iter().sum::<f64>()
+                        } else {
+                            values[..=index].iter().sum::<f64>()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let first_value = if reverse { values.last() } else { values.first() };
+                let first_values = first_value.map_or_else(Vec::new, |&value| vec![value; extent]);
+                assert_eq!(
+                    associative_scan(&input, 0, reverse, &add).map(|output| output.to_f64s()),
+                    Ok(sums),
+                    "summation over extent {extent}, reverse {reverse}",
+                );
+                assert_eq!(
+                    associative_scan(&input, 0, reverse, &first).map(|output| output.to_f64s()),
+                    Ok(first_values),
+                    "left projection over extent {extent}, reverse {reverse}",
+                );
+            }
+        }
+
+        // Boolean inputs are interleaved with a disjunction, because Booleans have no addition.
+        let or = |left: &Array, right: &Array| left.or(right);
+        let booleans = Array::vector(vec![false, false, true, false, false]).unwrap();
+        assert_eq!(
+            associative_scan(&booleans, 0, false, &or),
+            Ok(Array::vector(vec![false, false, true, true, true]).unwrap()),
+        );
+        assert_eq!(
+            associative_scan(&booleans, 0, true, &or),
+            Ok(Array::vector(vec![true, true, true, false, false]).unwrap()),
+        );
+
+        // The construction scans one axis of a higher-rank input independently per row, and negative axes count from
+        // the end of the shape.
+        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            associative_scan(&matrix, 1, false, &add),
+            Ok(Array::matrix(2, 3, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]).unwrap()),
+        );
+        assert_eq!(
+            associative_scan(&matrix, -1, true, &add),
+            Ok(Array::matrix(2, 3, vec![6.0, 5.0, 3.0, 15.0, 11.0, 6.0]).unwrap()),
+        );
+        assert_eq!(
+            associative_scan(&matrix, -2, false, &add),
+            Ok(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]).unwrap()),
+        );
+
+        // The interleaving pads with zeros, so element types without a zero support only scans that never interleave.
+        let first_element = Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![127]).unwrap();
+        assert_eq!(associative_scan(&first_element, 0, false, &first), Ok(first_element));
+        assert_eq!(
+            associative_scan(
+                &Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![127, 128]).unwrap(),
+                0,
+                false,
+                &first,
+            ),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "data type `{}` cannot represent zero",
+                DataType::F8E8M0FNU,
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_associative_scan_partial_evaluation() {
+        // Partial evaluation applies the rules of the staged primitives, so the construction over a known array folds
+        // away entirely while the construction over an unknown array of the same structure remains residual.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(known, unknown)| {
+                associative_scan(&(known, unknown), 0, false, &|left, right| {
+                    Ok((left.0.add(&right.0)?, left.1.add(&right.1)?))
+                })
+            },
+            (ArrayType::new_static(DataType::F64, [2]), ArrayType::new_static(DataType::F64, [2])),
+        )
+        .unwrap();
+        let program = program.into_flat_program();
+        let known = Array::vector(vec![1.0, 2.0]).unwrap();
+        let unknown = Array::vector(vec![3.0, 4.0]).unwrap();
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Known(known), PartialValue::Unknown(unknown.r#type().into_owned())])
+            .unwrap();
+        assert!(evaluation.outputs()[0].is_known());
+        assert!(evaluation.outputs()[1].is_unknown());
+        assert_eq!(evaluation.program().to_string(), indoc! {"
+            RESIDUAL"
+        });
+        assert_eq!(
+            evaluation.interpret(&EagerContext::<Array, ArrayOperation<Array>>::new(), &[unknown]),
+            Ok(vec![Array::vector(vec![1.0, 3.0]).unwrap(), Array::vector(vec![3.0, 7.0]).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_associative_scan_batching() {
+        // Batching applies the rules of the staged primitives, so every batch item is scanned independently along its
+        // own logical axis, wherever the mapped axis sits and including a negative logical axis.
+        let input = Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(
+            batch(
+                |item| associative_scan(&item, 0, false, &|left, right| left.add(right)),
+                input.clone(),
+                BatchAxis::new(1),
+                BatchAxis::new(1),
+                None,
+            ),
+            Ok(Array::matrix(3, 2, vec![1.0, 2.0, 4.0, 6.0, 9.0, 12.0]).unwrap()),
+        );
+        assert_eq!(
+            batch(
+                |item| associative_scan(&item, -1, true, &|left, right| left.add(right)),
+                input,
+                BatchAxis::new(1),
+                BatchAxis::new(0),
+                None,
+            ),
+            Ok(Array::matrix(2, 3, vec![9.0, 8.0, 5.0, 12.0, 10.0, 6.0]).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_associative_scan_differentiation() {
+        // Forward mode differentiates through the staged primitives, so the tangent of a running product sums the
+        // partial products with one factor replaced by its tangent.
+        let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let tangent = Array::vector(vec![1.0; 4]).unwrap();
+        assert_eq!(
+            differentiate_at(input.clone())
+                .jvp(tangent.clone(), |input| associative_scan(&input, 0, false, &|left, right| left.mul(right))),
+            Ok((
+                Array::vector(vec![1.0, 2.0, 6.0, 24.0]).unwrap(),
+                Array::vector(vec![1.0, 3.0, 11.0, 50.0]).unwrap(),
+            )),
+        );
+        assert_eq!(
+            differentiate_at(input).jvp(tangent, |input| associative_scan(&input, 0, true, &|left, right| left.mul(right))),
+            Ok((
+                Array::vector(vec![24.0, 24.0, 12.0, 4.0]).unwrap(),
+                Array::vector(vec![50.0, 26.0, 7.0, 1.0]).unwrap(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_associative_scan_transposition() {
+        // Reverse mode transposes the staged primitives. A running sum is linear, so its pullback is the running sum in
+        // the opposite direction.
+        let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let cotangent = Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let (_, pullback) = differentiate_at(input.clone())
+            .vjp(|input| associative_scan(&input, 0, false, &|left, right| left.add(right)))
+            .unwrap();
+        assert_eq!(pullback.apply(cotangent.clone()), Ok(Array::vector(vec![15.0, 14.0, 12.0, 9.0, 5.0]).unwrap()));
+        let (_, pullback) = differentiate_at(input)
+            .vjp(|input| associative_scan(&input, 0, true, &|left, right| left.add(right)))
+            .unwrap();
+        assert_eq!(pullback.apply(cotangent), Ok(Array::vector(vec![1.0, 3.0, 6.0, 10.0, 15.0]).unwrap()));
+
+        // A running product is nonlinear, so its pullback goes through the transposed linearization, which, for a unit
+        // cotangent, accumulates each prefix product divided by the factor it is differentiated with respect to.
+        let (output, pullback) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap())
+            .vjp(|input| associative_scan(&input, 0, false, &|left, right| left.mul(right)))
+            .unwrap();
+        assert_eq!(output, Array::vector(vec![1.0, 2.0, 6.0, 24.0]).unwrap());
+        assert_eq!(
+            pullback.apply(Array::vector(vec![1.0; 4]).unwrap()),
+            Ok(Array::vector(vec![33.0, 16.0, 10.0, 6.0]).unwrap()),
         );
     }
 }
