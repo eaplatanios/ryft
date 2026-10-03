@@ -31,11 +31,14 @@ use crate::operations::manipulation::slicing::Slice;
 use crate::parameters::Parameterized;
 use crate::programs::{ProgramError, ProvenanceScope, TypeError, Value};
 
-// TODO(eaplatanios): Review from here onwards.
+// TODO(eaplatanios): Move the contents of this module to `cumulative.rs`, in the end, right before `tests`.
+//  Also move the unit tests of this module to the end of the `tests` module of `cumulative`. The example from the
+//  module docstring should move to the docstring of `associative_scan`. No documentation or code (production or
+//  testing) should otherwise change and this should be as much as move operation as possible.
 
-/// Returns the inclusive prefix scans of the arrays in `values` along `axis` under the associative operator `combine`,
-/// built out of ordinary manipulation primitives instead of out of one
-/// [`CumulativeOperation`](crate::operations::cumulative::CumulativeOperation).
+/// Returns the inclusive prefix scans of the arrays in `values` along `axis` under the associative operator
+/// `combine_fn`, built out of ordinary manipulation primitives instead of out of one
+/// [`CumulativeOperation`](crate::CumulativeOperation).
 ///
 /// Writing `a ⊕ b` for `combine(a, b)`, element `i` of a forward scan combines the input elements `0..=i` and element
 /// `i` of a reverse scan combines the input elements `i..` (still in the original output order), with the accumulated
@@ -48,63 +51,64 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Value};
 /// ```
 ///
 /// This is Ryft's port of the log-depth Blelloch construction that JAX's
-/// [`lax.associative_scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.associative_scan.html) implements
-/// (`jax/_src/lax/control_flow/loops.py`), and it exists here for the reason it is reached for there: a cumulative
-/// operation whose combining operator is nonlinear has no closed-form primitive derivative, so the nonlinear
-/// [`CumulativeKind`](crate::operations::cumulative::CumulativeKind)s define their forward mode by differentiating
-/// *through* this decomposition rather than by carrying a bespoke gradient formula (JAX's `_cumulative_jvp_rule`). It
-/// is also useful on its own for combining operators that no cumulative kind covers.
+/// [`jax.lax.associative_scan`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.associative_scan.html) implements,
+/// and it exists here to support cumulative operations whose combining operators are non-linear and have no closed-form
+/// primitive derivatives. Specifically, the non-linear [`CumulativeKind`](crate::CumulativeKind)s define their forward
+/// mode differentiation rules by differentiating _through_ this decomposition rather than by carrying a bespoke
+/// gradient formula. It is also useful on its own for combining operators that no cumulative kind covers.
 ///
 /// For an operator that a cumulative kind does cover (e.g., a running sum or maximum), prefer the
-/// [`Cumulative`](crate::operations::cumulative::Cumulative) capability. It stages a single cumulative instruction
-/// instead of this construction, which keeps programs small and leaves each backend free to choose its own lowering
-/// (e.g., `ryft-xla` lowers forward cumulative sums to `chlo.scan` on GPUs). The two can also round floating-point
-/// results differently in their last bits, because they associate the combinations differently.
+/// [`Cumulative`](crate::Cumulative) capability. It stages a single cumulative instruction instead of this
+/// construction, which keeps programs small and leaves each backend free to choose its own lowering (e.g., the XLA
+/// backend lowers cumulative sums to [`chlo.scan`](https://openxla.org/stablehlo/generated/chlo#chloscan_chloscanop)
+/// on GPUs). The two can also round floating-point results differently in their last bits, because they associate the
+/// combinations differently.
 ///
-/// Like JAX's, the scan runs over a whole structure of arrays at once: `values` is any [`Parameterized`] structure of
-/// arrays (e.g., a single array, a tuple, a vector, or a derived structure), and `combine` receives and returns
+/// Like JAX's, the scan runs over a whole structure of arrays at once: `values` is any [`Parameterized`] structure
+/// of arrays (e.g., a single array, a tuple, a vector, or a derived structure), and `combine_fn` receives and returns
 /// structures shaped like it. This lets one scan carry several arrays that combine jointly, such as a running maximum
 /// together with the position at which it is attained. The arrays are sliced and interleaved along `axis` in lockstep,
 /// so they must all have the same extent along it, while their other dimensions and their data types can differ.
 ///
 /// The recursion combines adjacent pairs along `axis`, scans the halved sequence recursively, combines the scanned
 /// halves back against the elements the pairing skipped, and interleaves the two halves into the result. Each call of
-/// `combine` therefore operates on many positions at once (i.e., it must be vectorized along `axis`): it receives two
-/// structures whose arrays hold the same number of positions along `axis` (at most half of the scanned extent) and must
-/// combine them position by position. `combine` always receives its inputs in scan order (the accumulated prefix
-/// first), so the construction stays correct for associative operators that are not commutative. A `reverse` scan
-/// mirrors the same recursion around the end of the axis (the pairing simply starts one element in when the extent is
-/// odd) instead of reversing the arrays before and after a forward scan, which saves two array reversals per array and
-/// scan. Boolean arrays are interleaved with a disjunction rather than an addition, because Booleans have no addition.
+/// `combine_fn` therefore operates on many positions at once (i.e., it must be vectorized along `axis`): it receives
+/// two structures whose arrays hold the same number of positions along `axis` (at most half of the scanned extent) and
+/// must combine them position by position. `combine_fn` always receives its inputs in scan order (the accumulated
+/// prefix first), so the construction stays correct for associative operators that are not commutative. A `reverse`
+/// scan mirrors the same recursion around the end of the axis (the pairing simply starts one element in when the extent
+/// is odd) instead of reversing the arrays before and after a forward scan, which saves two array reversals per array
+/// and scan. Boolean arrays are interleaved with a disjunction rather than an addition, because Booleans have no
+/// addition.
 ///
 /// For example, a forward scan over five elements reduces the pairs `(x0, x1)` and `(x2, x3)`, scans those two
-/// reductions recursively to obtain the results at the odd positions, extends each of them by the next input element to
-/// obtain the results at the remaining even positions (where position 0 is just `x0`), and interleaves the two:
+/// reductions recursively to obtain the results at the odd positions, extends each of them by the next input element
+/// to obtain the results at the remaining even positions (where position 0 is just `x0`), and interleaves the two:
 ///
 /// ```text
-///     position             0     1        2             3                 4
-///     input                x0    x1       x2            x3                x4
-///     pairwise reductions        x0⊕x1                  x2⊕x3
-///     recursive scan             x0⊕x1                  x0⊕x1⊕x2⊕x3
-///     complement           x0             (x0⊕x1)⊕x2                      (x0⊕x1⊕x2⊕x3)⊕x4
-///     result               x0    x0⊕x1    x0⊕x1⊕x2      x0⊕x1⊕x2⊕x3       x0⊕x1⊕x2⊕x3⊕x4
+///     position             0     1          2                 3                       4
+///     input                x0    x1         x2                x3                      x4
+///     pairwise reductions        x0 ⊕ x1                      x2 ⊕ x3
+///     recursive scan             x0 ⊕ x1                      x0 ⊕ x1 ⊕ x2 ⊕ x3
+///     complement           x0               (x0 ⊕ x1) ⊕ x2                            (x0 ⊕ x1 ⊕ x2 ⊕ x3) ⊕ x4
+///     result               x0    x0 ⊕ x1    x0 ⊕ x1 ⊕ x2      x0 ⊕ x1 ⊕ x2 ⊕ x3       x0 ⊕ x1 ⊕ x2 ⊕ x3 ⊕ x4
 /// ```
 ///
 /// A reverse scan over the same five elements leaves `x0` unpaired instead, combines each pair with its later element
 /// on the left, and appends `x4` at the end of the complement:
 ///
 /// ```text
-///     position             0                  1              2            3        4
-///     input                x0                 x1             x2           x3       x4
-///     pairwise reductions                     x2⊕x1                       x4⊕x3
-///     recursive scan                          x4⊕x3⊕x2⊕x1                 x4⊕x3
-///     complement           (x4⊕x3⊕x2⊕x1)⊕x0                  (x4⊕x3)⊕x2            x4
-///     result               x4⊕x3⊕x2⊕x1⊕x0     x4⊕x3⊕x2⊕x1    x4⊕x3⊕x2     x4⊕x3    x4
+///     position             0                          1                    2                3          4
+///     input                x0                         x1                   x2               x3         x4
+///     pairwise reductions                             x2 ⊕ x1                               x4 ⊕ x3
+///     recursive scan                                  x4 ⊕ x3 ⊕ x2 ⊕ x1                     x4 ⊕ x3
+///     complement           (x4 ⊕ x3 ⊕ x2 ⊕ x1) ⊕ x0                        (x4 ⊕ x3) ⊕ x2              x4
+///     result               x4 ⊕ x3 ⊕ x2 ⊕ x1 ⊕ x0     x4 ⊕ x3 ⊕ x2 ⊕ x1    x4 ⊕ x3 ⊕ x2     x4 ⊕ x3    x4
 /// ```
 ///
 /// The scanned axis of every array must have a static extent, because the construction slices it at staging-time
 /// positions, while every other axis can be dynamic (it is kept whole). A scanned axis shorter than two elements leaves
-/// the arrays unchanged without invoking `combine`, and so does a structure that holds no arrays. A negative `axis`
+/// the arrays unchanged without invoking `combine_fn`, and so does a structure that holds no arrays. A negative `axis`
 /// counts from the end of the shape of the first array, and the resulting position is scanned in every array.
 ///
 /// # Parameters
@@ -112,37 +116,39 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Value};
 ///   - `values`: [`Parameterized`] structure of the scanned arrays.
 ///   - `axis`: Scanned [`Axis`] of every array, normalized against the rank of the first array.
 ///   - `reverse`: Whether to accumulate from the end of the scanned axis toward its start.
-///   - `combine`: Associative binary operator over structures shaped like `values`, receiving the accumulated prefix
-///     and the next elements in scan order and combining them position by position along `axis`. It must return as
-///     many arrays as `values` holds, each with the type of the corresponding array that it receives.
+///   - `combine_fn`: Associative binary operator over structures shaped like `values`, receiving the accumulated prefix
+///     and the next elements in scan order and combining them position by position along `axis`. It must return as many
+///     arrays as `values` holds, each with the type of the corresponding array that it receives.
 ///
 /// # Errors
 ///
 /// Returns a [`ProgramError`] if `axis` is out of bounds for any array, if the scanned extent of any array is not
-/// static, if the arrays have different extents along `axis`, if `combine` returns a different number of arrays, if
-/// the data type of any array cannot represent the zero that the interleaving pads with (e.g.,
-/// [`DataType::F8E8M0FNU`]), or if staging any of the primitives of the construction (including those that `combine`
-/// stages) fails.
+/// static, if the arrays have different extents along `axis`, if `combine_fn` returns a different number of arrays,
+/// if the data type of any array cannot represent the zero that the interleaving pads with (e.g.,
+/// [`DataType::F8E8M0FNU`]), or if staging any of the primitives of the construction (including
+/// those that `combine_fn` stages) fails.
 pub fn associative_scan<
     V: Value<Type = ArrayType, DispatchDomain: Context + Zero<V>> + Add + Or + Concatenate + Pad + Slice,
-    Values: Parameterized<V>,
+    P: Parameterized<V>,
     A: Into<Axis>,
-    F: Fn(&Values, &Values) -> Result<Values, ProgramError>,
+    F: Fn(&P, &P) -> Result<P, ProgramError>,
 >(
-    values: &Values,
+    values: &P,
     axis: A,
     reverse: bool,
-    combine: &F,
-) -> Result<Values, ProgramError> {
+    combine_fn: &F,
+) -> Result<P, ProgramError> {
     let structure = values.parameter_structure();
     let arrays = values.parameters().cloned().collect::<Vec<_>>();
     let Some(first) = arrays.first() else {
-        return Ok(Values::from_parameters(structure, arrays)?);
+        return Ok(P::from_parameters(structure, arrays)?);
     };
+
     let axis = axis
         .into()
         .normalize(first.r#type().rank())
         .map_err(|error| TypeError::invalid(format!("`associative_scan` {error}")))?;
+
     let extents = arrays
         .iter()
         .map(|array| {
@@ -153,6 +159,7 @@ pub fn associative_scan<
                     "`associative_scan` axis {axis} is out of bounds for rank {rank}",
                 )));
             }
+
             array_type.dimension(axis).value().ok_or_else(|| {
                 TypeError::invalid(format!(
                     "`associative_scan` requires a static extent along the scanned axis {axis} but got `{array_type}`",
@@ -160,6 +167,7 @@ pub fn associative_scan<
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+
     let extent = extents[0];
     if let Some(other) = extents.iter().find(|other| **other != extent) {
         return Err(TypeError::invalid(format!(
@@ -168,13 +176,13 @@ pub fn associative_scan<
         .into());
     }
 
-    // The recursion runs over the flat arrays, so the combining operator is wrapped to rebuild its structured inputs on
-    // the way in and to flatten its structured result on the way out.
+    // The recursion runs over the flat arrays, so the combining operator is wrapped to rebuild its structured inputs
+    // on the way in and to flatten its structured result on the way out.
     let array_count = arrays.len();
     let flat_combine = |left: &[V], right: &[V]| -> Result<Vec<V>, ProgramError> {
-        let left = Values::from_parameters(structure.clone(), left.iter().cloned())?;
-        let right = Values::from_parameters(structure.clone(), right.iter().cloned())?;
-        let combined = combine(&left, &right)?;
+        let left = P::from_parameters(structure.clone(), left.iter().cloned())?;
+        let right = P::from_parameters(structure.clone(), right.iter().cloned())?;
+        let combined = combine_fn(&left, &right)?;
         let combined_count = combined.parameter_count();
         if combined_count != array_count {
             return Err(TypeError::invalid(format!(
@@ -185,23 +193,24 @@ pub fn associative_scan<
         Ok(combined.into_parameters().collect())
     };
 
-    // The scopes below are purely diagnostic: they attribute every instruction the decomposition stages, and they are a
-    // no-op under an eager context, which records no instructions at all.
+    // The scopes below are purely diagnostic: they attribute every instruction the decomposition stages,
+    // and they are a no-op under an eager context, which records no instructions at all.
     let domain = first.dispatch_domain();
     let scanned = domain.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
         domain.invoke_with_provenance_scope(ProvenanceScope::new("associative_scan"), || {
             associative_scan_impl(&arrays, extent, axis, reverse, &flat_combine)
         })
     })?;
-    Ok(Values::from_parameters(structure, scanned)?)
+
+    Ok(P::from_parameters(structure, scanned)?)
 }
 
 /// Scans the flat arrays of a [`Parameterized`] structure using the construction that the documentation of
 /// [`associative_scan`] describes and illustrates. [`associative_scan`] validates `axis` and the scanned extents,
-/// flattens its structure into `values`, wraps its combining operator so that it operates on flat arrays too, and
-/// opens the provenance scopes that attribute the staged instructions before calling this function. Each call performs
-/// one level of the recursion: it reduces adjacent pairs, scans those reductions by calling itself over half the
-/// extent, completes the remaining positions, and interleaves the two halves using [`scan_interleave`].
+/// flattens its structure into `values`, wraps its combining operator so that it operates on flat arrays too, and opens
+/// the provenance scopes that attribute the staged instructions before calling this function. Each call performs one
+/// level of the recursion: it reduces adjacent pairs, scans those reductions by calling itself over half the extent,
+/// completes the remaining positions, and interleaves the two halves using [`scan_interleave`].
 ///
 /// # Parameters
 ///
@@ -209,7 +218,7 @@ pub fn associative_scan<
 ///   - `extent`: Static extent along `axis` that every array in `values` shares.
 ///   - `axis`: Scanned axis, already normalized against the rank of every array in `values`.
 ///   - `reverse`: Whether to accumulate from the end of `axis` toward its start.
-///   - `combine`: Flattened combining operator, which receives and returns one array per array in `values`.
+///   - `combine_fn`: Flattened combining operator, which receives and returns one array per array in `values`.
 fn associative_scan_impl<
     V: Value<Type = ArrayType, DispatchDomain: Zero<V>> + Add + Or + Concatenate + Pad + Slice,
     F: Fn(&[V], &[V]) -> Result<Vec<V>, ProgramError>,
@@ -218,7 +227,7 @@ fn associative_scan_impl<
     extent: usize,
     axis: usize,
     reverse: bool,
-    combine: &F,
+    combine_fn: &F,
 ) -> Result<Vec<V>, ProgramError> {
     if extent < 2 {
         return Ok(values.to_vec());
@@ -227,7 +236,7 @@ fn associative_scan_impl<
 
     // Pair adjacent elements. A forward scan pairs from the start of the axis and a reverse scan pairs from its end,
     // which is the one place the two directions differ: an odd extent leaves the first element unpaired going forward
-    // and the *last* one unpaired going backward, so the pairing starts one element in.
+    // and the _last_ one unpaired going backward, so the pairing starts one element in.
     let pair_offset = match reverse {
         true => extent % 2,
         false => 0,
@@ -241,13 +250,13 @@ fn associative_scan_impl<
         .map(|value| value.slice_axis(axis, pair_offset + 1, extent, 2))
         .collect::<Result<Vec<_>, _>>()?;
     let reduced = match reverse {
-        true => combine(&later, &earlier)?,
-        false => combine(&earlier, &later)?,
+        true => combine_fn(&later, &earlier)?,
+        false => combine_fn(&earlier, &later)?,
     };
 
-    // Scanning the pairwise reductions yields every other output element: the odd positions of a forward scan, and the
-    // positions congruent to `pair_offset` of a reverse one.
-    let aligned = associative_scan_impl(&reduced, half, axis, reverse, combine)?;
+    // Scanning the pairwise reductions yields every other output element: the odd positions of a forward scan,
+    // and the positions congruent to `pair_offset` of a reverse one.
+    let aligned = associative_scan_impl(&reduced, half, axis, reverse, combine_fn)?;
 
     // Each complementary position extends the aligned result just before it in scan order by its own input element,
     // except for the position at the scan's own start, which is just the input element there. An even extent has one
@@ -277,7 +286,7 @@ fn associative_scan_impl<
                         .iter()
                         .map(|value| value.slice_axis(axis, 1 - pair_offset, extent - 1, 2))
                         .collect::<Result<Vec<_>, _>>()?;
-                    combine(&trimmed, &inputs)?
+                    combine_fn(&trimmed, &inputs)?
                         .iter()
                         .zip(&last)
                         .map(|(combined, last)| combined.concatenate_with([last], axis))
@@ -303,7 +312,7 @@ fn associative_scan_impl<
                         .collect::<Result<Vec<_>, _>>()?;
                     first
                         .iter()
-                        .zip(&combine(&trimmed, &inputs)?)
+                        .zip(&combine_fn(&trimmed, &inputs)?)
                         .map(|(first, combined)| first.concatenate_with([combined], axis))
                         .collect::<Result<Vec<_>, _>>()?
                 }
@@ -555,8 +564,10 @@ mod tests {
                     %3:f64[batch, 1] = add %1 %2
                     %4:f64[batch, 1] = slice [start_indices=[0, 0], limits=[batch, 1]] %0
                     %5:f64[] = zero [type=f64[]]
-                    %6:f64[batch, 2] = pad [edge_padding_low=[0, 0], edge_padding_high=[0, 1], interior_padding=[0, 1]] %4 %5
-                    %7:f64[batch, 2] = pad [edge_padding_low=[0, 1], edge_padding_high=[0, 0], interior_padding=[0, 1]] %3 %5
+                    %6:f64[batch, 2] = \
+                        pad [edge_padding_low=[0, 0], edge_padding_high=[0, 1], interior_padding=[0, 1]] %4 %5
+                    %7:f64[batch, 2] = \
+                        pad [edge_padding_low=[0, 1], edge_padding_high=[0, 0], interior_padding=[0, 1]] %3 %5
                     %8:f64[batch, 2] = add %6 %7
                 in (%8)"
             },
@@ -589,13 +600,17 @@ mod tests {
                 .to_string(),
             indoc! {"
                 lambda %0:f64[2] .
-                let %1:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %0 ; provenance=ryft::associative_scan
-                    %2:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %0 ; provenance=ryft::associative_scan
+                let %1:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %0 ; \
+                        provenance=ryft::associative_scan
+                    %2:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %0 ; \
+                        provenance=ryft::associative_scan
                     %3:f64[1] = add %1 %2 ; provenance=ryft::associative_scan
                     %4:f64[1] = slice [start_indices=[0], limits=[1]] %0 ; provenance=ryft::associative_scan
                     %5:f64[] = zero [type=f64[]] ; provenance=ryft::associative_scan
-                    %6:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %4 %5 ; provenance=ryft::associative_scan
-                    %7:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %3 %5 ; provenance=ryft::associative_scan
+                    %6:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %4 %5 ; \
+                        provenance=ryft::associative_scan
+                    %7:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %3 %5 ; \
+                        provenance=ryft::associative_scan
                     %8:f64[2] = add %6 %7 ; provenance=ryft::associative_scan
                 in (%8)"
             },
