@@ -1702,8 +1702,8 @@ where
     L: Copy + Location<'c, 't>,
 {
     check_count!("input", input_values, 3, ProgramError);
+    check_count!("input", input_types, 3, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    check_count!("input type", input_types, 3, ProgramError);
     let output_type = &output_types[0];
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
     let multiple_dynamic_axes = output_type
@@ -13309,6 +13309,7 @@ where
 /// hold `factor != 0.0`, integer splats truncate `factor`, and float splats round `factor` to the nearest
 /// representable value of the element type (covering every float format that [`lower_element_type`] supports,
 /// including the `f8`/`f6`/`f4` families). [`DataType::Zero`] admits only a zero factor, lowered as its `i1` carrier.
+/// Integer attributes use the physical element type from [`lower_element_type`], including signless `i1` for `U1`.
 fn lower_f64_scalar_elements_attribute<'c, 't>(
     data_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -13339,7 +13340,7 @@ fn lower_f64_scalar_elements_attribute<'c, 't>(
                 .splatted_dense_attribute_elements_attribute(
                     tensor_type,
                     context.integer_attribute(
-                        context.unsigned_integer_type(unsigned_integer_width(data_type)?),
+                        lower_element_type(data_type, context)?.cast::<IntegerTypeRef>().unwrap(),
                         factor as i64,
                     ),
                 )
@@ -13373,7 +13374,8 @@ fn lower_f64_scalar_elements_attribute<'c, 't>(
 
 /// Builds a splatted dense-elements attribute holding `integer_value` converted to the given `data_type`. Integer
 /// splats hold the exact `i64` value; every other data type routes through
-/// [`lower_f64_scalar_elements_attribute`] after a lossless widening of `integer_value` to `f64`.
+/// [`lower_f64_scalar_elements_attribute`] after a lossless widening of `integer_value` to `f64`. Integer attributes
+/// use the physical element type from [`lower_element_type`], including signless `i1` for `U1`.
 fn lower_constant_elements_attribute<'c, 't>(
     data_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -13397,7 +13399,7 @@ fn lower_constant_elements_attribute<'c, 't>(
                 .splatted_dense_attribute_elements_attribute(
                     tensor_type,
                     context.integer_attribute(
-                        context.unsigned_integer_type(unsigned_integer_width(data_type)?),
+                        lower_element_type(data_type, context)?.cast::<IntegerTypeRef>().unwrap(),
                         integer_value,
                     ),
                 )
@@ -16883,7 +16885,11 @@ mod tests {
             .add_instruction(SelectOperation::new(), Vec::new(), vec![condition, on_true, on_false], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![selected], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![selected],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
             .unwrap();
         let program = unproject_plain_program(program);
         let client = execution_client();
@@ -19813,6 +19819,34 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_lower_unsigned_constant_splats_use_physical_carrier() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        for data_type in [DataType::U1, DataType::U8] {
+            let tensor_type = lower_tensor_type(&ArrayType::scalar(data_type), &context, location).unwrap();
+            for integer_value in [0, 1, 2, 3] {
+                let expected = match data_type {
+                    DataType::U1 => format!("dense<{}> : tensor<i1>", integer_value & 1 != 0),
+                    DataType::U8 => format!("dense<{integer_value}> : tensor<ui8>"),
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    lower_constant_elements_attribute(data_type, tensor_type, integer_value, &context)
+                        .unwrap()
+                        .to_string(),
+                    expected,
+                );
+                assert_eq!(
+                    lower_f64_scalar_elements_attribute(data_type, tensor_type, integer_value as f64 + 0.75, &context,)
+                        .unwrap()
+                        .to_string(),
+                    expected,
+                );
+            }
+        }
     }
 
     #[test]
