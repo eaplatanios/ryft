@@ -124,8 +124,8 @@ pub use manipulation::{
 };
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use random::{
-    DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm, RngBitGenerator,
-    RngBitGeneratorOperation,
+    CategoricalSamplingMode, DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm,
+    RngBitGenerator, RngBitGeneratorOperation,
 };
 pub use reductions::{
     ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation,

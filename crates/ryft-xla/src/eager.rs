@@ -2950,6 +2950,60 @@ mod tests {
         assert_eq!(device_words, reference_words);
     }
 
+    /// Empty outputs preserve the functional state, and counter advancement wraps at the algorithm's counter width
+    /// while preserving bit parity with the reference backend for every supported output width.
+    #[test]
+    fn test_eager_rng_bit_generator_counter_boundaries_matches_reference_backend() {
+        use ryft_core::{RandomAlgorithm, RngBitGenerator};
+
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        for (algorithm, state_values) in [
+            (RandomAlgorithm::ThreeFry, vec![42u64, u64::MAX - 1]),
+            (RandomAlgorithm::Philox, vec![42u64, u64::MAX - 1, 7]),
+            (RandomAlgorithm::Philox, vec![42u64, u64::MAX - 1, u64::MAX]),
+        ] {
+            let state = Array::from_host_buffer(
+                &client,
+                replicated_type(&mesh, DataType::U64, &[state_values.len()]),
+                mesh.clone(),
+                values_to_bytes::<u64>(&state_values).as_slice(),
+            )
+            .unwrap();
+            let reference_state = CpuArray::from_elements(algorithm.state_type(), &state_values).unwrap();
+            for data_type in [DataType::U8, DataType::U16, DataType::U32, DataType::U64] {
+                for dimensions in [vec![2, 0, 3], vec![5]] {
+                    let output_type = ArrayType::new_static(data_type, dimensions.clone());
+                    let (device_state, device_bits) = state.rng_bit_generator(algorithm, &output_type).unwrap();
+                    let (reference_state, reference_bits) =
+                        reference_state.rng_bit_generator(algorithm, &output_type).unwrap();
+
+                    // The empty shape runs no cipher invocations. Five elements run enough invocations to cross the
+                    // low counter boundary; Philox carries into the high half, which can itself wrap to zero.
+                    let element_count = dimensions.iter().product::<usize>();
+                    let invocation_count = match (algorithm, data_type) {
+                        (RandomAlgorithm::ThreeFry, DataType::U64) => element_count,
+                        (RandomAlgorithm::ThreeFry, _) => element_count.div_ceil(2),
+                        (RandomAlgorithm::Philox, DataType::U64) => element_count.div_ceil(2),
+                        (RandomAlgorithm::Philox, _) => element_count.div_ceil(4),
+                    };
+                    let (low_counter, carry) = state_values[1].overflowing_add(invocation_count as u64);
+                    let mut expected_state = vec![state_values[0], low_counter];
+                    if algorithm == RandomAlgorithm::Philox {
+                        expected_state.push(state_values[2].wrapping_add(u64::from(carry)));
+                    }
+                    let device_state = values_from_bytes::<u64>(
+                        shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
+                    );
+                    assert_eq!(device_state, expected_state, "{algorithm} state for {output_type}");
+                    assert_eq!(reference_state.elements::<u64>().unwrap(), expected_state);
+                    let device_bits = shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap();
+                    assert_eq!(device_bits, reference_bits.storage_bytes(), "{algorithm} bits for {output_type}");
+                }
+            }
+        }
+    }
+
     /// The composed random distributions agree between the XLA-backed eager array backend and the reference
     /// array backend: uniform `f32` samples are bit-identical (every step of the composition is exact arithmetic
     /// over bit-identical ThreeFry draws), normal samples agree within floating-point tolerance (the Box–Muller
@@ -3019,6 +3073,155 @@ mod tests {
             );
             let reference_words = reference_key.elements::<u64>().unwrap();
             assert_eq!(device_words, reference_words);
+        }
+    }
+
+    /// Narrow uniform samples preserve their exact encodings and advance the same state on both eager backends.
+    #[test]
+    fn test_eager_random_uniform_narrow_matches_reference_backend() {
+        use ryft_core::{Random, RandomAlgorithm};
+
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let state_values = [11u64, 3];
+        let state = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::U64, &[2]),
+            mesh.clone(),
+            values_to_bytes(&state_values).as_slice(),
+        )
+        .unwrap();
+        let reference_state = CpuArray::from_elements(RandomAlgorithm::ThreeFry.state_type(), &state_values).unwrap();
+        for data_type in [DataType::BF16, DataType::F16] {
+            let sample_type = ArrayType::new_static(data_type, [8]);
+            let (device_state, device_samples) = state.random_uniform(&sample_type).unwrap();
+            let (reference_state, reference_samples) = reference_state.random_uniform(&sample_type).unwrap();
+            assert_eq!(device_samples.data_type(), data_type);
+            assert_eq!(
+                shard_host_bytes(device_samples.addressable_shards().next().unwrap()).unwrap(),
+                reference_samples.storage_bytes(),
+            );
+            assert_eq!(
+                values_from_bytes::<u64>(
+                    shard_host_bytes(device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
+                ),
+                reference_state.elements::<u64>().unwrap(),
+            );
+        }
+    }
+
+    /// Complex normal samples retain both independently drawn components and agree within transcendental tolerance.
+    #[test]
+    fn test_eager_random_normal_complex_matches_reference_backend() {
+        use ryft_core::{Random, RandomAlgorithm};
+
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let state_values = [11u64, 3];
+        let state = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::U64, &[2]),
+            mesh.clone(),
+            values_to_bytes(&state_values).as_slice(),
+        )
+        .unwrap();
+        let reference_state = CpuArray::from_elements(RandomAlgorithm::ThreeFry.state_type(), &state_values).unwrap();
+        for data_type in [DataType::C64, DataType::C128] {
+            let sample_type = ArrayType::new_static(data_type, [8]);
+            let (device_state, device_samples) = state.random_normal(&sample_type).unwrap();
+            let (reference_state, reference_samples) = reference_state.random_normal(&sample_type).unwrap();
+            assert_eq!(device_samples.data_type(), data_type);
+            let device_bytes = shard_host_bytes(device_samples.addressable_shards().next().unwrap()).unwrap();
+            let reference_bytes = reference_samples.logical_bytes();
+            let (device_components, reference_components, tolerance) = if data_type == DataType::C64 {
+                (
+                    values_from_bytes::<f32>(&device_bytes).into_iter().map(f64::from).collect::<Vec<_>>(),
+                    values_from_bytes::<f32>(&reference_bytes).into_iter().map(f64::from).collect::<Vec<_>>(),
+                    1e-5,
+                )
+            } else {
+                (values_from_bytes::<f64>(&device_bytes), values_from_bytes::<f64>(&reference_bytes), 1e-12)
+            };
+            assert_eq!(device_components.len(), 16);
+            assert_eq!(reference_components.len(), 16);
+            for (device_component, reference_component) in device_components.iter().zip(&reference_components) {
+                assert!(
+                    (device_component - reference_component).abs() < tolerance,
+                    "{data_type} components disagree: {device_component} versus {reference_component}",
+                );
+            }
+            assert_eq!(
+                values_from_bytes::<u64>(
+                    shard_host_bytes(device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
+                ),
+                reference_state.elements::<u64>().unwrap(),
+            );
+        }
+    }
+
+    /// High-precision categorical sampling preserves masked categories and functional state parity across backends.
+    #[test]
+    fn test_eager_random_categorical_high_precision_matches_reference_backend() {
+        use ryft_core::{CategoricalSamplingMode, Random, RandomAlgorithm};
+
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        for algorithm in [RandomAlgorithm::ThreeFry, RandomAlgorithm::Philox] {
+            let state_values = match algorithm {
+                RandomAlgorithm::ThreeFry => vec![11u64, 3],
+                RandomAlgorithm::Philox => vec![11u64, 3, 0],
+            };
+            let state = Array::from_host_buffer(
+                &client,
+                replicated_type(&mesh, DataType::U64, &[state_values.len()]),
+                mesh.clone(),
+                values_to_bytes(&state_values).as_slice(),
+            )
+            .unwrap();
+            let reference_state = CpuArray::from_elements(algorithm.state_type(), &state_values).unwrap();
+            for data_type in [DataType::F32, DataType::F64] {
+                let reference_logits =
+                    CpuArray::matrix(2, 3, vec![f64::NEG_INFINITY, 2000.0, 0.0, f64::NEG_INFINITY, 0.0, 2000.0])
+                        .unwrap()
+                        .convert_element_type(data_type)
+                        .unwrap();
+                let logits = Array::from_host_buffer(
+                    &client,
+                    replicated_type(&mesh, data_type, &[2, 3]),
+                    mesh.clone(),
+                    &reference_logits.logical_bytes(),
+                )
+                .unwrap();
+                let (device_state, device_samples) =
+                    state.random_categorical_with_mode(&logits, -1, CategoricalSamplingMode::HighPrecision).unwrap();
+                let (reference_state, reference_samples) = reference_state
+                    .random_categorical_with_mode(&reference_logits, -1, CategoricalSamplingMode::HighPrecision)
+                    .unwrap();
+                assert_eq!(read_i32s(&device_samples), vec![1, 2]);
+                assert_eq!(reference_samples.elements::<i32>().unwrap(), vec![1, 2]);
+                assert_eq!(
+                    values_from_bytes::<u64>(
+                        shard_host_bytes(device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
+                    ),
+                    reference_state.elements::<u64>().unwrap(),
+                );
+            }
+        }
+
+        // A zero first uniform exercises the rare tail where ordinary log(1 - x) loses the distinction from zero.
+        let state_values = [0u64, 0x1badd8a64e5859ae];
+        let state = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::U64, &[2]),
+            mesh.clone(),
+            values_to_bytes(&state_values).as_slice(),
+        )
+        .unwrap();
+        let logits = f32_vector(&client, &mesh, &[-16.0, 0.0]);
+        for (mode, expected) in
+            [(CategoricalSamplingMode::LowPrecision, 1), (CategoricalSamplingMode::HighPrecision, 0)]
+        {
+            assert_eq!(read_i32s(&state.random_categorical_with_mode(&logits, 0, mode).unwrap().1), vec![expected]);
         }
     }
 

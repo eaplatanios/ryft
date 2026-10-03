@@ -36,25 +36,28 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable, Shape,
-    ShardingDimension,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
+    ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionType, DimensionValue,
+    DimensionVariable, Shape, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
-    check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
+    check_count, check_types, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sqrt, Sub};
+use crate::operations::comparisons::Compare;
+use crate::operations::complex::Complex;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::scan::ScanOperation;
+use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
-use crate::operations::exponential::Log;
+use crate::operations::exponential::{Ln1p, Log};
 use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::conversions::ConvertElementType;
@@ -179,8 +182,9 @@ impl<T: Type> RngBitGeneratorOperation<T> {
         &self.output_type
     }
 
-    /// Validates the provided state type, the output element type, and the absence of sharded axes, which are shared
-    /// by both input contracts, for this [`RngBitGeneratorOperation`].
+    /// Validates the state type, output element type, and sharding constraints shared by both input contracts.
+    /// States and outputs must be unsharded and carry no unreduced mesh axes because generation is nonlinear.
+    /// Any statically known output element count must fit in [`usize`].
     fn validate_types(&self, state_type: &ArrayType) -> Result<(), TypeError> {
         let algorithm = self.algorithm;
         let expected_state_type = algorithm.state_type();
@@ -211,6 +215,14 @@ impl<T: Type> RngBitGeneratorOperation<T> {
                  states inside `shard_map` instead",
             )));
         }
+
+        check_types!(@no_unreduced, RNG_BIT_GENERATOR_OPERATION_NAME, &[state_type]);
+        if !self.output_type.unreduced_axes().is_empty() {
+            return Err(TypeError::invalid(format!(
+                "`{RNG_BIT_GENERATOR_OPERATION_NAME}` does not support unreduced outputs",
+            )));
+        }
+        self.output_type.element_count()?;
 
         Ok(())
     }
@@ -247,9 +259,10 @@ impl Operation for RngBitGeneratorOperation<ArrayType> {
     fn infer_output_types(
         &self,
         input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
+        region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
         self.validate_types(&input_types[0])?;
         if self.output_type.static_shape().is_none() {
             return Err(TypeError::invalid(format!(
@@ -496,9 +509,9 @@ impl_non_transposable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 /// The state must have the [`RandomAlgorithm::state_type`] of the requested algorithm, and the output element type must
 /// be `u8`, `u16`, `u32`, or `u64`. Narrower outputs keep the low bits of one 32-bit word per element. The output must
 /// be statically shaped (refer to [`DynamicRngBitGenerator`] for dynamic shape support), and neither the state nor the
-/// output may be sharded, since every shard would otherwise draw the same bits. For XLA's `shard_map` operation, for
-/// example, you must derive per-shard states inside that operation instead. Concrete [`Array`]s generate the bits
-/// immediately, bit-identical with XLA's
+/// output may be sharded, since every shard would otherwise draw the same bits, or carry unreduced mesh axes.
+/// For XLA's `shard_map` operation, for example, you must derive per-shard states inside that operation instead.
+/// Concrete [`Array`]s generate the bits immediately, bit-identical with XLA's
 /// [`rng_bit_generator`](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc) expansion, while
 /// context-carrying values bind an [`RngBitGeneratorOperation`] through their own context. The bits are integers,
 /// and so their derivative is a structural zero.
@@ -527,8 +540,8 @@ pub trait RngBitGenerator: Sized {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if this state does not have the state type of `algorithm`, if `output_type` is not
-    /// a statically shaped and unsharded unsigned-integer type, or if the context of the value fails to bind the
-    /// operation.
+    /// a statically shaped and unsharded unsigned-integer type, if the state or output has unreduced mesh axes,
+    /// if the output element count overflows [`usize`], or if the context of the value fails to bind the operation.
     fn rng_bit_generator(
         &self,
         algorithm: RandomAlgorithm,
@@ -549,8 +562,15 @@ impl RngBitGenerator for Array {
         // decoded `u64` state elements as the algorithm requires. Narrower-than-32-bit outputs keep the low bits of
         // each generated `u32` word. The generated values are encoded in logical order, so the declared physical
         // layouts of both the state and the bits are preserved.
+
+        // Validate storage size and layout before allocating any cipher-word buffers.
+        let addressing = ArrayAddressing::new(output_type.clone())?;
         let dimensions = output_type.static_shape().unwrap().dimensions().to_vec();
-        let count = dimensions.iter().product::<usize>();
+        let count = addressing.element_count();
+        if count == 0 {
+            return Ok((self.clone(), Array::from_logical_bytes(output_type.clone(), &[])?));
+        }
+
         let data_type = output_type.data_type();
         let bits_from_u32_words = |words: Vec<u32>| match data_type {
             DataType::U8 => Array::from_fn_elements(output_type.clone(), |index| Ok(words[index] as u8)),
@@ -727,6 +747,18 @@ impl<
     }
 }
 
+/// Precision of the Gumbel noise used by [`Random::random_categorical_with_mode`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CategoricalSamplingMode {
+    /// Draws one uniform per logit. Rare events below the uniform spacing may be biased (approximately `2⁻²⁴`
+    /// for `f32` computation or `2⁻⁵³` for `f64` computation).
+    LowPrecision,
+
+    /// Draws two uniforms per logit and uses [`Ln1p`] to preserve the upper Gumbel tail. This approximately doubles
+    /// sampling work and extends the rare-event range to approximately `2⁻⁴⁸` for `f32` or `2⁻¹⁰⁶` for `f64`.
+    HighPrecision,
+}
+
 /// Represents the ability to draw random samples from a counter-based generator state. Every function selects the
 /// [`RandomAlgorithm`] from the state type (see [`RandomAlgorithm::from_state_type`]), threads the state functionally
 /// by returning the advanced state alongside its result, and is a pure composition of [`RngBitGenerator`] and ordinary
@@ -734,15 +766,19 @@ impl<
 ///
 ///   - [`split_rng_key`](Self::split_rng_key) draws one `u64` key per fresh state and pairs it with a zero counter.
 ///   - [`random_uniform`](Self::random_uniform) draws 32-bit words for `f32` samples and 64-bit words for `f64`
-///     samples, keeps their top 24 or 53 bits (i.e., the precision of the sample data type), and scales them by `2⁻²⁴`
-///     or `2⁻⁵³`. Every step is exact, so the samples are multiples of that spacing in `[0, 1 - 2⁻²⁴]` or
-///     `[0, 1 - 2⁻⁵³]` and never round up to `1`.
+///     samples, keeps their top 24 or 53 bits, and scales them by `2⁻²⁴` or `2⁻⁵³`. Narrower floating-point samples
+///     use 32-bit words and an exactly representable grid computed in `f32` before conversion. Every grid excludes
+///     `1`. `f4e2m1fn` and `f6e2m3fn` use fewer precision bits because their exponent ranges cannot represent the
+///     otherwise smallest grid points.
 ///   - [`random_normal`](Self::random_normal) applies the Box-Muller transform `√(-2 ln(1 - u₁)) · cos(2π u₂)` to two
-///     uniform draws, where `1 - u₁ > 0` keeps the logarithm finite.
+///     uniform draws, where `1 - u₁ > 0` keeps the logarithm finite. Narrower types round an `f32` computation once.
+///     Complex samples combine two independent real normals scaled by `1/√2`, giving unit expected squared modulus.
 ///   - [`random_categorical`](Self::random_categorical) applies the Gumbel-max trick
-///     `argmax(logits - ln(-ln(u + tiny)))` along the category axis, where `tiny` is the smallest positive normal value
-///     of the logits data type. The Gumbel noise is therefore always finite, so `-∞` logits are never sampled unless
-///     every logit along the axis is `-∞`, and ties resolve to the lowest index.
+///     `argmax(logits - ln(-ln(u + tiny)))` along the category axis. Narrower logits use `f32` arithmetic, and `tiny`
+///     is the smallest positive normal value of the computation data type. The Gumbel noise is therefore always
+///     finite, so `-∞` logits are never sampled unless every logit along the axis is `-∞`, and ties resolve to the
+///     lowest index. [`random_categorical_with_mode`](Self::random_categorical_with_mode) can instead use two uniform
+///     draws and accurate `ln(1 - x)` to retain more of the upper Gumbel tail.
 ///
 /// These are the distributions of JAX's
 /// [`jax.random.uniform`](https://docs.jax.dev/en/latest/_autosummary/jax.random.uniform.html),
@@ -783,8 +819,8 @@ pub trait Random: Sized {
     /// # Errors
     ///
     /// Returns a [`ProgramError`] if this value is not a generator state, if `r#type` is not statically shaped, if its
-    /// element data type is neither `f32` nor `f64`, if it is sharded, or if the context of the value fails to bind an
-    /// operation.
+    /// element data type is not a floating-point type with zero (in particular, `f8e8m0fnu` is unsupported), if it
+    /// has sharded dimensions or unreduced axes, or if the context of the value fails to bind an operation.
     fn random_uniform(&self, r#type: &ArrayType) -> Result<(Self, Self), ProgramError>;
 
     /// Draws standard-normal samples of type `r#type`, returning the advanced state together with the samples. The
@@ -792,25 +828,41 @@ pub trait Random: Sized {
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] under the same conditions as [`Self::random_uniform`].
+    /// Returns a [`ProgramError`] under the same conditions as [`Self::random_uniform`], except that `c64` and
+    /// `c128` outputs are also supported.
     fn random_normal(&self, r#type: &ArrayType) -> Result<(Self, Self), ProgramError>;
 
-    /// Draws one categorical sample for every position of `logits` outside `axis`, where the values along `axis` are
-    /// unnormalized log-probabilities, returning the advanced state together with the sampled `i32` indices. The
-    /// sample shape is the shape of `logits` with `axis` removed.
+    /// Draws one categorical sample for every position of `logits` outside `axis`, using
+    /// [`CategoricalSamplingMode::LowPrecision`]. Refer to [`Self::random_categorical_with_mode`]
+    /// for semantics and errors. Existing `f32` and `f64` draws use one uniform per logit.
+    #[inline]
+    fn random_categorical<A: Into<Axis>>(&self, logits: &Self, axis: A) -> Result<(Self, Self), ProgramError> {
+        self.random_categorical_with_mode(logits, axis, CategoricalSamplingMode::LowPrecision)
+    }
+
+    /// Draws one categorical sample for every position of `logits` outside `axis`, returning the advanced state
+    /// together with `i32` indices. The sample shape is the shape of `logits` with `axis` removed. Ties select the
+    /// lowest index and NaNs follow [`ArgMax`] semantics. Infinite negative logits remain masked unless every category
+    /// is masked, in which case the lowest index is returned.
     ///
     /// # Parameters
     ///
-    ///   - `logits`: `f32` or `f64` unnormalized log-probabilities. `-∞` entries are never sampled unless every entry
-    ///     along `axis` is `-∞`.
+    ///   - `logits`: Floating-point unnormalized log-probabilities. Narrower types use `f32` arithmetic, while `f64`
+    ///     retains its precision. The zero-free `f8e8m0fnu` type is unsupported.
     ///   - `axis`: [`Axis`] holding the categories. Negative axes count from the end.
+    ///   - `mode`: Precision of the Gumbel noise. High precision consumes two uniform draws instead of one.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] if this value is not a generator state, if `logits` is neither an `f32` nor an
-    /// `f64` statically shaped array, if `axis` is out of bounds or empty, or if the context of the value fails to
-    /// bind an operation.
-    fn random_categorical<A: Into<Axis>>(&self, logits: &Self, axis: A) -> Result<(Self, Self), ProgramError>;
+    /// Returns a [`ProgramError`] if this value is not a generator state, if `logits` has unsupported elements,
+    /// a dynamic shape, sharded dimensions, or unreduced axes, if `axis` is out of bounds or empty, if its indices
+    /// cannot be represented by `i32`, or if the context of the value fails to bind an operation.
+    fn random_categorical_with_mode<A: Into<Axis>>(
+        &self,
+        logits: &Self,
+        axis: A,
+        mode: CategoricalSamplingMode,
+    ) -> Result<(Self, Self), ProgramError>;
 }
 
 impl<
@@ -823,7 +875,11 @@ impl<
         + Div
         + Sqrt
         + Log
+        + Ln1p
         + Cos
+        + Complex
+        + Compare
+        + Select
         + ArgMax
         + Concatenate
         + Slice
@@ -834,7 +890,8 @@ impl<
     fn split_rng_key(&self, count: usize) -> Result<(Self, Vec<Self>), ProgramError> {
         let state_type = self.r#type();
         let algorithm = RandomAlgorithm::from_state_type(&state_type)?;
-        let (state, keys) = self.rng_bit_generator(algorithm, &ArrayType::new_static(DataType::U64, [count]))?;
+        let keys_type = state_type.as_ref().clone().with_shape([count]).with_layout(None);
+        let (state, keys) = self.rng_bit_generator(algorithm, &keys_type)?;
 
         // Every fresh state pairs one generated key with a zero counter of the parent state's algorithm.
         let state_width = state_type.dimension(0).value().unwrap();
@@ -847,9 +904,19 @@ impl<
 
     fn random_uniform(&self, r#type: &ArrayType) -> Result<(Self, Self), ProgramError> {
         let data_type = r#type.data_type();
-        let (bits_data_type, bit_count, precision) = match data_type {
-            DataType::F32 => (DataType::U32, 32, 24),
-            DataType::F64 => (DataType::U64, 64, 53),
+        let (bits_data_type, bit_count, precision, compute_data_type) = match data_type {
+            DataType::F4E2M1FN => (DataType::U32, 32, 1, DataType::F32),
+            DataType::F6E2M3FN | DataType::F6E3M2FN | DataType::F8E5M2 | DataType::F8E5M2FNUZ => {
+                (DataType::U32, 32, 3, DataType::F32)
+            }
+            DataType::F8E3M4 => (DataType::U32, 32, 5, DataType::F32),
+            DataType::F8E4M3 | DataType::F8E4M3FN | DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ => {
+                (DataType::U32, 32, 4, DataType::F32)
+            }
+            DataType::BF16 => (DataType::U32, 32, 8, DataType::F32),
+            DataType::F16 => (DataType::U32, 32, 11, DataType::F32),
+            DataType::F32 => (DataType::U32, 32, 24, DataType::F32),
+            DataType::F64 => (DataType::U64, 64, 53, DataType::F64),
             data_type => {
                 return Err(TypeError::invalid(format!(
                     "`random_uniform` does not support output data type `{data_type}`"
@@ -864,15 +931,41 @@ impl<
         let bits_type = r#type.clone().with_data_type(bits_data_type).with_layout(None);
         let (state, bits) = self.rng_bit_generator(algorithm, &bits_type)?;
 
-        // Dividing by `2^(bit_count - precision)` keeps the top `precision` bits as an integer below `2^precision`,
-        // which `data_type` represents exactly, so the conversion and the scaling by `2^-precision` are exact as well.
+        // Keep the top precision bits and scale in a type that represents both the integer and the grid exactly.
+        // Scaling before narrowing avoids overflowing the narrow type or rounding the largest sample up to one.
+        let compute_type = if data_type == compute_data_type {
+            r#type.clone()
+        } else {
+            r#type.clone().with_layout(None).with_data_type(compute_data_type)
+        };
         let domain = self.dispatch_domain();
         let divisor: Self = domain.fill(&bits_type, 2.0f64.powi(bit_count - precision))?;
-        let scale: Self = domain.fill(r#type, 2.0f64.powi(-precision))?;
-        Ok((state, bits.div(&divisor)?.convert_element_type(data_type)?.mul(&scale)?))
+        let scale: Self = domain.fill(&compute_type, 2.0f64.powi(-precision))?;
+        let samples = bits.div(&divisor)?.convert_element_type(compute_data_type)?.mul(&scale)?;
+        let samples = if data_type == compute_data_type { samples } else { samples.convert_element_type(data_type)? };
+        Ok((state, samples))
     }
 
     fn random_normal(&self, r#type: &ArrayType) -> Result<(Self, Self), ProgramError> {
+        let data_type = r#type.data_type();
+        if data_type.is_complex() {
+            let part_type = r#type.clone().with_layout(None).with_data_type(if data_type == DataType::C64 {
+                DataType::F32
+            } else {
+                DataType::F64
+            });
+            let (state, real) = self.random_normal(&part_type)?;
+            let (state, imaginary) = state.random_normal(&part_type)?;
+            let scale: Self = self.dispatch_domain().fill(&part_type, std::f64::consts::FRAC_1_SQRT_2)?;
+            return Ok((state, real.mul(&scale)?.complex(&imaginary.mul(&scale)?)?));
+        }
+
+        if data_type.is_floating_point() && !matches!(data_type, DataType::F32 | DataType::F64 | DataType::F8E8M0FNU) {
+            let compute_type = r#type.clone().with_layout(None).with_data_type(DataType::F32);
+            let (state, samples) = self.random_normal(&compute_type)?;
+            return Ok((state, samples.convert_element_type(data_type)?));
+        }
+
         let (state, first) = self.random_uniform(r#type)?;
         let (state, second) = state.random_uniform(r#type)?;
         let domain = self.dispatch_domain();
@@ -884,24 +977,57 @@ impl<
         Ok((state, radius.mul(&angle)?))
     }
 
-    fn random_categorical<A: Into<Axis>>(&self, logits: &Self, axis: A) -> Result<(Self, Self), ProgramError> {
+    fn random_categorical_with_mode<A: Into<Axis>>(
+        &self,
+        logits: &Self,
+        axis: A,
+        mode: CategoricalSamplingMode,
+    ) -> Result<(Self, Self), ProgramError> {
         let logits_type = logits.r#type();
-        let tiny = match logits_type.data_type() {
-            DataType::F32 => f64::from(f32::MIN_POSITIVE),
-            DataType::F64 => f64::MIN_POSITIVE,
-            data_type => {
-                return Err(TypeError::invalid(format!(
-                    "`random_categorical` does not support logits data type `{data_type}`"
-                ))
-                .into());
+        let data_type = logits_type.data_type();
+        if !data_type.is_floating_point() || data_type == DataType::F8E8M0FNU {
+            return Err(TypeError::invalid(format!(
+                "`random_categorical` does not support logits data type `{data_type}`",
+            ))
+            .into());
+        }
+
+        // Form noise and compare in at least single precision, rather than rounding it at every narrow operation.
+        let logits = if matches!(data_type, DataType::F32 | DataType::F64) {
+            logits.clone()
+        } else {
+            logits.convert_element_type(DataType::F32)?
+        };
+
+        let compute_type = logits.r#type().into_owned();
+        let (state, uniform) = self.random_uniform(&compute_type)?;
+        let domain = self.dispatch_domain();
+        let (state, gumbel) = match mode {
+            CategoricalSamplingMode::LowPrecision => {
+                // The shift changes only zero samples and keeps the noise finite, including for masked logits.
+                let tiny = if compute_type.data_type() == DataType::F64 {
+                    f64::MIN_POSITIVE
+                } else {
+                    f64::from(f32::MIN_POSITIVE)
+                };
+                let tiny: Self = domain.fill(&compute_type, tiny)?;
+                (state, uniform.add(&tiny)?.log()?.neg()?.log()?.neg()?)
+            }
+            CategoricalSamplingMode::HighPrecision => {
+                let (state, low) = state.random_uniform(&compute_type)?;
+                let precision = if compute_type.data_type() == DataType::F64 { 53 } else { 24 };
+                let half: Self = domain.fill(&compute_type, 0.5)?;
+                let scale: Self = domain.fill(&compute_type, 2.0f64.powi(-precision))?;
+                let offset: Self = domain.fill(&compute_type, 2.0f64.powi(-(2 * precision + 1)))?;
+
+                // Extend the lower uniform tail with a second draw. Keeping the upper half unchanged prevents
+                // rounding to one, and ln_1p retains the small differences that ordinary `log(1 - x)` would lose.
+                let extended = uniform.add(&low.mul(&scale)?)?.add(&offset)?;
+                let uniform = Self::select(&uniform.greater_than_or_equal(&half)?, &uniform, &extended)?;
+                (state, uniform.neg()?.ln_1p()?.neg()?.log()?.neg()?)
             }
         };
-        let (state, uniform) = self.random_uniform(&logits_type)?;
 
-        // Shifting the samples from `[0, 1)` to `[tiny, 1)` keeps the Gumbel noise `-ln(-ln(u + tiny))` finite.
-        // The shift only changes `u = 0`, because `tiny` is far below the spacing between non-zero samples.
-        let tiny: Self = self.dispatch_domain().fill(uniform.r#type().as_ref(), tiny)?;
-        let gumbel = uniform.add(&tiny)?.log()?.neg()?.log()?.neg()?;
         Ok((state, logits.add(&gumbel)?.argmax(axis)?))
     }
 }
@@ -934,6 +1060,9 @@ fn threefry_2x32(key: [u32; 2], counter: [u32; 2]) -> [u32; 2] {
 /// `(…, 2h, …)` and `(…, 2h + 1, …)`, dropping the last word of an odd split axis. A scalar uses the first word
 /// of one invocation. The counter advances by the number of invocations that ran.
 fn threefry_u32_words(key: u64, counter: u64, dimensions: &[usize]) -> (Vec<u32>, u64) {
+    if dimensions.contains(&0) {
+        return (Vec::new(), counter);
+    }
     let key = [key as u32, (key >> 32) as u32];
     let dimensions = if dimensions.is_empty() { &[1][..] } else { dimensions };
     let split_axis = dimensions.iter().position(|dimension| dimension % 2 == 0).unwrap_or_else(|| {
@@ -1063,7 +1192,7 @@ mod tests {
     };
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero};
+    use crate::programs::{EffectClasses, EmptyRegionDriver, MaybeZero};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -1231,6 +1360,30 @@ mod tests {
     }
 
     #[test]
+    fn test_rng_bit_generator_type_inference_output_count_and_regions() {
+        let state_type = RandomAlgorithm::ThreeFry.state_type();
+        let operation = RngBitGeneratorOperation::<ArrayType>::new(
+            RandomAlgorithm::ThreeFry,
+            ArrayType::new_static(DataType::U32, [usize::MAX, 2]),
+        );
+        assert_eq!(
+            operation.infer_output_types(std::slice::from_ref(&state_type), &[]),
+            Err(TypeError::invalid(format!("shape [{}, 2] element count does not fit in usize", usize::MAX))),
+        );
+        let operation = RngBitGeneratorOperation::<ArrayType>::new(
+            RandomAlgorithm::ThreeFry,
+            ArrayType::new_static(DataType::U32, [1]),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                &[state_type],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
+            ),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+    }
+
+    #[test]
     fn test_rng_bit_generator_type_inference_sharding() {
         // Replicated states and outputs are supported, while sharded ones are rejected because every shard would draw
         // the same bits.
@@ -1269,6 +1422,38 @@ mod tests {
                 error = "`rng_bit_generator` does not support sharded states or outputs; derive per-shard states \
                          inside `shard_map` instead",
             }],
+        );
+    }
+
+    #[test]
+    fn test_rng_bit_generator_type_inference_unreduced_axes() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unreduced = Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap();
+        let state_type = RandomAlgorithm::ThreeFry.state_type();
+        let output_type = ArrayType::new_static(DataType::U32, [4]);
+        let unreduced_state = state_type.clone().with_sharding(unreduced.clone()).unwrap();
+        let unreduced_output = output_type.clone().with_sharding(unreduced).unwrap();
+
+        // Both type universes enforce the same nonlinear state and output contract.
+        let operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, output_type.clone());
+        assert_eq!(
+            operation.infer_output_types(std::slice::from_ref(&unreduced_state), &[]),
+            Err(TypeError::invalid("`rng_bit_generator` does not support unreduced inputs")),
+        );
+        assert_eq!(
+            RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, output_type)
+                .infer_output_types(&[unreduced_state.into()], &[]),
+            Err(TypeError::invalid("`rng_bit_generator` does not support unreduced inputs")),
+        );
+        assert_eq!(
+            RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, unreduced_output.clone())
+                .infer_output_types(std::slice::from_ref(&state_type), &[]),
+            Err(TypeError::invalid("`rng_bit_generator` does not support unreduced outputs")),
+        );
+        assert_eq!(
+            RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, unreduced_output)
+                .infer_output_types(&[state_type.into()], &[]),
+            Err(TypeError::invalid("`rng_bit_generator` does not support unreduced outputs")),
         );
     }
 
@@ -1396,6 +1581,38 @@ mod tests {
                 if message == "`rng_bit_generator` with the `three_fry` algorithm requires a `u64[2]` state but got \
                                `u64[3]`",
         ));
+    }
+
+    #[test]
+    fn test_rng_bit_generator_interpretation_empty_output() {
+        for (algorithm, state) in [
+            (RandomAlgorithm::ThreeFry, threefry_state(42, u64::MAX)),
+            (RandomAlgorithm::Philox, philox_state(42, u128::MAX)),
+        ] {
+            let output_type = ArrayType::new_static(DataType::U32, [usize::MAX, 2, 0]);
+            assert_eq!(
+                state.rng_bit_generator(algorithm, &output_type),
+                Ok((state.clone(), Array::from_logical_bytes(output_type, &[]).unwrap())),
+            );
+        }
+        assert_eq!(threefry_u32_words(42, u64::MAX, &[usize::MAX, 2, 0]), (Vec::new(), u64::MAX));
+    }
+
+    #[test]
+    fn test_rng_bit_generator_interpretation_invalid_storage() {
+        let state = threefry_state(42, 7);
+        let output_type = ArrayType::new_static(DataType::U64, [usize::MAX]);
+        assert_eq!(
+            state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type),
+            Err(TypeError::invalid(format!("array type {output_type} requires more bytes than can be represented"))
+                .into()),
+        );
+        let output_type =
+            ArrayType::new_static(DataType::U32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4, 8])));
+        assert_eq!(
+            state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type),
+            Err(TypeError::invalid("strided layout rank 2 does not match array rank 1").into()),
+        );
     }
 
     #[test]
@@ -1808,6 +2025,19 @@ mod tests {
         assert_eq!(advanced_state, philox_state(5, counter));
         assert_eq!(fresh_states, keys.iter().map(|key| philox_state(*key, 0)).collect::<Vec<_>>());
 
+        // Split keys and counters retain the parent's memory space; byte strides are recomputed for each child.
+        let state_type = RandomAlgorithm::ThreeFry
+            .state_type()
+            .with_memory(Memory::Host { pinned: true })
+            .with_layout(Layout::Strided(StridedLayout::new(vec![-8])));
+        let parent = Array::from_elements(state_type.clone(), &[42u64, 7]).unwrap();
+        let (advanced, children) = parent.split_rng_key(2).unwrap();
+        assert_eq!(advanced.r#type().as_ref(), &state_type);
+        for child in children {
+            assert_eq!(child.r#type().memory(), state_type.memory());
+            assert_eq!(child.elements::<u64>().unwrap()[1], 0);
+        }
+
         // Zero splits leave the state unchanged, and values that are not states are rejected.
         assert_eq!(threefry_state(42, 7).split_rng_key(0), Ok((threefry_state(42, 7), Vec::new())));
         assert!(matches!(
@@ -1869,10 +2099,55 @@ mod tests {
         assert_eq!(samples.r#type().as_ref(), &sample_type);
 
         assert!(matches!(
-            state.random_uniform(&ArrayType::new_static(DataType::F16, [2])),
+            state.random_uniform(&ArrayType::new_static(DataType::F8E8M0FNU, [2])),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`random_uniform` does not support output data type `f16`",
+                if message == "`random_uniform` does not support output data type `f8e8m0fnu`",
         ));
+    }
+
+    #[test]
+    fn test_random_uniform_endpoints_and_narrow_types() {
+        // These counters invert the ThreeFry cipher under key zero to blocks [0, 0] and [MAX, MAX].
+        let zero = threefry_state(0, 0xdcf9249d7f72bced);
+        let maximum = threefry_state(0, 0x864a12b6bcf893de);
+        for (data_type, precision) in [
+            (DataType::F4E2M1FN, 1),
+            (DataType::F6E2M3FN, 3),
+            (DataType::F6E3M2FN, 3),
+            (DataType::F8E3M4, 5),
+            (DataType::F8E4M3, 4),
+            (DataType::F8E4M3FN, 4),
+            (DataType::F8E4M3FNUZ, 4),
+            (DataType::F8E4M3B11FNUZ, 4),
+            (DataType::F8E5M2, 3),
+            (DataType::F8E5M2FNUZ, 3),
+            (DataType::BF16, 8),
+            (DataType::F16, 11),
+            (DataType::F32, 24),
+            (DataType::F64, 53),
+        ] {
+            let output_type = ArrayType::scalar(data_type);
+            assert_eq!(zero.random_uniform(&output_type).unwrap().1.to_f64s(), vec![0.0]);
+            assert_eq!(maximum.random_uniform(&output_type).unwrap().1.to_f64s(), vec![1.0 - 2.0f64.powi(-precision)]);
+            let output_type = ArrayType::new_static(data_type, [128]);
+            let (_, samples) = threefry_state(42, 7).random_uniform(&output_type).unwrap();
+            assert_eq!(samples.r#type().as_ref(), &output_type);
+            for sample in samples.to_f64s() {
+                assert!((0.0..1.0).contains(&sample));
+                assert_eq!(sample * 2.0f64.powi(precision), (sample * 2.0f64.powi(precision)).floor());
+            }
+        }
+
+        // Empty draws do not advance the counter, and staging preserves the narrow grid and state advancement.
+        let output_type = ArrayType::new_static(DataType::F16, [0]);
+        assert_eq!(zero.random_uniform(&output_type).unwrap().0, zero);
+        let output_type = ArrayType::new_static(DataType::F6E2M3FN, [3]);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |state| state.random_uniform(&output_type),
+            RandomAlgorithm::ThreeFry.state_type(),
+        )
+        .unwrap();
+        assert_eq!(program.interpret(maximum.clone()), maximum.random_uniform(&output_type));
     }
 
     #[test]
@@ -1898,6 +2173,58 @@ mod tests {
         let variance = values.iter().map(|value| (value - mean) * (value - mean)).sum::<f64>() / values.len() as f64;
         assert!(mean.abs() < 0.05);
         assert!((variance - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_random_normal_narrow_and_complex_types() {
+        let state = threefry_state(42, 7);
+        let compute_type = ArrayType::new_static(DataType::F32, [128]);
+        let (expected_state, expected) = state.random_normal(&compute_type).unwrap();
+        for data_type in [
+            DataType::F4E2M1FN,
+            DataType::F6E2M3FN,
+            DataType::F6E3M2FN,
+            DataType::F8E3M4,
+            DataType::F8E4M3,
+            DataType::F8E4M3FN,
+            DataType::F8E4M3FNUZ,
+            DataType::F8E4M3B11FNUZ,
+            DataType::F8E5M2,
+            DataType::F8E5M2FNUZ,
+            DataType::BF16,
+            DataType::F16,
+        ] {
+            let output_type = compute_type.clone().with_data_type(data_type);
+            assert_eq!(
+                state.random_normal(&output_type),
+                Ok((expected_state.clone(), expected.convert_element_type(data_type).unwrap())),
+            );
+        }
+
+        // A zero first uniform has zero radius rather than an infinite logarithm.
+        for data_type in [DataType::F32, DataType::F64] {
+            let (_, sample) =
+                threefry_state(0, 0xdcf9249d7f72bced).random_normal(&ArrayType::scalar(data_type)).unwrap();
+            assert_eq!(sample.to_f64s()[0], 0.0);
+        }
+
+        for (data_type, part_data_type) in [(DataType::C64, DataType::F32), (DataType::C128, DataType::F64)] {
+            let output_type = ArrayType::new_static(data_type, [16]).with_memory(Memory::Host { pinned: true });
+            let part_type = output_type.clone().with_data_type(part_data_type);
+            let (after_real, real) = state.random_normal(&part_type).unwrap();
+            let (expected_state, imaginary) = after_real.random_normal(&part_type).unwrap();
+            let scale = EagerContext::<Array, ArrayOperation<Array>>::new()
+                .fill(&part_type, std::f64::consts::FRAC_1_SQRT_2)
+                .unwrap();
+            let expected = real.mul(&scale).unwrap().complex(&imaginary.mul(&scale).unwrap()).unwrap();
+            assert_eq!(state.random_normal(&output_type), Ok((expected_state, expected)));
+            let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |state| state.random_normal(&output_type),
+                RandomAlgorithm::ThreeFry.state_type(),
+            )
+            .unwrap();
+            assert_eq!(program.interpret(state.clone()), state.random_normal(&output_type));
+        }
     }
 
     #[test]
@@ -1927,7 +2254,82 @@ mod tests {
     }
 
     #[test]
-    fn test_threefry2x32() {
+    fn test_random_categorical_with_mode() {
+        // This key-zero counter yields the first uniform pair [0, 0.5]. High precision retains the rare upper
+        // Gumbel tail at zero; computing log(1 - x) would round to log(1) and make the noise infinite instead.
+        let tail_state = threefry_state(0, 0x1badd8a64e5859ae);
+        let tail_logits = Array::vector(vec![-16f32, 0.0]).unwrap();
+        assert_eq!(
+            tail_state
+                .random_categorical_with_mode(&tail_logits, 0, CategoricalSamplingMode::LowPrecision)
+                .unwrap()
+                .1,
+            Array::scalar(1i32).unwrap(),
+        );
+        assert_eq!(
+            tail_state
+                .random_categorical_with_mode(&tail_logits, 0, CategoricalSamplingMode::HighPrecision)
+                .unwrap()
+                .1,
+            Array::scalar(0i32).unwrap(),
+        );
+
+        let state = threefry_state(42, 7);
+        for data_type in [DataType::F16, DataType::BF16, DataType::F4E2M1FN, DataType::F8E4M3FNUZ] {
+            let logits = Array::vector(vec![0f32, 4.0, 0.0]).unwrap().convert_element_type(data_type).unwrap();
+            let wide_logits = logits.convert_element_type(DataType::F32).unwrap();
+            for mode in [CategoricalSamplingMode::LowPrecision, CategoricalSamplingMode::HighPrecision] {
+                assert_eq!(
+                    state.random_categorical_with_mode(&logits, 0, mode),
+                    state.random_categorical_with_mode(&wide_logits, 0, mode),
+                );
+            }
+        }
+
+        for data_type in [DataType::F32, DataType::F64] {
+            let logits = Array::vector(vec![f64::NEG_INFINITY, 0.0]).unwrap().convert_element_type(data_type).unwrap();
+            let masked = Array::vector(vec![f64::NEG_INFINITY, f64::NEG_INFINITY])
+                .unwrap()
+                .convert_element_type(data_type)
+                .unwrap();
+            for mode in [CategoricalSamplingMode::LowPrecision, CategoricalSamplingMode::HighPrecision] {
+                for counter in [0xdcf9249d7f72bced, 0x864a12b6bcf893de] {
+                    let state = threefry_state(0, counter);
+                    assert_eq!(
+                        state.random_categorical_with_mode(&logits, 0, mode).unwrap().1,
+                        Array::scalar(1i32).unwrap(),
+                    );
+                    assert_eq!(
+                        state.random_categorical_with_mode(&masked, 0, mode).unwrap().1,
+                        Array::scalar(0i32).unwrap(),
+                    );
+                }
+                let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                    |(state, logits)| state.random_categorical_with_mode(&logits, -1, mode),
+                    (RandomAlgorithm::ThreeFry.state_type(), logits.r#type().into_owned()),
+                )
+                .unwrap();
+                assert_eq!(
+                    program.interpret((state.clone(), logits.clone())),
+                    state.random_categorical_with_mode(&logits, -1, mode),
+                );
+            }
+        }
+
+        // High precision's extra draw is visible in the advanced state, even for a single category.
+        let logits = Array::vector(vec![0f32]).unwrap();
+        assert_eq!(
+            state.random_categorical_with_mode(&logits, 0, CategoricalSamplingMode::LowPrecision).unwrap().0,
+            threefry_state(42, 8),
+        );
+        assert_eq!(
+            state.random_categorical_with_mode(&logits, 0, CategoricalSamplingMode::HighPrecision).unwrap().0,
+            threefry_state(42, 9),
+        );
+    }
+
+    #[test]
+    fn test_threefry_2x32() {
         // These are the Random123 known-answer vectors for ThreeFry-2x32 with 20 rounds.
         assert_eq!(threefry_2x32([0, 0], [0, 0]), [0x6b200159, 0x99ba4efe]);
         assert_eq!(threefry_2x32([0xffffffff, 0xffffffff], [0xffffffff, 0xffffffff]), [0x1cb996fc, 0xbb002be7]);
@@ -1998,7 +2400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_philox4x32() {
+    fn test_philox_4x32() {
         // These are the Random123 known-answer vectors for Philox-4x32 with 10 rounds.
         assert_eq!(philox_4x32([0, 0], [0, 0, 0, 0]), [0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8]);
         assert_eq!(
