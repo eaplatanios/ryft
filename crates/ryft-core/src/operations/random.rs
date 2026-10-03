@@ -20,13 +20,13 @@
 //! # use ryft_core::{Array, DataType, ProgramError, Random, RandomAlgorithm};
 //! # fn main() -> Result<(), ProgramError> {
 //! let state = Array::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[42u64, 0])?;
-//! let (_, keys) = state.split_key(2)?;
-//! let (_, samples) = keys[0].uniform([3], DataType::F32)?;
+//! let (_, keys) = state.split_rng_key(2)?;
+//! let (_, samples) = keys[0].random_uniform([3], DataType::F32)?;
 //! assert!(samples.to_f64s().iter().all(|sample| (0.0..1.0).contains(sample)));
 //!
 //! // Drawing from the same state again reproduces the same samples, while a different state draws different ones.
-//! assert_eq!(keys[0].uniform([3], DataType::F32)?.1, samples);
-//! assert_ne!(keys[1].uniform([3], DataType::F32)?.1, samples);
+//! assert_eq!(keys[0].random_uniform([3], DataType::F32)?.1, samples);
+//! assert_ne!(keys[1].random_uniform([3], DataType::F32)?.1, samples);
 //! # Ok(())
 //! # }
 //! ```
@@ -143,10 +143,10 @@ pub const RNG_BIT_GENERATOR_OPERATION_NAME: &str = "rng_bit_generator";
 /// Both outputs are discrete, so differentiation assigns them structural-zero tangents and transposition is rejected.
 /// Batching a replicated state binds this operation once and replicates both outputs, since every batch item computes
 /// the same function of the same state. Batching a mapped state (e.g., one state per batch item derived with
-/// [`Random::split_key`]) stages one carry-free [`ScanOperation`] over the per-item states, so each batch item draws
-/// exactly the bits that its own state produces unbatched and the staged program size is independent of the batch
-/// size. The composite form threads its output extents through that scan as invariant carries, which requires them
-/// to be replicated.
+/// [`Random::split_rng_key`]) stages one carry-free [`ScanOperation`] over the per-item states, so each batch item
+/// draws exactly the bits that its own state produces unbatched and the staged program size is independent of the
+/// batch size. The composite form threads its output extents through that scan as invariant carries, which requires
+/// them to be replicated.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RngBitGeneratorOperation<T: Type> {
     /// Algorithm generating the random bits.
@@ -490,7 +490,7 @@ impl_non_transposable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 /// Represents the ability to generate deterministic, uniformly distributed random bits from a counter-based generator
 /// state, which is the primitive underlying [`Random`]. Randomness is _functional_. Specifically, the same state always
 /// produces the same bits and the same advanced state, and drawing again requires threading the advanced state or
-/// deriving fresh states with [`Random::split_key`].
+/// deriving fresh states with [`Random::split_rng_key`].
 ///
 /// The state must have the [`RandomAlgorithm::state_type`] of the requested algorithm, and the output element type must
 /// be `u8`, `u16`, `u32`, or `u64`. Narrower outputs keep the low bits of one 32-bit word per element. The output must
@@ -733,21 +733,24 @@ impl<
 /// by returning the advanced state alongside its result, and is a pure composition of [`RngBitGenerator`] and ordinary
 /// array operations, so the distributions inherit their transform rules from those operations. The recipes are:
 ///
-///   - [`split_key`](Self::split_key) draws one `u64` key per fresh state and pairs it with a zero counter.
-///   - [`uniform`](Self::uniform) draws 32-bit words for `f32` samples and 64-bit words for `f64` samples, keeps their
-///     top 24 or 53 bits (i.e., the precision of the sample data type), and scales them by `2⁻²⁴` or `2⁻⁵³`. Every
-///     step is exact, so the samples are multiples of that spacing in `[0, 1 - 2⁻²⁴]` or `[0, 1 - 2⁻⁵³]` and never
-///     round up to `1`.
-///   - [`normal`](Self::normal) applies the Box–Muller transform `√(-2 ln(1 - u₁)) · cos(2π u₂)` to two uniform
-///     draws, where `1 - u₁ > 0` keeps the logarithm finite.
-///   - [`categorical`](Self::categorical) applies the Gumbel-max trick `argmax(logits - ln(-ln(u + tiny)))` along the
-///     category axis, where `tiny` is the smallest positive normal value of the logits data type. The Gumbel noise is
-///     therefore always finite, so `-∞` logits are never sampled unless every logit along the axis is `-∞`, and ties
-///     resolve to the lowest index.
+///   - [`split_rng_key`](Self::split_rng_key) draws one `u64` key per fresh state and pairs it with a zero counter.
+///   - [`random_uniform`](Self::random_uniform) draws 32-bit words for `f32` samples and 64-bit words for `f64`
+///     samples, keeps their top 24 or 53 bits (i.e., the precision of the sample data type), and scales them by `2⁻²⁴`
+///     or `2⁻⁵³`. Every step is exact, so the samples are multiples of that spacing in `[0, 1 - 2⁻²⁴]` or
+///     `[0, 1 - 2⁻⁵³]` and never round up to `1`.
+///   - [`random_normal`](Self::random_normal) applies the Box-Muller transform `√(-2 ln(1 - u₁)) · cos(2π u₂)` to two
+///     uniform draws, where `1 - u₁ > 0` keeps the logarithm finite.
+///   - [`random_categorical`](Self::random_categorical) applies the Gumbel-max trick
+///     `argmax(logits - ln(-ln(u + tiny)))` along the category axis, where `tiny` is the smallest positive normal value
+///     of the logits data type. The Gumbel noise is therefore always finite, so `-∞` logits are never sampled unless
+///     every logit along the axis is `-∞`, and ties resolve to the lowest index.
 ///
-/// These are the distributions of JAX's [`jax.random`](https://docs.jax.dev/en/latest/jax.random.html) functions of
-/// the same names, although the samples differ bitwise because JAX derives its bits differently and draws normal
-/// samples through the inverse error function.
+/// These are the distributions of JAX's
+/// [`jax.random.uniform`](https://docs.jax.dev/en/latest/_autosummary/jax.random.uniform.html),
+/// [`jax.random.normal`](https://docs.jax.dev/en/latest/_autosummary/jax.random.normal.html), and
+/// [`jax.random.categorical`](https://docs.jax.dev/en/latest/_autosummary/jax.random.categorical.html), although the
+/// samples differ bitwise because JAX derives its bits differently and draws normal samples through the inverse error
+/// function.
 ///
 /// # Example
 ///
@@ -755,12 +758,12 @@ impl<
 /// # use ryft_core::{Array, DataType, ProgramError, Random, RandomAlgorithm};
 /// # fn main() -> Result<(), ProgramError> {
 /// let state = Array::from_elements(RandomAlgorithm::Philox.state_type(), &[7u64, 0, 0])?;
-/// let (state, normal) = state.normal([2, 3], DataType::F64)?;
+/// let (state, normal) = state.random_normal([2, 3], DataType::F64)?;
 /// assert!(normal.to_f64s().iter().all(|sample| sample.is_finite()));
 ///
 /// // The masked category has probability zero and the second category dominates the remaining two.
 /// let logits = Array::matrix(2, 3, vec![f64::NEG_INFINITY, 20.0, 0.0, f64::NEG_INFINITY, 0.0, 20.0])?;
-/// let (_, samples) = state.categorical(&logits, -1)?;
+/// let (_, samples) = state.random_categorical(&logits, -1)?;
 /// assert_eq!(samples, Array::vector(vec![1i32, 2])?);
 /// # Ok(())
 /// # }
@@ -773,7 +776,7 @@ pub trait Random: Sized {
     ///
     /// Returns a [`ProgramError`] if this value is not a generator state or if the context of the value fails to bind
     /// an operation.
-    fn split_key(&self, count: usize) -> Result<(Self, Vec<Self>), ProgramError>;
+    fn split_rng_key(&self, count: usize) -> Result<(Self, Vec<Self>), ProgramError>;
 
     /// Draws uniformly distributed samples in `[0, 1)` of the provided shape and floating-point data type, returning
     /// the advanced state together with the samples.
@@ -782,15 +785,15 @@ pub trait Random: Sized {
     ///
     /// Returns a [`ProgramError`] if this value is not a generator state, if `shape` is not static, if `data_type` is
     /// neither `f32` nor `f64`, or if the context of the value fails to bind an operation.
-    fn uniform<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError>;
+    fn random_uniform<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError>;
 
     /// Draws standard-normal samples of the provided shape and floating-point data type, returning the advanced state
     /// together with the samples.
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] under the same conditions as [`Self::uniform`].
-    fn normal<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError>;
+    /// Returns a [`ProgramError`] under the same conditions as [`Self::random_uniform`].
+    fn random_normal<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError>;
 
     /// Draws one categorical sample for every position of `logits` outside `axis`, where the values along `axis` are
     /// unnormalized log-probabilities, returning the advanced state together with the sampled `i32` indices. The
@@ -807,29 +810,28 @@ pub trait Random: Sized {
     /// Returns a [`ProgramError`] if this value is not a generator state, if `logits` is neither an `f32` nor an
     /// `f64` statically shaped array, if `axis` is out of bounds or empty, or if the context of the value fails to
     /// bind an operation.
-    fn categorical<A: Into<Axis>>(&self, logits: &Self, axis: A) -> Result<(Self, Self), ProgramError>;
+    fn random_categorical<A: Into<Axis>>(&self, logits: &Self, axis: A) -> Result<(Self, Self), ProgramError>;
 }
 
-impl<V> Random for V
-where
-    V: Value<Type = ArrayType>
-        + RngBitGenerator
+impl<
+    V: Value<Type = ArrayType, DispatchDomain: Fill<f64, V>>
+        + ZeroLike
+        + Neg
         + Add
+        + Sub
+        + Mul
+        + Div
+        + Sqrt
+        + Log
+        + Cos
         + ArgMax
         + Concatenate
-        + ConvertElementType
-        + Cos
-        + Div
-        + Log
-        + Mul
-        + Neg
         + Slice
-        + Sqrt
-        + Sub
-        + ZeroLike,
-    V::DispatchDomain: Fill<f64, V>,
+        + ConvertElementType
+        + RngBitGenerator,
+> Random for V
 {
-    fn split_key(&self, count: usize) -> Result<(Self, Vec<Self>), ProgramError> {
+    fn split_rng_key(&self, count: usize) -> Result<(Self, Vec<Self>), ProgramError> {
         let state_type = self.r#type();
         let algorithm = RandomAlgorithm::from_state_type(&state_type)?;
         let (state, keys) = self.rng_bit_generator(algorithm, &ArrayType::new_static(DataType::U64, [count]))?;
@@ -843,14 +845,15 @@ where
         Ok((state, fresh_states))
     }
 
-    fn uniform<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError> {
+    fn random_uniform<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError> {
         let (bits_data_type, bit_count, precision) = match data_type {
             DataType::F32 => (DataType::U32, 32, 24),
             DataType::F64 => (DataType::U64, 64, 53),
             data_type => {
-                return Err(
-                    TypeError::invalid(format!("`uniform` does not support output data type `{data_type}`")).into()
-                );
+                return Err(TypeError::invalid(format!(
+                    "`random_uniform` does not support output data type `{data_type}`"
+                ))
+                .into());
             }
         };
         let shape = shape.into();
@@ -866,10 +869,10 @@ where
         Ok((state, bits.div(&divisor)?.convert_element_type(data_type)?.mul(&scale)?))
     }
 
-    fn normal<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError> {
+    fn random_normal<S: Into<Shape>>(&self, shape: S, data_type: DataType) -> Result<(Self, Self), ProgramError> {
         let shape = shape.into();
-        let (state, first) = self.uniform(shape.clone(), data_type)?;
-        let (state, second) = state.uniform(shape.clone(), data_type)?;
+        let (state, first) = self.random_uniform(shape.clone(), data_type)?;
+        let (state, second) = state.random_uniform(shape.clone(), data_type)?;
         let sample_type = ArrayType::new(data_type, shape);
         let domain = self.dispatch_domain();
         let one: Self = domain.fill(&sample_type, 1.0)?;
@@ -880,19 +883,19 @@ where
         Ok((state, radius.mul(&angle)?))
     }
 
-    fn categorical<A: Into<Axis>>(&self, logits: &Self, axis: A) -> Result<(Self, Self), ProgramError> {
+    fn random_categorical<A: Into<Axis>>(&self, logits: &Self, axis: A) -> Result<(Self, Self), ProgramError> {
         let logits_type = logits.r#type();
         let tiny = match logits_type.data_type() {
             DataType::F32 => f64::from(f32::MIN_POSITIVE),
             DataType::F64 => f64::MIN_POSITIVE,
             data_type => {
                 return Err(TypeError::invalid(format!(
-                    "`categorical` does not support logits data type `{data_type}`"
+                    "`random_categorical` does not support logits data type `{data_type}`"
                 ))
                 .into());
             }
         };
-        let (state, uniform) = self.uniform(logits_type.shape().clone(), logits_type.data_type())?;
+        let (state, uniform) = self.random_uniform(logits_type.shape().clone(), logits_type.data_type())?;
 
         // Shifting the samples from `[0, 1)` to `[tiny, 1)` keeps the Gumbel noise `-ln(-ln(u + tiny))` finite. The
         // shift only changes `u = 0`, because `tiny` is far below the spacing between nonzero samples.
@@ -902,11 +905,11 @@ where
     }
 }
 
-/// Applies the 20-round ThreeFry-2x32 block cipher to one counter pair under the provided key pair, bit-exactly with
-/// [XLA's implementation](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc). The rounds are grouped
+/// Applies the 20-round ThreeFry-2x32 block cipher to one counter pair under the provided key pair, bit-identical with
+/// XLA's [implementation](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc). The rounds are grouped
 /// in blocks of four with alternating rotation groups `[13, 15, 26, 6]` and `[17, 29, 16, 24]`, and the key injections
 /// are derived from `key[0]`, `key[1]`, and `key[0] ^ key[1] ^ 0x1BD11BDA`.
-fn threefry2x32(key: [u32; 2], counter: [u32; 2]) -> [u32; 2] {
+fn threefry_2x32(key: [u32; 2], counter: [u32; 2]) -> [u32; 2] {
     const ROTATIONS: [u32; 8] = [13, 15, 26, 6, 17, 29, 16, 24];
     let key_schedule = [key[0], key[1], key[0] ^ key[1] ^ 0x1BD11BDA];
     let mut words = [counter[0].wrapping_add(key_schedule[0]), counter[1].wrapping_add(key_schedule[1])];
@@ -927,8 +930,8 @@ fn threefry2x32(key: [u32; 2], counter: [u32; 2]) -> [u32; 2] {
 /// the first even-sized axis, or the first largest axis if none is even, and the cipher runs once per element of the
 /// half shape, which halves the split axis (rounding up). The invocation at half index `(…, h, …)` uses counter
 /// `counter + i`, where `i` is the row-major index of `(…, h, …)` in the half shape, and its two words land at
-/// `(…, 2h, …)` and `(…, 2h + 1, …)`, dropping the last word of an odd split axis. A scalar uses the first word of
-/// one invocation. The counter advances by the number of invocations that ran.
+/// `(…, 2h, …)` and `(…, 2h + 1, …)`, dropping the last word of an odd split axis. A scalar uses the first word
+/// of one invocation. The counter advances by the number of invocations that ran.
 fn threefry_u32_words(key: u64, counter: u64, dimensions: &[usize]) -> (Vec<u32>, u64) {
     let key = [key as u32, (key >> 32) as u32];
     let dimensions = if dimensions.is_empty() { &[1][..] } else { dimensions };
@@ -946,7 +949,7 @@ fn threefry_u32_words(key: u64, counter: u64, dimensions: &[usize]) -> (Vec<u32>
             for inner_index in 0..inner_size {
                 let invocation_index = (outer_index * half_split_size + half_index) * inner_size + inner_index;
                 let invocation_counter = counter.wrapping_add(invocation_index as u64);
-                let output = threefry2x32(key, [invocation_counter as u32, (invocation_counter >> 32) as u32]);
+                let output = threefry_2x32(key, [invocation_counter as u32, (invocation_counter >> 32) as u32]);
                 for (word_index, word) in output.into_iter().enumerate() {
                     let split_index = 2 * half_index + word_index;
                     if split_index < split_size {
@@ -959,26 +962,26 @@ fn threefry_u32_words(key: u64, counter: u64, dimensions: &[usize]) -> (Vec<u32>
     (words, counter.wrapping_add((outer_size * half_split_size * inner_size) as u64))
 }
 
-/// Generates `count` `u64` words from a ThreeFry `[key, counter]` state, returning the words together with the
-/// advanced counter. Following XLA, word `i` combines the two cipher words of counter `counter + i` as
-/// `first | (second << 32)`, and the counter advances by `count`.
+/// Generates `count` `u64` words from a ThreeFry `[key, counter]` state, returning the words together with the advanced
+/// counter. Following XLA, word `i` combines the two cipher words of counter `counter + i` as `first | (second << 32)`,
+/// and the counter advances by `count`.
 fn threefry_u64_words(key: u64, counter: u64, count: usize) -> (Vec<u64>, u64) {
     let key = [key as u32, (key >> 32) as u32];
     let words = (0..count)
         .map(|index| {
             let word_counter = counter.wrapping_add(index as u64);
-            let output = threefry2x32(key, [word_counter as u32, (word_counter >> 32) as u32]);
+            let output = threefry_2x32(key, [word_counter as u32, (word_counter >> 32) as u32]);
             u64::from(output[0]) | (u64::from(output[1]) << 32)
         })
         .collect();
     (words, counter.wrapping_add(count as u64))
 }
 
-/// Applies the 10-round Philox-4x32 block cipher to one counter quad under the provided key pair, bit-exactly with
-/// [XLA's implementation](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc). Each round multiplies
+/// Applies the 10-round Philox-4x32 block cipher to one counter quad under the provided key pair, bit-identical with
+/// XLA's [implementation](https://github.com/openxla/xla/blob/main/xla/hlo/builder/lib/prng.cc). Each round multiplies
 /// two counter words by the `u32` constants `0xD2511F53` and `0xCD9E8D57` into 64-bit products, and the key words are
 /// incremented by `0x9E3779B9` and `0xBB67AE85` after every round.
-fn philox4x32(key: [u32; 2], counter: [u32; 4]) -> [u32; 4] {
+fn philox_4x32(key: [u32; 2], counter: [u32; 4]) -> [u32; 4] {
     const MULTIPLIERS: [u32; 2] = [0xD2511F53, 0xCD9E8D57];
     const KEY_INCREMENTS: [u32; 2] = [0x9E3779B9, 0xBB67AE85];
     let mut key = key;
@@ -998,13 +1001,13 @@ fn philox4x32(key: [u32; 2], counter: [u32; 4]) -> [u32; 4] {
 }
 
 /// Generates the cipher words of `invocation_count` consecutive Philox counters starting at `counter`, with each
-/// 128-bit counter split into four `u32` words (least significant first) and the key split into its low and high `u32`
-/// halves.
+/// 128-bit counter split into four `u32` words (least significant first) and the key split into its low and high
+/// `u32` halves.
 fn philox_invocations(key: u64, counter: u128, invocation_count: usize) -> impl Iterator<Item = [u32; 4]> {
     let key = [key as u32, (key >> 32) as u32];
     (0..invocation_count).map(move |index| {
         let invocation_counter = counter.wrapping_add(index as u128);
-        philox4x32(
+        philox_4x32(
             key,
             [
                 invocation_counter as u32,
@@ -1018,8 +1021,8 @@ fn philox_invocations(key: u64, counter: u128, invocation_count: usize) -> impl 
 
 /// Generates `count` `u32` words from a Philox `[key, counter]` state, returning the words together with the advanced
 /// 128-bit counter. Following XLA, the four cipher words of counter `counter + i` land at positions `4i` through
-/// `4i + 3` in row-major order regardless of the output shape, the final invocation is truncated to `count` words, and
-/// the counter advances by the `ceil(count / 4)` invocations that ran.
+/// `4i + 3` in row-major order regardless of the output shape, the final invocation is truncated to `count` words,
+/// and the counter advances by the `ceil(count / 4)` invocations that ran.
 fn philox_u32_words(key: u64, counter: u128, count: usize) -> (Vec<u32>, u128) {
     let invocation_count = count.div_ceil(4);
     let mut words = philox_invocations(key, counter, invocation_count).flatten().collect::<Vec<_>>();
@@ -1077,12 +1080,12 @@ mod tests {
 
     /// Returns the ThreeFry cipher words of `counter` under `key`, splitting both into their low and high `u32` halves.
     fn threefry_block(key: u64, counter: u64) -> [u32; 2] {
-        threefry2x32([key as u32, (key >> 32) as u32], [counter as u32, (counter >> 32) as u32])
+        threefry_2x32([key as u32, (key >> 32) as u32], [counter as u32, (counter >> 32) as u32])
     }
 
     /// Returns the Philox cipher words of `counter` under `key`, splitting both into their `u32` words.
     fn philox_block(key: u64, counter: u128) -> [u32; 4] {
-        philox4x32(
+        philox_4x32(
             [key as u32, (key >> 32) as u32],
             [counter as u32, (counter >> 32) as u32, (counter >> 64) as u32, (counter >> 96) as u32],
         )
@@ -1109,14 +1112,15 @@ mod tests {
         assert_eq!(
             RandomAlgorithm::from_state_type(&ArrayType::new_static(DataType::U32, [2])),
             Err(TypeError::invalid(
-                "random generator states must have type `u64[2]` (`three_fry`) or `u64[3]` (`philox`) but got `u32[2]`",
+                "random generator states must have type `u64[2]` (i.e., for `three_fry`) or `u64[3]` (i.e., for \
+                 `philox`) but got `u32[2]`",
             )),
         );
         assert_eq!(
             RandomAlgorithm::from_state_type(&ArrayType::new_static(DataType::U64, [2, 2])),
             Err(TypeError::invalid(
-                "random generator states must have type `u64[2]` (`three_fry`) or `u64[3]` (`philox`) but got \
-                 `u64[2, 2]`",
+                "random generator states must have type `u64[2]` (i.e., for `three_fry`) or `u64[3]` (i.e., for \
+                 `philox`) but got `u64[2, 2]`",
             )),
         );
     }
@@ -1787,9 +1791,9 @@ mod tests {
     }
 
     #[test]
-    fn test_random_split_key() {
+    fn test_split_rng_key() {
         // Splitting draws one `u64` key per fresh state, and each fresh state pairs its key with a zero counter.
-        let (advanced_state, fresh_states) = threefry_state(42, 7).split_key(3).unwrap();
+        let (advanced_state, fresh_states) = threefry_state(42, 7).split_rng_key(3).unwrap();
         let (keys, counter) = threefry_u64_words(42, 7, 3);
         assert_eq!(advanced_state, threefry_state(42, counter));
         assert_eq!(fresh_states, keys.iter().map(|key| threefry_state(*key, 0)).collect::<Vec<_>>());
@@ -1798,18 +1802,18 @@ mod tests {
 
         // Philox states split into Philox states.
         let counter = u128::from(u64::MAX);
-        let (advanced_state, fresh_states) = philox_state(5, counter).split_key(2).unwrap();
+        let (advanced_state, fresh_states) = philox_state(5, counter).split_rng_key(2).unwrap();
         let (keys, counter) = philox_u64_words(5, counter, 2);
         assert_eq!(advanced_state, philox_state(5, counter));
         assert_eq!(fresh_states, keys.iter().map(|key| philox_state(*key, 0)).collect::<Vec<_>>());
 
         // Zero splits leave the state unchanged, and values that are not states are rejected.
-        assert_eq!(threefry_state(42, 7).split_key(0), Ok((threefry_state(42, 7), Vec::new())));
+        assert_eq!(threefry_state(42, 7).split_rng_key(0), Ok((threefry_state(42, 7), Vec::new())));
         assert!(matches!(
-            Array::vector(vec![42u32, 7]).unwrap().split_key(2),
+            Array::vector(vec![42u32, 7]).unwrap().split_rng_key(2),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "random generator states must have type `u64[2]` (`three_fry`) or `u64[3]` \
-                               (`philox`) but got `u32[2]`",
+                if message == "random generator states must have type `u64[2]` (i.e., for `three_fry`) or \
+                               `u64[3]` (i.e., for `philox`) but got `u32[2]`",
         ));
     }
 
@@ -1818,7 +1822,7 @@ mod tests {
         // `f32` samples keep the top 24 bits of each 32-bit word, and `f64` samples keep the top 53 bits of each 64-bit
         // word, so both are exact multiples of their spacing.
         let state = threefry_state(42, 7);
-        let (advanced_state, samples) = state.uniform([2, 3], DataType::F32).unwrap();
+        let (advanced_state, samples) = state.random_uniform([2, 3], DataType::F32).unwrap();
         let (words, counter) = threefry_u32_words(42, 7, &[2, 3]);
         assert_eq!(advanced_state, threefry_state(42, counter));
         assert_eq!(samples.r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2, 3]));
@@ -1826,7 +1830,7 @@ mod tests {
             samples.elements::<f32>(),
             Ok(words.into_iter().map(|word| (word >> 8) as f32 * 2.0f32.powi(-24)).collect()),
         );
-        let (advanced_state, samples) = state.uniform([2, 3], DataType::F64).unwrap();
+        let (advanced_state, samples) = state.random_uniform([2, 3], DataType::F64).unwrap();
         let (words, counter) = threefry_u64_words(42, 7, 6);
         assert_eq!(advanced_state, threefry_state(42, counter));
         assert_eq!(
@@ -1835,16 +1839,16 @@ mod tests {
         );
 
         // Philox states draw with Philox, and the same state always draws the same samples.
-        let (_, samples) = philox_state(42, 7).uniform([5], DataType::F32).unwrap();
+        let (_, samples) = philox_state(42, 7).random_uniform([5], DataType::F32).unwrap();
         let (words, _) = philox_u32_words(42, 7, 5);
         assert_eq!(
             samples.elements::<f32>(),
             Ok(words.into_iter().map(|word| (word >> 8) as f32 * 2.0f32.powi(-24)).collect()),
         );
-        assert_eq!(philox_state(42, 7).uniform([5], DataType::F32).unwrap().1, samples);
+        assert_eq!(philox_state(42, 7).random_uniform([5], DataType::F32).unwrap().1, samples);
 
         // Many samples stay in `[0, 1)` with the moments of the uniform distribution.
-        let (_, samples) = state.uniform([4096], DataType::F32).unwrap();
+        let (_, samples) = state.random_uniform([4096], DataType::F32).unwrap();
         let values = samples.to_f64s();
         assert!(values.iter().all(|value| (0.0..1.0).contains(value)));
         let mean = values.iter().sum::<f64>() / values.len() as f64;
@@ -1853,9 +1857,9 @@ mod tests {
         assert!((variance - 1.0 / 12.0).abs() < 0.01);
 
         assert!(matches!(
-            state.uniform([2], DataType::F16),
+            state.random_uniform([2], DataType::F16),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`uniform` does not support output data type `f16`",
+                if message == "`random_uniform` does not support output data type `f16`",
         ));
     }
 
@@ -1863,9 +1867,9 @@ mod tests {
     fn test_random_normal() {
         // Samples follow the Box–Muller transform of two consecutive uniform draws.
         let state = threefry_state(42, 7);
-        let (advanced_state, samples) = state.normal([3], DataType::F64).unwrap();
-        let (state_after_first, first) = state.uniform([3], DataType::F64).unwrap();
-        let (expected_state, second) = state_after_first.uniform([3], DataType::F64).unwrap();
+        let (advanced_state, samples) = state.random_normal([3], DataType::F64).unwrap();
+        let (state_after_first, first) = state.random_uniform([3], DataType::F64).unwrap();
+        let (expected_state, second) = state_after_first.random_uniform([3], DataType::F64).unwrap();
         assert_eq!(advanced_state, expected_state);
         for ((sample, first), second) in samples.to_f64s().into_iter().zip(first.to_f64s()).zip(second.to_f64s()) {
             let expected = (-2.0 * (1.0 - first).ln()).sqrt() * (std::f64::consts::TAU * second).cos();
@@ -1873,7 +1877,7 @@ mod tests {
         }
 
         // Many samples are finite with the moments of the standard normal distribution.
-        let (_, samples) = state.normal([4096], DataType::F32).unwrap();
+        let (_, samples) = state.random_normal([4096], DataType::F32).unwrap();
         assert_eq!(samples.r#type().as_ref(), &ArrayType::new_static(DataType::F32, [4096]));
         let values = samples.to_f64s();
         assert!(values.iter().all(|value| value.is_finite()));
@@ -1890,31 +1894,31 @@ mod tests {
         let logits = Array::vector(vec![0.0, 10.0, f64::NEG_INFINITY]).unwrap();
         let mut state = threefry_state(42, 0);
         for _ in 0..64 {
-            let (advanced_state, sample) = state.categorical(&logits, 0).unwrap();
+            let (advanced_state, sample) = state.random_categorical(&logits, 0).unwrap();
             assert_eq!(sample, Array::scalar(1i32).unwrap());
             state = advanced_state;
         }
 
         // The category axis may be negative and is removed from the sample shape.
         let logits = Array::matrix(2, 3, vec![20.0f32, 0.0, 0.0, 0.0, 0.0, 20.0]).unwrap();
-        let (_, samples) = state.categorical(&logits, -1).unwrap();
+        let (_, samples) = state.random_categorical(&logits, -1).unwrap();
         assert_eq!(samples, Array::vector(vec![0i32, 2]).unwrap());
-        let (_, samples) = state.categorical(&logits, 0).unwrap();
+        let (_, samples) = state.random_categorical(&logits, 0).unwrap();
         assert_eq!(samples, Array::vector(vec![0i32, 0, 1]).unwrap());
 
         assert!(matches!(
-            state.categorical(&Array::vector(vec![0i32, 1]).unwrap(), 0),
+            state.random_categorical(&Array::vector(vec![0i32, 1]).unwrap(), 0),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "`categorical` does not support logits data type `i32`",
+                if message == "`random_categorical` does not support logits data type `i32`",
         ));
     }
 
     #[test]
     fn test_threefry2x32() {
         // These are the Random123 known-answer vectors for ThreeFry-2x32 with 20 rounds.
-        assert_eq!(threefry2x32([0, 0], [0, 0]), [0x6b200159, 0x99ba4efe]);
-        assert_eq!(threefry2x32([0xffffffff, 0xffffffff], [0xffffffff, 0xffffffff]), [0x1cb996fc, 0xbb002be7]);
-        assert_eq!(threefry2x32([0x13198a2e, 0x03707344], [0x243f6a88, 0x85a308d3]), [0xc4923a9c, 0x483df7a0]);
+        assert_eq!(threefry_2x32([0, 0], [0, 0]), [0x6b200159, 0x99ba4efe]);
+        assert_eq!(threefry_2x32([0xffffffff, 0xffffffff], [0xffffffff, 0xffffffff]), [0x1cb996fc, 0xbb002be7]);
+        assert_eq!(threefry_2x32([0x13198a2e, 0x03707344], [0x243f6a88, 0x85a308d3]), [0xc4923a9c, 0x483df7a0]);
     }
 
     #[test]
@@ -1983,13 +1987,13 @@ mod tests {
     #[test]
     fn test_philox4x32() {
         // These are the Random123 known-answer vectors for Philox-4x32 with 10 rounds.
-        assert_eq!(philox4x32([0, 0], [0, 0, 0, 0]), [0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8]);
+        assert_eq!(philox_4x32([0, 0], [0, 0, 0, 0]), [0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8]);
         assert_eq!(
-            philox4x32([0xffffffff, 0xffffffff], [0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff]),
+            philox_4x32([0xffffffff, 0xffffffff], [0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff]),
             [0x408f276d, 0x41c83b0e, 0xa20bc7c6, 0x6d5451fd],
         );
         assert_eq!(
-            philox4x32([0xa4093822, 0x299f31d0], [0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344]),
+            philox_4x32([0xa4093822, 0x299f31d0], [0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344]),
             [0xd16cfe09, 0x94fdcceb, 0x5001e420, 0x24126ea1],
         );
     }
