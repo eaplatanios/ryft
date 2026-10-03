@@ -984,8 +984,9 @@ fn philox4x32(key: [u32; 2], counter: [u32; 4]) -> [u32; 4] {
     words
 }
 
-/// Generates the cipher words of `invocation_count` consecutive Philox counters starting at `counter`, with each 128-bit
-/// counter split into four `u32` words (least significant first) and the key split into its low and high `u32` halves.
+/// Generates the cipher words of `invocation_count` consecutive Philox counters starting at `counter`, with each
+/// 128-bit counter split into four `u32` words (least significant first) and the key split into its low and high `u32`
+/// halves.
 fn philox_invocations(key: u64, counter: u128, invocation_count: usize) -> impl Iterator<Item = [u32; 4]> {
     let key = [key as u32, (key >> 32) as u32];
     (0..invocation_count).map(move |index| {
@@ -1280,7 +1281,7 @@ mod tests {
                 },
                 {
                     input_types = [rows_type.clone(), rows_type],
-                    error = "expected an array type but got a dimension type",
+                    error = "expected array type but got dimension type",
                 },
             ],
         );
@@ -1615,8 +1616,8 @@ mod tests {
         let batch_extent = trace.input(DimensionType::from(batch.clone()).into());
         let states = trace
             .input(ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(batch.clone()), 2.into()])).into());
-        let row_extent = trace.input(DimensionType::from(rows).into());
-        let column_extent = trace.input(DimensionType::from(columns).into());
+        let row_extent = trace.input(DimensionType::from(rows.clone()).into());
+        let column_extent = trace.input(DimensionType::from(columns.clone()).into());
         let input_ids = [batch_extent.clone(), states.clone(), row_extent.clone(), column_extent.clone()]
             .map(|input| input.atom_id().unwrap());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
@@ -1689,6 +1690,8 @@ mod tests {
         let trace = Context::new();
         let batch_extent = trace.input(DimensionType::new("batch", DimensionBounds::new(1, Some(9))?).into());
         let state = trace.input(RandomAlgorithm::ThreeFry.state_type().into());
+        let row_extent = trace.input(DimensionType::from(rows).into());
+        let column_extent = trace.input(DimensionType::from(columns).into());
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
         let outputs = context.bind(
             ArrayIrOperation::RngBitGenerator(RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, output_type)),

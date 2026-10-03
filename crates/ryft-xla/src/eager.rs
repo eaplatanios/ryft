@@ -2799,6 +2799,50 @@ mod tests {
         assert_eq!(device_words, reference_words);
     }
 
+    /// The reference backend reproduces the shape-dependent ThreeFry layout of XLA's 32-bit `rng_bit_generator`
+    /// expansion, which splits the first even-sized axis (or else the first largest axis) of the output and advances
+    /// the counter by the size of the resulting half shape, for every narrow output width.
+    #[test]
+    fn test_eager_rng_bit_generator_split_axis_layout_matches_reference_backend() {
+        use ryft_core::{RandomAlgorithm, RngBitGenerator};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+        let state_values = [(1u64 << 32) | 42, u64::from(u32::MAX)];
+        let state = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::U64, &[2]),
+            mesh.clone(),
+            values_to_bytes::<u64>(&state_values).as_slice(),
+        )
+        .unwrap();
+        let reference_state = CpuArray::from_elements(RandomAlgorithm::ThreeFry.state_type(), &state_values).unwrap();
+        for (data_type, dimensions) in [
+            (DataType::U32, vec![]),
+            (DataType::U32, vec![2, 3]),
+            (DataType::U32, vec![3, 4]),
+            (DataType::U32, vec![3, 5]),
+            (DataType::U32, vec![3, 3]),
+            (DataType::U32, vec![3, 2, 5]),
+            (DataType::U16, vec![2, 3]),
+            (DataType::U8, vec![3, 3]),
+        ] {
+            let output_type = ArrayType::new_static(data_type, dimensions.clone());
+            let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type).unwrap();
+            let (reference_state, reference_bits) =
+                reference_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type).unwrap();
+            let device_state = values_from_bytes::<u64>(
+                shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
+            );
+            assert_eq!(device_state, reference_state.elements::<u64>().unwrap(), "state for {output_type}");
+            let device_bits = shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap();
+            assert_eq!(device_bits, reference_bits.storage_bytes(), "bits for {output_type}");
+        }
+    }
+
     /// The reference backend's Philox implementation is bit-exact with XLA's `rng_bit_generator` expansion:
     /// the same `[key, counter]` state (with the 128-bit counter split into its low and high `u64` halves)
     /// produces identical `u32` and `u64` bits and identical advanced states on both backends.

@@ -452,8 +452,13 @@ impl Select for Array {
             );
             let condition_range = condition_addressing.byte_range_for_flat_index(condition_index);
             let (source, source_range) = if condition.storage_bytes()[condition_range.start] != 0 {
-                let source_index =
-                    Self::broadcast_index(output_index, &output_shape, &output_strides, &on_true_shape, &on_true_strides);
+                let source_index = Self::broadcast_index(
+                    output_index,
+                    &output_shape,
+                    &output_strides,
+                    &on_true_shape,
+                    &on_true_strides,
+                );
                 (on_true.storage_bytes(), on_true_addressing.byte_range_for_flat_index(source_index))
             } else {
                 let source_index = Self::broadcast_index(
@@ -538,7 +543,8 @@ mod tests {
         let condition = builder.add_input(ArrayType::new_static(DataType::Boolean, [2]));
         let on_true = builder.add_input(ArrayType::scalar(DataType::F32));
         let on_false = builder.add_input(ArrayType::new_static(DataType::F64, [2]));
-        let output = builder.add_instruction(operation, Vec::new(), vec![condition, on_true, on_false], None).unwrap()[0];
+        let output =
+            builder.add_instruction(operation, Vec::new(), vec![condition, on_true, on_false], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
@@ -707,7 +713,8 @@ mod tests {
         let condition = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Dynamic(size.clone())]));
         let branch = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
         assert_eq!(
-            operation.infer_output_types(&[condition.clone().into(), branch.clone().into(), branch.clone().into()], &[]),
+            operation
+                .infer_output_types(&[condition.clone().into(), branch.clone().into(), branch.clone().into()], &[]),
             Ok(vec![branch.clone().into()]),
         );
         assert_eq!(
@@ -756,13 +763,16 @@ mod tests {
         let on_true = Array::vector(vec![f32::from_bits(0x7fc00123), 1.0]).unwrap();
         let on_false = Array::vector(vec![2.0f32, -0.0]).unwrap();
         assert_eq!(
-            Array::select(&Array::vector(vec![true, false]).unwrap(), &on_true, &on_false).unwrap().storage_bytes(),
+            Array::select(&Array::vector(vec![true, false]).unwrap(), &on_true, &on_false)
+                .unwrap()
+                .storage_bytes(),
             Array::vector(vec![f32::from_bits(0x7fc00123), -0.0]).unwrap().storage_bytes(),
         );
 
         // Every input is read through its own physical layout under general broadcasting, and the output is dense.
         let condition = Array::from_elements(
-            ArrayType::new_static(DataType::Boolean, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-3, 1]))),
+            ArrayType::new_static(DataType::Boolean, [2, 1])
+                .with_layout(Layout::Strided(StridedLayout::new(vec![-3, 1]))),
             &[true, false],
         )
         .unwrap();
@@ -909,10 +919,10 @@ mod tests {
 
         // Branch tangents broadcast and promote with their primals.
         assert_eq!(
-            differentiate_at((Array::scalar(2.0f32).unwrap(), Array::vector(vec![-1.0f64, 3.0]).unwrap())).jvp(
-                (Array::scalar(1.0f32).unwrap(), Array::vector(vec![10.0f64, 20.0]).unwrap()),
-                |(x, y)| Select::select(&y.compare(&y.zero_like()?, ComparisonDirection::LessThan)?, &x, &y),
-            ),
+            differentiate_at((Array::scalar(2.0f32).unwrap(), Array::vector(vec![-1.0f64, 3.0]).unwrap()))
+                .jvp((Array::scalar(1.0f32).unwrap(), Array::vector(vec![10.0f64, 20.0]).unwrap()), |(x, y)| {
+                    Select::select(&y.compare(&y.zero_like()?, ComparisonDirection::LessThan)?, &x, &y)
+                },),
             Ok((Array::vector(vec![2.0f64, 3.0]).unwrap(), Array::vector(vec![1.0f64, 20.0]).unwrap())),
         );
 
@@ -968,7 +978,7 @@ mod tests {
                 lambda %0:bool[2], %1:f64[2], %2:f64[2], %3:f64[2] .
                 let %4:f64[2] = select %0 %1 %2
                     %5:f64[2] = select %0 %1 %2
-                    %6:f64[2] = zero
+                    %6:f64[2] = zero [type=f64[2]]
                     %7:f64[2] = select %0 %3 %6
                 in (%5, %7)
             "}
@@ -995,7 +1005,7 @@ mod tests {
                     input_cotangents = [Array::vector(vec![5.0, 0.0]).unwrap(), Array::vector(vec![0.0, 7.0]).unwrap()],
                     pullback = indoc! {"
                         lambda %0:f64[2], %1:bool[2] .
-                        let %2:f64[2] = zero
+                        let %2:f64[2] = zero [type=f64[2]]
                             %3:f64[2] = select %1 %0 %2
                             %4:f64[2] = select %1 %2 %0
                         in (%3, %4)
@@ -1012,7 +1022,7 @@ mod tests {
                     input_cotangents = [Array::vector(vec![5.0, 0.0]).unwrap()],
                     pullback = indoc! {"
                         lambda %0:f64[2], %1:bool[2], %2:f64[2] .
-                        let %3:f64[2] = zero
+                        let %3:f64[2] = zero [type=f64[2]]
                             %4:f64[2] = select %1 %0 %3
                         in (%4)
                     "},

@@ -9,9 +9,10 @@
 //! ([`ParallelPermuteOperation`], [`AllGatherOperation`], [`ParallelSumScatterOperation`], and [`AllToAllOperation`]).
 //! Each carries the referenced axis name and the participant count resolved from the active [`NamedAxes`] environment,
 //! consumes one statically shaped array input, and has only degenerate single-participant semantics outside a binder.
-//! Its tangent rides the same collective, and its transpose is another collective over the same axis. The
-//! [`linear_collective!`] macro generates their common operation structure, while shared functions support the
-//! generated code and hand-written rules.
+//! Its tangent rides the same collective, and its transpose is another collective over the same axis. The private
+//! `define_linear_collective_operation!` macro generates their common operation structure and the private
+//! `impl_differentiable_linear_collective_operation!` macro their differentiation rules, while shared functions support
+//! the generated code and hand-written rules.
 //!
 //! The collectives that resize an array axis ([`AllGatherOperation`], [`ParallelSumScatterOperation`], and
 //! [`AllToAllOperation`]) share additional machinery. Their output shapes depend
@@ -42,7 +43,7 @@ use crate::arrays::{
     StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::{AxisError, NamedAxes};
-use crate::batching::{BatchAxis, BatchingContext, BatchingError};
+use crate::batching::{BatchAxis, BatchedOutputs, BatchingContext, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
@@ -331,7 +332,7 @@ fn linear_collective_output_type(
 
 /// Defines the structural implementations shared by the single-input linear collectives (e.g., `all_gather` and
 /// `parallel_permute`). The generated base includes the operation struct, with its `new` constructor and its
-/// `axis_name` and `axis_size` accessors, together with its [`Display`], [`Operation`](crate::Operation),
+/// `axis_name` and `axis_size` accessors, together with its [`Display`](std::fmt::Display), [`Operation`],
 /// [`InterpretableOperation`](crate::InterpretableOperation), and
 /// [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementations:
 ///
@@ -539,8 +540,7 @@ use define_linear_collective_operation;
 ///   - `$operation`: Linear collective type for which the rules are generated.
 ///   - `$operation_binding`: Name bound to the operation whose adjoint is being constructed.
 ///   - `$adjoint`: Type of the adjoint collective that the transposition rule stages.
-///   - `$adjoint_body`: Block that evaluates to the adjoint collective, or returns a
-///     [`ProgramError`](crate::ProgramError) early.
+///   - `$adjoint_body`: Block that evaluates to the adjoint collective, or returns a [`ProgramError`] early.
 macro_rules! impl_differentiable_linear_collective_operation {
     // This branch generates the adjoint function together with the JVP and transposition rules of one collective.
     (
@@ -565,7 +565,7 @@ macro_rules! impl_differentiable_linear_collective_operation {
                 _driver: &D,
                 inputs: &[$crate::DifferentiationDual<C::Value>],
             ) -> Result<Vec<$crate::DifferentiationDual<C::Value>>, $crate::DifferentiationError> {
-                use $crate::{Context as _, DifferentiableType as _, Typed as _};
+                use $crate::{DifferentiableType as _, Typed as _};
 
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 let mut primals =
@@ -920,22 +920,59 @@ where
     }
 }
 
-/// Forwards one shape-changing collective while updating its mapped result axis.
-fn forward_shape_changing_collective<C, P>(
+/// Forwards a shape-changing collective over an axis that the active batching level does not bind to the parent
+/// context. An input without a mapped batch axis forwards the collective unchanged. A mapped input instead forwards the
+/// collective that `remap` returns for the input's mapped axis position, because the collective's own axes shift
+/// around the mapped axis, and `remap` also returns the position of the mapped axis in the forwarded result.
+fn forward_shape_changing_collective<C, P, O>(
     context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
-    operation: C::Operation,
-    input: &ArrayBatch<C::Value>,
-    output_batch_axis: Option<usize>,
-) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
+    operation: &O,
+    inputs: &[ArrayBatch<C::Value>],
+    remap: impl FnOnce(usize) -> (O, usize),
+) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
+    C::Operation: From<O>,
     P: ArrayExtentBatchingPolicy<C>,
+    O: Clone,
 {
-    let mut outputs = context.parent().bind(operation, Vec::new(), std::slice::from_ref(input.value()))?;
+    let [input] = inputs else {
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+    };
+    let Some(batch_axis) = input.batch_axis_position() else {
+        return Ok(context.forward_to_parent(C::Operation::from(operation.clone()), inputs)?.into());
+    };
+    let (operation, output_batch_axis) = remap(batch_axis);
+    let mut outputs =
+        context
+            .parent()
+            .bind(C::Operation::from(operation), Vec::new(), std::slice::from_ref(input.value()))?;
     check_count!("output", outputs, 1, ProgramError);
-    let output = outputs.remove(0);
-    let output_batch_axis = output_batch_axis.map_or_else(BatchAxis::replicated, BatchAxis::from_position);
-    Ok(vec![ArrayBatch::new(output, output_batch_axis)?])
+    Ok(vec![ArrayBatch::new(outputs.remove(0), BatchAxis::from_position(output_batch_axis))?].into())
+}
+
+/// Infers the output type of a shape-changing collective for the logical (i.e., unbatched) `input_type` of a level
+/// that binds its axis, and returns that type together with its extents in the batching policy's representation,
+/// which the collective's matching-axis kernel consumes.
+fn collective_output_extents<C, P, O>(
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+    operation: &O,
+    input_type: &ArrayType,
+) -> Result<(ArrayType, Vec<P::ShapeExtent>), BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    P: CollectiveArrayExtentBatchingPolicy<C>,
+    O: Operation<Type = ArrayType>,
+{
+    let mut output_types = operation.infer_output_types(std::slice::from_ref(input_type), &[])?;
+    let output_type = output_types.remove(0);
+    let output_extents = output_type
+        .shape()
+        .dimensions()
+        .iter()
+        .map(|dimension| P::collective_extent_from_dimension(context, dimension))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((output_type, output_extents))
 }
 
 macro_rules! impl_shape_changing_collective_member_operation {

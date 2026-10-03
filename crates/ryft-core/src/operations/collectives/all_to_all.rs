@@ -4,7 +4,6 @@
 
 // TODO(eaplatanios): Review this module.
 
-
 use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension,
@@ -17,9 +16,8 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
-    
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    MemberDifferentiableOperation,
 };
 use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
@@ -34,16 +32,17 @@ use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBro
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::programs::{
-    MemberOperation, Operation, OperationProjection, ProgramError, ProjectedValue,
-    RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    MemberOperation, Operation, OperationProjection, ProgramError, ProjectedValue, RegionInterface, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
 use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,
-    collective_input_extents, divided_collective_extent, explicit_collective_inputs, forward_explicit_collective,
-    forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
+    collective_input_extents, collective_output_extents, define_linear_collective_operation, divided_collective_extent,
+    explicit_collective_inputs, forward_explicit_collective, forward_shape_changing_collective,
+    impl_differentiable_linear_collective_operation, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, jvp_shape_changing_collective_with_adjoint,
-    define_linear_collective_operation, impl_differentiable_linear_collective_operation, linear_collective_output_type, multiplied_collective_extent, require_collective_axis_divisible,
+    linear_collective_output_type, multiplied_collective_extent, require_collective_axis_divisible,
     require_collective_axis_extent, resolve_named_axis_size, validate_explicit_collective_output_extents,
 };
 
@@ -317,36 +316,19 @@ where
             });
         }
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            let [input] = inputs else {
-                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-            };
-            let Some(batch_axis) = input.batch_axis_position() else {
-                return Ok(context.forward_to_parent(C::Operation::from(self.clone()), inputs)?.into());
-            };
-            let (split_axis, concat_axis, output_batch_axis) =
-                forwarded_all_to_all_axes(self.options.mode, self.split_axis, self.concat_axis, batch_axis);
-            let operation =
-                Self::new(self.axis_name.clone(), self.axis_size, split_axis, concat_axis, self.options.clone());
-            return Ok(forward_shape_changing_collective(
-                context,
-                C::Operation::from(operation),
-                input,
-                Some(output_batch_axis),
-            )?
-            .into());
+            return forward_shape_changing_collective(context, self, inputs, |batch_axis| {
+                let (split_axis, concat_axis, output_batch_axis) =
+                    forwarded_all_to_all_axes(self.options.mode, self.split_axis, self.concat_axis, batch_axis);
+                let operation =
+                    Self::new(self.axis_name.clone(), self.axis_size, split_axis, concat_axis, self.options.clone());
+                (operation, output_batch_axis)
+            });
         }
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
         let input_type = input.unbatched_type();
-        let mut output_types = self.infer_output_types(std::slice::from_ref(&input_type), &[])?;
-        let output_type = output_types.remove(0);
-        let output_extents = output_type
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|dimension| P::collective_extent_from_dimension(context, dimension))
-            .collect::<Result<Vec<_>, _>>()?;
+        let (output_type, output_extents) = collective_output_extents(context, self, &input_type)?;
         Ok(vec![batch_all_to_all_matching_axis::<C, P>(
             self,
             context,
@@ -494,12 +476,7 @@ where
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        jvp_shape_changing_collective_with_adjoint(
-            self,
-            self.adjoint()?,
-            context,
-            inputs,
-        )
+        jvp_shape_changing_collective_with_adjoint(self, self.adjoint()?, context, inputs)
     }
 }
 

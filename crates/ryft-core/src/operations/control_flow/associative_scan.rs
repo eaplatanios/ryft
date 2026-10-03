@@ -89,14 +89,14 @@ use crate::programs::{ProgramError, ProvenanceScope, TypeError, Typed, Value};
 /// the data type of any array cannot represent the zero that the interleaving pads with (e.g.,
 /// [`DataType::F8E8M0FNU`]), or if staging any of the primitives of the construction (including those that `combine`
 /// stages) fails.
-pub fn associative_scan<V: Value<Type = ArrayType>, Values: Parameterized<V>, A: Into<Axis>, F>(
+pub fn associative_scan<V, Values: Parameterized<V>, A: Into<Axis>, F>(
     values: &Values,
     axis: A,
     reverse: bool,
     combine: &F,
 ) -> Result<Values, ProgramError>
 where
-    V: Add + Concatenate + Or + Pad + Slice,
+    V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
     V::DispatchDomain: Context + Zero<V>,
     F: Fn(&Values, &Values) -> Result<Values, ProgramError>,
 {
@@ -164,7 +164,7 @@ where
 
 /// Recursive half of [`associative_scan`], operating on the flat arrays of the scanned structure, whose (static) extent
 /// along `axis` is `extent`.
-fn associative_scan_recursively<V: Value<Type = ArrayType>, F>(
+fn associative_scan_recursively<V, F>(
     values: &[V],
     extent: usize,
     axis: usize,
@@ -172,7 +172,7 @@ fn associative_scan_recursively<V: Value<Type = ArrayType>, F>(
     combine: &F,
 ) -> Result<Vec<V>, ProgramError>
 where
-    V: Add + Concatenate + Or + Pad + Slice,
+    V: Value<Type = ArrayType> + Add + Concatenate + Or + Pad + Slice,
     V::DispatchDomain: Zero<V>,
     F: Fn(&[V], &[V]) -> Result<Vec<V>, ProgramError>,
 {
@@ -248,7 +248,7 @@ where
 
     // The aligned results lead exactly when they include the start of the axis, which happens only for a reverse scan
     // over an even extent.
-    match reverse && extent % 2 == 0 {
+    match reverse && extent.is_multiple_of(2) {
         true => scan_interleave(&aligned, &complement, axis, half, extent - half),
         false => scan_interleave(&complement, &aligned, axis, extent - half, half),
     }
@@ -340,9 +340,24 @@ mod tests {
             ArrayType::new_static(DataType::F64, [3]),
         )
         .unwrap();
-        assert_eq!(program.to_string(), indoc! {"
-            FORWARD"
-        });
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[1] = slice [start_indices=[0], limits=[2], strides=[2]] %0
+                    %2:f64[1] = slice [start_indices=[1], limits=[3], strides=[2]] %0
+                    %3:f64[1] = add %1 %2
+                    %4:f64[1] = slice [start_indices=[0], limits=[1]] %0
+                    %5:f64[1] = slice [start_indices=[2], limits=[3], strides=[2]] %0
+                    %6:f64[1] = add %3 %5
+                    %7:f64[2] = concatenate [axis=0] %4 %6
+                    %8:f64[] = zero [type=f64[]]
+                    %9:f64[3] = pad [edge_padding_low=[0], edge_padding_high=[0], interior_padding=[1]] %7 %8
+                    %10:f64[3] = pad [edge_padding_low=[1], edge_padding_high=[1], interior_padding=[1]] %3 %8
+                    %11:f64[3] = add %9 %10
+                in (%11)"
+            },
+        );
 
         // A reverse scan mirrors that recursion: it pairs from the end of the axis, combines the scanned pairs with
         // the elements at the remaining positions (passing the accumulated suffix first), and appends the last element.
@@ -351,9 +366,24 @@ mod tests {
             ArrayType::new_static(DataType::F64, [3]),
         )
         .unwrap();
-        assert_eq!(program.to_string(), indoc! {"
-            REVERSE"
-        });
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3] .
+                let %1:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %0
+                    %2:f64[1] = slice [start_indices=[2], limits=[3], strides=[2]] %0
+                    %3:f64[1] = add %2 %1
+                    %4:f64[1] = slice [start_indices=[2], limits=[3]] %0
+                    %5:f64[1] = slice [start_indices=[0], limits=[2], strides=[2]] %0
+                    %6:f64[1] = add %3 %5
+                    %7:f64[2] = concatenate [axis=0] %6 %4
+                    %8:f64[] = zero [type=f64[]]
+                    %9:f64[3] = pad [edge_padding_low=[0], edge_padding_high=[0], interior_padding=[1]] %7 %8
+                    %10:f64[3] = pad [edge_padding_low=[1], edge_padding_high=[1], interior_padding=[1]] %3 %8
+                    %11:f64[3] = add %9 %10
+                in (%11)"
+            },
+        );
 
         // The construction slices at staging-time positions, so it needs an in-bounds axis.
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
@@ -448,10 +478,8 @@ mod tests {
         // Only the scanned axis needs a static extent: every other axis is sliced whole, so a dynamic one keeps its
         // dynamic extent through the construction.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let input_type = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]),
-        );
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2)]));
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |input| associative_scan(&input, 1, false, &|left, right| left.add(right)),
             input_type.clone(),
@@ -528,11 +556,7 @@ mod tests {
             for reverse in [false, true] {
                 let sums = (0..extent)
                     .map(|index| {
-                        if reverse {
-                            values[index..].iter().sum::<f64>()
-                        } else {
-                            values[..=index].iter().sum::<f64>()
-                        }
+                        if reverse { values[index..].iter().sum::<f64>() } else { values[..=index].iter().sum::<f64>() }
                     })
                     .collect::<Vec<_>>();
                 let first_value = if reverse { values.last() } else { values.first() };
@@ -616,9 +640,20 @@ mod tests {
             .unwrap();
         assert!(evaluation.outputs()[0].is_known());
         assert!(evaluation.outputs()[1].is_unknown());
-        assert_eq!(evaluation.program().to_string(), indoc! {"
-            RESIDUAL"
-        });
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:f64[] .
+                let %2:f64[1] = slice [start_indices=[0], limits=[1]] %0
+                    %3:f64[2] = pad [edge_padding_low=[0], edge_padding_high=[1], interior_padding=[1]] %2 %1
+                    %4:f64[1] = slice [start_indices=[0], limits=[1], strides=[2]] %0
+                    %5:f64[1] = slice [start_indices=[1], limits=[2], strides=[2]] %0
+                    %6:f64[1] = add %4 %5
+                    %7:f64[2] = pad [edge_padding_low=[1], edge_padding_high=[0], interior_padding=[1]] %6 %1
+                    %8:f64[2] = add %3 %7
+                in (%8)"
+            },
+        );
         assert_eq!(
             evaluation.interpret(&EagerContext::<Array, ArrayOperation<Array>>::new(), &[unknown]),
             Ok(vec![Array::vector(vec![1.0, 3.0]).unwrap(), Array::vector(vec![3.0, 7.0]).unwrap()]),
@@ -658,21 +693,16 @@ mod tests {
         // partial products with one factor replaced by its tangent.
         let input = Array::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let tangent = Array::vector(vec![1.0; 4]).unwrap();
-        assert_eq!(
-            differentiate_at(input.clone())
-                .jvp(tangent.clone(), |input| associative_scan(&input, 0, false, &|left, right| left.mul(right))),
-            Ok((
-                Array::vector(vec![1.0, 2.0, 6.0, 24.0]).unwrap(),
-                Array::vector(vec![1.0, 3.0, 11.0, 50.0]).unwrap(),
-            )),
-        );
-        assert_eq!(
-            differentiate_at(input).jvp(tangent, |input| associative_scan(&input, 0, true, &|left, right| left.mul(right))),
-            Ok((
-                Array::vector(vec![24.0, 24.0, 12.0, 4.0]).unwrap(),
-                Array::vector(vec![50.0, 26.0, 7.0, 1.0]).unwrap(),
-            )),
-        );
+        let (primal_output, tangent_output) = differentiate_at(input.clone())
+            .jvp(tangent.clone(), |input| associative_scan(&input, 0, false, &|left, right| left.mul(right)))
+            .unwrap();
+        assert_eq!(primal_output, Array::vector(vec![1.0, 2.0, 6.0, 24.0]).unwrap());
+        assert_eq!(tangent_output, Array::vector(vec![1.0, 3.0, 11.0, 50.0]).unwrap());
+        let (primal_output, tangent_output) = differentiate_at(input)
+            .jvp(tangent, |input| associative_scan(&input, 0, true, &|left, right| left.mul(right)))
+            .unwrap();
+        assert_eq!(primal_output, Array::vector(vec![24.0, 24.0, 12.0, 4.0]).unwrap());
+        assert_eq!(tangent_output, Array::vector(vec![50.0, 26.0, 7.0, 1.0]).unwrap());
     }
 
     #[test]

@@ -1,4 +1,3 @@
-
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayOperation,
     ArrayType, RaggedAxis,
@@ -6,29 +5,25 @@ use crate::arrays::{
 use crate::axes::NamedAxes;
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{
-    
-};
-use crate::interpretation::{InterpretableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
-use crate::programs::{
-    ProgramError, ProjectedValue, TypeError, Value,
-    ValueProjection,
-};
+use crate::programs::{ProgramError, ProjectedValue, TypeError, Value, ValueProjection};
 
 // TODO(eaplatanios): Review from here onwards.
 
-use super::{define_linear_collective_operation, impl_differentiable_linear_collective_operation, linear_collective_output_type, resolve_named_axis_size};
+use super::{
+    define_linear_collective_operation, impl_differentiable_linear_collective_operation, linear_collective_output_type,
+    resolve_named_axis_size,
+};
 
 /// Canonical operation name for [`ParallelPermuteOperation`].
 pub const PARALLEL_PERMUTE_OPERATION_NAME: &str = "parallel_permute";
 
 define_linear_collective_operation!(
-    /// [`Operation`] that sends every participant's input to another participant along the named axis according to
+    /// [`Operation`](crate::Operation) that sends every participant's input to another participant along the named axis according to
     /// explicit `(source, target)` pairs — the analogue of
     /// [JAX's `ppermute`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ppermute.html) and
     /// [StableHLO's `collective_permute`](https://openxla.org/stablehlo/spec#collective_permute). Participants that
@@ -328,7 +323,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, ProjectedContext};
     use crate::operations::collectives::tests::f32_vector;
-    use crate::programs::EmptyRegionDriver;
+    use crate::programs::{EmptyRegionDriver, Typed};
 
     use super::*;
 

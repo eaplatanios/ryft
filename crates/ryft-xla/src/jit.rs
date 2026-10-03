@@ -7522,7 +7522,7 @@ mod tests {
         // greedy and sampled sequences differ, demonstrating that the categorical draws actually steer decoding.
         let expected_tokens: &[i32] = match sampling {
             DecodeSampling::Greedy => &[12, 8, 12, 8, 12, 8],
-            DecodeSampling::TopK => &[10, 15, 10, 10, 15, 15],
+            DecodeSampling::TopK => &[13, 12, 10, 10, 2, 15],
         };
         assert_eq!(device_tokens, expected_tokens);
         for (state_index, device_cache) in [(2, &device_cache_keys), (3, &device_cache_values)] {
