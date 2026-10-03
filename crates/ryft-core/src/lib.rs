@@ -41,7 +41,7 @@ pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, Axis
 pub use batching::{
     Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedOutputs, BatchedProgram,
     BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingLevel, BatchingLevelExtent,
-    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram,
+    BatchingPolicy, BatchingPolicyProjection, BatchingTracer, BoundaryPreservingBatchedProgram, DiagonalBatchingPolicy,
     InterpretableBatchableOperation, MemberBatchableOperation, ProgramBatchingOutputAxesPolicy,
     RecursiveBatchingPolicy, batch, batch_projected_operation,
 };
@@ -92,9 +92,10 @@ pub use operations::{
     ASSERT_OPERATION_NAME, ATAN2_OPERATION_NAME, Abs, AbsOperation, Accuracy, Add, AddOperation, And, AndOperation,
     ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation, ArithmeticDimensionOperation, Assert, AssertOperation,
     AssertionError, AssertionFailure, AssertionValue, Atan2, Atan2Operation, BROADCAST_OPERATION_NAME, BasicIndex,
-    BlockQuantize, Broadcast, BroadcastOperation, CEIL_OPERATION_NAME, CLAMP_OPERATION_NAME, COMPARE_OPERATION_NAME,
-    CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME, CONSTANT_OPERATION_NAME, CONSTRAIN_SHARDING_OPERATION_NAME,
-    CONVERT_ELEMENT_TYPE_OPERATION_NAME, COS_OPERATION_NAME, CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME,
+    BatchingRuleConsistencyError, BlockQuantize, Broadcast, BroadcastOperation, CEIL_OPERATION_NAME,
+    CLAMP_OPERATION_NAME, COMPARE_OPERATION_NAME, CONCATENATE_OPERATION_NAME, CONDITION_OPERATION_NAME,
+    CONSTANT_OPERATION_NAME, CONSTRAIN_SHARDING_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME,
+    COS_OPERATION_NAME, CUMULATIVE_OPERATION_NAME, CUSTOM_FUNCTION_OPERATION_NAME,
     CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, Ceil, CeilOperation, Clamp, ClampOperation, Compare, CompareOperation,
     ComparisonDirection, Concatenate, ConcatenateOperation, ConditionOperation, Constant, ConstantOperation,
     ConstrainSharding, ConstrainShardingOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation,
@@ -148,10 +149,10 @@ pub use operations::{
     TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, Tag, TagOperation, Tanh, TanhOperation, Tolerance,
     TopK, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME,
     UnavailableCustomRules, UpdateSlice, UpdateSliceOperation, WHILE_OPERATION_NAME, WeakCustomRuleRegistration,
-    WhileOperation, WhilePredicate, WhileTypeSemantics, WithAccumulatingVjp, WithBatching, WithJvp,
-    WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, XOR_OPERATION_NAME, Xor, XorOperation, ZERO_LIKE_OPERATION_NAME,
-    ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan, custom_function,
-    transpose_primal_condition, transpose_primal_scan,
+    WhileOperation, WhilePredicate, WhileTypeSemantics, WithAccumulatingVjp, WithAxisDependentBatching, WithBatching,
+    WithJvp, WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, XOR_OPERATION_NAME, Xor, XorOperation,
+    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, associative_scan,
+    check_batching_rule_consistency, custom_function, transpose_primal_condition, transpose_primal_scan,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

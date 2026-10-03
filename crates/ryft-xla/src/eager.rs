@@ -2498,6 +2498,52 @@ mod tests {
         assert!(close(&value, &doubled(&sine)) && close(&derivative, &doubled(&cosine)));
     }
 
+    /// A custom function whose batching rule depends on its input batch axes (`2xy` when both inputs are mapped and
+    /// `3xy` otherwise) and is configured as axis-dependent batches its derivative in eager XLA with the exact per-item
+    /// tangents `3(ẋy + xẏ)` when `y` is replicated but its tangent is mapped, which requires taking a diagonal on
+    /// device.
+    #[test]
+    fn test_eager_custom_function_with_axis_dependent_batching_rule() {
+        use ryft_core::{BatchingLevelExtent, DomainTracer, custom_function};
+
+        use crate::XlaDomain;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let mesh = cpu_mesh(&client);
+
+        type Tracer<'c> = DomainTracer<ProjectedContext<XlaDomain<'c>, ArrayType>>;
+        let function = custom_function(|(x, y): (Tracer<'_>, Tracer<'_>)| Ok(x * y)).with_axis_dependent_batching(
+            |_: BatchingLevelExtent<Tracer<'_>>,
+             (x, y): (Tracer<'_>, Tracer<'_>),
+             (x_axis, y_axis): (BatchAxis, BatchAxis)| {
+                let product = x * y;
+                let scaled = match x_axis.is_replicated() || y_axis.is_replicated() {
+                    true => product.clone() + product.clone() + product,
+                    false => product.clone() + product,
+                };
+                Ok((scaled, if x_axis.is_replicated() { y_axis } else { x_axis }))
+            },
+        );
+        let (value, derivative): (Array<'_>, Array<'_>) = batch(
+            |((x, y), (x_tangent, y_tangent))| {
+                Ok(differentiate_at((x, y)).jvp((x_tangent, y_tangent), |inputs| function.call(inputs))?)
+            },
+            (
+                (f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]), f32_scalar(&client, &mesh, 4.0)),
+                (f32_vector(&client, &mesh, &[1.0, 0.5, 0.25]), f32_vector(&client, &mesh, &[2.0, 3.0, 4.0])),
+            ),
+            ((BatchAxis::new(0), BatchAxis::replicated()), (BatchAxis::new(0), BatchAxis::new(0))),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_f32s(&value), vec![12.0, 24.0, 36.0]);
+        assert_eq!(read_f32s(&derivative), vec![18.0, 24.0, 39.0]);
+    }
+
     /// Sorting, top-k, argmax, and argmin agree between the XLA-backed eager array backend and the reference array
     /// backend under both sort orderings, including stable-tie routing (equal keys keep their original order, so
     /// ranking ties select the lowest index), signed zeros, and NaNs of either sign.
@@ -3318,6 +3364,48 @@ mod tests {
 
         let selected = Array::select(&less_than, &a, &b).unwrap();
         assert_eq!(read_f32s(&selected), vec![1.0, 2.0, 3.0, 8.0]);
+    }
+
+    #[test]
+    fn test_eager_select_signed_one_bit_promotion() {
+        let client = execution_client();
+        let mesh = cpu_mesh(&client);
+        let condition = boolean_vector(&client, &mesh, &[true, false, true, false]);
+        let signed =
+            Array::from_host_buffer(&client, replicated_type(&mesh, DataType::I1, &[4]), mesh.clone(), &[1, 1, 0, 0])
+                .unwrap();
+        let wide = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I32, &[4]),
+            mesh.clone(),
+            &values_to_bytes(&[2i32, 3, 4, 5]),
+        )
+        .unwrap();
+        let reference_condition = CpuArray::vector(vec![true, false, true, false]).unwrap();
+        let reference_signed =
+            CpuArray::from_logical_bytes(ArrayType::new_static(DataType::I1, [4]), &[1, 1, 0, 0]).unwrap();
+        let reference_wide = CpuArray::vector(vec![2i32, 3, 4, 5]).unwrap();
+
+        // A set I1 bit represents -1, even when selection promotes it to a wider branch type. Exercise both
+        // branch positions so that recovering the sign cannot accidentally depend on the selected side.
+        let selected_signed = read_i32s(&Array::select(&condition, &signed, &wide).unwrap());
+        assert_eq!(
+            selected_signed,
+            CpuArray::select(&reference_condition, &reference_signed, &reference_wide)
+                .unwrap()
+                .elements::<i32>()
+                .unwrap(),
+        );
+        assert_eq!(selected_signed, vec![-1, 3, 0, 5]);
+        let selected_wide = read_i32s(&Array::select(&condition, &wide, &signed).unwrap());
+        assert_eq!(
+            selected_wide,
+            CpuArray::select(&reference_condition, &reference_wide, &reference_signed)
+                .unwrap()
+                .elements::<i32>()
+                .unwrap(),
+        );
+        assert_eq!(selected_wide, vec![2, -1, 4, 0]);
     }
 
     #[test]

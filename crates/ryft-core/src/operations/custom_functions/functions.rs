@@ -13,8 +13,13 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+use thiserror::Error;
+
 use crate::axes::{NamedAxes, NamedAxis};
-use crate::batching::{BatchAxis, BatchableType, BatchingLevelExtent, RecursiveBatchingPolicy};
+use crate::batching::{
+    Batch, BatchAxis, BatchAxisSpecification, BatchableType, BatchingError, BatchingLevel, BatchingLevelExtent,
+    BatchingPolicy, BatchingTracer, DiagonalBatchingPolicy, RecursiveBatchingPolicy, batch,
+};
 use crate::contexts::{Context, EagerContext};
 use crate::differentiation::{
     CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationError,
@@ -38,6 +43,26 @@ use crate::programs::{
     ReferenceTransform, Type, TypeError, Typed, Value,
 };
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
+
+/// Error returned by [`check_batching_rule_consistency`].
+#[derive(Error, Clone, Debug, PartialEq)]
+pub enum BatchingRuleConsistencyError {
+    /// Broadcasting a replicated input changes a batched output, so the batching rule behind the function depends on
+    /// its input batch axes beyond computing the batched function (refer to
+    /// [`CustomFunction::with_axis_dependent_batching`]).
+    #[error("broadcasting the replicated input leaf {input} changes the batched output leaf {output}")]
+    Inconsistent {
+        /// Index of the replicated input leaf whose broadcast changes the batched outputs.
+        input: usize,
+
+        /// Index of the first batched output leaf that changes.
+        output: usize,
+    },
+
+    /// Batching the function failed.
+    #[error(transparent)]
+    Batching(#[from] BatchingError),
+}
 
 /// Forward-mode configuration of a [`CustomFunction`] without a configured forward-mode rule. A function without
 /// reverse-mode rules then derives its forward-mode rule from its primal (as [`JvpFromPrimal`] does), while a function
@@ -613,8 +638,20 @@ pub struct WithBatching<Tracer, Rule> {
     marker: PhantomData<fn() -> Tracer>,
 }
 
-/// Batching configuration of a [`CustomFunction`] (i.e., [`DefaultBatching`] or [`WithBatching`]), which installs its
-/// custom batching rule, if any, in the retained definition that a call registers for the operation family `(V, O)`.
+/// Batching configuration of a [`CustomFunction`] with a user-supplied custom batching rule closure implementing
+/// `(extent, x, x_axes) ↦ (y, y_axes)` whose result may depend on its input batch axes (refer to
+/// [`CustomFunction::with_axis_dependent_batching`]).
+pub struct WithAxisDependentBatching<Tracer, Rule> {
+    /// Closure computing the batched outputs and their batch axes from the batched inputs and their batch axes.
+    rule: Arc<Rule>,
+
+    /// Phantom marker pinning the tracer type of the closure's leaves, which is also the type of dynamic extents.
+    marker: PhantomData<fn() -> Tracer>,
+}
+
+/// Batching configuration of a [`CustomFunction`] (i.e., [`DefaultBatching`], [`WithBatching`], or
+/// [`WithAxisDependentBatching`]), which installs its custom batching rule, if any, in the retained definition that a
+/// call registers for the operation family `(V, O)`.
 pub trait CustomFunctionBatching<V: Value, O: Operation<Type = V::Type>, Input, Output>
 where
     Input: Parameterized<CustomRuleTracer<V, O>>,
@@ -689,46 +726,150 @@ where
         input_structure: &Input::ParameterStructure,
         output_structure: &Output::ParameterStructure,
     ) -> CustomRuleDefinition<V, O> {
-        let (rule, name) = (self.rule.clone(), name.clone());
-        let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
-        definition.with_batching_rule(move |level, boundary_inputs, inputs, input_axes| {
-            // A dynamic extent reaches the rule as the level's only boundary input. The inputs of a call that was
-            // batched at earlier levels start with those levels' boundary inputs, which the rule does not receive.
-            let extent = match (level.extent(), boundary_inputs) {
-                (BatchingLevelExtent::Static(extent), _) => BatchingLevelExtent::Static(*extent),
-                (BatchingLevelExtent::Dynamic(_), [extent]) => BatchingLevelExtent::Dynamic(extent.clone()),
-                (BatchingLevelExtent::Dynamic(_), _) => {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "`{name}` batching rule requires a dynamic batch extent to be the only boundary input of \
+        definition.with_batching_rule(retained_custom_batching_rule::<V, O, Input, Output, Rule>(
+            self.rule.clone(),
+            name,
+            input_structure,
+            output_structure,
+        ))
+    }
+}
+
+impl<V, O, Input, Output, Rule> CustomFunctionBatching<V, O, Input, Output>
+    for WithAxisDependentBatching<CustomRuleTracer<V, O>, Rule>
+where
+    V: 'static
+        + Value<
+            Type: DifferentiableType + BatchableType<Policy: DiagonalBatchingPolicy<TracingContext<V, O>>> + Eq + Hash,
+        >,
+    O: 'static
+        + Operation<Type = V::Type>
+        + PartiallyEvaluatableOperation<TracingContext<V, O>>
+        + DifferentiableOperation<TracingContext<V, O>>
+        + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
+        + ResidualZeroProvider<V::Type, Operation = O>
+        + From<AddOperation<V::Type>>,
+    Input: 'static
+        + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
+    Output: 'static
+        + Parameterized<
+            CustomRuleTracer<V, O>,
+            Family: ParameterizedFamily<BatchAxis>,
+            ParameterStructure: Debug + PartialEq + Send + Sync,
+        >,
+    Rule: 'static
+        + Fn(
+            BatchingLevelExtent<CustomRuleTracer<V, O>>,
+            Input,
+            Input::To<BatchAxis>,
+        ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
+        + Send
+        + Sync,
+{
+    fn configure(
+        &self,
+        definition: CustomRuleDefinition<V, O>,
+        name: &Cow<'static, str>,
+        input_structure: &Input::ParameterStructure,
+        output_structure: &Output::ParameterStructure,
+    ) -> CustomRuleDefinition<V, O> {
+        definition.with_axis_dependent_batching_rule(retained_custom_batching_rule::<V, O, Input, Output, Rule>(
+            self.rule.clone(),
+            name,
+            input_structure,
+            output_structure,
+        ))
+    }
+}
+
+/// Adapts the structured custom batching rule closure `rule` of a [`CustomFunction`] to the flat interface of retained
+/// batching rules: each invocation passes the closure the level's extent, the call's own batched inputs with the
+/// call's input structure, and their batch axes, and validates that its outputs and their batch axes have the call's
+/// output structure.
+///
+/// # Parameters
+///
+///   - `rule`: Closure implementing `(extent, x, x_axes) ↦ (y, y_axes)`.
+///   - `name`: Name of the function, used in diagnostics.
+///   - `input_structure`: Structure of the call's inputs.
+///   - `output_structure`: Structure of the call's outputs.
+fn retained_custom_batching_rule<V, O, Input, Output, Rule>(
+    rule: Arc<Rule>,
+    name: &Cow<'static, str>,
+    input_structure: &Input::ParameterStructure,
+    output_structure: &Output::ParameterStructure,
+) -> impl 'static
++ Fn(
+    &BatchingLevel<V::Type>,
+    &[CustomRuleTracer<V, O>],
+    &[CustomRuleTracer<V, O>],
+    &[BatchAxis],
+) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<BatchAxis>), ProgramError>
++ Send
++ Sync
+where
+    V: 'static + Value,
+    O: 'static + Operation<Type = V::Type>,
+    Input: 'static
+        + Parameterized<CustomRuleTracer<V, O>, Family: ParameterizedFamily<BatchAxis>, ParameterStructure: Send + Sync>,
+    Output: 'static
+        + Parameterized<
+            CustomRuleTracer<V, O>,
+            Family: ParameterizedFamily<BatchAxis>,
+            ParameterStructure: Debug + PartialEq + Send + Sync,
+        >,
+    Rule: 'static
+        + Fn(
+            BatchingLevelExtent<CustomRuleTracer<V, O>>,
+            Input,
+            Input::To<BatchAxis>,
+        ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
+        + Send
+        + Sync,
+{
+    let name = name.clone();
+    let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
+    move |level: &BatchingLevel<V::Type>,
+          boundary_inputs: &[CustomRuleTracer<V, O>],
+          inputs: &[CustomRuleTracer<V, O>],
+          input_axes: &[BatchAxis]| {
+        // A dynamic extent reaches the rule as the level's only boundary input. The inputs of a call that was
+        // batched at earlier levels start with those levels' boundary inputs, which the rule does not receive.
+        let extent = match (level.extent(), boundary_inputs) {
+            (BatchingLevelExtent::Static(extent), _) => BatchingLevelExtent::Static(*extent),
+            (BatchingLevelExtent::Dynamic(_), [extent]) => BatchingLevelExtent::Dynamic(extent.clone()),
+            (BatchingLevelExtent::Dynamic(_), _) => {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "`{name}` batching rule requires a dynamic batch extent to be the only boundary input of \
                              its batching level, but the level has {} boundary inputs",
-                            boundary_inputs.len(),
-                        ),
-                    });
-                }
-            };
-            let leading_input_count = inputs.len().checked_sub(input_structure.parameter_count()).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("`{name}` batching rule received too few inputs"))
-            })?;
-            let (outputs, output_axes) = rule(
-                extent,
-                Input::from_parameters(input_structure.clone(), inputs[leading_input_count..].iter().cloned())?,
-                Input::To::<BatchAxis>::from_parameters(
-                    input_structure.clone(),
-                    input_axes[leading_input_count..].iter().copied(),
-                )?,
-            )?;
-            for structure in [outputs.parameter_structure(), output_axes.parameter_structure()] {
-                if structure != output_structure {
-                    return Err(ParameterError::MismatchedParameterStructures {
-                        left_structure: format!("{output_structure:?}"),
-                        right_structure: format!("{structure:?}"),
-                    }
-                    .into());
-                }
+                        boundary_inputs.len(),
+                    ),
+                });
             }
-            Ok((outputs.into_parameters().collect(), output_axes.into_parameters().collect()))
-        })
+        };
+        let leading_input_count = inputs
+            .len()
+            .checked_sub(input_structure.parameter_count())
+            .ok_or_else(|| ProgramError::MalformedProgram(format!("`{name}` batching rule received too few inputs")))?;
+        let (outputs, output_axes) = rule(
+            extent,
+            Input::from_parameters(input_structure.clone(), inputs[leading_input_count..].iter().cloned())?,
+            Input::To::<BatchAxis>::from_parameters(
+                input_structure.clone(),
+                input_axes[leading_input_count..].iter().copied(),
+            )?,
+        )?;
+        for structure in [outputs.parameter_structure(), output_axes.parameter_structure()] {
+            if structure != output_structure {
+                return Err(ParameterError::MismatchedParameterStructures {
+                    left_structure: format!("{output_structure:?}"),
+                    right_structure: format!("{structure:?}"),
+                }
+                .into());
+            }
+        }
+        Ok((outputs.into_parameters().collect(), output_axes.into_parameters().collect()))
     }
 }
 
@@ -1746,17 +1887,19 @@ impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp,
     ///     tangent to its primal (broadcasting or moving it), so the batched derivative has the batch axes of the
     ///     batched call. A replicated primal whose tangent is mapped is the exception: the rule cannot perturb a shared
     ///     input differently for each batch item, so the tangents come from a second application of the rule with that
-    ///     primal broadcast. When another input is mapped, this deliberately differs from JAX, which applies the rule
-    ///     with the primal-side axes and batches such tangents separately, which yields the outer product of the two
-    ///     batches, of which only the diagonal holds the per-item tangents. A rule whose result depends on its input
-    ///     axes therefore gets tangents from the broadcast application, whereas JAX's diagonal reflects the primal-side
-    ///     axes. When every primal is replicated (e.g., in a forward-mode Jacobian), it applies the rule with every
-    ///     input replicated and batches the rule's derivative structurally, so the rule must also accept calls without
-    ///     mapped inputs. Linearization computes the outputs with the call itself and recomputes the primal inside the
-    ///     staged pushforward, because the call is opaque to partial evaluation, which is only valid for a primal
-    ///     without effects: a primal with effects (e.g., one that updates or reads references) is linearized inline, so
-    ///     that its effects run once, and batching that linearization's pushforward batches it structurally. Reverse
-    ///     mode inlines the derivative of the primal instead, because derived calls are not transposable.
+    ///     primal broadcast. That gives the per-item derivatives of the batched primal for every rule that only
+    ///     computes the batched primal for the batch axes that it receives, because such a rule computes the same
+    ///     values whether the primal is broadcast or not. A rule whose result depends on its input axes beyond that
+    ///     should use [`Self::with_axis_dependent_batching`] instead, which recovers the exact per-item tangents of
+    ///     such inputs from the outer product of their tangents' batch with the rule's batch (i.e., the diagonal of the
+    ///     outer product that JAX returns for them when another input is mapped). When every primal is replicated
+    ///     (e.g., in a forward-mode Jacobian), it applies the rule with every input replicated and batches the rule's
+    ///     derivative structurally, so the rule must also accept calls without mapped inputs. Linearization computes
+    ///     the outputs with the call itself and recomputes the primal inside the staged pushforward, because the call
+    ///     is opaque to partial evaluation, which is only valid for a primal without effects: a primal with effects
+    ///     (e.g., one that updates or reads references) is linearized inline, so that its effects run once, and
+    ///     batching that linearization's pushforward batches it structurally. Reverse mode inlines the derivative of
+    ///     the primal instead, because derived calls are not transposable.
     ///   - **Explicit** (i.e., [`Self::with_jvp`] or reverse-mode rules): differentiating a batched call traces the
     ///     derivative rules at the unbatched types and batches them structurally, aligned to the batch axes that the
     ///     rule declared, and batching a derivative batches the explicit rule structurally, which is JAX's
@@ -1782,6 +1925,45 @@ impl<Input, Output, Primal, Jvp, Vjp> CustomFunction<Input, Output, Primal, Jvp,
     {
         let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
         let batching = WithBatching { rule: Arc::new(rule), marker: PhantomData };
+        Self::with_configuration(primal, jvp, vjp, batching, non_differentiated_count, name)
+    }
+
+    /// Returns this function with the provided custom batching rule `(extent, x, x_axes) ↦ (y, y_axes)`, which is used
+    /// as the rule of [`Self::with_batching`] except that its result may depend on its input batch axes beyond
+    /// computing the batched primal for them (e.g., a rule that applies a different approximation when an input is
+    /// replicated, so that it does not compute the same values when that input is broadcast instead). This only
+    /// changes how derivatives derived from the primal are batched (refer to the derivatives section of
+    /// [`Self::with_batching`]): when a replicated primal has a mapped tangent while another input is mapped, the
+    /// rule is still applied once, at the primal inputs' own batch axes, and the per-item tangents of such inputs are
+    /// recovered exactly from the outer product of their batch of tangents with the batch of the rule, instead of from
+    /// a second application of the rule with that primal broadcast. The tangents are then exactly the per-item
+    /// derivatives of the batched primal, which is also the diagonal of the outer product that JAX's `custom_vmap`
+    /// returns for such inputs.
+    ///
+    /// The outer product costs one application of the rule's derivative with respect to those inputs per batch item,
+    /// which is why a rule that only computes the batched primal (and therefore gives the same values when an input is
+    /// broadcast) should use [`Self::with_batching`] instead. The family's batching policy must support taking
+    /// diagonals (refer to [`DiagonalBatchingPolicy`]).
+    #[inline]
+    pub fn with_axis_dependent_batching<Tracer, Rule>(
+        self,
+        rule: Rule,
+    ) -> CustomFunction<Input, Output, Primal, Jvp, Vjp, WithAxisDependentBatching<Tracer, Rule>>
+    where
+        Tracer: Parameter,
+        Input: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+        Output: Parameterized<Tracer, Family: ParameterizedFamily<BatchAxis>>,
+        Rule: 'static
+            + Fn(
+                BatchingLevelExtent<Tracer>,
+                Input,
+                Input::To<BatchAxis>,
+            ) -> Result<(Output, Output::To<BatchAxis>), ProgramError>
+            + Send
+            + Sync,
+    {
+        let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        let batching = WithAxisDependentBatching { rule: Arc::new(rule), marker: PhantomData };
         Self::with_configuration(primal, jvp, vjp, batching, non_differentiated_count, name)
     }
 }
@@ -2049,6 +2231,92 @@ pub fn custom_function<Input, Output, Primal: Fn(Input) -> Result<Output, Progra
         registrations: CustomFunctionRegistrations::default(),
         marker: PhantomData,
     }
+}
+
+/// Checks on sample values whether the batching rule behind `function` depends on its input batch axes beyond computing
+/// the batched function, which is what decides between [`CustomFunction::with_batching`] and
+/// [`CustomFunction::with_axis_dependent_batching`] (the former is exact only for rules that do not). The function is
+/// batched once at `input_batch_axes`, and then once for each replicated input leaf with that leaf broadcast along the
+/// batch instead. Every batched output is mapped at axis `0`, and the outputs of each broadcast batch are compared with
+/// those of the first batch by `equivalent` (e.g., exact equality, or equality within a numerical tolerance for a rule
+/// that uses a different but equivalent algorithm). This is the batching counterpart of
+/// [`check_gradient!`](crate::check_gradient): it observes the rule only through the public [`batch`] transform.
+///
+/// Passing the check on samples does not prove that the rule is independent of its axes, but failing it proves that it
+/// is not, in which case the function's derivatives batched with a replicated primal whose tangent is mapped require
+/// [`CustomFunction::with_axis_dependent_batching`] to be the per-item derivatives of its batched primal.
+///
+/// # Parameters
+///
+///   - `function`: Function to batch, which typically calls a [`CustomFunction`] with a custom batching rule.
+///   - `input`: Sample input of `function`, with every mapped leaf packed along its batch axis.
+///   - `input_batch_axes`: Batch axis of each input leaf, with the structure of `input`.
+///   - `batch_axis`: Batch axis specification passed to every [`batch`] call. It must supply the batch extent when
+///     every input leaf is replicated.
+///   - `equivalent`: Comparison deciding whether two batched output leaves agree.
+///
+/// # Errors
+///
+/// Returns [`BatchingRuleConsistencyError::Inconsistent`] for the first replicated input leaf whose broadcast changes
+/// a batched output leaf, and [`BatchingRuleConsistencyError::Batching`] when batching fails.
+pub fn check_batching_rule_consistency<V, F, I, O, Specification, Equivalent>(
+    function: F,
+    input: I,
+    input_batch_axes: I::To<BatchAxis>,
+    batch_axis: Specification,
+    equivalent: Equivalent,
+) -> Result<(), BatchingRuleConsistencyError>
+where
+    V: Value<ExecutionDomain: Batch>,
+    F: Fn(I::To<BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>>) -> Result<O, ProgramError>,
+    I: Parameterized<
+            V,
+            Family: ParameterizedFamily<BatchAxis>
+                        + ParameterizedFamily<BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>>,
+        >,
+    O: Parameterized<
+            BatchingTracer<V::ExecutionDomain, <V::ExecutionDomain as Batch>::Policy>,
+            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
+        >,
+    Specification: Into<
+        BatchAxisSpecification<<<V::ExecutionDomain as Batch>::Policy as BatchingPolicy<V::ExecutionDomain>>::Extent>,
+    >,
+    Equivalent: Fn(&V, &V) -> bool,
+{
+    let batch_axis = batch_axis.into();
+    let structure = input.parameter_structure();
+    let inputs = input.into_parameters().collect::<Vec<_>>();
+    let input_axes = input_batch_axes.into_parameters().collect::<Vec<_>>();
+    let batched = |inputs: Vec<V>, input_axes: Vec<BatchAxis>| -> Result<Vec<V>, BatchingRuleConsistencyError> {
+        let input = I::from_parameters(structure.clone(), inputs).map_err(BatchingError::from)?;
+        let input_axes =
+            I::To::<BatchAxis>::from_parameters(structure.clone(), input_axes).map_err(BatchingError::from)?;
+        let outputs = batch(|input| function(input), input, input_axes, BatchAxis::new(0), batch_axis.clone())?;
+        Ok(outputs.into_parameters().collect())
+    };
+    let expected = batched(inputs.clone(), input_axes.clone())?;
+    for (input, axis) in input_axes.iter().enumerate() {
+        if !axis.is_replicated() {
+            continue;
+        }
+        let broadcast: V = batch(
+            |value| Ok(value),
+            inputs[input].clone(),
+            BatchAxis::replicated(),
+            BatchAxis::new(0),
+            batch_axis.clone(),
+        )?;
+        let mut broadcast_inputs = inputs.clone();
+        broadcast_inputs[input] = broadcast;
+        let mut broadcast_axes = input_axes.clone();
+        broadcast_axes[input] = BatchAxis::new(0);
+        let actual = batched(broadcast_inputs, broadcast_axes)?;
+        if let Some(output) = expected.iter().zip(&actual).position(|(expected, actual)| !equivalent(expected, actual))
+        {
+            return Err(BatchingRuleConsistencyError::Inconsistent { input, output });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4317,6 +4585,62 @@ mod tests {
             ),
             (vec![primal, Array::vector(vec![12.0f64, 18.0, 24.0]).unwrap()], vec![mapped; 2]),
         );
+
+        // An axis-dependent configuration of the same rule applies it once, at the primal axes, in the first case too,
+        // and recovers the per-item tangents of the replicated `y` from the outer product of its batch of tangents with
+        // the rule's batch, so they are exactly the per-item derivatives `3(ẋy + xẏ)` of the batched primal `3xy`.
+        let function = custom_function(|(x, y): (Tracer, Tracer)| Ok(x * y)).with_axis_dependent_batching(
+            |_: BatchingLevelExtent<Tracer>, (x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis)| {
+                let product = x * y;
+                let scale = if x_axis.is_replicated() || y_axis.is_replicated() { 3.0 } else { 2.0 };
+                let scale = product.context().lift(Array::scalar(scale)?)?;
+                Ok((product * scale, if x_axis.is_replicated() { y_axis } else { x_axis }))
+            },
+        );
+        let (_, program) = ArrayContext::trace(
+            |inputs| function.call(inputs),
+            (ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        let jvp = program.into_flat_program().jvp().unwrap();
+        assert_eq!(
+            batched(
+                &jvp,
+                &[mapped, replicated, mapped, mapped],
+                vec![
+                    Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap(),
+                    Array::scalar(4.0f64).unwrap(),
+                    Array::vector(vec![1.0f64, 0.5, 0.25]).unwrap(),
+                    Array::vector(vec![2.0f64, 3.0, 4.0]).unwrap(),
+                ],
+            ),
+            (
+                vec![
+                    Array::vector(vec![12.0f64, 24.0, 36.0]).unwrap(),
+                    Array::vector(vec![18.0f64, 24.0, 39.0]).unwrap(),
+                ],
+                vec![mapped; 2],
+            ),
+        );
+        assert_eq!(
+            batched(
+                &jvp,
+                &[mapped, mapped, replicated, replicated],
+                vec![
+                    Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap(),
+                    Array::vector(vec![4.0f64, 5.0, 6.0]).unwrap(),
+                    Array::scalar(1.0f64).unwrap(),
+                    Array::scalar(2.0f64).unwrap(),
+                ],
+            ),
+            (
+                vec![
+                    Array::vector(vec![8.0f64, 20.0, 36.0]).unwrap(),
+                    Array::vector(vec![12.0f64, 18.0, 24.0]).unwrap(),
+                ],
+                vec![mapped; 2],
+            ),
+        );
     }
 
     #[test]
@@ -4858,6 +5182,261 @@ mod tests {
             ),
             Ok(doubled_sine_and_cosine(&[0.5, 1.0])),
         );
+    }
+
+    #[test]
+    fn test_custom_function_with_axis_dependent_batching() {
+        // The rule of `(x, y, z) ↦ (xy, yz)` computes the batched products for every batch axis pattern, so it does not
+        // depend on its axes, and the axis-dependent configuration must give exactly the per-item derivatives that the
+        // plain configuration gives. With `x` mapped and `y` and `z` replicated, the mapped tangent `ẏ` (and, in the
+        // second case, `ż`) of a replicated primal is recovered from an outer product, and the tangent of the
+        // replicated output `yz` sums the broadcast tangent `yż` with the per-item tangents `ẏᵢz`.
+        type Tracer = DomainTracer<ArrayContext>;
+        let primal = |(x, y, z): (Tracer, Tracer, Tracer)| Ok((x * y.clone(), y * z));
+        let rule = |_: BatchingLevelExtent<Tracer>,
+                    (x, y, z): (Tracer, Tracer, Tracer),
+                    (x_axis, y_axis, z_axis): (BatchAxis, BatchAxis, BatchAxis)| {
+            let mapped = |left: BatchAxis, right: BatchAxis| if left.is_replicated() { right } else { left };
+            Ok(((x * y.clone(), y * z), (mapped(x_axis, y_axis), mapped(y_axis, z_axis))))
+        };
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let input_types = (scalar_type.clone(), scalar_type.clone(), scalar_type);
+        let axis_dependent = custom_function(primal).with_axis_dependent_batching(rule);
+        let (_, program) = ArrayContext::trace(|inputs| axis_dependent.call(inputs), input_types.clone()).unwrap();
+        let program = program.into_flat_program();
+        let plain = custom_function(primal).with_batching(rule);
+        let (_, plain_program) = ArrayContext::trace(|inputs| plain.call(inputs), input_types).unwrap();
+        let plain_program = plain_program.into_flat_program();
+        let batched = |program: &FlatProgram<ArrayContext>, axes: &[BatchAxis], inputs: Vec<Array>| {
+            let (batched, output_axes) = program
+                .batched(3, ShardingDimension::Replicated, axes, ProgramBatchingOutputAxesPolicy::Natural)
+                .unwrap()
+                .into_parts();
+            let outputs = batched.interpret(inputs).unwrap();
+            (batched, outputs, output_axes)
+        };
+        let (mapped, replicated) = (BatchAxis::new(0), BatchAxis::replicated());
+        let vector = |values: Vec<f64>| Array::vector(values).unwrap();
+        let scalar = |value: f64| Array::scalar(value).unwrap();
+        let primals = vec![vector(vec![1.0, 2.0, 3.0]), scalar(4.0), scalar(5.0)];
+
+        // Only `ẏ` belongs to a replicated primal: `ẋy + xẏ = [6, 8, 13]` and `ẏz + yż = [34, 39, 44]`.
+        let axes = [mapped, replicated, replicated, mapped, mapped, replicated];
+        let mut inputs = primals.clone();
+        inputs.extend([vector(vec![1.0, 0.5, 0.25]), vector(vec![2.0, 3.0, 4.0]), scalar(6.0)]);
+        let jvp = program.jvp().unwrap();
+        let (batched_jvp, outputs, output_axes) = batched(&jvp, &axes, inputs.clone());
+        let expected = vec![
+            vector(vec![4.0, 8.0, 12.0]),
+            scalar(20.0),
+            vector(vec![6.0, 8.0, 13.0]),
+            vector(vec![34.0, 39.0, 44.0]),
+        ];
+        assert_eq!(
+            outputs, expected);
+        assert_eq!(output_axes, vec![mapped, replicated, mapped, mapped]);
+        assert_eq!(batched(&plain_program.jvp().unwrap(), &axes, inputs).1, expected);
+        assert_eq!(batched_jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[], %2:f64[], %3:f64[3], %4:f64[3], %5:f64[] .
+                let %6:f64[3], %7:f64[], %8:f64[3], %9:f64[3] = custom_function [
+                    name=\"jvp(custom_function)\",
+                    batching=[(extent=3, input_axes=[axis 0, replicated, replicated, axis 0, axis 0, replicated], output_axes=[axis 0, replicated, axis 0, axis 0])],
+                ] %0 %1 %2 %3 %4 %5 [
+                    primal={
+                        lambda %0:f64[3], %1:f64[], %2:f64[], %3:f64[3], %4:f64[3], %5:f64[] .
+                        let %6:f64[3] = mul %0 %1
+                            %7:f64[] = mul %1 %2
+                            %8:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
+                            %9:f64[3] = mul %8 %3
+                            %10:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
+                            %11:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %4
+                            %12:f64[3, 3] = mul %10 %11
+                            %13:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
+                            %14:f64[3] = gather [
+                                dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
+                                slice_sizes=[1, 1],
+                            ] %12 %13
+                            %15:f64[3] = add %9 %14
+                            %16:f64[] = mul %1 %5
+                            %17:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %16
+                            %18:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %2
+                            %19:f64[3] = mul %18 %4
+                            %20:f64[3] = add %17 %19
+                        in (%6, %7, %15, %20)
+                    },
+                ]
+                in (%6, %7, %8, %9)
+            "}
+            .trim_end(),
+        );
+
+        // Both `ẏ` and `ż` belong to replicated primals: `ẏz + yż = [34, 43, 52]` has no following contribution.
+        let axes = [mapped, replicated, replicated, mapped, mapped, mapped];
+        let mut inputs = primals.clone();
+        inputs.extend([vector(vec![1.0, 0.5, 0.25]), vector(vec![2.0, 3.0, 4.0]), vector(vec![6.0, 7.0, 8.0])]);
+        let expected = vec![
+            vector(vec![4.0, 8.0, 12.0]),
+            scalar(20.0),
+            vector(vec![6.0, 8.0, 13.0]),
+            vector(vec![34.0, 43.0, 52.0]),
+        ];
+        assert_eq!(batched(&jvp, &axes, inputs.clone()).1, expected);
+        assert_eq!(batched(&plain_program.jvp().unwrap(), &axes, inputs).1, expected);
+
+        // Linearization stages a pushforward call, whose batching takes the same exact path when its residual primals
+        // have the axes above, and structural batching when they are replicated (e.g., in a forward-mode Jacobian).
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.tangent().to_string(), "");
+    }
+
+    #[test]
+    fn test_custom_function_with_axis_dependent_batching_dynamic_extent() {
+        // The rule of `y ↦ 3y` maps its output itself: it computes `3y` broadcast along the batch when `y` is replicated
+        // and `2y` otherwise. With a replicated `y` whose tangent is mapped along a first-class extent, the plain
+        // configuration applies the rule with `y` broadcast, which gives `2ẏ`, while the axis-dependent configuration
+        // takes the diagonal of the outer product over that extent, which gives the per-item derivatives `3ẏ` of the
+        // batched primal.
+        type Tracer = DomainTracer<EagerArrayIrContext>;
+        let add = |left: &Tracer, right: &Tracer| -> Result<Tracer, ProgramError> {
+            let left = ValueProjection::<ArrayType>::into_projected(left.clone())?;
+            Ok((left + ValueProjection::<ArrayType>::into_projected(right.clone())?).into_value())
+        };
+        let primal = move |y: Tracer| add(&add(&y, &y)?, &y);
+        let rule = move |extent: BatchingLevelExtent<Tracer>, y: Tracer, axis: BatchAxis| match (extent, axis.axis()) {
+            (BatchingLevelExtent::Dynamic(extent), None) => {
+                Ok((primal(y)?.dynamic_broadcast(&[extent], &[])?, BatchAxis::new(0)))
+            }
+            (_, Some(_)) => Ok((add(&y, &y)?, axis)),
+            (BatchingLevelExtent::Static(_), None) => {
+                Err(ProgramError::InvalidArgument { message: "the test rule expects a dynamic extent".to_string() })
+            }
+        };
+        let extent_type = DimensionType::new("n", DimensionBounds::new(1, Some(8)).unwrap());
+        let extent = DimensionValue::new(extent_type.clone(), 3).unwrap();
+        let batched_jvp = |program: FlatProgram<EagerArrayIrContext>| {
+            program
+                .jvp()
+                .unwrap()
+                .batched_with_threaded_extent(
+                    extent_type.clone(),
+                    ShardingDimension::Replicated,
+                    &[BatchAxis::replicated(), BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+        };
+        let inputs = vec![
+            ArrayIrValue::Dimension(extent.clone()),
+            ArrayIrValue::Array(Array::scalar(4.0f64).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap()),
+        ];
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let outputs = |tangent: Vec<f64>| {
+            Ok(vec![
+                ArrayIrValue::Dimension(extent.clone()),
+                ArrayIrValue::Array(Array::vector(vec![12.0f64; 3]).unwrap()),
+                ArrayIrValue::Array(Array::vector(tangent).unwrap()),
+            ])
+        };
+
+        let function = custom_function(primal).with_batching(rule);
+        let (_, program) = EagerArrayIrContext::trace(|y| function.call(y), scalar_type.clone()).unwrap();
+        let (batched, output_axes) = batched_jvp(program.into_flat_program());
+        assert_eq!(
+            output_axes, vec![BatchAxis::new(0); 2]);
+        assert_eq!(batched.interpret(inputs.clone()), outputs(vec![2.0, 4.0, 6.0]));
+
+        let function = custom_function(primal).with_axis_dependent_batching(rule);
+        let (_, program) = EagerArrayIrContext::trace(|y| function.call(y), scalar_type).unwrap();
+        let (batched, output_axes) = batched_jvp(program.into_flat_program());
+        assert_eq!(output_axes, vec![BatchAxis::new(0); 2]);
+        assert_eq!(batched.interpret(inputs), outputs(vec![3.0, 6.0, 9.0]));
+        assert_eq!(batched.to_string(),
+            indoc! {"
+                lambda %0:dimension<n ∈ [1, 8)>, %1:f64[], %2:f64[n] .
+                let %3:f64[n], %4:f64[n] = custom_function [
+                    name=\"jvp(custom_function)\",
+                    non_differentiated_count=1,
+                    batching=[(extent=dimension<n ∈ [1, 8)>, input_axes=[replicated, axis 0], output_axes=[axis 0, axis 0])],
+                ] %0 %1 %2 [
+                    primal={
+                        lambda %0:dimension<n ∈ [1, 8)>, %1:f64[], %2:f64[n] .
+                        let %3:f64[] = add %1 %1
+                            %4:f64[] = add %3 %1
+                            %5:f64[n] = broadcast [output_axes=[]] %4 %0
+                            %6:f64[n] = add %2 %2
+                            %7:f64[n] = add %6 %2
+                            %8:f64[n, n] = broadcast [output_axes=[0]] %7 %0 %0
+                            %9:dimension<n ∈ [1, 8)> = dimension_size [axis=1] %8
+                            %10:i64[n, 1] = iota [type=i64[n, 1], dimension=0] %9
+                            %11:f64[n] = gather [
+                                dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
+                                slice_sizes=[1, 1],
+                            ] %8 %10
+                        in (%5, %11)
+                    },
+                ]
+                in (%0, %3, %4)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_function_with_axis_dependent_batching_nested_levels() {
+        // A derived call batched at an earlier level reaches the exact path with that level's batch axes on its inputs.
+        // The rule of `(x, y) ↦ xy` does not depend on its axes, so the per-item derivative `ẋy + xẏ` (with `y` mapped
+        // only at the inner level) is also what the plain configuration computes.
+        type Tracer = DomainTracer<ArrayContext>;
+        let primal = |(x, y): (Tracer, Tracer)| Ok(x * y);
+        let rule =
+            |_: BatchingLevelExtent<Tracer>, (x, y): (Tracer, Tracer), (x_axis, y_axis): (BatchAxis, BatchAxis)| {
+                Ok((x * y, if x_axis.is_replicated() { y_axis } else { x_axis }))
+            };
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mapped = BatchAxis::new(0);
+        let batched_jvp = |program: FlatProgram<ArrayContext>| {
+            let (inner, _) = program
+                .jvp()
+                .unwrap()
+                .batched(2, ShardingDimension::Replicated, &[mapped; 4], ProgramBatchingOutputAxesPolicy::Natural)
+                .unwrap()
+                .into_parts();
+            inner
+                .batched(
+                    3,
+                    ShardingDimension::Replicated,
+                    &[mapped, BatchAxis::replicated(), mapped, mapped],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+        };
+        let x = Array::matrix(3, 2, vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let y = Array::vector(vec![10.0f64, 20.0]).unwrap();
+        let x_tangent = Array::matrix(3, 2, vec![1.0f64, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
+        let y_tangent = Array::matrix(3, 2, vec![2.0f64, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap();
+        let expected = vec![
+            Array::matrix(3, 2, vec![10.0f64, 40.0, 30.0, 80.0, 50.0, 120.0]).unwrap(),
+            Array::matrix(3, 2, vec![12.0f64, 6.0, 12.0, 40.0, 40.0, 62.0]).unwrap(),
+        ];
+        let inputs = vec![x, y, x_tangent, y_tangent];
+
+        let function = custom_function(primal).with_batching(rule);
+        let (_, program) =
+            ArrayContext::trace(|inputs| function.call(inputs), (scalar_type.clone(), scalar_type.clone())).unwrap();
+        let (batched, output_axes) = batched_jvp(program.into_flat_program());
+        assert_eq!(output_axes, vec![mapped; 2]);
+        assert_eq!(batched.interpret(inputs.clone()), Ok(expected.clone()));
+
+        let function = custom_function(primal).with_axis_dependent_batching(rule);
+        let (_, program) =
+            ArrayContext::trace(|inputs| function.call(inputs), (scalar_type.clone(), scalar_type)).unwrap();
+        let (batched, output_axes) = batched_jvp(program.into_flat_program());
+        assert_eq!(output_axes, vec![mapped; 2]);
+        assert_eq!(batched.interpret(inputs), Ok(expected));
     }
 
     #[test]

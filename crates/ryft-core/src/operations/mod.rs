@@ -60,16 +60,17 @@ pub use constants::{
 pub use control_flow::{
     CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation,
     ScanReferenceDischarge, Select, SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate,
-    WhileTypeSemantics, associative_scan, transpose_primal_condition, transpose_primal_scan,
+    WhileTypeSemantics, transpose_primal_condition, transpose_primal_scan,
 };
-pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation};
+pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation, associative_scan};
 pub use custom_functions::{
-    CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME, CustomCallPrimal, CustomFunction,
-    CustomFunctionBatching, CustomFunctionJvp, CustomFunctionJvpRule, CustomFunctionOperation,
-    CustomFunctionTransposeOperation, CustomFunctionVjp, CustomRuleDefinition, CustomRuleReference,
-    CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer, CustomRuleTracer, DefaultBatching, DefaultJvp,
-    DefaultVjp, JvpFromPrimal, LiftedCustomRules, UnavailableCustomRules, WeakCustomRuleRegistration,
-    WithAccumulatingVjp, WithBatching, WithJvp, WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, custom_function,
+    BatchingRuleConsistencyError, CUSTOM_FUNCTION_OPERATION_NAME, CUSTOM_FUNCTION_TRANSPOSE_OPERATION_NAME,
+    CustomCallPrimal, CustomFunction, CustomFunctionBatching, CustomFunctionJvp, CustomFunctionJvpRule,
+    CustomFunctionOperation, CustomFunctionTransposeOperation, CustomFunctionVjp, CustomRuleDefinition,
+    CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleSpecializer, CustomRuleTracer,
+    DefaultBatching, DefaultJvp, DefaultVjp, JvpFromPrimal, LiftedCustomRules, UnavailableCustomRules,
+    WeakCustomRuleRegistration, WithAccumulatingVjp, WithAxisDependentBatching, WithBatching, WithJvp,
+    WithSymbolicZeroJvp, WithSymbolicZeroVjp, WithVjp, check_batching_rule_consistency, custom_function,
 };
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::{
