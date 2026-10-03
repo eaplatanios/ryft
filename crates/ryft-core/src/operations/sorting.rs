@@ -79,7 +79,7 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
@@ -517,7 +517,13 @@ impl_differentiable_operation! {
                 return Ok(());
             }
 
-            let index_type = staged_index_passenger_type(&keys[0].r#type())?;
+            // The `i32` index iota shares the sharding of the keys, including their varying manual axes. An iota
+            // holds the same elements on every device, so typing it as varying is always valid (i.e., it is what
+            // a `parallel_vary` of the invariant iota produces, and an integer iota has no cotangent for that
+            // transition to affect).
+            let index_type = ArrayType::new(DataType::I32, keys[0].r#type().shape().clone())
+                .with_sharding(keys[0].r#type().sharding().cloned())
+                .map_err(|error| TypeError::invalid(error.to_string()))?;
             let index_operation = IotaOperation::new(index_type, operation.axis())?;
             let mut indices = context.stage_nullary_operation(index_operation)?;
             check_count!("output", indices, 1, ProgramError);
@@ -806,158 +812,96 @@ pub trait TopK: Sized {
 
 // TODO(eaplatanios): Review from here onwards.
 
-impl TopK for Array {
+impl<V: Value<Type = ArrayType, DispatchDomain: Iota<V>> + Sort + Slice + Reshape> TopK for V {
     fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError> {
-        let (axis, dimensions) = top_k_dimensions(&self.r#type(), k, axis.into())?;
-        if let Some(outputs) = top_k_via_squeezed_view(self, dimensions.as_slice(), k, axis)? {
-            return Ok(outputs);
+        // Complex values have no total order, and the index passenger and the slices below need static extents,
+        // so both are rejected before the axis is normalized and `k` is checked against its extent.
+        let value_type = self.r#type();
+        let data_type = value_type.data_type();
+        if data_type.is_complex() {
+            return Err(TypeError::invalid(format!("`top_k` does not support data type `{data_type}`")).into());
         }
-        top_k_with_index_passenger(self, eager_index_passenger(self, axis)?, dimensions.as_slice(), k, axis)
-    }
-}
 
-impl<
-    V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<IotaOperation<ArrayType>>>>
-        + Sort
-        + Slice
-        + Reshape,
-> TopK for V
-{
-    fn top_k<A: Into<Axis>>(&self, k: usize, axis: A) -> Result<(Self, Self), ProgramError> {
-        let (axis, dimensions) = top_k_dimensions(&self.r#type(), k, axis.into())?;
-        if let Some(outputs) = top_k_via_squeezed_view(self, dimensions.as_slice(), k, axis)? {
-            return Ok(outputs);
-        }
-        top_k_with_index_passenger(self, staged_index_passenger(self, axis)?, dimensions.as_slice(), k, axis)
-    }
-}
-
-/// Validates a [`top_k`](TopK::top_k) of `k` elements along `axis` of a value of type `value_type` and returns the
-/// normalized axis together with the static dimensions of that value. Complex values are rejected, because complex
-/// numbers have no total order, and so are dynamic dimensions, because the index passenger and the slices need static
-/// extents.
-fn top_k_dimensions(value_type: &ArrayType, k: usize, axis: Axis) -> Result<(usize, Vec<usize>), ProgramError> {
-    let data_type = value_type.data_type();
-    if data_type.is_complex() {
-        return Err(TypeError::invalid(format!("`top_k` does not support data type `{data_type}`")).into());
-    }
-    let dimensions = value_type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| {
-            dimension.value().ok_or_else(|| ProgramError::UnsupportedOperation {
-                message: "`top_k` does not support dynamic dimensions".to_string(),
+        let dimensions = value_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| {
+                dimension.value().ok_or_else(|| ProgramError::UnsupportedOperation {
+                    message: "`top_k` does not support dynamic dimensions".to_string(),
+                })
             })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let rank = dimensions.len();
-    let axis = axis
-        .normalize(rank)
-        .map_err(|_| TypeError::invalid(format!("`top_k` axis {axis} is out of bounds for rank {rank}")))?;
-    if k > dimensions[axis] {
-        return Err(ProgramError::InvalidArgument {
-            message: format!("`top_k` `k` {k} exceeds size {} of axis {axis}", dimensions[axis]),
-        });
-    }
-    Ok((axis, dimensions))
-}
-
-/// Computes [`top_k`](TopK::top_k) through a squeezed view of `value` that strips the leading size-1 dimensions in
-/// front of a trailing ranked axis, reshaping both outputs back to the original rank afterward. The squeeze exists
-/// for XLA: its top-k rewriter only accepts `iota` or `broadcast(iota)` index passengers, and the StableHLO-to-HLO
-/// import canonicalizes the degenerate higher-rank index iota of a batch-size-1 input (e.g., `f32[1, 32000]`) into
-/// `reshape(iota)`, so without the squeeze such inputs never reach XLA's fast top-k implementation. The index iota must
-/// therefore be created at the squeezed shape (reshaping the higher-rank iota would stage the same rejected
-/// `reshape(iota)` pattern), which is why the squeeze recurses into [`top_k`](TopK::top_k) on the squeezed value
-/// instead of reshaping around [`top_k_with_index_passenger`]. Values and indices are identical to those of the
-/// unsqueezed composition.
-///
-/// Returns `Ok(None)` when no squeeze applies: the ranked axis is not the trailing axis, there are no leading size-1
-/// dimensions in front of the ranked axis, or a leading size-1 dimension is sharded.
-fn top_k_via_squeezed_view<V: Typed<Type = ArrayType> + TopK + Reshape>(
-    value: &V,
-    dimensions: &[usize],
-    k: usize,
-    axis: usize,
-) -> Result<Option<(V, V)>, ProgramError> {
-    let squeezed_count = dimensions[..axis].iter().take_while(|&&size| size == 1).count();
-    if axis + 1 != dimensions.len() || squeezed_count == 0 {
-        return Ok(None);
-    }
-    if let Some(sharding) = value.r#type().sharding() {
-        let squeezed_dimensions = &sharding.dimensions()[..squeezed_count];
-        if squeezed_dimensions.iter().any(|dimension| matches!(dimension, ShardingDimension::Sharded(_))) {
-            return Ok(None);
+            .collect::<Result<Vec<_>, _>>()?;
+        let rank = dimensions.len();
+        let axis = axis.into();
+        let axis = axis
+            .normalize(rank)
+            .map_err(|_| TypeError::invalid(format!("`top_k` axis {axis} is out of bounds for rank {rank}")))?;
+        if k > dimensions[axis] {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("`top_k` `k` {k} exceeds size {} of axis {axis}", dimensions[axis]),
+            });
         }
+
+        // When the ranked axis is the trailing axis and follows unsharded size-1 dimensions, the composition runs on
+        // a squeezed view without those dimensions, and both outputs are reshaped back to the original rank afterward.
+        // The squeeze exists for XLA: its top-k rewriter only accepts `iota` or `broadcast(iota)` index passengers, and
+        // the StableHLO-to-HLO import canonicalizes the degenerate higher-rank index iota of a batch-size-1 input
+        // (e.g., `f32[1, 32000]`) into `reshape(iota)`, so without the squeeze such inputs would never reach XLA's fast
+        // top-k implementation. The index iota must therefore be created at the squeezed shape (reshaping the
+        // higher-rank iota would stage the same rejected `reshape(iota)` pattern), which is why the squeeze recurses
+        // into `top_k` on the squeezed value instead of reshaping the outputs computed below. Values and indices are
+        // identical either way, and the validation above already reported errors in terms of the original axis.
+        let squeezed_count = dimensions[..axis].iter().take_while(|&&size| size == 1).count();
+        let squeezes_sharded_dimension = value_type.sharding().is_some_and(|sharding| {
+            sharding.dimensions()[..squeezed_count]
+                .iter()
+                .any(|dimension| matches!(dimension, ShardingDimension::Sharded(_)))
+        });
+        if axis + 1 == rank && squeezed_count > 0 && !squeezes_sharded_dimension {
+            let squeezed_shape =
+                Shape::new(dimensions[squeezed_count..].iter().copied().map(Dimension::Static).collect());
+            let (values, indices) = self.reshape(squeezed_shape)?.top_k(k, axis - squeezed_count)?;
+            let mut output_dimensions = dimensions.iter().copied().map(Dimension::Static).collect::<Vec<_>>();
+            output_dimensions[axis] = Dimension::Static(k);
+            let output_shape = Shape::new(output_dimensions);
+            return Ok((values.reshape(output_shape.clone())?, indices.reshape(output_shape)?));
+        }
+
+        // The `i32` index passenger holds the index of every element along the ranked axis, and it is built through the
+        // `Iota` capability of the dispatch domain of the value, which materializes it for eager arrays and stages an
+        // `IotaOperation` for context-carrying values. The passenger shares the sharding of the value, including its
+        // varying manual axes. An iota holds the same elements on every device, so typing it as varying is always
+        // valid (i.e., it is what a `parallel_vary` of the invariant iota produces, and an integer iota has no
+        // cotangent for that transition to affect), and it lets values that insert no variation transitions (e.g.,
+        // eager arrays) sort it together with the value. A stable descending sort under the total ordering then moves
+        // the largest elements to the front of the axis, with ties keeping their original order (and so the lowest
+        // index first), and carries the passenger along, so that it holds the original index of every sorted element.
+        let index_type = ArrayType::new(DataType::I32, value_type.shape().clone())
+            .with_sharding(value_type.sharding().cloned())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        let indices = self.dispatch_domain().iota(&index_type, axis)?;
+        let mut sorted = Self::sort_with_ordering(
+            &[self.clone(), indices],
+            axis,
+            1,
+            SortDirection::Descending,
+            SortOrdering::Total,
+        )?;
+        let sorted_indices = sorted.pop().unwrap();
+        let sorted_values = sorted.pop().unwrap();
+
+        // The `k` leading entries of both sorted outputs along the ranked axis are the `k` largest values and their
+        // indices, which is the sort-plus-slice idiom that XLA's top-k rewriter replaces with its fast implementation.
+        let start_indices = vec![0; rank];
+        let mut limit_indices = dimensions;
+        limit_indices[axis] = k;
+        let strides = vec![1; rank];
+        Ok((
+            sorted_values.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())?,
+            sorted_indices.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())?,
+        ))
     }
-    let squeezed_shape = Shape::new(dimensions[squeezed_count..].iter().copied().map(Dimension::Static).collect());
-    let (values, indices) = value.reshape(squeezed_shape)?.top_k(k, axis - squeezed_count)?;
-    let mut output_dimensions = dimensions.iter().copied().map(Dimension::Static).collect::<Vec<_>>();
-    output_dimensions[axis] = Dimension::Static(k);
-    let output_shape = Shape::new(output_dimensions);
-    Ok(Some((values.reshape(output_shape.clone())?, indices.reshape(output_shape)?)))
-}
-
-/// Selects the `k` leading entries of a stable descending total-order sort of `value` with the prebuilt index
-/// passenger `indices`. This is the composition shared by every [`TopK`] implementation, which differ only in how they
-/// construct the index passenger.
-fn top_k_with_index_passenger<V: Clone + Sort + Slice>(
-    value: &V,
-    indices: V,
-    dimensions: &[usize],
-    k: usize,
-    axis: usize,
-) -> Result<(V, V), ProgramError> {
-    let mut sorted =
-        V::sort_with_ordering(&[value.clone(), indices], axis, 1, SortDirection::Descending, SortOrdering::Total)?;
-    let sorted_indices = sorted.pop().unwrap();
-    let sorted_values = sorted.pop().unwrap();
-    let start_indices = vec![0; dimensions.len()];
-    let mut limit_indices = dimensions.to_vec();
-    limit_indices[axis] = k;
-    let strides = vec![1; dimensions.len()];
-    Ok((
-        sorted_values.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())?,
-        sorted_indices.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())?,
-    ))
-}
-
-/// Returns the `i32` index passenger of a ranking of the eager [`Array`] `value` along `axis`, which holds the index of
-/// every element along that axis. The passenger keeps the sharding of `value`, including its varying manual axes,
-/// because eager arrays do not insert manual-variation transitions.
-fn eager_index_passenger(value: &Array, axis: usize) -> Result<Array, ProgramError> {
-    let index_type = ArrayType::new(DataType::I32, value.r#type().shape().clone())
-        .with_sharding(value.r#type().sharding().cloned())
-        .map_err(|error| TypeError::invalid(error.to_string()))?;
-    EagerContext::<Array>::new().iota(&index_type, axis)
-}
-
-/// Stages the `i32` index passenger of a ranking of the context-carrying `value` along `axis` as an [`IotaOperation`],
-/// which holds the index of every element along that axis.
-fn staged_index_passenger<V: Value<Type = ArrayType>>(value: &V, axis: usize) -> Result<V, ProgramError>
-where
-    V::DispatchDomain: Context<Operation: From<IotaOperation<ArrayType>>>,
-{
-    let index_type = staged_index_passenger_type(&value.r#type())?;
-    let mut outputs = value.dispatch_domain().bind(IotaOperation::new(index_type, axis)?, Vec::new(), &[])?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
-
-/// Returns the type of the staged `i32` index passenger of a ranking of a value of type `value_type`. The staged iota
-/// is a constant and thus invariant across manual mesh axes, so its type drops the varying manual axes of
-/// `value_type`, and [`Sort`] inserts the required transitions when it sorts the iota with the value.
-fn staged_index_passenger_type(value_type: &ArrayType) -> Result<ArrayType, ProgramError> {
-    let index_type = ArrayType::new(DataType::I32, value_type.shape().clone());
-    let Some(sharding) = value_type.sharding() else {
-        return Ok(index_type);
-    };
-    let sharding = sharding
-        .clone()
-        .with_varying_manual_axes(Vec::<String>::new())
-        .map_err(|error| TypeError::invalid(error.to_string()))?;
-    Ok(index_type.with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))?)
 }
 
 #[cfg(test)]
@@ -970,6 +914,7 @@ mod tests {
         Sharding, StridedLayout, i4,
     };
     use crate::axes::NamedAxis;
+    use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -1756,6 +1701,38 @@ mod tests {
                 in (%7)
             "}
             .trim_end(),
+        );
+    }
+    #[test]
+    fn test_top_k_manual_variation() {
+        // The index passenger shares the varying manual axes of the ranked value, so eager arrays (which insert no
+        // variation transitions) rank varying values, and traced values stage no `parallel_vary` for the passenger.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F64, [3]).with_sharding(sharding.clone()).unwrap();
+        let values_type = ArrayType::new_static(DataType::F64, [2]).with_sharding(sharding.clone()).unwrap();
+        let indices_type = ArrayType::new_static(DataType::I32, [2]).with_sharding(sharding).unwrap();
+        assert_eq!(
+            Array::from_elements(input_type.clone(), &[1.0, 3.0, 2.0]).unwrap().top_k(2, 0),
+            Ok((
+                Array::from_elements(values_type.clone(), &[3.0, 2.0]).unwrap(),
+                Array::from_elements(indices_type.clone(), &[1i32, 2]).unwrap(),
+            )),
+        );
+        let (outputs, program) =
+            DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
+                |inputs| {
+                    let (values, indices) = inputs[0].top_k(2, 0)?;
+                    Ok(vec![values, indices])
+                },
+                vec![input_type],
+                vec![("x".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })],
+            )
+            .unwrap();
+        assert_eq!(outputs, vec![values_type, indices_type]);
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["iota", "sort", "slice", "slice"],
         );
     }
 }

@@ -1,9 +1,3 @@
-//! Contains the named-axis [`ParallelPermuteOperation`], which sends every participant's input to another participant
-//! along a named axis, together with its interpretation, partial-evaluation, batching, forward-mode differentiation,
-//! and transposition rules.
-
-// TODO(eaplatanios): Review this module.
-
 use std::fmt::Display;
 
 use crate::arrays::{
@@ -30,6 +24,8 @@ use crate::programs::{
     ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
+
+// TODO(eaplatanios): Review from here onwards.
 
 use super::{
     interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,

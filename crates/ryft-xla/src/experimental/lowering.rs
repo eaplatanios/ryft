@@ -5000,7 +5000,7 @@ fn lower_canonical_sort_key<'b, 'c: 'b, 't: 'c>(
 /// [`ArgMinOperation`](ryft_core::ArgMinOperation) along `axis` to a variadic `stablehlo.reduce` over the input and a
 /// `stablehlo.iota` of its indices along `axis`, returning the reduced indices. The reduction starts from the extremum
 /// identity of the input data type (i.e., the lowest value for `argmax` and the highest one for `argmin`) paired with
-/// index zero, and its comparator (refer to [`build_extremal_index_body_region`]) is commutative and associative, so
+/// index zero, and its comparator (refer to [`build_index_reduction_body_region`]) is commutative and associative, so
 /// that the result does not depend on the order in which XLA combines elements. Narrow floating-point inputs compare in
 /// `f32`, into which they convert exactly (including their NaNs and signed zeros), and signed one-bit inputs and indices
 /// use a signed byte carrier, because StableHLO treats `i1` as a predicate.
@@ -5010,7 +5010,7 @@ fn lower_canonical_sort_key<'b, 'c: 'b, 't: 'c>(
 /// extremum identity paired with index zero. Such a pair never strictly beats a live element, and it ties with live
 /// elements only when every live element equals the identity, in which case index zero is the correct result. Dynamic
 /// axes that are not reduced pass through the reduction unchanged.
-fn lower_extremal_index_to_mlir<'b, 'c: 'b, 't: 'c>(
+fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
     maximize: bool,
     axis: usize,
     input_value: ValueRef<'b, 'c, 't>,
@@ -5050,7 +5050,7 @@ fn lower_extremal_index_to_mlir<'b, 'c: 'b, 't: 'c>(
     let scalar_index_tensor_type = lower_tensor_type(&scalar_index_type, context, location)?;
     let index_identity =
         lower_f64_constant_splat(0.0, &scalar_index_type, scalar_index_tensor_type, block, context, location)?;
-    let body = build_extremal_index_body_region(maximize, value_data_type, index_data_type, context, location)?;
+    let body = build_index_reduction_body_region(maximize, value_data_type, index_data_type, context, location)?;
     let reduced = block.append_operation(stable_hlo::reduce(
         &[value, indices],
         &[value_identity, index_identity],
@@ -5067,14 +5067,14 @@ fn lower_extremal_index_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(converted.result(0).expect("stablehlo.convert should return one result").as_ref())
 }
 
-/// Builds the comparator region of [`lower_extremal_index_to_mlir`], which combines two `(value, index)` pairs by
+/// Builds the comparator region of [`lower_index_reduction_to_mlir`], which combines two `(value, index)` pairs by
 /// picking the left pair when its value is strictly better than the right one, or equivalent to it with a lower index.
 /// For `argmax` (when `maximize` is `true`), a value is strictly better when it is greater, and for `argmin` when it is
 /// smaller, comparing floating-point values with `FLOAT` semantics (so that `-0.0` and `+0.0` are equivalent).
 /// A floating-point NaN is also strictly better than every ordered value for both directions, and two NaNs are
 /// equivalent. Unlike JAX's comparator, which picks the left pair whenever its value is a NaN, this one is commutative
 /// and associative, so every combination order selects the first NaN and the lowest index among ties.
-fn build_extremal_index_body_region<'c, 't>(
+fn build_index_reduction_body_region<'c, 't>(
     maximize: bool,
     value_data_type: DataType,
     index_data_type: DataType,
@@ -6159,7 +6159,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::ArgMax(operation) => {
                 check_count!("input", lowerer.input_types, 1, ProgramError);
                 check_count!("output", output_types, 1, ProgramError);
-                Ok(vec![lower_extremal_index_to_mlir(
+                Ok(vec![lower_index_reduction_to_mlir(
                     true,
                     operation.axis(),
                     input_values[0],
@@ -6173,7 +6173,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
             ArrayOperation::ArgMin(operation) => {
                 check_count!("input", lowerer.input_types, 1, ProgramError);
                 check_count!("output", output_types, 1, ProgramError);
-                Ok(vec![lower_extremal_index_to_mlir(
+                Ok(vec![lower_index_reduction_to_mlir(
                     false,
                     operation.axis(),
                     input_values[0],
