@@ -4,8 +4,9 @@
 //! counting global allocator in a dedicated integration-test binary, keeping its counters and serialized measurement
 //! state independent of the array cloning and mixed-IR projection contracts.
 
-use ryft_core::operations::random::{RandomAlgorithm, RngBitGenerator};
-use ryft_core::{Add, Array, ArrayType, DataType, Dimension, EagerContext, Fill, Iota, Shape, Sin};
+use ryft_core::{
+    Add, Array, ArrayType, DataType, Dimension, EagerContext, Fill, Iota, RandomAlgorithm, RngBitGenerator, Shape, Sin,
+};
 
 include!("support/allocation_measurement.rs");
 

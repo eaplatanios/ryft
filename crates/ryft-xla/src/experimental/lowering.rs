@@ -18,7 +18,6 @@ use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, Imagi
 use ryft_core::operations::custom_call::{CUSTOM_CALL_OPERATION_NAME, CustomCallAttribute, CustomCallOperation};
 use ryft_core::operations::dot::{lhs_result_axes, rhs_result_axes};
 use ryft_core::operations::quantization::scaled_dot_ir_composition;
-use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
 use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
@@ -31,12 +30,12 @@ use ryft_core::{
     LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MaxOperation, Memory, MeshAxisType, MinOperation,
     MulOperation, NegOperation, Operation, PadOperation, ParallelReduceOperation, Parameterized, PowOperation, Program,
     ProgramError, ProjectedValue, Provenance, REDUCE_OPERATION_NAME, REMATERIALIZE_OPERATION_NAME, RaggedDotMode,
-    RaggedDotOperation, ReducePrecisionOperation, ReductionKind, RegionId, RegionRef, RemOperation,
-    RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation, RoundOperation, RsqrtOperation,
-    SCAN_OPERATION_NAME, SORT_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation,
-    ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation,
-    SliceOperation, SortDirection, SortOperation, SortOrdering, SqrtOperation, SubOperation, TanhOperation,
-    TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    RaggedDotOperation, RandomAlgorithm, ReducePrecisionOperation, ReductionKind, RegionId, RegionRef, RemOperation,
+    RematerializationOptimizationBarrier, ReshapeOperation, ReverseOperation, RngBitGeneratorOperation, RoundOperation,
+    RsqrtOperation, SCAN_OPERATION_NAME, SORT_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterMode,
+    ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation,
+    SinOperation, SliceOperation, SortDirection, SortOperation, SortOrdering, SqrtOperation, SubOperation,
+    TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers};
@@ -13334,7 +13333,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::operations::attention::{AttentionConfiguration, AttentionImplementation, AttentionInputSignature};
-    use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::{
         AndOperation, Array as CpuArray, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation,
         ArrayOperation, Atan2Operation, BatchAxis, BatchableOperation, BatchedProgram, BatchingContext,
@@ -13346,10 +13344,11 @@ mod tests {
         DynamicUpdateSliceOperation, EagerContext, EmptyRegionDriver, Fill, GatherDimensionNumbers, IotaOperation,
         LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation,
         Placeholder, ProgramBatchingOutputAxesPolicy, ProgramBuilder, Provenance, ProvenanceScope, RaggedDot,
-        ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, ScanOperation, ScatterDimensionNumbers,
-        SelectOperation, Shape, Sharding, ShardingDimension, Sin, SliceOperation, StagingContext, StridedLayout, Tile,
-        TileDimension, TiledLayout, Trace, TracingContext, Transpose, TypeError, UpdateSliceOperation, WhileOperation,
-        XorOperation, ZeroLike, ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        RandomAlgorithm, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, RngBitGeneratorOperation,
+        ScanOperation, ScatterDimensionNumbers, SelectOperation, Shape, Sharding, ShardingDimension, Sin,
+        SliceOperation, StagingContext, StridedLayout, Tile, TileDimension, TiledLayout, Trace, TracingContext,
+        Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike, ZeroLikeOperation,
+        ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
     use ryft_mlir::ElementsAttribute;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
@@ -23856,7 +23855,7 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_rng_bit_generator() {
-        use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
+        use ryft_core::{RandomAlgorithm, RngBitGeneratorOperation};
 
         let state_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(2)]));
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Static(4)]));

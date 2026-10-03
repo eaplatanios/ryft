@@ -2743,7 +2743,7 @@ mod tests {
     /// both backends.
     #[test]
     fn test_eager_rng_bit_generator_matches_reference_backend() {
-        use ryft_core::operations::random::{RandomAlgorithm, RngBitGenerator};
+        use ryft_core::{RandomAlgorithm, RngBitGenerator};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2804,7 +2804,7 @@ mod tests {
     /// produces identical `u32` and `u64` bits and identical advanced states on both backends.
     #[test]
     fn test_eager_philox_rng_bit_generator_matches_reference_backend() {
-        use ryft_core::operations::random::{RandomAlgorithm, RngBitGenerator};
+        use ryft_core::{RandomAlgorithm, RngBitGenerator};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -2867,7 +2867,7 @@ mod tests {
     /// select identical indices.
     #[test]
     fn test_eager_random_distributions_parity_with_reference_backend() {
-        use ryft_core::operations::random::Random;
+        use ryft_core::Random;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Add or Review Core Operation"
+  short_description: "Adds support for a new operation type in `ryft-core`, or reviews support for an existing one."

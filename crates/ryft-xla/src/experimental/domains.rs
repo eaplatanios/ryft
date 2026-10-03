@@ -6265,7 +6265,6 @@ mod tests {
     };
     use ryft_core::operations::custom_call::CustomCallOperation;
     use ryft_core::operations::manipulation::indexing::index;
-    use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::{
         AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch,
         ArrayOperation, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, Assert, AssertOperation,
@@ -6280,13 +6279,13 @@ mod tests {
         DynamicScatter, DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
         DynamicUpdateSliceOperation, EmptyRegionDriver, Fill, Gather, GatherDimensionNumbers, GatherMode,
         GatherOperation, GatherOptions, Indexing, IotaOperation, Linearization, MulOperation, NegOperation,
-        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
-        ReferenceWrite, ReferenceWriteOperation, Reshape, ScaledDotOperation, ScanOperation, Scatter,
-        ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, SelectOperation, Sharding,
-        ShardingDimension, SliceOperation, SortDirection, SortOperation, StagingContext, StaticShape, SubOperation,
-        TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
+        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, RandomAlgorithm, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation,
+        ReferenceType, ReferenceWrite, ReferenceWriteOperation, Reshape, RngBitGeneratorOperation, ScaledDotOperation,
+        ScanOperation, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions,
+        SelectOperation, Sharding, ShardingDimension, SliceOperation, SortDirection, SortOperation, StagingContext,
+        StaticShape, SubOperation, TracingContext, WhileOperation, ZeroOperation, batch, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]

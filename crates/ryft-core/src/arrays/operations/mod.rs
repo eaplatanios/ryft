@@ -36,7 +36,6 @@ use crate::operations::complex::{
     Complex, ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
 };
 use crate::operations::custom_call::CustomCallOperation;
-use crate::operations::random::RngBitGeneratorOperation;
 use crate::operations::{
     Abs, AbsOperation, Add, AddOperation, And, AndOperation, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation, Assert,
     AssertOperation, Atan2, Atan2Operation, Broadcast, BroadcastOperation, Ceil, CeilOperation, Clamp, ClampOperation,
@@ -58,11 +57,12 @@ use crate::operations::{
     ReferenceAtomicAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
     ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
     ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation, Reshape, ReshapeOperation, ReshardOperation,
-    Reverse, ReverseOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation,
-    ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign, SignOperation, Sin, SinOperation, Slice,
-    SliceOperation, Sort, SortOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation,
-    TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice,
-    UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    Reverse, ReverseOperation, RngBitGeneratorOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot,
+    ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, Sign, SignOperation, Sin,
+    SinOperation, Slice, SliceOperation, Sort, SortOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation,
+    Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation,
+    UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation,
+    ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -73,7 +73,6 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 
 mod control_flow;
-mod random;
 
 // The element-level extrema of the reference kernels are the canonical least and greatest values of each element data
 // type, so the ragged identity masking of `arrays::batching` reads them through this facade instead of restating them.
@@ -199,7 +198,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///   - type-semantics plumbing such as [`WhileTypeSemantics`](crate::operations::control_flow::WhileTypeSemantics),
 ///     [`ScanTypeSemantics`](crate::operations::control_flow::scan::ScanTypeSemantics),
 ///     [`ConditionTypeSemantics`](crate::operations::control_flow::condition::ConditionTypeSemantics), and
-///     [`WhilePredicate`](crate::operations::control_flow::WhilePredicate);
+///     [`WhilePredicate`](crate::WhilePredicate);
 ///   - staging machinery such as [`Constant`](crate::operations::constants::Constant) and
 ///     [`Tag`](crate::operations::tagging::Tag), and the context-side constructors [`Zero`],
 ///     [`One`](crate::operations::constants::One), [`Fill`](crate::operations::constants::Fill), and
@@ -209,7 +208,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///     hatch [`CustomCall`](crate::operations::custom_call::CustomCall);
 ///   - first-class dimension plumbing, which belongs to [`ArrayIrOperations`] rather than to the homogeneous array
 ///     family;
-///   - random bit generation, whose [`RngBitGenerator`](crate::operations::random::RngBitGenerator) contract threads
+///   - random bit generation, whose [`RngBitGenerator`](crate::RngBitGenerator) contract threads
 ///     explicit algorithm state rather than shaping a value-to-value capability;
 ///   - the collectives ([`AllGather`](crate::operations::collectives::AllGather),
 ///     [`AllToAll`](crate::operations::collectives::AllToAll),
@@ -1099,14 +1098,13 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::collectives::{AllGatherOutputVariance, CollectiveMode, CollectiveOptions};
-    use crate::operations::random::RandomAlgorithm;
     use crate::operations::{
         AddOperation, AssertOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation,
         CustomFunctionJvpRule, CustomFunctionOperation, CustomFunctionTransposeOperation, CustomRuleDefinition,
         CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation, DimensionMulOperation,
-        DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation,
-        ReductionKind, RematerializationOptimizationBarrier, ScanOperation, SinOperation, WhileOperation,
-        ZeroOperation,
+        DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, RandomAlgorithm,
+        ReduceOperation, ReductionKind, RematerializationOptimizationBarrier, ScanOperation, SinOperation,
+        WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialValue, ResidualPolicyReference};

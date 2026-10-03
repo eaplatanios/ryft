@@ -1852,7 +1852,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
-    use ryft_core::operations::random::Random;
     use ryft_core::{
         Add, AddOperation, ArgMax, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver,
@@ -1861,7 +1860,7 @@ mod tests {
         DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
         DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogicalMesh,
         Logistic, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation, Placeholder,
-        ProgramBuilder, ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate,
+        ProgramBuilder, ProgramError, ProjectedValue, Random, Reduce, ReductionKind, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
         ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
         ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
