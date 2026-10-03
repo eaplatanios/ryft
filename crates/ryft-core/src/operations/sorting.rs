@@ -625,8 +625,6 @@ pub trait Sort: Sized {
     ) -> Result<Vec<Self>, ProgramError>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Sort for Array {
     fn sort_with_ordering<A: Into<Axis>>(
         inputs: &[Self],
@@ -636,10 +634,9 @@ impl Sort for Array {
         ordering: SortOrdering,
     ) -> Result<Vec<Self>, ProgramError> {
         // Type inference validates the inputs (e.g., their count, key data types, shapes, axis, sharding, and manual
-        // variation) exactly as it does for staged sorts. The keys are then ranked through an order-preserving
-        // encoding of each element and the resulting gather map moves whole element encodings, so non-key inputs of
-        // any element data type (including the sub-byte ones without a scalar representation) sort without being
-        // decoded.
+        // variation) exactly as it does for staged sorts. The keys are then ranked through an order-preserving encoding
+        // of each element and the resulting gather map moves whole element encodings, so non-key inputs of any element
+        // data type (including the sub-byte ones without a scalar representation) sort without being decoded.
         let operation = SortOperation::from_sort_arguments(inputs, axis.into(), key_count, direction, ordering)?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         operation.infer_output_types(input_types.as_slice(), &[])?;
@@ -661,9 +658,10 @@ impl Sort for Array {
     }
 }
 
-impl<V: Value<Type = ArrayType> + ManualVariationAlignment<ArrayType>> Sort for V
-where
-    V::DispatchDomain: Context<Operation: From<SortOperation>>,
+impl<
+    V: Value<Type = ArrayType, DispatchDomain: Context<Operation: From<SortOperation>>>
+        + ManualVariationAlignment<ArrayType>,
+> Sort for V
 {
     fn sort_with_ordering<A: Into<Axis>>(
         inputs: &[Self],
@@ -680,6 +678,8 @@ where
         inputs[0].dispatch_domain().bind(operation, Vec::new(), &aligned_inputs)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Array {
     /// Returns the order-preserving `u64` ranks of the elements of this array, in row-major order, when it acts as a
