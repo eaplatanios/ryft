@@ -15,8 +15,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, DataType, DimensionValue,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch,
+    ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
+    DimensionValue,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -40,7 +41,9 @@ use crate::operations::control_flow::condition::ConditionOperation;
 use crate::operations::control_flow::scan::{ScanOperation, stacked_scan_type, validate_reference_carry_axis};
 use crate::operations::control_flow::select::SelectOperation;
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
+use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
 use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::DynamicUpdateSliceOperation;
@@ -1720,6 +1723,55 @@ impl<O: Operation<Type = ArrayType>> TemporalResidualOperation<ArrayType> for O 
     }
 }
 
+// Composite array IR residuals store arrays directly and first-class dimensions as scalar arrays. A reference never
+// defines temporal storage because the transforms thread references through loops as carries and never save them as
+// residuals.
+impl TemporalResidualType for ArrayIrType {
+    #[inline]
+    fn temporal_storage_type(&self) -> Result<Self, TypeError> {
+        Ok(match self {
+            Self::Array(r#type) => Self::Array(r#type.clone()),
+            Self::Dimension(_) => Self::Array(ArrayType::scalar(DIMENSION_DATA_TYPE)),
+            Self::Reference(_) => {
+                return Err(TypeError::invalid(
+                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                ));
+            }
+        })
+    }
+}
+
+impl<O> TemporalResidualOperation<ArrayIrType> for O
+where
+    O: Operation<Type = ArrayIrType> + From<DimensionFromScalarOperation> + From<DimensionToScalarOperation>,
+{
+    fn residual_to_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
+        Ok(match residual_type {
+            ArrayIrType::Array(_) => None,
+            ArrayIrType::Dimension(_) => Some(Self::from(DimensionToScalarOperation)),
+            ArrayIrType::Reference(_) => {
+                return Err(TypeError::invalid(
+                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                ));
+            }
+        })
+    }
+
+    fn residual_from_storage(residual_type: &ArrayIrType) -> Result<Option<Self>, TypeError> {
+        Ok(match residual_type {
+            ArrayIrType::Array(_) => None,
+            ArrayIrType::Dimension(r#type) => {
+                Some(Self::from(DimensionFromScalarOperation::new(r#type.variable().clone())))
+            }
+            ArrayIrType::Reference(_) => {
+                return Err(TypeError::invalid(
+                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                ));
+            }
+        })
+    }
+}
+
 impl WhileResidualStackType for ArrayType {
     #[inline]
     fn from_array_type(r#type: ArrayType) -> Self {
@@ -1787,6 +1839,82 @@ where
     #[inline]
     fn mask_and() -> Self {
         Self::from(AndOperation::new())
+    }
+}
+
+impl WhileResidualStackType for ArrayIrType {
+    #[inline]
+    fn from_array_type(r#type: ArrayType) -> Self {
+        Self::Array(r#type)
+    }
+
+    fn array_type(&self) -> Result<&ArrayType, TypeError> {
+        match self {
+            Self::Array(r#type) => Ok(r#type),
+            Self::Dimension(r#type) => {
+                Err(TypeError::invalid(format!("expected an array-backed bounded-while state type but got {}", r#type)))
+            }
+            Self::Reference(r#type) => {
+                Err(TypeError::invalid(format!("expected an array-backed bounded-while state type but got {}", r#type)))
+            }
+        }
+    }
+
+    #[inline]
+    fn maskable_array_type(&self) -> Option<&ArrayType> {
+        match self {
+            Self::Array(r#type) => Some(r#type),
+            Self::Dimension(_) => None,
+            Self::Reference(_) => None,
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType>, O> WhileResidualStackOperation<ArrayIrType, A> for O
+where
+    O: Operation<Type = ArrayIrType> + From<ArrayIrOperation<A>> + TemporalResidualOperation<ArrayIrType>,
+{
+    fn residual_stack_zero(r#type: ArrayIrType) -> Self {
+        let ArrayIrType::Array(r#type) = r#type else { unreachable!("bounded-while stack zeros are always arrays") };
+        Self::from(ArrayIrOperation::<A>::from(ZeroOperation::new(r#type)))
+    }
+
+    fn residual_stack_one(r#type: ArrayIrType) -> Self {
+        let ArrayIrType::Array(r#type) = r#type else { unreachable!("bounded-while stack ones are always arrays") };
+        Self::from(ArrayIrOperation::<A>::from(OneOperation::new(r#type)))
+    }
+
+    #[inline]
+    fn residual_stack_broadcast(output_type: ArrayType, output_axes: Vec<usize>) -> Self {
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::Broadcast(BroadcastOperation::new(
+            output_type,
+            output_axes,
+        ))))
+    }
+
+    #[inline]
+    fn residual_stack_update() -> Self {
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation::new())))
+    }
+
+    #[inline]
+    fn residual_stack_add() -> Self {
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::Add(AddOperation::new())))
+    }
+
+    #[inline]
+    fn residual_stack_select() -> Self {
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::Select(SelectOperation::new())))
+    }
+
+    #[inline]
+    fn mask_reduce_any(axes: Vec<usize>) -> Self {
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::Reduce(ReduceOperation::new(axes, ReductionKind::Any))))
+    }
+
+    #[inline]
+    fn mask_and() -> Self {
+        Self::from(ArrayIrOperation::<A>::Array(ArrayOperation::And(AndOperation::new())))
     }
 }
 
@@ -2759,6 +2887,127 @@ pub trait WhilePredicate: Concretizable<bool> + Clone + Sized {
     /// against their shape along its leading (prefix) axes.
     fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
         Ok(if self.concretize()? { on_true.clone() } else { on_false.clone() })
+    }
+}
+
+// Batched while-predicate semantics for [`Array`]: `any_true` reduces the whole Boolean payload with `or`, and
+// `mask_select` broadcasts the predicate against its other inputs along its leading (prefix) axes, so predicate item
+// `i` masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
+impl WhilePredicate for Array {
+    fn any_true(&self) -> Result<bool, ProgramError> {
+        if !self.r#type().data_type().is_boolean() {
+            return Err(ProgramError::Concretization {
+                message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type()),
+            });
+        }
+        let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        Ok((0..addressing.element_count())
+            .any(|index| self.storage_bytes()[addressing.byte_range_for_flat_index(index).start] != 0))
+    }
+
+    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        let predicate_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let true_addressing = ArrayAddressing::new(on_true.r#type().into_owned())?;
+        if !self.r#type().data_type().is_boolean()
+            || on_true.r#type() != on_false.r#type()
+            || predicate_addressing.element_count() == 0
+            || !true_addressing.element_count().is_multiple_of(predicate_addressing.element_count())
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "mask_select requires a Boolean predicate whose element count divides congruent inputs, but \
+                     got predicate {} with inputs {} and {}",
+                    self.r#type(),
+                    on_true.r#type(),
+                    on_false.r#type(),
+                ),
+            });
+        }
+        ArrayType::check_matching_manual_variation(
+            "mask_select",
+            &[self.r#type().as_ref(), on_true.r#type().as_ref(), on_false.r#type().as_ref()],
+        )?;
+        let block = true_addressing.element_count() / predicate_addressing.element_count();
+        let mut output_bytes = vec![0; true_addressing.storage_byte_len()];
+        for index in 0..true_addressing.element_count() {
+            let predicate_range = predicate_addressing.byte_range_for_flat_index(index / block);
+            let source = if self.storage_bytes()[predicate_range.start] != 0 {
+                on_true.storage_bytes()
+            } else {
+                on_false.storage_bytes()
+            };
+            let source_range = true_addressing.byte_range_for_flat_index(index);
+            output_bytes[source_range.clone()].copy_from_slice(&source[source_range]);
+        }
+        Ok(Self::new_unchecked(on_true.r#type().into_owned(), Arc::new(output_bytes)))
+    }
+}
+
+// Composite predicates delegate to their array payload. Under a batched predicate, equal dimension and reference
+// carries pass through unchanged; the eager `while` interpreter selects distinct reference carries wholesale under a
+// scalar predicate and rejects a batched predicate over them, since effectful state has no per-item value to mask.
+impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValue<A> {
+    fn any_true(&self) -> Result<bool, ProgramError> {
+        match self {
+            Self::Array(predicate) => predicate.any_true(),
+            Self::Dimension(value) => Err(ProgramError::Concretization {
+                message: format!("cannot use first-class dimension `{value}` as a while predicate"),
+            }),
+            Self::Reference(value) => Err(ProgramError::Concretization {
+                message: format!("cannot use reference `{value}` as a while predicate"),
+            }),
+        }
+    }
+
+    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        let predicate = match self {
+            Self::Array(predicate) => predicate,
+            Self::Dimension(value) => {
+                return Err(ProgramError::Concretization {
+                    message: format!("cannot use first-class dimension `{value}` as a while predicate"),
+                });
+            }
+            Self::Reference(value) => {
+                return Err(ProgramError::Concretization {
+                    message: format!("cannot use reference `{value}` as a while predicate"),
+                });
+            }
+        };
+        match (on_true, on_false) {
+            (Self::Array(on_true), Self::Array(on_false)) => Ok(Self::Array(predicate.mask_select(on_true, on_false)?)),
+            (Self::Dimension(on_true), Self::Dimension(on_false)) => {
+                // Selecting between equal dimension carries (e.g., the loop-invariant mapped extent that structural
+                // batching threads through a while loop's state) is the identity for every item, so it needs no
+                // scalar predicate. Distinct dimension carries fall back to the scalar-predicate semantics because
+                // one dimension value cannot represent independently masked per-item extents.
+                if on_true == on_false {
+                    return Ok(Self::Dimension(on_true.clone()));
+                }
+                Ok(Self::Dimension(if predicate.concretize()? { on_true.clone() } else { on_false.clone() }))
+            }
+            (Self::Reference(on_true), Self::Reference(on_false)) => {
+                // A reference carry has one state per allocation rather than one per batch item, so it is never
+                // masked: identical carries (the common loop-invariant case) need no selection, a scalar predicate
+                // selects one carry wholesale, and a batched predicate over distinct carries has no per-item meaning.
+                if on_true == on_false {
+                    return Ok(Self::Reference(on_true.clone()));
+                }
+                if predicate.r#type().rank() != 0 {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: "a batched while predicate cannot select between distinct reference carries per \
+                                  batch item; reference state has one value per allocation"
+                            .to_string(),
+                    });
+                }
+                Ok(Self::Reference(if predicate.concretize()? { on_true.clone() } else { on_false.clone() }))
+            }
+            _ => Err(TypeError::invalid(format!(
+                "while predicate cannot select between mismatched state types {} and {}",
+                on_true.r#type().as_ref(),
+                on_false.r#type().as_ref(),
+            ))
+            .into()),
+        }
     }
 }
 
@@ -7374,5 +7623,514 @@ mod tests {
                     while loops is not supported; eager differentiation executes concrete duals, and loops built \
                     with `with_iteration_bound` stage a transposable masked scan)",
         ));
+    }
+
+    fn doubling_while_regions(
+        extent_type: DimensionType,
+    ) -> Vec<Program<TestIrValue, TestIrOperation, Vec<TestIrValue>, Vec<TestIrValue>>> {
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        condition_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let state = condition_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let limit = condition_builder.add_constant(array(Array::scalar(8.0).unwrap()));
+        let predicate = condition_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![state, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder.build(vec![predicate], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let extent = body_builder.add_input(ArrayIrType::Dimension(extent_type));
+        let state = body_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let doubled = body_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![state, state],
+                None,
+            )
+            .unwrap()[0];
+        let body = body_builder.build(vec![extent, doubled], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+        vec![condition, body]
+    }
+
+    #[test]
+    fn test_composite_while_jvp_omits_the_dimension_state_tangent() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let state = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let regions = doubling_while_regions(extent_type.clone());
+        let regions = regions.iter().map(|region| builder.import_region(region.entry_region_ref())).collect();
+        let outputs = builder
+            .add_instruction(
+                TestIrOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                regions,
+                vec![extent, state],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder.build(outputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_count(), 3);
+        assert_eq!(jvp.output_count(), 3);
+        let outputs = jvp
+            .interpret(vec![
+                dimension(&extent_type, 4),
+                array(Array::scalar(1.0).unwrap()),
+                array(Array::scalar(3.0).unwrap()),
+            ])
+            .unwrap();
+        assert!(matches!(&outputs[0], TestIrValue::Dimension(value) if value.extent() == 4));
+        assert!(matches!(&outputs[1], TestIrValue::Array(value) if value.to_f64s() == vec![8.0]));
+        assert!(matches!(&outputs[2], TestIrValue::Array(value) if value.to_f64s() == vec![24.0]));
+
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![dimension(&extent_type, 4), array(Array::scalar(1.0).unwrap())])
+            .unwrap();
+        let residuals = primal_outputs.split_off(2);
+        let mut pullback_inputs = vec![array(Array::scalar(1.0).unwrap())];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::scalar(8.0).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_composite_bounded_while_pullback_supports_batched_predicates() {
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let state = condition_builder.add_input(ArrayIrType::Array(vector_type.clone()));
+        let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
+        let predicate = condition_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![state, limits],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let state = body_builder.add_input(ArrayIrType::Array(vector_type.clone()));
+        let doubled = body_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![state, state],
+                None,
+            )
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let state = builder.add_input(ArrayIrType::Array(vector_type));
+        let regions =
+            vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
+        let outputs = builder
+            .add_instruction(
+                TestIrOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                regions,
+                vec![state],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs =
+            linearization.primal().interpret(vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())]).unwrap();
+        assert_eq!(primal_outputs[0], array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
+        let residuals = primal_outputs.split_off(1);
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_composite_bounded_while_differentiation_supports_batched_predicates_with_dimension_state() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+
+        // Condition: a per-item predicate `state < [2, 4, 8]` that ignores the loop-invariant dimension carry.
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        condition_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let state = condition_builder.add_input(ArrayIrType::Array(vector_type.clone()));
+        let limits = condition_builder.add_constant(array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
+        let predicate = condition_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![state, limits],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Body: the dimension carry is forwarded unchanged and the array carry doubles.
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let extent = body_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let state = body_builder.add_input(ArrayIrType::Array(vector_type.clone()));
+        let doubled = body_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![state, state],
+                None,
+            )
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![extent, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let state = builder.add_input(ArrayIrType::Array(vector_type));
+        let regions =
+            vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
+        let outputs = builder
+            .add_instruction(
+                TestIrOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                regions,
+                vec![extent, state],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // Starting from `[1, 1, 1]`, item `i` doubles `i + 1` times before its own predicate turns false, so the
+        // primal outputs are `[2, 4, 8]` and the per-item tangent scale factors are the matching `[2, 4, 8]`. The
+        // dimension carry has an empty tangent space, so it contributes neither a tangent input nor a tangent output.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_count(), 3);
+        assert_eq!(jvp.output_count(), 3);
+        let outputs = jvp
+            .interpret(vec![
+                dimension(&extent_type, 4),
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
+            ])
+            .unwrap();
+        assert_eq!(outputs[0], dimension(&extent_type, 4));
+        assert_eq!(outputs[1], array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
+        assert_eq!(outputs[2], array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
+
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![dimension(&extent_type, 4), array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())])
+            .unwrap();
+        assert_eq!(primal_outputs[0], dimension(&extent_type, 4));
+        assert_eq!(primal_outputs[1], array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap()));
+        let residuals = primal_outputs.split_off(2);
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::vector(vec![2.0, 4.0, 8.0]).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_composite_bounded_while_pullback_threads_invariant_dimension_residuals_as_scan_carries() {
+        let extent_variable = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let extent_type = DimensionType::from(extent_variable.clone());
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_variable)]));
+
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        condition_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        condition_builder.add_input(ArrayIrType::Array(vector_type.clone()));
+        let counter = condition_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
+        let limit = condition_builder.add_constant(array(Array::scalar(2i64).unwrap()));
+        let predicate = condition_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let extent = body_builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let vector = body_builder.add_input(ArrayIrType::Array(vector_type.clone()));
+        let counter = body_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
+        let reshaped = body_builder
+            .add_instruction(
+                TestIrOperation::from(DynamicReshapeOperation::new()),
+                Vec::new(),
+                vec![vector, extent],
+                None,
+            )
+            .unwrap()[0];
+        let one = body_builder.add_constant(array(Array::scalar(1i64).unwrap()));
+        let next_counter = body_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![counter, one],
+                None,
+            )
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![extent, reshaped, next_counter],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let vector = builder.add_input(ArrayIrType::Array(vector_type));
+        let counter = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
+        let regions =
+            vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
+        let outputs = builder
+            .add_instruction(
+                TestIrOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                regions,
+                vec![extent, vector, counter],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let rendered_primal = linearization.primal().to_string();
+        let rendered_tangent = linearization.tangent().to_string();
+
+        // The residual scan threads the invariant extent as a carry. The known side of its split only forwards the
+        // stacked mask that the residual scan consumes, so the primal program needs no known scan.
+        assert!(rendered_tangent.contains("scan [carry_count=2"), "{rendered_tangent}");
+        assert!(!rendered_primal.contains("scan"), "{rendered_primal}");
+        assert!(!rendered_primal.contains("dimension_to_scalar"), "{rendered_primal}");
+        assert!(!rendered_tangent.contains("dimension_from_scalar"), "{rendered_tangent}");
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                dimension(&extent_type, 3),
+                array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
+                array(Array::scalar(0i64).unwrap()),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(3);
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_composite_bounded_while_pullback_stacks_varying_dimension_residuals_through_scalar_gateways() {
+        let iteration_variable = DimensionVariable::new("iteration", DimensionBounds::positive(Some(4)).unwrap());
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let scalar_u64 = ArrayType::scalar(DataType::U64);
+
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        condition_builder.add_input(ArrayIrType::Array(scalar_f64.clone()));
+        let counter = condition_builder.add_input(ArrayIrType::Array(scalar_u64.clone()));
+        let limit = condition_builder.add_constant(array(Array::scalar(3_u64).unwrap()));
+        let predicate = condition_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let state = body_builder.add_input(ArrayIrType::Array(scalar_f64.clone()));
+        let counter = body_builder.add_input(ArrayIrType::Array(scalar_u64.clone()));
+        let iteration = body_builder
+            .add_instruction(
+                TestIrOperation::from(DimensionFromScalarOperation::new(iteration_variable)),
+                Vec::new(),
+                vec![counter],
+                None,
+            )
+            .unwrap()[0];
+        let repeated = body_builder
+            .add_instruction(
+                TestIrOperation::from(DynamicBroadcastOperation::new(Vec::new())),
+                Vec::new(),
+                vec![state, iteration],
+                None,
+            )
+            .unwrap()[0];
+        let next_state = body_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum))),
+                Vec::new(),
+                vec![repeated],
+                None,
+            )
+            .unwrap()[0];
+        let one = body_builder.add_constant(array(Array::scalar(1_u64).unwrap()));
+        let next_counter = body_builder
+            .add_instruction(
+                TestIrOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![counter, one],
+                None,
+            )
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![next_state, next_counter],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let state = builder.add_input(ArrayIrType::Array(scalar_f64));
+        let counter = builder.add_input(ArrayIrType::Array(scalar_u64));
+        let regions =
+            vec![builder.import_region(condition.entry_region_ref()), builder.import_region(body.entry_region_ref())];
+        let outputs = builder
+            .add_instruction(
+                TestIrOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
+                regions,
+                vec![state, counter],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let rendered_primal = linearization.primal().to_string();
+        let rendered_tangent = linearization.tangent().to_string();
+        assert!(rendered_primal.contains("dimension_to_scalar"), "{rendered_primal}");
+        assert!(rendered_tangent.contains("dimension_from_scalar"), "{rendered_tangent}");
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![array(Array::scalar(2.0).unwrap()), array(Array::scalar(1_u64).unwrap())])
+            .unwrap();
+        let residuals = primal_outputs.split_off(2);
+        let mut pullback_inputs = vec![array(Array::scalar(1.0).unwrap())];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::scalar(2.0).unwrap())])
+        );
+    }
+
+    #[test]
+    fn test_array_mask_select_manual_variation() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = ArrayType::scalar(DataType::Boolean)
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let predicate = Array::from_elements(varying_type.clone(), &[true]).unwrap();
+        let invariant = Array::scalar(false).unwrap();
+        assert_eq!(
+            predicate.mask_select(&invariant, &invariant),
+            Err(TypeError::invalid(
+                "`mask_select` inputs must have matching varying manual axes; insert `parallel_vary` on the inputs \
+                 that lack an axis, as `align_manual_variation` does"
+            )
+            .into()),
+        );
+        let varying = Array::from_elements(varying_type, &[false]).unwrap();
+        assert_eq!(predicate.mask_select(&varying, &varying), Ok(varying));
+    }
+
+    #[test]
+    fn test_array_while_predicate() {
+        let predicate = Array::vector(vec![false, true]).unwrap();
+        assert_eq!(predicate.any_true(), Ok(true));
+        assert_eq!(Array::vector(vec![false, false]).unwrap().any_true(), Ok(false));
+        assert!(Array::vector(vec![1.0]).unwrap().any_true().is_err());
+        // Predicate item `i` masks the contiguous per-item block of `on_true` and `on_false` elements it governs.
+        let on_true =
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        let on_false =
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[-1.0, -2.0, -3.0, -4.0])
+                .unwrap();
+        assert_eq!(
+            predicate.mask_select(&on_true, &on_false).unwrap(),
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [2, 2]), &[-1.0, -2.0, 3.0, 4.0]).unwrap(),
+        );
+
+        // Predicate and branch layouts are independent of logical masking. The output preserves the congruent branch
+        // layout, including its hole, while selecting exact element bytes in logical order.
+        let predicate_type =
+            ArrayType::new_static(DataType::Boolean, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+        let predicate = Array::from_elements(predicate_type, &[false, true]).unwrap();
+        assert_eq!(predicate.any_true(), Ok(true));
+        let branch_type =
+            ArrayType::new_static(DataType::U16, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
+        let on_true = Array::from_elements(branch_type.clone(), &[0x1111u16, 0x2222, 0x3333, 0x4444]).unwrap();
+        let on_false = Array::from_elements(branch_type.clone(), &[0xaaaau16, 0xbbbb, 0xcccc, 0xdddd]).unwrap();
+        let selected = predicate.mask_select(&on_true, &on_false).unwrap();
+        assert_eq!(selected.r#type().as_ref(), &branch_type);
+        assert_eq!(selected.elements::<u16>(), Ok(vec![0xaaaa, 0xbbbb, 0x3333, 0x4444]));
+        assert_eq!(selected.storage_bytes(), [0x33, 0x33, 0x44, 0x44, 0, 0, 0xaa, 0xaa, 0xbb, 0xbb]);
+
+        // Reference carries are selected wholesale by a scalar predicate: the handle itself is selected, never its
+        // contents, so the selected carry aliases the chosen input.
+        let on_true = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0f32).unwrap()));
+        let on_false = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0f32).unwrap()));
+        assert_eq!(
+            ArrayIrValue::Array(Array::scalar(true).unwrap()).mask_select(&on_true, &on_false),
+            Ok(on_true.clone())
+        );
+        assert_eq!(
+            ArrayIrValue::Array(Array::scalar(false).unwrap()).mask_select(&on_true, &on_false),
+            Ok(on_false.clone())
+        );
+
+        // A batched predicate cannot mask a reference per item, so it accepts only identical carries.
+        let predicate = ArrayIrValue::Array(Array::vector(vec![false, true]).unwrap());
+        assert_eq!(predicate.mask_select(&on_true, &on_true), Ok(on_true.clone()));
+        assert_eq!(
+            predicate.mask_select(&on_true, &on_false),
+            Err(ProgramError::UnsupportedOperation {
+                message: "a batched while predicate cannot select between distinct reference carries per batch item; \
+                          reference state has one value per allocation"
+                    .to_string(),
+            }),
+        );
     }
 }

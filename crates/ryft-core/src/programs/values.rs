@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
+use std::hash::Hasher;
 
 use ryft_macros::Parameter;
 
@@ -482,6 +483,24 @@ impl<T: Type, C, V: Concretizable<C>> Concretizable<C> for ProjectedValue<T, V> 
     fn concretize(&self) -> Result<C, ProgramError> {
         self.value.concretize()
     }
+}
+
+/// Exact identity of a literal stored in an operation attribute, such as the value of a
+/// [`ConstantOperation`](crate::ConstantOperation) or the fill value of a [`GatherMode::Fill`](crate::GatherMode::Fill)
+/// instance. Operations compare and hash their stored literals through this trait so that operation equality is a
+/// faithful key of what backends receive (i.e., two literals are identical exactly when they have the same type and the
+/// same encoded payload, which is what lowering emits). This is stricter than numeric value equality, which treats
+/// `-0.0` and `+0.0` as equal and NaN as unequal to itself, and is why [`Array`](crate::Array) implements this trait
+/// bitwise even though its [`PartialEq`] implementation compares values.
+///
+/// Implementations must make [`Self::literal_eq`] an equivalence relation and keep [`Self::literal_hash`] consistent
+/// with it (i.e., identical literals must feed identical data into the hasher).
+pub trait LiteralIdentity {
+    /// Returns whether `self` and `other` are the same literal.
+    fn literal_eq(&self, other: &Self) -> bool;
+
+    /// Feeds the identity of this literal into `state`, consistently with [`Self::literal_eq`].
+    fn literal_hash<H: Hasher>(&self, state: &mut H);
 }
 
 /// Renames a value's type-identity metadata by _rejection_ meaning that identity renamings and renamings that leave

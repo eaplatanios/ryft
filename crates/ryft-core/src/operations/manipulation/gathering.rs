@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::arrays::{
@@ -34,8 +35,8 @@ use crate::operations::manipulation::scattering::{
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueProjection,
+    LiteralIdentity, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface,
+    TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
 /// Determines how [`Gather`] handles windows extending outside its input. Negative indices are out of bounds and they
@@ -44,8 +45,9 @@ use crate::programs::{
 /// `V` is the stored constant representation, independent of the gathered value or tracer. Built-in operation families
 /// use [`Array`] literals, just as their [`ConstantOperation`](crate::ConstantOperation) variants do. A custom
 /// operation family can choose another [`Value`] representation. An explicit fill is a constant attribute and does
-/// not introduce another operation input or receive a gradient.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// not introduce another operation input or receive a gradient. Equality and hashing compare an explicit fill value
+/// through [`LiteralIdentity`], so they match what backends receive.
+#[derive(Clone, Debug, Default)]
 pub enum GatherMode<V: Value<Type = ArrayType> = Array> {
     /// The caller promises every window is in bounds. Violating the promise leaves results and gradients undefined.
     #[default]
@@ -80,6 +82,34 @@ impl<V: Value<Type = ArrayType>> Display for GatherMode<V> {
         match self {
             Self::Fill { value: Some(value) } => write!(formatter, "fill(value={value})"),
             _ => write!(formatter, "{}", self.name()),
+        }
+    }
+}
+
+impl<V: Value<Type = ArrayType> + LiteralIdentity> PartialEq for GatherMode<V> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::PromiseInBounds, Self::PromiseInBounds) | (Self::Clip, Self::Clip) => true,
+            (Self::Fill { value: left }, Self::Fill { value: right }) => match (left, right) {
+                (Some(left), Some(right)) => left.literal_eq(right),
+                (None, None) => true,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+impl<V: Value<Type = ArrayType> + LiteralIdentity> Eq for GatherMode<V> {}
+
+impl<V: Value<Type = ArrayType> + LiteralIdentity> Hash for GatherMode<V> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        if let Self::Fill { value } = self {
+            value.is_some().hash(state);
+            if let Some(value) = value {
+                value.literal_hash(state);
+            }
         }
     }
 }
@@ -172,7 +202,7 @@ impl GatherDimensionNumbers {
 /// Optional behavior and output placement for [`Gather`]. Geometry is supplied separately as [`GatherDimensionNumbers`]
 /// and slice sizes. The default promises in-bounds indices, makes no sortedness or non-overlap promise, and infers
 /// output [`Sharding`]. Explicit fill values remain constant attributes and do not receive gradients.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct GatherOptions<V: Value<Type = ArrayType> = Array> {
     /// Refer to the documentation of [`mode`](Self::mode) for more information.
     mode: GatherMode<V>,
@@ -339,6 +369,28 @@ impl<V: Value<Type = ArrayType>> Default for GatherOptions<V> {
     }
 }
 
+impl<V: Value<Type = ArrayType> + LiteralIdentity> PartialEq for GatherOptions<V> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.indices_are_sorted == other.indices_are_sorted
+            && self.unique_indices == other.unique_indices
+            && self.output_sharding == other.output_sharding
+    }
+}
+
+impl<V: Value<Type = ArrayType> + LiteralIdentity> Eq for GatherOptions<V> {}
+
+impl<V: Value<Type = ArrayType> + LiteralIdentity> Hash for GatherOptions<V> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.mode.hash(state);
+        self.indices_are_sorted.hash(state);
+        self.unique_indices.hash(state);
+        self.output_sharding.hash(state);
+    }
+}
+
 /// Canonical operation name for [`GatherOperation`].
 pub const GATHER_OPERATION_NAME: &str = "gather";
 
@@ -350,7 +402,7 @@ pub const GATHER_OPERATION_NAME: &str = "gather";
 /// placement. Construction stores these settings and type inference validates them against the input and indices.
 /// The `V` parameter describes the stored fill constant, not the gathered input. See [`GatherMode`] for the
 /// distinction between a stored literal and a flowing value.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct GatherOperation<V: Value<Type = ArrayType> = Array> {
     /// Refer to the documentation of [`dimensions`](Self::dimensions) for more information.
     dimensions: GatherDimensionNumbers,
@@ -514,6 +566,24 @@ impl<V: Value<Type = ArrayType>> Display for GatherOperation<V> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
+    }
+}
+
+impl<V: Value<Type = ArrayType> + LiteralIdentity> PartialEq for GatherOperation<V> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.dimensions == other.dimensions && self.slice_sizes == other.slice_sizes && self.options == other.options
+    }
+}
+
+impl<V: Value<Type = ArrayType> + LiteralIdentity> Eq for GatherOperation<V> {}
+
+impl<V: Value<Type = ArrayType> + LiteralIdentity> Hash for GatherOperation<V> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.dimensions.hash(state);
+        self.slice_sizes.hash(state);
+        self.options.hash(state);
     }
 }
 
@@ -1994,6 +2064,7 @@ mod tests {
         EffectClasses, EmptyRegionDriver, OperationProvider, Program, ProgramBuilder, ReferenceDischargeContext,
         ReferenceDischargeValue, ReferenceDischargeableOperation,
     };
+    use crate::tests::hash_of;
     use crate::tracing::{DomainTracingContext, Trace, Tracer, TracingContext};
 
     use super::*;
@@ -2122,6 +2193,29 @@ mod tests {
         assert_eq!(format!("{:?}", GatherMode::<Array>::PromiseInBounds), "PromiseInBounds");
         assert_eq!(format!("{:?}", GatherMode::<Array>::Clip), "Clip");
         assert_eq!(format!("{:?}", GatherMode::<Array>::Fill { value: None }), "Fill { value: None }");
+    }
+
+    #[test]
+    fn test_gather_mode_identity() {
+        // Modes without fill values are equal exactly when they are the same mode.
+        assert_eq!(GatherMode::<Array>::PromiseInBounds, GatherMode::PromiseInBounds);
+        assert_eq!(hash_of(&GatherMode::<Array>::Clip), hash_of(&GatherMode::<Array>::Clip));
+        assert_ne!(GatherMode::<Array>::PromiseInBounds, GatherMode::Clip);
+        assert_ne!(GatherMode::<Array>::Clip, GatherMode::Fill { value: None });
+
+        // Explicit fill values compare as literals, so identical fills are equal and hash identically, while fills
+        // that are numerically equal but bitwise different (or bitwise equal NaNs) follow their encodings.
+        let fill = |value: f32| GatherMode::Fill { value: Some(Box::new(Array::scalar(value).unwrap())) };
+        assert_eq!(fill(7.0), fill(7.0));
+        assert_eq!(hash_of(&fill(7.0)), hash_of(&fill(7.0)));
+        let modes = HashMap::from([(fill(7.0), "fill")]);
+        assert_eq!(modes.get(&fill(7.0)), Some(&"fill"));
+        assert_eq!(modes.get(&fill(8.0)), None);
+        assert_ne!(fill(-0.0), fill(0.0));
+        assert_eq!(fill(f32::NAN), fill(f32::NAN));
+        assert_eq!(hash_of(&fill(f32::NAN)), hash_of(&fill(f32::NAN)));
+        assert_ne!(fill(7.0), GatherMode::Fill { value: Some(Box::new(Array::scalar(7.0f64).unwrap())) });
+        assert_ne!(fill(7.0), GatherMode::Fill { value: None });
     }
 
     #[test]
@@ -2313,6 +2407,37 @@ mod tests {
         let operation = operation.with_options(GatherOptions::new());
         assert_eq!(operation.mode(), &GatherMode::PromiseInBounds);
         assert!(!operation.unique_indices());
+    }
+
+    #[test]
+    fn test_gather_identity() {
+        // Operations with equal dimension numbers, slice sizes, and options are equal and hash identically.
+        let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
+        let operation = GatherOperation::<Array>::new(dimensions.clone(), vec![1, 2]).with_mode(GatherMode::Clip);
+        let same_operation = GatherOperation::<Array>::new(dimensions.clone(), vec![1, 2]).with_mode(GatherMode::Clip);
+        assert_eq!(operation, same_operation);
+        assert_eq!(hash_of(&operation), hash_of(&same_operation));
+        let operations = HashMap::from([(operation.clone(), "gather")]);
+        assert_eq!(operations.get(&same_operation), Some(&"gather"));
+
+        // Every attribute participates in the identity.
+        assert_ne!(operation, GatherOperation::new(dimensions.clone(), vec![1, 1]).with_mode(GatherMode::Clip));
+        assert_ne!(operation, operation.clone().with_mode(GatherMode::PromiseInBounds));
+        assert_ne!(operation, operation.clone().with_indices_are_sorted(true));
+        assert_ne!(operation, operation.clone().with_unique_indices(true));
+        assert_ne!(
+            operation,
+            GatherOperation::new(GatherDimensionNumbers::new(vec![0], vec![1], vec![1]), vec![1, 2])
+                .with_mode(GatherMode::Clip),
+        );
+
+        // Fill values compare as literals.
+        let fill = |value: f32| {
+            GatherOperation::<Array>::new(dimensions.clone(), vec![1, 2])
+                .with_mode(GatherMode::Fill { value: Some(Box::new(Array::scalar(value).unwrap())) })
+        };
+        assert_eq!(fill(f32::NAN), fill(f32::NAN));
+        assert_ne!(fill(-0.0), fill(0.0));
     }
 
     #[test]

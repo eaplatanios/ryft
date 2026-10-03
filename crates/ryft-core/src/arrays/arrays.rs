@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use approx::AbsDiffEq;
@@ -23,7 +24,7 @@ use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::contexts::EagerContext;
 use crate::operations::ElementType;
 use crate::parameters::Parameter;
-use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
+use crate::programs::{Concretizable, LiteralIdentity, ProgramError, TypeError, Typed, Value};
 
 /// Dense multidimensional [`Value`] whose [`Type`](crate::Type) is an [`ArrayType`]. It is the reference array value
 /// of Ryft, and it exists primarily to exercise the tracing, transformation, and interpretation machinery with programs
@@ -788,6 +789,22 @@ impl Value for Array {
     }
 }
 
+impl LiteralIdentity for Array {
+    // An array's physical storage is canonical for its type (layout holes and tile padding are always zero), so
+    // comparing the type and the storage bytes compares the literal exactly. Shared storage short-circuits the byte
+    // comparison.
+    fn literal_eq(&self, other: &Self) -> bool {
+        self.r#type() == other.r#type()
+            && (std::ptr::eq(self.storage_bytes(), other.storage_bytes())
+                || self.storage_bytes() == other.storage_bytes())
+    }
+
+    fn literal_hash<H: Hasher>(&self, state: &mut H) {
+        self.r#type().hash(state);
+        self.storage_bytes().hash(state);
+    }
+}
+
 impl TryFrom<bool> for Array {
     type Error = ProgramError;
 
@@ -796,9 +813,10 @@ impl TryFrom<bool> for Array {
     }
 }
 
-// Approximate equality requires identical array types. Floating-point payloads compare through their exactly widened
-// `f64` values, complex payloads compare both components, and all other element types use exact equality.
 impl AbsDiffEq for Array {
+    // Approximate equality requires identical array types. Floating-point payloads compare through their exactly
+    // widened `f64` values, complex payloads compare both components, and all other element types use exact equality.
+
     type Epsilon = f64;
 
     fn default_epsilon() -> f64 {
@@ -987,6 +1005,8 @@ mod tests {
     use crate::arrays::{DimensionBounds, DimensionVariable, Layout, StridedLayout};
     use crate::operations::complex::Complex;
     use crate::operations::{Compare, ComparisonDirection};
+
+    use crate::tests::literal_hash_of;
 
     use super::*;
 
@@ -1614,6 +1634,41 @@ mod tests {
         // The zero differential space has a unique zero value, while an effect token is not a numerical zero.
         assert!(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap().is_zero());
         assert!(!Array::new(ArrayType::scalar(DataType::Token), Vec::new()).unwrap().is_zero());
+    }
+
+    #[test]
+    fn test_literal_identity_array() {
+        // An array is literally identical to its clone and to an independently constructed array with the same type
+        // and storage, and literally identical arrays hash identically.
+        let array = Array::vector(vec![1.0f32, -2.5]).unwrap();
+        let same_array = Array::vector(vec![1.0f32, -2.5]).unwrap();
+        assert!(array.literal_eq(&array.clone()));
+        assert!(array.literal_eq(&same_array));
+        assert_eq!(literal_hash_of(&array), literal_hash_of(&array.clone()));
+        assert_eq!(literal_hash_of(&array), literal_hash_of(&same_array));
+        assert!(!array.literal_eq(&Array::vector(vec![1.0f32, 2.5]).unwrap()));
+
+        // Identical storage bytes under different types are distinct literals.
+        let float = Array::scalar(1.0f32).unwrap();
+        let integer = Array::new(ArrayType::scalar(DataType::I32), 1.0f32.to_le_bytes().to_vec()).unwrap();
+        assert_eq!(float.storage_bytes(), integer.storage_bytes());
+        assert!(!float.literal_eq(&integer));
+
+        // Literal identity is bitwise, unlike the IEEE value equality of `Array::eq`: signed zeros are numerically
+        // equal but distinct literals.
+        let negative_zero = Array::scalar(-0.0f64).unwrap();
+        let positive_zero = Array::scalar(0.0f64).unwrap();
+        assert_eq!(negative_zero, positive_zero);
+        assert!(!negative_zero.literal_eq(&positive_zero));
+
+        // A NaN is numerically unequal to itself but is the same literal as any NaN with identical bits.
+        let nan = Array::scalar(f64::NAN).unwrap();
+        let same_nan = Array::scalar(f64::NAN).unwrap();
+        assert_ne!(nan, nan.clone());
+        assert!(nan.literal_eq(&nan));
+        assert!(nan.literal_eq(&same_nan));
+        assert_eq!(literal_hash_of(&nan), literal_hash_of(&same_nan));
+        assert!(!nan.literal_eq(&Array::scalar(-f64::NAN).unwrap()));
     }
 
     #[test]

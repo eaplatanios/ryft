@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 
 use crate::arrays::{ArrayType, Broadcastable};
 use crate::macros::check_count;
@@ -58,9 +59,9 @@ pub use constants::{
     ZeroLikeOperation, ZeroOperation,
 };
 pub use control_flow::{
-    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation,
-    ScanReferenceDischarge, Select, SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate,
-    WhileTypeSemantics, transpose_primal_condition, transpose_primal_scan,
+    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation, Select,
+    SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics,
+    transpose_primal_condition,
 };
 pub use cumulative::{CUMULATIVE_OPERATION_NAME, Cumulative, CumulativeKind, CumulativeOperation, associative_scan};
 pub use custom_functions::{
@@ -190,7 +191,7 @@ pub trait ElementwiseOperation: Operation<Type = ArrayType> {
 /// it never changes the operation's type or its mathematical definition. Backends without alternative implementations,
 /// including the eager reference [`Array`](crate::Array) kernels, evaluate their only implementation for every
 /// accuracy, and a backend compiler reports an error when it cannot satisfy a requested [`Tolerance`].
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Accuracy {
     /// Backend-selected default implementation.
     #[default]
@@ -224,7 +225,10 @@ impl Display for Accuracy {
 /// the tolerance when its error stays within the absolute tolerance, the relative tolerance, or the provided number of
 /// units in the last place of the exact result. At most two of the three tolerances are typically combined (i.e., an
 /// absolute tolerance with either a relative tolerance or a number of units in the last place).
-#[derive(Copy, Clone, Debug, PartialEq)]
+///
+/// Equality and hashing compare the floating-point tolerances bitwise, so `-0.0` and `+0.0` tolerances are distinct.
+/// This makes [`Tolerance`] (and the operations that carry it) a faithful key of the attribute that backends receive.
+#[derive(Copy, Clone, Debug)]
 pub struct Tolerance {
     /// Absolute error tolerance.
     absolute: f64,
@@ -289,8 +293,30 @@ impl Tolerance {
     }
 }
 
+impl PartialEq for Tolerance {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.absolute.to_bits() == other.absolute.to_bits()
+            && self.relative.to_bits() == other.relative.to_bits()
+            && self.units_of_least_precision == other.units_of_least_precision
+    }
+}
+
+impl Eq for Tolerance {}
+
+impl Hash for Tolerance {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.absolute.to_bits().hash(state);
+        self.relative.to_bits().hash(state);
+        self.units_of_least_precision.hash(state);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -298,6 +324,7 @@ mod tests {
         MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::programs::RegionInterface;
+    use crate::tests::hash_of;
 
     use super::*;
 
@@ -508,5 +535,32 @@ mod tests {
                 message: "at least one accuracy tolerance must be non-zero".to_string()
             }),
         );
+    }
+
+    #[test]
+    fn test_tolerance_identity() {
+        // Equal tolerances are equal and hash identically, so they work as map keys.
+        let tolerance = Tolerance::new(1e-6, 1e-3, 2).unwrap();
+        let same_tolerance = Tolerance::new(1e-6, 1e-3, 2).unwrap();
+        assert_eq!(tolerance, tolerance);
+        assert_eq!(tolerance, same_tolerance);
+        assert_eq!(hash_of(&tolerance), hash_of(&same_tolerance));
+        let tolerances = HashMap::from([(tolerance, "tolerance")]);
+        assert_eq!(tolerances.get(&same_tolerance), Some(&"tolerance"));
+        assert_ne!(tolerance, Tolerance::new(1e-6, 1e-3, 3).unwrap());
+
+        // Floating-point tolerances compare bitwise, so signed zeros are distinct even though `-0.0 == 0.0`.
+        let negative_zero = Tolerance::new(-0.0, 0.0, 1).unwrap();
+        let positive_zero = Tolerance::new(0.0, 0.0, 1).unwrap();
+        assert_ne!(negative_zero, positive_zero);
+        assert_ne!(Tolerance::new(0.0, -0.0, 1).unwrap(), positive_zero);
+        assert_eq!(tolerances.get(&negative_zero), None);
+
+        // Accuracy requests inherit the bitwise tolerance identity and distinguish their variants.
+        assert_eq!(Accuracy::Tolerance(tolerance), Accuracy::Tolerance(same_tolerance));
+        assert_eq!(hash_of(&Accuracy::Tolerance(tolerance)), hash_of(&Accuracy::Tolerance(same_tolerance)));
+        assert_ne!(Accuracy::Tolerance(negative_zero), Accuracy::Tolerance(positive_zero));
+        assert_ne!(Accuracy::Tolerance(tolerance), Accuracy::Highest);
+        assert_ne!(Accuracy::Highest, Accuracy::Default);
     }
 }

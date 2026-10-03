@@ -2829,7 +2829,6 @@ pub(super) fn replay_custom_jvp_rule<
 
 #[cfg(test)]
 mod tests {
-    use std::collections::hash_map::DefaultHasher;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2887,7 +2886,7 @@ mod tests {
         OutputRegionProvenance, Program, ProgramBuilder, ReferenceAccessDescriptor, ReferenceAccessOperation,
         ReferenceType, RegionDriver, RegionInterface, RegionRole, RegionSlot, ValueProjection,
     };
-    use crate::tests::TestArrayOperation;
+    use crate::tests::{TestArrayOperation, hash_of};
     use crate::tracing::{DomainTracer, Trace, TracingContext};
 
     use crate::operations::differentiation::linear_call::tests::scalar_multiply_program;
@@ -3616,13 +3615,6 @@ mod tests {
             .unwrap()
             .into_parts()
             .0
-    }
-
-    /// Returns the hash of `value` under the standard library's default hasher.
-    fn hash_of<T: Hash>(value: &T) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        value.hash(&mut hasher);
-        hasher.finish()
     }
 
     /// Retained-rule definition over [`ReferenceTestOperation`].

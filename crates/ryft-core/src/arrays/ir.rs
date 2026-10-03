@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 
 use ryft_macros::Parameter;
 
@@ -13,7 +14,7 @@ use crate::contexts::{Context, EagerContext};
 use crate::macros::check_count;
 use crate::parameters::Parameter;
 use crate::programs::{
-    Concretizable, OperationProjection, ProgramError, ReferenceId, ReferenceType, Type, TypeError,
+    Concretizable, LiteralIdentity, OperationProjection, ProgramError, ReferenceId, ReferenceType, Type, TypeError,
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
@@ -137,6 +138,26 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
         match self {
             Self::Array(_) | Self::Dimension(_) => None,
             Self::Reference(value) => Some(value.id()),
+        }
+    }
+}
+
+impl<A: Value<Type = ArrayType> + LiteralIdentity> LiteralIdentity for ArrayIrValue<A> {
+    fn literal_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Array(left), Self::Array(right)) => left.literal_eq(right),
+            (Self::Dimension(left), Self::Dimension(right)) => left == right,
+            (Self::Reference(left), Self::Reference(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn literal_hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Array(array) => array.literal_hash(state),
+            Self::Dimension(dimension) => dimension.hash(state),
+            Self::Reference(reference) => reference.hash(state),
         }
     }
 }
@@ -347,6 +368,8 @@ mod tests {
     use crate::partial::PartialTracer;
     use crate::programs::{Atom, Program, ProgramBuilder, Region, RegionArena, RegionId};
     use crate::tracing::{Tracer, TracingContext};
+
+    use crate::tests::literal_hash_of;
 
     use super::*;
 
@@ -583,6 +606,30 @@ mod tests {
             value.rename_type_identities(&merging),
             Err(TypeError::invalid("type identities `source` and `second` are both renamed to `target`")),
         );
+    }
+
+    #[test]
+    fn test_literal_identity_array_ir_value() {
+        // Array literals follow the bitwise array identity.
+        let negative_zero = ArrayIrValue::<Array>::Array(Array::scalar(-0.0f64).unwrap());
+        let same_negative_zero = ArrayIrValue::<Array>::Array(Array::scalar(-0.0f64).unwrap());
+        let positive_zero = ArrayIrValue::<Array>::Array(Array::scalar(0.0f64).unwrap());
+        assert!(negative_zero.literal_eq(&same_negative_zero));
+        assert_eq!(literal_hash_of(&negative_zero), literal_hash_of(&same_negative_zero));
+        assert!(!negative_zero.literal_eq(&positive_zero));
+        let nan = ArrayIrValue::<Array>::Array(Array::scalar(f64::NAN).unwrap());
+        assert!(nan.literal_eq(&ArrayIrValue::Array(Array::scalar(f64::NAN).unwrap())));
+
+        // Dimension literals follow the dimension value identity.
+        let dimension = DimensionValue::constant(3).unwrap();
+        let dimension_literal = ArrayIrValue::<Array>::Dimension(dimension.clone());
+        let same_dimension_literal = ArrayIrValue::<Array>::Dimension(dimension);
+        assert!(dimension_literal.literal_eq(&same_dimension_literal));
+        assert_eq!(literal_hash_of(&dimension_literal), literal_hash_of(&same_dimension_literal));
+        assert!(!dimension_literal.literal_eq(&ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())));
+
+        // Literals of different kinds are never identical.
+        assert!(!dimension_literal.literal_eq(&ArrayIrValue::Array(Array::scalar(3i64).unwrap())));
     }
 
     #[test]

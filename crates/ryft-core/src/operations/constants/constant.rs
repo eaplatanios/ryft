@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
 
 use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DimensionValue};
 use crate::batching::{
@@ -14,8 +15,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming, Value,
-    ValueProjection,
+    LiteralIdentity, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
+    TypeIdentityRenaming, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -64,6 +65,23 @@ impl<V: Value> Debug for ConstantOperation<V> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("ConstantOperation").field("value", &self.value).finish()
+    }
+}
+
+impl<V: Value + LiteralIdentity> PartialEq for ConstantOperation<V> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // Constant operations are identical exactly when their literals are, as defined by `LiteralIdentity`.
+        self.value.literal_eq(&other.value)
+    }
+}
+
+impl<V: Value + LiteralIdentity> Eq for ConstantOperation<V> {}
+
+impl<V: Value + LiteralIdentity> Hash for ConstantOperation<V> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.value.literal_hash(state);
     }
 }
 
@@ -253,6 +271,8 @@ impl<C: Context<Operation: From<ConstantOperation<DimensionValue>>>> DimensionCo
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -267,6 +287,7 @@ mod tests {
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, AtomId, EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, Typed};
+    use crate::tests::hash_of;
     use crate::tracing::{DomainTracingContext, TracingContext};
 
     use super::*;
@@ -291,6 +312,40 @@ mod tests {
                 in (%0)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_constant_identity() {
+        // Constants with identical literals are equal and hash identically, so they work as map keys.
+        let operation = ConstantOperation::new(Array::scalar(3.5).unwrap());
+        let same_operation = ConstantOperation::new(Array::scalar(3.5).unwrap());
+        assert_eq!(operation, same_operation);
+        assert_eq!(hash_of(&operation), hash_of(&same_operation));
+        let operations = HashMap::from([(operation.clone(), "constant")]);
+        assert_eq!(operations.get(&same_operation), Some(&"constant"));
+        assert_ne!(operation, ConstantOperation::new(Array::scalar(4.5).unwrap()));
+        assert_ne!(operation, ConstantOperation::new(Array::scalar(3.5f32).unwrap()));
+
+        // Constant identity follows literal identity rather than IEEE value equality.
+        let negative_zero = ConstantOperation::new(Array::scalar(-0.0f64).unwrap());
+        let positive_zero = ConstantOperation::new(Array::scalar(0.0f64).unwrap());
+        assert_eq!(negative_zero.value(), positive_zero.value());
+        assert_ne!(negative_zero, positive_zero);
+        assert_eq!(operations.get(&negative_zero), None);
+        let nan = ConstantOperation::new(Array::scalar(f64::NAN).unwrap());
+        let same_nan = ConstantOperation::new(Array::scalar(f64::NAN).unwrap());
+        assert_ne!(nan.value(), same_nan.value());
+        assert_eq!(nan, same_nan);
+        assert_eq!(hash_of(&nan), hash_of(&same_nan));
+
+        // Composite literals follow the identity of their kind.
+        let dimension = DimensionValue::constant(3).unwrap();
+        let dimension_operation = ConstantOperation::new(ArrayIrValue::<Array>::Dimension(dimension.clone()));
+        assert_eq!(dimension_operation, ConstantOperation::new(ArrayIrValue::Dimension(dimension)));
+        assert_ne!(
+            ConstantOperation::new(ArrayIrValue::<Array>::Array(Array::scalar(-0.0f64).unwrap())),
+            ConstantOperation::new(ArrayIrValue::<Array>::Array(Array::scalar(0.0f64).unwrap())),
         );
     }
 

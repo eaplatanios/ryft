@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 
 use ryft_macros::Parameter;
 
@@ -7,7 +8,9 @@ use crate::arrays::operations::DimensionOperation;
 use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSION_EXTENT};
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
-use crate::programs::{Concretizable, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed, Value};
+use crate::programs::{
+    Concretizable, LiteralIdentity, ProgramError, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+};
 
 /// Checked host representation of a first-class runtime [`Dimension`](crate::Dimension) value. Its eager domain
 /// performs checked host integer arithmetic without allocating an array or dispatching to a device backend. Fallible
@@ -102,6 +105,18 @@ impl Value for DimensionValue {
     }
 }
 
+impl LiteralIdentity for DimensionValue {
+    #[inline]
+    fn literal_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    #[inline]
+    fn literal_hash<H: Hasher>(&self, state: &mut H) {
+        self.hash(state);
+    }
+}
+
 impl Concretizable<usize> for DimensionValue {
     #[inline]
     fn concretize(&self) -> Result<usize, ProgramError> {
@@ -115,6 +130,8 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::operations::{Add, Assert, Compare, Div, Rem, Sub};
+
+    use crate::tests::literal_hash_of;
 
     use super::*;
 
@@ -203,5 +220,14 @@ mod tests {
             let unsupported_bounds = DimensionBounds::new(unsupported_extent, Some(unsupported_upper)).unwrap();
             assert_eq!(DimensionValue::singleton(&DimensionType::new("batch", unsupported_bounds)), None);
         }
+    }
+
+    #[test]
+    fn test_literal_identity_dimension_value() {
+        // Dimension literals are identical exactly when their values are, including their dimension identity.
+        let dimension = DimensionValue::constant(3).unwrap();
+        assert!(dimension.literal_eq(&dimension.clone()));
+        assert_eq!(literal_hash_of(&dimension), literal_hash_of(&dimension.clone()));
+        assert!(!dimension.literal_eq(&DimensionValue::constant(3).unwrap()));
     }
 }

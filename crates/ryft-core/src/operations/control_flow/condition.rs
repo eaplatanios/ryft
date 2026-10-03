@@ -5442,4 +5442,481 @@ mod tests {
                 .to_string(),
         );
     }
+
+    fn scale_branch(
+        dimension_type: DimensionType,
+        factor: f64,
+    ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let extent = builder.add_input(ArrayIrType::Dimension(dimension_type));
+        let input = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let factor = builder.add_constant(array(Array::scalar(factor).unwrap()));
+        let output = builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(MulOperation::new())),
+                Vec::new(),
+                vec![input, factor],
+                None,
+            )
+            .unwrap()[0];
+        builder.build(vec![extent, output], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
+    }
+
+    #[test]
+    fn test_composite_condition_tracing_rendering_and_eager_execution() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let input = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let regions = vec![
+            builder.import_region(scale_branch(extent_type.clone(), 2.0).entry_region_ref()),
+            builder.import_region(scale_branch(extent_type.clone(), 3.0).entry_region_ref()),
+        ];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                regions,
+                vec![predicate, extent, input],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder.build(outputs, vec![Placeholder; 3], vec![Placeholder; 2]).unwrap();
+
+        // A dimension carried through a condition is an ordinary structural value: it appears in both branch
+        // interfaces and in the composite output signature exactly like the array beside it.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:dimension<extent ∈ [1, 8)>, %2:f64[] .
+                let %3:dimension<extent ∈ [1, 8)>, %4:f64[] = condition %0 %1 %2 [
+                    true={
+                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[] .
+                        let %2:f64[] = const 2.0
+                            %3:f64[] = mul %1 %2
+                        in (%0, %3)
+                    },
+                    false={
+                        lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[] .
+                        let %2:f64[] = const 3.0
+                            %3:f64[] = mul %1 %2
+                        in (%0, %3)
+                    },
+                ]
+                in (%3, %4)"},
+        );
+
+        // Eager interpretation selects one branch per predicate value and forwards the same dimension either way.
+        let boolean =
+            |value: bool| array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[value]).unwrap());
+        assert_eq!(
+            program.interpret(vec![boolean(true), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
+            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(10.0).unwrap())]),
+        );
+        assert_eq!(
+            program.interpret(vec![boolean(false), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
+            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(15.0).unwrap())]),
+        );
+
+        // Relocating the composite program imports both branch regions unchanged, so it renders and executes exactly
+        // like its source.
+        let mut relocated_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let relocated_inputs = vec![
+            relocated_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))),
+            relocated_builder.add_input(ArrayIrType::Dimension(extent_type.clone())),
+            relocated_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64))),
+        ];
+        let relocated_outputs = relocated_builder.splice_program(&program, &relocated_inputs).unwrap();
+        let relocated = relocated_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(relocated_outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(relocated.to_string(), program.to_string());
+        assert_eq!(
+            relocated.interpret(vec![boolean(true), dimension(&extent_type, 4), array(Array::scalar(5.0).unwrap())]),
+            Ok(vec![dimension(&extent_type, 4), array(Array::scalar(10.0).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_composite_condition_jvp_preserves_dimension_outputs_without_tangent_slots() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let input = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
+        let true_branch = scale_branch(extent_type.clone(), 2.0);
+        let false_branch = scale_branch(extent_type.clone(), 3.0);
+        let regions = vec![
+            builder.import_region(true_branch.entry_region_ref()),
+            builder.import_region(false_branch.entry_region_ref()),
+        ];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                regions,
+                vec![predicate, extent, input],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder.build(outputs, vec![Placeholder; 3], vec![Placeholder; 2]).unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_count(), 4);
+        assert_eq!(jvp.output_count(), 3);
+        let outputs = jvp
+            .interpret(vec![
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
+                dimension(&extent_type, 4),
+                array(Array::scalar(5.0).unwrap()),
+                array(Array::scalar(7.0).unwrap()),
+            ])
+            .unwrap();
+        assert!(matches!(&outputs[0], TestValue::Dimension(value) if value.extent() == 4));
+        assert!(matches!(&outputs[1], TestValue::Array(value) if value.to_f64s() == vec![10.0]));
+        assert!(matches!(&outputs[2], TestValue::Array(value) if value.to_f64s() == vec![14.0]));
+
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
+                dimension(&extent_type, 4),
+                array(Array::scalar(5.0).unwrap()),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(2);
+        let mut pullback_inputs = vec![array(Array::scalar(1.0).unwrap())];
+        pullback_inputs.extend(residuals);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![array(Array::scalar(2.0).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_composite_condition_all_zero_jvp_materializes_a_dynamic_output_tangent() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let output_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let extent = builder.add_input(extent_type.clone().into());
+            let output = builder
+                .add_instruction(ZeroOperation::new(output_type.clone()), Vec::new(), vec![extent], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let extent = builder.add_input(extent_type.clone().into());
+        let regions = vec![
+            builder.import_region(branch().entry_region_ref()),
+            builder.import_region(branch().entry_region_ref()),
+        ];
+        let output =
+            builder.add_instruction(ConditionOperation::new(), regions, vec![predicate, extent], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Both inputs have zero tangent spaces, but the dynamic floating-point result does not. Its zero tangent must
+        // therefore consume the selected primal result's explicit runtime extent instead of using a nullary zero.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_count(), 2);
+        assert_eq!(jvp.output_count(), 2);
+        assert_eq!(
+            jvp.interpret(vec![
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
+                dimension(&extent_type, 3),
+            ]),
+            Ok(vec![array(Array::vector(vec![0.0f64; 3]).unwrap()), array(Array::vector(vec![0.0f64; 3]).unwrap()),]),
+        );
+
+        // Eager direct JVP keeps the operation's all-zero region fast path and derives the concrete output tangent
+        // extent from the selected primal result at the public boundary.
+        let eager = EagerContext::<TestValue, TestOperation>::new();
+        let (primal, tangent) = eager
+            .jvp(
+                |inputs, ()| {
+                    let context = inputs[0].context().clone();
+                    context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())
+                },
+                vec![
+                    array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
+                    dimension(&extent_type, 3),
+                ],
+                vec![
+                    array(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()),
+                    array(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()),
+                ],
+                (),
+            )
+            .unwrap();
+        assert_eq!(primal, vec![array(Array::vector(vec![0.0f64; 3]).unwrap())]);
+        assert_eq!(tangent, vec![array(Array::vector(vec![0.0f64; 3]).unwrap())]);
+
+        // Split program linearization stages the same extent read on the primal side and forces the shaped zero into
+        // the tangent program, rather than folding it into an affine known tangent.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
+                dimension(&extent_type, 3),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        assert_eq!(
+            linearization.tangent().interpret(residuals),
+            Ok(vec![array(Array::vector(vec![0.0f64; 3]).unwrap())]),
+        );
+
+        // A known symbolic predicate cannot select a branch during partial evaluation. Because the dynamic output
+        // edge refers to the extent identity, the condition remains whole instead of fabricating an opposite-branch
+        // placeholder with arbitrary geometry.
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let symbolic_predicate = outer.input(ArrayType::scalar(DataType::Boolean).into());
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &outer,
+                &[PartialValue::Known(symbolic_predicate), PartialValue::Unknown(extent_type.clone().into())],
+            )
+            .unwrap();
+        assert!(matches!(evaluation.outputs.as_slice(), [PartialEvaluationOutput::Unknown(0)]));
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayIrOperation::Condition(_),));
+
+        // Direct transform dispatch must make the same decision before it has a staged instruction whose result type
+        // it can inspect. The condition rule retains the selected branch's extent and constructs the tangent there.
+        let context = TracingContext::<TestValue, TestOperation>::new();
+        let predicate = context.input(ArrayType::scalar(DataType::Boolean).into());
+        let extent = context.input(extent_type.clone().into());
+        let predicate_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        let (_, tangent) = context
+            .jvp(
+                |inputs, ()| {
+                    let context = inputs[0].context().clone();
+                    Ok(context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())?.remove(0))
+                },
+                vec![predicate, extent],
+                vec![predicate_tangent, extent_tangent],
+                (),
+            )
+            .unwrap();
+        assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(output_type.clone()));
+
+        // Reusable linearization follows the same ordinary region rule and closes over the dynamic result geometry;
+        // applying its null linear map therefore reconstructs the shaped tangent without a type-only zero.
+        let predicate = context.input(ArrayType::scalar(DataType::Boolean).into());
+        let extent = context.input(extent_type.clone().into());
+        let (_, pushforward) = context
+            .linearize(
+                |inputs, ()| {
+                    let context = inputs[0].context().clone();
+                    Ok(context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())?.remove(0))
+                },
+                vec![predicate, extent],
+                (),
+            )
+            .unwrap();
+        let predicate_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
+        assert_eq!(pushforward.apply(vec![predicate_tangent, extent_tangent]).unwrap().r#type(), tangent.r#type(),);
+    }
+
+    #[test]
+    fn test_composite_condition_jvp_shapes_a_disconnected_dynamic_input_tangent_from_its_primal() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+            let left = builder.add_input(ArrayIrType::Array(array_type.clone()));
+            let right = builder.add_input(ArrayIrType::Array(array_type.clone()));
+            let sum = builder
+                .add_instruction(
+                    TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                    Vec::new(),
+                    vec![left, right],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![extent, sum], vec![Placeholder; 3], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let left = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let right = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        // Severing the tangent of the conditional's last instruction input leaves the fused conditional with one live
+        // and one structurally zero dynamic tangent input, which is exactly the case a type-only nullary zero cannot
+        // construct.
+        let severed = builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(StopGradientOperation::<ArrayType>::new())),
+                Vec::new(),
+                vec![right],
+                None,
+            )
+            .unwrap()[0];
+        let regions = vec![
+            builder.import_region(branch().entry_region_ref()),
+            builder.import_region(branch().entry_region_ref()),
+        ];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                regions,
+                vec![predicate, extent, left, severed],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[1]], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+
+        // The severed input's tangent reads its own primal's runtime extent before constructing the dynamic zero.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:dimension<extent ∈ [1, 8)>, %2:f64[extent], %3:f64[extent], \
+                    %4:f64[extent], %5:f64[extent] .
+                let %6:f64[extent] = stop_gradient %3
+                    %7:dimension<extent ∈ [1, 8)> = dimension_size [axis=0] %6
+                    %8:f64[extent] = zero [type=f64[extent]] %7
+                    %9:dimension<extent ∈ [1, 8)>, %10:f64[extent], %11:f64[extent] = condition %0 %1 %2 %6 %4 %8 [
+                        true={
+                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent], %2:f64[extent], \
+                                %3:f64[extent], %4:f64[extent] .
+                            let %5:f64[extent] = add %1 %2
+                                %6:f64[extent] = add %3 %4
+                            in (%0, %5, %6)
+                        },
+                        false={
+                            lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[extent], %2:f64[extent], \
+                                %3:f64[extent], %4:f64[extent] .
+                            let %5:f64[extent] = add %1 %2
+                                %6:f64[extent] = add %3 %4
+                            in (%0, %5, %6)
+                        },
+                    ]
+                in (%10, %11)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            jvp.interpret(vec![
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
+                dimension(&extent_type, 3),
+                array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
+                array(Array::vector(vec![10.0, 20.0, 30.0]).unwrap()),
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
+                array(Array::vector(vec![5.0, 5.0, 5.0]).unwrap()),
+            ]),
+            Ok(vec![
+                array(Array::vector(vec![11.0, 22.0, 33.0]).unwrap()),
+                array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_composite_condition_pullback_shapes_a_dead_dynamic_output_cotangent_from_a_live_peer() {
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let array_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+            let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
+            let doubled = builder
+                .add_instruction(
+                    TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                    Vec::new(),
+                    vec![input, input],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(
+                    vec![extent, doubled, input],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 3],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let regions = vec![
+            builder.import_region(branch().entry_region_ref()),
+            builder.import_region(branch().entry_region_ref()),
+        ];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                regions,
+                vec![predicate, extent, input],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        // Keeping only the doubled output leaves the third branch output dead, so its dynamic cotangent reaches the
+        // transposed condition as a structural zero that no type-only constructor can build. The transpose boundary
+        // reads the runtime extent it names off the live peer cotangent and stages the mixed dynamic zero.
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[1]], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[extent], %1:bool[] .
+                let %2:dimension<extent \u{2208} [1, 8)> = dimension_size [axis=0] %0
+                    %3:f64[extent] = zero [type=f64[extent]] %2
+                    %4:f64[extent] = condition %1 %0 %3 [
+                        true={
+                            lambda %0:f64[extent], %1:f64[extent] .
+                            let %2:f64[extent] = add %1 %0
+                                %3:f64[extent] = add %2 %0
+                            in (%3)
+                        },
+                        false={
+                            lambda %0:f64[extent], %1:f64[extent] .
+                            let %2:f64[extent] = add %1 %0
+                                %3:f64[extent] = add %2 %0
+                            in (%3)
+                        },
+                    ]
+                in (%4)"}
+            .trim_end(),
+        );
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                array(Array::from_elements::<bool>(ArrayType::scalar(DataType::Boolean), &[true]).unwrap()),
+                dimension(&extent_type, 3),
+                array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap())];
+        pullback_inputs.extend(residuals);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![array(Array::vector(vec![2.0, 2.0, 2.0]).unwrap())]));
+    }
 }

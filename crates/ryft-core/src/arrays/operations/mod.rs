@@ -72,8 +72,6 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-mod control_flow;
-
 // The element-level extrema of the reference kernels are the canonical least and greatest values of each element data
 // type, so the ragged identity masking of `arrays::batching` reads them through this facade instead of restating them.
 
@@ -1075,7 +1073,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::hash::Hash;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -1119,6 +1117,7 @@ mod tests {
         ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming,
         Typed, Value, ValueProjection,
     };
+    use crate::tests::hash_of;
     use crate::tracing::{Trace, Tracer, TracingContext};
 
     use super::*;
@@ -1129,13 +1128,6 @@ mod tests {
 
     /// Asserts at compile time that `T` implements the complete operation identity contract.
     fn assert_identity<T: Eq + Hash>() {}
-
-    /// Returns the hash of `value` under the standard library's default hasher.
-    fn hash_of<T: Hash>(value: &T) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        value.hash(&mut hasher);
-        hasher.finish()
-    }
 
     #[test]
     fn test_array_operations_holds_for_every_canonical_array_value() {

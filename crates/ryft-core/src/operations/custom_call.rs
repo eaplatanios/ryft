@@ -1815,9 +1815,8 @@ where
         + From<DimensionSizeOperation>
         + From<ScanOperation<C::Type>>
         + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<CustomCallOperation>
-        + From<ScanOperation<ArrayType>>
-        + From<TransposeOperation>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected:
+        From<CustomCallOperation> + From<ScanOperation<ArrayType>> + From<TransposeOperation>,
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -2070,7 +2069,6 @@ mod tests {
     use std::borrow::Cow;
     use std::cell::Cell;
     use std::collections::HashMap;
-    use std::hash::DefaultHasher;
     use std::rc::Rc;
 
     use indoc::indoc;
@@ -2089,16 +2087,10 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{BindingRegionDriver, EmptyRegionDriver, ProgramBuilder, Provenance, ProvenanceScope};
+    use crate::tests::hash_of;
     use crate::tracing::{DomainTracer, Trace, TracingContext};
 
     use super::*;
-
-    /// Returns the hash of `value` under the standard library's default hasher.
-    fn hash_of<T: Hash>(value: &T) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        value.hash(&mut hasher);
-        hasher.finish()
-    }
 
     /// Returns the `f32[2]` array type used throughout these tests.
     fn vector_type() -> ArrayType {
