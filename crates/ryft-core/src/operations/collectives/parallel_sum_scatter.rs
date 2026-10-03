@@ -47,9 +47,8 @@ use super::{
     CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_input_extents,
     divided_collective_extent, explicit_collective_inputs, forward_explicit_collective,
     forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
-    infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
-    jvp_shape_changing_collective_with_adjoint, linear_collective, linear_collective_dimensions,
-    linear_collective_output_type, require_collective_axis_extent, resolve_named_axis_size,
+    infer_explicit_shape_changing_collective_output_type, jvp_shape_changing_collective_with_adjoint,
+    linear_collective, linear_collective_output_type, require_collective_axis_extent, resolve_named_axis_size,
     transpose_linear_collective, validate_explicit_collective_output_extents,
 };
 

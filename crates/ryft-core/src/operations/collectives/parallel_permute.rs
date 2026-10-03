@@ -27,10 +27,7 @@ use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review from here onwards.
 
-use super::{
-    interpret_degenerate_collective, linear_collective, linear_collective_dimensions, linear_collective_output_type,
-    resolve_named_axis_size, transpose_linear_collective,
-};
+use super::{linear_collective, linear_collective_output_type, resolve_named_axis_size, transpose_linear_collective};
 
 linear_collective! {
     /// [`Operation`] that sends every participant's input to another participant along the named axis according to

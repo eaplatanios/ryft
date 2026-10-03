@@ -316,30 +316,6 @@ pub(super) fn resolve_named_axis_size<C: NamedAxes>(context: &C, axis_name: &str
 
 // TODO(eaplatanios): Review form here onwards.
 
-/// Validates the shared input contract of the linear collectives (exactly one statically shaped input, which may
-/// carry unreduced axes only when the collective accepts them) and returns the input's static dimensions.
-///
-/// # Parameters
-///
-///   - `operation_name`: Name of the collective, used in diagnostics.
-///   - `accepts_unreduced`: Whether the collective accepts inputs with unreduced axes (e.g., a sum-scatter, which
-///     completes the pending reduction as part of its exchange).
-///   - `input_types`: Input types of the collective.
-fn linear_collective_dimensions(
-    operation_name: &str,
-    accepts_unreduced: bool,
-    input_types: &[ArrayType],
-) -> Result<Vec<usize>, TypeError> {
-    check_count!("input", input_types, 1, TypeError);
-    if !accepts_unreduced && !input_types[0].unreduced_axes().is_empty() {
-        return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced inputs")));
-    }
-    let Some(shape) = input_types[0].static_shape() else {
-        return Err(TypeError::invalid(format!("`{operation_name}` does not support dynamically shaped inputs")));
-    };
-    Ok(shape.dimensions().to_vec())
-}
-
 /// Builds a linear collective's output type from its input and (possibly resized) dimensions, carrying the input
 /// sharding through with the same per-dimension placement (the dimension count never changes).
 fn linear_collective_output_type(
@@ -353,27 +329,6 @@ fn linear_collective_output_type(
         ArrayType::new(input_type.data_type(), Shape::new(output_sizes)).with_memory(input_type.memory());
     output_type.sharding = sharding;
     Ok(output_type)
-}
-
-/// Interprets a linear collective outside any binder: only the degenerate single-participant axis
-/// (`axis_size == 1`) has defined per-item semantics (the identity), and any larger axis reports an error because
-/// the other participants do not exist per item.
-fn interpret_degenerate_collective<V: Clone>(
-    operation_name: &str,
-    axis_name: &str,
-    axis_size: usize,
-    inputs: &[V],
-) -> Result<Vec<V>, ProgramError> {
-    check_count!("input", inputs, 1, ProgramError);
-    if axis_size != 1 {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "cannot interpret `{operation_name}` over axis `{axis_name}` of size {axis_size} without an \
-                 enclosing binder",
-            ),
-        });
-    }
-    Ok(vec![inputs[0].clone()])
 }
 
 /// Implements the shared structure of the single-input linear collectives: the operation constant and struct with
@@ -454,7 +409,24 @@ macro_rules! linear_collective {
                 if self.axis_size == 0 {
                     return Err(TypeError::invalid(format!("`{}` axis size must be greater than zero", $name_literal)));
                 }
-                let $dimensions = linear_collective_dimensions($name_literal, $accepts_unreduced, input_types)?;
+
+                // Every linear collective has exactly one statically shaped input, which may carry unreduced axes only
+                // when the collective accepts them (e.g., a sum-scatter, which completes the pending reduction as part
+                // of its exchange).
+                check_count!("input", input_types, 1, TypeError);
+                let accepts_unreduced: bool = $accepts_unreduced;
+                if !accepts_unreduced && !input_types[0].unreduced_axes().is_empty() {
+                    return Err(TypeError::invalid(format!("`{}` does not support unreduced inputs", $name_literal)));
+                }
+
+                let Some(shape) = input_types[0].static_shape() else {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` does not support dynamically shaped inputs",
+                        $name_literal,
+                    )));
+                };
+
+                let $dimensions = shape.dimensions().to_vec();
                 let $infer_self = self;
                 let $input_type = &input_types[0];
                 Ok(vec![$infer?])
@@ -477,7 +449,18 @@ macro_rules! linear_collective {
                 _driver: &D,
                 inputs: &[C::Value],
             ) -> Result<Vec<C::Value>, ProgramError> {
-                interpret_degenerate_collective($name_literal, &self.axis_name, self.axis_size, inputs)
+                // Outside any binder, only the degenerate single-participant axis has defined per-item semantics (the
+                // identity). Any larger axis is an error because the other participants do not exist per item.
+                check_count!("input", inputs, 1, ProgramError);
+                if self.axis_size != 1 {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "cannot interpret `{}` over axis `{}` of size {} without an enclosing binder",
+                            $name_literal, self.axis_name, self.axis_size,
+                        ),
+                    });
+                }
+                Ok(vec![inputs[0].clone()])
             }
         }
 
@@ -560,9 +543,8 @@ where
 /// # Parameters
 ///
 ///   - `operation_name`: Name of the collective, used in diagnostics.
-///   - `accepts_unreduced`: Whether the collective accepts array inputs with unreduced axes (refer to
-///     [`linear_collective_dimensions`](linear_collective_dimensions) for more
-///     information).
+///   - `accepts_unreduced`: Whether the collective accepts array inputs with unreduced axes (e.g., a sum-scatter, which
+///     completes the pending reduction as part of its exchange).
 ///   - `input_types`: Array input type followed by one explicit extent type per output axis.
 ///   - `base_output_type`: Output type whose shape is replaced by the explicit extents.
 ///   - `unchanged_input_axes`: For every output axis, the input axis whose extent it must preserve, if any.
