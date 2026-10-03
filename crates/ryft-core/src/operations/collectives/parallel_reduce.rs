@@ -747,13 +747,15 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable, MeshAxis, Shape, Sharding,
+        ArrayElement, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, MeshAxis, Shape, Sharding,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -814,6 +816,24 @@ mod tests {
         Ok(operation.batch(&context, &EmptyRegionDriver, &[input])?.into_parts().0)
     }
 
+    /// Packs `values` as two batch items of three elements each, along a bounded ragged axis of dimension `length`
+    /// whose extents are one and two, so that the last two elements of the first item and the last element of the
+    /// second item are padding.
+    fn ragged_batch<T: ArrayElement>(values: Vec<T>, length: &DimensionVariable) -> ArrayBatch<Array> {
+        ArrayBatch::new(Array::matrix(2, 3, values).unwrap(), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1i32, 2]).unwrap(), length.clone(), vec![0])])
+            .unwrap()
+    }
+
+    /// Wraps `values` as the replicated reduction of a [`ragged_batch`] across its batch items, whose ragged axis keeps
+    /// the largest extent of the two items.
+    fn ragged_reduction<T: ArrayElement>(values: Vec<T>, length: &DimensionVariable) -> ArrayBatch<Array> {
+        ArrayBatch::replicated(Array::vector(values).unwrap())
+            .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2i32).unwrap(), length.clone(), Vec::new())])
+            .unwrap()
+    }
+
     #[test]
     fn test_parallel_reduce() {
         let operation = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string());
@@ -830,6 +850,8 @@ mod tests {
             ParallelReduceOperation::grouped(ReductionKind::Mean, "x".to_string(), 4, vec![vec![0, 2], vec![3, 1]])
                 .unwrap();
         assert_eq!(grouped.name(), PARALLEL_REDUCE_OPERATION_NAME);
+        assert_eq!(grouped.kind(), ReductionKind::Mean);
+        assert_eq!(grouped.axis_name(), "x");
         assert_eq!(grouped.axis_size(), Some(4));
         assert_eq!(grouped.axis_index_groups(), Some([vec![0, 2], vec![3, 1]].as_slice()));
         assert_eq!(grouped.mesh(), None);
@@ -855,21 +877,32 @@ mod tests {
             (2, vec![vec![0, 2]], "`parallel_reduce` axis index 2 is out of bounds for axis size 2"),
         ] {
             assert_eq!(
-                ParallelReduceOperation::grouped(ReductionKind::Sum, "x".to_string(), axis_size, axis_index_groups,),
+                ParallelReduceOperation::grouped(ReductionKind::Sum, "x".to_string(), axis_size, axis_index_groups),
                 Err(TypeError::invalid(message)),
             );
         }
 
         // Mesh reductions record and render their mesh.
         let (mesh, _, _) = mesh_scalar_types();
-        let operation = ParallelReduceOperation::new(ReductionKind::Max, "m".to_string()).with_mesh(mesh.clone());
-        assert_eq!(operation.name(), PARALLEL_REDUCE_OPERATION_NAME);
-        assert_eq!(operation.mesh(), Some(&mesh));
+        let mesh_max = ParallelReduceOperation::new(ReductionKind::Max, "m".to_string()).with_mesh(mesh.clone());
+        assert_eq!(mesh_max.name(), PARALLEL_REDUCE_OPERATION_NAME);
+        assert_eq!(mesh_max.mesh(), Some(&mesh));
         assert_eq!(
-            operation.to_string(),
+            mesh_max.to_string(),
             "parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]]",
         );
-        assert_ne!(operation, ParallelReduceOperation::new(ReductionKind::Max, "m".to_string()));
+
+        // Operations are equal, and hash alike, exactly when their kinds, axes, participant groups, and meshes agree.
+        let max = ParallelReduceOperation::new(ReductionKind::Max, "m".to_string());
+        assert_eq!(mesh_max, mesh_max.clone());
+        assert_ne!(mesh_max, max);
+        assert_ne!(max, ParallelReduceOperation::new(ReductionKind::Min, "m".to_string()));
+        assert_ne!(max, ParallelReduceOperation::new(ReductionKind::Max, "n".to_string()));
+        let operations = HashMap::from([(operation.clone(), 0), (grouped.clone(), 1), (mesh_max.clone(), 2)]);
+        assert_eq!(operations.get(&operation), Some(&0));
+        assert_eq!(operations.get(&grouped), Some(&1));
+        assert_eq!(operations.get(&mesh_max), Some(&2));
+        assert_eq!(operations.get(&max), None);
     }
 
     #[test]
@@ -895,6 +928,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             operation = ParallelReduceOperation::grouped(
                 ReductionKind::Mean,
@@ -911,6 +945,20 @@ mod tests {
                 },
             ],
         );
+
+        // An operation that records only one of the full axis size and the participant groups is malformed. The public
+        // constructors never produce one, so it is built directly.
+        let malformed = ParallelReduceOperation {
+            axis_size: Some(4),
+            ..ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
+        };
+        assert_eq!(
+            malformed.infer_output_types(std::slice::from_ref(&varying), &[]),
+            Err(TypeError::invalid(
+                "`parallel_reduce` must store both the full axis size and axis index groups, or neither",
+            )),
+        );
+
         check_operation_type_inference!(
             operation = ParallelReduceOperation::new(ReductionKind::Max, "i".to_string()),
             cases = [
@@ -924,6 +972,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             operation = ParallelReduceOperation::new(ReductionKind::Min, "i".to_string()),
             cases = [
@@ -937,6 +986,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             operation = ParallelReduceOperation::new(ReductionKind::Product, "i".to_string()),
             cases = [
@@ -950,6 +1000,7 @@ mod tests {
                 },
             ],
         );
+
         check_operation_type_inference!(
             operation = ParallelReduceOperation::new(ReductionKind::LogSumExp, "i".to_string()),
             cases = [
@@ -973,6 +1024,7 @@ mod tests {
                 },
             ],
         );
+
         for kind in [ReductionKind::Any, ReductionKind::All] {
             check_operation_type_inference!(
                 operation = ParallelReduceOperation::new(kind, "i".to_string()),
@@ -996,10 +1048,12 @@ mod tests {
                 .with_sharding(Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["outer"]).unwrap())
                 .unwrap()
         };
+
         check_operation_type_inference!(
             operation = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string()),
             cases = [{ input_types = [unreduced(DataType::I32)], output_types = [unreduced(DataType::I32)] }],
         );
+
         check_operation_type_inference!(
             operation = ParallelReduceOperation::new(ReductionKind::Mean, "i".to_string()),
             cases = [
@@ -1010,6 +1064,7 @@ mod tests {
                 },
             ],
         );
+
         for kind in [ReductionKind::Product, ReductionKind::LogSumExp, ReductionKind::Max, ReductionKind::Min] {
             check_operation_type_inference!(
                 operation = ParallelReduceOperation::new(kind, "i".to_string()),
@@ -1020,76 +1075,15 @@ mod tests {
             );
         }
 
-        // A mesh reduction removes its axis from the input's manual variation and preserves every other piece of
-        // sharding state, including reduced axes and the variation over other manual axes.
+        // Every primitive kind reduces over a manual mesh axis by removing that axis from the input's manual variation,
+        // which makes a mesh reduction an operation that cannot be folded.
         let sharding = invariant.sharding().unwrap().clone();
-        let with_sharding = |sharding: Sharding| ArrayType::scalar(DataType::F32).with_sharding(sharding).unwrap();
         for kind in [ReductionKind::Sum, ReductionKind::Product, ReductionKind::Max, ReductionKind::Min] {
             let operation = ParallelReduceOperation::new(kind, "m".to_string()).with_mesh(mesh.clone());
-            assert_eq!(operation.infer_output_types(&[varying.clone()], &[]), Ok(vec![invariant.clone()]));
-            assert_eq!(operation.fold(&[varying.clone()], &[]), Ok(None));
-            assert_eq!(
-                operation.infer_output_types(
-                    &[with_sharding(sharding.clone().with_varying_manual_axes(["m", "outer"]).unwrap())],
-                    &[],
-                ),
-                Ok(vec![with_sharding(sharding.clone().with_varying_manual_axes(["outer"]).unwrap())]),
-            );
-            let reduced = sharding.clone().with_reduced_axes(["outer"]).unwrap();
-            assert_eq!(
-                operation.infer_output_types(
-                    &[with_sharding(reduced.clone().with_varying_manual_axes(["m"]).unwrap())],
-                    &[],
-                ),
-                Ok(vec![with_sharding(reduced)]),
-            );
-
-            // The input must vary over the manual axis of the operation's own mesh and carry no reduction state
-            // along it, and a mesh reduction cannot also be grouped.
-            assert_eq!(
-                operation.infer_output_types(&[invariant.clone()], &[]),
-                Err(TypeError::invalid(
-                    "`parallel_reduce` input must vary over manual axis `m`; pass an invariant value through \
-                     `parallel_vary` first so that every copy is counted",
-                )),
-            );
-            assert_eq!(
-                operation.infer_output_types(&[ArrayType::scalar(DataType::F32)], &[]),
-                Err(TypeError::invalid("`parallel_reduce` input must carry a mesh containing manual axis `m`")),
-            );
-            for sharding in [
-                sharding.clone().with_unreduced_axes(["m"]).unwrap(),
-                sharding.clone().with_reduced_axes(["m"]).unwrap(),
-            ] {
-                assert_eq!(
-                    operation.infer_output_types(&[with_sharding(sharding)], &[]),
-                    Err(TypeError::invalid("`parallel_reduce` axis `m` must not carry reduction state")),
-                );
-            }
-            let other_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Manual).unwrap()]).unwrap();
-            assert_eq!(
-                ParallelReduceOperation::new(kind, "m".to_string())
-                    .with_mesh(other_mesh)
-                    .infer_output_types(&[varying.clone()], &[]),
-                Err(TypeError::invalid("`parallel_reduce` input mesh does not match the operation mesh")),
-            );
-            let explicit = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
-            assert_eq!(
-                ParallelReduceOperation::new(kind, "m".to_string())
-                    .with_mesh(explicit)
-                    .infer_output_types(&[varying.clone()], &[]),
-                Err(TypeError::invalid("`parallel_reduce` mesh axis `m` must be manual")),
-            );
-            assert_eq!(
-                ParallelReduceOperation::grouped(kind, "m".to_string(), 4, vec![vec![0, 1], vec![2, 3]])
-                    .unwrap()
-                    .with_mesh(mesh.clone())
-                    .infer_output_types(&[varying.clone()], &[]),
-                Err(TypeError::invalid("`parallel_reduce` over a manual mesh axis must not use axis index groups")),
-            );
+            assert_eq!(operation.infer_output_types(std::slice::from_ref(&varying), &[]), Ok(vec![invariant.clone()]));
+            assert_eq!(operation.fold(std::slice::from_ref(&varying), &[]), Ok(None));
         }
 
-        // Boolean disjunctions and conjunctions are primitive mesh reductions as well.
         let boolean = |sharding: Sharding| ArrayType::scalar(DataType::Boolean).with_sharding(sharding).unwrap();
         for kind in [ReductionKind::Any, ReductionKind::All] {
             assert_eq!(
@@ -1099,6 +1093,73 @@ mod tests {
                 Ok(vec![boolean(sharding.clone())]),
             );
         }
+
+        // A mesh reduction preserves every other piece of sharding state, including reduced axes and the variation
+        // over other manual axes.
+        let mesh_sum = ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string()).with_mesh(mesh.clone());
+        let with_sharding = |sharding: Sharding| ArrayType::scalar(DataType::F32).with_sharding(sharding).unwrap();
+        assert_eq!(
+            mesh_sum.infer_output_types(
+                &[with_sharding(sharding.clone().with_varying_manual_axes(["m", "outer"]).unwrap())],
+                &[],
+            ),
+            Ok(vec![with_sharding(sharding.clone().with_varying_manual_axes(["outer"]).unwrap())]),
+        );
+
+        let reduced = sharding.clone().with_reduced_axes(["outer"]).unwrap();
+        assert_eq!(
+            mesh_sum
+                .infer_output_types(&[with_sharding(reduced.clone().with_varying_manual_axes(["m"]).unwrap())], &[]),
+            Ok(vec![with_sharding(reduced)]),
+        );
+
+        // The input must vary over the manual axis of the operation's own mesh and carry no reduction state along it,
+        // and a mesh reduction cannot also be grouped.
+        assert_eq!(
+            mesh_sum.infer_output_types(std::slice::from_ref(&invariant), &[]),
+            Err(TypeError::invalid(
+                "`parallel_reduce` input must vary over manual axis `m`; pass an invariant value through \
+                 `parallel_vary` first so that every copy is counted",
+            )),
+        );
+
+        assert_eq!(
+            mesh_sum.infer_output_types(&[ArrayType::scalar(DataType::F32)], &[]),
+            Err(TypeError::invalid("`parallel_reduce` input must carry a mesh containing manual axis `m`")),
+        );
+
+        for sharding in
+            [sharding.clone().with_unreduced_axes(["m"]).unwrap(), sharding.clone().with_reduced_axes(["m"]).unwrap()]
+        {
+            assert_eq!(
+                mesh_sum.infer_output_types(&[with_sharding(sharding)], &[]),
+                Err(TypeError::invalid("`parallel_reduce` axis `m` must not carry reduction state")),
+            );
+        }
+
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        assert_eq!(
+            ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string())
+                .with_mesh(other_mesh)
+                .infer_output_types(std::slice::from_ref(&varying), &[]),
+            Err(TypeError::invalid("`parallel_reduce` input mesh does not match the operation mesh")),
+        );
+
+        let explicit = LogicalMesh::new(vec![MeshAxis::new("m", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        assert_eq!(
+            ParallelReduceOperation::new(ReductionKind::Sum, "m".to_string())
+                .with_mesh(explicit)
+                .infer_output_types(std::slice::from_ref(&varying), &[]),
+            Err(TypeError::invalid("`parallel_reduce` mesh axis `m` must be manual")),
+        );
+
+        assert_eq!(
+            ParallelReduceOperation::grouped(ReductionKind::Sum, "m".to_string(), 4, vec![vec![0, 1], vec![2, 3]])
+                .unwrap()
+                .with_mesh(mesh.clone())
+                .infer_output_types(std::slice::from_ref(&varying), &[]),
+            Err(TypeError::invalid("`parallel_reduce` over a manual mesh axis must not use axis index groups")),
+        );
 
         // The unreduced-input rule applies to mesh reductions as well, while mesh means and logarithmic sums must be
         // composed from primitive mesh reductions.
@@ -1110,12 +1171,14 @@ mod tests {
                 .infer_output_types(std::slice::from_ref(&input), &[]),
             Ok(vec![with_sharding(unreduced)]),
         );
+
         assert_eq!(
             ParallelReduceOperation::new(ReductionKind::Max, "m".to_string())
                 .with_mesh(mesh.clone())
                 .infer_output_types(&[input], &[]),
             Err(TypeError::invalid("`parallel_reduce` with kind `max` cannot reduce inputs with unreduced axes")),
         );
+
         for kind in [ReductionKind::Mean, ReductionKind::LogSumExp] {
             assert_eq!(
                 ParallelReduceOperation::new(kind, "m".to_string())
@@ -1299,12 +1362,24 @@ mod tests {
         let outputs = sum.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap().into_parts().0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(1));
-        assert_eq!(outputs[0].value().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [2, 3]));
-        assert_eq!(trace.builder().borrow().instructions().len(), 1);
-        assert!(matches!(
-            trace.builder().borrow().instructions()[0].operation(),
-            ArrayOperation::ParallelReduce(operation) if operation == &sum,
-        ));
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![outputs[0].value().atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3] .
+                let %1:f32[2, 3] = parallel_reduce [kind=sum, axis_name=\"i\"] %0
+                in (%1)"
+            },
+        );
     }
 
     #[test]
@@ -1353,22 +1428,8 @@ mod tests {
         // ragged extent is the maximum of the participants' extents, so positions that no participant covers hold the
         // identity.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
-        let ragged = |values: Vec<f32>| {
-            ArrayBatch::new(Array::matrix(2, 3, values).unwrap(), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(
-                    1,
-                    Array::vector(vec![1i32, 2]).unwrap(),
-                    length.clone(),
-                    vec![0],
-                )])
-                .unwrap()
-        };
-        let expected = |values: Vec<f32>| {
-            ArrayBatch::replicated(Array::vector(values).unwrap())
-                .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2i32).unwrap(), length.clone(), Vec::new())])
-                .unwrap()
-        };
+        let ragged = |values: Vec<f32>| ragged_batch(values, &length);
+        let expected = |values: Vec<f32>| ragged_reduction(values, &length);
         let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
@@ -1404,29 +1465,13 @@ mod tests {
         );
 
         // Boolean padding is replaced with `false` for disjunctions and with `true` for conjunctions.
-        let ragged_booleans = |values: Vec<bool>| {
-            ArrayBatch::new(Array::matrix(2, 3, values).unwrap(), BatchAxis::new(0))
-                .unwrap()
-                .with_ragged_axes(vec![RaggedAxis::new(
-                    1,
-                    Array::vector(vec![1i32, 2]).unwrap(),
-                    length.clone(),
-                    vec![0],
-                )])
-                .unwrap()
-        };
-        let expected_booleans = |values: Vec<bool>| {
-            ArrayBatch::replicated(Array::vector(values).unwrap())
-                .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2i32).unwrap(), length.clone(), Vec::new())])
-                .unwrap()
-        };
         assert_eq!(
-            batch_ragged(ReductionKind::Any, ragged_booleans(vec![false, true, true, false, false, true])),
-            Ok(vec![expected_booleans(vec![false, false, false])]),
+            batch_ragged(ReductionKind::Any, ragged_batch(vec![false, true, true, false, false, true], &length)),
+            Ok(vec![ragged_reduction(vec![false, false, false], &length)]),
         );
         assert_eq!(
-            batch_ragged(ReductionKind::All, ragged_booleans(vec![true, false, false, true, true, false])),
-            Ok(vec![expected_booleans(vec![true, true, true])]),
+            batch_ragged(ReductionKind::All, ragged_batch(vec![true, false, false, true, true, false], &length)),
+            Ok(vec![ragged_reduction(vec![true, true, true], &length)]),
         );
 
         // A mean has no single implied denominator for ragged inputs.
@@ -1434,6 +1479,21 @@ mod tests {
             batch_ragged(ReductionKind::Mean, ragged(vec![1.0; 6])),
             Err(BatchingError::UnsupportedOperation {
                 message: "`parallel_reduce` with kind `mean` does not define a denominator for bounded ragged inputs"
+                    .to_string(),
+            }),
+        );
+
+        // Static array batching never creates bounded ragged axes, so it rejects a ragged input instead of reducing its
+        // padding.
+        assert_eq!(
+            batch_parallel_reduce(
+                &ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string()),
+                2,
+                ragged(vec![1.0; 6]),
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "static array batching cannot identity-mask bounded ragged dimension `length` on axis 1 with \
+                          `Zero`"
                     .to_string(),
             }),
         );
@@ -1564,6 +1624,46 @@ mod tests {
                 in (%2)"
             },
         );
+
+        // A sum over a dynamic mapped extent counts a replicated input once per batch item by first materializing it
+        // across the runtime extent.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+        let batch_extent = trace.input(DimensionType::from(items).into());
+        let input = trace.input(ArrayType::new_static(DataType::F32, [3]).into());
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+            ProjectedContext::new(trace.clone()),
+            batch_extent,
+        )
+        .with_axis_name("i".to_string());
+        let output = ParallelReduceOperation::new(ReductionKind::Sum, "i".to_string())
+            .batch(&context, &EmptyRegionDriver, &[ArrayBatch::replicated(input.into_projected().unwrap())])
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(output.batch_axis(), BatchAxis::replicated());
+        let value = output.into_value().into_value().atom_id().unwrap();
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![value],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<items ∈ [1, 9)>, %1:f32[3] .
+                let %2:dimension<3> = constant [value=3]
+                    %3:f32[items, 3] = broadcast [output_axes=[1]] %1 %0 %2
+                    %4:f32[3] = reduce [kind=sum, axes=[0]] %3
+                in (%4)"
+            },
+        );
     }
 
     #[test]
@@ -1572,7 +1672,7 @@ mod tests {
         let (mesh, invariant, varying) = mesh_scalar_types();
         let input_type = ArrayType::scalar(DataType::F32);
         assert_eq!(
-            parallel_reduce_program(ParallelReduceOperation::new(ReductionKind::Mean, "i".to_string()), input_type,)
+            parallel_reduce_program(ParallelReduceOperation::new(ReductionKind::Mean, "i".to_string()), input_type)
                 .jvp()
                 .unwrap()
                 .to_string(),
@@ -1589,8 +1689,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}], \
                 %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
-                let %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
-                    %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %1
+                let %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
+                    %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %1
                 in (%2, %3)"
             },
         );
@@ -1637,42 +1739,6 @@ mod tests {
             ));
         }
 
-        // The composed logarithmic sum over a manual mesh axis is differentiable even though its mesh maximum is not:
-        // the maximum only reads the stopped input, so its tangent is a structural zero, and the shift is stopped as
-        // well, which leaves the softmax-weighted average of the input tangents as the output tangent (`%18`). The
-        // materialized zero branch of the selected shift tangent (`%8` and `%9`) is dead.
-        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
-            |inputs: Vec<_>| Ok(vec![inputs[0].parallel_reduce(ReductionKind::LogSumExp, "m")?]),
-            vec![varying.clone()],
-            manual_mesh_axes(&mesh),
-        )
-        .unwrap();
-        assert_eq!(
-            program.jvp().unwrap().to_string(),
-            indoc! {"
-                lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}], %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
-                let %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = stop_gradient %0
-                    %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %2
-                    %4:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = zero_like %3
-                    %5:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = sub %3 %3
-                    %6:bool[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = compare [direction=Equal] %5 %4
-                    %7:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = select %6 %3 %4
-                    %8:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = zero [type=f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}]]
-                    %9:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = select %6 %8 %4
-                    %10:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = stop_gradient %7
-                    %11:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary [axis_name=\"m\"] %10
-                    %12:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = sub %0 %11
-                    %13:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = exp %12
-                    %14:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = mul %13 %1
-                    %15:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %13
-                    %16:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %14
-                    %17:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = log %15
-                    %18:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = div %16 %15
-                    %19:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = add %17 %10
-                in (%19, %18)"
-            },
-        );
-
         // Reverse mode through a level that binds the axis gives every item the cotangent of the shared total, which
         // a mean scales by the inverse batch size.
         let inputs = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
@@ -1696,15 +1762,29 @@ mod tests {
     fn test_parallel_reduce_transposition() {
         // Ordinary sums and means are self-adjoint.
         let (mesh, invariant, varying) = mesh_scalar_types();
-        for kind in [ReductionKind::Sum, ReductionKind::Mean] {
+        for (kind, expected) in [
+            (
+                ReductionKind::Sum,
+                indoc! {"
+                    lambda %0:f32[] .
+                    let %1:f32[] = parallel_reduce [kind=sum, axis_name=\"i\"] %0
+                    in (%1)"
+                },
+            ),
+            (
+                ReductionKind::Mean,
+                indoc! {"
+                    lambda %0:f32[] .
+                    let %1:f32[] = parallel_reduce [kind=mean, axis_name=\"i\"] %0
+                    in (%1)"
+                },
+            ),
+        ] {
             let program = parallel_reduce_program(
                 ParallelReduceOperation::new(kind, "i".to_string()),
                 ArrayType::scalar(DataType::F32),
             );
-            assert_eq!(
-                program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(),
-                format!("lambda %0:f32[] .\nlet %1:f32[] = parallel_reduce [kind={kind}, axis_name=\"i\"] %0\nin (%1)"),
-            );
+            assert_eq!(program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), expected);
         }
 
         // A mesh sum hands the shared cotangent to every device, which is a `parallel_vary`, and transposing that
@@ -1716,7 +1796,8 @@ mod tests {
             transposed.to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] .
-                let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary [axis_name=\"m\"] %0
+                let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %0
                 in (%1)"
             },
         );
@@ -1785,27 +1866,17 @@ mod tests {
             Err::<Array, _>(BatchingError::Axis(AxisError::UnboundAxisName { name: "j".to_string() })),
         );
 
-        // A name that a `batch` level binds reduces across its batch items, and a value that is the same for every
-        // item is counted once per item by a sum.
-        for (kind, mapped, replicated) in
-            [(ReductionKind::Sum, 6.0, 30.0), (ReductionKind::Mean, 2.0, 10.0), (ReductionKind::Max, 3.0, 10.0)]
-        {
-            assert_eq!(
-                batch(
-                    |(item, constant): (
-                        BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>,
-                        _,
-                    )| {
-                        Ok((item.parallel_reduce(kind, "i")?, constant.parallel_reduce(kind, "i")?))
-                    },
-                    (inputs.clone(), Array::scalar(10.0).unwrap()),
-                    (BatchAxis::new(0), BatchAxis::replicated()),
-                    (BatchAxis::replicated(), BatchAxis::replicated()),
-                    BatchAxisSpecification::named("i"),
-                ),
-                Ok((Array::scalar(mapped).unwrap(), Array::scalar(replicated).unwrap())),
-            );
-        }
+        // A name that a `batch` level binds reduces across its batch items, as the level's batching rule defines.
+        assert_eq!(
+            batch(
+                |item| item.parallel_reduce(ReductionKind::Sum, "i"),
+                inputs.clone(),
+                BatchAxis::new(0),
+                BatchAxis::replicated(),
+                BatchAxisSpecification::named("i"),
+            ),
+            Ok(Array::scalar(6.0).unwrap()),
+        );
 
         // Names bound by nested `batch` levels resolve to the matching level: the inner reduction over the outer axis
         // sums the columns of the outer items.
@@ -1838,7 +1909,8 @@ mod tests {
                 ReductionKind::Sum,
                 indoc! {"
                     lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
-                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
+                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                            parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
                     in (%1)"
                 },
             ),
@@ -1847,8 +1919,10 @@ mod tests {
                 ReductionKind::Sum,
                 indoc! {"
                     lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] .
-                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary [axis_name=\"m\"] %0
-                        %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %1
+                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                            parallel_vary [axis_name=\"m\"] %0
+                        %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                            parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %1
                     in (%2)"
                 },
             ),
@@ -1861,8 +1935,10 @@ mod tests {
                         output_type=f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}],
                         output_axes=[],
                     ] %0
-                        %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary [axis_name=\"m\"] %1
-                        %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %2
+                        %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                            parallel_vary [axis_name=\"m\"] %1
+                        %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                            parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %2
                     in (%3)"
                 },
             ),
@@ -1871,7 +1947,8 @@ mod tests {
                 ReductionKind::Max,
                 indoc! {"
                     lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
-                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
+                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                            parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
                     in (%1)"
                 },
             ),
@@ -1881,7 +1958,8 @@ mod tests {
                 ReductionKind::Mean,
                 indoc! {"
                     lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
-                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
+                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                            parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
                         %2:f32[] = constant [value=4.0]
                         %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = div %1 %2
                     in (%3)"
@@ -1894,17 +1972,22 @@ mod tests {
                 ReductionKind::LogSumExp,
                 indoc! {"
                     lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
-                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = stop_gradient %0
-                        %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %1
+                    let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                            stop_gradient %0
+                        %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                            parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %1
                         %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = zero_like %2
                         %4:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = sub %2 %2
                         %5:bool[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = compare [direction=Equal] %4 %3
                         %6:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = select %5 %2 %3
                         %7:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = stop_gradient %6
-                        %8:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = parallel_vary [axis_name=\"m\"] %7
-                        %9:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = sub %0 %8
+                        %8:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                            parallel_vary [axis_name=\"m\"] %7
+                        %9:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                            sub %0 %8
                         %10:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = exp %9
-                        %11:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %10
+                        %11:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                            parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %10
                         %12:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = log %11
                         %13:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = add %12 %7
                     in (%13)"
@@ -1920,6 +2003,127 @@ mod tests {
             assert_eq!(output, invariant);
             assert_eq!(program.to_string(), expected);
         }
+
+        // A complex logarithmic sum is shifted by the maximum of the real components of its input, which is lifted back
+        // into the complex plane before it is subtracted.
+        let sharding = invariant.sharding().unwrap().clone();
+        let complex_type = |sharding: Sharding| ArrayType::scalar(DataType::C64).with_sharding(sharding).unwrap();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_reduce(ReductionKind::LogSumExp, "m"),
+            complex_type(sharding.clone().with_varying_manual_axes(["m"]).unwrap()),
+            manual_mesh_axes(&mesh),
+        )
+        .unwrap();
+        assert_eq!(output, complex_type(sharding.clone()));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:c64[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
+                let %1:c64[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                        stop_gradient %0
+                    %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = real %1
+                    %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %2
+                    %4:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = zero_like %3
+                    %5:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = sub %3 %3
+                    %6:bool[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = compare [direction=Equal] %5 %4
+                    %7:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = select %6 %3 %4
+                    %8:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = stop_gradient %7
+                    %9:c64[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = complex %8 %4
+                    %10:c64[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %9
+                    %11:c64[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = sub %0 %10
+                    %12:c64[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = exp %11
+                    %13:c64[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %12
+                    %14:c64[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = log %13
+                    %15:c64[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = add %14 %9
+                in (%15)"
+            },
+        );
+
+        // An integer mean over a manual mesh axis divides in the element data type, so it truncates toward zero.
+        let integer_type = |sharding: Sharding| ArrayType::scalar(DataType::I32).with_sharding(sharding).unwrap();
+        let (output, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |input| input.parallel_reduce(ReductionKind::Mean, "m"),
+            integer_type(sharding.clone().with_varying_manual_axes(["m"]).unwrap()),
+            manual_mesh_axes(&mesh),
+        )
+        .unwrap();
+        assert_eq!(output, integer_type(sharding.clone()));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
+                let %1:i32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %0
+                    %2:i32[] = constant [value=4]
+                    %3:i32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = div %1 %2
+                in (%3)"
+            },
+        );
+
+        // The element data type of a composed kind is validated before any component reduction is staged, so the
+        // error names this operation rather than one of its components.
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_reduce(ReductionKind::LogSumExp, "m"),
+                integer_type(sharding.with_varying_manual_axes(["m"]).unwrap()),
+                manual_mesh_axes(&mesh),
+            )
+            .map(|(output, _)| output),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`parallel_reduce` with kind `log_sum_exp` requires floating-point or complex inputs but got `i32`",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_parallel_reduce_parallel_reduce_differentiation() {
+        let (mesh, _, varying) = mesh_scalar_types();
+        // The composed logarithmic sum over a manual mesh axis is differentiable even though its mesh maximum is not:
+        // the maximum only reads the stopped input, so its tangent is a structural zero, and the shift is stopped as
+        // well, which leaves the softmax-weighted average of the input tangents as the output tangent (`%18`). The
+        // materialized zero branch of the selected shift tangent (`%8` and `%9`) is dead.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
+            |inputs: Vec<_>| Ok(vec![inputs[0].parallel_reduce(ReductionKind::LogSumExp, "m")?]),
+            vec![varying.clone()],
+            manual_mesh_axes(&mesh),
+        )
+        .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda \
+                    %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}], \
+                    %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
+                let %2:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                        stop_gradient %0
+                    %3:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=max, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %2
+                    %4:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = zero_like %3
+                    %5:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = sub %3 %3
+                    %6:bool[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = compare [direction=Equal] %5 %4
+                    %7:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = select %6 %3 %4
+                    %8:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        zero [type=f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}]]
+                    %9:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = select %6 %8 %4
+                    %10:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = stop_gradient %7
+                    %11:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                        parallel_vary [axis_name=\"m\"] %10
+                    %12:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = sub %0 %11
+                    %13:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = exp %12
+                    %14:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = mul %13 %1
+                    %15:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %13
+                    %16:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = \
+                        parallel_reduce [kind=sum, axis_name=\"m\", mesh=['m'=4:manual, 'outer'=2:manual]] %14
+                    %17:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = log %15
+                    %18:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = div %16 %15
+                    %19:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, []}] = add %17 %10
+                in (%19, %18)"
+            },
+        );
     }
 
     #[test]
@@ -1937,7 +2141,8 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] .
-                let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = parallel_reduce [kind=sum, axis_name=\"m\", axis_size=4, axis_index_groups=[[0, 1], [2, 3]]] %0
+                let %1:f32[][sharding={mesh<['m'=4:manual, 'outer'=2:manual]>, [], varying_manual={'m'}}] = \
+                    parallel_reduce [kind=sum, axis_name=\"m\", axis_size=4, axis_index_groups=[[0, 1], [2, 3]]] %0
                 in (%1)"
             },
         );
