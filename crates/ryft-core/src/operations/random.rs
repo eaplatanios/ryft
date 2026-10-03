@@ -726,8 +726,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from this point onwards.
-
 /// Represents the ability to draw random samples from a counter-based generator state. Every function selects the
 /// [`RandomAlgorithm`] from the state type (see [`RandomAlgorithm::from_state_type`]), threads the state functionally
 /// by returning the advanced state alongside its result, and is a pure composition of [`RngBitGenerator`] and ordinary
@@ -897,8 +895,8 @@ impl<
         };
         let (state, uniform) = self.random_uniform(logits_type.shape().clone(), logits_type.data_type())?;
 
-        // Shifting the samples from `[0, 1)` to `[tiny, 1)` keeps the Gumbel noise `-ln(-ln(u + tiny))` finite. The
-        // shift only changes `u = 0`, because `tiny` is far below the spacing between nonzero samples.
+        // Shifting the samples from `[0, 1)` to `[tiny, 1)` keeps the Gumbel noise `-ln(-ln(u + tiny))` finite.
+        // The shift only changes `u = 0`, because `tiny` is far below the spacing between non-zero samples.
         let tiny: Self = self.dispatch_domain().fill(uniform.r#type().as_ref(), tiny)?;
         let gumbel = uniform.add(&tiny)?.log()?.neg()?.log()?.neg()?;
         Ok((state, logits.add(&gumbel)?.argmax(axis)?))
@@ -1923,7 +1921,7 @@ mod tests {
 
     #[test]
     fn test_threefry_u32_words() {
-        // A key with a nonzero high half and a counter that crosses the 32-bit boundary check that both are split
+        // A key with a non-zero high half and a counter that crosses the 32-bit boundary check that both are split
         // into their low and high halves, low half first.
         let key = (1u64 << 32) | 42;
         let counter = u64::from(u32::MAX);
