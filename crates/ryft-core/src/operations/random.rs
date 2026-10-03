@@ -1,14 +1,14 @@
-//! Counter-based pseudorandom number generation. Randomness in ryft is functional: a generator state is an ordinary
-//! `u64` array, the same state always produces the same bits, and every draw returns an advanced state that the caller
-//! threads into the next draw. There is no hidden generator state, so random programs remain deterministic and every
-//! transform treats them like any other pure computation. The module is organized in three layers:
+//! Counter-based pseudorandom number generation. Randomness in Ryft is _functional_. Specifically, a generator state
+//! is an ordinary `u64` array, the same state always produces the same bits, and every random draw returns an advanced
+//! state that the caller threads into the next draw. There is no hidden generator state, so random programs remain
+//! deterministic and every transform treats them like any other pure computation. The module is organized in three
+//! layers:
 //!
-//!   - [`RandomAlgorithm`] selects a counter-based bit generator (ThreeFry-2x32 or Philox-4x32) and defines the type
-//!     of its state.
-//!   - [`RngBitGenerator`] generates raw unsigned-integer bits from a state by applying an
-//!     [`RngBitGeneratorOperation`], the analogue of StableHLO's
-//!     [`rng_bit_generator`](https://openxla.org/stablehlo/spec#rng_bit_generator). [`DynamicRngBitGenerator`] does
-//!     the same for dynamically shaped outputs in the mixed [`ArrayIrValue`] family.
+//!   - [`RandomAlgorithm`] selects a counter-based bit generator (e.g., ThreeFry-2x32 or Philox-4x32) and defines the
+//!     type of its state.
+//!   - [`RngBitGenerator`] generates raw unsigned-integer bits from a state by applying an [`RngBitGeneratorOperation`]
+//!     which is analogous to StableHLO's [`rng_bit_generator`](https://openxla.org/stablehlo/spec#rng_bit_generator).
+//!     [`DynamicRngBitGenerator`] does the same for dynamically shaped outputs in the mixed [`ArrayIrValue`] family.
 //!   - [`Random`] composes those bits with ordinary array operations into key splitting and the uniform, normal, and
 //!     categorical distributions, which therefore inherit their transform rules from the operations they use.
 //!
@@ -30,8 +30,6 @@
 //! # Ok(())
 //! # }
 //! ```
-
-// TODO(eaplatanios): Review this module.
 
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -70,19 +68,17 @@ use crate::programs::{
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
-/// Deterministic counter-based pseudorandom bit-generation algorithm used by an [`RngBitGeneratorOperation`]. Both
-/// algorithms come from Salmon et al.,
-/// ["Parallel Random Numbers: As Easy as 1, 2, 3"](https://doi.org/10.1145/2063384.2063405), and their states hold a
-/// `u64` key followed by a counter that every draw advances by the number of cipher invocations it performs.
+/// Deterministic counter-based pseudorandom bit-generation algorithm used by an [`RngBitGeneratorOperation`].
+/// Both algorithms come from [Salmon et al. paper](https://doi.org/10.1145/2063384.2063405), and their states hold
+/// a `u64` key followed by a counter that every draw advances by the number of cipher invocations it performs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RandomAlgorithm {
     /// The 20-round ThreeFry-2x32 generator, whose `u64[2]` state holds `[key, counter]`.
     ThreeFry,
 
-    /// The 10-round Philox-4x32 generator, whose `u64[3]` state holds the key followed by the low and high `u64`
-    /// halves of its 128-bit counter. StableHLO also accepts a `u64[2]` Philox state that reuses the key as the high
-    /// counter half, but ryft requires the explicit three-element form so that every algorithm has exactly one state
-    /// type.
+    /// The 10-round Philox-4x32 generator, whose `u64[3]` state holds the key followed by the low and high `u64` halves
+    /// of its 128-bit counter. StableHLO also accepts a `u64[2]` Philox state that reuses the key as the high counter
+    /// half, but Ryft requires the explicit three-element form so that every algorithm has exactly one state type.
     Philox,
 }
 
@@ -98,14 +94,14 @@ impl RandomAlgorithm {
             (DataType::U64, [Dimension::Static(2)]) => Ok(Self::ThreeFry),
             (DataType::U64, [Dimension::Static(3)]) => Ok(Self::Philox),
             _ => Err(TypeError::invalid(format!(
-                "random generator states must have type `u64[2]` (`three_fry`) or `u64[3]` (`philox`) but got \
-                 `{state_type}`",
+                "random generator states must have type `u64[2]` (i.e., for `three_fry`) or \
+                 `u64[3]` (i.e., for `philox`) but got `{state_type}`",
             ))),
         }
     }
 
-    /// Returns the type of the states consumed and produced by this algorithm, which is `u64[2]` for
-    /// [`ThreeFry`](Self::ThreeFry) and `u64[3]` for [`Philox`](Self::Philox).
+    /// Returns the type of the states consumed and produced by this algorithm, which is `u64[2]`
+    /// for [`ThreeFry`](Self::ThreeFry) and `u64[3]` for [`Philox`](Self::Philox).
     #[inline]
     pub fn state_type(self) -> ArrayType {
         ArrayType::new_static(
@@ -141,27 +137,29 @@ pub const RNG_BIT_GENERATOR_OPERATION_NAME: &str = "rng_bit_generator";
 ///   - `RngBitGeneratorOperation<ArrayType>` accepts only the state and requires a statically shaped output.
 ///   - `RngBitGeneratorOperation<ArrayIrType>` additionally accepts one trailing first-class dimension input per
 ///     dynamic axis of the declared output, in axis order, and each input must define the dimension variable that its
-///     axis refers to. XLA lowering rejects dynamic outputs, because generating the physical upper-bound buffer would
-///     advance the state by the physical rather than the logical element count.
+///     axis refers to. Note that, lowering when using the XLA backend rejects dynamic outputs, because generating the
+///     physical upper-bound buffer would advance the state by the physical rather than the logical element count.
 ///
 /// Both outputs are discrete, so differentiation assigns them structural-zero tangents and transposition is rejected.
 /// Batching a replicated state binds this operation once and replicates both outputs, since every batch item computes
 /// the same function of the same state. Batching a mapped state (e.g., one state per batch item derived with
 /// [`Random::split_key`]) stages one carry-free [`ScanOperation`] over the per-item states, so each batch item draws
 /// exactly the bits that its own state produces unbatched and the staged program size is independent of the batch
-/// size. The composite form threads its output extents through that scan as invariant carries, which requires them to
-/// be replicated.
+/// size. The composite form threads its output extents through that scan as invariant carries, which requires them
+/// to be replicated.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RngBitGeneratorOperation<T: Type> {
-    /// Algorithm generating the bits.
+    /// Algorithm generating the random bits.
     algorithm: RandomAlgorithm,
 
-    /// Declared type of the generated bits.
+    /// Declared type of the generated random bits.
     output_type: ArrayType,
 
     /// Type universe whose input contract this payload represents.
     marker: PhantomData<fn() -> T>,
 }
+
+// TODO(eaplatanios): Review from this point onwards.
 
 impl<T: Type> RngBitGeneratorOperation<T> {
     /// Creates a new [`RngBitGeneratorOperation`] with the provided algorithm and declared bits output type.
@@ -170,20 +168,20 @@ impl<T: Type> RngBitGeneratorOperation<T> {
         Self { algorithm, output_type, marker: PhantomData }
     }
 
-    /// Returns the algorithm generating the bits.
+    /// Returns the algorithm generating the bits for this [`RngBitGeneratorOperation`].
     #[inline]
     pub fn algorithm(&self) -> RandomAlgorithm {
         self.algorithm
     }
 
-    /// Returns the declared type of the generated bits.
+    /// Returns the declared type of the generated bits for this [`RngBitGeneratorOperation`].
     #[inline]
     pub fn output_type(&self) -> &ArrayType {
         &self.output_type
     }
 
-    /// Validates the state type, the output element type, and the absence of sharded axes, which are shared by both
-    /// input contracts.
+    /// Validates the provided state type, the output element type, and the absence of sharded axes, which are shared
+    /// by both input contracts, for this [`RngBitGeneratorOperation`].
     fn validate_types(&self, state_type: &ArrayType) -> Result<(), TypeError> {
         let algorithm = self.algorithm;
         let expected_state_type = algorithm.state_type();
@@ -195,12 +193,14 @@ impl<T: Type> RngBitGeneratorOperation<T> {
                  `{expected_state_type}` state but got `{state_type}`",
             )));
         }
+
         let data_type = self.output_type.data_type();
         if !matches!(data_type, DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64) {
             return Err(TypeError::invalid(format!(
                 "`{RNG_BIT_GENERATOR_OPERATION_NAME}` does not support output data type `{data_type}`",
             )));
         }
+
         let is_sharded = |array_type: &ArrayType| {
             array_type.sharding().is_some_and(|sharding| {
                 sharding.dimensions().iter().any(|dimension| matches!(dimension, ShardingDimension::Sharded(_)))
@@ -212,6 +212,7 @@ impl<T: Type> RngBitGeneratorOperation<T> {
                  states inside `shard_map` instead",
             )));
         }
+
         Ok(())
     }
 
